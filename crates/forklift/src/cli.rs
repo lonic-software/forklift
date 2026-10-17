@@ -1632,6 +1632,29 @@ impl Command {
         )
     }
 
+    /// Whether the command holds the store-access lock shared for its whole run (see
+    /// `StoreAccessLock`), which orders its writes to the shared object store against every
+    /// operation that deletes objects on a liveness or scope decision in another process.
+    ///
+    /// Every command that publishes a root another process can see — a pallet head, a staged
+    /// shard, a parked parcel, consolidation state — must be on [`Self::requires_warehouse_lock`]
+    /// for this to cover it; a new such command belongs there. `franchise` is the one command off
+    /// that list that sets a pallet head, and it writes into a store it has just created, which
+    /// no other process uses yet.
+    ///
+    /// `compact` and `scope-prune` are excluded because they host deleters, which take the
+    /// exclusive side; their own shared hold would refuse them. They take the side they need
+    /// themselves: a full repack and scope-prune the exclusive one, incremental compaction the
+    /// shared one, tried.
+    ///
+    /// # Returns
+    /// * `true`  - Take the shared hold right after the warehouse lock.
+    /// * `false` - A read-only command, or one that hosts a deleter.
+    pub fn holds_store_access(&self) -> bool {
+        self.requires_warehouse_lock()
+            && !matches!(self, Command::Compact { .. } | Command::ScopePrune { .. })
+    }
+
     /// Whether finishing this command should kick off background object-store maintenance
     /// (git's `gc --auto`): the mutating commands that add loose objects, so the store stays
     /// packed without the user remembering to `compact`. `compact` itself is excluded (or it

@@ -2241,6 +2241,21 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
         None
     };
 
+    // A repack drops every packed object outside the live set it is about to compute, so no
+    // writer may be between a dedup decision and the root that publishes it while that set is
+    // computed and the old packs are dropped (FORK-150): a load in another bay that found a
+    // packed-but-unreachable object present would otherwise publish a reference to it and lose it
+    // here. Never waits; refused while any writer holds the store, which auto-maintenance treats
+    // as any other compaction error and retries on a later command. Incremental compaction makes
+    // no liveness decision, but it moves loose objects into a pack and deletes the loose copies,
+    // which must not interleave with a scope-prune or gc deleting loose objects on a keep-set; so
+    // it shares the store with writers, refused (never waiting) while a deleter holds it.
+    let (_store_exclusive, _store_shared) = if all {
+        (Some(lock_utils::StoreAccessLock::try_exclusive()?), None)
+    } else {
+        (None, Some(lock_utils::StoreAccessLock::try_shared()?))
+    };
+
     remove_stale_temp_files(&pack_folder);
 
     progress.status("Collecting objects");
@@ -6770,6 +6785,69 @@ mod tests {
         assert!(compact(false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a server");
         drop(served);
         assert!(compact(true, false, &Progress::NONE).is_ok(), "a repack runs once the root is no longer served");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// FORK-150: a full repack is refused while any writer holds the store, and the packed
+    /// unreachable object it would drop survives; with no holder the same repack drops it. A
+    /// writer in another bay is stood in for by a shared hold on a second open file, which the
+    /// kernel treats exactly like another process's. Incremental compaction drops nothing on a
+    /// liveness decision and still runs beside the writer.
+    ///
+    /// Revert: drop the store-access acquire from `compact` → the guarded repack drops the
+    /// object → red.
+    #[test]
+    fn a_repack_refuses_while_a_writer_holds_the_store_and_keeps_the_object_it_would_drop() {
+        let temp = fresh_root("repack-store-access");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"unreachable, packed, and found present by another bay's dedup".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        store_loose(&hash, &content);
+        compact(false, false, &Progress::NONE).unwrap();
+        assert!(is_in_packs(&hash).unwrap(), "sanity: the object is packed before the repack");
+
+        let writer = lock_utils::StoreAccessLock::shared(|| panic!("nothing holds the store exclusively"))
+            .expect("hold the store shared, as a writer in another bay does");
+        let error = compact(true, false, &Progress::NONE).expect_err("a repack must refuse beside a writer");
+        assert!(error.contains("using the object store"), "the refusal should say the store is in use: {}", error);
+        assert!(is_in_packs(&hash).unwrap(), "the refused repack must leave the unreachable object packed");
+        assert!(compact(false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a writer");
+        drop(writer);
+
+        compact(true, false, &Progress::NONE).expect("a repack runs once no writer holds the store");
+        assert!(!is_in_packs(&hash).unwrap(), "with no writer, the repack drops the unreachable object");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Incremental compaction moves loose objects into a pack and deletes the loose copies, so it
+    /// must not interleave with a scope-prune or gc deleting loose objects on a keep-set: refused
+    /// (never waiting) while a deleter holds the store, leaving the loose object where the deleter
+    /// planned to find it.
+    ///
+    /// Revert: incremental compaction takes nothing again → it packs the object beside the deleter
+    /// → red.
+    #[test]
+    fn incremental_compaction_refuses_while_a_deleter_holds_the_store() {
+        let temp = fresh_root("compact-beside-deleter");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"loose, and planned for freeing by a scope-prune".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        store_loose(&hash, &content);
+
+        let deleter = lock_utils::StoreAccessLock::try_exclusive()
+            .expect("hold the store exclusively, as a scope-prune in another bay does");
+        let error = compact(false, false, &Progress::NONE)
+            .expect_err("incremental compaction must refuse beside a deleter");
+        assert!(error.contains("maintenance"), "the refusal should name the maintenance: {}", error);
+        assert!(!is_in_packs(&hash).unwrap(), "the refused compaction must leave the object loose");
+        drop(deleter);
+
+        compact(false, false, &Progress::NONE).expect("incremental compaction runs once the deleter is done");
+        assert!(is_in_packs(&hash).unwrap(), "with no deleter, the object is packed");
 
         std::fs::remove_dir_all(&temp).ok();
     }

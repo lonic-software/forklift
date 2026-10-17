@@ -35,7 +35,7 @@ use forklift_core::model::remote::{
     distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
-use forklift_core::util::lock_utils::ServeLock;
+use forklift_core::util::lock_utils::{self, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
     office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
@@ -65,6 +65,13 @@ struct WarehouseHandle {
     /// `put_warehouse` uses only to run `prepare` in a storage scope). Held in the handle so the
     /// lock releases exactly when the served warehouse stops being served (server shutdown).
     _serve_lock: Option<ServeLock>,
+
+    /// The shared store-access hold for this root, held beside the serve lock for the same
+    /// lifetime and `None` exactly when it is. It orders everything the server writes against
+    /// every operation that deletes objects on a liveness or scope decision — a full repack, gc
+    /// and scope-prune, run by another process on this root — so a lift can never dedup against
+    /// an object one of them is about to delete.
+    _store_access: Option<StoreAccessLock>,
 }
 
 impl WarehouseHandle {
@@ -77,23 +84,30 @@ impl WarehouseHandle {
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
+            _store_access: None,
         }
     }
 
-    /// A handle for a warehouse this process is about to serve: acquires the serve lock at `root`
-    /// and holds it in the handle for the handle's lifetime. Errors if the root is already
-    /// served by another process, or a `gc`/`bundle` is running against it — in either case
-    /// serving it would be unsafe.
+    /// A handle for a warehouse this process is about to serve: acquires the serve lock and the
+    /// shared store-access hold at `root` and keeps both in the handle for its lifetime. Errors if
+    /// the root is already served by another process, or a `gc`, full repack or scope-prune is
+    /// running against it — in either case serving it would be unsafe. Every handle the server
+    /// registers must come from here.
+    ///
+    /// The shared hold is tried, never waited for: this runs under the registry mutex, on a
+    /// runtime thread.
     fn serving(root: PathBuf) -> Result<WarehouseHandle, String> {
-        // Acquire inside the root's storage scope so the lock lands at this warehouse's store
-        // root (the scope is synchronous and never held across an `.await`; the guard keeps an
-        // absolute path, so it stays valid once the scope drops).
-        let serve_lock = {
+        // Acquire inside the root's storage scope so the locks land at this warehouse's store
+        // root (the scope is synchronous and never held across an `.await`; both guards keep an
+        // absolute path or an open file, so they stay valid once the scope drops).
+        let (serve_lock, store_access) = {
             let _scope = StorageRootScope::enter(&root);
-            ServeLock::acquire()?
+            let serve_lock = ServeLock::acquire()?;
+            (serve_lock, StoreAccessLock::try_shared()?)
         };
         let mut handle = WarehouseHandle::new(root);
         handle._serve_lock = Some(serve_lock);
+        handle._store_access = Some(store_access);
         Ok(handle)
     }
 }
@@ -416,6 +430,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         )
         .with_writer(std::io::stderr)
         .try_init();
+
+    // Every warehouse served keeps an open file (its store-access hold) until the server stops.
+    lock_utils::raise_open_file_limit();
 
     // Kept past the `match` below (which consumes `options.tokens`) so the startup refusal can
     // name the empty-`[operators]`-table case distinctly from "no --tokens/tokens file at all":
@@ -1377,10 +1394,12 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
         return error_response(error);
     }
 
+    // A transient, lockless handle, for `prepare` only: it is never registered, because a served
+    // warehouse must hold the serve lock and the shared store-access hold.
     let root = base.join(&id);
     let handle = Arc::new(WarehouseHandle::new(root.clone()));
 
-    let result = blocking(Arc::clone(&handle), move || {
+    let result = blocking(handle, move || {
         let existed = root.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir();
 
         std::fs::create_dir_all(&root)
@@ -1393,23 +1412,25 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
 
     match result {
         Ok(created) => {
-            // Register the handle unless a concurrent request already did: exactly one
-            // handle (one write mutex) may ever exist per warehouse.
-            match state.warehouses.lock() {
-                Ok(mut registry) => { registry.entry(id.clone()).or_insert(handle); }
-                Err(_) => return error_response(internal(
-                    "The warehouse registry lock is poisoned.".to_string()
-                )),
-            }
+            // Serve it the way every request does: the registry's handle when this warehouse is
+            // already served (a re-PUT stays an idempotent 200), else a locked one built under
+            // the registry mutex, so exactly one handle (one write mutex) ever exists per
+            // warehouse. Never `serving` directly: the serve lock refuses even its own holder.
+            let served = resolve_warehouse(&state, &params);
 
+            // The warehouse exists from here on, served or not: a retry after a refused
+            // registration finds it existing and answers 200, so a refused registration must
+            // still announce it here or the announcement is lost.
             if created {
                 let mut event = HookEvent::new(EVENT_WAREHOUSE_CREATED);
                 event.warehouse = Some(id);
                 emit_event(&state, event);
+            }
 
-                StatusCode::CREATED.into_response()
-            } else {
-                StatusCode::OK.into_response()
+            match served {
+                Err(error) => error_response(error),
+                Ok(_) if created => StatusCode::CREATED.into_response(),
+                Ok(_) => StatusCode::OK.into_response(),
             }
         }
         Err(error) => error_response(error),

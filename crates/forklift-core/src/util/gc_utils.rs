@@ -18,7 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{audit_utils, bay_utils, file_utils, object_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
 // `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
@@ -47,9 +47,16 @@ pub struct GcStats {
 ///
 /// # Returns
 /// * `Ok(GcStats)` - What happened.
-/// * `Err(String)` - If the live set could not be computed (nothing is deleted then)
-///                   or a deletion failed.
+/// * `Err(String)` - If another forklift process is using the store, the live set could
+///                   not be computed (nothing is deleted then), or a deletion failed.
 pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
+    // Exclusive store access from before the live set is computed until the sweep ends
+    // (FORK-150): the grace period protects only objects *written* recently, and a writer that
+    // deduplicates against an old unreachable loose object writes nothing, so without this a
+    // concurrent writer could publish a reference to an object the sweep then deletes. Never
+    // waits; refused while any writer or server holds the store.
+    let _store_access = lock_utils::StoreAccessLock::try_exclusive()?;
+
     let live = collect_live_set()?;
 
     let objects_root = std::path::PathBuf::from(file_utils::get_path_objects_root());
@@ -476,6 +483,32 @@ pub(crate) mod tests {
         // The blob *beneath* the sealed boundary is never reached (the boundary was not descended)
         // — correct, and by the store invariant it is absent locally anyway.
         assert!(!live.contains(&f.web_blob), "nothing beneath a sealed boundary is individually marked");
+    }
+
+    /// FORK-150: gc is refused while any writer holds the store, and the unreachable loose object
+    /// past its grace period survives; with no holder the same sweep deletes it. A writer in
+    /// another bay is stood in for by a shared hold on a second open file.
+    ///
+    /// Revert: drop the store-access acquire from `collect_garbage` → the guarded sweep deletes
+    /// the object → red.
+    #[test]
+    fn gc_refuses_while_a_writer_holds_the_store_and_keeps_the_object_it_would_delete() {
+        let _scratch = Scratch::new("gc-store-access");
+        let garbage = store_blob("unreachable, and found present by another bay's dedup\n");
+
+        let writer = lock_utils::StoreAccessLock::shared(|| panic!("nothing holds the store exclusively"))
+            .expect("hold the store shared, as a writer in another bay does");
+        let error = match collect_garbage(0) {
+            Ok(_) => panic!("gc must refuse beside a writer"),
+            Err(error) => error,
+        };
+        assert!(error.contains("using the object store"), "the refusal should say the store is in use: {}", error);
+        assert!(loose_path(&garbage).exists(), "the refused sweep must leave the unreachable object");
+        drop(writer);
+
+        let stats = collect_garbage(0).expect("gc runs once no writer holds the store");
+        assert_eq!(stats.deleted, 1, "with no writer, the sweep deletes the unreachable object");
+        assert!(!loose_path(&garbage).exists(), "the unreachable object is gone");
     }
 
     #[test]

@@ -250,6 +250,10 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     // command, which never takes the warehouse lock at all.
     let mut _lock: Option<lock_utils::WarehouseLock> = None;
 
+    // The shared store-access hold of a command that writes the shared object store: taken right
+    // after the warehouse lock, released before auto-maintenance (see below).
+    let mut store_access: Option<lock_utils::StoreAccessLock> = None;
+
     // Help needs no warehouse, and its one failure (an unknown command name) is a usage error,
     // which `dispatch`'s plain `String` errors cannot carry.
     if let Command::Help { command } = &cli.command {
@@ -275,6 +279,16 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
             ))?);
         }
 
+        // Order this command's whole decide-then-publish window against every operation that
+        // deletes objects on a liveness or scope decision in any other process (FORK-150): a
+        // dedup that finds an unreachable object present must never publish a reference to it
+        // while a full repack, gc or scope-prune is about to delete it. Taken after the bay lock
+        // (always that order, so no cycle) and before entry-heal, which can restage objects.
+        // Waits while a deleter runs: the lock is a kernel lock, so a dead holder releases it.
+        if cli.command.holds_store_access() {
+            store_access = Some(lock_utils::StoreAccessLock::shared(announce_store_access_wait)?);
+        }
+
         if !cli.command.bypasses_taint_heal() {
             forklift_core::util::heal_utils::heal_if_tainted()?;
         }
@@ -295,6 +309,14 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
         if let Some(pre) = journal_pre {
             let _ = forklift_core::util::journal_utils::push_if_changed(pre);
         }
+    }
+
+    // Everything this command publishes is published. Release the shared hold before
+    // auto-maintenance, whose full repack takes the exclusive one and would otherwise be refused
+    // by this very process's own shared hold.
+    drop(store_access);
+
+    if result.is_ok() {
 
         // Now that the command has succeeded, keep the object store healthy if it has
         // accumulated enough loose objects or packs to warrant it (git's gc --auto). Runs
@@ -305,6 +327,19 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     }
 
     result.map_err(ForkliftError::from)
+}
+
+/// Say why a mutating command is not starting yet: another process holds the store exclusively
+/// for maintenance. One line, on stderr so it never mixes into a command's result, and as a
+/// status report on the progress-events channel.
+fn announce_store_access_wait() {
+    const WAITING: &str = "Waiting for object-store maintenance in another process…";
+
+    if !output::is_json() {
+        eprintln!("{}", WAITING);
+    }
+
+    events::progress().status(WAITING);
 }
 
 /// Dispatch a parsed command to its handler. Handlers own presentation and return a

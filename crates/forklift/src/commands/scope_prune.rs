@@ -1,6 +1,7 @@
 use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::util::bay_utils;
+use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::prune_utils;
@@ -34,9 +35,18 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - If the plan was reported (dry run) or carried out.
 /// * `Err(String)` - If the warehouse is not sparse, a path is a live spine ancestor or a
-///   sub-path of what is still fetched, the last fetched path would be dropped, or a checkout
-///   still materializes the path.
+///   sub-path of what is still fetched, the last fetched path would be dropped, a checkout
+///   still materializes the path, or another process is using the object store.
 pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
+    // Exclusive store access first, before anything is read (FORK-150). The keep-set depends on
+    // the fetch scope read just below and on every bay's materialization scope, not only on the
+    // plan's walk, and the fetch scope is rewritten from that read; so no writer in another bay —
+    // a load that dedups against a planned object, an expand widening the fetch scope — may run
+    // anywhere between this read and the last deletion. A dry run takes it too, so it reports
+    // exactly the plan a real run would carry out. Never waits: refused while any writer holds
+    // the store. `main` takes no shared hold for this command, which would refuse this try.
+    let store_access = StoreAccessLock::try_exclusive()?;
+
     let fetch = scope_utils::read_fetch_scope()?;
 
     if fetch.is_full() {
@@ -96,7 +106,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     // to check anyway, and a destructive verb is exactly where redundant defense earns its keep.
     guard_materialization_scopes(&to_reclaim, &post_prune)?;
 
-    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune)?;
+    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &store_access)?;
 
     if dry_run {
         output::emit(&PruneReport {
@@ -121,7 +131,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     // The reverse order could leave an in-scope object missing, which is unsafe.
     scope_utils::set_fetch_scope(&post_prune)?;
 
-    let stats = prune_utils::free_objects(&plan.to_free)?;
+    let stats = prune_utils::free_objects(&plan.to_free, &store_access)?;
 
     output::emit(&PruneReport {
         dry_run: false,

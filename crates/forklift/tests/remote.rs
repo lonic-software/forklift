@@ -11,7 +11,7 @@ use forklift_core::util::progress_utils::Progress;
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
 mod common;
-use common::forklift_command;
+use common::{forklift_command, hold_store_access};
 
 /// Path to the compiled forklift-server binary. Cargo exposes `CARGO_BIN_EXE_*` only
 /// for the package's own binaries, so the server is located next to the CLI (both land
@@ -1903,6 +1903,76 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
     assert_success(&franchised);
     assert_eq!(area.read_file("b/keep.txt"), "live content\n");
+}
+
+#[test]
+fn gc_is_refused_while_another_process_writes_the_store() {
+    // FORK-150: gc's grace period protects objects written recently, but a writer that dedups
+    // against an old unreachable object writes nothing. So gc takes the store exclusively before
+    // it computes the live set, and is refused while any writer holds it — here a CLI command in
+    // another bay, stood in for by the test process's shared hold on an unserved root.
+    //
+    // Revert: drop the store-access acquire from `collect_garbage` → the sweep deletes the
+    // orphan → red.
+    let area = TestArea::new("gc-store-access");
+    std::fs::create_dir_all(area.path("w")).unwrap();
+    assert_success(&area.forklift("w", &["prepare"]));
+
+    let orphan = area.path("w/.forklift/objects/aa/orphan-object");
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"junk").unwrap();
+    let root_str = area.path("w").to_str().unwrap().to_string();
+
+    let writer = hold_store_access(&area.path("w"), false);
+    let refused = server_command()
+        .args(["gc", "--root", &root_str, "--grace-hours", "0"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "gc must be refused while another process writes the store");
+    assert!(stderr(&refused).contains("using the object store"),
+        "the refusal should say the store is in use: {}", stderr(&refused));
+    assert!(orphan.exists(), "a refused gc must not have swept anything");
+
+    drop(writer);
+    let swept = server_command()
+        .args(["gc", "--root", &root_str, "--grace-hours", "0"])
+        .output()
+        .unwrap();
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert!(stdout(&swept).contains("deleted 1"), "{}", stdout(&swept));
+    assert!(!orphan.exists(), "with no writer, gc sweeps the orphan");
+}
+
+#[test]
+fn a_warehouse_created_by_put_is_served_under_the_serve_lock() {
+    // A warehouse first reached through `PUT /warehouses/W` must be served like any other: under
+    // the serve lock and the shared store-access hold, so gc, a full repack and scope-prune are
+    // refused on it while the server runs. `put_warehouse` used to register the lockless handle it
+    // ran `prepare` with, and every later request reused it.
+    //
+    // Revert: `put_warehouse` registers its transient handle again → gc runs on the served
+    // warehouse and sweeps the orphan → red.
+    let area = TestArea::new("put-serve-lock");
+    let server = Server::start_multi(&area, Some("admin"));
+
+    assert_eq!(http_status(&server.url, "PUT", "/warehouses/w", Some("admin")), "HTTP/1.1 201 Created");
+    assert_eq!(http_status(&server.url, "GET", "/warehouses/w/v1/warehouse", Some("admin")), "HTTP/1.1 200 OK");
+    // A re-PUT of a warehouse being served stays idempotent.
+    assert_eq!(http_status(&server.url, "PUT", "/warehouses/w", Some("admin")), "HTTP/1.1 200 OK");
+
+    let root = area.path("warehouses-base/w");
+    let orphan = root.join(".forklift/objects/aa/orphan-object");
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"junk").unwrap();
+
+    let refused = server_command()
+        .args(["gc", "--root", root.to_str().unwrap(), "--grace-hours", "0"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "gc must be refused on a warehouse the server serves");
+    assert!(orphan.exists(), "a refused gc must not have swept anything");
+    assert_eq!(http_status(&server.url, "GET", "/warehouses/w/v1/warehouse", Some("admin")), "HTTP/1.1 200 OK",
+        "the warehouse is still served");
 }
 
 #[test]
@@ -4278,6 +4348,56 @@ fn scope_prune_dry_run_reports_and_frees_nothing() {
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
     assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]),
         "a dry run leaves the fetch scope unchanged: {}", stdout(&scope));
+}
+
+#[test]
+fn scope_prune_is_refused_while_another_process_writes_the_store() {
+    // FORK-150: scope-prune computes what to keep from the fetch scope and every bay's work, then
+    // frees the rest. A writer in another bay — a load that dedups against a planned object, an
+    // expand widening the fetch scope — must not run between the two, so scope-prune takes the
+    // store exclusively before it reads anything, dry run included, and is refused while any
+    // writer holds it. The test process stands in for that writer with a shared hold.
+    //
+    // Revert: the handler skips the exclusive acquire → the prune runs, frees the objects and
+    // narrows the fetch scope → red.
+    let area = TestArea::new("scope-prune-store-access");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+
+    let writer = hold_store_access(&area.path("sparse"), false);
+
+    for args in [&["--json", "scope-prune", "src/web"][..], &["--json", "scope-prune", "src/web", "--dry-run"][..]] {
+        let refused = area.forklift("sparse", args);
+        assert!(!refused.status.success(), "{:?} must be refused while another process writes the store", args);
+        let said = format!("{}{}", stdout(&refused), stderr(&refused));
+        assert!(said.contains("using the object store"), "the refusal should say the store is in use: {}", said);
+    }
+
+    assert!(object_present(&area, "sparse", &web_tree), "a refused prune frees no object");
+    assert!(object_present(&area, "sparse", &web_blob), "a refused prune frees no object");
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]),
+        "a refused prune leaves the fetch scope unchanged: {}", stdout(&scope));
+
+    // Once the writer is done, the same prune runs and frees them.
+    drop(writer);
+    assert_success(&area.forklift("sparse", &["scope-prune", "src/web"]));
+    assert!(!object_present(&area, "sparse", &web_blob), "with no writer, the prune frees the object");
 }
 
 #[test]

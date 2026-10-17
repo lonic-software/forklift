@@ -1133,7 +1133,9 @@ under the path, narrow and prune; the parked edits survive, and `park pop` re-ap
 `expand` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
 before you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
-repack is future work.)
+repack is future work.) A prune, dry run included, is **refused while a mutating command runs in
+another bay** or a `forklift-server` serves the warehouse, since that writer could reuse an object
+the prune is about to free; run it again once the other command finishes.
 
 Pruning a **large (chunked) file** frees its recipe **and every chunk** it names, not just the
 recipe — chunks are content-addressed objects reachable only through the recipe, so a
@@ -1285,8 +1287,10 @@ never races — which means it can add a brief pause when it fires (rarely). Tur
 Compaction also takes a **shared object-store lock** (separate from the per-bay lock ordinary
 commands hold), so two bays or two processes never compact the same store at once. If another
 compaction is already running, an explicit `forklift compact` reports it and stops; the
-automatic background compaction simply skips (the other run is doing the same work). Ordinary
-mutating commands are never blocked by it.
+automatic background compaction simply skips (the other run is doing the same work). An
+incremental compaction never blocks ordinary mutating commands; a full repack does, briefly (see
+below). Compaction of either kind is refused while a `scope-prune` or `forklift-server gc` runs
+on the warehouse.
 
 Plain `compact` is **incremental**: it packs the loose objects into a *new* pack and leaves
 existing packs alone (cheap, but packs accumulate over time). `compact --all` is a **full
@@ -1303,6 +1307,15 @@ uploaded. Stop the server, repack, then restart. Plain `compact` drops nothing a
 allowed; the automatic repack simply waits until the root is no longer served. A server that was
 hard-killed leaves its `serve.lock` behind, which blocks repacks (automatic ones silently) until
 it is removed, exactly as it blocks `gc`.
+
+For the same reason a full repack is **refused while a mutating command is running in another
+bay** of the same warehouse: that command may have just decided to reuse an object the repack
+was about to drop. Run it again once the other command finishes. The opposite case waits
+instead of failing. A mutating command that starts while a full repack, a `scope-prune` or a
+`forklift-server gc` runs on the warehouse prints `Waiting for object-store maintenance in
+another process…` and carries on once it finishes. The coordination is a kernel lock on
+`.forklift/store-access.lock`, so a process that dies releases it and leaves nothing to clean
+up.
 
 ```sh
 forklift compact          # incremental: pack the loose objects
