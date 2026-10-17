@@ -422,3 +422,43 @@ fn restore_refuses_a_path_that_names_another_spellings_file() {
     assert!(stderr(&restored).contains("names the same file as"), "{}", stderr(&restored));
     assert_eq!(warehouse.read("docs/a"), "changed\n");
 }
+
+/// A file where a new path needs a directory occupies the whole path: an untracked one is refused
+/// by name on every volume, and on a folding one a staying tracked file reached through another
+/// spelling is an alias collision.
+#[test]
+fn a_file_where_a_new_path_needs_a_directory_is_judged_as_its_occupant() {
+    let warehouse = Warehouse::new("non-directory", &[("app.txt", "app\n"), ("Foo", "tracked\n")]);
+    warehouse.craft("nested", "main", &[("app.txt", "app\n"), ("Foo", "tracked\n"), ("bar/a", "a\n")]);
+    warehouse.write("bar", "untracked\n");
+
+    let untracked = warehouse.run(&["shift", "nested"]);
+    assert_refused_with(&untracked, UNTRACKED_REFUSAL, &["bar"]);
+    assert_eq!(warehouse.read("bar"), "untracked\n");
+    std::fs::remove_file(warehouse.root.join("bar")).unwrap();
+
+    warehouse.craft("aliased", "main", &[("app.txt", "app\n"), ("Foo", "tracked\n"), ("foo/a", "a\n")]);
+    let aliased = warehouse.run(&["shift", "aliased"]);
+
+    if warehouse.folds_case() {
+        assert_refused_with(&aliased, ALIAS_REFUSAL, &["Foo and foo/a"]);
+        assert_eq!(warehouse.read("Foo"), "tracked\n");
+    } else {
+        assert!(aliased.status.success(), "{}", stderr(&aliased));
+        assert_eq!(warehouse.read("foo/a"), "a\n");
+    }
+}
+
+/// Two new spellings of which one is already on disk are judged against the disk alone, so the
+/// refusal reports the untracked occupant once rather than also as a pair.
+#[test]
+fn a_new_pair_whose_one_name_is_on_disk_is_reported_once() {
+    let warehouse = Warehouse::new("pair-on-disk", &[("app.txt", "app\n")]);
+    warehouse.craft("pair", "main", &[("app.txt", "app\n"), ("a", "lower\n"), ("A", "upper\n")]);
+    warehouse.write("a", "untracked\n");
+
+    let shifted = warehouse.run(&["shift", "pair"]);
+    assert_refused_with(&shifted, UNTRACKED_REFUSAL, &["a"]);
+    assert!(!stderr(&shifted).contains(ALIAS_REFUSAL), "{}", stderr(&shifted));
+    assert_eq!(warehouse.read("a"), "untracked\n");
+}
