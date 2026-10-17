@@ -21,19 +21,20 @@
 //!
 //! ## On-disk format
 //!
-//! One normalized path key per line, sorted. The warehouse root is a literal blank line (`""`),
-//! never specially spelled or omitted — [`str::lines`] round-trips this correctly (a genuinely
-//! empty file, or a missing one, yields zero lines; a file containing a lone `"\n"` yields exactly
-//! one, the empty string). A missing file reads as the empty set.
+//! A [`record_utils`] file of kind `marker`: one normalized path key per line, sorted, escaped so
+//! that a key holding a line break is still one line. The warehouse root is the empty key, a
+//! blank line, never specially spelled or omitted. A missing file reads as the empty set.
 //!
 //! ## Malformed content
 //!
-//! The only way this module considers a marker file malformed is if its bytes are not valid
-//! UTF-8 ([`read`] returns `Err` in that case) — the line-per-key format has no other structural
-//! requirement to violate. Every consumer built on this module is expected to follow one
+//! A marker file is malformed when [`record_utils`] refuses it: bytes that are not UTF-8, a
+//! missing or unknown format header, a file cut short or a bad escape ([`read`] returns `Err`).
+//! Every consumer built on this module is expected to follow one
 //! convention for handling that:
-//! * **Write side** (recording a new key): treat malformed existing content exactly like a
-//!   missing file — self-heal by overwriting with a fresh set. [`add`] does this unconditionally.
+//! * **Write side** (recording a new key): malformed existing content may have recorded any key,
+//!   so it reads as the warehouse root, which covers every key. [`add`] rewrites it as exactly
+//!   that: the file becomes readable again and still records everything it could have. Starting
+//!   from an empty set instead would drop whatever the unreadable file recorded.
 //! * **Check side** (deciding whether to refuse based on what is recorded): malformed content
 //!   must never be silently treated as "nothing recorded" — that defeats whatever the recorded
 //!   set exists to guard against. A consumer's check must treat a malformed marker as at least as
@@ -51,33 +52,35 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use crate::util::{file_utils, path_utils};
+use crate::util::{file_utils, path_utils, record_utils};
 
 /// Read the set of path keys currently recorded at `path`.
 ///
 /// # Returns
 /// * `Ok(set)`     - Possibly empty (a missing file reads as the empty set).
-/// * `Err(String)` - The file exists but its content is not valid UTF-8.
+/// * `Err(String)` - The file exists but is malformed (see the module doc comment).
 pub fn read(path: &Path) -> Result<BTreeSet<String>, String> {
     if !path.exists() {
         return Ok(BTreeSet::new());
     }
 
-    let content = std::fs::read_to_string(path)
+    let bytes = std::fs::read(path)
         .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
 
-    Ok(content.lines().map(str::to_string).collect())
+    let keys = record_utils::from_bytes(&bytes, MARKER_RECORD, MARKER_VERSION)
+        .map_err(|e| format!("The marker file \"{}\" {}", path.to_string_lossy(), e.describe()))?;
+
+    Ok(keys.into_iter().collect())
 }
 
 /// Serialize `set` to its on-disk form — see the module doc comment's format section.
 fn serialize(set: &BTreeSet<String>) -> Vec<u8> {
-    let mut content = String::new();
-    for key in set {
-        content.push_str(key);
-        content.push('\n');
-    }
-    content.into_bytes()
+    record_utils::to_bytes(MARKER_RECORD, MARKER_VERSION, set)
 }
+
+/// The [`record_utils`] kind and version of a marker file.
+const MARKER_RECORD: &str = "marker";
+const MARKER_VERSION: u32 = 1;
 
 /// The antichain-maintaining update [`add`], [`pending_add`] and [`add_deferred`] share: absorb
 /// `key` into `existing` (see the module doc comment's antichain-invariant section).
@@ -103,17 +106,20 @@ fn absorb(existing: BTreeSet<String>, key: &str) -> BTreeSet<String> {
 /// it — for a caller that wants to fold that write into a batch it already controls (see the
 /// module doc comment's durability section) instead of calling [`add`]/[`add_deferred`] directly.
 ///
-/// Malformed existing content is treated as the empty set (the module doc comment's write-side
-/// convention), so this never fails.
+/// Malformed existing content reads as the warehouse root (the module doc comment's write-side
+/// convention), so this never fails, and always rewrites such a file.
 ///
 /// # Returns
 /// * `Some(bytes)` - `key` is not yet covered by what is recorded; this is the new file content.
 /// * `None`        - `key` is already covered by what is recorded; nothing needs to change.
 pub fn pending_add(path: &Path, key: &str) -> Option<Vec<u8>> {
-    let existing = read(path).unwrap_or_default();
+    let (existing, readable) = match read(path) {
+        Ok(existing) => (existing, true),
+        Err(_) => (BTreeSet::from([String::new()]), false),
+    };
     let updated = absorb(existing.clone(), key);
 
-    if updated == existing { None } else { Some(serialize(&updated)) }
+    if readable && updated == existing { None } else { Some(serialize(&updated)) }
 }
 
 /// Add `key` to the set recorded at `path`, durably, maintaining the antichain invariant (see the
@@ -370,12 +376,16 @@ mod tests {
     }
 
     #[test]
-    fn add_self_heals_malformed_content() {
-        let path = scratch("self-heal");
-        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+    fn add_rewrites_malformed_content_as_the_root_it_may_have_recorded() {
+        // An unreadable marker may have recorded any key, so adding one must not drop them all:
+        // it becomes the root key, which covers every key, readable again.
+        for malformed in [&[0xFF, 0xFE, 0x00, 0xFF][..], b"src\n"] {
+            let path = scratch("self-heal");
+            std::fs::write(&path, malformed).unwrap();
 
-        add(&path, "src").unwrap();
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+            add(&path, "other").unwrap();
+            assert_eq!(read(&path).unwrap(), BTreeSet::from(["".to_string()]));
+        }
     }
 
     #[test]
@@ -383,5 +393,23 @@ mod tests {
         let path = scratch("root-key");
         add(&path, "").unwrap();
         assert_eq!(read(&path).unwrap(), BTreeSet::from(["".to_string()]));
+    }
+
+    #[test]
+    fn a_key_holding_a_line_break_round_trips_as_one_key() {
+        let path = scratch("line-break-key");
+        for key in ["a\nb", "c\r", "d\\ne"] {
+            add(&path, key).unwrap();
+        }
+
+        assert_eq!(read(&path).unwrap(), BTreeSet::from(["a\nb".to_string(), "c\r".to_string(), "d\\ne".to_string()]));
+    }
+
+    #[test]
+    fn a_marker_without_its_format_header_is_refused() {
+        let path = scratch("headerless");
+        std::fs::write(&path, "src\n").unwrap();
+
+        assert!(read(&path).is_err());
     }
 }

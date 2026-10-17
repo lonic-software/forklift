@@ -14,19 +14,22 @@ of the project, so it is never written into a parcel, pushed to a remote, or imp
 collaborators. A plain bay (or the main tree) has no scope file at all.
 
 ## Structure
-A UTF-8 text file: a format header line, then one in-scope path prefix per line:
+A [state record](STATE_RECORD_FORMAT.md) of kind `scope`: a format header line, then one
+in-scope path prefix per line, escaped:
 ```
-/forklift-scope 2[NL]
+/forklift-scope 3[NL]
 [prefix_1][NL]
 [prefix_2][NL]
 ...
 ```
 Where:
-- `/forklift-scope 2` names the format. It opens with `/`, which no stored prefix can, so it
+- `/forklift-scope 3` names the format. It opens with `/`, which no stored prefix can, so it
   cannot be mistaken for a prefix. A full scope is written as the empty file, with no header.
 - `prefix_n` is a **warehouse path key**: `/`-separated, relative to the warehouse root,
   with no leading or trailing `/` and no `.`/`..` components (e.g. `src/api`). A prefix names
-  a directory; everything at or under it is *in scope*.
+  a directory; everything at or under it is *in scope*. It is escaped as every state record
+  entry is: `\` as `\\`, a line feed as `\n`, a carriage return as `\r`, since a directory name
+  may hold any of them.
 - `NL` is an ASCII newline character (decimal value `10`), written after every prefix
   (including the last).
 
@@ -37,12 +40,14 @@ Where:
 - A header followed by no prefix is **refused**, and so is one with a root prefix (an empty
   string or `/`) anywhere among its prefixes, since the root takes in everything. Forklift
   never writes either: the full scope is the empty file.
-- On read, blank lines and surrounding whitespace are ignored; prefixes are trimmed of
-  surrounding `/`, de-duplicated and sorted, giving a canonical on-disk form.
+- Prefixes are trimmed of surrounding `/`, de-duplicated and sorted, giving a canonical
+  on-disk form. Whitespace is part of a prefix: a directory name may begin or end with a space.
 - A non-empty file whose first line is not the header is the unversioned format 1, written
-  before the root ignore file joined every scope, and is **refused** — read under format 2's
+  before the root ignore file joined every scope, and is **refused** — read under today's
   meaning, the never-inventoried ignore file would show as removed and the next stack would
-  commit the removal. A header naming any other version is refused too. Nothing is migrated.
+  commit the removal. A header naming any other version is refused too, format 2 included,
+  which wrote prefixes raw, so a prefix holding a line break read back as two. Nothing is
+  migrated.
   The way out depends on the file: for the fetch scope or the main tree's scope, franchise
   the remote again, into a new directory; for a bay's scope, remove the bay and add it again
   with `bay add --scope`.

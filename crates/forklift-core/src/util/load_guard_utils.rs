@@ -268,8 +268,8 @@ fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
 fn malformed_marker_refusal(read_error: &str) -> CoreError {
     let path = marker_path();
     let next_step = format!(
-        "Fix or remove \"{}\" by hand, or run \"forklift restore --staged <path>\" over the \
-        affected area, then try again.",
+        "Run \"forklift load .\": it rewrites \"{}\" as an incomplete load of the whole \
+        warehouse and, once it completes, clears it. Then try again.",
         path.to_string_lossy()
     );
 
@@ -422,11 +422,11 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
-    /// A malformed marker never blocks the load that would fix it (self-heals by overwriting),
-    /// but a check about to durably commit refuses conservatively rather than treat unreadable
-    /// state as "nothing recorded".
+    /// A malformed marker never blocks a load, but neither the load's write nor the check treats
+    /// unreadable state as "nothing recorded": the write rewrites it as the whole warehouse, which
+    /// only a load of the whole warehouse then clears.
     #[test]
-    fn a_malformed_marker_self_heals_on_write_but_refuses_the_check() {
+    fn a_malformed_marker_reads_as_the_whole_warehouse_on_write_and_refuses_the_check() {
         let temp = temp_warehouse("malformed");
         let _scope = StorageRootScope::enter(&temp);
 
@@ -437,16 +437,20 @@ mod tests {
         let error = check_no_incomplete_load().unwrap_err();
         assert!(matches!(error, CoreError::Refusal { code: RefusalCode::IncompleteLoad, .. }));
 
-        // The write side self-heals: a load over the malformed marker proceeds and records
-        // fresh, readable content.
+        // A load over the malformed marker proceeds, and rewrites it as the root: the unreadable
+        // file may have recorded any load, so finishing one under "src" does not clear it.
         start_load("src");
+        assert_eq!(marker_utils::read(&marker_path()).unwrap(), BTreeSet::from([String::new()]));
+
+        mark_load_completed("src");
         let error = check_no_incomplete_load().unwrap_err();
         match error {
-            CoreError::Refusal { message, .. } => assert!(message.contains("src")),
+            CoreError::Refusal { message, .. } => assert!(message.contains("./"), "{}", message),
             other => panic!("expected a refusal, got {:?}", other),
         }
 
-        mark_load_completed("src");
+        start_load("");
+        mark_load_completed("");
         assert!(check_no_incomplete_load().is_ok());
 
         std::fs::remove_dir_all(&temp).ok();

@@ -3080,7 +3080,10 @@ mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        std::fs::write(bay_b_dir.join("consolidation"), format!("{}\ntheir-pallet\n", target_hash)).unwrap();
+        let state = crate::util::merge_utils::ConsolidationState {
+            their_head: target_hash.clone(), their_pallet: "their-pallet".to_string(),
+        };
+        std::fs::write(bay_b_dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets).unwrap().hashes;
@@ -3774,7 +3777,7 @@ mod tests {
     fn plant_torn_taint(forklift_root: &Path, surviving_lines: &[&str]) {
         let taint_dir = forklift_root.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        let mut content = String::new();
+        let mut content = String::from("/forklift-taint 1\n");
         for line in surviving_lines {
             content.push_str(line);
             content.push('\n');
@@ -5281,13 +5284,7 @@ mod tests {
     fn plant_complete_taint(forklift_root: &Path, paths: &[&str]) {
         let taint_dir = forklift_root.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        let mut content = String::new();
-        for path in paths {
-            content.push_str(path);
-            content.push('\n');
-        }
-        content.push_str("END\n");
-        std::fs::write(taint_dir.join("taint-77777-0"), content).unwrap();
+        std::fs::write(taint_dir.join("taint-77777-0"), taint_utils::taint_file_bytes(paths)).unwrap();
     }
 
     /// (§10.3, mechanism check 1 — the literal claim) Taint a pallet ref pointer while it holds

@@ -10,7 +10,7 @@ use file_id::FileId;
 use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
-use crate::util::byte_utils;
+use crate::util::record_utils;
 use crate::util::taint_utils;
 
 /// The number of characters in an object hash that are used for creating the folders.
@@ -55,6 +55,9 @@ pub const FILE_NAME_INVENTORY_DATA: &str = "data";
 
 /// The name of the inventory metadata file.
 pub const FILE_NAME_INVENTORY_METADATA: &str = "metadata";
+/// The record kind and format version of the inventory metadata file (see [`record_utils`]).
+pub const INVENTORY_METADATA_RECORD: &str = "inventory-metadata";
+pub const INVENTORY_METADATA_VERSION: u32 = 1;
 
 /// Create a folder if it does not exist yet.
 /// All folders in the given path will be created (if they don't exist already).
@@ -2043,6 +2046,11 @@ pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<V
     ).map(|bytes| (file_path, Some(bytes)))
 }
 
+/// The path of the inventory metadata file, whether or not it exists.
+pub fn get_inventory_metadata_path() -> PathBuf {
+    PathBuf::from(get_path_inventory_root()).join(FILE_NAME_INVENTORY_METADATA)
+}
+
 /// Retrieve the contents of the inventory metadata file (i.e. the paths of existing inventory
 /// files), if it exists.
 ///
@@ -2055,8 +2063,7 @@ pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<V
 /// * `Err(String)` - The error message if the inventory metadata file exists, but there was an
 /// error while reading it.
 pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet<String>>), String> {
-    let mut metadata_store_path = PathBuf::from(get_path_inventory_root());
-    metadata_store_path.push(FILE_NAME_INVENTORY_METADATA);
+    let metadata_store_path = get_inventory_metadata_path();
 
     if !metadata_store_path.exists() {
         return Ok((metadata_store_path, None));
@@ -2064,15 +2071,14 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
 
     let metadata_bytes = std::fs::read(&metadata_store_path)
         .map_err(|e| format!("Error while reading inventory metadata from file \"{}\": {}", metadata_store_path.to_string_lossy(), e))?;
-    let mut metadata: BTreeSet<String> = BTreeSet::new();
-
-    let mut cursor = 0usize;
-
-    while let Some((line, bytes_read)) = byte_utils::read_line(cursor, &metadata_bytes) {
-        cursor += bytes_read;
-        let path = String::from_utf8(line).map_err(|e| format!("Error while parsing inventory metadata line as UTF-8: {}", e))?;
-        metadata.insert(path);
-    }
+    let metadata: BTreeSet<String> =
+        record_utils::from_bytes(&metadata_bytes, INVENTORY_METADATA_RECORD, INVENTORY_METADATA_VERSION)
+            .map_err(|e| format!(
+                "The inventory metadata file \"{}\" {}",
+                metadata_store_path.to_string_lossy(), e.describe()
+            ))?
+            .into_iter()
+            .collect();
 
     Ok((metadata_store_path, Some(metadata)))
 }
@@ -4122,7 +4128,7 @@ mod tests {
         // (a crash-survivor / sibling-process taint neither this batch nor this process caused).
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("dd").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4157,7 +4163,7 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("ee").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4192,7 +4198,7 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("gg").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4248,7 +4254,7 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("hh").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4392,7 +4398,7 @@ mod tests {
         // And a hand-written (pre-existing) taint file must not be honored by the re-check either.
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-1-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-1-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("cc").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();

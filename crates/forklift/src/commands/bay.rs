@@ -75,6 +75,10 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
         ));
     }
 
+    // The bay's records store both paths as text; refuse one that is not before anything is
+    // created, so a refusal leaves no half-made bay behind.
+    bay_utils::check_bay_paths_recordable(&warehouse_root, &bay_dir)?;
+
     // The bay's pallet, at the current head (a shared ref).
     pallet_utils::set_pallet_head(name, &head)?;
 
@@ -82,8 +86,10 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     std::fs::create_dir_all(&bay_dir)
         .map_err(|e| format!("Error while creating the bay directory \"{}\": {}", bay_dir.to_string_lossy(), e))?;
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
-    bay_utils::write_bay_redirect(&bay_dir, &warehouse_root, name)?;
+    // The path file is written before the redirect, so a bay without a path file never wrote
+    // one — which is what lets `bay remove` drop such a bay without leaving a redirect behind.
     bay_utils::write_bay_path(name, &bay_dir)?;
+    bay_utils::write_bay_redirect(&bay_dir, &warehouse_root, name)?;
 
     // Enter the bay to check out its pallet and materialize its working tree. The current
     // warehouse lock stored its path at acquire time, so switching context here does not
@@ -214,14 +220,15 @@ fn list() -> Result<(), String> {
     let bays = bay_utils::list_bays()?
         .into_iter()
         .map(|name| {
-            let path = bay_utils::read_bay_path(&name)
+            // A bay whose creation failed before recording its directory lists with none.
+            let path = bay_utils::read_bay_path(&name)?
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let pallet = bay_utils::read_bay_current_pallet(&name);
 
-            BayEntry { name, path, pallet }
+            Ok(BayEntry { name, path, pallet })
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     output::emit(&BayList { bays });
 
@@ -235,9 +242,19 @@ fn remove(name: &str) -> Result<(), String> {
         return Err(format!("There is no bay named \"{}\".", name));
     }
 
+    // A bay that never recorded its working directory (its creation failed first) has no
+    // redirect to drop: `bay add` writes the path file before the redirect. One whose record
+    // cannot be read refuses: removing the state alone would leave that directory redirecting
+    // to a bay that no longer exists.
+    let bay_dir = bay_utils::read_bay_path(name).map_err(|e| format!(
+        "{} To remove the bay by hand, delete the \".forklift\" file in its working directory and \
+        the folder \"{}\".",
+        e, bay_utils::bay_state_dir(name).to_string_lossy()
+    ))?;
+
     // Drop the redirect so the directory is no longer a bay (best effort — the working
     // tree may already be gone).
-    if let Ok(bay_dir) = bay_utils::read_bay_path(name) {
+    if let Some(bay_dir) = bay_dir {
         let _ = std::fs::remove_file(bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT));
     }
 

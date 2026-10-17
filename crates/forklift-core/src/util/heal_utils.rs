@@ -776,13 +776,7 @@ mod tests {
     fn plant_taint(forklift_root: &Path, paths: &[&str]) {
         let taint_dir = forklift_root.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        let mut content = String::new();
-        for path in paths {
-            content.push_str(path);
-            content.push('\n');
-        }
-        content.push_str("END\n");
-        std::fs::write(taint_dir.join("taint-99999-0"), content).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), taint_utils::taint_file_bytes(paths)).unwrap();
     }
 
     fn write_loose_object(forklift_root: &Path, content: &[u8]) -> (String, PathBuf) {
@@ -982,7 +976,7 @@ mod tests {
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
         // No terminator: torn by construction (see `taint_utils`'s own format tests).
-        std::fs::write(taint_dir.join("taint-1-0"), b"objects/ab/cdef\n").unwrap();
+        std::fs::write(taint_dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
 
         let error = heal_if_tainted().unwrap_err();
         assert_durability_taint(&error, &["record is itself incomplete"]);

@@ -48,15 +48,18 @@
 //! up deleting a freshly re-recorded `taint-P-0` that has nothing to do with the one it read (the
 //! ABA hole a naive "restart the counter at 0 every call" scheme leaves open).
 //!
-//! Content is the batch's final object paths, root-relative, one per line, followed by a
-//! terminator line (see [`TAINT_TERMINATOR`]). Each path's components are joined with `/` on
+//! Content is a header line (see [`TAINT_RECORD`]), then the batch's final object paths,
+//! root-relative, one per line, followed by a terminator line (see [`TAINT_TERMINATOR`]). A path
+//! is escaped as a [`record_utils`] entry is, since an inventory shard's folder is named after a
+//! working directory, whose name may hold a line break. Each path's components are joined with `/` on
 //! every OS (see [`taint_record_line`]) — never the platform-native separator a bare
 //! `Path::to_string_lossy()` would produce (`\` on Windows) — because a taint file written on one
 //! platform must still parse into the exact same recorded paths on whatever platform later reads
 //! it back (DESIGN.html §3.1.1); a record keyed by native separator could not make that promise.
-//! A file whose bytes end with that exact terminator
-//! line is complete; anything else — truncated by a crash mid-write, or simply absent — is
-//! **torn**: its parseable (fully newline-terminated) prefix still contributes recorded paths,
+//! A file whose bytes open with the header and end with that exact terminator
+//! line is complete; anything else — truncated by a crash mid-write, written without the header
+//! by an older Forklift, or simply absent — is **torn**: the parseable (fully newline-terminated,
+//! correctly escaped) lines of a headed file still contribute recorded paths,
 //! since a real write only ever appends, but the file can no longer prove it named every path the
 //! failing batch touched. [`read_taints`] unions every file under the directory and reports `torn`
 //! if any one of them is.
@@ -76,7 +79,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use crate::globals::forklift_root;
-use crate::util::file_utils;
+use crate::util::{file_utils, record_utils};
 
 /// The folder under a storage root that holds taint files.
 const TAINT_DIR_NAME: &str = "taint";
@@ -85,6 +88,30 @@ const TAINT_DIR_NAME: &str = "taint";
 /// including the newline that follows it) is what distinguishes a fully-written taint file from
 /// one truncated by a crash mid-write — see the module doc comment's format section.
 const TAINT_TERMINATOR: &str = "END";
+
+/// The [`record_utils`] kind and version of a taint file's header line. A file without it is
+/// torn, never read as raw unescaped paths.
+const TAINT_RECORD: &str = "taint";
+const TAINT_VERSION: u32 = 1;
+
+/// The bytes of a complete taint file recording `paths` (root-relative, `/`-joined): the
+/// header, one escaped path per line, the terminator.
+pub fn taint_file_bytes<I, S>(paths: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut content = record_utils::header(TAINT_RECORD, TAINT_VERSION);
+    content.push('\n');
+    for path in paths {
+        content.push_str(&record_utils::escape(path.as_ref()));
+        content.push('\n');
+    }
+    content.push_str(TAINT_TERMINATOR);
+    content.push('\n');
+
+    content.into_bytes()
+}
 
 /// An arbitrary bound on how many same-process, same-`pid` taint files [`record_taint`] will
 /// probe for before giving up. Thousands of live taint files under one root means something else
@@ -246,15 +273,9 @@ fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(
 
     let (mut handle, candidate) = create_taint_file(&taint_dir)?;
 
-    let mut content = String::new();
-    for path in relative_paths {
-        content.push_str(&taint_record_line(path));
-        content.push('\n');
-    }
-    content.push_str(TAINT_TERMINATOR);
-    content.push('\n');
+    let content = taint_file_bytes(relative_paths.iter().map(|path| taint_record_line(path)));
 
-    if let Err(e) = handle.write_all(content.as_bytes()) {
+    if let Err(e) = handle.write_all(&content) {
         let _ = std::fs::remove_file(&candidate);
         return Err(format!("Error while writing taint file \"{}\": {}", candidate.to_string_lossy(), e));
     }
@@ -626,27 +647,38 @@ fn parse_taint_content(bytes: &[u8]) -> (BTreeSet<PathBuf>, bool) {
         return (BTreeSet::new(), true);
     };
 
+    // Without the header the lines may be raw, unescaped paths an older Forklift wrote, which
+    // would read back as different paths: nothing is trusted, and the file is torn.
+    let header_line = format!("{}\n", record_utils::header(TAINT_RECORD, TAINT_VERSION));
+    let Some(text) = text.strip_prefix(&header_line) else {
+        return (BTreeSet::new(), true);
+    };
+
     let terminator_line = format!("{}\n", TAINT_TERMINATOR);
+    let complete_body = text.strip_suffix(&terminator_line);
+    let mut torn = complete_body.is_none();
 
-    if let Some(body) = text.strip_suffix(&terminator_line) {
-        let recorded = body.lines().filter(|line| !line.is_empty()).map(PathBuf::from).collect();
-        return (recorded, false);
-    }
-
-    // No terminator as the file's exact suffix: torn. Only fully newline-terminated lines are
-    // trusted as recorded paths — a trailing fragment with no closing `\n` is exactly the debris
-    // a crash mid-write-of-a-line would leave, and is dropped rather than parsed as a path.
-    let mut recorded = BTreeSet::new();
-    let mut rest = text;
-    while let Some(newline_at) = rest.find('\n') {
-        let line = &rest[..newline_at];
-        if !line.is_empty() && line != TAINT_TERMINATOR {
-            recorded.insert(PathBuf::from(line));
+    // A torn file's lines are trusted only up to the last full line — a trailing fragment with
+    // no closing `\n` is exactly the debris a crash mid-write-of-a-line would leave, and is
+    // dropped rather than parsed as a path. A line that does not unescape cannot be trusted
+    // either, and makes the file torn.
+    let lines: Vec<&str> = match complete_body {
+        Some(body) => body.split_terminator('\n').collect(),
+        None => {
+            let full = text.rfind('\n').map_or("", |last| &text[..=last]);
+            full.split_terminator('\n').filter(|line| *line != TAINT_TERMINATOR).collect()
         }
-        rest = &rest[newline_at + 1..];
+    };
+
+    let mut recorded = BTreeSet::new();
+    for line in lines.into_iter().filter(|line| !line.is_empty()) {
+        match record_utils::unescape(line) {
+            Some(path) => { recorded.insert(PathBuf::from(path)); }
+            None => torn = true,
+        }
     }
 
-    (recorded, true)
+    (recorded, torn)
 }
 
 /// Delete every path in `files`, tolerating each one already being gone (`NotFound` — a sibling
@@ -964,8 +996,8 @@ mod tests {
         let counter: u64 = counter_str.parse().expect("counter suffix must be numeric");
 
         let survivor_path = taint_dir.join(format!("{}-{}", prefix, counter + 1));
-        let survivor_content = "objects/aa/survivor\nEND\n";
-        std::fs::write(&survivor_path, survivor_content).unwrap();
+        let survivor_content = String::from_utf8(taint_file_bytes(["objects/aa/survivor"])).unwrap();
+        std::fs::write(&survivor_path, &survivor_content).unwrap();
 
         let second_object = forklift.join("objects").join("22").join("33445566");
         record_taint(&[second_object.as_path()]).unwrap();
@@ -1026,12 +1058,53 @@ mod tests {
         let forklift = root.join(".forklift");
         let taint_dir = forklift.join(TAINT_DIR_NAME);
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\nobjects/c").unwrap();
 
         let state = read_taints(&forklift).unwrap();
         assert!(state.torn, "a taint file without its terminator must read as torn");
-        assert!(state.recorded.contains(&PathBuf::from("objects/ab/cdef")),
+        assert_eq!(state.recorded, BTreeSet::from([PathBuf::from("objects/ab/cdef")]),
             "the parseable prefix must still be recorded even though the file is torn");
+    }
+
+    #[test]
+    fn a_taint_path_holding_a_line_break_reads_back_as_one_path() {
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("line-break");
+        let forklift = root.join(".forklift");
+        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        let paths = ["inventory/inv_/inv_a\nb/data", "inventory/inv_/inv_c\r/data", "objects/ab/cd\\n"];
+        std::fs::write(taint_dir.join("taint-99999-0"), taint_file_bytes(paths)).unwrap();
+
+        let state = read_taints(&forklift).unwrap();
+        assert!(!state.torn);
+        assert_eq!(state.recorded, paths.iter().map(PathBuf::from).collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    fn a_taint_file_without_its_header_or_with_a_bad_escape_is_torn_and_trusts_nothing_unreadable() {
+        let _serial = lock_activation();
+        activate();
+
+        let root = scratch("headerless");
+        let forklift = root.join(".forklift");
+        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        std::fs::create_dir_all(&taint_dir).unwrap();
+
+        // An older, unescaped file: torn, and none of its lines read as paths — this raw path,
+        // holding a literal backslash before "n", would otherwise unescape into a different one.
+        std::fs::write(taint_dir.join("taint-99999-0"), b"inventory/inv_/inv_a\\nb/data\nEND\n").unwrap();
+        let state = read_taints(&forklift).unwrap();
+        assert!(state.torn, "a headerless taint file must read as torn");
+        assert!(state.recorded.is_empty(), "{:?}", state.recorded);
+
+        // A line no writer produces makes a complete-looking file torn.
+        std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab\\x\nobjects/cd\nEND\n").unwrap();
+        let state = read_taints(&forklift).unwrap();
+        assert!(state.torn, "a badly escaped line must make the file torn");
+        assert_eq!(state.recorded, BTreeSet::from([PathBuf::from("objects/cd")]));
     }
 
     #[test]

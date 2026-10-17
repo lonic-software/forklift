@@ -13,7 +13,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils};
+use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 
@@ -1965,9 +1965,8 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
 
     batch.finish()?;
 
-    let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none()?;
-
-    write_metadata_to_file(&metadata_path, &metadata)?;
+    // The old metadata is replaced, not read, so a damaged one cannot block the reset.
+    write_metadata_to_file(&file_utils::get_inventory_metadata_path(), &metadata)?;
 
     load_guard_utils::clear_all_recorded();
 
@@ -2252,16 +2251,14 @@ fn update_inventory_metadata(keys_to_add: &BTreeSet<String>,
 fn write_metadata_to_file(path: &Path, metadata: &BTreeSet<String>) -> Result<(), String> {
     let closed = close_under_ancestors(metadata);
 
-    let mut metadata_bytes: Vec<u8> = Vec::new();
+    let metadata_bytes = record_utils::to_bytes(
+        file_utils::INVENTORY_METADATA_RECORD, file_utils::INVENTORY_METADATA_VERSION, &closed
+    );
 
-    for inv_path in &closed {
-        metadata_bytes.extend(inv_path.as_bytes());
-        object_utils::push_new_line(&mut metadata_bytes);
-    }
-
-    std::fs::write(path, metadata_bytes).map_err(|e|
-        format!("Error while writing inventory metadata to file \"{}\": {}", path.to_string_lossy(), e)
-    )
+    // Replaced atomically, so a crash mid-write leaves the old metadata and never a torn file
+    // the reader refuses. Not `write_file_atomically`, which only stages a write inside a bulk
+    // store session, where a later read in the same command would still see the old metadata.
+    file_utils::replace_file_atomically(path, &metadata_bytes)
 }
 
 /// Close a set of metadata entries under ancestors: add the entry of every ancestor of every
@@ -3164,5 +3161,47 @@ mod tests {
         let metadata_after = metadata_opt.unwrap();
         assert!(metadata_after.contains(&key_to_metadata_entry("")),
             "the newly discovered root directory must still be registered: {:?}", metadata_after);
+    }
+
+    #[test]
+    fn a_metadata_entry_holding_a_line_break_reads_back_as_one_entry() {
+        let _scratch = Scratch::new("metadata-line-break");
+
+        let path = file_utils::get_inventory_metadata_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let metadata: BTreeSet<String> = ["src/a\nb".to_string(), "c\rd".to_string()].into();
+        write_metadata_to_file(&path, &metadata).unwrap();
+
+        let (_, read) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        let expected: BTreeSet<String> =
+            [key_to_metadata_entry(""), "src".to_string(), "src/a\nb".to_string(), "c\rd".to_string()].into();
+        assert_eq!(read.unwrap(), expected);
+    }
+
+    #[test]
+    fn a_metadata_file_without_its_format_header_is_refused() {
+        let _scratch = Scratch::new("metadata-headerless");
+
+        let path = file_utils::get_inventory_metadata_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"./\nsrc\n").unwrap();
+
+        let error = file_utils::retrieve_inventory_metadata_or_none().unwrap_err();
+        assert!(error.contains("has no format header"), "{}", error);
+    }
+
+    #[test]
+    fn replacing_every_inventory_overwrites_a_damaged_metadata_file_without_reading_it() {
+        let _scratch = Scratch::new("metadata-damaged-reset");
+
+        let path = file_utils::get_inventory_metadata_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a metadata record").unwrap();
+
+        replace_all_inventories(&std::collections::BTreeMap::new())
+            .expect("a wholesale reset must not depend on the metadata it replaces");
+
+        let (_, read) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        assert_eq!(read.unwrap(), BTreeSet::new());
     }
 }
