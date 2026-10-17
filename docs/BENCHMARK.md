@@ -7,15 +7,16 @@ number by hand and add your own.
 
 > **Read this first — the honest framing.** Git is a 20-year-old C codebase tuned
 > against the exact repos below; Forklift is **v0.3.x**. On git.git against a native
-> arm64 git (2026-10-17, hyperfine), `log` is level with git (1.01x) and `status` is
-> 1.4x slower; `diff` is ~2.2–2.4x slower; `commit` is 3.3x slower than git's
-> defaults but 1.55x against a git that syncs as durably as forklift does (§3).
+> arm64 git (2026-10-18, hyperfine), `status` is faster than git (0.88x) and `log` is
+> level with it (0.99x); `diff` is ~1.2–1.3x slower (2.2–2.4x before FORK-183); `commit`
+> is 3.1x slower than git's defaults but 1.47x against a git that syncs as durably as
+> forklift does (§3).
 > On-disk size ends up smaller after the one-shot redelta pass; see §2. The slower
 > rows are tracked as optimization targets in
 > [`PERFORMANCE_BACKLOG.md`](PERFORMANCE_BACKLOG.md). Earlier versions of this page
 > reported `status` and `log` *faster* than git (0.64x / 0.84x); those came from a
 > harness with no warm-up run and a shell timer, and this re-run does not reproduce
-> them. The point of
+> them; the 0.88x here comes from the FORK-183 fixes, recorded in the backlog. The point of
 > benchmarking here is not to "beat git" — it
 > is to (a) see where Forklift is already in the same ballpark or ahead, (b) find the
 > operations that are *unexpectedly* slow so they become optimization targets, and
@@ -117,7 +118,7 @@ faster), and a per-row note. Example shape:
 
 ```
   Repo:      git — 82513 commits, 4857 tracked files
-  On-disk:   git .git = 334M   forklift .forklift = 444M as imported, 239M after redelta  (forklift 1.4x smaller)
+  On-disk:   git .git = 334M   forklift .forklift = 445M as imported, 240M after redelta  (forklift 1.4x smaller)
   Tools:     git version 2.55.0 · Forklift version 0.3.1
   Method:    hyperfine 2.0.0; read-only ops = mean of 20 runs after one warm-up run, commit = mean of 10; warm cache.
              A ratio below 1.00 means forklift is faster.
@@ -125,26 +126,26 @@ faster), and a per-row note. Example shape:
 
   Operation                  git        forklift   forklift/git   Notes
   -------------------------  ---------  ---------  -------------  ----------------------------------
-  status (clean tree)        15 ms      21 ms      1.40x          git status vs forklift stocktake --summary
-  log (whole history)        558 ms     565 ms     1.01x          82513 commits walked
-  commit (1 file)            18 ms      59 ms      3.28x          git commit vs forklift stack, staging untimed
-  commit, git fsync=all      38 ms      59 ms      1.55x          same, git with core.fsync=all core.fsyncMethod=fsync
-  diff, unstaged (20 files)  12 ms      29 ms      2.42x          git diff vs forklift diff
-  diff, staged (20 files)    9 ms       20 ms      2.22x          git diff --staged vs forklift diff --staged
+  status (clean tree)        16 ms      14 ms      0.88x          git status vs forklift stocktake --summary
+  log (whole history)        560 ms     556 ms     0.99x          82513 commits walked
+  commit (1 file)            18 ms      56 ms      3.11x          git commit vs forklift stack, staging untimed
+  commit, git fsync=all      38 ms      56 ms      1.47x          same, git with core.fsync=all core.fsyncMethod=fsync
+  diff, unstaged (20 files)  13 ms      16 ms      1.23x          git diff vs forklift diff
+  diff, staged (20 files)    9 ms       12 ms      1.33x          git diff --staged vs forklift diff --staged
 
   Onboarding — measured separately; NOT a ratio (different operations):
-    git clone --local     379 ms     (copies an existing packfile)
-    forklift import-git   60.99 s    (re-encodes every commit/tree/blob straight into packs; store lands at 444M)
+    git clone --local     420 ms     (copies an existing packfile)
+    forklift import-git   60.43 s    (re-encodes every commit/tree/blob straight into packs; store lands at 445M)
     Packed the imported store: 409297 object(s) into 5 pack(s), 315500 delta-compressed.
-    compact --all --redelta  181.05 s (one-shot densify: 444M -> 239M)
+    compact --all --redelta  179.16 s (one-shot densify: 445M -> 240M)
 ```
 
 **Two sizes, one store.** `import-git` writes straight into native packs as it imports
 (delta-compressing successive file/tree versions on the way in), but its per-path delta
 chains don't see the cross-path similarity (renames, moved files) that a global repack
 ordering does — on git.git the as-imported store lands **~1.3x larger** than git's own
-pack (444M vs 334M). The one-shot `compact --all --redelta` densify pass closes that
-and more: **239M, ~1.4x smaller than git**, for ~181 s of one-time CPU on this corpus.
+pack (445M vs 334M). The one-shot `compact --all --redelta` densify pass closes that
+and more: **240M, ~1.4x smaller than git**, for ~179 s of one-time CPU on this corpus.
 The harness reports both sizes and times the comparison rows on the densified store;
 redelta itself did not measurably change the timing rows. On
 repos whose `.git` carries unreachable refs or stale
