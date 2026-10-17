@@ -364,11 +364,12 @@ fn a_merge_adding_a_second_spelling_beside_a_staying_entry_is_refused() {
     let file = warehouse.run(&["consolidate", "file"]);
 
     if warehouse.folds_case() {
-        assert_refused_with(&file, ALIAS_REFUSAL, &["README", "readme"]);
+        // The staying tracked entry is named as the occupant, the new path after it.
+        assert_refused_with(&file, ALIAS_REFUSAL, &["README and readme"]);
         assert_eq!(warehouse.read("README"), "ours\n");
 
         let dir = warehouse.run(&["consolidate", "dir"]);
-        assert_refused_with(&dir, ALIAS_REFUSAL, &["Docs", "docs/c"]);
+        assert_refused_with(&dir, ALIAS_REFUSAL, &["Docs and docs/c"]);
         assert_eq!(listed(&warehouse.root.join("Docs")), BTreeSet::from(["a".to_string()]));
     } else {
         assert!(file.status.success(), "{}", stderr(&file));
