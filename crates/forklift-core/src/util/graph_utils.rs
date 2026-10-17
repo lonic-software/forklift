@@ -1044,11 +1044,31 @@ mod tests {
 
     #[test]
     fn a_checksummed_shard_with_a_record_running_past_its_body_reads_as_empty() {
-        // A correctly sealed shard whose last record is cut short: the earlier, complete record
-        // must not be kept either — a partly readable shard is not a source of records.
-        let bytes = sample_shard();
-        let body = &bytes[..bytes.len() - CHECKSUM_LEN];
-        assert!(parse_shard(&sealed(&body[..body.len() - 3])).is_empty());
+        // A correctly sealed shard whose last record is cut short, at each of its three bounds
+        // checks: the earlier, complete record must not be kept either — a partly readable shard
+        // is not a source of records. Records are serialized in map order, so the complete one
+        // is appended by hand to keep which record is cut deterministic.
+        let mut whole = HashMap::new();
+        whole.insert("aa".repeat(32), Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
+        let mut cut = HashMap::new();
+        cut.insert("ab".repeat(32), Record {
+            generation: 2,
+            parents: vec!["aa".repeat(32)],
+            filter: PathFilter::Bloom(vec![9; 16]),
+        });
+        let whole_bytes = serialize_shard(&whole);
+        let cut_bytes = serialize_shard(&cut);
+        let mut body = whole_bytes[..whole_bytes.len() - CHECKSUM_LEN].to_vec();
+        let cut_record = &cut_bytes[HEADER_LEN..cut_bytes.len() - CHECKSUM_LEN];
+
+        // Inside the Bloom filter, inside the parent list, and inside the fixed hash/generation head.
+        for keep in [cut_record.len() - 3, HASH_LEN + 4 + 1 + 10, HASH_LEN - 1] {
+            let mut damaged = body.clone();
+            damaged.extend_from_slice(&cut_record[..keep]);
+            assert!(parse_shard(&sealed(&damaged)).is_empty(), "a record cut to {} bytes", keep);
+        }
+        body.extend_from_slice(cut_record);
+        assert_eq!(parse_shard(&sealed(&body)).len(), 2, "sanity: the uncut pair parses whole");
     }
 
     #[test]
