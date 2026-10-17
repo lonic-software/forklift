@@ -2655,8 +2655,8 @@ impl IgnoreFileRule {
 ///   that makes the rule display as another, a byte order mark past the start of the file. A
 ///   pattern that needs one writes its escape. Only the format characters of real names are
 ///   accepted, and only where a name holds them: a joiner (U+200C, U+200D) between two visible
-///   characters, as in an emoji sequence or Persian script, and the tag run that spells a flag
-///   emoji, right after the black flag and closed by its cancel tag;
+///   non-ASCII characters, as in an emoji sequence or Persian script, and the tag run that
+///   spells a flag emoji, right after the black flag and closed by its cancel tag;
 /// * a pattern with whitespace at its start or end. It would be part of the regex, so `^build$ `
 ///   never matches `build`. Trimming it instead would guess: a space the pattern needs is
 ///   written `\x20`;
@@ -2725,29 +2725,30 @@ fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
 }
 
 /// The first control or format character in the line that no real name holds there, if any.
-/// A joiner is accepted between two visible characters, and the tags of a flag emoji as one run
-/// right after the black flag (U+1F3F4) and closed by the cancel tag (U+E007F); anywhere else
-/// they are invisible text, as every other control and format character is.
+/// A joiner is accepted between two visible non-ASCII characters, as an emoji sequence or a
+/// Persian or Indic name holds it, and the tags of a flag emoji as one run right after the black
+/// flag (U+1F3F4) and closed by the cancel tag (U+E007F). Anywhere else they are invisible text,
+/// as every other control and format character is: next to ASCII or regex syntax, `^build\u{200D}$`
+/// displays as `^build$` and never matches.
 fn refused_format_character(line: &str, invisible: &Regex) -> Option<char> {
     const BLACK_FLAG: char = '\u{1F3F4}';
     const CANCEL_TAG: char = '\u{E007F}';
-    let chars: Vec<(usize, char)> = line.char_indices().collect();
-    let starts: std::collections::HashSet<usize> = invisible.find_iter(line).map(|found| found.start()).collect();
-    let visible = |i: usize| chars.get(i).is_some_and(|&(at, c)| !starts.contains(&at) && !c.is_whitespace());
+    let hidden = |c: char| invisible.is_match(c.encode_utf8(&mut [0; 4]));
+    let chars: Vec<char> = line.chars().collect();
+    let name_character = |i: usize| chars.get(i).is_some_and(|&c| !c.is_ascii() && !c.is_whitespace() && !hidden(c));
 
     let mut i = 0;
     while i < chars.len() {
-        let c = chars[i].1;
+        let c = chars[i];
         if c == BLACK_FLAG {
-            let run = chars[i + 1..].iter().take_while(|&&(_, t)| ('\u{E0020}'..=CANCEL_TAG).contains(&t)).count();
-            let tags = &chars[i + 1..i + 1 + run];
-            if run >= 2 && tags.iter().position(|&(_, t)| t == CANCEL_TAG) == Some(run - 1) {
+            let run = chars[i + 1..].iter().take_while(|&&t| ('\u{E0020}'..=CANCEL_TAG).contains(&t)).count();
+            if run >= 2 && chars[i + 1..i + 1 + run].iter().position(|&t| t == CANCEL_TAG) == Some(run - 1) {
                 i += 1 + run;
                 continue;
             }
         }
         let joiner = matches!(c, '\u{200C}' | '\u{200D}');
-        if starts.contains(&chars[i].0) && !(joiner && i > 0 && visible(i - 1) && visible(i + 1)) {
+        if hidden(c) && !(joiner && i > 0 && name_character(i - 1) && name_character(i + 1)) {
             return Some(c);
         }
         i += 1;
@@ -2978,7 +2979,8 @@ mod tests {
         for (content, c) in [
             ("^build$\u{E0062}\u{E0075}\u{E007F}\n", "U+E0062"), ("^build\u{1F3F4}\u{E0062}$\n", "U+E0062"),
             ("^\u{1F3F4}\u{E0067}\u{E007F}\u{E0062}$\n", "U+E0067"), ("^build$\u{200D}\n", "U+200D"),
-            ("\u{200C}^build$\n", "U+200C"), ("^a\u{200D}\u{200D}b$\n", "U+200D"), ("^co\u{AD}op$\n", "U+00AD"),
+            ("\u{200C}^build$\n", "U+200C"), ("^a\u{200D}\u{200D}b$\n", "U+200D"), ("^build\u{200D}$\n", "U+200D"),
+            ("^\u{200C}build$\n", "U+200C"), ("^src/\u{200D}gen$\n", "U+200D"), ("^a\u{200D}b$\n", "U+200D"), ("^co\u{AD}op$\n", "U+00AD"),
         ] {
             let error = parse_ignore_file(content).unwrap_err();
             assert!(error.contains(&format!("invisible or control character ({})", c)), "{:?}: {}", content, error);

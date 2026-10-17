@@ -1069,12 +1069,13 @@ impl CommandOutput for ImportReport {
         }
 
         // A warning may run over several lines (a refused ignore file's reason does); each one
-        // after the first stays inside the warning, indented under its text.
+        // after the first stays inside the warning, indented under its text. A warning can name
+        // an entry of the imported repository, so each line is sanitized.
         for warning in &self.warnings {
             let mut lines = warning.lines();
-            println!("  warning: {}", lines.next().unwrap_or_default());
+            println!("  warning: {}", sanitize(lines.next().unwrap_or_default()));
             for line in lines {
-                println!("           {}", line);
+                println!("           {}", sanitize(line));
             }
         }
 

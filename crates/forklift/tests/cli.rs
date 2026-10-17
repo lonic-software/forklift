@@ -3158,6 +3158,40 @@ fn import_git_from_elsewhere_writes_no_ignore_file() {
 }
 
 #[test]
+fn import_git_warnings_are_sanitized_for_the_terminal() {
+    // A warning can name an entry of the imported repository, whose name is anyone's to choose:
+    // a submodule named with an escape sequence must not reach the terminal as one.
+    let source = TestWarehouse::new("import-git-warning-source");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&source.root)
+            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    source.write_file("a.txt", "hello\n");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-qm", "first commit"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    git(&["update-index", "--add", "--cacheinfo", &format!("160000,{},sub\u{1b}]0;pwned\u{7}", head)]);
+    git(&["commit", "-qm", "add a submodule"]);
+
+    let warehouse = TestWarehouse::new("import-git-warning-target");
+    warehouse.write_file("a.txt", "hello\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    let imported = warehouse.run(&["import-git", source.root.to_str().unwrap()]);
+    assert_success(&imported);
+    assert!(stdout(&imported).contains("  warning: skipped submodule \"sub ]0;pwned \""), "{:?}", stdout(&imported));
+    assert!(!stdout(&imported).contains('\u{1b}') && !stdout(&imported).contains('\u{7}'), "{:?}", stdout(&imported));
+}
+
+#[test]
 fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alone() {
     let source = TestWarehouse::new("import-git-rule-source");
     let git = |args: &[&str]| {
