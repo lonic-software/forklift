@@ -375,6 +375,11 @@ fn a_merge_adding_a_second_spelling_beside_a_staying_entry_is_refused() {
         assert!(file.status.success(), "{}", stderr(&file));
         assert_eq!(warehouse.read("README"), "ours\n");
         assert_eq!(warehouse.read("readme"), "theirs\n");
+
+        let dir = warehouse.run(&["consolidate", "dir"]);
+        assert!(dir.status.success(), "{}", stderr(&dir));
+        assert_eq!(warehouse.read("Docs/a"), "a\n");
+        assert_eq!(warehouse.read("docs/c"), "theirs\n");
     }
 }
 

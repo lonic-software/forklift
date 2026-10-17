@@ -305,18 +305,34 @@ pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec
 /// * `Ok(())`      - If every operation applied.
 /// * `Err(String)` - If a file system operation failed.
 pub fn apply_ops(ops: &[FileOp], removed_dirs: &[String]) -> Result<(), String> {
-    for op in ops {
-        if matches!(op, FileOp::Remove { .. }) {
-            apply_file_op(op)?;
-        }
+    apply_ops_each(ops, removed_dirs, |_| Ok(()))
+}
+
+/// [`apply_ops`], calling `after` with each operation once it has applied (for progress, or to
+/// stage it). The one place the removals-first order lives: every materializer applies through
+/// here.
+///
+/// # Arguments
+/// * `ops`          - The file operations to apply.
+/// * `removed_dirs` - The directories a diff found source-only (deepest first).
+/// * `after`        - Called after each operation applies; an error stops the run.
+///
+/// # Returns
+/// * `Ok(())`      - If every operation applied.
+/// * `Err(String)` - If a file system operation, or `after`, failed.
+pub fn apply_ops_each(ops: &[FileOp],
+                      removed_dirs: &[String],
+                      mut after: impl FnMut(&FileOp) -> Result<(), String>) -> Result<(), String> {
+    for op in ops.iter().filter(|op| matches!(op, FileOp::Remove { .. })) {
+        apply_file_op(op)?;
+        after(op)?;
     }
 
     remove_empty_directories(removed_dirs);
 
-    for op in ops {
-        if matches!(op, FileOp::Write { .. }) {
-            apply_file_op(op)?;
-        }
+    for op in ops.iter().filter(|op| matches!(op, FileOp::Write { .. })) {
+        apply_file_op(op)?;
+        after(op)?;
     }
 
     Ok(())
@@ -933,23 +949,13 @@ pub fn materialize_tree(from_tree: Option<&str>,
     // In `apply_ops`'s order — every removal, then the emptied directories, then every write —
     // never the diff's own (writes first, per directory): across a case-only rename the write
     // would land on the old name through the alias and the removal after it would delete it.
-    let removals = ops.iter().filter(|op| matches!(op, FileOp::Remove { .. }));
-    let writes = ops.iter().filter(|op| matches!(op, FileOp::Write { .. }));
     let mut done = 0;
 
-    for op in removals {
-        apply_file_op(op)?;
+    apply_ops_each(&ops, &removed_dirs, |op| {
         done += 1;
         progress.fraction(done, ops.len(), || op_path(op).to_string());
-    }
-
-    remove_empty_directories(&removed_dirs);
-
-    for op in writes {
-        apply_file_op(op)?;
-        done += 1;
-        progress.fraction(done, ops.len(), || op_path(op).to_string());
-    }
+        Ok(())
+    })?;
 
     progress.status("Rebuilding the inventory");
 

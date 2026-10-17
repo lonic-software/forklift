@@ -276,21 +276,10 @@ pub fn pop_parked() -> Result<(), String> {
         ));
     }
 
-    // Every removal (and the directories it empties) before every write, as in `apply_ops`:
-    // across a case-only rename the write would otherwise land on the old name through the
-    // alias, and the removal after it would delete it.
-    let removals = ops.iter().filter(|op| matches!(op, FileOp::Remove { .. }));
-    let writes = ops.iter().filter(|op| matches!(op, FileOp::Write { .. }));
-    let mut emptied = false;
-
-    for op in removals.chain(writes) {
-        if !emptied && matches!(op, FileOp::Write { .. }) {
-            shift_utils::remove_empty_directories(&removed_dirs);
-            emptied = true;
-        }
-
-        shift_utils::apply_file_op(op)?;
-
+    // Every removal (and the directories it empties) before every write: across a case-only
+    // rename the write would otherwise land on the old name through the alias, and the removal
+    // after it would delete it.
+    shift_utils::apply_ops_each(&ops, &removed_dirs, |op| {
         match op {
             FileOp::Write { path, hash, item_type, .. } => {
                 inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)?;
@@ -307,11 +296,9 @@ pub fn pop_parked() -> Result<(), String> {
                 })?;
             }
         }
-    }
 
-    if !emptied {
-        shift_utils::remove_empty_directories(&removed_dirs);
-    }
+        Ok(())
+    })?;
 
     parked.pop();
     park_utils::write_parked(&parked)?;

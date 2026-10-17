@@ -6,7 +6,9 @@
 //! are free to hold such pairs and nothing here consults a fixed folding table for a verdict.
 //! The volume is the oracle: a path is judged by what the file system resolves it to (by
 //! `lstat` identity), and a pair of names nothing on disk can judge yet is settled by a probe on
-//! the same volume. A case-fold key only proposes candidates; it never decides.
+//! the same volume. A case-fold key only proposes candidates; it never decides. It does no
+//! normalization, so two new names that alias only under normalization are not paired up front:
+//! the exclusive create of the second write is what refuses them.
 //!
 //! Every working-directory materializer runs its up-front collision check through
 //! [`AliasCheck`], so a case-only rename is a rename (not an "untracked" collision), and two
@@ -63,6 +65,12 @@ pub enum Occupancy {
         occupant: String,
         /// Whether the occupant is a directory.
         occupant_is_dir: bool,
+    },
+    /// A component short of the last resolves, under its own name, to something that is not a
+    /// directory (a file, or a symlink, which is never followed): that entry occupies the path.
+    NonDirectory {
+        /// The key of the entry on disk.
+        occupant: String,
     },
     /// A component resolves, its parent does not list it by name, and no listed entry has its
     /// identity: something occupies the path that cannot be named.
@@ -137,10 +145,14 @@ pub enum Verdict {
     Refuse(Collision),
 }
 
-/// One run's alias check. Directory listings are read once per directory and kept for the run.
+/// One run's alias check. Directory listings are read once per directory and kept for the run,
+/// and so is each aliased directory's verdict (whether it is tracked, and whether the run vacates
+/// it), so a renamed directory of many files is walked once. One check therefore serves one
+/// operation's set of removals.
 #[derive(Default)]
 pub struct AliasCheck {
     listings: HashMap<String, Option<BTreeSet<String>>>,
+    directories: HashMap<String, (bool, bool)>,
 }
 
 impl AliasCheck {
@@ -175,18 +187,16 @@ impl AliasCheck {
     /// * `Err(String)`   - If a component's metadata could not be read.
     pub fn occupancy(&mut self, path: &str) -> Result<Occupancy, String> {
         let mut parent = String::new();
+        let mut names = path.split('/').peekable();
 
-        for name in path.split('/') {
+        while let Some(name) = names.next() {
             let key = if parent.is_empty() { name.to_string() } else { format!("{}/{}", parent, name) };
 
-            match std::fs::symlink_metadata(&key) {
-                Ok(_) => {}
+            let is_dir = match std::fs::symlink_metadata(&key) {
+                Ok(metadata) => metadata.is_dir(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Occupancy::Vacant),
-                // A component that is a file where a directory is expected: what occupies the
-                // path is that file, which the caller's rules handle under its own name.
-                Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => return Ok(Occupancy::Listed),
                 Err(e) => return Err(format!("Error while getting metadata for path \"{}\": {}", key, e)),
-            }
+            };
 
             let listed = self.listing(&parent).is_some_and(|names| names.contains(name));
 
@@ -195,6 +205,13 @@ impl AliasCheck {
                     Some((occupant, occupant_is_dir)) => Occupancy::Alias { component: key, occupant, occupant_is_dir },
                     None => Occupancy::Unidentified { component: key },
                 });
+            }
+
+            // A file (or a symlink) where the path needs a directory occupies the whole path —
+            // a file-to-directory flip when the operation removes it. Stopping here keeps the
+            // walk from reading past it, which fails differently on each platform.
+            if !is_dir && names.peek().is_some() {
+                return Ok(Occupancy::NonDirectory { occupant: key });
             }
 
             parent = key;
@@ -237,7 +254,7 @@ impl AliasCheck {
             Occupancy::Vacant => Verdict::Proceed,
             Occupancy::Listed => Verdict::Exists,
             Occupancy::Unidentified { component } => Verdict::Refuse(Collision::Untracked(component)),
-            Occupancy::Alias { occupant, occupant_is_dir: false, .. } => {
+            Occupancy::Alias { occupant, occupant_is_dir: false, .. } | Occupancy::NonDirectory { occupant } => {
                 if removals.removes_file(&occupant) {
                     Verdict::Proceed
                 } else if tracked_file(&occupant)? {
@@ -247,9 +264,17 @@ impl AliasCheck {
                 }
             }
             Occupancy::Alias { occupant, occupant_is_dir: true, .. } => {
-                let tracked = inventory_utils::is_tracked_directory(&occupant)?;
+                let (tracked, vacated) = match self.directories.get(&occupant) {
+                    Some(&known) => known,
+                    None => {
+                        let tracked = inventory_utils::is_tracked_directory(&occupant)?;
+                        let known = (tracked, tracked && vacated(&occupant, removals)?);
+                        self.directories.insert(occupant.clone(), known);
+                        known
+                    }
+                };
 
-                if tracked && vacated(&occupant, removals)? {
+                if vacated {
                     Verdict::Proceed
                 } else if tracked {
                     Verdict::Refuse(Collision::Alias { path: path.to_string(), occupant })
@@ -296,7 +321,9 @@ impl AliasCheck {
 
                 for (index, first) in names.iter().enumerate() {
                     for second in &names[index + 1..] {
-                        if probe_aliases(parent, first, second) {
+                        let on_disk = |name: &str| std::fs::symlink_metadata(join(parent, name)).is_ok();
+
+                        if !on_disk(first) && !on_disk(second) && probe_aliases(parent, first, second) {
                             collisions.push(Collision::Alias {
                                 path: join(parent, second),
                                 occupant: join(parent, first),
@@ -350,7 +377,7 @@ fn probe_aliases(parent: &str, first: &str, second: &str) -> bool {
 }
 
 /// Whether the inventory holds a live file entry at `key`.
-fn tracked_file(key: &str) -> Result<bool, String> {
+pub fn tracked_file(key: &str) -> Result<bool, String> {
     let (parent, name) = key.rsplit_once('/').unwrap_or(("", key));
     let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(parent)?;
 

@@ -2,7 +2,6 @@ use serde::Serialize;
 use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::blob::Blob;
-use forklift_core::model::inventory::InventoryItem;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
@@ -404,7 +403,7 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
         let Some(path) = new_path else { continue };
 
         // A tracked file cannot collide (tracked paths were verified clean).
-        if inventory_lookup(path)?.is_some() {
+        if alias_utils::tracked_file(path)? {
             continue;
         }
 
@@ -453,25 +452,6 @@ impl alias_utils::Removals for MergeRemovals {
 /// from its recipe.
 fn conflict_writes(action: &MergeAction) -> bool {
     matches!(action, MergeAction::Conflict { content, item_type, .. } if content.is_some() || item_type.is_chunked())
-}
-
-/// Look up the inventory entry for a warehouse path (`None` when the file is untracked).
-fn inventory_lookup(path: &str) -> Result<Option<InventoryItem>, String> {
-    let (parent_key, name) = match path.rsplit_once('/') {
-        Some((parent, name)) => (parent, name),
-        None => ("", path),
-    };
-
-    let (_, bytes_opt) = forklift_core::util::file_utils::retrieve_inventory_or_none_by_key(parent_key)?;
-
-    let Some(bytes) = bytes_opt else {
-        return Ok(None);
-    };
-
-    let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
-        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", parent_key, e))?;
-
-    Ok(inventory.get_item_by_name(name).map(|item| (*item).clone()))
 }
 
 /// Apply every merge action to the working directory and the inventory, and return the
@@ -554,7 +534,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         MergeAction::Conflict { path, content, entry_hash, item_type } => {
             // A conflict on a path the inventory does not hold re-creates a file we deleted, so
             // it is new to the working directory, like `ensure_no_untracked_collisions` judged it.
-            let create = conflict_writes(action) && inventory_lookup(path)?.is_none();
+            let create = conflict_writes(action) && !alias_utils::tracked_file(path)?;
 
             if let Some(content) = content {
                 shift_utils::write_working_file(path, content, *item_type, create)?;
