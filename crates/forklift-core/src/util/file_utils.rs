@@ -2650,10 +2650,13 @@ impl IgnoreFileRule {
 ///   them, `||||||| base`, compiles to a pattern that matches every path, so the next `load .`
 ///   would stage the removal of the whole tree;
 /// * a pattern holding a control or an invisible format character (Unicode categories Cc and
-///   Cf, less the joiners, soft hyphen and emoji tags that real names hold): a tab, the carriage returns of a file with bare-CR line endings (which reads as one
-///   line whose rules never match), a zero-width space, a bidirectional override that makes the
-///   rule display as another, a byte order mark past the start of the file. A pattern that needs
-///   one writes its escape;
+///   Cf): a tab, the carriage returns of a file with bare-CR line endings (which reads as one
+///   line whose rules never match), a zero-width space, a soft hyphen, a bidirectional override
+///   that makes the rule display as another, a byte order mark past the start of the file. A
+///   pattern that needs one writes its escape. Only the format characters of real names are
+///   accepted, and only where a name holds them: a joiner (U+200C, U+200D) between two visible
+///   characters, as in an emoji sequence or Persian script, and the tag run that spells a flag
+///   emoji, right after the black flag and closed by its cancel tag;
 /// * a pattern with whitespace at its start or end. It would be part of the regex, so `^build$ `
 ///   never matches `build`. Trimming it instead would guess: a space the pattern needs is
 ///   written `\x20`;
@@ -2667,11 +2670,7 @@ impl IgnoreFileRule {
 /// * `Err(String)`             - The first refused line, by number.
 fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
     static INVISIBLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    // Less the format characters that real names hold: the joiners of emoji sequences and of
-    // Persian and Indic script, the soft hyphen, and the tags of flag emoji.
-    let invisible = INVISIBLE.get_or_init(|| {
-        Regex::new(r"[[\p{Cc}\p{Cf}]--[\x{AD}\x{200C}\x{200D}\x{E0020}-\x{E007F}]]").expect("a valid class")
-    });
+    let invisible = INVISIBLE.get_or_init(|| Regex::new(r"[\p{Cc}\p{Cf}]").expect("a valid class"));
 
     let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let mut rules = Vec::new();
@@ -2688,8 +2687,7 @@ fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
             ));
         }
 
-        if let Some(found) = invisible.find(line) {
-            let c = found.as_str().chars().next().expect("a match is one character");
+        if let Some(c) = refused_format_character(line, invisible) {
             let remedy = match c {
                 '\r' => "Save the file with newline line endings.".to_string(),
                 _ => format!("Remove it, or write it as {} if the pattern needs it.", escape_for(c)),
@@ -2724,6 +2722,37 @@ fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
     }
 
     Ok(rules)
+}
+
+/// The first control or format character in the line that no real name holds there, if any.
+/// A joiner is accepted between two visible characters, and the tags of a flag emoji as one run
+/// right after the black flag (U+1F3F4) and closed by the cancel tag (U+E007F); anywhere else
+/// they are invisible text, as every other control and format character is.
+fn refused_format_character(line: &str, invisible: &Regex) -> Option<char> {
+    const BLACK_FLAG: char = '\u{1F3F4}';
+    const CANCEL_TAG: char = '\u{E007F}';
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let starts: std::collections::HashSet<usize> = invisible.find_iter(line).map(|found| found.start()).collect();
+    let visible = |i: usize| chars.get(i).is_some_and(|&(at, c)| !starts.contains(&at) && !c.is_whitespace());
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i].1;
+        if c == BLACK_FLAG {
+            let run = chars[i + 1..].iter().take_while(|&&(_, t)| ('\u{E0020}'..=CANCEL_TAG).contains(&t)).count();
+            let tags = &chars[i + 1..i + 1 + run];
+            if run >= 2 && tags.iter().position(|&(_, t)| t == CANCEL_TAG) == Some(run - 1) {
+                i += 1 + run;
+                continue;
+            }
+        }
+        let joiner = matches!(c, '\u{200C}' | '\u{200D}');
+        if starts.contains(&chars[i].0) && !(joiner && i > 0 && visible(i - 1) && visible(i + 1)) {
+            return Some(c);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// A character as its Unicode code point, such as `U+00A0`: an invisible one stays nameable.
@@ -2937,12 +2966,22 @@ mod tests {
         assert_eq!(rules[0].pattern, "^build(/.*)?$");
         assert!(rules[0].matches("build"));
         assert!(parse_ignore_file("\u{FEFF}# note\n").unwrap().is_empty());
-        // The format characters real names hold are not refused: the joiners of an emoji
-        // sequence and of Persian script, the soft hyphen, the tags of a flag emoji.
+        // The format characters real names hold are not refused where a name holds them: the
+        // joiners of an emoji sequence and of Persian script, the tags of a flag emoji.
         for name in ["photos/\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg", "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
-                     "co\u{AD}op", "\u{1F3F4}\u{E0067}\u{E0062}\u{E007F}"] {
+                     "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}.png"] {
             let rules = parse_ignore_file(&format!("^{}$\n", regex::escape(name))).unwrap();
             assert!(rules[0].matches(name), "{:?}", name);
+        }
+        // Anywhere else they are invisible text that leaves the rule dead or disguised, as is a
+        // soft hyphen, which hyphenated copied text leaves behind.
+        for (content, c) in [
+            ("^build$\u{E0062}\u{E0075}\u{E007F}\n", "U+E0062"), ("^build\u{1F3F4}\u{E0062}$\n", "U+E0062"),
+            ("^\u{1F3F4}\u{E0067}\u{E007F}\u{E0062}$\n", "U+E0067"), ("^build$\u{200D}\n", "U+200D"),
+            ("\u{200C}^build$\n", "U+200C"), ("^a\u{200D}\u{200D}b$\n", "U+200D"), ("^co\u{AD}op$\n", "U+00AD"),
+        ] {
+            let error = parse_ignore_file(content).unwrap_err();
+            assert!(error.contains(&format!("invisible or control character ({})", c)), "{:?}: {}", content, error);
         }
 
         // Past the start of the file it is no encoding marker, and is refused.

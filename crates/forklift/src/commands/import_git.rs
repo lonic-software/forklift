@@ -1068,8 +1068,14 @@ impl CommandOutput for ImportReport {
             println!("Checked out \"{}\".", current);
         }
 
+        // A warning may run over several lines (a refused ignore file's reason does); each one
+        // after the first stays inside the warning, indented under its text.
         for warning in &self.warnings {
-            println!("  warning: {}", warning);
+            let mut lines = warning.lines();
+            println!("  warning: {}", lines.next().unwrap_or_default());
+            for line in lines {
+                println!("           {}", line);
+            }
         }
 
         if self.ignored_git {

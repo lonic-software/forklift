@@ -3213,7 +3213,8 @@ fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alon
     assert_success(&imported);
     assert!(stdout(&imported).contains(r"is refused, so it was left unchanged. Fix the problem below, then add the rule ^\.git(/.*)?$ if no rule covers"),
         "{}", stdout(&imported));
-    assert!(stdout(&imported).contains("\".forkliftignore\", line 1: the pattern \"  ^\\\\.git(/.*)?$\" starts or ends with whitespace (U+0020)"),
+    // The reason sits on its own line, indented inside the warning rather than at column 0.
+    assert!(stdout(&imported).contains("covers \".git\".\n           \".forkliftignore\", line 1: the pattern \"  ^\\\\.git(/.*)?$\" starts or ends with whitespace (U+0020)"),
         "{}", stdout(&imported));
     assert!(!stdout(&imported).contains("by hand"), "{}", stdout(&imported));
     assert!(!stdout(&imported).contains("Added \".git/\""), "{}", stdout(&imported));
