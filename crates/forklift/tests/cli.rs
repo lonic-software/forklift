@@ -2869,6 +2869,38 @@ fn import_git_tolerates_non_utf8_author_names() {
         "the author email must survive lossy name coercion");
 }
 
+#[cfg(unix)]
+#[test]
+fn import_git_refuses_a_top_level_alias_of_the_metadata_folder() {
+    // `.forklift.` is an ordinary directory to git here, but Windows opens `.forklift` for it, so
+    // imported history carrying it could never be checked out there.
+    let warehouse = TestWarehouse::new("import-git-metadata-alias");
+    let root = warehouse.root.clone();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+
+    git(&["init", "-q", "-b", "main"]);
+    warehouse.write_file("a.txt", "hello\n");
+    warehouse.write_file(".forklift./notes.txt", "notes\n");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "alias"]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let imported = warehouse.run(&["import-git", "."]);
+    assert!(!imported.status.success(), "import-git accepted the alias: {}", stdout(&imported));
+    assert!(stderr(&imported).contains("\".forklift.\""), "the refusal must name the entry: {}", stderr(&imported));
+}
+
 #[test]
 fn export_git_writes_the_history_into_a_git_repo() {
     let warehouse = TestWarehouse::new("export-git");
