@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::enums::object_type::ObjectType;
 use crate::model::object::loose_object::LooseObject;
 
 use crate::util::{
@@ -1339,6 +1340,10 @@ fn validate_index_records(index: &[u8], count: usize, data_len: usize, path: &Pa
 pub(crate) struct TransportImportStats {
     pub stored_objects: usize,
     pub skipped_objects: usize,
+
+    /// The parcels the packs carry (hex), whether stored or already present: the only hashes the
+    /// bundle's signature section may sign.
+    pub parcels: HashSet<String>,
 }
 
 /// A quarantined native pack/index pair extracted from a transport bundle. Both paths live in the
@@ -1416,7 +1421,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
             .map(|pair| load_pack_pair(&pair.data_path, &pair.index_path))
             .collect::<Result<_, _>>()?;
 
-        let hashes = verify_incoming_packs(&incoming)?;
+        let (hashes, parcels) = verify_incoming_packs(&incoming)?;
         let mut stored_objects = 0;
         let mut skipped_objects = 0;
         for hash in &hashes {
@@ -1432,7 +1437,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         drop(incoming);
 
         if stored_objects == 0 {
-            return Ok(TransportImportStats { stored_objects, skipped_objects });
+            return Ok(TransportImportStats { stored_objects, skipped_objects, parcels });
         }
 
         // All pack bytes and indexes are valid. Harden the small number of aggregate files, then
@@ -1504,7 +1509,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         // the same undensified shape `--redelta` exists to fix.
         mark_densify_pending(&folder);
 
-        Ok(TransportImportStats { stored_objects, skipped_objects })
+        Ok(TransportImportStats { stored_objects, skipped_objects, parcels })
     })();
 
     // Published paths were renamed away and return NotFound here; failed/unneeded staging files
@@ -1570,26 +1575,33 @@ fn pack_id_from_index(index: &[u8]) -> Result<String, String> {
 }
 
 /// Verify every object reachable through the incoming indexes before any pack is published.
-/// Returns the distinct object hashes for import statistics. Bookkeeping keeps hashes in their
+/// Returns the distinct object hashes for import statistics, and the parcels among them, read off
+/// each object's header as it is verified, at no extra decode. Bookkeeping keeps hashes in their
 /// raw 32-byte index form — hex `String`s would multiply the per-object cost several times over,
-/// and a large clone carries millions of objects. The cache is deliberately bounded: it
+/// and a large clone carries millions of objects; only the parcels, a small share of them, are
+/// kept in hex, the form the signature section names them in. The cache is deliberately bounded: it
 /// accelerates delta chains, but a hostile pack cannot make verification retain the whole
 /// decompressed store in RAM.
-fn verify_incoming_packs(packs: &[LoadedPack]) -> Result<Vec<[u8; HASH_LEN]>, String> {
+fn verify_incoming_packs(packs: &[LoadedPack])
+                         -> Result<(Vec<[u8; HASH_LEN]>, HashSet<String>), String> {
     let locator = IncomingLocator::build(packs)?;
 
     let mut hashes = Vec::with_capacity(locator.entries.len());
+    let mut parcels = HashSet::new();
     let mut cache = IncomingVerificationCache::default();
     let mut visiting = HashSet::new();
 
     for entry in &locator.entries {
         let mut hash = [0u8; HASH_LEN];
         hash.copy_from_slice(locator.hash_of(*entry));
-        resolve_incoming_object(&hash, &locator, &mut cache, &mut visiting, 0)?;
+        let bytes = resolve_incoming_object(&hash, &locator, &mut cache, &mut visiting, 0)?;
+        if matches!(object_utils::peek_object_header(&bytes), Ok((ObjectType::Parcel, _))) {
+            parcels.insert(sign_utils::to_hex(&hash));
+        }
         hashes.push(hash);
     }
 
-    Ok(hashes)
+    Ok((hashes, parcels))
 }
 
 /// A sorted locator over every record in the quarantined incoming set, so each of the

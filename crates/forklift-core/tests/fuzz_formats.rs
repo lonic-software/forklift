@@ -469,13 +469,12 @@ mod regressions {
         assert!(err.is_err(), "a huge field length must be an error, not a panic");
     }
 
-    /// A bundle can arrive from an untrusted remote (`franchise` downloads one), and its records
-    /// carry an 8-byte length prefix. A record that declares a `u64::MAX` length used to
+    /// A batch or subtree response arrives from an untrusted remote, and its records carry an
+    /// 8-byte length prefix. A record that declares a `u64::MAX` length used to
     /// `vec![0u8; length]` before reading — a one-record denial of service (capacity-overflow
-    /// panic / allocator abort). Import now reads the record as a bounded stream and reports the
-    /// short stream as truncation. This is the most exposed of the length bugs, so it is pinned
-    /// end-to-end through `import_bundle`, the path a downloaded bundle file takes. (A batch or
-    /// subtree streamed from a remote takes `import_streamed_bundle`, pinned in its own module.)
+    /// panic / allocator abort). This is the most exposed of the length bugs, so it is pinned
+    /// end-to-end through `import_streamed_bundle`, the public path those responses take, with
+    /// the record's hash requested so the length itself is what gets judged.
     #[test]
     fn bundle_import_rejects_a_huge_record_length_without_allocating_it() {
         // A private storage scope: `import` resolves the object root from the thread-local scope,
@@ -486,7 +485,7 @@ mod regressions {
         let _scope = forklift_core::globals::StorageRootScope::enter(&temp);
 
         let mut raw = Vec::new();
-        raw.extend(b"forklift-bundle 2026-07-06");
+        raw.extend(b"forklift-bundle 2026-07-11");
         raw.push(b'\n');
         let mut record = Vec::new();
         record.push(b'O'); // an object record
@@ -495,10 +494,11 @@ mod regressions {
         record.extend(b"only a few real bytes");
         raw.extend(zstd::encode_all(&record[..], 3).unwrap());
 
-        let bundle = temp.join("hostile.bundle");
-        std::fs::write(&bundle, &raw).unwrap();
-        let result = forklift_core::util::bundle_utils::import_bundle(&bundle);
-        assert!(result.is_err(), "a huge record length must be an error, not a panic/abort");
+        use forklift_core::util::bundle_utils::{import_streamed_bundle, StreamAdmission};
+        let admission = StreamAdmission::Requested(std::collections::HashSet::from(["a".repeat(64)]));
+        let result = import_streamed_bundle(std::io::Cursor::new(&raw), admission);
+        let error = result.err().expect("a huge record length must be an error, not a panic/abort");
+        assert!(error.contains("declares 18446744073709551615 bytes"), "refused on its length: {}", error);
 
         std::fs::remove_dir_all(&temp).ok();
     }

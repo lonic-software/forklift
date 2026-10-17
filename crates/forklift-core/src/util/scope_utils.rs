@@ -60,8 +60,8 @@ pub const CODE_SCOPE_PRUNE_BLOCKED: &str = RefusalCode::ScopePruneBlocked.as_str
 /// refusal code, re-exported from the typed [`RefusalCode`].
 pub const CODE_CHUNKED_TRANSPORT_UNSUPPORTED: &str = RefusalCode::ChunkedTransportUnsupported.as_str();
 
-/// A **grandfathered** object above the whole-object ceiling (authored, or imported via an
-/// old-version bundle, before the ceiling existed) is readable and checkout-able locally forever —
+/// A **grandfathered** object above the whole-object ceiling (authored before the ceiling
+/// existed) is readable and checkout-able locally forever —
 /// the ceiling gates writes and imports only — but nothing accepts it on the wire, and there is no
 /// migration that would preserve its signed identity (a blob's hash is pinned inside a signed
 /// tree; re-chunking it would mint a different hash and so a different, unsigned tree). Refusing
@@ -700,12 +700,10 @@ pub fn commit_pagination_unsupported_refusal(staged_count: usize) -> CoreError {
 
 /// A ready-made `oversized_transport_unsupported` refusal for sending an object above the
 /// whole-object ceiling to a remote or into a bundle — the honest failure the maintainer settled
-/// on for a **grandfathered** giant (an object authored, or imported via an old-version bundle,
-/// before `MAX_OBJECT_BYTES` existed). It stays fully readable and checkout-able locally forever
+/// on for a **grandfathered** giant (an object authored before `MAX_OBJECT_BYTES` existed). It stays fully readable and checkout-able locally forever
 /// (the ceiling gates writes and imports, never reads), but no migration exists that preserves its
-/// signed identity, so it can never move to a remote or into a bundle: a version-3 bundle reader
-/// refuses its declared length before reading a byte, and an older reader would only rediscover
-/// the same problem on the far end. Refusing here — before anything is written into a bundle
+/// signed identity, so it can never move to a remote or into a bundle: every bundle reader
+/// refuses it, the record-stream one on its declared length before reading a byte. Refusing here — before anything is written into a bundle
 /// stream or sent over the wire on a lift — is the honest failure at the source.
 ///
 /// # Arguments

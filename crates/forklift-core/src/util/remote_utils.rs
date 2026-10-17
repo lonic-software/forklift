@@ -3276,11 +3276,19 @@ impl RemoteClient {
     /// is why their [`Self::describe_transport_error`] arms have to be told apart by wording — see
     /// that function's doc.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<Option<bundle_utils::ImportStats>, String> {
+        // Each hash is asked for once, and the response may carry nothing else (see
+        // `StreamAdmission::Requested`).
+        let mut requested: HashSet<String> = HashSet::new();
+        let hashes: Vec<String> = hashes.iter()
+            .filter(|hash| requested.insert((*hash).clone()))
+            .cloned()
+            .collect();
+
         let post_posture = Posture::HeadDeadlineNoRedirect { head: self.batch_head_budget() };
         let outcome = self.send_on(
             post_posture,
             reqwest::Method::POST, "/v1/objects/batch",
-            SendBody::json(&MissingObjectsRequest { hashes: hashes.to_vec() })?,
+            SendBody::json(&MissingObjectsRequest { hashes })?,
         ).await;
         let response = self.response_from_send(
             "batch-fetching from the remote", post_posture, outcome
@@ -3330,7 +3338,8 @@ impl RemoteClient {
             return Err(self.error_of(response, "the batch fetch").await);
         }
 
-        self.import_response(response, "reading the batch response", body_posture).await.map(Some)
+        let admission = bundle_utils::StreamAdmission::Requested(requested);
+        self.import_response(response, "reading the batch response", body_posture, admission).await.map(Some)
     }
 
     /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
@@ -3346,8 +3355,10 @@ impl RemoteClient {
     /// shipping this endpoint needs no protocol bump.
     ///
     /// # Arguments
-    /// * `parcel` - The parcel whose tree the path is resolved in.
-    /// * `path`   - The warehouse path key of the subtree (`/`-separated, e.g. `src/api`).
+    /// * `parcel`  - The parcel whose tree the path is resolved in.
+    /// * `path`    - The warehouse path key of the subtree (`/`-separated, e.g. `src/api`).
+    /// * `subtree` - The hash of the tree at `path`, from the spine tree the caller holds. The
+    ///   response may carry only that tree's object closure (see `StreamAdmission::Closure`).
     ///
     /// Deliberately **not** on [`Posture::BoundedReads`]: the server side walks and buffers the
     /// whole resolved subtree closure into memory before its first response byte
@@ -3359,7 +3370,10 @@ impl RemoteClient {
     /// all, so a budget here would price nothing reachable. This stays unbounded until it has its
     /// own scaled budget or an abandon-and-fall-back lane — or until a production caller appears,
     /// which is the trigger to reconsider rather than a reason to guess now.
-    pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<bundle_utils::ImportStats>, String> {
+    pub async fn fetch_subtree(&self,
+                               parcel: &str,
+                               path: &str,
+                               subtree: &str) -> Result<Option<bundle_utils::ImportStats>, String> {
         let posture = Posture::UnboundedFollowsRedirects(UnboundedTicket::Fork92);
         let outcome = self.send_on(
             posture,
@@ -3380,7 +3394,8 @@ impl RemoteClient {
             return Err(self.error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
         }
 
-        self.import_response(response, "reading the subtree response", posture).await.map(Some)
+        let admission = bundle_utils::StreamAdmission::Closure { root: subtree.to_string() };
+        self.import_response(response, "reading the subtree response", posture, admission).await.map(Some)
     }
 
     /// Import a batch or subtree response into the object store as it arrives, never holding the
@@ -3410,13 +3425,14 @@ impl RemoteClient {
     async fn import_response(&self,
                              mut response: reqwest::Response,
                              action: &str,
-                             posture: Posture) -> Result<bundle_utils::ImportStats, String> {
+                             posture: Posture,
+                             admission: bundle_utils::StreamAdmission) -> Result<bundle_utils::ImportStats, String> {
         let (sender, receiver) = tokio::sync::mpsc::channel::<BodyPiece>(IMPORT_CHANNEL_DEPTH);
         let scope_root = globals::current_scope_root();
 
         let importer = tokio::task::spawn_blocking(move || {
             let _scope = scope_root.as_deref().map(StorageRootScope::enter);
-            bundle_utils::import_streamed_bundle(std::io::BufReader::new(ChannelBody::new(receiver)))
+            bundle_utils::import_streamed_bundle(std::io::BufReader::new(ChannelBody::new(receiver)), admission)
         });
 
         let transferred: Result<(), String> = loop {
@@ -7933,7 +7949,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
-            tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+            tokio::time::timeout(outer_ceiling, client.fetch_batch(&[hash.clone()])).await
         });
 
         let stats = outcome
@@ -9789,7 +9805,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(assert_still_running(
-            "fetch_subtree", check_after, client.fetch_subtree(&"p".repeat(64), "src"),
+            "fetch_subtree", check_after, client.fetch_subtree(&"p".repeat(64), "src", &"t".repeat(64)),
         ));
     }
 
@@ -10077,7 +10093,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
-            tokio::time::timeout(outer_ceiling, client.fetch_batch(&["a".repeat(64)])).await
+            tokio::time::timeout(outer_ceiling, client.fetch_batch(&[hash.clone()])).await
         });
 
         let stats = outcome

@@ -1227,6 +1227,69 @@ fn bundles_speed_up_franchising() {
 }
 
 #[test]
+fn a_bundle_that_lags_the_remote_heads_still_imports_with_its_signatures() {
+    // A bundle is rebuilt on the server's own schedule, so the heads may have moved past it. Each
+    // of its signature entries names a parcel its own packs carry, so it imports whole, sidecars
+    // included, and the walk fetches only what was lifted since.
+    let area = TestArea::new("bundle-lagging");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    area.write_file("a/one.txt", "one\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "bundled"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    server.rebuild_bundle(&area);
+
+    area.write_file("a/two.txt", "two\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "lifted after the bundle"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let franchised = area.forklift(".", &["franchise", &server.url, "c"]);
+    assert_success(&franchised);
+    assert!(stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
+    assert!(!stdout(&franchised).contains("and 0 signature(s)"),
+            "the bundle's signed parcels keep their sidecars: {}", stdout(&franchised));
+    assert!(!stdout(&franchised).contains("0 object(s) fetched loose"),
+            "the lift after the bundle came through the walk: {}", stdout(&franchised));
+
+    assert_eq!(area.read_file("c/one.txt"), "one\n");
+    assert_eq!(area.read_file("c/two.txt"), "two\n");
+    assert_success(&area.forklift("c", &["audit", "main"]));
+}
+
+#[test]
+fn a_record_stream_bundle_file_is_refused_and_franchise_falls_back_to_the_walk() {
+    // A whole-warehouse bundle is read only in the native format. A file in an older
+    // record-stream format is set aside as unsupported, never imported by a reader that could not
+    // bound what it stores, and the franchise completes through its verified walk.
+    let area = TestArea::new("bundle-record-stream");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/one.txt", "one\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "walked"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    server.rebuild_bundle(&area);
+    // The header alone decides: what follows it is never read.
+    let bundle = area.path("server-root/.forklift/bundles/latest");
+    assert!(bundle.is_file(), "the server wrote its bundle");
+    std::fs::write(&bundle, b"forklift-bundle 2026-07-11\nnever read").unwrap();
+
+    let franchised = area.forklift(".", &["franchise", &server.url, "c"]);
+    assert_success(&franchised);
+    assert!(!stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
+    assert_eq!(area.read_file("c/one.txt"), "one\n");
+    assert!(!area.path("c/.forklift/bundles/latest").exists(),
+            "an unsupported bundle is not kept as the warehouse's own");
+}
+
+#[test]
 fn a_token_protected_remote_requires_the_token() {
     let area = TestArea::new("token");
     let server = Server::start(&area, Some("sesame"));
@@ -4777,7 +4840,7 @@ fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_
     // The endpoint resolves src/web to its subtree and streams the closure, which the client
     // imports as it arrives — the sealed objects land hash-verified like any bundle.
     runtime
-        .block_on(client.fetch_subtree(&head, "src/web"))
+        .block_on(client.fetch_subtree(&head, "src/web", &web_tree))
         .expect("the subtree fetch and its import must not error")
         .expect("a present remote serves the subtree, not a 404");
 
@@ -4788,9 +4851,47 @@ fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_
     // signal to fall back to the hash-addressed walk. An older remote without the route 404s
     // identically, so the fallback path is the same one this returns.
     let missing = runtime
-        .block_on(client.fetch_subtree(&head, "does/not/exist"))
+        .block_on(client.fetch_subtree(&head, "does/not/exist", &web_tree))
         .expect("a 404 is not an error");
     assert!(missing.is_none(), "an unresolved path signals the client to fall back");
+}
+
+#[test]
+fn a_subtree_response_imports_in_full_when_the_client_already_holds_a_tree_inside_it() {
+    // The server sends a subtree's whole closure, including trees the client already holds. Such
+    // a record is skipped, but its tree must still widen what the response may carry — loaded
+    // from the client's store — or the objects below it would be refused as unrequested.
+    let area = TestArea::new("subtree-endpoint-held-tree");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    area.write_file("dev/src/web/inner/x.txt", "inner v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+    let inner_tree = path_object_hash(&area, "dev", &head, "src/web/inner");
+
+    // Scoped to src/web/inner: the client holds that tree and its blob, but not src/web's file.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/web/inner"]));
+    assert!(object_present(&area, "sparse", &inner_tree), "the scoped tree is held");
+    assert!(!object_present(&area, "sparse", &web_blob), "src/web's own file starts sealed");
+
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
+    let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
+
+    runtime
+        .block_on(client.fetch_subtree(&head, "src/web", &web_tree))
+        .expect("a closure overlapping what the client holds must import")
+        .expect("a present remote serves the subtree, not a 404");
+
+    assert!(object_present(&area, "sparse", &web_blob), "the endpoint delivered src/web's file");
 }
 
 #[test]
@@ -4824,7 +4925,7 @@ fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characte
     let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
 
     runtime
-        .block_on(client.fetch_subtree(&head, "src/a dir#1/100%"))
+        .block_on(client.fetch_subtree(&head, "src/a dir#1/100%", &weird_tree))
         .expect("the subtree fetch and its import must not error")
         .expect("the server must resolve the reserved-character path, not 404 on a mangled URL");
 
@@ -4920,7 +5021,9 @@ fn the_subtree_endpoint_refuses_an_oversized_closure_and_the_client_falls_back()
     // The client treats that 422 exactly like a 404: `Ok(None)`, the fallback signal.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
-    let result = runtime.block_on(client.fetch_subtree(&head, "big"));
+    // The refusal comes before any record, so the subtree hash the response would be admitted
+    // against is never consulted.
+    let result = runtime.block_on(client.fetch_subtree(&head, "big", &"0".repeat(64)));
     assert!(result.is_ok(), "an over-cap subtree must not be a client error: {:?}", result.err());
     assert!(result.unwrap().is_none(), "an over-cap subtree signals fallback, exactly like a 404");
 }
