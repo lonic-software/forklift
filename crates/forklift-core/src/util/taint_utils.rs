@@ -581,8 +581,7 @@ pub struct TaintState {
     /// The exact absolute paths of every taint file this read actually consumed, captured at read
     /// time — this is the snapshot a later deletion must be scoped to, never re-derived by
     /// scanning the taint directory again at deletion time. Taint files are born concurrently, from
-    /// any process, at any time (even a read-only command can self-heal a commit-graph shard and
-    /// trip a taint); a heal that deletes "whatever the directory holds right now" instead of
+    /// any process, at any time; a heal that deletes "whatever the directory holds right now" instead of
     /// "exactly what I read" can delete a taint a sibling process recorded after this read, losing
     /// a real durability gap forever. [`resolve_taints`] takes this set as its deletion scope for
     /// exactly that reason — see its own doc comment.
@@ -710,8 +709,7 @@ fn delete_snapshot_and_sync(root: &Path, files: &[PathBuf]) -> Result<(), String
 /// at deletion time — then fsync the directory so the removals are themselves durable.
 ///
 /// **Why snapshot-scoped, not a rescan-and-delete-everything:** taint files are born concurrently,
-/// from any process, at any time (even a read-only command can self-heal a commit-graph shard and
-/// trip a taint) — the entry-heal that eventually calls this runs lock-free, before the warehouse
+/// from any process, at any time — the entry-heal that eventually calls this runs lock-free, before the warehouse
 /// lock. A version of this function that instead re-read the directory at deletion time would
 /// delete every file it found there, including one recorded by a *different* process after this
 /// heal's caller snapshotted its work — silently losing a real durability gap forever. Deleting

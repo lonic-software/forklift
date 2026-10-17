@@ -1996,6 +1996,208 @@ fn commit_graph_is_built_by_compact_and_ancestry_stays_correct() {
     assert!(feature_head.len() == 64, "sanity: a full parcel hash was captured");
 }
 
+/// Commit-graph shards are written without a durability barrier, so a power loss can leave one
+/// torn. A torn shard must read as absent — never as wrong ancestry — and be rewritten whole by
+/// the next query that needs it. Every shard is corrupted here (one flipped byte each, so each
+/// still has the right magic, version and length), and the merge that reads the graph must still
+/// find the right base.
+#[test]
+fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
+    let warehouse = TestWarehouse::new("commit-graph-corrupt");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nfive\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "main work"]));
+
+    assert_success(&warehouse.run(&["compact"]));
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let shards: Vec<_> = std::fs::read_dir(&graph_root).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(!shards.is_empty(), "sanity: compact must have built the commit-graph");
+
+    // Flip one byte inside the records of every shard: the 12-byte header and the length stay
+    // intact, so only the checksum can tell the shard is damaged.
+    let mut corrupted = Vec::new();
+    for shard in &shards {
+        let mut bytes = std::fs::read(shard).unwrap();
+        bytes[12 + 32] ^= 0x01;
+        std::fs::write(shard, &bytes).unwrap();
+        corrupted.push(bytes);
+    }
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert_success(&merge);
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nFIVE\n",
+        "the merge must find the true base despite every shard being damaged"
+    );
+
+    // The query that needed the damaged shards recomputed their records and rewrote them.
+    let rewritten = shards.iter().zip(&corrupted)
+        .filter(|(shard, damaged)| std::fs::read(shard).unwrap() != **damaged)
+        .count();
+    assert!(rewritten > 0, "the merge must have rewritten at least one damaged shard");
+
+    // A rebuild from every head heals the rest: each shard is sealed again and holds records.
+    assert_success(&warehouse.run(&["compact"]));
+    for shard in &shards {
+        assert!(graph_shard_is_sealed_with_records(shard),
+            "every damaged shard must be rewritten whole: {}", shard.display());
+    }
+}
+
+/// Whether a commit-graph shard file is whole, checked from the outside: its trailing blake3
+/// matches the bytes before it (the v2 seal), and the body after the 12-byte header walks as a
+/// sequence of complete records — at least one, ending exactly at the checksum — each keyed by a
+/// parcel hash that belongs in this shard (its first byte is the file's 2-hex name).
+fn graph_shard_is_sealed_with_records(shard: &std::path::Path) -> bool {
+    let bytes = std::fs::read(shard).unwrap();
+    if bytes.len() < 12 + 32 {
+        return false;
+    }
+    let (body, checksum) = bytes.split_at(bytes.len() - 32);
+    if blake3::hash(body).as_bytes() != checksum {
+        return false;
+    }
+    let prefix = u8::from_str_radix(shard.file_name().unwrap().to_str().unwrap(), 16).unwrap();
+    let u32_at = |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+    let (mut offset, mut records) = (12, 0);
+    while offset < body.len() {
+        // hash(32) + generation(4) + parent count(1), the parents, then a filter length (4).
+        if offset + 37 > body.len() || body[offset] != prefix {
+            return false;
+        }
+        let parents = body[offset + 36] as usize;
+        offset += 37 + parents * 32;
+        if offset + 4 > body.len() {
+            return false;
+        }
+        let filter_len = u32_at(offset);
+        offset += 4;
+        // u32::MAX and u32::MAX - 1 are the "no filter" / "too large" sentinels, with no bytes.
+        if filter_len < u32::MAX - 1 {
+            offset += filter_len as usize;
+        }
+        if offset > body.len() {
+            return false;
+        }
+        records += 1;
+    }
+    records > 0
+}
+
+/// A shard is written with no durability barrier, so a power loss can keep a descendant's shard
+/// while losing an ancestor's. `compact` must not take the surviving head record as proof that
+/// its history is recorded: it walks through it and rebuilds every lost shard.
+#[test]
+fn compact_rebuilds_lost_ancestor_shards_behind_a_recorded_head() {
+    let warehouse = TestWarehouse::new("commit-graph-lost-ancestor");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    for i in 0..12 {
+        warehouse.write_file("file.txt", &format!("{}\n", i));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("c{}", i)]));
+    }
+    assert_success(&warehouse.run(&["compact"]));
+
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let head = pallet_head_hash(&warehouse, "main");
+    let head_shard = graph_root.join(&head[..2]);
+    let shards: Vec<_> = std::fs::read_dir(&graph_root).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(shards.len() > 1 && shards.contains(&head_shard),
+        "sanity: the history spans several shards, one of them the head's: {:?}", shards);
+    for shard in shards.iter().filter(|shard| **shard != head_shard) {
+        std::fs::remove_file(shard).unwrap();
+    }
+
+    assert_success(&warehouse.run(&["compact"]));
+    for shard in &shards {
+        assert!(shard.exists() && graph_shard_is_sealed_with_records(shard),
+            "compact must rebuild the lost ancestor shard {}", shard.display());
+    }
+
+    // The checker itself: a correctly sealed shard whose body ends in a stray byte, or whose
+    // record sits in the wrong shard, must not pass as whole.
+    let mut body = std::fs::read(&head_shard).unwrap();
+    body.truncate(body.len() - 32);
+    let reseal = |body: &[u8]| {
+        let mut sealed = body.to_vec();
+        sealed.extend_from_slice(blake3::hash(body).as_bytes());
+        sealed
+    };
+    let probe_dir = warehouse.root.join("probe");
+    std::fs::create_dir_all(&probe_dir).unwrap();
+    let mut stray = body.clone();
+    stray.push(0);
+    std::fs::write(probe_dir.join(&head[..2]), reseal(&stray)).unwrap();
+    assert!(!graph_shard_is_sealed_with_records(&probe_dir.join(&head[..2])),
+        "a sealed body with a stray trailing byte must not pass");
+    let elsewhere = if &head[..2] == "00" { "01" } else { "00" };
+    std::fs::write(probe_dir.join(elsewhere), reseal(&body)).unwrap();
+    assert!(!graph_shard_is_sealed_with_records(&probe_dir.join(elsewhere)),
+        "a record filed under the wrong shard must not pass");
+    std::fs::write(probe_dir.join(&head[..2]), reseal(&body)).unwrap();
+    assert!(graph_shard_is_sealed_with_records(&probe_dir.join(&head[..2])),
+        "sanity: the untouched body, resealed, passes");
+}
+
+/// The commit-graph is a cache: when it cannot be read or written at all, a query still answers
+/// from the object store rather than failing. A file squatting the graph directory blocks both.
+#[test]
+fn an_unwritable_commit_graph_never_fails_a_query() {
+    let warehouse = TestWarehouse::new("commit-graph-unwritable");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "main work"]));
+
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let _ = std::fs::remove_dir_all(&graph_root);
+    std::fs::write(&graph_root, "not a directory").unwrap();
+
+    // `blame` reads its parent edges through the graph and has no object-walk fallback of its
+    // own; the merge base below does fall back, so blame is the query that pins the graph's
+    // own tolerance.
+    let blame = warehouse.run(&["blame", "file.txt"]);
+    assert_success(&blame);
+    assert!(stdout(&blame).contains("ONE") && stdout(&blame).contains("five"),
+        "blame must answer from the object store: {}", stdout(&blame));
+
+    assert_success(&warehouse.run(&["consolidate", "feature"]));
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nFIVE\n",
+        "the merge must still find the true base with no usable commit-graph"
+    );
+    assert!(graph_root.is_file(), "sanity: the squatting file is still in place");
+}
+
 #[test]
 fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     let warehouse = TestWarehouse::new("consolidate-conflict");

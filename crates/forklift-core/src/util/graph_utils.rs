@@ -22,6 +22,19 @@
 //! parcel objects. Generation numbers are derived purely from the DAG shape, so a rebuilt
 //! record is byte-identical to the one it replaces.
 //!
+//! # Why it is written without a durability barrier
+//!
+//! Shards are published with `file_utils::replace_file_unsynced` — an atomic rename with no
+//! fsync — because losing one costs only a rebuild, and a cold graph used to pay about two full
+//! barriers per parcel for nothing else. After a power loss a shard may therefore be old, torn,
+//! empty or missing. Missing and old are already covered (a missing record is recomputed). Torn
+//! is what the trailing checksum is for: every shard ends with the blake3 hash of the bytes
+//! before it, and a shard whose checksum does not match reads as empty. Without it, a torn
+//! shard could misalign the record parser into a real parcel hash followed by garbage
+//! generation or parent bytes — a wrong ancestry answer, and so a wrong merge base, that nothing
+//! would report. Any shard that passes the check holds only correct records, whichever version
+//! of the file a crash left behind, because a record is a pure function of its parcel's hash.
+//!
 //! # Why it is sharded (not one file)
 //!
 //! Forklift's invariant is bounded RAM: the per-directory inventory shards so a `stocktake`
@@ -50,8 +63,15 @@ use crate::util::{file_utils, object_utils, sign_utils};
 const GRAPH_MAGIC: &[u8; 8] = b"FORKGRPH";
 
 /// The shard format version. Bumped only on an incompatible on-disk change; an unrecognised
-/// version makes the shard read as empty (and is rebuilt), never an error.
-const GRAPH_FORMAT_VERSION: u32 = 1;
+/// version makes the shard read as empty (and is rebuilt), never an error. Version 2 added the
+/// trailing checksum.
+const GRAPH_FORMAT_VERSION: u32 = 2;
+
+/// Length of the magic plus the version word that open every shard.
+const HEADER_LEN: usize = 12;
+
+/// Length of the blake3 checksum that closes every shard.
+const CHECKSUM_LEN: usize = 32;
 
 /// Number of leading hex characters of a parcel hash that name its shard — the same 2-char
 /// fan-out the object store uses, so the graph shards exactly as the objects do.
@@ -139,6 +159,10 @@ struct Shard {
     /// unchanged, so a record another thread inserted meanwhile (raising `version`) is never
     /// falsely marked flushed — it stays dirty until its own writer persists it.
     version: u64,
+    /// False only for a stand-in served after the shard file failed to read for a reason other
+    /// than its absence (see [`with_shard`]): it is never cached and never written back, so a
+    /// valid file on disk is never replaced by a copy missing its records.
+    writable: bool,
 }
 
 /// The process-global resident shard cache, keyed by `root\0prefix` so warehouses never mix.
@@ -219,27 +243,43 @@ fn serialize_shard(records: &HashMap<String, Record>) -> Vec<u8> {
         }
     }
 
+    let checksum = blake3::hash(&out);
+    out.extend_from_slice(checksum.as_bytes());
+
     out
 }
 
-/// Parse a shard's on-disk bytes back into its records. A truncated, foreign, or
+/// Parse a shard's on-disk bytes back into its records. A truncated, torn, foreign, or
 /// wrong-version file yields an empty map — the graph is derived, so an unreadable shard is
-/// rebuilt, never fatal.
+/// rebuilt, never fatal. Nothing is taken from a shard unless the whole of it checks out: a
+/// shard is published without a durability barrier (see the module docs), so a partly readable
+/// one is evidence of a torn write, and its readable-looking records are not trusted.
 fn parse_shard(bytes: &[u8]) -> HashMap<String, Record> {
-    let mut records = HashMap::new();
-    if bytes.len() < 12 || &bytes[..8] != GRAPH_MAGIC {
-        return records;
+    parse_verified_shard(bytes).unwrap_or_default()
+}
+
+/// [`parse_shard`]'s body: `None` for any shard that fails a check.
+fn parse_verified_shard(bytes: &[u8]) -> Option<HashMap<String, Record>> {
+    if bytes.len() < HEADER_LEN + CHECKSUM_LEN || &bytes[..8] != GRAPH_MAGIC {
+        return None;
     }
     let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
     if version != GRAPH_FORMAT_VERSION {
-        return records;
+        return None;
     }
 
-    let mut offset = 12;
+    let (body, checksum) = bytes.split_at(bytes.len() - CHECKSUM_LEN);
+    if blake3::hash(body).as_bytes() != checksum {
+        return None;
+    }
+
+    let bytes = body;
+    let mut records = HashMap::new();
+    let mut offset = HEADER_LEN;
     while offset < bytes.len() {
         // hash(32) + generation(4) + parent_count(1)
         if offset + HASH_LEN + 4 + 1 > bytes.len() {
-            break;
+            return None;
         }
         let hash = sign_utils::to_hex(&bytes[offset..offset + HASH_LEN]);
         offset += HASH_LEN;
@@ -249,7 +289,7 @@ fn parse_shard(bytes: &[u8]) -> HashMap<String, Record> {
         offset += 1;
 
         if offset + parent_count * HASH_LEN + 4 > bytes.len() {
-            break;
+            return None;
         }
         let mut parents = Vec::with_capacity(parent_count);
         for _ in 0..parent_count {
@@ -265,7 +305,7 @@ fn parse_shard(bytes: &[u8]) -> HashMap<String, Record> {
         } else {
             let len = filter_len as usize;
             if offset + len > bytes.len() {
-                break;
+                return None;
             }
             let bytes = bytes[offset..offset + len].to_vec();
             offset += len;
@@ -275,7 +315,7 @@ fn parse_shard(bytes: &[u8]) -> HashMap<String, Record> {
         records.insert(hash, Record { generation, parents, filter });
     }
 
-    records
+    Some(records)
 }
 
 // ---- resident shard access (disk I/O happens outside the cache lock) ---------------------
@@ -306,11 +346,26 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
         }
     }
 
-    // Miss: read and parse the shard file with the lock released.
+    // Miss: read and parse the shard file with the lock released. A missing or damaged shard
+    // is empty and is rebuilt over. Any other read error (a transient EMFILE or EIO, or a path
+    // something else squats) must not fail a query of a cache, but the file may still hold
+    // valid records: serve an uncached, never-written stand-in, so this access answers from the
+    // object store and the next one retries the read.
     let records = match std::fs::read(shard_path(root, prefix)) {
         Ok(bytes) => parse_shard(&bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-        Err(e) => return Err(format!("Error while reading commit-graph shard \"{}\": {}", prefix, e)),
+        Err(_) => {
+            let mut stand_in = Shard {
+                root: root.to_string(),
+                prefix: prefix.to_string(),
+                records: HashMap::new(),
+                dirty: false,
+                last_access: 0,
+                version: 0,
+                writable: false,
+            };
+            return Ok(f(&mut stand_in));
+        }
     };
 
     // Re-take the lock to install the shard and run `f`. Any dirty eviction victims are removed
@@ -331,6 +386,7 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
                 dirty: false,
                 last_access: 0,
                 version: 0,
+                writable: true,
             });
             victim_writes
         };
@@ -342,9 +398,10 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
     };
 
     // Flush the evicted dirty victims with the lock released. They are already out of the cache,
-    // so their bytes are final; a write error is surfaced (a saved write is a saved rebuild).
+    // so their bytes are final. A failed write only costs a later rebuild, so it never fails the
+    // query that happened to evict them.
     for (root, prefix, bytes) in victim_writes {
-        write_shard_bytes(&root, &prefix, &bytes)?;
+        let _ = write_shard_bytes(&root, &prefix, &bytes);
     }
 
     Ok(result)
@@ -358,7 +415,7 @@ fn poisoned<T>(_: T) -> String {
 
 /// Evict least-recently-used shards until there is room for one more, returning the serialized
 /// bytes of any **dirty** victim so the caller can write it to disk *after releasing the lock*
-/// (flushing under the lock would block every other graph access on an fsync). A victim's
+/// (flushing under the lock would block every other graph access on file I/O). A victim's
 /// records would only be recomputed if dropped, but a write saved is a walk saved. With a 2-hex
 /// fan-out all ≤256 shards of one warehouse fit under the cap, so this only evicts when a single
 /// process (a server) holds shards for many warehouses at once.
@@ -376,7 +433,7 @@ fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<
         };
         if let Some(shard) = cache.shards.remove(&victim) {
             if shard.dirty {
-                // Serialize under the lock (in-memory, cheap); the fsyncing write is done by the
+                // Serialize under the lock (in-memory, cheap); the file write is done by the
                 // caller once the lock is released.
                 pending_writes.push((
                     shard.root.clone(),
@@ -389,11 +446,15 @@ fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<
     pending_writes
 }
 
-/// Write pre-serialized shard bytes to the shard file atomically. Callers serialize under the
-/// cache lock and call this with the lock released, so the fsync never blocks the cache.
+/// Write pre-serialized shard bytes to the shard file — atomically, but with no durability
+/// barrier (see the module docs for why that is safe). Callers serialize under the cache lock
+/// and call this with the lock released, so the file write never blocks the cache. Both callers
+/// treat a failure as best-effort. Because no directory sync runs, this never consults or
+/// records a durability taint either: on a store with a standing taint, a graph query still
+/// writes its checksummed shards, and a shard the failing device mangles simply reads as absent.
 fn write_shard_bytes(root: &str, prefix: &str, bytes: &[u8]) -> Result<(), String> {
     file_utils::create_folder_if_not_exists(std::path::Path::new(root))?;
-    file_utils::write_file_atomically(&shard_path(root, prefix), bytes)
+    file_utils::replace_file_unsynced(&shard_path(root, prefix), bytes)
 }
 
 /// Fetch a parcel's record if it is already stored (in a resident shard or on disk). Does not
@@ -414,20 +475,31 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
         by_prefix.entry(shard_prefix(hash)).or_default().push((hash, record));
     }
     for (prefix, records) in by_prefix {
-        // Insert the records and snapshot the shard's bytes + version under the lock; the
-        // fsyncing write then happens with the lock released.
-        let (bytes, version) = with_shard(root, &prefix, |shard| {
+        // Insert the records and snapshot the shard's bytes + version under the lock; the file
+        // write then happens with the lock released.
+        let snapshot = with_shard(root, &prefix, |shard| {
+            if !shard.writable {
+                return None;
+            }
             for (hash, record) in records {
                 shard.records.insert(hash.clone(), record.clone());
             }
             shard.dirty = true;
             shard.version = shard.version.wrapping_add(1);
-            (serialize_shard(&shard.records), shard.version)
+            Some((serialize_shard(&shard.records), shard.version))
         })?;
+        // An unreadable shard is never written back over (see `Shard::writable`).
+        let Some((bytes, version)) = snapshot else {
+            continue;
+        };
 
-        // Flush eagerly so the memoization survives a crash (otherwise only a rebuild, but
-        // avoidable) — off the lock, so a concurrent graph access never waits on this fsync.
-        write_shard_bytes(root, &prefix, &bytes)?;
+        // Write eagerly so the memoization outlives this process — off the lock, so a concurrent
+        // graph access never waits on the file write. A failed write (a full or read-only disk)
+        // is not an error: the shard stays dirty, so a later persist or eviction retries it, and
+        // the records are already resident for this process.
+        if write_shard_bytes(root, &prefix, &bytes).is_err() {
+            continue;
+        }
 
         // Mark clean only if nothing changed the shard since the snapshot: a record another
         // thread inserted meanwhile (a higher `version`) is newer than what we just wrote and
@@ -566,19 +638,24 @@ pub fn parents(hash: &str) -> Result<Vec<String>, String> {
 }
 
 /// Populate the graph for everything reachable from `heads`, computing only the records that
-/// are still missing (an already-recorded parcel prunes the walk, since its ancestors were
-/// recorded with it). Cheap to call repeatedly; meant to run inside `compact`, which already
-/// holds the warehouse lock and has warm object caches, so a warehouse is graph-ready right
-/// after an import or a repack. Returns the number of new records written.
+/// are still missing. An already-recorded parcel is walked through by its stored parents rather
+/// than treated as proof its ancestors are recorded, so a lost or damaged ancestor shard is
+/// found and rebuilt. The cost is one record lookup per reachable parcel, against shards that
+/// end up resident, even when nothing is missing: linear in history, but never an object read
+/// for a recorded parcel. Meant to run inside `compact`, which already holds the warehouse lock,
+/// does work linear in the store, and has warm object caches, so a warehouse is graph-ready
+/// right after an import or a repack. Returns the number of new records written.
 ///
 /// # Arguments
 /// * `heads` - Parcel hashes to populate the ancestry of (all pallet heads, typically).
 pub fn build_from_heads(heads: &[String]) -> Result<usize, String> {
     let root = file_utils::get_path_graph_root();
 
-    // Collect the parcels still missing a record, and their parents, in one BFS. Pruning at an
-    // already-recorded parcel assumes its ancestors are recorded too; if a partial write ever
-    // broke that, `node`'s self-heal fills the gap on demand — this is only an optimization.
+    // Collect the parcels still missing a record, and their parents, in one BFS. An
+    // already-recorded parcel does not prune the walk: shards are written without a durability
+    // barrier, so after a power loss a descendant's shard can survive while an ancestor's is
+    // lost or reads as empty. Walking a recorded parcel costs only a record lookup (its parents
+    // come from the record, not the object store).
     let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = heads.iter().cloned().collect();
@@ -587,7 +664,8 @@ pub fn build_from_heads(heads: &[String]) -> Result<usize, String> {
         if !visited.insert(hash.clone()) {
             continue;
         }
-        if stored_record(&root, &hash)?.is_some() {
+        if let Some(record) = stored_record(&root, &hash)? {
+            queue.extend(record.parents);
             continue;
         }
         let parcel = object_utils::load_parcel(&hash)?;
@@ -955,6 +1033,100 @@ mod tests {
         assert!(parse_shard(&bytes).is_empty());
     }
 
+    /// A small shard of two records, one with a parent, for the damage tests below.
+    fn sample_shard() -> Vec<u8> {
+        let mut records = HashMap::new();
+        records.insert("aa".repeat(32), Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
+        records.insert("ab".repeat(32), Record {
+            generation: 2,
+            parents: vec!["aa".repeat(32)],
+            filter: PathFilter::Bloom(vec![9; 16]),
+        });
+        let bytes = serialize_shard(&records);
+        assert_eq!(parse_shard(&bytes).len(), 2, "sanity: the undamaged shard parses back whole");
+        bytes
+    }
+
+    /// Re-seal `body` (header plus records, no checksum) with a valid checksum, so a test can
+    /// reach the checks that run *after* the checksum has passed.
+    fn sealed(body: &[u8]) -> Vec<u8> {
+        let mut bytes = body.to_vec();
+        bytes.extend_from_slice(blake3::hash(body).as_bytes());
+        bytes
+    }
+
+    // Shards are published without a durability barrier, so after a power loss one may be torn
+    // in any of these ways. Each must read as empty — never as its readable-looking records,
+    // which the checksum exists to stop being trusted.
+
+    #[test]
+    fn a_shard_with_a_flipped_body_byte_reads_as_empty() {
+        let mut bytes = sample_shard();
+        // The first record's generation word: without the checksum this parses as a valid
+        // record carrying the wrong generation.
+        bytes[HEADER_LEN + HASH_LEN] ^= 0x01;
+        assert!(parse_shard(&bytes).is_empty());
+    }
+
+    #[test]
+    fn a_shard_with_a_zeroed_middle_region_reads_as_empty() {
+        let mut bytes = sample_shard();
+        let middle = bytes.len() / 2;
+        bytes[middle - 8..middle + 8].fill(0);
+        assert!(parse_shard(&bytes).is_empty());
+    }
+
+    #[test]
+    fn a_shard_with_a_truncated_tail_reads_as_empty() {
+        let bytes = sample_shard();
+        assert!(parse_shard(&bytes[..bytes.len() - 1]).is_empty());
+        assert!(parse_shard(&bytes[..bytes.len() - CHECKSUM_LEN]).is_empty());
+    }
+
+    #[test]
+    fn a_checksummed_shard_with_a_record_running_past_its_body_reads_as_empty() {
+        // A correctly sealed shard whose last record is cut short, at each of its three bounds
+        // checks: the earlier, complete record must not be kept either — a partly readable shard
+        // is not a source of records. Records are serialized in map order, so the complete one
+        // is appended by hand to keep which record is cut deterministic.
+        let mut whole = HashMap::new();
+        whole.insert("aa".repeat(32), Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
+        let mut cut = HashMap::new();
+        cut.insert("ab".repeat(32), Record {
+            generation: 2,
+            parents: vec!["aa".repeat(32)],
+            filter: PathFilter::Bloom(vec![9; 16]),
+        });
+        let whole_bytes = serialize_shard(&whole);
+        let cut_bytes = serialize_shard(&cut);
+        let mut body = whole_bytes[..whole_bytes.len() - CHECKSUM_LEN].to_vec();
+        let cut_record = &cut_bytes[HEADER_LEN..cut_bytes.len() - CHECKSUM_LEN];
+
+        // Inside the Bloom filter, inside the parent list, and inside the fixed hash/generation head.
+        for keep in [cut_record.len() - 3, HASH_LEN + 4 + 1 + 10, HASH_LEN - 1] {
+            let mut damaged = body.clone();
+            damaged.extend_from_slice(&cut_record[..keep]);
+            assert!(parse_shard(&sealed(&damaged)).is_empty(), "a record cut to {} bytes", keep);
+        }
+        body.extend_from_slice(cut_record);
+        assert_eq!(parse_shard(&sealed(&body)).len(), 2, "sanity: the uncut pair parses whole");
+    }
+
+    #[test]
+    fn a_version_1_shard_reads_as_empty() {
+        let bytes = sample_shard();
+        let mut body = bytes[..bytes.len() - CHECKSUM_LEN].to_vec();
+        body[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(parse_shard(&sealed(&body)).is_empty());
+    }
+
+    #[test]
+    fn an_empty_but_sealed_shard_parses_to_no_records() {
+        let bytes = serialize_shard(&HashMap::new());
+        assert_eq!(bytes.len(), HEADER_LEN + CHECKSUM_LEN);
+        assert!(parse_verified_shard(&bytes).is_some_and(|records| records.is_empty()));
+    }
+
     #[test]
     fn shard_prefix_matches_the_object_fan_out_width() {
         let hash = "9c423b8".to_string() + &"0".repeat(57);
@@ -1023,6 +1195,83 @@ mod tests {
 
         let order = topo_order(&parents_of).unwrap();
         assert_eq!(order.len(), 2);
+    }
+
+    /// A fresh scratch directory for one test, unique per process and per test name.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-graph-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shard_that_cannot_be_written_is_not_an_error() {
+        // The graph is a cache: a full or read-only disk must not fail the query that computed
+        // the records. A read-only graph root makes the shard write fail while its read is an
+        // ordinary NotFound; the persist still succeeds and the record stays resident.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("unwritable");
+        let root_path = dir.join("graph");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(root_path.join("probe")).is_ok() {
+            // Running as root: permissions cannot make the write fail, so there is nothing to test.
+            std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let root = root_path.to_string_lossy().into_owned();
+
+        let hash = "cd".repeat(32);
+        let mut new = HashMap::new();
+        new.insert(hash.clone(), Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
+        let persisted = persist_records(&root, &new);
+        let resident = stored_record(&root, &hash).unwrap().map(|r| r.generation);
+        let written = root_path.join("cd").exists();
+        std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(persisted.is_ok(), "a failed shard write must not fail the persist: {:?}", persisted);
+        assert_eq!(resident, Some(1), "the record must stay resident after its write failed");
+        assert!(!written, "sanity: the read-only root blocked the write");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shard_that_cannot_be_read_is_never_written_over() {
+        // A shard file that exists but fails to read (here: no read permission; in the field a
+        // transient EMFILE or EIO) may still hold valid records. The persist must not fail, and
+        // it must not replace the file with a copy holding only the new records.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("unreadable");
+        let root_path = dir.join("graph");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = root_path.to_string_lossy().into_owned();
+
+        let mut kept = HashMap::new();
+        kept.insert("ef".repeat(32), Record { generation: 3, parents: vec![], filter: PathFilter::Unknown });
+        let original = serialize_shard(&kept);
+        let shard_file = root_path.join("ef");
+        std::fs::write(&shard_file, &original).unwrap();
+        std::fs::set_permissions(&shard_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&shard_file).is_ok() {
+            // Running as root: permissions cannot make the read fail, so there is nothing to test.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mut new = HashMap::new();
+        new.insert(format!("ef{}", "01".repeat(31)),
+            Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
+        let persisted = persist_records(&root, &new);
+        std::fs::set_permissions(&shard_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let after = std::fs::read(&shard_file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(persisted.is_ok(), "an unreadable shard must not fail the persist: {:?}", persisted);
+        assert_eq!(after, original, "an unreadable shard must never be written over");
     }
 
     #[test]

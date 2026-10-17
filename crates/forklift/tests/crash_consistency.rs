@@ -1,10 +1,12 @@
 //! The crash / interrupted-write harness, part of the hardening test spine.
 //!
-//! "Durable before destructive" holds across power loss: every object, ref, inventory
-//! shard and graph file is written to a temp file, fsynced, renamed, and the directory fsynced,
-//! and a pallet's ref advances only *after* all the objects it names are durable. The claim is
+//! "Durable before destructive" holds across power loss: every object, ref and inventory
+//! shard is written to a temp file, fsynced, renamed, and the directory fsynced, and a pallet's
+//! ref advances only *after* all the objects it names are durable. The claim is
 //! that a crash at any instant leaves the store either at its old state or fully at the new one —
-//! never a torn object at a real address, never a half-written ref.
+//! never a torn object at a real address, never a half-written ref. Commit-graph shards are the
+//! exception by design: a rebuildable, checksummed cache, renamed into place with no barrier
+//! (`building_the_commit_graph_pays_no_durability_barrier` pins that).
 //!
 //! A unit test can assert the atomic-write contract (see `file_utils`), but only a real,
 //! externally killed process exercises the whole `stack` pipeline under interruption. This test
@@ -879,4 +881,40 @@ fn a_small_single_file_load_pays_no_extra_barrier_for_the_incomplete_load_marker
     assert!(output.status.success(), "load failed: {}", String::from_utf8_lossy(&output.stderr));
 
     assert_eq!(barrier_count(&output), 2);
+}
+
+/// The commit-graph is a rebuildable cache, so its shards are published with no durability
+/// barrier: a `blame` that builds the graph from cold pays none at all (it used to pay about two
+/// per parcel). The `stack` beforehand proves the counter is live in this run — fsync is on, so
+/// a zero below means the graph wrote without a barrier, not that nothing was counted.
+#[test]
+fn building_the_commit_graph_pays_no_durability_barrier() {
+    let area = Area::new("graph-barriers");
+    let warehouse = area.warehouse();
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "graph@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "graph@forklift"]).status.success());
+
+    for i in 0..8 {
+        std::fs::write(warehouse.join("f.txt"), format!("line {i}\n").repeat(i + 1)).unwrap();
+        assert!(area.run(&["load", "f.txt"]).status.success());
+        let mut stack = area.command(&["stack", &format!("change {i}")]);
+        stack.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+        let output = stack.output().unwrap();
+        assert!(output.status.success(), "stack failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(barrier_count(&output) > 0, "sanity: a stack pays durability barriers with fsync on");
+    }
+
+    let graph_root = warehouse.join(".forklift").join("graph");
+    let _ = std::fs::remove_dir_all(&graph_root);
+
+    let mut blame = area.command(&["blame", "f.txt"]);
+    blame.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = blame.output().unwrap();
+    assert!(output.status.success(), "blame failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let shards = std::fs::read_dir(&graph_root).map(|entries| entries.count()).unwrap_or(0);
+    assert!(shards > 0, "sanity: the cold blame must have built the commit-graph");
+    assert_eq!(barrier_count(&output), 0, "building the commit-graph must not pay a durability barrier");
 }

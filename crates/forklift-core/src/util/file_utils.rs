@@ -575,18 +575,39 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 /// primitive shares the exact same uniqueness discipline for its own fresh temp name, rather
 /// than reimplementing it — restaging never routes through `write_file_atomically` itself (see
 /// that module's no-self-trip rule), but there is no reason its temp-naming should differ.
+///
+/// The name can already exist, as litter from a dead process that had this same process id; a
+/// caller opening it `create_new` steps past that through [`create_fresh_temp`].
 pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
     static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let file_name = file_path.file_name()
         .ok_or(format!("Cannot write to \"{}\": it has no file name.", file_path.to_string_lossy()))?
         .to_string_lossy();
 
+    let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut temporary_file_path = PathBuf::from(file_path);
     temporary_file_path.set_file_name(format!("{}.tmp{}-{}", file_name, std::process::id(), write_id));
-
     Ok(temporary_file_path)
+}
+
+/// Create a fresh temporary file for replacing `file_path`, opened `create_new`, with names drawn
+/// from `next_name` ([`temp_path_for`] outside tests). A name that already exists is skipped: it
+/// can only be litter from a process that was killed mid-write and had this same process id
+/// (Windows reuses ids quickly), so no live process owns it, and the litter is left for whatever
+/// cleans it up. Retrying on `AlreadyExists`, rather than checking first, costs nothing when
+/// nothing collides and leaves no window between the check and the create. Any other error
+/// returns.
+fn create_fresh_temp(file_path: &Path,
+                     mut next_name: impl FnMut(&Path) -> Result<PathBuf, String>) -> Result<(PathBuf, std::fs::File), String> {
+    loop {
+        let path = next_name(file_path)?;
+        match std::fs::File::create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Error while writing file \"{}\": {}", path.to_string_lossy(), e)),
+        }
+    }
 }
 
 /// Write a file atomically: the content is written to a temporary file in the same folder first,
@@ -687,19 +708,7 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 ///                   before; or the folder sync after the rename failed, and `file_path` holds
 ///                   `content` with the durability of its new name unproven.
 pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
-    let temporary_file_path = temp_path_for(file_path)?;
-
-    let written = write_replacement(&temporary_file_path, file_path, content).and_then(|()|
-        std::fs::rename(&temporary_file_path, file_path).map_err(|e| format!(
-            "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
-        ))
-    );
-
-    if let Err(error) = written {
-        // Nothing was published; the temporary file is litter, and nobody else knows its name.
-        let _ = std::fs::remove_file(&temporary_file_path);
-        return Err(error);
-    }
+    publish_replacement(file_path, content, true)?;
 
     match file_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
@@ -707,18 +716,72 @@ pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Resul
     }
 }
 
-/// Write [`replace_file_atomically`]'s temporary file: created fresh, given `replaced`'s
-/// permission bits on Unix (when `replaced` exists) while still empty, then filled and fsynced
-/// through its own write handle.
+/// Replace a file whose loss is harmless — a **rebuildable cache** — atomically but with no
+/// durability barrier at all: a fresh temporary file in the same folder, renamed over
+/// `file_path`, with no file sync, no folder sync, no taint record, no [`BulkStoreSession`]
+/// staging and no [`BARRIER_COUNT`] increment.
+///
+/// What a reader may assume:
+///
+/// * **Concurrently, and after a process crash:** `file_path` holds the old content or the new
+///   one, complete — the rename is atomic, and a killed process loses nothing the kernel already
+///   holds.
+/// * **After a power loss or kernel crash:** anything. The old content, the new content, a torn
+///   or empty file, or no file at all — no filesystem's ordering is relied on.
+///
+/// So a caller must hold state for which every one of those outcomes is safe: a reader that
+/// verifies the bytes (the commit-graph checksums each shard) and treats anything unverifiable
+/// as absent, and a value that is only ever an accelerator, recomputable from durable state.
+/// Never use this for anything a reader trusts unverified, or whose loss changes what the
+/// warehouse means — the undo journal looked like a candidate and is not one, because a journal
+/// left behind the refs makes `undo` reverse an older operation than the user's last.
+///
+/// # Arguments
+/// * `file_path` - The file to replace (or create).
+/// * `content`   - Its complete new content.
+///
+/// # Returns
+/// * `Ok(())`      - `file_path` now holds `content` (not durably).
+/// * `Err(String)` - The write or the rename failed, and `file_path` still holds whatever it held
+///                   before.
+pub(crate) fn replace_file_unsynced(file_path: &Path, content: &[u8]) -> Result<(), String> {
+    publish_replacement(file_path, content, false)
+}
+
+/// Write a replacement into a fresh temporary file ([`create_fresh_temp`], then
+/// [`write_replacement`]) and rename it over `file_path`, removing the temporary file if either
+/// step fails. `sync` says whether the replacement's bytes are fsynced before the rename; the
+/// folder sync, if any, is the caller's.
+fn publish_replacement(file_path: &Path, content: &[u8], sync: bool) -> Result<(), String> {
+    let (temporary_file_path, file) = create_fresh_temp(file_path, temp_path_for)?;
+    let temporary_file_path = temporary_file_path.as_path();
+
+    let written = write_replacement(file, temporary_file_path, file_path, content, sync).and_then(|()|
+        std::fs::rename(temporary_file_path, file_path).map_err(|e| format!(
+            "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
+        ))
+    );
+
+    if let Err(error) = written {
+        // Nothing was published; the temporary file is litter, and nobody else knows its name.
+        let _ = std::fs::remove_file(temporary_file_path);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+/// Fill the temporary file `file`, open at `path`, for [`replace_file_atomically`] (`sync` set) or
+/// [`replace_file_unsynced`] (`sync` clear): already created fresh, given `replaced`'s
+/// permission bits on Unix (when `replaced` exists) while still empty, then filled and — when
+/// `sync` is set — fsynced through its own write handle.
 ///
 /// The permissions are set on the open handle rather than requested at creation, because a
 /// creation mode is filtered through the umask and would turn a `0664` file into `0644`.
-fn write_replacement(path: &Path, replaced: &Path, content: &[u8]) -> Result<(), String> {
+fn write_replacement(mut file: std::fs::File, path: &Path, replaced: &Path, content: &[u8], sync: bool) -> Result<(), String> {
     use std::io::Write;
 
     let error = |e: std::io::Error| format!("Error while writing file \"{}\": {}", path.to_string_lossy(), e);
-
-    let mut file = std::fs::File::create_new(path).map_err(error)?;
 
     // Only a file that is truly absent has no mode to keep; any other failure to read it would
     // quietly widen the replacement to the umask's default, so it refuses instead.
@@ -735,7 +798,7 @@ fn write_replacement(path: &Path, replaced: &Path, content: &[u8]) -> Result<(),
 
     file.write_all(content).map_err(error)?;
 
-    if fsync_enabled() {
+    if sync && fsync_enabled() {
         file.sync_all()
             .map_err(|e| format!("Error while syncing file \"{}\": {}", path.to_string_lossy(), e))?;
     }
@@ -2861,6 +2924,37 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    #[test]
+    fn a_stale_temp_file_from_a_dead_process_with_the_same_id_does_not_block_a_write() {
+        // A process killed mid-write leaves `<name>.tmp<pid>-<n>` behind, and on Windows a later
+        // process can reuse that pid. The name source hands out three litter names first; the
+        // create must step past them to the fourth, rather than fail with "file exists", and must
+        // leave the litter alone.
+        let dir = std::env::temp_dir().join(format!("forklift-stale-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("metadata");
+        let names: Vec<PathBuf> = (0..4).map(|id| dir.join(format!("metadata.tmp1-{}", id))).collect();
+        for litter in &names[..3] {
+            std::fs::write(litter, b"litter").unwrap();
+        }
+
+        let mut source = names.clone().into_iter();
+        let (fresh, _file) = create_fresh_temp(&target, |_| Ok(source.next().expect("asked past the last name")))
+            .expect("a stale temp must not block the write");
+        assert_eq!(fresh, names[3], "the first name that does not exist must be the one created");
+        for litter in &names[..3] {
+            assert_eq!(std::fs::read(litter).unwrap(), b"litter", "litter must be left as it was");
+        }
+
+        // Any other failure returns rather than retrying forever.
+        let missing = dir.join("absent").join("metadata.tmp1-0");
+        let mut asked = 0;
+        let result = create_fresh_temp(&target, |_| { asked += 1; Ok(missing.clone()) });
+        assert!(result.is_err() && asked == 1, "a missing folder must fail at once, asked {} times", asked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn default_ignore_rules_cover_the_warehouse_folder_but_no_sibling() {
