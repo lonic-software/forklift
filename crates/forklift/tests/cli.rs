@@ -1126,13 +1126,23 @@ fn warehouse_with_a_nested_single_file_load(name: &str) -> TestWarehouse {
 
 #[test]
 fn an_edit_under_a_nested_single_file_load_is_visible_and_blocks_shift() {
-    let warehouse = warehouse_with_a_nested_single_file_load("nested-load-edit");
+    let warehouse = TestWarehouse::new("nested-load-edit");
+    warehouse.write_file("root.txt", "r\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
     assert_success(&warehouse.run(&["palletize", "feature"]));
     warehouse.write_file("a/b/c.txt", "feature\n");
-    assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
+    assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
+    // A shift rebuilds every shard from the tree, so the single-file load and the edit come
+    // after it: the load registers only a/b itself.
+    warehouse.write_file("a/b/c.txt", "c\n");
+    assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
+    assert_success(&warehouse.run(&["stack", "nested"]));
     warehouse.write_file("a/b/c.txt", "local\n");
     assert!(changes(&warehouse, "unstaged").contains(&("modified".to_string(), "a/b/c.txt".to_string())));
 
