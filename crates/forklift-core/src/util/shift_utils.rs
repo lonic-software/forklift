@@ -516,8 +516,16 @@ fn write_chunked_file(path: &str,
         fs_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     ));
 
+    // Whatever already sits at the temp path (a leftover from an interrupted assembly, or an
+    // entry a tree planted there, a symlink included) is removed, and the temp file is created
+    // new: opening an existing path would follow a symlink and assemble into its target.
+    if std::fs::symlink_metadata(&temp_path).is_ok() {
+        std::fs::remove_file(&temp_path)
+            .map_err(|e| format!("Error while clearing \"{}\": {}", temp_path.to_string_lossy(), e))?;
+    }
+
     let assemble = || -> Result<(), String> {
-        let file = std::fs::File::create(&temp_path)
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)
             .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
         let mut writer = std::io::BufWriter::new(file);
 
@@ -756,14 +764,15 @@ mod tests {
     #[test]
     fn windows_accepts_names_that_only_resemble_reserved_ones() {
         for name in ["CONSOLE", "con_", "COM0", "COM10", "LPT", "auxiliary.txt", ".con", "a.CON", "café",
-            "...a", "file.txt"] {
+            "...a", "file.txt", "abé.txt", "a€", "€"] {
             assert_eq!(windows_component_problem(name), None, "{:?} must be accepted", name);
         }
     }
 
     #[test]
     fn a_path_inside_the_metadata_folder_is_refused_in_any_case() {
-        for path in [".forklift/config", ".ForkLift/objects/x", ".forklift./x", ".FORKLIFT /x", ".forklift"] {
+        for path in [".forklift/config", ".ForkLift/objects/x", ".forklift./x", ".FORKLIFT /x", ".forklift",
+            ".for\u{212A}lift/config"] {
             let error = check_working_path(path).expect_err(path);
             assert!(error.contains(&format!("{:?}", path)), "{}", error);
         }
