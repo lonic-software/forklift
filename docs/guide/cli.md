@@ -231,8 +231,10 @@ over it still succeeds, as a no-op that just clears the marker.
 A load refuses outright when a folder's stored inventory cannot be read (a truncated file
 after a crash, say), rather than rebuilding it: the inventory is what says which files are
 tracked, and a rebuild would quietly stop tracking any file an ignore rule covers.
-`restore --staged <folder>` resets that folder's inventory to the pallet head, unstaging
-what was staged in it; the error names the exact command.
+`restore --staged <folder>` resets the inventory of that folder and every folder below it to
+the pallet head, unstaging everything staged there; the error names the exact command. Then
+load the folder again, and load by name any file an ignore rule covers that you had loaded by
+name: a folder load never adds those.
 
 ### `unload` — unstage (`ul`)
 

@@ -1054,10 +1054,13 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         let existing_inventory = match file_utils::retrieve_inventory_or_none_by_key(path.as_key())? {
             (shard_path, Some(bytes)) => {
                 let folder = if path.is_root() { "." } else { path.as_key() };
+                let quoted = format!("'{}'", folder.replace('\'', "'\\''"));
                 let unreadable = |e: String| format!(
                     "The inventory of folder \"{}\" cannot be read: {}. \"forklift restore --staged {}\" \
-                    resets it to the pallet head, unstaging what was staged in that folder.",
-                    folder, e, folder
+                    resets it, and every folder below it, to the pallet head, unstaging everything staged \
+                    there. Then load the folder again, naming any file an ignore rule covers that you had \
+                    loaded by name.",
+                    folder, e.trim_end_matches('.'), quoted
                 );
                 let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path)
                     .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m))
