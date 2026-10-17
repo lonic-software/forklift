@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::stocktake_utils::ChangeKind;
-use forklift_core::util::{inventory_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
+use forklift_core::util::{alias_utils, inventory_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
@@ -84,18 +84,13 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
         &target_tree_hash
     )?;
 
-    // New files must never overwrite untracked content. This is checked up front, before
-    // anything is touched, so a conflict aborts the shift with the warehouse unchanged.
-    let conflicts = shift_utils::collect_untracked_collisions(&ops)?;
-
-    if !conflicts.is_empty() {
-        return Err(format!(
-            "Shifting to \"{}\" would overwrite these untracked files:\n  {}\n\
-            Move them out of the way (or load and stack them) first.",
-            target,
-            conflicts.join("\n  ")
-        ));
-    }
+    // New files must never overwrite untracked content, nor land on another entry through a
+    // case alias. This is checked up front, before anything is touched, so a conflict aborts
+    // the shift with the warehouse unchanged.
+    alias_utils::refuse_collisions(
+        &format!("Shifting to \"{}\"", target),
+        &shift_utils::collect_collisions(&ops, &removed_dirs)?,
+    )?;
 
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 

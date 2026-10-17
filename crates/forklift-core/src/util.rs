@@ -22,6 +22,7 @@ pub mod cherry_pick_utils;
 pub mod pallet_utils;
 pub mod park_utils;
 pub mod shift_utils;
+pub mod alias_utils;
 pub mod scope_utils;
 pub mod prune_utils;
 pub mod stocktake_utils;

@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{file_utils, inventory_utils, object_utils, office_utils, tree_utils};
+use crate::util::{alias_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -18,7 +18,9 @@ pub enum FileOp {
         /// The type of the entry (normal / executable / symlink).
         item_type: DirEntryType,
         /// Whether the file is new (it does not exist in the source tree). New files must
-        /// not overwrite anything — an existing (untracked) file at the path is a conflict.
+        /// not overwrite anything: whatever the path resolves to on disk — an untracked file,
+        /// or on a case-insensitive file system another entry spelled differently — is a
+        /// conflict (see [`collect_collisions`]), and the write creates the file exclusively.
         is_new: bool,
     },
 
@@ -201,39 +203,89 @@ fn diff_directory(from: Option<&TreeItem>,
     Ok(())
 }
 
-/// Find the new-file writes in `ops` that would overwrite something already on disk: used
-/// up front by `shift` and consolidate's fast-forward path, before anything is touched.
+/// What a diff removes before it writes: every `Remove` path, and every source-only directory
+/// (`remove_empty_directories` tries exactly those). A case-only rename's old name is one of
+/// these, so its occupancy of the new name is no collision (see
+/// [`alias_utils::AliasCheck::judge`]).
+pub struct OpRemovals {
+    files: HashSet<String>,
+    dirs: HashSet<String>,
+}
+
+impl OpRemovals {
+    /// The removals of one diff.
+    pub fn of(ops: &[FileOp], removed_dirs: &[String]) -> OpRemovals {
+        OpRemovals {
+            files: ops.iter()
+                .filter_map(|op| match op {
+                    FileOp::Remove { path } => Some(path.clone()),
+                    FileOp::Write { .. } => None,
+                })
+                .collect(),
+            dirs: removed_dirs.iter().cloned().collect(),
+        }
+    }
+}
+
+impl alias_utils::Removals for OpRemovals {
+    fn removes_file(&self, key: &str) -> bool {
+        self.files.contains(key)
+    }
+
+    fn removes_directory(&self, key: &str) -> bool {
+        self.dirs.contains(key)
+    }
+}
+
+/// Find the new-file writes in `ops` that would overwrite something already on disk: used up
+/// front, before anything is touched, by every diff-driven materializer (`shift`, consolidate's
+/// fast-forward, [`materialize_tree`], `park` and `unpark`).
 ///
-/// A path that exists on disk is not a collision when it is a tracked, fully clean
-/// directory (every entry beneath it tracked) — that is a tracked directory the diff is
-/// legitimately replacing with a file (a dir→file flip). Applying the diff must then delete
-/// the directory's contents before writing the file (see `apply_ops`); a directory with any
+/// A new path is judged by what the file system resolves it to, not by `exists()` (see
+/// [`alias_utils`]): a path that only resolves through a case alias of an entry this diff
+/// removes is free (a case-only rename), one that aliases a tracked entry that stays is refused
+/// naming both, and two new paths the volume would land on one file are refused naming both.
+///
+/// A path that exists on disk under its own name is not a collision when it is a tracked, fully
+/// clean directory (every entry beneath it tracked) — that is a tracked directory the diff is
+/// legitimately replacing with a file (a dir→file flip). Applying the diff must then delete the
+/// directory's contents before writing the file (see `apply_ops`); a directory with any
 /// untracked content beneath it is a genuine collision and still refuses.
 ///
 /// # Arguments
-/// * `ops` - The file operations a diff produced.
+/// * `ops`          - The file operations a diff produced.
+/// * `removed_dirs` - The directories the same diff found source-only.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - The colliding paths (empty when there are none).
-/// * `Err(String)`      - If a directory or a shard could not be read or parsed.
-pub fn collect_untracked_collisions(ops: &[FileOp]) -> Result<Vec<String>, String> {
+/// * `Ok(Vec<Collision>)` - The collisions (empty when there are none).
+/// * `Err(String)`        - If a directory or a shard could not be read or parsed.
+pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec<alias_utils::Collision>, String> {
+    let removals = OpRemovals::of(ops, removed_dirs);
+    let mut check = alias_utils::AliasCheck::new();
     let mut collisions = Vec::new();
+    let mut created = Vec::new();
 
     for op in ops {
         let FileOp::Write { path, is_new: true, .. } = op else { continue };
 
-        let fs_path = Path::new(path);
+        created.push(path.as_str());
 
-        if !fs_path.exists() {
-            continue;
+        match check.judge(path, &removals)? {
+            alias_utils::Verdict::Proceed => {}
+            alias_utils::Verdict::Refuse(collision) => collisions.push(collision),
+            alias_utils::Verdict::Exists => {
+                let fs_path = Path::new(path);
+
+                if fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(path)? {
+                    continue;
+                }
+
+                collisions.push(alias_utils::Collision::Untracked(path.clone()));
+            }
         }
-
-        if fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(path)? {
-            continue;
-        }
-
-        collisions.push(path.clone());
     }
+
+    collisions.extend(check.created_pairs(created, &removals)?);
 
     Ok(collisions)
 }
@@ -253,21 +305,44 @@ pub fn collect_untracked_collisions(ops: &[FileOp]) -> Result<Vec<String>, Strin
 /// * `Ok(())`      - If every operation applied.
 /// * `Err(String)` - If a file system operation failed.
 pub fn apply_ops(ops: &[FileOp], removed_dirs: &[String]) -> Result<(), String> {
-    for op in ops {
-        if matches!(op, FileOp::Remove { .. }) {
-            apply_file_op(op)?;
-        }
+    apply_ops_each(ops, removed_dirs, |_| Ok(()))
+}
+
+/// [`apply_ops`], calling `after` with each operation once it has applied (for progress, or to
+/// stage it). The one place the removals-first order lives: every materializer applies through
+/// here.
+///
+/// # Arguments
+/// * `ops`          - The file operations to apply.
+/// * `removed_dirs` - The directories a diff found source-only (deepest first).
+/// * `after`        - Called after each operation applies; an error stops the run.
+///
+/// # Returns
+/// * `Ok(())`      - If every operation applied.
+/// * `Err(String)` - If a file system operation, or `after`, failed.
+pub fn apply_ops_each(ops: &[FileOp],
+                      removed_dirs: &[String],
+                      mut after: impl FnMut(&FileOp) -> Result<(), String>) -> Result<(), String> {
+    for op in ops.iter().filter(|op| matches!(op, FileOp::Remove { .. })) {
+        apply_file_op(op)?;
+        after(op)?;
     }
 
     remove_empty_directories(removed_dirs);
 
-    for op in ops {
-        if matches!(op, FileOp::Write { .. }) {
-            apply_file_op(op)?;
-        }
+    for op in ops.iter().filter(|op| matches!(op, FileOp::Write { .. })) {
+        apply_file_op(op)?;
+        after(op)?;
     }
 
     Ok(())
+}
+
+/// The warehouse path a file operation acts on.
+pub fn op_path(op: &FileOp) -> &str {
+    match op {
+        FileOp::Write { path, .. } | FileOp::Remove { path } => path,
+    }
 }
 
 /// Apply a file operation to the working directory.
@@ -280,7 +355,7 @@ pub fn apply_ops(ops: &[FileOp], removed_dirs: &[String]) -> Result<(), String> 
 /// * `Err(String)` - If a file system operation failed.
 pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
     match op {
-        FileOp::Write { path, hash, item_type, .. } => write_tracked_file(path, hash, *item_type),
+        FileOp::Write { path, hash, item_type, is_new } => write_tracked_file(path, hash, *item_type, *is_new),
         FileOp::Remove { path } => {
             check_working_path(path)?;
 
@@ -297,15 +372,23 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
 /// Write a tracked file (normal, executable or symlink) from its blob to the working
 /// directory, creating parent directories as needed.
 ///
+/// A `create` write is of a path the source tree did not hold: it removes nothing first and
+/// creates the file exclusively, so whatever already resolves at the path — on a case-folding
+/// volume, another entry under a different spelling — fails the write loudly instead of being
+/// truncated, replaced or deleted. It is the backstop under the up-front checks
+/// ([`collect_collisions`] and the merge's), for any alias they cannot see.
+///
 /// # Arguments
 /// * `path`      - The warehouse path of the file.
 /// * `hash`      - The blob hash of the content.
 /// * `item_type` - The type of the entry.
+/// * `create`    - Whether the path is new (nothing of ours is at it): create, never replace.
 ///
 /// # Returns
 /// * `Ok(())`      - If the file was written.
-/// * `Err(String)` - If the blob could not be loaded or a file system operation failed.
-pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Result<(), String> {
+/// * `Err(String)` - If the blob could not be loaded, something already exists at a `create`
+///                   path, or a file system operation failed.
+pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType, create: bool) -> Result<(), String> {
     check_working_path(path)?;
 
     let fs_path = Path::new(path);
@@ -321,7 +404,7 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
     // chunk in memory at a time, never the whole file). Dispatched on the tree entry type with no
     // extra object load to discover the path.
     if item_type.is_chunked() {
-        return write_chunked_file(path, fs_path, hash, item_type);
+        return write_chunked_file(path, fs_path, hash, item_type, create);
     }
 
     let blob = object_utils::load_blob(hash)?;
@@ -330,16 +413,20 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
         let target = String::from_utf8(blob.content)
             .map_err(|_| format!("The symlink target stored for \"{}\" is not valid UTF-8.", path))?;
 
-        // A symlink cannot be overwritten in place; remove whatever is at the path first.
-        match std::fs::remove_file(fs_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Error while replacing \"{}\": {}", path, e)),
+        // A symlink cannot be overwritten in place; remove whatever is at the path first —
+        // unless the path is new, where what resolves there is not ours to remove and
+        // `symlink` refuses it on its own.
+        if !create {
+            match std::fs::remove_file(fs_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Error while replacing \"{}\": {}", path, e)),
+            }
         }
 
         #[cfg(unix)]
         return std::os::unix::fs::symlink(&target, fs_path)
-            .map_err(|e| format!("Error while creating symlink \"{}\": {}", path, e));
+            .map_err(|e| creation_error(path, "creating symlink", e));
 
         #[cfg(windows)]
         return Err(format!(
@@ -348,7 +435,40 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
         ));
     }
 
+    if create {
+        return create_regular_file(fs_path, path, &blob.content, item_type);
+    }
+
     write_regular_file(fs_path, path, &blob.content, item_type)
+}
+
+/// The error for a failed write of a new path: an occupant names the backstop that caught it.
+fn creation_error(path: &str, what: &str, e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        format!(
+            "Error while {} \"{}\": something already exists at that path on disk (on a \
+            case-insensitive file system, possibly another entry spelled differently); it was \
+            left untouched.",
+            what, path
+        )
+    } else {
+        format!("Error while {} \"{}\": {}", what, path, e)
+    }
+}
+
+/// Create a regular file at a new path exclusively (see [`write_tracked_file`]'s `create`).
+fn create_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(fs_path)
+        .map_err(|e| creation_error(path, "creating", e))?;
+
+    std::io::Write::write_all(&mut file, content)
+        .map_err(|e| format!("Error while writing \"{}\": {}", path, e))?;
+    drop(file);
+
+    set_file_mode(fs_path, path, item_type)
 }
 
 /// Write `content` to the working directory at `path` as a regular file, creating parent
@@ -359,11 +479,14 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
 /// * `path`      - The warehouse path of the file.
 /// * `content`   - The bytes to write.
 /// * `item_type` - The entry type, for the executable bit.
+/// * `create`    - Whether the path is new to the working directory: then the file is created
+///                 exclusively, as [`write_tracked_file`] does, and anything already there is an
+///                 error rather than overwritten.
 ///
 /// # Returns
 /// * `Ok(())`      - If the file was written.
 /// * `Err(String)` - If the path is refused or a file system operation failed.
-pub fn write_working_file(path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
+pub fn write_working_file(path: &str, content: &[u8], item_type: DirEntryType, create: bool) -> Result<(), String> {
     check_working_path(path)?;
 
     let fs_path = Path::new(path);
@@ -372,6 +495,10 @@ pub fn write_working_file(path: &str, content: &[u8], item_type: DirEntryType) -
         if !parent.as_os_str().is_empty() {
             file_utils::create_folder_if_not_exists(parent)?;
         }
+    }
+
+    if create {
+        return create_regular_file(fs_path, path, content, item_type);
     }
 
     write_regular_file(fs_path, path, content, item_type)
@@ -503,7 +630,8 @@ pub fn windows_component_problem(name: &str) -> Option<&'static str> {
 fn write_chunked_file(path: &str,
                       fs_path: &Path,
                       recipe_hash: &str,
-                      item_type: DirEntryType) -> Result<(), String> {
+                      item_type: DirEntryType,
+                      create: bool) -> Result<(), String> {
     // Assembly can fail its integrity check partway; assemble into a temp file and only then
     // rename it into place (durable-before-destructive). The original at `fs_path` — an existing
     // file or symlink — survives untouched until the temp is proven good: a failed materialization
@@ -526,6 +654,17 @@ fn write_chunked_file(path: &str,
     let placed = assemble().and_then(|()| {
         set_file_mode(&temp_path, path, item_type)?;
 
+        // A new path is claimed exclusively before the rename lands on it: the rename replaces
+        // whatever is at the target, so without the claim an alias would be replaced silently.
+        // On a failure below, the claimed (empty) placeholder is removed again.
+        if create {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(fs_path)
+                .map_err(|e| creation_error(path, "creating", e))?;
+        }
+
         match std::fs::rename(&temp_path, fs_path) {
             Ok(()) => Ok(()),
             // A bay may live on another file system than the metadata folder.
@@ -534,6 +673,7 @@ fn write_chunked_file(path: &str,
             }
             Err(e) => Err(format!("Error while finalizing \"{}\": {}", path, e)),
         }
+        .inspect_err(|_| if create { let _ = std::fs::remove_file(fs_path); })
     });
 
     let _ = std::fs::remove_file(&temp_path);
@@ -783,7 +923,8 @@ fn join_key(key: &str, name: &str) -> String {
 /// Materialize a target tree over the working directory and rebuild the whole staging
 /// area from it — the shared engine of every head-moving operation that arrives from a
 /// remote (`lower`, `franchise`). Refuses up front (before anything is touched) when a
-/// new file would overwrite untracked content.
+/// new file would overwrite untracked content or land on another entry through a case alias
+/// (see [`collect_collisions`]).
 ///
 /// # Arguments
 /// * `from_tree`  - The tree the working directory currently matches (`None` for an
@@ -801,33 +942,20 @@ pub fn materialize_tree(from_tree: Option<&str>,
                         progress: &Progress) -> Result<(), String> {
     let (ops, removed_dirs) = diff_trees(from_tree, to_tree)?;
 
-    let conflicts: Vec<&String> = ops.iter()
-        .filter_map(|op| match op {
-            FileOp::Write { path, is_new: true, .. }
-                if std::path::Path::new(path).exists() => Some(path),
-            _ => None,
-        })
-        .collect();
-
-    if !conflicts.is_empty() {
-        return Err(format!(
-            "{} would overwrite these untracked files:\n  {}\n\
-            Move them out of the way (or load and stack them) first.",
-            operation,
-            conflicts.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n  ")
-        ));
-    }
+    alias_utils::refuse_collisions(operation, &collect_collisions(&ops, &removed_dirs)?)?;
 
     progress.status("Writing files");
 
-    for (done, op) in ops.iter().enumerate() {
-        apply_file_op(op)?;
-        progress.fraction(done + 1, ops.len(), || match op {
-            FileOp::Write { path, .. } | FileOp::Remove { path } => path.clone(),
-        });
-    }
+    // In `apply_ops`'s order — every removal, then the emptied directories, then every write —
+    // never the diff's own (writes first, per directory): across a case-only rename the write
+    // would land on the old name through the alias and the removal after it would delete it.
+    let mut done = 0;
 
-    remove_empty_directories(&removed_dirs);
+    apply_ops_each(&ops, &removed_dirs, |op| {
+        done += 1;
+        progress.fraction(done, ops.len(), || op_path(op).to_string());
+        Ok(())
+    })?;
 
     progress.status("Rebuilding the inventory");
 

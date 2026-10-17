@@ -397,7 +397,9 @@ pub enum TrackedKind {
 pub fn tracked_kind(path: &WarehousePath) -> Result<TrackedKind, String> {
     let is_directory_on_disk = match std::fs::symlink_metadata(path.to_fs_path()) {
         Ok(metadata) => metadata.is_dir(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // A file where a component of the path should be: nothing is at the path itself, and
+        // whatever writes it refuses on the file.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => false,
         Err(e) => return Err(format!("Error while getting metadata for path \"{}\": {}", path.as_key(), e)),
     };
 
