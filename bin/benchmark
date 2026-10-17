@@ -475,8 +475,12 @@ build_report() {
             echo "- \`forklift compact --all --redelta\`: $(fmt_ms "$FORK_REDELTA_MS") (one-shot densify: ${FORK_SIZE_IMPORT:-?} → ${FORK_SIZE:-?})"
         fi
         echo
-        echo "> Quick comparison on one machine, not a published benchmark. For tighter"
-        echo "> statistics install \`hyperfine\`; the harness then times with it. See docs/BENCHMARK.md."
+        if [ "$HYPERFINE" -eq 1 ]; then
+            echo "> One machine, one run of the harness. See docs/BENCHMARK.md for the fairness caveats."
+        else
+            echo "> Quick comparison on one machine, not a published benchmark. For tighter"
+            echo "> statistics install \`hyperfine\`; the harness then times with it. See docs/BENCHMARK.md."
+        fi
     else
         echo
         echo "Benchmark: forklift vs git — $REPO_NAME"
@@ -500,7 +504,9 @@ build_report() {
             printf '    compact --all --redelta  %-7s (one-shot densify: %s -> %s)\n' "$(fmt_ms "$FORK_REDELTA_MS")" "${FORK_SIZE_IMPORT:-?}" "${FORK_SIZE:-?}"
         fi
         echo
-        echo "  Quick comparison on one machine — install hyperfine and the harness times with it."
+        if [ "$HYPERFINE" -eq 0 ]; then
+            echo "  Quick comparison on one machine — install hyperfine and the harness times with it."
+        fi
         echo "  See docs/BENCHMARK.md for the fairness caveats."
     fi
 }
