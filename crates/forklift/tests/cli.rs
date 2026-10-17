@@ -4145,8 +4145,11 @@ fn a_bay_whose_path_file_is_missing_still_lists_and_removes() {
     let bay_dir = warehouse.home.join("bay-missing");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
 
-    // No path file is recorded, unlike a damaged one: nothing is misread, and the bay is removable.
+    // The state a `bay add` that failed writing its path file leaves: the path file is written
+    // before the redirect, so neither exists. Unlike a damaged path file, nothing is misread, and
+    // the bay is removable.
     std::fs::remove_file(warehouse.root.join(".forklift/bays/feature/path")).unwrap();
+    std::fs::remove_file(bay_dir.join(".forklift")).unwrap();
 
     let listed = warehouse.run(&["bay"]);
     assert_success(&listed);
@@ -4154,6 +4157,7 @@ fn a_bay_whose_path_file_is_missing_still_lists_and_removes() {
 
     assert_success(&warehouse.run(&["bay", "remove", "feature"]));
     assert!(!warehouse.root.join(".forklift/bays/feature").exists());
+    assert!(!bay_dir.join(".forklift").exists());
 }
 
 #[test]

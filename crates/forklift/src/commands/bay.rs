@@ -86,8 +86,10 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     std::fs::create_dir_all(&bay_dir)
         .map_err(|e| format!("Error while creating the bay directory \"{}\": {}", bay_dir.to_string_lossy(), e))?;
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
-    bay_utils::write_bay_redirect(&bay_dir, &warehouse_root, name)?;
+    // The path file is written before the redirect, so a bay without a path file never wrote
+    // one — which is what lets `bay remove` drop such a bay without leaving a redirect behind.
     bay_utils::write_bay_path(name, &bay_dir)?;
+    bay_utils::write_bay_redirect(&bay_dir, &warehouse_root, name)?;
 
     // Enter the bay to check out its pallet and materialize its working tree. The current
     // warehouse lock stored its path at acquire time, so switching context here does not
@@ -241,8 +243,9 @@ fn remove(name: &str) -> Result<(), String> {
     }
 
     // A bay that never recorded its working directory (its creation failed first) has no
-    // redirect to drop. One whose record cannot be read refuses: removing the state alone would
-    // leave that directory redirecting to a bay that no longer exists.
+    // redirect to drop: `bay add` writes the path file before the redirect. One whose record
+    // cannot be read refuses: removing the state alone would leave that directory redirecting
+    // to a bay that no longer exists.
     let bay_dir = bay_utils::read_bay_path(name).map_err(|e| format!(
         "{} To remove the bay by hand, delete the \".forklift\" file in its working directory and \
         the folder \"{}\".",
