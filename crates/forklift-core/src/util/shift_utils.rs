@@ -565,7 +565,10 @@ fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> 
     let pid = std::process::id();
     {
         let mut cleared = CLEARED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cleared.get_or_insert_with(Default::default).insert(dir.clone()) {
+        // Keyed absolute: a command may change directory mid-run (`bay add`), and the relative
+        // path would then name another folder.
+        let key = std::path::absolute(&dir).unwrap_or_else(|_| dir.clone());
+        if cleared.get_or_insert_with(Default::default).insert(key) {
             clear_other_assemblies(&dir, pid);
         }
     }
