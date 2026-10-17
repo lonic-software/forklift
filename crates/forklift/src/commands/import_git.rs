@@ -429,6 +429,12 @@ impl Converter {
     /// unchanged subtrees, so — like the bundle builder's closure walk — only changed paths
     /// are revisited, and each blob is considered exactly where history changed it.
     fn convert_tree(&mut self, git_hash: &str, path_prefix: &str) -> Result<String, String> {
+        // Before the memo: a tree first converted as a subdirectory, where any name is fine,
+        // can come back as a commit's root.
+        if path_prefix.is_empty() {
+            self.ensure_importable_root(git_hash)?;
+        }
+
         if let Some(hash) = self.trees.get(git_hash) {
             // Already imported (an identical directory elsewhere in history) — nothing to
             // store, but it is now the newest version at *this* path, so a later version
@@ -449,16 +455,6 @@ impl Converter {
             e, if path_prefix.is_empty() { "/" } else { path_prefix }
         ))?;
         for entry in entries {
-            // As `stack` refuses it: a top-level name some file system opens as `.forklift`
-            // could never be checked out there.
-            if path_prefix.is_empty() && office_utils::is_metadata_folder_name(&entry.name) {
-                return Err(format!(
-                    "The git tree {} has the top-level entry {:?}, which some file systems open as \
-                    the warehouse's metadata folder, so it cannot be imported.",
-                    git_hash, entry.name
-                ));
-            }
-
             let path = join_path(path_prefix, &entry.name);
             let child = match entry.mode.as_str() {
                 "40000" | "040000" => {
@@ -561,6 +557,26 @@ impl Converter {
         let depth = self.stored_depth.get(&base_hash).copied().unwrap_or(u32::MAX);
 
         Ok(Some((base_hash, bytes, depth)))
+    }
+
+    /// Refuse a root tree with a top-level name some file system opens as `.forklift`, as `stack`
+    /// does: a parcel carrying it could never be checked out there.
+    fn ensure_importable_root(&mut self, git_hash: &str) -> Result<(), String> {
+        let (_, bytes) = self.batch.read(git_hash)?;
+
+        let entries = parse_raw_tree(&bytes, self.oid_len)
+            .map_err(|e| format!("{} It is in the directory \"/\" of the git history.", e))?;
+        for entry in entries {
+            if office_utils::is_metadata_folder_name(&entry.name) {
+                return Err(format!(
+                    "The git tree {} has the top-level entry {:?}, which some file systems open as \
+                    the warehouse's metadata folder, so it cannot be imported.",
+                    git_hash, entry.name
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Rebuild a tree's object bytes from its git hash, for when the cache has evicted them.
