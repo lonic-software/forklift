@@ -2404,6 +2404,26 @@ fn symlinks_are_stored_as_symlinks_and_cycles_do_not_hang() {
     }
 }
 
+/// A symlink's identity is its own inode, read from the `lstat` the walk already holds: a dangling
+/// link has no target to `stat`, and it loads and stays clean like any other entry.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_loads_and_reads_clean() {
+    let warehouse = TestWarehouse::new("dangling-symlink");
+    warehouse.write_file("real.txt", "content\n");
+    std::os::unix::fs::symlink("nowhere", warehouse.root.join("dangling")).unwrap();
+    std::os::unix::fs::symlink("real.txt", warehouse.root.join("pointing")).unwrap();
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "links"]));
+
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(status["data"]["staged_count"], 0, "{}", status);
+    assert_eq!(status["data"]["unstaged_count"], 0, "{}", status);
+}
+
 #[test]
 fn diff_reports_unstaged_and_staged_line_changes() {
     let warehouse = TestWarehouse::new("diff");

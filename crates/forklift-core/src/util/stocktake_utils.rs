@@ -3,7 +3,6 @@ use std::fmt::Display;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use file_id::FileId;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::inventory::Inventory;
 use crate::model::task::change_walk::change_walk_context::ChangeWalkContext;
@@ -770,14 +769,12 @@ fn remove_consumed(changes: &mut Vec<Change>, consumed: &[bool]) {
     });
 }
 
-/// Get the (device, inode) pair of a file in the working directory, if it can be read.
+/// Get the (device, inode) pair of an entry in the working directory, if it can be read. It is
+/// the same symlink-own identity the inventory records, so a moved symlink pairs too.
 fn file_id_for_path(path: &str) -> Option<(u64, u64)> {
-    match file_utils::get_file_id_for_file(Path::new(path)).ok()? {
-        FileId::Inode { device_id, inode_number } => Some((device_id, inode_number)),
-        FileId::LowRes { volume_serial_number, file_index } =>
-            Some((volume_serial_number as u64, file_index)),
-        FileId::HighRes { .. } => None,
-    }
+    let metadata = file_utils::get_symlink_metadata_for_path(Path::new(path)).ok()?;
+
+    file_utils::get_device_and_inode(Path::new(path), &metadata).ok()
 }
 
 /// Hash a file in the working directory (without storing anything), exactly as `load`

@@ -6,6 +6,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use file_id::FileId;
 use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
@@ -2449,36 +2450,45 @@ pub fn get_content_modification_timestamp_for_file(file_metadata: &Metadata) -> 
         ).map(|time| time.as_secs())
 }
 
-/// Get the file ID for a file.
-/// On windows, we use the low resolution file ID.
+/// Get the (device, inode) identity of a directory entry, without following a symlink.
+///
+/// On unix the pair comes straight from `metadata`, which must be the entry's `symlink_metadata`:
+/// the walk already holds it, and a second, symlink-following `stat` per file was ~19% of the
+/// unstaged walk's CPU on git.git (FORK-183). A symlink therefore carries its own inode, never its
+/// target's, so a dangling link has an identity too.
 ///
 /// # Arguments
-/// * `path` - The path to the file.
+/// * `_path`    - The path of the entry (unused on unix).
+/// * `metadata` - The entry's `symlink_metadata`.
 ///
 /// # Returns
-/// * `Ok(FileId)`  - The file ID for the file.
-/// * `Err(String)` - If an error occurred while getting the file ID.
+/// * `Ok((u64, u64))` - The device and inode numbers.
+/// * `Err(String)`    - Never on unix.
 #[cfg(unix)]
-pub fn get_file_id_for_file(path: &Path) -> Result<FileId, String> {
-    file_id::get_file_id(path).map_err(|e|
-        format!("Error while getting file ID for file: {}", e)
-    )
+pub fn get_device_and_inode(_path: &Path, metadata: &Metadata) -> Result<(u64, u64), String> {
+    Ok((metadata.dev(), metadata.ino()))
 }
 
-/// Get the file ID for a file.
-/// On windows, we use the low resolution file ID.
+/// Get the (volume serial, file index) identity of a file.
+///
+/// Stable Rust exposes neither number through `Metadata` on Windows, so this opens the path for
+/// the low resolution file ID. Windows never materializes a symlink, so the followed file is the
+/// entry's own.
 ///
 /// # Arguments
-/// * `path` - The path to the file.
+/// * `path`      - The path of the file.
+/// * `_metadata` - The file's metadata (unused on Windows).
 ///
 /// # Returns
-/// * `Ok(FileId)`  - The file ID for the file.
-/// * `Err(String)` - If an error occurred while getting the file ID.
+/// * `Ok((u64, u64))` - The volume serial number and file index.
+/// * `Err(String)`    - If the file ID could not be read.
 #[cfg(windows)]
-pub fn get_file_id_for_file(path: &Path) -> Result<FileId, String> {
-    file_id::get_low_res_file_id(path).map_err(|e|
-        format!("Error while getting file ID for file: {}", e)
-    )
+pub fn get_device_and_inode(path: &Path, _metadata: &Metadata) -> Result<(u64, u64), String> {
+    match file_id::get_low_res_file_id(path) {
+        Ok(FileId::LowRes { volume_serial_number, file_index }) => Ok((volume_serial_number as u64, file_index)),
+        Ok(_) => Err("Only low resolution file IDs are supported.".to_string()),
+        Err(e) => Err(format!("Error while getting file ID for file: {}", e)),
+    }
 }
 
 /// Get the owners of a file (user ID and group ID).

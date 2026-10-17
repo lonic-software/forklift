@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use file_id::FileId;
 use crate::builder::inventory::InventoryBuilder;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::enums::dir_entry_type::DirEntryType;
@@ -1248,13 +1247,7 @@ pub fn build_inventory_item_from_stat(path: &Path,
     let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
-    let file_id = file_utils::get_file_id_for_file(path)?;
-
-    let (device_id, inode) = match file_id {
-        FileId::Inode { device_id, inode_number } => Ok((device_id, inode_number)),
-        FileId::LowRes { volume_serial_number, file_index } => Ok((volume_serial_number as u64, file_index)),
-        FileId::HighRes { .. } => Err("High resolution file IDs are not supported.".to_string()),
-    }?;
+    let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
 
     let (user_id, group_id) = file_utils::get_owners_for_file(&metadata);
 
@@ -2327,13 +2320,8 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
     };
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(metadata);
 
-    let Ok(file_id) = file_utils::get_file_id_for_file(path) else {
+    let Ok((device, inode)) = file_utils::get_device_and_inode(path, metadata) else {
         return false;
-    };
-    let (device, inode) = match file_id {
-        FileId::Inode { device_id, inode_number } => (device_id, inode_number),
-        FileId::LowRes { volume_serial_number, file_index } => (volume_serial_number as u64, file_index),
-        FileId::HighRes { .. } => return false,
     };
 
     // For symlinks the stored size is the length of the target path, which is not comparable
@@ -2435,13 +2423,7 @@ fn build_item_and_object_for_file(path: &Path,
     let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
-    let file_id = file_utils::get_file_id_for_file(path)?;
-
-    let (device_id, inode) = match file_id {
-        FileId::Inode { device_id, inode_number } => Ok((device_id, inode_number)),
-        FileId::LowRes { volume_serial_number, file_index } => Ok((volume_serial_number as u64, file_index)),
-        FileId::HighRes { .. } => Err("High resolution file IDs are not supported.".to_string()),
-    }?;
+    let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
 
     let (user_id, group_id) = file_utils::get_owners_for_file(&metadata);
     let ingested = object_utils::ingest_file(name, path, item_type, mode)?;
