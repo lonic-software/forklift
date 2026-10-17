@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use crate::error::CoreError;
-use crate::enums::object_type::ObjectType;
 use crate::globals::forklift_root;
 use crate::model::remote::MAX_MISSING_BATCH;
 use crate::util::{
@@ -514,9 +513,10 @@ fn emit_blob(pack: &mut pack_utils::TransportPackBuilder,
 /// of the maintainer's chosen posture for a grandfathered giant (an object authored before
 /// `MAX_OBJECT_BYTES` existed): it stays readable locally forever, but a bundle must never carry
 /// it, because no reader accepts it (the record-stream reader refuses its declared length
-/// pre-read, and the native reader refuses it on verification). Checked here, right after an object's bytes are loaded and before
-/// a single byte is written into the bundle stream — so a warehouse holding one anywhere in the
-/// closure fails loudly at the source, before writing anything a consumer could partially import.
+/// pre-read, and the native reader refuses it on verification). Checked here, right after an
+/// object's bytes are loaded and before a single byte is written into the bundle stream — so a
+/// warehouse holding one anywhere in the closure fails loudly at the source, before writing
+/// anything a consumer could partially import.
 fn refuse_if_transporting_over_ceiling(what: &str, len: usize) -> Result<(), CoreError> {
     scope_utils::refuse_if_over_object_ceiling(what, len)
 }
@@ -625,67 +625,79 @@ pub enum StreamAdmission {
     Requested(HashSet<String>),
 
     /// A subtree response: the object closure of this tree. The first admissible record is the
-    /// root itself, and each admitted tree makes its files and subtrees admissible — the order the
-    /// server's breadth-first closure walk emits, where every hash follows the tree naming it.
+    /// root itself, and each admitted tree makes its files and subtrees admissible — the order
+    /// the server's breadth-first closure walk emits, where every hash follows the tree naming it.
     /// At most [`MAX_MISSING_BATCH`] records are admitted, the server's own cap on one response.
     Closure { root: String },
 }
 
 /// The running state of a [`StreamAdmission`] over one stream.
 struct Admitter {
-    /// Every hash a record may still name, mapped to whether it is a tree to expand on admission.
+    /// Every hash a record may still name, mapped to whether it is a tree whose entries become
+    /// admissible once it is admitted — only ever true in a closure.
     expected: HashMap<String, bool>,
     admitted: HashSet<String>,
-    expand_trees: bool,
-    cap: usize,
+
+    /// A closure's root and record cap. A batch has neither: its requested set is its own bound.
+    closure: Option<(String, usize)>,
 }
 
 impl Admitter {
     fn new(admission: StreamAdmission) -> Self {
         match admission {
             StreamAdmission::Requested(hashes) => Admitter {
-                cap: hashes.len(),
                 expected: hashes.into_iter().map(|hash| (hash, false)).collect(),
                 admitted: HashSet::new(),
-                expand_trees: false,
+                closure: None,
             },
             StreamAdmission::Closure { root } => Admitter {
-                expected: HashMap::from([(root, true)]),
+                expected: HashMap::from([(root.clone(), true)]),
                 admitted: HashSet::new(),
-                expand_trees: true,
-                cap: MAX_MISSING_BATCH,
+                closure: Some((root, MAX_MISSING_BATCH)),
             },
         }
     }
 
-    /// Admit a record naming `hash`, or refuse it. `Ok(true)` when it is a tree whose children
+    /// Admit a record naming `hash`, or refuse it. `Ok(true)` when it is a tree whose entries
     /// [`Self::expand`] must make admissible once it is in the store.
     fn admit(&mut self, hash: &str) -> Result<bool, String> {
         if self.admitted.contains(hash) {
             return Err(format!("The remote sent object {} twice in one response; refusing it.", hash));
         }
 
-        let is_tree = match self.expected.get(hash) {
-            Some(is_tree) => *is_tree,
-            None => return Err(format!(
+        let Some(&is_tree) = self.expected.get(hash) else {
+            if let (Some((root, _)), true) = (&self.closure, self.admitted.is_empty()) {
+                return Err(format!(
+                    "The remote's subtree response starts at {}, not at the requested tree {}; \
+                    refusing it.", hash, root
+                ));
+            }
+
+            return Err(format!(
                 "The remote sent object {}, which this request did not ask for; refusing it.", hash
-            )),
+            ));
         };
 
-        if self.admitted.len() >= self.cap {
-            return Err(format!(
-                "The remote sent more than {} objects in one response; refusing it.", self.cap
-            ));
+        if let Some((_, cap)) = &self.closure {
+            if self.admitted.len() >= *cap {
+                return Err(format!(
+                    "The remote sent more than {} objects in one response; refusing it.", cap
+                ));
+            }
         }
 
         self.admitted.insert(hash.to_string());
 
-        Ok(is_tree && self.expand_trees)
+        Ok(is_tree)
     }
 
     /// Make an admitted tree's files and subtrees admissible. The tree is read from the store,
     /// which holds it whether this record stored it or it was already present (and the record
     /// skipped): the server sends every closure object it has, including ones the client holds.
+    ///
+    /// A chunked file's recipe is admitted as the file entry, but never its chunks: chunk
+    /// transport has not shipped, and the server's closure walk does not descend into recipes.
+    /// When it does, this must learn to expand a recipe too, or every such response is refused.
     fn expand(&mut self, tree_hash: &str) -> Result<(), String> {
         let tree = object_utils::load_tree(tree_hash)?;
 
@@ -879,7 +891,7 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         sections.push((data_len, index_len));
     }
 
-    let imported = pack_utils::import_transport_packs(reader, &sections)?;
+    let mut imported = pack_utils::import_transport_packs(reader, &sections)?;
     let total_objects = imported.stored_objects + imported.skipped_objects;
     let signature_count = read_u64_be(reader, "signature count")?;
     if signature_count > total_objects as u64 {
@@ -899,10 +911,9 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
     };
 
     // Each entry becomes its own sidecar file, so an entry is admitted only for a parcel the packs
-    // just imported, once: a sidecar naming anything else would cost a file for bytes the bundle
-    // never carried. The store is checked rather than the packs' own index because the only
-    // caller imports into a freshly prepared warehouse, where the two are the same set.
-    let mut seen_signatures: HashSet<String> = HashSet::new();
+    // carry, once: a sidecar naming anything else would cost a file for bytes the bundle never
+    // carried. Each admitted parcel moves from the carried set to the signed one.
+    let mut signed: HashSet<String> = HashSet::new();
 
     for _ in 0..signature_count {
         let mut hash_bytes = [0u8; 64];
@@ -917,18 +928,21 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         if length > object_utils::MAX_OBJECT_BYTES as u64 {
             return Err(oversized_record_refusal("signature", length));
         }
-        if !seen_signatures.insert(hash.clone()) {
-            return Err(format!("The bundle carries two signatures for {}; refusing it.", hash));
+        if !imported.parcels.remove(&hash) {
+            return Err(if signed.contains(&hash) {
+                format!("The bundle carries two signatures for {}; refusing it.", hash)
+            } else {
+                format!(
+                    "The bundle carries a signature for {}, which is not a parcel it carries; \
+                    refusing it.", hash
+                )
+            });
         }
-        if !names_stored_parcel(&hash)? {
-            return Err(format!(
-                "The bundle carries a signature for {}, which is not a parcel it carries; refusing it.",
-                hash
-            ));
-        }
+        signed.insert(hash.clone());
         let payload = read_exact_payload(reader, length)?;
-        // An already-present sidecar wins and the bundle's copy is skipped — even a conflicting one, whose refusal would otherwise fail
-        // the import after its packs were already published.
+        // An already-present sidecar wins and the bundle's copy is skipped — even a conflicting
+        // one, whose refusal would otherwise fail the import after its packs were already
+        // published.
         if sign_utils::load_raw_parcel_signature(&hash)?.is_some() {
             stats.skipped_records += 1;
         } else {
@@ -977,17 +991,6 @@ fn read_exact_payload<R: Read>(reader: &mut R, length: u64) -> Result<Vec<u8>, S
     }
 
     Ok(payload)
-}
-
-/// Whether `hash` names a parcel in the store.
-fn names_stored_parcel(hash: &str) -> Result<bool, String> {
-    if !file_utils::does_object_exist(hash)? {
-        return Ok(false);
-    }
-
-    let bytes = file_utils::retrieve_object_by_hash(hash)?;
-
-    Ok(matches!(object_utils::peek_object_header(&bytes), Ok((ObjectType::Parcel, _))))
 }
 
 /// The refusal for a bundle record whose *declared* length is above the whole-object ceiling —
@@ -1197,9 +1200,10 @@ mod tests {
         assert!(error.contains(&MAX_HEADER_BYTES.to_string()), "names the bound: {}", error);
     }
 
-    /// A whole-warehouse bundle file is read only in the native format. Every record-stream header —
-    /// version 3 included, which partial responses still use — is refused as unsupported before a
-    /// record is read, so a clone handed such a file falls back to its verified walk.
+    /// A whole-warehouse bundle file is read only in the native format. Every record-stream
+    /// header — version 3 included, which partial responses still use — is refused as
+    /// unsupported before a record is read, so a clone handed such a file falls back to its
+    /// verified walk.
     #[test]
     fn import_bundle_refuses_every_record_stream_header() {
         let _scratch = Scratch::new("import-record-stream-headers");
@@ -1217,8 +1221,8 @@ mod tests {
     }
 
     /// A batch response may store only what the request named. An unrequested record is refused
-    /// on its hash alone — even one declaring `u64::MAX` bytes, which would otherwise be refused on
-    /// its length — and an honestly sized one is never stored.
+    /// on its hash alone — even one declaring `u64::MAX` bytes, which would otherwise be refused
+    /// on its length — and an honestly sized one is never stored.
     #[test]
     fn a_batch_refuses_an_object_it_did_not_ask_for() {
         let _scratch = Scratch::new("batch-unrequested");
@@ -1328,7 +1332,7 @@ mod tests {
 
         let error = import_closure_bytes(&raw_bundle(BUNDLE_HEADER_V3, &fixture.records), &fixture.subtree.0)
             .err().unwrap();
-        assert!(error.contains("did not ask for"), "{}", error);
+        assert!(error.contains("not at the requested tree"), "{}", error);
         assert!(!file_utils::does_object_exist(&fixture.root).unwrap(), "the foreign root never lands");
     }
 

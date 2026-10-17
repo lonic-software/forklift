@@ -940,10 +940,11 @@ struct StreamOutcome {
 /// lands and a failed import cleans up after itself.
 ///
 /// The whole-object ceiling (`MAX_OBJECT_BYTES`) is *not* enforced here: the bundle importer, its
-/// only caller, refuses a record whose declared length is above it before streaming a byte. The
-/// per-type
-/// chunk ceiling *is* enforced — a `Chunk`-typed object whose payload exceeds `MAX_CHUNK_BYTES` is
-/// refused mid-stream, exactly as [`store_object_bytes`] refuses it whole.
+/// only production caller, refuses a record whose declared length is above it before streaming a
+/// byte, and the bundle tests store their pre-ceiling giant fixture through this path because it
+/// skips the check. The per-type chunk ceiling *is* enforced — a `Chunk`-typed object whose
+/// payload exceeds `MAX_CHUNK_BYTES` is refused mid-stream, exactly as [`store_object_bytes`]
+/// refuses it whole.
 ///
 /// # Arguments
 /// * `claimed_hash` - The hash the streamed bytes must have.
