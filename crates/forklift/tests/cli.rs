@@ -2128,6 +2128,14 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
     let _ = std::fs::remove_dir_all(&graph_root);
     std::fs::write(&graph_root, "not a directory").unwrap();
 
+    // `blame` reads its parent edges through the graph and has no object-walk fallback of its
+    // own; the merge base below does fall back, so blame is the query that pins the graph's
+    // own tolerance.
+    let blame = warehouse.run(&["blame", "file.txt"]);
+    assert_success(&blame);
+    assert!(stdout(&blame).contains("ONE") && stdout(&blame).contains("five"),
+        "blame must answer from the object store: {}", stdout(&blame));
+
     assert_success(&warehouse.run(&["consolidate", "feature"]));
     assert_eq!(
         std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap(),
