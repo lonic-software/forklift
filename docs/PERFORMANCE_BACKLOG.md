@@ -382,8 +382,8 @@ barriers although losing it misreads nothing. It found two candidates, and only 
 qualified.
 
 * **The commit-graph moved.** It is a cache keyed by immutable parcel hash, and it was paying
-  two barriers per parcel on a cold build. A cold `blame` over 1,000 parcels took 16.05 s with
-  fsync and 0.24 s without, on the dev box. Shards are now published with
+  two barriers per parcel on a cold build. A cold `blame` over 1,000 parcels paid 1,999 barriers and
+  took 16–19 s with fsync, against 0.24–0.95 s without, across runs on the dev box. Shards are now published with
   `file_utils::replace_file_unsynced` (rename, no fsync), and the format went to v2 with a
   trailing blake3 checksum. The crash contract: after a power loss a shard may be old, torn,
   empty or missing. Every one of those reads as absent, or as a subset of correct records, and
@@ -391,12 +391,13 @@ qualified.
   checksum exists for. `crash_consistency.rs` pins the barrier count of a cold build at zero.
 * **The undo journal stays durable.** Its push is best-effort by contract and costs about 4 ms
   of a ~47 ms `stack`, but a lost unsynced push leaves the journal *behind* the refs. `undo`
-  would then quietly reverse an older operation than the user's last. An after-state gate
-  cannot detect that soundly, because un-journaled `palletize` and `deliver` move the current
-  pallet between journaled ops. The saving does not pay for the misread.
+  would then quietly reverse an older operation than the user's last. Undo's existing gate only
+  refuses when the surviving entry's own pallet has moved, so a lost op on another pallet, or a
+  surviving shift entry, slips past it. A full after-state gate cannot close that soundly,
+  because un-journaled `palletize` and `deliver` move the current pallet between journaled ops. The saving does not pay for the misread.
 * **Everything else is authoritative.** That covers refs, the current pallet, consolidation and
-  cherry-pick state, inventory, markers, scope, signatures, office anchors, bay records and
-  config. The store side is covered by the no-go list above.
+  cherry-pick state, inventory, markers, scope, signatures, office anchors, bay records,
+  config, the parked-parcel list and loose objects. The store side is covered by the no-go list above.
 * **Left over:** a cold graph still rewrites a whole shard on every `persist_records` call, which
   is cheap without fsync but quadratic per shard. Measure it at git.git scale before batching.
 
