@@ -166,8 +166,8 @@ impl MaterializationScope {
             return ScopeClass::InScope;
         }
 
-        // In scope: at or under some in-scope prefix.
-        for prefix in &self.prefixes {
+        // In scope: at or under some in-scope prefix, or the root ignore file.
+        for prefix in self.prefixes.iter().map(String::as_str).chain([crate::util::file_utils::FILENAME_IGNORE]) {
             if path == prefix || is_strictly_under(path, prefix) {
                 return ScopeClass::InScope;
             }

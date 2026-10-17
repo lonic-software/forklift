@@ -25,7 +25,8 @@ use crate::util::taint_utils;
 /// store (everything else under the object root, e.g. the `pack/` folder, is not one).
 pub const OBJECT_HASH_FOLDER_PATH_CHARACTERS: usize = 2;
 
-const FILENAME_IGNORE: &str = ".forkliftignore";
+/// The ignore file, at the warehouse root. Its name is also its warehouse path key.
+pub const FILENAME_IGNORE: &str = ".forkliftignore";
 
 const IGNORE_FILE_COMMENT_PREFIX: &str = "#";
 
