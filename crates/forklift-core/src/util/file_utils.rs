@@ -575,18 +575,26 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 /// primitive shares the exact same uniqueness discipline for its own fresh temp name, rather
 /// than reimplementing it — restaging never routes through `write_file_atomically` itself (see
 /// that module's no-self-trip rule), but there is no reason its temp-naming should differ.
+///
+/// A name that already exists is skipped. It can only be litter from a process that was killed
+/// mid-write and had this same process id (Windows reuses ids quickly): no live process can
+/// own it, so stepping past it is safe, and the litter is left for whatever cleans it up.
+/// Without the skip, the fresh `create_new` open fails with "file exists".
 pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
     static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let file_name = file_path.file_name()
         .ok_or(format!("Cannot write to \"{}\": it has no file name.", file_path.to_string_lossy()))?
         .to_string_lossy();
 
-    let mut temporary_file_path = PathBuf::from(file_path);
-    temporary_file_path.set_file_name(format!("{}.tmp{}-{}", file_name, std::process::id(), write_id));
-
-    Ok(temporary_file_path)
+    loop {
+        let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut temporary_file_path = PathBuf::from(file_path);
+        temporary_file_path.set_file_name(format!("{}.tmp{}-{}", file_name, std::process::id(), write_id));
+        if std::fs::symlink_metadata(&temporary_file_path).is_err() {
+            return Ok(temporary_file_path);
+        }
+    }
 }
 
 /// Write a file atomically: the content is written to a temporary file in the same folder first,
@@ -2905,6 +2913,30 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    #[test]
+    fn a_stale_temp_file_from_a_dead_process_with_the_same_id_does_not_block_a_write() {
+        // A process killed mid-write leaves `<name>.tmp<pid>-<n>` behind, and on Windows a later
+        // process can reuse that pid. Litter is laid down at the next several names this process
+        // would pick; the atomic write must step past it rather than fail with "file exists".
+        let dir = std::env::temp_dir().join(format!("forklift-stale-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("metadata");
+
+        let probe = temp_path_for(&target).unwrap();
+        let probe_name = probe.file_name().unwrap().to_string_lossy().into_owned();
+        let next: u64 = probe_name.rsplit('-').next().unwrap().parse().unwrap();
+        for id in next + 1..next + 500 {
+            std::fs::write(dir.join(format!("metadata.tmp{}-{}", std::process::id(), id)), b"litter").unwrap();
+        }
+
+        let fresh = temp_path_for(&target).unwrap();
+        assert!(!fresh.exists(), "a temp name that already exists must be skipped: {}", fresh.display());
+        replace_file_atomically(&target, b"new").expect("a stale temp must not block the write");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn default_ignore_rules_cover_the_warehouse_folder_but_no_sibling() {
