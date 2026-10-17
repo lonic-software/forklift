@@ -689,17 +689,7 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
     let temporary_file_path = temp_path_for(file_path)?;
 
-    let written = write_replacement(&temporary_file_path, file_path, content).and_then(|()|
-        std::fs::rename(&temporary_file_path, file_path).map_err(|e| format!(
-            "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
-        ))
-    );
-
-    if let Err(error) = written {
-        // Nothing was published; the temporary file is litter, and nobody else knows its name.
-        let _ = std::fs::remove_file(&temporary_file_path);
-        return Err(error);
-    }
+    publish_replacement(&temporary_file_path, file_path, content, true)?;
 
     match file_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
@@ -707,13 +697,66 @@ pub(crate) fn replace_file_atomically(file_path: &Path, content: &[u8]) -> Resul
     }
 }
 
+/// Replace a file whose loss is harmless — a **rebuildable cache** — atomically but with no
+/// durability barrier at all: a fresh temporary file in the same folder, renamed over
+/// `file_path`, with no file sync, no folder sync, no taint record, no [`BulkStoreSession`]
+/// staging and no [`BARRIER_COUNT`] increment.
+///
+/// What a reader may assume:
+///
+/// * **Concurrently, and after a process crash:** `file_path` holds the old content or the new
+///   one, complete — the rename is atomic, and a killed process loses nothing the kernel already
+///   holds.
+/// * **After a power loss or kernel crash:** anything. The old content, the new content, a torn
+///   or empty file, or no file at all — no filesystem's ordering is relied on.
+///
+/// So a caller must hold state for which every one of those outcomes is safe: a reader that
+/// verifies the bytes (the commit-graph checksums each shard) and treats anything unverifiable
+/// as absent, and a value that is only ever an accelerator, recomputable from durable state.
+/// Never use this for anything a reader trusts unverified, or whose loss changes what the
+/// warehouse means — the undo journal looked like a candidate and is not one, because a journal
+/// left behind the refs makes `undo` reverse an older operation than the user's last.
+///
+/// # Arguments
+/// * `file_path` - The file to replace (or create).
+/// * `content`   - Its complete new content.
+///
+/// # Returns
+/// * `Ok(())`      - `file_path` now holds `content` (not durably).
+/// * `Err(String)` - The write or the rename failed, and `file_path` still holds whatever it held
+///                   before.
+pub(crate) fn replace_file_unsynced(file_path: &Path, content: &[u8]) -> Result<(), String> {
+    let temporary_file_path = temp_path_for(file_path)?;
+
+    publish_replacement(&temporary_file_path, file_path, content, false)
+}
+
+/// Write a replacement through [`write_replacement`] and rename it over `file_path`, removing the
+/// temporary file if either step fails. `sync` says whether the replacement's bytes are fsynced
+/// before the rename; the folder sync, if any, is the caller's.
+fn publish_replacement(temporary_file_path: &Path, file_path: &Path, content: &[u8], sync: bool) -> Result<(), String> {
+    let written = write_replacement(temporary_file_path, file_path, content, sync).and_then(|()|
+        std::fs::rename(temporary_file_path, file_path).map_err(|e| format!(
+            "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
+        ))
+    );
+
+    if let Err(error) = written {
+        // Nothing was published; the temporary file is litter, and nobody else knows its name.
+        let _ = std::fs::remove_file(temporary_file_path);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
 /// Write [`replace_file_atomically`]'s temporary file: created fresh, given `replaced`'s
-/// permission bits on Unix (when `replaced` exists) while still empty, then filled and fsynced
-/// through its own write handle.
+/// permission bits on Unix (when `replaced` exists) while still empty, then filled and — when
+/// `sync` is set — fsynced through its own write handle.
 ///
 /// The permissions are set on the open handle rather than requested at creation, because a
 /// creation mode is filtered through the umask and would turn a `0664` file into `0644`.
-fn write_replacement(path: &Path, replaced: &Path, content: &[u8]) -> Result<(), String> {
+fn write_replacement(path: &Path, replaced: &Path, content: &[u8], sync: bool) -> Result<(), String> {
     use std::io::Write;
 
     let error = |e: std::io::Error| format!("Error while writing file \"{}\": {}", path.to_string_lossy(), e);
@@ -735,7 +778,7 @@ fn write_replacement(path: &Path, replaced: &Path, content: &[u8]) -> Result<(),
 
     file.write_all(content).map_err(error)?;
 
-    if fsync_enabled() {
+    if sync && fsync_enabled() {
         file.sync_all()
             .map_err(|e| format!("Error while syncing file \"{}\": {}", path.to_string_lossy(), e))?;
     }

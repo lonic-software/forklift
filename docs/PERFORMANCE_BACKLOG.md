@@ -359,8 +359,9 @@ itself as well as the findings.
      distinct directories still costs more than one that touches a few; queued for PR B.
 4. **`restore <dir>` (plain) and `park pop`** — ~9.2–9.6 ms/file; same join-point
    primitive as #2, bundles with it. Queued for PR B.
-5. **`remove <dir>`'s per-shard loop and commit-graph multi-shard writes** —
-   untimed, small, rare operations; demand-gated.
+5. **`remove <dir>`'s per-shard loop** — untimed, small, rare; demand-gated. (The
+   commit-graph's multi-shard writes, once listed here, pay no barrier at all since
+   FORK-162 — see "Best-effort state" below.)
 
 **Confirmed already-batched (class a).** The `load` join point, `cleanup_after_stack_with`,
 `replace_all`/`subtree_inventories`, and `stack`'s tree+parcel batch. `restore --staged`
@@ -375,6 +376,29 @@ PR A's changes stay inside this list: blobs join the *same* barrier as the shard
 content that references them (at least as strong as "no later than"), and `park`'s
 object batch (blobs/trees/parcel) is finished strictly before the signature sidecar
 and the parked-list record, exactly like `stack`'s identical ordering.
+
+**Best-effort state (FORK-162, 2026-10-17).** A second sweep looked for state that pays full
+barriers although losing it misreads nothing. It found two candidates, and only one of them
+qualified.
+
+* **The commit-graph moved.** It is a cache keyed by immutable parcel hash, and it was paying
+  two barriers per parcel on a cold build. A cold `blame` over 1,000 parcels took 16.05 s with
+  fsync and 0.24 s without, on the dev box. Shards are now published with
+  `file_utils::replace_file_unsynced` (rename, no fsync), and the format went to v2 with a
+  trailing blake3 checksum. The crash contract: after a power loss a shard may be old, torn,
+  empty or missing. Every one of those reads as absent, or as a subset of correct records, and
+  is rebuilt. A torn shard can no longer be misparsed into wrong ancestry, which is the case the
+  checksum exists for. `crash_consistency.rs` pins the barrier count of a cold build at zero.
+* **The undo journal stays durable.** Its push is best-effort by contract and costs about 4 ms
+  of a ~47 ms `stack`, but a lost unsynced push leaves the journal *behind* the refs. `undo`
+  would then quietly reverse an older operation than the user's last. An after-state gate
+  cannot detect that soundly, because un-journaled `palletize` and `deliver` move the current
+  pallet between journaled ops. The saving does not pay for the misread.
+* **Everything else is authoritative.** That covers refs, the current pallet, consolidation and
+  cherry-pick state, inventory, markers, scope, signatures, office anchors, bay records and
+  config. The store side is covered by the no-go list above.
+* **Left over:** a cold graph still rewrites a whole shard on every `persist_records` call, which
+  is cheap without fsync but quadratic per shard. Measure it at git.git scale before batching.
 
 **Implementation note.** Several loops call `update_shard` per file against the
 same shard; the batching work needs to collapse same-shard actions into one

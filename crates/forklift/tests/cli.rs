@@ -1996,6 +1996,63 @@ fn commit_graph_is_built_by_compact_and_ancestry_stays_correct() {
     assert!(feature_head.len() == 64, "sanity: a full parcel hash was captured");
 }
 
+/// Commit-graph shards are written without a durability barrier, so a power loss can leave one
+/// torn. A torn shard must read as absent — never as wrong ancestry — and be rewritten whole by
+/// the next query that needs it. Every shard is corrupted here (one flipped byte each, so each
+/// still has the right magic, version and length), and the merge that reads the graph must still
+/// find the right base.
+#[test]
+fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
+    let warehouse = TestWarehouse::new("commit-graph-corrupt");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nfive\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "main work"]));
+
+    assert_success(&warehouse.run(&["compact"]));
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let shards: Vec<_> = std::fs::read_dir(&graph_root).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(!shards.is_empty(), "sanity: compact must have built the commit-graph");
+
+    // Flip one byte inside the records of every shard: the 12-byte header and the length stay
+    // intact, so only the checksum can tell the shard is damaged.
+    let mut corrupted = Vec::new();
+    for shard in &shards {
+        let mut bytes = std::fs::read(shard).unwrap();
+        bytes[12 + 32] ^= 0x01;
+        std::fs::write(shard, &bytes).unwrap();
+        corrupted.push(bytes);
+    }
+
+    let merge = warehouse.run(&["consolidate", "feature"]);
+    assert_success(&merge);
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join("file.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nFIVE\n",
+        "the merge must find the true base despite every shard being damaged"
+    );
+
+    // The query that needed the damaged shards recomputed their records and rewrote them.
+    let rewritten = shards.iter().zip(&corrupted)
+        .filter(|(shard, damaged)| std::fs::read(shard).unwrap() != **damaged)
+        .count();
+    assert!(rewritten > 0, "the merge must have rewritten at least one damaged shard");
+}
+
 #[test]
 fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     let warehouse = TestWarehouse::new("consolidate-conflict");

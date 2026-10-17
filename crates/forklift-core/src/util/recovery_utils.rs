@@ -37,8 +37,8 @@
 //! [`file_utils::does_object_exist`] (the taint-gated presence check — calling it here would trip
 //! the very gate this recovery is trying to lift, on its first call, under the tainted root this
 //! walk necessarily runs under) and never touch [`crate::util::graph_utils`]'s persisting entry
-//! points (`node`/`ensure` durably self-heal a commit-graph shard via `write_file_atomically` —
-//! exactly the kind of barrier-on-a-possibly-failing-device this recovery path must never risk).
+//! points (`node`/`ensure` self-heal a commit-graph shard by writing it — a write on a possibly
+//! failing device, which this recovery path must never risk, barrier or not).
 //! Presence is checked with [`file_utils::raw_object_present`], the one sanctioned gate-free
 //! presence check — see its own doc comment for why bypassing the gate is safe specifically here.
 //! [`tests::closure_walk_never_touches_a_barrier_or_a_dir_sync`] is the actual enforcer, not this
@@ -2454,7 +2454,9 @@ mod tests {
         // Pins the read-only-by-construction claim in this module's doc comment: the walk must
         // never persist anything, however many (or few) targets it is asked about, and however
         // many ref roots exist. Mutation: route the walk through a persisting `graph_utils` entry
-        // point (or any write path) → red.
+        // point (or any write path) → red. Commit-graph shards are written with no directory sync
+        // at all, so the sync recorders below cannot see one; the graph root's absence after the
+        // walk is what catches that route.
         //
         // Enters a real scope with a real ref source (a pallet head over a real, stored tree) so
         // the walk actually runs against something — with no scope entered at all (the previous
@@ -2496,6 +2498,9 @@ mod tests {
         let _sync_dir_guard = file_utils::SyncDirFaultGuard::recording();
         let _barrier_dir_guard = file_utils::DirSyncFaultGuard::recording();
 
+        let graph_root = std::path::PathBuf::from(file_utils::get_path_graph_root());
+        assert!(!graph_root.exists(), "sanity: the fixture writes no commit-graph shard");
+
         let targets: BTreeSet<String> = ["a".repeat(64), "b".repeat(64)].into_iter().collect();
         let referenced = closure_references_any(&targets)
             .expect("the walk must succeed against a real, readable ref source")
@@ -2523,6 +2528,8 @@ mod tests {
         assert!(file_utils::dir_sync_attempts().is_empty(),
             "the enumerating walk must never run a durability barrier either: {:?}",
             file_utils::dir_sync_attempts());
+        assert!(!graph_root.exists(),
+            "neither walk may self-heal a commit-graph shard (an unsynced write, invisible to the recorders)");
 
         std::fs::remove_dir_all(&dir).ok();
     }
