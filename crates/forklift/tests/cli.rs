@@ -3211,7 +3211,7 @@ fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alon
     let indented = colocated("import-git-rule-indented", rules);
     let imported = indented.run(&["import-git", source.root.to_str().unwrap()]);
     assert_success(&imported);
-    assert!(stdout(&imported).contains(r"left as it is, as it is refused. Once that is fixed, add the rule ^\.git(/.*)?$ if no rule covers"),
+    assert!(stdout(&imported).contains(r"is refused, so it was left unchanged. Fix the problem below, then add the rule ^\.git(/.*)?$ if no rule covers"),
         "{}", stdout(&imported));
     assert!(stdout(&imported).contains("\".forkliftignore\", line 1: the pattern \"  ^\\\\.git(/.*)?$\" starts or ends with whitespace (U+0020)"),
         "{}", stdout(&imported));
@@ -3229,7 +3229,7 @@ fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alon
         std::os::unix::fs::symlink("rules.txt", &ignore_file).unwrap();
         let imported = linked.run(&["import-git", source.root.to_str().unwrap()]);
         assert_success(&imported);
-        assert!(stdout(&imported).contains("as it is refused") && stdout(&imported).contains("must be a regular file"),
+        assert!(stdout(&imported).contains("is refused, so it was left unchanged") && stdout(&imported).contains("must be a regular file"),
             "{}", stdout(&imported));
         assert!(!stdout(&imported).contains("by hand"), "{}", stdout(&imported));
         assert!(std::fs::symlink_metadata(&ignore_file).unwrap().file_type().is_symlink());

@@ -156,8 +156,8 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
                 // line is fixed, and fixed, it may already cover `.git`.
                 // The reason goes last: a regex error runs over several lines.
                 warnings.push(format!(
-                    "the \".git\" folder is not ignored, and \".forkliftignore\" was left as it is, as it is \
-                    refused. Once that is fixed, add the rule {} if no rule covers \".git\". {}",
+                    "the \".git\" folder is not ignored: \".forkliftignore\" is refused, so it was left \
+                    unchanged. Fix the problem below, then add the rule {} if no rule covers \".git\".\n{}",
                     GIT_DIRECTORY_PATTERN, e
                 ));
                 None

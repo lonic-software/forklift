@@ -2650,7 +2650,7 @@ impl IgnoreFileRule {
 ///   them, `||||||| base`, compiles to a pattern that matches every path, so the next `load .`
 ///   would stage the removal of the whole tree;
 /// * a pattern holding a control or an invisible format character (Unicode categories Cc and
-///   Cf): a tab, the carriage returns of a file with bare-CR line endings (which reads as one
+///   Cf, less the joiners, soft hyphen and emoji tags that real names hold): a tab, the carriage returns of a file with bare-CR line endings (which reads as one
 ///   line whose rules never match), a zero-width space, a bidirectional override that makes the
 ///   rule display as another, a byte order mark past the start of the file. A pattern that needs
 ///   one writes its escape;
@@ -2667,7 +2667,11 @@ impl IgnoreFileRule {
 /// * `Err(String)`             - The first refused line, by number.
 fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
     static INVISIBLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let invisible = INVISIBLE.get_or_init(|| Regex::new(r"[\p{Cc}\p{Cf}]").expect("a valid class"));
+    // Less the format characters that real names hold: the joiners of emoji sequences and of
+    // Persian and Indic script, the soft hyphen, and the tags of flag emoji.
+    let invisible = INVISIBLE.get_or_init(|| {
+        Regex::new(r"[[\p{Cc}\p{Cf}]--[\x{AD}\x{200C}\x{200D}\x{E0020}-\x{E007F}]]").expect("a valid class")
+    });
 
     let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let mut rules = Vec::new();
@@ -2933,6 +2937,14 @@ mod tests {
         assert_eq!(rules[0].pattern, "^build(/.*)?$");
         assert!(rules[0].matches("build"));
         assert!(parse_ignore_file("\u{FEFF}# note\n").unwrap().is_empty());
+        // The format characters real names hold are not refused: the joiners of an emoji
+        // sequence and of Persian script, the soft hyphen, the tags of a flag emoji.
+        for name in ["photos/\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg", "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+                     "co\u{AD}op", "\u{1F3F4}\u{E0067}\u{E0062}\u{E007F}"] {
+            let rules = parse_ignore_file(&format!("^{}$\n", regex::escape(name))).unwrap();
+            assert!(rules[0].matches(name), "{:?}", name);
+        }
+
         // Past the start of the file it is no encoding marker, and is refused.
         let error = parse_ignore_file("^a$\n\u{FEFF}^b$\n").unwrap_err();
         assert!(error.contains("line 2: the pattern") && error.contains("(U+FEFF)"), "{}", error);
