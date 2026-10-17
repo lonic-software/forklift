@@ -772,53 +772,69 @@ pub fn pack_preload_count() -> u64 {
     PACK_PRELOAD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A pack set being read on a background thread ahead of its first lookup (see [`preload_packs`]).
+/// Where the active warehouse's pack set lives: its registry key and its pack folder, resolved
+/// when this is made. A storage-root scope is thread-local, so a caller that hands the read to
+/// other threads resolves this first, on its own thread.
+#[derive(Clone, Debug)]
+pub struct PackSetLocation {
+    key: String,
+    folder: PathBuf,
+}
+
+impl PackSetLocation {
+    /// The active warehouse's pack set, as the calling thread resolves it.
+    pub fn current() -> Self {
+        Self { key: file_utils::get_path_objects_root(), folder: pack_folder() }
+    }
+
+    /// Start reading this pack set on a background thread. Opening a pack set reads and validates
+    /// every index, ~4.4 ms for git.git's ~500k records (FORK-183), so a command that walks first
+    /// and looks objects up after overlaps the two instead of paying them in turn.
+    ///
+    /// The set is cached only if nothing was cached for the key meanwhile, and a read error is
+    /// dropped: the first real lookup then reads the folder itself and reports the error where it
+    /// always has. Dropping the result without waiting on it detaches the thread, and process
+    /// exit does not wait for it.
+    pub fn preload(&self) -> PackPreload {
+        let PackSetLocation { key, folder } = self.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("forklift-pack-preload".to_string())
+            .spawn(move || {
+                if registry().lock().expect("the pack registry lock is poisoned").contains_key(&key) {
+                    return;
+                }
+
+                if let Ok(packs) = load_packs_from_disk(&folder) {
+                    registry().lock().expect("the pack registry lock is poisoned")
+                        .entry(key)
+                        .or_insert_with(|| {
+                            PACK_PRELOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Arc::new(packs)
+                        });
+                }
+            })
+            .ok();
+
+        PackPreload { handle }
+    }
+}
+
+/// A pack set being read on a background thread ahead of its first lookup (see
+/// [`PackSetLocation::preload`]).
 pub struct PackPreload {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PackPreload {
     /// Wait for the preload to land, so the next lookup finds the set cached rather than racing
-    /// the background read into a second one.
-    pub fn wait(self) {
+    /// the background read into a second one. The join runs on tokio's blocking pool, so the
+    /// awaiting task's worker stays free meanwhile.
+    pub async fn landed(self) {
         if let Some(handle) = self.handle {
-            let _ = handle.join();
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
     }
-}
-
-/// Start reading the active warehouse's packs on a background thread. Opening a pack set reads
-/// and validates every index, ~4.4 ms for git.git's ~500k records (FORK-183), so a command that
-/// walks first and looks objects up after overlaps the two instead of paying them in turn.
-///
-/// The objects root is resolved here, on the calling thread, since a storage-root scope is
-/// thread-local. The set is cached only if nothing was cached for that root meanwhile, and a read
-/// error is dropped: the first real lookup then reads the folder itself and reports the error
-/// where it always has. Dropping the handle without [`PackPreload::wait`] detaches the thread,
-/// and process exit does not wait for it.
-pub fn preload_packs() -> PackPreload {
-    let key = file_utils::get_path_objects_root();
-    let folder = pack_folder();
-
-    let handle = std::thread::Builder::new()
-        .name("forklift-pack-preload".to_string())
-        .spawn(move || {
-            if registry().lock().expect("the pack registry lock is poisoned").contains_key(&key) {
-                return;
-            }
-
-            if let Ok(packs) = load_packs_from_disk(&folder) {
-                registry().lock().expect("the pack registry lock is poisoned")
-                    .entry(key)
-                    .or_insert_with(|| {
-                        PACK_PRELOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Arc::new(packs)
-                    });
-            }
-        })
-        .ok();
-
-    PackPreload { handle }
 }
 
 /// Load the active warehouse's packs from disk and cache them, replacing whatever was cached.

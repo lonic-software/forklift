@@ -6,8 +6,6 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use file_id::FileId;
 use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
@@ -2469,26 +2467,48 @@ pub fn get_device_and_inode(_path: &Path, metadata: &Metadata) -> Result<(u64, u
     Ok((metadata.dev(), metadata.ino()))
 }
 
-/// Get the (volume serial, file index) identity of a file.
+/// Get the (volume serial, file index) identity of a directory entry, without following a
+/// symlink.
 ///
-/// Stable Rust exposes neither number through `Metadata` on Windows, so this opens the path for
-/// the low resolution file ID. Windows never materializes a symlink, so the followed file is the
-/// entry's own.
+/// Stable Rust exposes neither number through `Metadata` on Windows, so this opens the entry with
+/// `FILE_FLAG_OPEN_REPARSE_POINT`, which opens a symlink itself rather than its target, as an
+/// `lstat` would. A dangling link therefore has an identity too, and a link's identity never
+/// changes with its target.
 ///
 /// # Arguments
-/// * `path`      - The path of the file.
-/// * `_metadata` - The file's metadata (unused on Windows).
+/// * `path`      - The path of the entry.
+/// * `_metadata` - The entry's metadata (unused on Windows).
 ///
 /// # Returns
 /// * `Ok((u64, u64))` - The volume serial number and file index.
-/// * `Err(String)`    - If the file ID could not be read.
+/// * `Err(String)`    - If the entry could not be opened or queried.
 #[cfg(windows)]
 pub fn get_device_and_inode(path: &Path, _metadata: &Metadata) -> Result<(u64, u64), String> {
-    match file_id::get_low_res_file_id(path) {
-        Ok(FileId::LowRes { volume_serial_number, file_index }) => Ok((volume_serial_number as u64, file_index)),
-        Ok(_) => Err("Only low resolution file IDs are supported.".to_string()),
-        Err(e) => Err(format!("Error while getting file ID for file: {}", e)),
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    // Access mode 0 queries attributes without read access; backup semantics lets a directory open.
+    let entry = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("Error while getting file ID for file: {}", e))?;
+
+    // SAFETY: the handle is open for the whole call, and `info` is a plain-data out parameter
+    // the call fills in.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(entry.as_raw_handle() as _, &mut info) };
+
+    if ok == 0 {
+        return Err(format!("Error while getting file ID for file: {}", std::io::Error::last_os_error()));
     }
+
+    Ok((info.dwVolumeSerialNumber as u64,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64))
 }
 
 /// Get the owners of a file (user ID and group ID).

@@ -23,20 +23,23 @@ use crate::enums::inventory_item_state::InventoryItemState;
 use crate::parser::inventory::inventory_parser;
 use crate::util::{file_utils, inventory_utils};
 
-/// A file's identity as the file system reports it without following a symlink.
+/// A file's identity as the file system reports it without following a symlink: the same pair the
+/// inventory records (see [`file_utils::get_device_and_inode`]).
 #[cfg(unix)]
 type Identity = (u64, u64);
 
-/// A file's identity as the file system reports it. Windows never materializes a symlink, so
-/// the followed file id is the entry's own there.
+/// A file's identity as the file system reports it. This keeps the high-resolution id, unlike the
+/// inventory's 64-bit file index, because the volume is the oracle for whether two names are one
+/// entry, and ReFS ids need all 128 bits to stay unique. It follows a symlink, which is safe here:
+/// Windows never materializes one, and every write sink refuses a symlinked ancestor first.
 #[cfg(not(unix))]
 type Identity = file_id::FileId;
 
 #[cfg(unix)]
 fn identity(path: &Path) -> Option<Identity> {
-    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
 
-    std::fs::symlink_metadata(path).ok().map(|metadata| (metadata.dev(), metadata.ino()))
+    file_utils::get_device_and_inode(path, &metadata).ok()
 }
 
 #[cfg(not(unix))]

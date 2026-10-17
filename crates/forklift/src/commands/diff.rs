@@ -141,7 +141,13 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
         return Ok(());
     }
 
-    let (changes, shards) = stocktake_utils::collect_unstaged_changes_with_shards().await?;
+    // The changes rendered below are exactly the ones read from the store, so the walk reads the
+    // pack set ahead only for those. A chunked file's stored side is never read, but the walk
+    // cannot tell one apart from here; that rare case costs only an unused pack read.
+    let preload_filter = filter.cloned();
+    let (changes, shards) = stocktake_utils::collect_unstaged_changes_with_shards(move |change| {
+        change.kind != ChangeKind::Untracked && is_within(&change.path, preload_filter.as_ref())
+    }).await?;
 
     // Untracked files are not diffed (stocktake reports them).
     let selected: Vec<&Change> = changes.iter()
@@ -162,11 +168,9 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
         };
 
         Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, verbose))
-    })?;
+    });
 
-    print_blocks(&blocks);
-
-    Ok(())
+    print_blocks(blocks)
 }
 
 /// Diff the inventory against the pallet head. An unborn head reports every inventoried
@@ -235,11 +239,9 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
         };
 
         Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, verbose))
-    })?;
+    });
 
-    print_blocks(&blocks);
-
-    Ok(())
+    print_blocks(blocks)
 }
 
 /// Diff the trees of two revisions: `from` is the old side, `to` the new side (the
@@ -321,11 +323,9 @@ fn diff_pallets(from_revision: &str,
     // diff is real CPU, so the files fan out across the cores. The output must stay in path
     // order, so the blocks are computed into strings and printed afterwards rather than
     // inline.
-    let blocks = format_blocks(&selected, |change| diff_block(change, verbose))?;
+    let blocks = format_blocks(&selected, |change| diff_block(change, verbose));
 
-    print_blocks(&blocks);
-
-    Ok(())
+    print_blocks(blocks)
 }
 
 /// Format one block per changed file, fanning the work across the cores once there are enough
@@ -340,11 +340,11 @@ fn diff_pallets(from_revision: &str,
 /// * `block`   - Formats one file's block.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - One formatted block per change, in order.
-/// * `Err(String)`     - The first (lowest-index) file whose content could not be read.
+/// * `Vec<Result<String, String>>` - One formatted block, or the error reading that file's content,
+///   per change, in order.
 fn format_blocks<T: Sync>(changes: &[&T],
                           block: impl Fn(&T) -> Result<String, String> + Sync)
-                          -> Result<Vec<String>, String> {
+                          -> Vec<Result<String, String>> {
     // Below this many files the threads cost more than the diffs they would share.
     const PARALLEL_THRESHOLD: usize = 8;
 
@@ -353,22 +353,24 @@ fn format_blocks<T: Sync>(changes: &[&T],
     }
 
     // See `forklift_core::util::fanout_utils::fanout_map` for the fan-out idiom (chunking,
-    // worker count, and the storage-scope re-entry every worker needs). It never
-    // short-circuits, so the first-path error a serial `.collect()` would report is
-    // recovered by collecting the (order-preserved) results the same way here.
+    // worker count, and the storage-scope re-entry every worker needs).
     fanout_utils::fanout_map(changes, |change| block(change))
-        .into_iter()
-        .collect()
 }
 
-/// Print formatted diff blocks in order, a blank line between consecutive blocks.
-fn print_blocks(blocks: &[String]) {
-    for (index, block) in blocks.iter().enumerate() {
+/// Print formatted diff blocks in order, a blank line between consecutive blocks, stopping at the
+/// first file whose content could not be read: the files before it print, as they would from a
+/// serial render, and its error is returned.
+fn print_blocks(blocks: Vec<Result<String, String>>) -> Result<(), String> {
+    for (index, block) in blocks.into_iter().enumerate() {
+        let block = block?;
+
         if index > 0 {
             println!();
         }
         print!("{}", block);
     }
+
+    Ok(())
 }
 
 /// Load one changed file's two sides and format its diff block (the body of the parallel

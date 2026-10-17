@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use crate::model::inventory::Inventory;
 use crate::model::task::base_task_context::BaseTaskContext;
 use crate::traits::task_context::TaskContext;
-use crate::util::pack_utils::{self, PackPreload};
+use crate::util::pack_utils::{PackPreload, PackSetLocation};
 use crate::util::stocktake_utils::Change;
 
 /// The context for the parallel change-collection walks (the staged and unstaged halves
@@ -31,9 +31,17 @@ pub struct ChangeWalkContext {
     /// contention-free as it was before this memo existed.
     pub collect_shards: bool,
 
-    /// The pack set read ahead for a content render, started by the first directory that found a
-    /// change whose old side lives in the object store (see [`preload_packs`](Self::preload_packs)).
-    pack_preload: std::sync::Mutex<Option<PackPreload>>,
+    /// The pack set to read ahead for a content render, if the caller asked for one (see
+    /// [`with_pack_preload`](Self::with_pack_preload)).
+    pack_preload: Option<PackPreloadPlan>,
+}
+
+/// What a walk feeding a content render reads ahead: which changes the render will look up in the
+/// object store, where that store's packs are, and the read once it has started.
+struct PackPreloadPlan {
+    renders: Box<dyn Fn(&Change) -> bool + Send + Sync>,
+    location: PackSetLocation,
+    started: std::sync::Mutex<Option<PackPreload>>,
 }
 
 impl ChangeWalkContext {
@@ -52,27 +60,50 @@ impl ChangeWalkContext {
             changes: Arc::new(Mutex::new(Vec::new())),
             shards: Arc::new(Mutex::new(HashMap::new())),
             collect_shards,
-            pack_preload: std::sync::Mutex::new(None),
+            pack_preload: None,
         }
     }
 
-    /// Start reading the pack set in the background, once per walk. A walk that collects shards
-    /// is feeding a content render, whose first object lookup would otherwise open every pack
-    /// after the walk instead of during it; a walk that finds no such change never pays for it.
-    pub fn preload_packs(&self) {
-        let mut preload = self.pack_preload.lock().expect("the pack preload lock is poisoned");
+    /// Read the active warehouse's pack set ahead, in the background, as soon as the walk finds a
+    /// change `renders` accepts: one whose stored side the caller will look up afterwards. The
+    /// render's first object lookup would otherwise open every pack after the walk instead of
+    /// during it, and a walk that finds no such change never pays for the read.
+    ///
+    /// The pack set's location is resolved here, on the calling thread, because the walk's tasks
+    /// run on executor threads that do not carry its storage-root scope.
+    pub fn with_pack_preload(mut self, renders: impl Fn(&Change) -> bool + Send + Sync + 'static) -> Self {
+        self.pack_preload = Some(PackPreloadPlan {
+            renders: Box::new(renders),
+            location: PackSetLocation::current(),
+            started: std::sync::Mutex::new(None),
+        });
 
-        if preload.is_none() {
-            *preload = Some(pack_utils::preload_packs());
+        self
+    }
+
+    /// Start the pack-set read once per walk if any of `found` is a change the caller renders from
+    /// the store. A no-op without [`with_pack_preload`](Self::with_pack_preload).
+    pub fn preload_packs_for(&self, found: &[Change]) {
+        let Some(plan) = &self.pack_preload else { return; };
+
+        if !found.iter().any(|change| (plan.renders)(change)) {
+            return;
+        }
+
+        let mut started = plan.started.lock().expect("the pack preload lock is poisoned");
+
+        if started.is_none() {
+            *started = Some(plan.location.preload());
         }
     }
 
-    /// Wait for a preload [`preload_packs`](Self::preload_packs) started, if any.
-    pub fn wait_for_packs(&self) {
-        let preload = self.pack_preload.lock().expect("the pack preload lock is poisoned").take();
+    /// Wait for the read [`preload_packs_for`](Self::preload_packs_for) started, if any.
+    pub async fn wait_for_packs(&self) {
+        let started = self.pack_preload.as_ref()
+            .and_then(|plan| plan.started.lock().expect("the pack preload lock is poisoned").take());
 
-        if let Some(preload) = preload {
-            preload.wait();
+        if let Some(preload) = started {
+            preload.landed().await;
         }
     }
 }

@@ -2774,6 +2774,33 @@ mod tests {
             "a symlink recorded from its own stat must hit the stat cache");
     }
 
+    /// The Windows identity opens the link itself, not its target, so a dangling link has one and
+    /// a live link's differs from its target's. Creating a symlink needs developer mode or an
+    /// elevated runner; without either the test has nothing to check.
+    #[cfg(windows)]
+    #[test]
+    fn a_symlink_identity_is_its_own_on_windows() {
+        let scratch = Scratch::new("symlink-identity");
+        let target = scratch.root.join("target.txt");
+        let link = scratch.root.join("link");
+
+        if std::os::windows::fs::symlink_file("target.txt", &link).is_err() {
+            eprintln!("skipped: this runner cannot create symlinks");
+            return;
+        }
+
+        let dangling = std::fs::symlink_metadata(&link).unwrap();
+        let identity = file_utils::get_device_and_inode(&link, &dangling)
+            .expect("a dangling symlink must have an identity");
+
+        std::fs::write(&target, "content\n").unwrap();
+        let target_identity = file_utils::get_device_and_inode(&target, &std::fs::metadata(&target).unwrap()).unwrap();
+
+        assert_ne!(identity, target_identity, "a symlink's identity must not be its target's");
+        assert_eq!(file_utils::get_device_and_inode(&link, &dangling).unwrap(), identity,
+            "a symlink's identity must not change when its target appears");
+    }
+
     #[test]
     fn prepare_stack_inventory_reports_a_conflict_found_before_a_later_corrupt_shard() {
         // Regression: a single up-front parse pass must not let an unrelated corrupt shard mask

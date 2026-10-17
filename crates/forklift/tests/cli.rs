@@ -2563,6 +2563,11 @@ fn diff_preloads_the_pack_set_only_for_a_change_it_renders() {
     assert_success(&modified);
     assert!(stdout(&modified).contains("+ changed"), "{}", stdout(&modified));
     assert_eq!(pack_counts(&modified), (1, 1), "the render reads the preloaded set, never a second one");
+
+    let filtered = warehouse.run_with_env(&["diff", "a.txt"], &counts);
+    assert_success(&filtered);
+    assert!(stdout(&filtered).contains("matches the inventory"), "{}", stdout(&filtered));
+    assert_eq!(pack_counts(&filtered), (0, 0), "a change outside the path filter is not rendered, so nothing is preloaded");
 }
 
 #[test]

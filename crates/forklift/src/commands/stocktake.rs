@@ -22,7 +22,8 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
 
     // The two comparisons read disjoint sources (pallet head vs working directory) against the
     // same inventory, so they overlap: the unstaged walk's tasks fan out over the runtime's
-    // workers while this task opens the pack for the head parcel and walks the staged side.
+    // workers while this task opens the pack for the head parcel and walks the staged side. The
+    // first error from either side ends the other, as running them in turn would.
     let staged = async {
         let head_tree_hash = match &head {
             Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
@@ -31,8 +32,7 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
 
         stocktake_utils::collect_staged_changes(head_tree_hash.as_deref()).await
     };
-    let (unstaged, staged) = tokio::join!(stocktake_utils::collect_unstaged_changes(), staged);
-    let (staged, unstaged) = (staged?, unstaged?);
+    let (unstaged, staged) = tokio::try_join!(stocktake_utils::collect_unstaged_changes(), staged)?;
 
     let report = StocktakeReport {
         pallet,

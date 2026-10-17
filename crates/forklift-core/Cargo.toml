@@ -36,6 +36,9 @@ chacha20poly1305 = { workspace = true }
 # Cargo.toml and bin/gen-docs). Never enabled in a release build.
 schemars = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 # The capped-reader tests serve a gzip body; flate2 is already in the tree through reqwest's
 # `gzip` decoder, so this pins no new crate.
