@@ -1643,7 +1643,9 @@ impl Command {
     /// no other process uses yet.
     ///
     /// `compact` and `scope-prune` are excluded because they host deleters, which take the
-    /// exclusive side; their own shared hold would refuse them.
+    /// exclusive side; their own shared hold would refuse them. They take the side they need
+    /// themselves: a full repack and scope-prune the exclusive one, incremental compaction the
+    /// shared one, tried.
     ///
     /// # Returns
     /// * `true`  - Take the shared hold right after the warehouse lock.

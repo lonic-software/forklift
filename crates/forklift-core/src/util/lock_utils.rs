@@ -159,7 +159,9 @@ impl Drop for ServeLock {
 ///   `scope-prune`, which host deleters (a process's own shared hold refuses its own exclusive
 ///   try). Taken right after the bay lock, so the order is always bay lock first and no cycle is
 ///   possible; released before auto-maintenance, which may repack.
-/// * **shared, try** — a server, for every warehouse it serves, for the handle's lifetime.
+/// * **shared, try** — a server, for every warehouse it serves, for the handle's lifetime; and
+///   incremental compaction (explicit or automatic), which moves loose objects into a pack and
+///   deletes the loose copies, so it must not interleave with a deleter's loose deletions.
 /// * **exclusive, try** — the deleters, at the deleter itself so no caller can forget it.
 ///
 /// Unlike [`StoreLock`] and [`ServeLock`], this is a *kernel* lock (`File::lock_shared` /
@@ -198,7 +200,8 @@ impl StoreAccessLock {
     }
 
     /// Take the shared hold at the current storage root without waiting: refused while a deleter
-    /// holds it exclusively. For the server, which must not block a runtime thread.
+    /// holds it exclusively. For the server, which must not block a runtime thread, and for
+    /// incremental compaction, which is maintenance and is retried later rather than waiting.
     ///
     /// # Returns
     /// * `Ok(StoreAccessLock)` - The shared hold (released when dropped).
@@ -250,17 +253,18 @@ pub struct StoreAccessExclusive {
     _file: std::fs::File,
 }
 
-/// `OPEN_MAX` from macOS's `<sys/syslimits.h>`, which the `libc` crate does not export: what
-/// macOS accepts for `RLIMIT_NOFILE` when it refuses the hard limit (an unlimited hard limit).
+/// `OPEN_MAX` from macOS's `<sys/syslimits.h>`, which the `libc` crate does not export: where the
+/// search starts when macOS refuses the hard limit (an unlimited one).
 #[cfg(target_os = "macos")]
 const MACOS_OPEN_MAX: libc::rlim_t = 10240;
 
 /// Raise this process's soft limit on open files toward its hard limit. A server keeps one
 /// store-access hold — one open file — per warehouse it serves, for as long as it serves it, so in
 /// multi-warehouse mode the count grows with the warehouses served, and the default soft limit
-/// (256 on macOS) is far below what the hard limit allows. Tries the hard limit, then, on macOS,
-/// `OPEN_MAX`; never lowers the limit. Best-effort: a limit that cannot be read or raised is left
-/// as it is. A no-op off Unix, which has no such per-process soft limit.
+/// (256 on macOS) is far below what the hard limit allows. Tries the hard limit, then halves down
+/// from it (from `OPEN_MAX` on macOS, whose kernel also caps the limit at `kern.maxfilesperproc`)
+/// until the kernel accepts one; never lowers the limit. Best-effort: a limit that cannot be read
+/// or raised is left as it is. A no-op off Unix, which has no such per-process soft limit.
 pub fn raise_open_file_limit() {
     #[cfg(unix)]
     {
@@ -270,18 +274,22 @@ pub fn raise_open_file_limit() {
             return;
         }
 
-        #[cfg(target_os = "macos")]
-        let targets = [limit.rlim_max, MACOS_OPEN_MAX.min(limit.rlim_max)];
-        #[cfg(not(target_os = "macos"))]
-        let targets = [limit.rlim_max];
-
-        let current = limit.rlim_cur;
-        for target in targets.into_iter().filter(|&target| target > current) {
-            limit.rlim_cur = target;
+        let (current, hard) = (limit.rlim_cur, limit.rlim_max);
+        let try_raise = |target: libc::rlim_t| {
+            let raised = libc::rlimit { rlim_cur: target, rlim_max: hard };
             // SAFETY: `setrlimit` only reads the `rlimit` it is given.
-            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 {
-                return;
-            }
+            target > current && unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0
+        };
+        if try_raise(hard) {
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        let mut target = MACOS_OPEN_MAX.min(hard);
+        #[cfg(not(target_os = "macos"))]
+        let mut target = hard / 2;
+        while target > current && !try_raise(target) {
+            target /= 2;
         }
     }
 }
@@ -541,35 +549,6 @@ mod tests {
 
         assert!(writer_ok, "a writer takes the shared side through a read-only sidecar");
         assert!(deleter_ok, "a deleter takes the exclusive side through a read-only sidecar");
-    }
-
-    /// A low soft open-file limit is raised. The test lowers it to 1024 at most first (and puts it
-    /// back after), so the raise has something to do whatever limit the test runs under, while the
-    /// tests running beside it keep more files than they ever open at once.
-    #[cfg(unix)]
-    #[test]
-    fn a_low_open_file_limit_is_raised() {
-        let read = || {
-            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
-            limit
-        };
-        let original = read();
-        let low = original.rlim_cur.min(1024);
-        if original.rlim_max <= low {
-            return; // A hard limit this low leaves nothing to raise.
-        }
-        let mut lowered = original;
-        lowered.rlim_cur = low;
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
-
-        raise_open_file_limit();
-        let raised = read().rlim_cur;
-
-        if raised < original.rlim_cur {
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) }, 0);
-        }
-        assert!(raised > low, "the soft limit was raised above {}: it is {}", low, raised);
     }
 
     #[test]

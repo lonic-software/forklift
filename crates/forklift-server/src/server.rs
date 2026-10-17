@@ -1419,8 +1419,8 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
             let served = resolve_warehouse(&state, &params);
 
             // The warehouse exists from here on, served or not: a retry after a refused
-            // registration finds it existing and answers 200, so this is the only chance to
-            // announce it.
+            // registration finds it existing and answers 200, so a refused registration must
+            // still announce it here or the announcement is lost.
             if created {
                 let mut event = HookEvent::new(EVENT_WAREHOUSE_CREATED);
                 event.warehouse = Some(id);
