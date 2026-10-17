@@ -2474,6 +2474,54 @@ fn diff_reports_unstaged_and_staged_line_changes() {
     assert!(verbose.contains("shared"), "unexpected verbose output: {}", verbose);
 }
 
+/// Past the fan-out threshold, each mode renders its files on several threads; the report must
+/// still read as the serial one did: every file once, in path order, each with its own lines.
+#[test]
+fn diff_renders_many_files_in_path_order_in_every_mode() {
+    let warehouse = TestWarehouse::new("diff-fanout");
+    let names: Vec<String> = (0..12).map(|i| format!("d{}/f{:02}.txt", i % 3, i)).collect();
+    for name in &names {
+        warehouse.write_file(name, &format!("old {}\n", name));
+    }
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["compact"]));
+
+    for name in &names {
+        warehouse.write_file(name, &format!("new {}\n", name));
+    }
+
+    let mut sorted = names.clone();
+    sorted.sort();
+    let expected: String = sorted.iter()
+        .map(|name| format!("modified: {}|- old {}|+ new {}|", name, name, name))
+        .collect();
+    // One line per header and changed line, stripped of colour and line-number columns.
+    let digest = |output: &Output| -> String {
+        stdout(output).lines()
+            .map(|line| line.replace("\x1b[1m", "").replace("\x1b[0m", "").replace("\x1b[31m", "")
+                .replace("\x1b[32m", ""))
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let trimmed = line.trim_start_matches(|c: char| c == ' ' || c.is_ascii_digit()).to_string();
+                format!("{}|", trimmed)
+            })
+            .collect()
+    };
+
+    let unstaged = warehouse.run(&["diff"]);
+    assert_success(&unstaged);
+    assert_eq!(digest(&unstaged), expected, "{}", stdout(&unstaged));
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = warehouse.run(&["diff", "--staged"]);
+    assert_success(&staged);
+    assert_eq!(digest(&staged), expected, "{}", stdout(&staged));
+}
+
 /// The `FORKLIFT_DEBUG_PACK_COUNTS` lines of a run: (pack-folder reads, preloads that landed).
 fn pack_counts(output: &Output) -> (u64, u64) {
     let stderr = stderr(output);
