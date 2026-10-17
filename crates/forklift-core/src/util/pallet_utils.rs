@@ -600,8 +600,7 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
                 continue;
             };
 
-            // Sidecar files (tree metadata, parcel signatures) carry a dotted suffix and are
-            // not objects.
+            // Sidecar files (parcel signatures) carry a dotted suffix and are not objects.
             if file_name.contains('.') {
                 continue;
             }

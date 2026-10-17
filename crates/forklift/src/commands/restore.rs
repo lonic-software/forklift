@@ -4,6 +4,7 @@ use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
+use forklift_core::util::inventory_utils::TrackedKind;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::{
     file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
@@ -81,10 +82,14 @@ pub fn handle_unstage(target: &str) -> Result<(), String> {
 /// * `Ok(())`      - If the restore completed.
 /// * `Err(String)` - If the path is not in the inventory or a write failed.
 fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
-    let has_shard = file_utils::get_inventory_data_path_for_key(path.as_key()).exists();
-
-    if path.is_root() || has_shard {
+    if path.is_root() {
         return restore_worktree_directory(path.as_key());
+    }
+
+    match inventory_utils::tracked_kind(path)? {
+        TrackedKind::Directory => return restore_worktree_directory(path.as_key()),
+        TrackedKind::UntrackedDirectory => return Err(format!("No inventory found for folder \"{}\".", path.as_key())),
+        TrackedKind::File => {}
     }
 
     let (parent, file_name) = path.split_parent()?;
@@ -242,9 +247,8 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
         None => None,
     };
 
-    let has_shard = file_utils::get_inventory_data_path_for_key(path.as_key()).exists();
     let treat_as_directory = path.is_root()
-        || has_shard
+        || inventory_utils::is_tracked_directory(path.as_key())?
         || matches!(head_entry, Some(HeadEntry::Tree { .. }));
 
     if treat_as_directory {

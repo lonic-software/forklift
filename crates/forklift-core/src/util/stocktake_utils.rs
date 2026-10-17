@@ -4,7 +4,6 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use file_id::FileId;
-use regex::Regex;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::inventory::Inventory;
 use crate::model::task::change_walk::change_walk_context::ChangeWalkContext;
@@ -385,7 +384,7 @@ pub async fn collect_unstaged_changes_with_shards()
 /// [`ChangeWalkContext::collect_shards`].
 async fn collect_unstaged_changes_impl(collect_shards: bool)
     -> Result<(Vec<Change>, HashMap<String, Arc<Inventory>>), String> {
-    let ignored_paths = Arc::new(file_utils::get_ignored_paths()?);
+    let ignore_rules = Arc::new(file_utils::get_ignore_rules()?);
 
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
     let metadata = metadata_opt.unwrap_or_default();
@@ -401,7 +400,7 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
         Arc::clone(&context),
         String::new(),
         Arc::clone(&keys),
-        Arc::clone(&ignored_paths),
+        Arc::clone(&ignore_rules),
     ));
 
     executor.execute(root_task).await.map_err(|e|
@@ -427,7 +426,7 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
 /// * `context`       - The shared walk context.
 /// * `key`           - The warehouse path key of the directory.
 /// * `keys`          - All inventoried directory keys.
-/// * `ignored_paths` - The ignore patterns.
+/// * `ignore_rules`  - The ignore rules.
 ///
 /// # Returns
 /// * `Ok(())`      - If the directory was compared.
@@ -435,7 +434,7 @@ async fn collect_unstaged_changes_impl(collect_shards: bool)
 fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                            key: String,
                            keys: Arc<BTreeSet<String>>,
-                           ignored_paths: Arc<Vec<Regex>>)
+                           ignore_rules: Arc<file_utils::IgnoreRules>)
                            -> impl Future<Output = Result<(), String>> + Send {
     async move {
         let fs_path = if key.is_empty() {
@@ -461,12 +460,13 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
         let mut found: Vec<Change> = Vec::new();
         let mut seen_files: BTreeSet<String> = BTreeSet::new();
         let mut seen_dirs: BTreeSet<String> = BTreeSet::new();
-        // Names ignored at this level. An ignored entry is present on disk — we just do not
-        // descend into it or diff it — so the reconciliation below must not mistake it for a
-        // removal. For a tracked directory that was ignored *after* it was tracked (e.g. a
-        // build dir added to `.forkliftignore`), reporting it "removed" would fan out into a
-        // single-threaded walk of its whole subtree — the cause of a multi-minute stocktake
-        // hang on a store that had accumulated many such tracked-then-ignored files.
+        // Names of the untracked entries the ignore rules cover at this level. Such an entry is
+        // present on disk — we just do not descend into it or diff it — so the reconciliation
+        // below must not mistake it for a removal. A tracked entry is never in here, whatever the
+        // rules say: it is classified like any other, so an edit to it stays visible and the
+        // dirty checks built on this walk refuse to overwrite it. A tracked directory a rule
+        // matches is walked by its own task, never reported "removed" (which fans out into a
+        // single-threaded walk of its whole subtree).
         let mut ignored_names: BTreeSet<String> = BTreeSet::new();
 
         for entry_result in file_utils::read_directory(&fs_path)? {
@@ -474,13 +474,22 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
             let entry_key = join_key(&key, &name);
 
-            if file_utils::is_path_ignored(&entry_key, &ignored_paths) {
+            let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
+            let item_type = file_utils::get_type_of_dir_entry(&metadata);
+
+            let tracked = if item_type.is_file() {
+                matches!(
+                    inventory.get_item_by_name(&name),
+                    Some(item) if item.state != InventoryItemState::Deleted
+                )
+            } else {
+                keys.contains(&entry_key)
+            };
+
+            if ignore_rules.excludes(&entry_key, tracked) {
                 ignored_names.insert(name);
                 continue;
             }
-
-            let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-            let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
             if item_type.is_file() {
                 seen_files.insert(name.clone());
@@ -515,7 +524,7 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                         Arc::clone(&context),
                         entry_key,
                         Arc::clone(&keys),
-                        Arc::clone(&ignored_paths),
+                        Arc::clone(&ignore_rules),
                     )))?;
                 } else {
                     found.push(Change::new(ChangeKind::Untracked, format!("{}/", entry_key)));

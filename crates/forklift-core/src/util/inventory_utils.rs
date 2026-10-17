@@ -3,7 +3,6 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use file_id::FileId;
-use regex::Regex;
 use crate::builder::inventory::InventoryBuilder;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::enums::dir_entry_type::DirEntryType;
@@ -345,22 +344,97 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
 /// * `Ok(())`      - If the operation was successful.
 /// * `Err(String)` - If there was an error.
 pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
-    // A directory is recognized by its inventory shard, not by the file system state:
-    // the subject may already be gone from the working directory, and staging its removal
-    // must still work in that case.
-    let has_shard = file_utils::get_inventory_data_path_for_key(path.as_key()).exists();
-
-    if path.is_root() || has_shard {
+    if path.is_root() {
         return stage_removal_for_directory(path);
     }
 
-    let fs_path = path.to_fs_path();
-
-    if fs_path.exists() && file_utils::is_directory(&fs_path)? {
-        return Err(format!("No inventory found for folder \"{}\".", path.as_key()));
+    match tracked_kind(path)? {
+        TrackedKind::Directory => stage_removal_for_directory(path),
+        TrackedKind::File => stage_removal_for_file(path),
+        TrackedKind::UntrackedDirectory => Err(format!("No inventory found for folder \"{}\".", path.as_key())),
     }
+}
 
-    stage_removal_for_file(path)
+/// What `remove` or `restore` should treat a path as. See [`tracked_kind`].
+pub enum TrackedKind {
+    /// A tracked directory: its key is registered.
+    Directory,
+    /// A file, tracked or not; the file branch reports a path that is not in the inventory.
+    File,
+    /// A directory on disk whose key is not registered.
+    UntrackedDirectory,
+}
+
+/// Decide whether a (non-root) path is a file or a directory for `remove` and `restore`.
+///
+/// Registration says a directory is tracked, not that the path is a directory now: after a
+/// staged flip, a registered key can name a file on disk, and a live file entry can name a
+/// directory. So the type on disk decides when the path exists, and the inventory only when it
+/// is gone: a live file entry in the parent's shard first, then the key's registration.
+///
+/// # Arguments
+/// * `path` - The warehouse path.
+///
+/// # Returns
+/// * `Ok(TrackedKind)` - What to treat the path as.
+/// * `Err(String)`     - If the path, the parent's shard or the metadata could not be read.
+pub fn tracked_kind(path: &WarehousePath) -> Result<TrackedKind, String> {
+    match std::fs::symlink_metadata(path.to_fs_path()) {
+        Ok(metadata) if metadata.is_dir() => {
+            if is_tracked_directory(path.as_key())? {
+                Ok(TrackedKind::Directory)
+            } else {
+                Ok(TrackedKind::UntrackedDirectory)
+            }
+        }
+        Ok(_) => Ok(TrackedKind::File),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let (parent, file_name) = path.split_parent()?;
+            let (_, parent_inventory) = retrieve_inventory_or_empty(&parent)?;
+
+            let has_live_file_entry = matches!(
+                parent_inventory.get_item_by_name(&file_name),
+                Some(item) if item.state != InventoryItemState::Deleted
+            );
+
+            if !has_live_file_entry && is_tracked_directory(path.as_key())? {
+                Ok(TrackedKind::Directory)
+            } else {
+                Ok(TrackedKind::File)
+            }
+        }
+        Err(e) => Err(format!("Error while getting metadata for path \"{}\": {}", path.as_key(), e)),
+    }
+}
+
+/// Whether the directory with the given key is tracked: registered in the inventory metadata.
+///
+/// Registration is the one definition of a tracked directory. Every ancestor of a registered key
+/// is registered too (see [`write_metadata_to_file`]), so every directory between the root and a
+/// tracked file is tracked. A registered key need not have a shard file: a directory that holds
+/// only subdirectories has none, and reads as an empty inventory.
+///
+/// # Arguments
+/// * `key` - The warehouse path key of the directory.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether the key is registered.
+/// * `Err(String)` - If the metadata file could not be read.
+pub fn is_tracked_directory(key: &str) -> Result<bool, String> {
+    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+
+    Ok(metadata_opt.is_some_and(|metadata| metadata.contains(&key_to_metadata_entry(key))))
+}
+
+/// Every key registered in the inventory metadata (an empty set when there is no metadata file).
+///
+/// # Returns
+/// * `Ok(BTreeSet<String>)` - The registered warehouse path keys.
+/// * `Err(String)`          - If the metadata file could not be read.
+fn registered_keys() -> Result<BTreeSet<String>, String> {
+    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+
+    Ok(metadata_opt.unwrap_or_default().iter().map(|entry| metadata_entry_to_key(entry).to_string()).collect())
 }
 
 /// Create an inventory for the specified directory (and all subdirectories).
@@ -382,7 +456,7 @@ pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
 /// costs nothing durability-wise: `WriteBatch::stage` only creates an as-yet-invisible temp file
 /// (not itself a durable mutation), and nothing below is durable until `blob_batch.finish()`
 /// (Phase 0) returns `Ok`. Two outcomes, both consistent: something between here and Phase 0
-/// fails first (`get_ignored_paths`, `populate_dirty_inventory_paths`, or the walk itself) —
+/// fails first (`get_ignore_rules`, `populate_dirty_inventory_paths`, or the walk itself) —
 /// `context` (and the marker's still-unpublished temp with it) is simply dropped, exactly as
 /// invisible as before this call, and nothing else from this load became durable either; or
 /// Phase 0 is reached and runs — which it always does once the walk has been attempted,
@@ -402,18 +476,19 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     load_guard_utils::stage_start_marker(&context.blob_batch, path.as_key())?;
 
     let executor = TaskExecutor::new(Arc::clone(&context));
-    let ignored_paths = file_utils::get_ignored_paths()?;
+    let ignore_rules = file_utils::get_ignore_rules()?;
 
     // Every previously inventoried directory inside the loaded subtree starts out "dirty";
     // the walk removes each directory it visits. Whatever is left afterwards no longer
-    // exists in the working directory (or is ignored now), so its entries are staged
-    // as removals.
-    populate_dirty_inventory_paths(&context, path).await?;
+    // exists in the working directory, so its entries are staged as removals. The same set,
+    // taken before the walk changes it, is what the walk asks whether a directory is tracked.
+    let registered = populate_dirty_inventory_paths(&context, path).await?;
 
     let root_task: InventoryBuilderTask = Box::pin(build_inventory(
         Arc::clone(&context),
         Arc::new(path.clone()),
-        Arc::new(ignored_paths)
+        Arc::new(ignore_rules),
+        Arc::new(registered),
     ));
 
     // `result` accumulates the *first* failure from anywhere in this function — the walk itself,
@@ -602,27 +677,29 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
 /// * `path`    - The root of the subtree being loaded.
 ///
 /// # Returns
-/// * `Ok(())`      - If the dirty set was populated successfully.
-/// * `Err(String)` - If the inventory metadata could not be read.
+/// * `Ok(BTreeSet<String>)` - The registered keys at or under `path`: the dirty set as populated.
+/// * `Err(String)`          - If the inventory metadata could not be read.
 async fn populate_dirty_inventory_paths(context: &InventoryBuilderContext,
-                                        path: &WarehousePath) -> Result<(), String> {
+                                        path: &WarehousePath) -> Result<BTreeSet<String>, String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
     let Some(metadata) = metadata_opt else {
-        return Ok(());
+        return Ok(BTreeSet::new());
     };
 
-    let mut dirty = context.dirty_inventory_paths.lock().await;
+    let mut registered: BTreeSet<String> = BTreeSet::new();
 
     for entry in metadata {
         let key = metadata_entry_to_key(&entry);
 
         if path_utils::covers(path.as_key(), key) {
-            dirty.insert(key.to_string());
+            registered.insert(key.to_string());
         }
     }
 
-    Ok(())
+    context.dirty_inventory_paths.lock().await.extend(registered.iter().cloned());
+
+    Ok(registered)
 }
 
 /// Convert an inventory metadata file entry to a warehouse path key.
@@ -847,15 +924,18 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
 /// # Arguments
 /// * `context`         - The task context.
 /// * `path`            - The warehouse path of the directory.
-/// * `paths_to_ignore` - Paths of files and directories that should be ignored. The patterns are
-/// matched against warehouse path keys (see `WarehousePath::as_key`).
+/// * `ignore_rules`    - The ignore rules. A user rule skips only untracked entries, so a tracked
+/// entry a rule matches is refreshed like any other, never staged for removal.
+/// * `registered`      - The registered directory keys under the load's root, taken before the
+/// walk started: what decides whether a directory is tracked.
 ///
 /// # Returns
 /// * `Ok(())`      - If the directory was classified successfully.
 /// * `Err(String)` - If there was an error during the operation.
 fn build_inventory(context: Arc<InventoryBuilderContext>,
                    path: Arc<WarehousePath>,
-                   paths_to_ignore: Arc<Vec<Regex>>) -> impl Future<Output = Result<(), String>> + Send {
+                   ignore_rules: Arc<file_utils::IgnoreRules>,
+                   registered: Arc<BTreeSet<String>>) -> impl Future<Output = Result<(), String>> + Send {
     async move {
         // Captured before this task reads, stats or hashes anything below — the timestamp this
         // directory's published shard will carry as its mtime (see the join point's publish
@@ -867,7 +947,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
         let directory = file_utils::read_directory(&path.to_fs_path())?;
 
-        if !path.is_root() && file_utils::is_path_ignored(path.as_key(), &paths_to_ignore) {
+        // Only the walk's root can be ignored here: every other directory was already checked
+        // by its parent's per-entry filter below. A folder load never force-tracks, so an
+        // untracked root the rules cover adds nothing. A tracked one is walked: its tracked
+        // content is refreshed, and its untracked content stays skipped by the filter below.
+        if !path.is_root() && ignore_rules.excludes(path.as_key(), registered.contains(path.as_key())) {
             return Ok(());
         }
 
@@ -908,7 +992,16 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             let item_type = file_utils::get_type_of_dir_entry(&metadata);
             let entry_path = path.child(&name);
 
-            if file_utils::is_path_ignored(entry_path.as_key(), &paths_to_ignore) {
+            let tracked = if item_type.is_file() {
+                existing_inventory.as_ref().is_some_and(|(inv, _)| matches!(
+                    inv.get_item_by_name(&name),
+                    Some(item) if item.state != InventoryItemState::Deleted
+                ))
+            } else {
+                registered.contains(entry_path.as_key())
+            };
+
+            if ignore_rules.excludes(entry_path.as_key(), tracked) {
                 continue;
             }
 
@@ -967,7 +1060,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                 let new_task = Box::pin(build_inventory(
                     context.clone(),
                     Arc::new(entry_path),
-                    Arc::clone(&paths_to_ignore)
+                    Arc::clone(&ignore_rules),
+                    Arc::clone(&registered),
                 ));
 
                 context.send_task(new_task)?;
@@ -975,7 +1069,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         }
 
         // Entries of the old inventory whose file is no longer in the directory (deleted,
-        // renamed, newly ignored, or replaced by a directory) are carried over as staged
+        // renamed, or replaced by a directory) are carried over as staged
         // removals — this is the "present only in the shard → Deleted" half of the
         // per-directory merge-join. A real content change (a state flip to `Deleted`), caught
         // the same way as any other by `inventory_content_matches` below.
@@ -1099,9 +1193,8 @@ pub fn stage_file_entry_from_stat(path: &str, hash: String, item_type: DirEntryT
 }
 
 /// Whether the directory at `path` may be safely replaced (by a file, or cleared to make
-/// way for one) without losing data: it is tracked — represented by its own inventory
-/// shard, the sharded-inventory way a directory is recognized (see `stage_removal`) — and
-/// every entry beneath it, recursively, is tracked too. Called for a path a merge or shift
+/// way for one) without losing data: it is tracked — its key is registered, see
+/// [`is_tracked_directory`] — and every entry beneath it, recursively, is tracked too. Called for a path a merge or shift
 /// wants to write a new file to that already exists as a directory on disk (a tracked
 /// dir→file flip); the caller still refuses when this returns `false`, exactly as it does
 /// for a plain untracked file at the path.
@@ -1114,25 +1207,29 @@ pub fn stage_file_entry_from_stat(path: &str, hash: String, item_type: DirEntryT
 /// * `Ok(false)`   - The directory is untracked, or has untracked content beneath it.
 /// * `Err(String)` - If a directory entry or a shard could not be read or parsed.
 pub fn directory_is_safe_to_replace(path: &str) -> Result<bool, String> {
-    if !file_utils::get_inventory_data_path_for_key(path).exists() {
+    let registered = registered_keys()?;
+
+    if !registered.contains(path) {
         return Ok(false);
     }
 
-    let ignored_paths = Arc::new(file_utils::get_ignored_paths()?);
+    let ignore_rules = file_utils::get_ignore_rules()?;
 
-    directory_has_no_untracked_content(path, ignored_paths)
+    directory_has_no_untracked_content(path, &ignore_rules, &registered)
 }
 
 /// Recursively check a tracked directory for untracked content (the body of
-/// `directory_is_safe_to_replace`). Ignored entries are skipped, matching the rest of the
-/// inventory machinery (`walk_directory_unstaged` in `stocktake_utils`): they are invisible
-/// to tracking, not a collision.
+/// `directory_is_safe_to_replace`). An untracked entry the ignore rules cover is skipped,
+/// matching `walk_directory_unstaged` in `stocktake_utils`: it is expendable, as in git, not a
+/// collision. A tracked entry a rule matches is checked like any other.
 ///
 /// # Arguments
-/// * `key`           - The warehouse path key of the directory.
-/// * `ignored_paths` - The ignore patterns, computed once by the caller and threaded through
-///                     the recursion instead of being reloaded and recompiled at every level.
-fn directory_has_no_untracked_content(key: &str, ignored_paths: Arc<Vec<Regex>>) -> Result<bool, String> {
+/// * `key`          - The warehouse path key of the directory.
+/// * `ignore_rules` - The ignore rules, read once by the caller.
+/// * `registered`   - The registered directory keys, read once by the caller.
+fn directory_has_no_untracked_content(key: &str,
+                                      ignore_rules: &file_utils::IgnoreRules,
+                                      registered: &BTreeSet<String>) -> Result<bool, String> {
     let fs_path = if key.is_empty() { std::path::PathBuf::from(".") } else { std::path::PathBuf::from(key) };
 
     let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
@@ -1147,24 +1244,23 @@ fn directory_has_no_untracked_content(key: &str, ignored_paths: Arc<Vec<Regex>>)
         let name = file_utils::get_name_for_file_or_directory(&entry)?;
         let entry_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
-        if file_utils::is_path_ignored(&entry_key, &ignored_paths) {
-            continue;
-        }
-
         let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
         let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
-        let is_tracked = if item_type.is_file() {
+        let tracked = if item_type.is_file() {
             matches!(
                 inventory.get_item_by_name(&name),
                 Some(item) if item.state != InventoryItemState::Deleted
             )
         } else {
-            file_utils::get_inventory_data_path_for_key(&entry_key).exists()
-                && directory_has_no_untracked_content(&entry_key, Arc::clone(&ignored_paths))?
+            registered.contains(&entry_key)
         };
 
-        if !is_tracked {
+        if ignore_rules.excludes(&entry_key, tracked) {
+            continue;
+        }
+
+        if !tracked || (!item_type.is_file() && !directory_has_no_untracked_content(&entry_key, ignore_rules, registered)?) {
             return Ok(false);
         }
     }
@@ -2003,6 +2099,12 @@ fn update_inventory_metadata(keys_to_add: &BTreeSet<String>,
 
 /// Save the inventory metadata to file.
 ///
+/// The set is closed under ancestors before it is written: every ancestor of a registered key is
+/// registered too, so every directory between the root and a tracked file is tracked (see
+/// [`is_tracked_directory`]). Every metadata write passes through here, so no writer can break
+/// that, whether it registers only the directory it wrote (single-file load, `update_shard`) or
+/// drops a key a registered descendant still needs (the removal paths).
+///
 /// # Arguments
 /// * `path`     - The path of the file where the metadata should be saved.
 /// * `metadata` - Inventory metadata. A `BTreeSet` consisting of paths of directories where
@@ -2012,9 +2114,11 @@ fn update_inventory_metadata(keys_to_add: &BTreeSet<String>,
 /// * `Ok(())`      - If the metadata file was saved successfully.
 /// * `Err(String)` - If there was an error while saving the metadata file.
 fn write_metadata_to_file(path: &Path, metadata: &BTreeSet<String>) -> Result<(), String> {
+    let closed = close_under_ancestors(metadata);
+
     let mut metadata_bytes: Vec<u8> = Vec::new();
 
-    for inv_path in metadata {
+    for inv_path in &closed {
         metadata_bytes.extend(inv_path.as_bytes());
         object_utils::push_new_line(&mut metadata_bytes);
     }
@@ -2022,6 +2126,26 @@ fn write_metadata_to_file(path: &Path, metadata: &BTreeSet<String>) -> Result<()
     std::fs::write(path, metadata_bytes).map_err(|e|
         format!("Error while writing inventory metadata to file \"{}\": {}", path.to_string_lossy(), e)
     )
+}
+
+/// Close a set of metadata entries under ancestors: add the entry of every ancestor of every
+/// entry's key, the root included.
+///
+/// # Arguments
+/// * `metadata` - Metadata entries (see [`key_to_metadata_entry`]).
+///
+/// # Returns
+/// * `BTreeSet<String>` - The entries plus the entries of all their ancestors.
+fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut closed = metadata.clone();
+
+    for entry in metadata {
+        for ancestor in ancestor_keys_root_first(metadata_entry_to_key(entry)) {
+            closed.insert(key_to_metadata_entry(&ancestor));
+        }
+    }
+
+    closed
 }
 
 /// Check whether a file is unchanged compared to its existing inventory entry, based purely

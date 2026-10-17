@@ -1,9 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::ops::Add;
-use std::path::PathBuf;
 use std::sync::Arc;
-use regex::Regex;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
@@ -15,8 +12,6 @@ use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{file_utils, inventory_utils, object_utils};
-
-const FILENAME_METADATA_SUFFIX: &str = ".metadata";
 
 /// Build (and store) tree objects from an already-parsed [`inventory_utils::PreparedInventory`]
 /// snapshot, bottom-up: one tree object per inventoried directory, staged into `batch` instead of
@@ -793,148 +788,6 @@ fn join_key(key: &str, name: &str) -> String {
 /// The final component (the directory's own name) of a warehouse path key.
 fn last_component(key: &str) -> &str {
     key.rsplit_once('/').map(|(_, name)| name).unwrap_or(key)
-}
-
-/// Create tree objects for the given directory and all of its subdirectories.
-/// The tree objects are stored in the object store.
-/// A metadata file is also created, which contains the mapping of directory paths to tree hashes.
-///
-/// # Arguments
-/// * `path` - The path to the directory.
-///
-/// # Returns
-/// * `Ok(TreeItem)` - if the tree was built successfully.
-/// * `Err(String)`  - if an error occurred while building the tree.
-pub fn create_tree_for_directory(path: &PathBuf) -> Result<Option<TreeItem>, String> {
-    let mut tree_hashes: BTreeMap<String, String> = BTreeMap::new();
-    let ignored_paths = file_utils::get_ignored_paths()?;
-    let result = build_tree(path, &mut tree_hashes, &ignored_paths)?;
-
-    if let Some(tree_item) = &result {
-        build_tree_metadata(&tree_item.hash, &tree_hashes)?;
-    }
-
-    Ok(result)
-}
-
-/// Build a tree item from a directory.
-/// Created tree and blob objects are stored.
-///
-/// # Arguments
-/// * `path`        - The path to the directory.
-/// * `tree_hashes` - The mapping of directory paths to tree hashes.
-/// The new tree objects will be added to this map.
-///
-/// # Returns
-/// * `Ok(TreeItem)` - if the tree was built successfully.
-/// * `Err(String)`  - if an error occurred while building the tree.
-fn build_tree(path: &PathBuf,
-              tree_hashes: &mut BTreeMap<String, String>,
-              ignored_paths: &Vec<Regex>) -> Result<Option<TreeItem>, String> {
-    let path_string = file_utils::path_to_string(path)?;
-
-    if ignored_paths.iter().any(|r| r.is_match(&path_string)) {
-        return Ok(None)
-    }
-
-    let directory = file_utils::read_directory(path)?;
-    let name = file_utils::get_filename_from_path(path)?.unwrap_or(String::new());
-
-    let mut tree = TreeItem::new(name, String::from(""), DirEntryType::Tree);
-
-    for entry_result in directory {
-        let entry = entry_result
-            .map_err(|e| format!("Error while reading directory entry: {}", e))?;
-        let entry_path = file_utils::path_to_string(&entry.path())?;
-
-        if ignored_paths.iter().any(|r| r.is_match(&entry_path)) {
-            continue;
-        }
-
-        let name = file_utils::get_name_for_file_or_directory(&entry)?;
-        let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-        let item_type = file_utils::get_type_of_dir_entry(&metadata);
-
-        if item_type.is_file() {
-            let tree_item = build_tree_item_from_file(&entry, name, item_type)?;
-            tree.add_child(tree_item);
-        } else {
-            let tree_item = build_tree(&entry.path(), tree_hashes, ignored_paths)?;
-
-            if let Some(item) = tree_item {
-                tree.add_child(item);
-            }
-        }
-    }
-
-    let mut object = LooseObjectBuilder::build_tree(&tree);
-    tree.hash = object.hash.clone();
-    object.store()?;
-
-    let path_string = file_utils::path_to_string(path)?;
-    tree_hashes.insert(path_string, object.hash.clone());
-
-    Ok(Some(tree))
-}
-
-/// Build a tree item from a file.
-/// Created blob objects are stored.
-///
-/// # Arguments
-/// * `entry`     - The directory entry to build the tree item from (should be a file).
-/// * `name`      - The name of the file.
-/// * `item_type` - The type of the tree item.
-///
-/// # Returns
-/// * `Ok(TreeItem)` - if the tree item was built successfully.
-/// * `Err(String)`  - if an error occurred while building the tree item.
-fn build_tree_item_from_file(entry: &std::fs::DirEntry,
-                             name: String,
-                             item_type: DirEntryType) -> Result<TreeItem, String> {
-    // Chunk-aware ingest: a giant becomes a recipe + chunks (its entry type upgraded to a
-    // `*Chunked` variant), a small file an ordinary blob. Store mode persists whatever it built.
-    let ingested = object_utils::ingest_file(&name, &entry.path(), item_type,
-                                             object_utils::IngestMode::Store)?;
-
-    if let Some(mut object) = ingested.deferred {
-        object.store()?;
-    }
-
-    Ok(TreeItem::new(name, ingested.hash, ingested.item_type))
-}
-
-/// Create (and save) a tree metadata file.
-/// The metadata file contains the mapping of directory paths to tree hashes.
-///
-/// # Arguments
-/// * `root_hash`   - The hash of the root tree object.
-/// * `tree_hashes` - The mapping of directory paths to tree hashes.
-/// The key should be the path, and the value should be the hash.
-///
-/// # Returns
-/// * `Ok(())`      - if the metadata was successfully created.
-/// * `Err(String)` - if an error occurred while creating the metadata.
-fn build_tree_metadata(root_hash: &str, tree_hashes: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut metadata: Vec<u8>  = Vec::new();
-
-    for (path, hash) in tree_hashes {
-        metadata.extend(path.as_bytes());
-        object_utils::push_end_of_text(&mut metadata);
-        metadata.extend_from_slice(hash.as_bytes());
-        object_utils::push_new_line(&mut metadata);
-    }
-
-    let (folder_path, tree_filename) = file_utils::get_path_for_object(root_hash)?;
-    let metadata_path = String::from(folder_path)
-        .add(file_utils::PATH_SEPARATOR)
-        .add(&tree_filename)
-        .add(FILENAME_METADATA_SUFFIX);
-
-    std::fs::write(&metadata_path, metadata).map_err(|e|
-        format!("Error while writing tree metadata to file \"{}\": {}", metadata_path, e)
-    )?;
-
-    Ok(())
 }
 
 /// Resolve a warehouse path key to its subtree object hash inside a tree, or `None` when the key

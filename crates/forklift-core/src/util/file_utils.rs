@@ -2440,20 +2440,74 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
     (0, 0)
 }
 
-/// Get regex patterns for paths that should be ignored by Forklift.
+/// The ignore rules in force: the built-in rules, which keep the warehouse's own folder out of
+/// tracking, and the user's rules from the ignore file.
+///
+/// A user rule covers only untracked paths, as in git: a file with a live entry in its parent's
+/// shard, or a directory registered in the inventory metadata, is tracked whatever the rules say,
+/// so its edits stay visible and are never silently overwritten. `remove` is how a path stops
+/// being tracked and so becomes ignored. The built-in rules apply whether or not a path is
+/// tracked. The only way to ask is [`IgnoreRules::excludes`], which takes the path's trackedness,
+/// so no caller can exclude a tracked path by forgetting to ask.
+pub struct IgnoreRules {
+    built_in: Vec<Regex>,
+    user: Vec<Regex>,
+}
+
+impl IgnoreRules {
+    /// Whether the walks should skip the path with the given key.
+    ///
+    /// An untracked path is covered by a user rule that matches its own key or the key of any
+    /// ancestor: a tracked folder a rule matches is walked, and the untracked content beneath it
+    /// stays ignored even where no rule matches its own key.
+    ///
+    /// # Arguments
+    /// * `key`     - The warehouse path key (see `WarehousePath::as_key`).
+    /// * `tracked` - Whether the path is tracked: a file with a live entry in its parent's
+    ///               shard, or a directory whose key is registered in the inventory metadata.
+    ///
+    /// # Returns
+    /// * `true`  - If the path should be skipped.
+    /// * `false` - If the path should be walked.
+    pub fn excludes(&self, key: &str, tracked: bool) -> bool {
+        if self.built_in.iter().any(|r| r.is_match(key)) {
+            return true;
+        }
+
+        if tracked || self.user.is_empty() {
+            return false;
+        }
+
+        let mut current = key;
+
+        loop {
+            if self.user.iter().any(|r| r.is_match(current)) {
+                return true;
+            }
+
+            match current.rsplit_once(PATH_SEPARATOR_CHAR) {
+                Some((parent, _)) => current = parent,
+                None => return false,
+            }
+        }
+    }
+}
+
+/// Get the ignore rules in force: the built-in rules and the rules of the ignore file.
 ///
 /// # Returns
-/// * Ok(Vec<Regex>) - The regex patterns for ignored paths.
-/// * Err(String)    - If the ignore file could not be read, or was refused: a symbolic link or
-///                    folder, a conflict marker, or a pattern matching the empty string.
-pub fn get_ignored_paths() -> Result<Vec<Regex>, String> {
-    let mut ignored_paths = get_default_ignored_paths()?;
+/// * Ok(IgnoreRules) - The rules.
+/// * Err(String)     - If the ignore file could not be read, or was refused: a symbolic link or
+///                     folder, a conflict marker, or a pattern matching the empty string.
+pub fn get_ignore_rules() -> Result<IgnoreRules, String> {
+    let built_in = get_default_ignored_paths()?;
 
-    if let Some(content) = read_ignore_file()? {
-        ignored_paths.extend(parse_ignore_rules(&content)?);
-    }
+    let user = match read_ignore_file()? {
+        Some(content) => parse_ignore_rules(&content)?,
+        None => Vec::new(),
+    };
 
-    Ok(ignored_paths)
+    Ok(IgnoreRules { built_in, user })
 }
 
 /// The path of the warehouse's ignore file, at the root of the working tree.
@@ -2530,19 +2584,6 @@ fn parse_ignore_rules(content: &str) -> Result<Vec<Regex>, String> {
     }
 
     Ok(rules)
-}
-
-/// Check if a path should be ignored by Forklift.
-///
-/// # Arguments
-/// * `path`          - The path to check.
-/// * `ignored_paths` - The regex patterns for ignored paths.
-///
-/// # Returns
-/// * `true`  - If the path should be ignored.
-/// * `false` - If the path should not be ignored.
-pub fn is_path_ignored(path: &str, ignored_paths: &Vec<Regex>) -> bool {
-    ignored_paths.iter().any(|r| r.is_match(path))
 }
 
 /// Get the metadata of the file or directory at the given path.
@@ -2632,15 +2673,35 @@ mod tests {
 
     #[test]
     fn default_ignore_rules_cover_the_warehouse_folder_but_no_sibling() {
-        let defaults = get_default_ignored_paths().unwrap();
+        let defaults = IgnoreRules { built_in: get_default_ignored_paths().unwrap(), user: Vec::new() };
 
         for ignored in [".forklift", ".forklift/config/warehouse.toml"] {
-            assert!(is_path_ignored(ignored, &defaults), "{} must be ignored", ignored);
+            // Trackedness never overrides a built-in rule.
+            assert!(defaults.excludes(ignored, true), "{} must be ignored", ignored);
         }
         // The ignore file is a sibling too: it is tracked content, like `.gitignore`.
         for tracked in [".forkliftignore", ".forkliftignore.bak", ".forklift-notes", ".forkliftrc", "a/.forklift", "x.forklift"] {
-            assert!(!is_path_ignored(tracked, &defaults), "{} must not be ignored", tracked);
+            assert!(!defaults.excludes(tracked, false), "{} must not be ignored", tracked);
         }
+    }
+
+    #[test]
+    fn a_user_rule_covers_only_untracked_paths_and_their_descendants() {
+        let rules = IgnoreRules {
+            built_in: get_default_ignored_paths().unwrap(),
+            user: parse_ignore_rules("^build$\n\\.log$\n").unwrap(),
+        };
+
+        // A tracked path is never excluded by a user rule, an untracked one is.
+        assert!(!rules.excludes("build", true));
+        assert!(rules.excludes("build", false));
+        assert!(!rules.excludes("a/x.log", true));
+        assert!(rules.excludes("a/x.log", false));
+        // Coverage is inherited: the rule matches only the folder's key, not the file's.
+        assert!(rules.excludes("build/new.txt", false));
+        assert!(rules.excludes("build/sub/new.txt", false));
+        assert!(!rules.excludes("build/new.txt", true));
+        assert!(!rules.excludes("src/main.rs", false));
     }
 
     #[test]
