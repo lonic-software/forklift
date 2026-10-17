@@ -60,7 +60,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     // A dropped prefix that still contains a kept (more specific) prefix cannot be cleanly
     // de-materialized — part of it is still needed. Refuse rather than remove kept files.
     for prefix in &dropped {
-        if let Some(inner) = keep.iter().find(|kept| is_strictly_under(kept, prefix)) {
+        if let Some(inner) = keep.iter().find(|kept| scope_utils::is_strictly_under(kept, prefix)) {
             return Err(format!(
                 "Cannot narrow away \"{}\": the kept path \"{}\" is inside it. Narrow the inner \
                 path first, or drop both.",
@@ -150,13 +150,6 @@ fn remove_working_subtree(prefix: &str) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while de-materializing \"{}\": {}", prefix, e)),
     }
-}
-
-/// Whether `child` is a strict descendant of the `ancestor` directory (both non-root keys).
-fn is_strictly_under(child: &str, ancestor: &str) -> bool {
-    child.len() > ancestor.len()
-        && child.as_bytes()[ancestor.len()] == b'/'
-        && child.starts_with(ancestor)
 }
 
 /// The result of a narrow: the paths dropped and the scope that remains.

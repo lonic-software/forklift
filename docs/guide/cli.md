@@ -945,13 +945,15 @@ forklift scope --json     # the same, as a machine envelope
 Read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
 the in-scope subtree prefixes. The warehouse fetch scope is reported too — *full* for an
 ordinary warehouse (the store holds everything), or the fetched prefixes for a sparse
-(`franchise --only`) one. The root `.forkliftignore` is in every scope without being
-listed. Widen the fetch scope with `expand`; shrink a checkout's
+(`franchise --only`) one. A scoped checkout also holds the root `.forkliftignore` in
+scope without it being a prefix; the report lists it as always in scope (`implicit_scope`
+in `--json`). Widen the fetch scope with `expand`; shrink a checkout's
 materialization scope with `narrow`.
 
-A sparse warehouse franchised by a Forklift older than the one that put the ignore file
-in every scope is refused by every command that reads its scope. Franchise the remote
-again, into a new directory.
+A scope recorded by a Forklift older than the one that put the ignore file in every
+scope is refused by every command that reads it. For a sparse warehouse, franchise the
+remote again, into a new directory; for a scoped bay, remove the bay and add it again
+with `bay add --scope`.
 
 ---
 

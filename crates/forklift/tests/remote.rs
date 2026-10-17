@@ -550,6 +550,13 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     assert!(!area.path("sparse/README").exists(), "another root file stays sealed");
     assert!(!area.path("sparse/docs").exists(), "an out-of-scope folder stays sealed");
 
+    // The scope report names it, apart from the declared prefixes.
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    assert_success(&scope);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["implicit_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
+
     // The rules are in force: an ignored build folder inside the scope reads clean.
     area.write_file("sparse/src/build/out.txt", "generated\n");
     let status = area.forklift("sparse", &["stocktake"]);

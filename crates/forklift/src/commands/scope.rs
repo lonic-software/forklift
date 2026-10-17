@@ -57,6 +57,7 @@ fn status() -> Result<(), String> {
         bay: globals::active_bay(),
         scoped: !bay_scope.is_full(),
         materialization_scope: bay_scope.prefixes().to_vec(),
+        implicit_scope: bay_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
         fetch_scope: fetch_scope.prefixes().to_vec(),
     });
 
@@ -78,6 +79,10 @@ pub(crate) struct ScopeStatus {
     /// The bay's in-scope prefixes (empty = the full tree).
     materialization_scope: Vec<String>,
 
+    /// The paths a scoped bay holds in scope without listing them as prefixes: the root ignore
+    /// file, so its rules apply to the checkout. Empty when the bay is not scoped.
+    implicit_scope: Vec<String>,
+
     /// The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse franchise records
     /// its fetched prefixes here).
     fetch_scope: Vec<String>,
@@ -96,6 +101,9 @@ impl CommandOutput for ScopeStatus {
             println!("{} is a scoped (sparse) bay. Materialization scope:", where_);
             for prefix in &self.materialization_scope {
                 println!("  {}", prefix);
+            }
+            for path in &self.implicit_scope {
+                println!("  {} (always in scope)", path);
             }
         }
 

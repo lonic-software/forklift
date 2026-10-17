@@ -628,10 +628,7 @@ async fn resolve_the_rest(
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
         (RemoteConsultation::ConsultedCleanly, BTreeMap::new())
     } else {
-        // Read before the best-effort passes and propagated, never defaulted: a scope this build
-        // cannot read must refuse heal, not widen pass 1's history fetch to the whole remote.
-        let fetch_scope = scope_utils::read_fetch_scope()?;
-        attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes, &fetch_scope).await
+        attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes).await
     };
 
     // Classifying-read filter (DESIGN.html §3.1.1): a candidate present elsewhere (another pack,
@@ -2181,7 +2178,6 @@ fn remedy_text(consultation: RemoteConsultation) -> &'static str {
 async fn attempt_heal_driven_refetch(
     candidate_hashes: &[String],
     corrupt_hashes: &[String],
-    fetch_scope: &scope_utils::MaterializationScope,
 ) -> (RemoteConsultation, BTreeMap<String, String>) {
     // In practice this function's own caller already filters out the "nothing configured" case
     // before ever calling it (`resolve_the_rest`'s own `remote_configured` gate, fixed the same
@@ -2210,10 +2206,17 @@ async fn attempt_heal_driven_refetch(
 
     match client.fetch_info().await {
         Ok(info) => {
+            // A user pallet's history fetch needs the fetch scope; one this build cannot read
+            // skips those fetches, never widens them to the whole remote. The meta pallets and
+            // the hash-addressed passes below need no scope and still run, and whatever stays
+            // missing is reported by the caller's recheck as usual.
+            let fetch_scope = scope_utils::read_fetch_scope();
+
             for (wire, remote_head) in &info.pallets {
-                let fetched = match wire.strip_prefix(pallet_utils::META_QUALIFIER) {
-                    Some(_) => remote_utils::fetch_history(&client, remote_head, &Progress::NONE).await,
-                    None => remote_utils::fetch_history_scoped(&client, remote_head, fetch_scope, &Progress::NONE).await,
+                let fetched = match (wire.strip_prefix(pallet_utils::META_QUALIFIER), &fetch_scope) {
+                    (Some(_), _) => remote_utils::fetch_history(&client, remote_head, &Progress::NONE).await,
+                    (None, Ok(scope)) => remote_utils::fetch_history_scoped(&client, remote_head, scope, &Progress::NONE).await,
+                    (None, Err(reason)) => Err(reason.clone()),
                 };
 
                 if fetched.is_err() {
