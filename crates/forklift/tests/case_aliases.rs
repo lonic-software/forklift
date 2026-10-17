@@ -564,3 +564,34 @@ fn a_new_directory_pair_replacing_a_removed_symlink_is_refused_or_materialized_w
         assert_eq!(warehouse.read("lib/b"), "b\n");
     }
 }
+
+/// A pair beneath a symlink the shift replaces with a real directory is probed in the working
+/// directory, never inside the link's target: an unwritable target must neither fail the shift
+/// nor answer for the volume the directory is created on.
+#[cfg(unix)]
+#[test]
+fn a_pair_beneath_a_replaced_symlink_is_probed_in_the_working_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = Warehouse::new("probe-base-link", &[("app.txt", "app\n")]);
+    let outside = warehouse.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, warehouse.root.join("lib")).unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "link"]);
+    warehouse.craft("pair", "main", &[("app.txt", "app\n"), ("lib/d/x", "x\n"), ("lib/D/y", "y\n")]);
+
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let shifted = warehouse.run(&["shift", "pair"]);
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!stderr(&shifted).contains("Could not tell"), "the probe ran in the link's target: {}", stderr(&shifted));
+    assert!(listed(&outside).is_empty(), "nothing is written in the link's target");
+    if warehouse.folds_case() {
+        assert_refused_with(&shifted, ALIAS_REFUSAL, &["lib/D and lib/d"]);
+    } else {
+        assert!(shifted.status.success(), "{}", stderr(&shifted));
+        assert_eq!(warehouse.read("lib/d/x"), "x\n");
+        assert_eq!(warehouse.read("lib/D/y"), "y\n");
+    }
+}

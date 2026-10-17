@@ -385,13 +385,21 @@ fn join(parent: &str, name: &str) -> String {
 /// the metadata folder need not share. A probe that cannot be made is an error, never a "no":
 /// two directories that alias would otherwise merge silently.
 fn probe_aliases(parent: &str, first: &str, second: &str) -> Result<bool, String> {
-    let mut base = PathBuf::from(if parent.is_empty() { "." } else { parent });
+    // Walked from the root with `lstat`, stopping at the first component that is not a real
+    // directory: a symlink (one the operation replaces, say) would put the probe in its target,
+    // outside the working directory and possibly on another volume.
+    let mut base = PathBuf::new();
 
-    while !base.is_dir() {
-        if !base.pop() || base.as_os_str().is_empty() {
-            base = PathBuf::from(".");
+    for name in parent.split('/').filter(|name| !name.is_empty()) {
+        let next = base.join(name);
+        if !std::fs::symlink_metadata(&next).is_ok_and(|metadata| metadata.is_dir()) {
             break;
         }
+        base = next;
+    }
+
+    if base.as_os_str().is_empty() {
+        base = PathBuf::from(".");
     }
 
     let mut last_error = None;
