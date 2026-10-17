@@ -1320,7 +1320,7 @@ fn validate_index_records(index: &[u8], count: usize, data_len: usize, path: &Pa
         ranges.push((offset, end));
     }
 
-    ranges.sort_unstable_by_key(|(start, _)| *start);
+    sort_ranges_by_start(&mut ranges);
     let mut expected = PACK_DATA_HEADER_LEN;
     for (start, end) in ranges {
         if start != expected {
@@ -1334,6 +1334,54 @@ fn validate_index_records(index: &[u8], count: usize, data_len: usize, path: &Pa
     }
 
     Ok(())
+}
+
+/// The bits of a start offset one radix pass of [`sort_ranges_by_start`] consumes.
+const RANGE_RADIX_BITS: u32 = 11;
+
+/// Sort `(start, end)` ranges by `start`, as `sort_unstable_by_key` would, with an LSD radix sort.
+///
+/// Every process pays this once per pack it opens, over every record of a hash-ordered index —
+/// ~400k on git.git, where the comparison sort was 5.1 of the 5.8 ms the whole validation took
+/// (FORK-183). The keys are byte offsets bounded by the pack's size, so a few 11-bit passes cover
+/// them: three for any pack under 8 GiB.
+fn sort_ranges_by_start(ranges: &mut Vec<(u64, u64)>) {
+    // Below this the counting arrays cost more than the comparison sort they replace.
+    if ranges.len() < 1024 {
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+        return;
+    }
+
+    let max_start = ranges.iter().map(|(start, _)| *start).max().unwrap_or(0);
+    let key_bits = u64::BITS - max_start.leading_zeros();
+    let mask = (1u64 << RANGE_RADIX_BITS) - 1;
+    let mut scratch = vec![(0u64, 0u64); ranges.len()];
+    let mut shift = 0;
+
+    while shift < key_bits {
+        let mut counts = [0usize; 1 << RANGE_RADIX_BITS];
+        for (start, _) in ranges.iter() {
+            counts[((start >> shift) & mask) as usize] += 1;
+        }
+
+        let mut position = 0;
+        for count in counts.iter_mut() {
+            let bucket = *count;
+            *count = position;
+            position += bucket;
+        }
+
+        // Each pass is stable, so the order the earlier (lower-digit) passes established survives
+        // every tie on this digit.
+        for range in ranges.iter() {
+            let digit = ((range.0 >> shift) & mask) as usize;
+            scratch[counts[digit]] = *range;
+            counts[digit] += 1;
+        }
+
+        std::mem::swap(ranges, &mut scratch);
+        shift += RANGE_RADIX_BITS;
+    }
 }
 
 /// What installing the native-pack payload of a transport bundle added to this object store.
@@ -4184,6 +4232,109 @@ mod tests {
             PackRetrieval::Verified(bytes) => bytes,
             other => panic!("expected a verified pack record for {}, got {:?}", hash, other),
         }
+    }
+
+    /// A deterministic pseudo-random stream (an LCG), so the shuffles below are reproducible.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 11
+    }
+
+    /// An index (header bytes zeroed: `validate_index_records` reads only the records) over
+    /// `count` objects that tile a data body in a shuffled order, with the records in strictly
+    /// increasing hash order, as the native writer lays them out. Lengths vary so that offsets
+    /// need several radix digits. Returns the index and the data length the records tile.
+    fn tiled_index(count: usize) -> (Vec<u8>, Vec<(u64, u64)>, usize) {
+        let mut seed = 7;
+        let mut order: Vec<usize> = (0..count).collect();
+        for i in (1..count).rev() {
+            order.swap(i, (lcg(&mut seed) % (i as u64 + 1)) as usize);
+        }
+
+        let lengths: Vec<u64> = (0..count).map(|_| 1 + lcg(&mut seed) % 5000).collect();
+        let mut placed = vec![(0u64, 0u64); count];
+        let mut offset = PACK_DATA_HEADER_LEN;
+        for &record in &order {
+            placed[record] = (offset, lengths[record]);
+            offset += lengths[record];
+        }
+
+        let mut index = vec![0u8; INDEX_HEADER_LEN];
+        for (position, (offset, length)) in placed.iter().enumerate() {
+            let mut hash = [0u8; HASH_LEN];
+            hash[..8].copy_from_slice(&(position as u64).to_be_bytes());
+            index.extend_from_slice(&hash);
+            index.extend_from_slice(&offset.to_le_bytes());
+            index.extend_from_slice(&length.to_le_bytes());
+        }
+
+        (index, placed, offset as usize)
+    }
+
+    /// Overwrite record `position`'s offset and length in an index built by [`tiled_index`].
+    fn set_record(index: &mut [u8], position: usize, offset: u64, length: u64) {
+        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN + HASH_LEN;
+        index[record..record + 8].copy_from_slice(&offset.to_le_bytes());
+        index[record + 8..record + 16].copy_from_slice(&length.to_le_bytes());
+    }
+
+    #[test]
+    fn the_radix_range_sort_orders_like_a_comparison_sort() {
+        // Starts spread over 41 bits take four radix passes, and repeated starts check that ties
+        // keep a valid order; small inputs take the comparison-sort branch.
+        for count in [0, 1, 5, 1023, 1024, 5000] {
+            let mut seed = count as u64 + 1;
+            let mut ranges: Vec<(u64, u64)> = (0..count).map(|_| {
+                let start = lcg(&mut seed) % (1 << 41);
+                let start = if start % 7 == 0 { 4096 } else { start };
+                (start, lcg(&mut seed))
+            }).collect();
+
+            let mut expected = ranges.clone();
+            expected.sort_by_key(|(start, _)| *start);
+            sort_ranges_by_start(&mut ranges);
+
+            let starts = |rs: &[(u64, u64)]| rs.iter().map(|(start, _)| *start).collect::<Vec<_>>();
+            assert_eq!(starts(&ranges), starts(&expected), "starts out of order for {} ranges", count);
+
+            let mut got_sorted = ranges.clone();
+            got_sorted.sort();
+            expected.sort();
+            assert_eq!(got_sorted, expected, "the sort lost or duplicated a range for {} ranges", count);
+        }
+    }
+
+    #[test]
+    fn index_validation_accepts_a_shuffled_tiling_and_refuses_a_gap_or_an_overlap() {
+        // 5000 records: the radix branch. The records are in hash order and their offsets are a
+        // shuffle of the body, so only a correct sort by offset sees the exact tiling.
+        let (index, placed, data_len) = tiled_index(5000);
+        let path = Path::new("test.idx");
+        assert!(validate_index_records(&index, placed.len(), data_len, path).is_ok());
+
+        // A record that starts one byte late leaves a gap before it and overlaps its successor.
+        let (record, (offset, length)) = placed.iter().enumerate()
+            .find(|(_, (offset, length))| *length > 1 && offset + length < data_len as u64)
+            .map(|(record, range)| (record, *range)).unwrap();
+        let mut shifted = index.clone();
+        set_record(&mut shifted, record, offset + 1, length);
+        let error = validate_index_records(&shifted, placed.len(), data_len, path).unwrap_err();
+        assert!(error.contains("is corrupt"), "{}", error);
+
+        // A record one byte short leaves a gap after it that no record accounts for.
+        let mut short = index.clone();
+        set_record(&mut short, record, offset, length - 1);
+        let error = validate_index_records(&short, placed.len(), data_len, path).unwrap_err();
+        assert!(error.contains("is corrupt"), "{}", error);
+
+        // Two records swapping their offsets but keeping their lengths no longer tile the body when
+        // the lengths differ, although the lengths still sum to it.
+        let (a, b) = (0..placed.len()).flat_map(|a| (a + 1..placed.len()).map(move |b| (a, b)))
+            .find(|&(a, b)| placed[a].1 != placed[b].1).unwrap();
+        let mut swapped = index.clone();
+        set_record(&mut swapped, a, placed[b].0, placed[a].1);
+        set_record(&mut swapped, b, placed[a].0, placed[b].1);
+        assert!(validate_index_records(&swapped, placed.len(), data_len, path).is_err());
     }
 
     #[test]
