@@ -226,6 +226,30 @@ so the first real lookup reports it as before.
 The log and commit rows didn't move beyond noise (0.99x, 3.11x). The git-side numbers drift by
 about 1 ms between runs.
 
+## FORK-185: commit-graph write amplification on a cold build (2026-10-18)
+
+**Measured** on the benchmark's git.git warehouse (24,423-parcel first-parent chain), with
+`.forklift/graph` removed and `forklift blame Makefile` run once. Writes were counted with a
+throwaway build that logged each shard write; the counting build was never committed.
+
+- **Before:** 105,037 shard writes, 1.37 GB written, to leave a 7 MB graph. One shard was
+  rewritten 480 times. Blame walks its chain oldest first, so each step persists a small batch:
+  the `ensure` for the next parcel's few missing ancestors, then that parcel's changed-path filter.
+  Every persist rewrote whole shards.
+- **Fix:** `graph_utils::DeferredWrites`. While a guard is live, a persist marks the resident
+  shard dirty, and the guard's drop writes each dirty shard once. The CLI holds one guard per
+  command. The server holds none and keeps writing eagerly, because a long-lived process would
+  never reach the drop.
+- **After:** 256 writes and 6.85 MB written. The blame output is byte-identical.
+
+| Cold `blame Makefile` (hyperfine, 3 runs, graph removed before each) | before | after |
+|---|---|---|
+| wall time | 1.0 ± 0.2 min | 0.5 ± 0.0 min (2.1x) |
+
+The remaining ~29 s cold (16.5 s warm) is blame itself: computing changed-path filters by tree
+diff, and attributing the versions that touch the file. git blames the same file in 0.68 s,
+which is FORK-190.
+
 ---
 
 ## Remaining items
