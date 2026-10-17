@@ -170,7 +170,12 @@ forklift behaves predictably. From `DESIGN.html` §2:
   (`.forklift/lock`, `create_new`, held for the whole command) so a reader can
   never see a half-updated staging area. Read-only commands don't take it. Add a
   new mutating command to the lock list in `cli.rs`
-  (`requires_warehouse_lock`).
+  (`requires_warehouse_lock`). Every command on that list also holds the
+  object store **shared** (`StoreAccessLock`, `.forklift/store-access.lock`)
+  unless it deletes objects itself (`holds_store_access`); anything that deletes
+  objects on a liveness or scope decision — a full repack, `gc`, `scope-prune` —
+  takes it exclusively with a try and refuses beside a writer. Bay lock first,
+  store access second.
 - **The remote is untrusted storage + thin verifiers.** Anything a client uploads
   is unverified until the server checks it (hash, signature, privileges). Anything
   a client downloads is verifiable offline (content addressing + signatures).

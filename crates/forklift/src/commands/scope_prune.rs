@@ -35,8 +35,8 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - If the plan was reported (dry run) or carried out.
 /// * `Err(String)` - If the warehouse is not sparse, a path is a live spine ancestor or a
-///   sub-path of what is still fetched, the last fetched path would be dropped, or a checkout
-///   still materializes the path.
+///   sub-path of what is still fetched, the last fetched path would be dropped, a checkout
+///   still materializes the path, or another process is using the object store.
 pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     // Exclusive store access first, before anything is read (FORK-150). The keep-set depends on
     // the fetch scope read just below and on every bay's materialization scope, not only on the
