@@ -384,4 +384,22 @@ mod tests {
         add(&path, "").unwrap();
         assert_eq!(read(&path).unwrap(), BTreeSet::from(["".to_string()]));
     }
+
+    #[test]
+    fn a_key_holding_a_line_break_round_trips_as_one_key() {
+        let path = scratch("line-break-key");
+        for key in ["a\nb", "c\r", "d\\ne"] {
+            add(&path, key).unwrap();
+        }
+
+        assert_eq!(read(&path).unwrap(), BTreeSet::from(["a\nb".to_string(), "c\r".to_string(), "d\\ne".to_string()]));
+    }
+
+    #[test]
+    fn a_marker_without_its_format_header_is_refused() {
+        let path = scratch("headerless");
+        std::fs::write(&path, "src\n").unwrap();
+
+        assert!(read(&path).is_err());
+    }
 }

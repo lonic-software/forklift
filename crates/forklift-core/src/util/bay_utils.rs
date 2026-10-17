@@ -415,4 +415,23 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_redirect_round_trips_a_warehouse_root_holding_a_line_break() {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-bay-utils-redirect-line-break-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for root in ["/srv/ware\nhouse", "/srv/ware\r", "/srv/a\\nb"] {
+            write_bay_redirect(&dir, Path::new(root), "review").unwrap();
+
+            let redirect = read_bay_redirect(&dir.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+
+            assert_eq!(redirect.warehouse_root, PathBuf::from(root));
+            assert_eq!(redirect.name, "review");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

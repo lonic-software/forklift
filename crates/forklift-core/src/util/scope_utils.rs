@@ -1000,4 +1000,13 @@ mod tests {
         assert!(message.contains("bay \"reviewer\""), "the blocker is named: {}", message);
         assert!(next_step.contains("Narrow"), "the recovery says how to unblock: {}", next_step);
     }
+
+    #[test]
+    fn prefixes_holding_line_breaks_or_edge_spaces_round_trip() {
+        let scope = MaterializationScope::from_prefixes(["a\nb", " docs ", "c\r", "d\\ne"]);
+
+        let read_back = MaterializationScope::from_bytes(&scope.to_bytes(), "").unwrap();
+
+        assert_eq!(read_back, scope);
+    }
 }

@@ -8343,6 +8343,53 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
     assert_eq!(pallet_head_hash(&warehouse, "scoped"), head_before, "a refused stack must commit nothing");
 }
 
+/// The skeleton records out-of-scope paths, and a tree name may hold a line break. A scoped
+/// merge left in progress by an in-scope conflict, then resolved and stacked, must commit the
+/// same tree a full bay does — the skeleton has to read back the name it wrote. (Windows cannot
+/// create a file name holding a line break.)
+#[cfg(unix)]
+#[test]
+fn a_scoped_merge_resumed_after_a_conflict_keeps_an_out_of_scope_name_holding_a_line_break() {
+    let warehouse = TestWarehouse::new("scoped-skeleton-line-break");
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/web\nold/w.txt", "web v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    warehouse.write_file("src/web\nold/w.txt", "web v2 from theirs\n");
+    warehouse.write_file("src/api/a.txt", "api a v2 from theirs\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs edits web and api"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    let full_dir = warehouse.home.join("bay-full");
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    let mut trees = Vec::new();
+    for (bay, dir) in [("full", &full_dir), ("scoped", &scoped_dir)] {
+        std::fs::write(dir.join("src/api/a.txt"), format!("api a v2 from {}\n", bay)).unwrap();
+        assert_success(&warehouse.run_at(dir, &["load", "."]));
+        assert_success(&warehouse.run_at(dir, &["stack", "edit api"]));
+
+        let consolidated = warehouse.run_at(dir, &["--json", "consolidate", "theirs"]);
+        assert_success(&consolidated);
+        assert_eq!(json(&consolidated)["data"]["outcome"], "conflicts", "{}", stdout(&consolidated));
+
+        std::fs::write(dir.join("src/api/a.txt"), "api a resolved\n").unwrap();
+        assert_success(&warehouse.run_at(dir, &["load", "."]));
+        assert_success(&warehouse.run_at(dir, &["stack", "complete the merge"]));
+        trees.push(parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, bay)));
+    }
+
+    assert_eq!(trees[0], trees[1],
+        "the scoped merge must commit theirs' out-of-scope directory under its exact name");
+}
+
 // -------------------------------------------------------------------------------------------
 // Presence-tolerant maintenance: `compact --all` on a store that legitimately lacks its
 // out-of-scope objects.

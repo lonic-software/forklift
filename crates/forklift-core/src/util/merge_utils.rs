@@ -1419,4 +1419,54 @@ mod tests {
 
         std::fs::remove_dir_all(&temp).ok();
     }
+
+    /// The names a tree may hold but a line-per-entry record cannot carry raw: a line feed, a
+    /// carriage return (which `str::lines` also strips from a line's end), and the backslash the
+    /// escape itself is built from.
+    const HOSTILE_NAMES: [&str; 7] = ["a\nb", "c\rd", "e\r", "\nf", "g\\nh", "i\\", "with space"];
+
+    #[test]
+    fn the_skeleton_round_trips_names_holding_line_breaks_and_backslashes() {
+        let hash = "0123456789abcdef".repeat(4);
+        let mut entries = BTreeMap::new();
+        for name in HOSTILE_NAMES {
+            entries.insert(format!("src/{}", name), Some((hash.clone(), DirEntryType::Normal)));
+            entries.insert(format!("gone/{}", name), None);
+        }
+        let skeleton = OutOfScopeSkeleton { entries: entries.clone() };
+
+        let read_back = OutOfScopeSkeleton::from_bytes(&skeleton.to_bytes()).unwrap();
+
+        assert_eq!(read_back.entries, entries);
+    }
+
+    #[test]
+    fn a_skeleton_without_its_format_header_is_refused() {
+        let refused = OutOfScopeSkeleton::from_bytes(b"D src/a\n").unwrap_err();
+
+        assert!(refused.contains("format"), "{}", refused);
+    }
+
+    #[test]
+    fn the_consolidation_state_round_trips_a_label_holding_a_line_break() {
+        use crate::globals::StorageRootScope;
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-consolidation-state-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        for label in HOSTILE_NAMES {
+            let state = ConsolidationState { their_head: "ab".repeat(32), their_pallet: label.to_string() };
+            write_consolidation_state(&state).unwrap();
+
+            let read_back = read_consolidation_state().unwrap().unwrap();
+
+            assert_eq!(read_back.their_pallet, label);
+            assert_eq!(read_back.their_head, state.their_head);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
 }
