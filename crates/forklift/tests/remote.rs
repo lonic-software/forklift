@@ -583,6 +583,75 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 }
 
+/// The root ignore file is in scope without being a declared prefix, so the sparse verbs that
+/// guard a prefix's shape or contents treat it as an ordinary file: unstaging an edit to it is
+/// no type change, and an edit to it does not block narrowing some other prefix away.
+#[test]
+fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_it() {
+    let area = TestArea::new("sparse-ignore-file-verbs");
+    let server = Server::start(&area, None);
+
+    let rules = "^src/build(/.*)?$\n";
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.forkliftignore", rules);
+    area.write_file("dev/src/a.txt", "a v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src", "--only", "docs"]));
+
+    // A staged edit to the rules unstages back to the head's version.
+    area.write_file("sparse/.forkliftignore", "^src/build(/.*)?$\n\\.log$\n");
+    assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["restore", "--staged", ".forkliftignore"]));
+    let status = area.forklift("sparse", &["--json", "stocktake"]);
+    assert_success(&status);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(json["data"]["staged_count"], serde_json::json!(0), "the edit is unstaged: {}", stdout(&status));
+    assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "modified", "path": ".forkliftignore"}]),
+        "{}", stdout(&status));
+
+    // The edit is still on disk, unstaged; narrowing "docs" away is not blocked by it.
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert!(!area.path("sparse/docs").exists(), "the narrowed prefix is de-materialized");
+    assert_eq!(area.read_file("sparse/.forkliftignore"), "^src/build(/.*)?$\n\\.log$\n",
+        "the unstaged edit to the rules survives the narrow");
+}
+
+/// A scope file written before the root ignore file joined every scope is refused on read, rather
+/// than read under today's meaning — under which the never-inventoried ignore file would show as
+/// a removal and the next stack would commit it.
+#[test]
+fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
+    let area = TestArea::new("sparse-legacy-scope");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.forkliftignore", "^src/build(/.*)?$\n");
+    area.write_file("dev/src/a.txt", "a v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+
+    // Rewrite the recorded scopes in the unversioned form an older Forklift wrote.
+    for file in ["sparse/.forklift/config/fetch-scope", "sparse/.forklift/scope"] {
+        assert!(area.path(file).exists(), "the sparse franchise records {}", file);
+        std::fs::write(area.path(file), "src\n").unwrap();
+    }
+
+    for verb in [&["stocktake"][..], &["stack", "nothing"][..]] {
+        let refused = area.forklift("sparse", verb);
+        assert!(!refused.status.success(), "{:?} must refuse: {}", verb, stdout(&refused));
+        assert!(stderr(&refused).contains("older version of Forklift"), "{:?}: {}", verb, stderr(&refused));
+        assert!(stderr(&refused).contains("Franchise the remote again"), "{:?}: {}", verb, stderr(&refused));
+    }
+}
+
 #[test]
 fn lift_franchise_lower_round_trip() {
     let area = TestArea::new("round-trip");
@@ -4516,7 +4585,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     // Simulate an interrupted prune by hand: narrow the shared fetch scope directly (step one of
     // a real prune, already durable) and delete only the blob — the child, freed before its
     // parent tree in a real run's order — leaving the parent tree behind (step two, interrupted).
-    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), "src/api\n").unwrap();
+    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), "/forklift-scope 2\nsrc/api\n").unwrap();
     std::fs::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
     assert!(object_present(&area, "sparse", &web_tree),
         "the simulated interruption leaves the parent tree behind");

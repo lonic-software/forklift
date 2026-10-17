@@ -14,13 +14,16 @@ of the project, so it is never written into a parcel, pushed to a remote, or imp
 collaborators. A plain bay (or the main tree) has no scope file at all.
 
 ## Structure
-A UTF-8 text file, one in-scope path prefix per line:
+A UTF-8 text file: a format header line, then one in-scope path prefix per line:
 ```
+/forklift-scope 2[NL]
 [prefix_1][NL]
 [prefix_2][NL]
 ...
 ```
 Where:
+- `/forklift-scope 2` names the format. It opens with `/`, which no stored prefix can, so it
+  cannot be mistaken for a prefix. A full scope is written as the empty file, with no header.
 - `prefix_n` is a **warehouse path key**: `/`-separated, relative to the warehouse root,
   with no leading or trailing `/` and no `.`/`..` components (e.g. `src/api`). A prefix names
   a directory; everything at or under it is *in scope*.
@@ -34,12 +37,20 @@ Where:
 - A prefix of the empty string (the warehouse root) is equivalent to full scope.
 - On read, blank lines and surrounding whitespace are ignored; prefixes are trimmed of
   surrounding `/`, de-duplicated and sorted, giving a canonical on-disk form.
+- A non-empty file whose first line is not the header is the unversioned format 1, written
+  before the root ignore file joined every scope, and is **refused** — read under format 2's
+  meaning, the never-inventoried ignore file would show as removed and the next stack would
+  commit the removal. A header naming any other version is refused too. Neither is migrated:
+  franchise the remote again.
 
 Against a scope, every user-pallet content path is classified three ways (the classifier the
 sparse walks branch on):
 
-- **In scope** — the path is at or under an in-scope prefix. Fully materialized: descended,
-  staged, verified and merged exactly as a full workspace would.
+- **In scope** — the path is at or under an in-scope prefix, or is the root `.forkliftignore`,
+  which every non-full scope holds so that a sparse checkout always has the rules that apply
+  to it. Fully materialized: descended, staged, verified and merged exactly as a full
+  workspace would. The ignore file is not a declared prefix, so a scope never requires it to
+  be a directory.
 - **Spine** — the path is a strict ancestor of an in-scope prefix (so the root is always
   spine in a scoped bay). Walked, but its *other* entries at that level are out of scope and
   carried forward by hash, never descended.

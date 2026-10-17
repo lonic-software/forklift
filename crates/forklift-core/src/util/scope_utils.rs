@@ -36,6 +36,13 @@ const FILE_NAME_BAY_SCOPE: &str = "scope";
 const FOLDER_NAME_CONFIG: &str = "config";
 const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 
+/// The first line of every non-full scope file, naming its format. Format 2 is the one in which
+/// the root ignore file is in every scope; the unversioned files before it are refused on read.
+/// It opens with "/", which no stored prefix can (prefixes are trimmed of it), so an unversioned
+/// file can never be mistaken for a versioned one.
+const SCOPE_FORMAT_TAG: &str = "/forklift-scope ";
+const SCOPE_FORMAT_HEADER: &str = "/forklift-scope 2";
+
 /// The stable machine-branchable refusal codes this feature contributes to the §7.4 error
 /// taxonomy, as their code strings — kept as re-exports of the typed [`RefusalCode`] (the source
 /// of truth lives in [`crate::error`]) so existing references keep resolving. A scope refusal is a
@@ -83,8 +90,11 @@ pub use crate::error::{REFUSAL_PREFIX, REFUSAL_FIELD_SEPARATOR};
 /// §3.1). Every scope-aware walk branches on the three cases, never on a single predicate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScopeClass {
-    /// At or under a configured in-scope prefix: fully materialized — descend, materialize,
-    /// verify and merge exactly as a full workspace would. Nothing below needs re-classifying.
+    /// At or under a configured in-scope prefix, or the root ignore file, which every scope
+    /// holds: fully materialized — descend, materialize, verify and merge exactly as a full
+    /// workspace would. Nothing below needs re-classifying. Not every in-scope path is under a
+    /// directory prefix — the ignore file is a file at a spine level — so a walk that refuses a
+    /// type change asks [`MaterializationScope::requires_directory`], never this variant.
     InScope,
 
     /// A strict ancestor of at least one in-scope prefix: must be walked (something below it
@@ -166,9 +176,11 @@ impl MaterializationScope {
             return ScopeClass::InScope;
         }
 
-        // In scope: at or under some in-scope prefix, or the root ignore file.
+        // In scope: at or under some in-scope prefix, or the root ignore file — an implicit member
+        // of every scope, so a sparse checkout always holds the rules that apply to it.
+        // `requires_directory` and `subset_of` reason over the declared prefixes only.
         for prefix in self.prefixes.iter().map(String::as_str).chain([crate::util::file_utils::FILENAME_IGNORE]) {
-            if path == prefix || is_strictly_under(path, prefix) {
+            if is_at_or_under(path, prefix) {
                 return ScopeClass::InScope;
             }
         }
@@ -208,10 +220,17 @@ impl MaterializationScope {
         self.prefixes.iter().all(|prefix| other.classify(prefix) == ScopeClass::InScope)
     }
 
-    /// Serialize the scope to its on-disk form: one prefix per line, newline-terminated.
-    /// A full scope serializes to the empty string.
+    /// Serialize the scope to its on-disk form: the [`SCOPE_FORMAT_HEADER`] line, then one prefix
+    /// per line, each newline-terminated. A full scope serializes to the empty string.
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+
+        if self.prefixes.is_empty() {
+            return bytes;
+        }
+
+        bytes.extend_from_slice(SCOPE_FORMAT_HEADER.as_bytes());
+        bytes.push(b'\n');
 
         for prefix in &self.prefixes {
             bytes.extend_from_slice(prefix.as_bytes());
@@ -221,18 +240,47 @@ impl MaterializationScope {
         bytes
     }
 
-    /// Parse a scope from its on-disk form (blank lines and surrounding whitespace ignored).
+    /// Parse a scope from its on-disk form (blank lines and surrounding whitespace ignored); an
+    /// error is phrased to follow "The scope file \"<path>\"". An
+    /// empty file is the full scope. Anything else must open with [`SCOPE_FORMAT_HEADER`]: a file
+    /// without it was written under the older meaning of a scope, which left the root ignore file
+    /// out, and reading it under today's meaning would report that file as removed and commit the
+    /// removal — so it is refused, as is a header naming a format this build does not know.
     fn from_bytes(bytes: &[u8]) -> Result<MaterializationScope, String> {
         let text = std::str::from_utf8(bytes)
-            .map_err(|_| "The scope file is not valid UTF-8.".to_string())?;
+            .map_err(|_| "is not valid UTF-8.".to_string())?;
 
-        let prefixes: Vec<&str> = text.lines()
+        let mut lines = text.lines()
             .map(|line| line.trim())
-            .filter(|line| !line.is_empty())
-            .collect();
+            .filter(|line| !line.is_empty());
 
-        Ok(MaterializationScope::from_prefixes(prefixes))
+        let header = match lines.next() {
+            Some(header) => header,
+            None => return Ok(MaterializationScope::full()),
+        };
+
+        if header != SCOPE_FORMAT_HEADER {
+            return Err(if header.starts_with(SCOPE_FORMAT_TAG) {
+                format!(
+                    "is in a format this version of Forklift does not know (\"{}\"). Use the \
+                    Forklift that wrote it.",
+                    header
+                )
+            } else {
+                "was written by an older version of Forklift, whose sparse checkouts left out \
+                the root ignore file, so this sparse warehouse cannot be read safely. Franchise \
+                the remote again, into a new directory.".to_string()
+            });
+        }
+
+        Ok(MaterializationScope::from_prefixes(lines))
     }
+}
+
+/// Whether `path` is `prefix` itself or lies under it — a pure path test, unlike
+/// [`MaterializationScope::classify`], which also holds the root ignore file in scope.
+pub fn is_at_or_under(path: &str, prefix: &str) -> bool {
+    path == prefix || is_strictly_under(path, prefix)
 }
 
 /// Whether `child` is a strict descendant of the `ancestor` directory (not equal to it).
@@ -261,7 +309,9 @@ pub fn fetch_scope_path() -> PathBuf {
 /// unscoped default that keeps plain bays and the main tree behaving exactly as before).
 fn read_scope_file(path: &Path) -> Result<MaterializationScope, String> {
     match std::fs::read(path) {
-        Ok(bytes) => MaterializationScope::from_bytes(&bytes),
+        Ok(bytes) => MaterializationScope::from_bytes(&bytes).map_err(|reason| {
+            format!("The scope file \"{}\" {}", path.to_string_lossy(), reason)
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(MaterializationScope::full()),
         Err(e) => Err(format!("Error while reading the scope file \"{}\": {}", path.to_string_lossy(), e)),
     }
@@ -673,6 +723,26 @@ mod tests {
     }
 
     #[test]
+    fn the_root_ignore_file_is_in_every_scope_without_being_a_prefix() {
+        let scope = MaterializationScope::from_prefixes(["src/api"]);
+
+        // The root ignore file is in scope, though no prefix names it — but it is not a declared
+        // prefix, so the scope never requires it to be a directory, and it widens nothing else.
+        assert_eq!(scope.classify(".forkliftignore"), ScopeClass::InScope);
+        assert!(!scope.requires_directory(".forkliftignore"));
+        assert_eq!(scope.prefixes(), &["src/api".to_string()]);
+        assert_eq!(scope.classify("README.md"), ScopeClass::OutOfScope);
+        assert_eq!(scope.classify(".forkliftignorex"), ScopeClass::OutOfScope);
+        assert_eq!(scope.classify("src/.forkliftignore"), ScopeClass::OutOfScope);
+
+        // A path test that does not go through the scope sees only the prefix.
+        assert!(is_at_or_under("src/api/x.rs", "src/api"));
+        assert!(is_at_or_under("src/api", "src/api"));
+        assert!(!is_at_or_under(".forkliftignore", "src/api"));
+        assert!(!is_at_or_under("src", "src/api"));
+    }
+
+    #[test]
     fn classify_handles_multiple_prefixes() {
         let scope = MaterializationScope::from_prefixes(["src/api", "docs"]);
 
@@ -706,6 +776,22 @@ mod tests {
         assert!(MaterializationScope::full().to_bytes().is_empty());
         assert!(MaterializationScope::from_bytes(b"").unwrap().is_full());
         assert!(MaterializationScope::from_bytes(b"\n  \n").unwrap().is_full());
+    }
+
+    #[test]
+    fn a_scope_file_without_its_format_header_is_refused() {
+        // A non-full scope is written under its format header.
+        let bytes = MaterializationScope::from_prefixes(["src"]).to_bytes();
+        assert!(bytes.starts_with(b"/forklift-scope 2\n"), "{:?}", String::from_utf8_lossy(&bytes));
+
+        // The unversioned form an older Forklift wrote is refused, naming the way out.
+        let legacy = MaterializationScope::from_bytes(b"src\n").unwrap_err();
+        assert!(legacy.contains("older version of Forklift"), "{}", legacy);
+        assert!(legacy.contains("Franchise the remote again"), "{}", legacy);
+
+        // So is a format this build does not know.
+        let unknown = MaterializationScope::from_bytes(b"/forklift-scope 3\nsrc\n").unwrap_err();
+        assert!(unknown.contains("/forklift-scope 3"), "{}", unknown);
     }
 
     #[test]

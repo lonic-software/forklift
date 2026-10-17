@@ -628,7 +628,10 @@ async fn resolve_the_rest(
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
         (RemoteConsultation::ConsultedCleanly, BTreeMap::new())
     } else {
-        attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes).await
+        // Read before the best-effort passes and propagated, never defaulted: a scope this build
+        // cannot read must refuse heal, not widen pass 1's history fetch to the whole remote.
+        let fetch_scope = scope_utils::read_fetch_scope()?;
+        attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes, &fetch_scope).await
     };
 
     // Classifying-read filter (DESIGN.html §3.1.1): a candidate present elsewhere (another pack,
@@ -2178,6 +2181,7 @@ fn remedy_text(consultation: RemoteConsultation) -> &'static str {
 async fn attempt_heal_driven_refetch(
     candidate_hashes: &[String],
     corrupt_hashes: &[String],
+    fetch_scope: &scope_utils::MaterializationScope,
 ) -> (RemoteConsultation, BTreeMap<String, String>) {
     // In practice this function's own caller already filters out the "nothing configured" case
     // before ever calling it (`resolve_the_rest`'s own `remote_configured` gate, fixed the same
@@ -2206,18 +2210,10 @@ async fn attempt_heal_driven_refetch(
 
     match client.fetch_info().await {
         Ok(info) => {
-            let fetch_scope = match scope_utils::read_fetch_scope() {
-                Ok(scope) => scope,
-                Err(_) => {
-                    clean = false;
-                    scope_utils::MaterializationScope::full()
-                }
-            };
-
             for (wire, remote_head) in &info.pallets {
                 let fetched = match wire.strip_prefix(pallet_utils::META_QUALIFIER) {
                     Some(_) => remote_utils::fetch_history(&client, remote_head, &Progress::NONE).await,
-                    None => remote_utils::fetch_history_scoped(&client, remote_head, &fetch_scope, &Progress::NONE).await,
+                    None => remote_utils::fetch_history_scoped(&client, remote_head, fetch_scope, &Progress::NONE).await,
                 };
 
                 if fetched.is_err() {
