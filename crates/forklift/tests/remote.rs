@@ -527,6 +527,62 @@ fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 }
 
+/// A sparse franchise whose scope leaves out the root holds the root ignore file in scope all
+/// the same: it is fetched and materialized, its rules are in force, and an edit to it stacks
+/// and travels both ways, while the other root files stay sealed.
+#[test]
+fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
+    let area = TestArea::new("sparse-ignore-file");
+    let server = Server::start(&area, None);
+
+    let rules = "^src/build(/.*)?$\n";
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.forkliftignore", rules);
+    area.write_file("dev/README", "readme v1\n");
+    area.write_file("dev/src/a.txt", "a v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+    assert_eq!(area.read_file("sparse/.forkliftignore"), rules, "the root ignore file is materialized");
+    assert!(!area.path("sparse/README").exists(), "another root file stays sealed");
+    assert!(!area.path("sparse/docs").exists(), "an out-of-scope folder stays sealed");
+
+    // The rules are in force: an ignored build folder inside the scope reads clean.
+    area.write_file("sparse/src/build/out.txt", "generated\n");
+    let status = area.forklift("sparse", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+
+    // An edit to the rules made in the sparse checkout stacks, lifts and reaches a full one.
+    let widened = "^src/build(/.*)?$\n\\.log$\n";
+    area.write_file("sparse/.forkliftignore", widened);
+    assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["stack", "ignore logs"]));
+    assert_success(&area.forklift("sparse", &["lift"]));
+    assert_success(&area.forklift("dev", &["lower"]));
+    assert_eq!(area.read_file("dev/.forkliftignore"), widened);
+    assert_eq!(area.read_file("dev/README"), "readme v1\n", "the sealed root file survives the sparse stack");
+    assert_eq!(area.read_file("dev/docs/guide.md"), "guide v1\n");
+
+    // And an edit made on the full side reaches the sparse one.
+    let narrowed = "^src/build(/.*)?$\n";
+    area.write_file("dev/.forkliftignore", narrowed);
+    area.write_file("dev/README", "readme v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "drop the log rule"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("sparse", &["lower"]));
+    assert_eq!(area.read_file("sparse/.forkliftignore"), narrowed);
+    assert!(!area.path("sparse/README").exists(), "the lowered root file stays sealed");
+
+    let status = area.forklift("sparse", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+}
+
 #[test]
 fn lift_franchise_lower_round_trip() {
     let area = TestArea::new("round-trip");
