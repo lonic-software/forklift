@@ -7466,6 +7466,26 @@ fn a_scoped_bay_materializes_only_its_subtree_and_reports_the_scope() {
     assert_eq!(json(&main_status)["data"]["scoped"], false);
 }
 
+/// A bay scope recorded in the older, unversioned format is refused, and the way out it names is
+/// the bay's own (add it again), not the sparse warehouse's (franchise again).
+#[test]
+fn a_scoped_bay_with_an_unversioned_scope_file_names_re_adding_the_bay() {
+    let warehouse = scoped_fixture("scoped-legacy");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    let scope_file = warehouse.root.join(".forklift/bays/scoped/scope");
+    assert!(scope_file.exists(), "the scoped bay records its scope at {}", scope_file.display());
+    std::fs::write(&scope_file, "src/api\n").unwrap();
+
+    let refused = warehouse.run_at(&scoped_dir, &["stocktake"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("older version of Forklift"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("Remove the bay and add it again"), "{}", stderr(&refused));
+    assert!(!stderr(&refused).contains("Franchise"), "{}", stderr(&refused));
+}
+
 #[test]
 fn bay_add_scope_rejects_a_path_that_is_a_file_not_a_directory_in_the_head() {
     // `scoped_fixture` stacks "README.md" as a plain file at the head. A `--scope` naming it (or

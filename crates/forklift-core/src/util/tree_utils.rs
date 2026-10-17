@@ -585,40 +585,36 @@ fn splice_spine_level(head: Option<&TreeItem>,
             .collect())
         .unwrap_or_default();
 
-    // A spine level's own files are all out-of-scope (an in-scope path is a directory prefix),
-    // so they are copied verbatim — or resolved by the merge skeleton where it changed
-    // them — unless the path is where an in-scope directory is expected, i.e. the entry flipped
-    // from a directory to a file at this revision (a spine-path type change).
+    // A spine level's own files are out of scope, and copied verbatim — or resolved by the merge
+    // skeleton where it changed them — except the root ignore file, which every scope holds in
+    // scope and which the dock pass below takes. A file where the scope expects a directory (a
+    // spine ancestor, or an in-scope prefix itself) flipped from a directory at this revision:
+    // a spine-path type change.
     for (name, item) in &head_files {
         let child_key = join_key(key, name);
 
-        match scope.classify(&child_key) {
-            ScopeClass::OutOfScope =>
-                splice_out_of_scope_entry(&mut tree, name, item, overrides.get(&child_key)),
-            ScopeClass::InScope | ScopeClass::Spine =>
-                return Err(scope_utils::type_changed_refusal(&child_key).into()),
+        if scope.spine_file_is_sealed(&child_key)? {
+            splice_out_of_scope_entry(&mut tree, name, item, overrides.get(&child_key));
         }
     }
 
-    // The symmetric check from the *dock* (working-tree) side: a file here means the working
-    // tree has replaced what the scope expects to be a directory (the in-scope prefix itself,
-    // or a spine ancestor of one) with a plain file. Without this check such a file lands in no
-    // other branch below (`dock_subtrees.get` finds nothing under its name) and is silently
-    // dropped from the signed tree — a scoped stack would then diverge from a full stack of the
-    // same content. Refuse instead, exactly mirroring the head-files case above — on the first
-    // dock file found, since any one of them is already a refusal (a `BTreeMap`, so this is the
-    // alphabetically-first name, deterministic either way).
-    if let Some((name, _)) = dock_files.iter().next() {
+    // The dock's files at this level: an in-scope one is taken as the dock has it, the same way
+    // an in-scope subtree is below, so a head file the dock no longer holds is deleted. A file
+    // where the scope expects a directory is the type change again, from the working-tree side:
+    // without the refusal it would land in no branch below and be silently dropped from the
+    // signed tree, so a scoped stack would diverge from a full stack of the same content.
+    for (name, item) in &dock_files {
         let child_key = join_key(key, name);
 
-        // Frontier: reframe the typed refusal for this still-String walker (bridge shim).
-        return Err(match scope.classify(&child_key) {
-            ScopeClass::InScope | ScopeClass::Spine => scope_utils::type_changed_refusal(&child_key),
-            // Not producible by the current materialize/load model (the working tree only ever
-            // holds content on the path to an in-scope prefix) — refused defensively rather
-            // than silently spliced into a signed tree unsealed.
-            ScopeClass::OutOfScope => scope_utils::out_of_scope_refusal(&child_key),
-        }.into());
+        // An out-of-scope dock file is not producible by the current materialize/load model (the
+        // working tree only ever holds in-scope content) — refused defensively rather than
+        // silently spliced into a signed tree unsealed.
+        if scope.spine_file_is_sealed(&child_key)? {
+            // Frontier: reframe the typed refusal for this still-String walker (bridge shim).
+            return Err(scope_utils::out_of_scope_refusal(&child_key).into());
+        }
+
+        tree.add_child(shallow_entry(item));
     }
 
     // Head subtrees: out-of-scope ones are copied verbatim (or resolved by the merge skeleton);
@@ -651,8 +647,9 @@ fn splice_spine_level(head: Option<&TreeItem>,
     }
 
     // In-scope / spine subtrees the dock has but the head does not — a newly added in-scope
-    // directory (or the spine leading to one). A head *file* of the same name would already
-    // have been refused above as a type change, so nothing here can collide with one.
+    // directory (or the spine leading to one). A head *file* of the same name was either refused
+    // above as a type change or, being in scope, left out for the dock to supply, so nothing
+    // here can collide with one.
     for (name, dock_subtree) in &dock_subtrees {
         if head_subtrees.contains_key(*name) {
             continue;

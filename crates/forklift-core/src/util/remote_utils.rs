@@ -4247,8 +4247,8 @@ async fn fetch_scoped_from(client: &RemoteClient,
 
             for (name, file) in tree.get_files() {
                 // A file entry on the spine is a sibling of the in-scope path — out of scope — so
-                // it is sealed, unless the scope names this exact path in scope (a scope prefix
-                // names a directory, so this stays classifier-driven rather than assumed).
+                // it is sealed, unless the classifier holds it in scope: the root ignore file is in
+                // every scope, though every declared prefix names a directory.
                 if scope.classify(&scope_join(&path, name)) == ScopeClass::InScope
                     && seen_blobs.insert(file.hash.clone())
                 {

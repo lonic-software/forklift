@@ -438,13 +438,11 @@ fn build_stale_shards(tree: &TreeItem,
         if !fully_in_scope {
             let child_key = join_key(key, name);
 
-            match scope.classify(&child_key) {
-                ScopeClass::OutOfScope => continue,
-                // A file where the scope expects a directory (a spine ancestor, or the
-                // in-scope prefix itself) is the §3.1 type change — refuse rather than guess.
-                // Frontier: reframe the typed refusal for this still-String walker (bridge shim).
-                ScopeClass::InScope | ScopeClass::Spine =>
-                    return Err(scope_utils::type_changed_refusal(&child_key).into()),
+            // A file where the scope expects a directory (a spine ancestor, or the in-scope
+            // prefix itself) is the §3.1 type change — refused rather than guessed.
+            // Frontier: reframe the typed refusal for this still-String walker (bridge shim).
+            if scope.spine_file_is_sealed(&child_key)? {
+                continue;
             }
         }
 

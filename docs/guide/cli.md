@@ -141,8 +141,9 @@ The file is **tracked content**, like `.gitignore`: `load` and `stack` it, and i
 rules travel with the history — a `franchise` or `lower` brings the remote's rules
 along. Only `.forklift/` is always ignored. `import-git` adds a rule for `.git/` when
 the warehouse holds a `.git` folder. The rules are read only from the file on disk at
-the warehouse root. A sparse franchise (`--only`) materializes only its in-scope
-paths, so when the root file is out of scope, its rules do not apply there.
+the warehouse root. Every sparse scope holds that file, whatever its prefixes: a
+`franchise --only` checkout fetches and materializes it, so its rules apply there too and
+an edit to it stacks like any in-scope file.
 
 Forklift refuses to read the file, and stops, when it is a symbolic link, when a line
 is a leftover conflict marker (consolidating two edits of the file writes them), or
@@ -944,8 +945,16 @@ forklift scope --json     # the same, as a machine envelope
 Read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
 the in-scope subtree prefixes. The warehouse fetch scope is reported too — *full* for an
 ordinary warehouse (the store holds everything), or the fetched prefixes for a sparse
-(`franchise --only`) one. Widen the fetch scope with `expand`; shrink a checkout's
+(`franchise --only`) one. A scoped checkout and a sparse fetch scope also hold the root `.forkliftignore`
+without it being a prefix; the report lists it as always in scope (`implicit_scope` and
+`implicit_fetch_scope` in `--json`). Widen the fetch scope with `expand`; shrink a checkout's
 materialization scope with `narrow`.
+
+A scope recorded by a Forklift older than the one that put the ignore file in every
+scope is refused by every command that reads it. For a sparse warehouse, franchise the
+remote again, into a new directory; for a scoped bay, remove the bay and add it again
+with `bay add --scope`. The same holds for a scope file whose format header names no
+prefix.
 
 ---
 

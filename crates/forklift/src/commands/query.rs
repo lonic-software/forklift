@@ -83,8 +83,7 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
 
     // The scope block rides every response so a consumer can never mistake a partial pass
     // for a complete one. `fetch_scope` appears only on a sparse warehouse.
-    let fetch_scope = scope_utils::read_fetch_scope()
-        .ok()
+    let fetch_scope = Some(scope_utils::read_fetch_scope()?)
         .filter(|scope| !scope.is_full())
         .map(|scope| scope.prefixes().to_vec());
 

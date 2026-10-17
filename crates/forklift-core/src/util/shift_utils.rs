@@ -107,12 +107,9 @@ fn diff_directory(from: Option<&TreeItem>,
 
         if !scope_is_full {
             // A file where the scope expects a directory (a spine ancestor, or the in-scope
-            // prefix itself) is the §3.1 type change — refuse rather than guess. Out-of-scope
-            // files are sealed and never materialized; only genuinely in-scope files are written.
-            if scope.requires_directory(&child_key) {
-                return Err(scope_utils::type_changed_refusal(&child_key).into());
-            }
-            if scope.classify(&child_key) == ScopeClass::OutOfScope {
+            // prefix itself) is the §3.1 type change — refused rather than guessed. Out-of-scope
+            // files are sealed and never materialized; only in-scope files are written.
+            if scope.spine_file_is_sealed(&child_key)? {
                 continue;
             }
         }
@@ -733,7 +730,8 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
         let file_key = join_key(key, name);
 
         // A spine directory's own files are out of scope and were never materialized, so they
-        // are not inventoried; only genuinely in-scope files land in a shard.
+        // are not inventoried — except the root ignore file, which every scope holds in scope.
+        // Only in-scope files land in a shard.
         if !scope_is_full && scope.classify(&file_key) != ScopeClass::InScope {
             continue;
         }

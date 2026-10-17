@@ -527,6 +527,143 @@ fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 }
 
+/// A sparse franchise whose scope leaves out the root holds the root ignore file in scope all
+/// the same: it is fetched and materialized, its rules are in force, and an edit to it stacks
+/// and travels both ways, while the other root files stay sealed.
+#[test]
+fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
+    let area = TestArea::new("sparse-ignore-file");
+    let server = Server::start(&area, None);
+
+    let rules = "^src/build(/.*)?$\n";
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.forkliftignore", rules);
+    area.write_file("dev/README", "readme v1\n");
+    area.write_file("dev/src/a.txt", "a v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+    assert_eq!(area.read_file("sparse/.forkliftignore"), rules, "the root ignore file is materialized");
+    assert!(!area.path("sparse/README").exists(), "another root file stays sealed");
+    assert!(!area.path("sparse/docs").exists(), "an out-of-scope folder stays sealed");
+
+    // The scope report names it, apart from the declared prefixes.
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    assert_success(&scope);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["implicit_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["implicit_fetch_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
+
+    // The rules are in force: an ignored build folder inside the scope reads clean.
+    area.write_file("sparse/src/build/out.txt", "generated\n");
+    let status = area.forklift("sparse", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+
+    // An edit to the rules made in the sparse checkout stacks, lifts and reaches a full one.
+    let widened = "^src/build(/.*)?$\n\\.log$\n";
+    area.write_file("sparse/.forkliftignore", widened);
+    assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["stack", "ignore logs"]));
+    assert_success(&area.forklift("sparse", &["lift"]));
+    assert_success(&area.forklift("dev", &["lower"]));
+    assert_eq!(area.read_file("dev/.forkliftignore"), widened);
+    assert_eq!(area.read_file("dev/README"), "readme v1\n", "the sealed root file survives the sparse stack");
+    assert_eq!(area.read_file("dev/docs/guide.md"), "guide v1\n");
+
+    // And an edit made on the full side reaches the sparse one.
+    let narrowed = "^src/build(/.*)?$\n";
+    area.write_file("dev/.forkliftignore", narrowed);
+    area.write_file("dev/README", "readme v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "drop the log rule"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("sparse", &["lower"]));
+    assert_eq!(area.read_file("sparse/.forkliftignore"), narrowed);
+    assert!(!area.path("sparse/README").exists(), "the lowered root file stays sealed");
+
+    let status = area.forklift("sparse", &["stocktake"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+}
+
+/// The root ignore file is in scope without being a declared prefix, so the sparse verbs that
+/// guard a prefix's shape or contents treat it as an ordinary file: unstaging an edit to it is
+/// no type change, and an edit to it does not block narrowing some other prefix away.
+#[test]
+fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_it() {
+    let area = TestArea::new("sparse-ignore-file-verbs");
+    let server = Server::start(&area, None);
+
+    let rules = "^src/build(/.*)?$\n";
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.forkliftignore", rules);
+    area.write_file("dev/src/a.txt", "a v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src", "--only", "docs"]));
+
+    // A staged edit to the rules unstages back to the head's version, by name and as part of
+    // the root folder — the folder form rebuilds the root shard, whose files are on the spine.
+    area.write_file("sparse/.forkliftignore", "^src/build(/.*)?$\n\\.log$\n");
+    assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["restore", "--staged", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["restore", "--staged", "."]));
+    let status = area.forklift("sparse", &["--json", "stocktake"]);
+    assert_success(&status);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(json["data"]["staged_count"], serde_json::json!(0), "the edit is unstaged: {}", stdout(&status));
+    assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "modified", "path": ".forkliftignore"}]),
+        "{}", stdout(&status));
+
+    // The edit is still on disk, unstaged; narrowing "docs" away is not blocked by it.
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert!(!area.path("sparse/docs").exists(), "the narrowed prefix is de-materialized");
+    assert_eq!(area.read_file("sparse/.forkliftignore"), "^src/build(/.*)?$\n\\.log$\n",
+        "the unstaged edit to the rules survives the narrow");
+}
+
+/// A scope file written before the root ignore file joined every scope is refused on read, rather
+/// than read under today's meaning — under which the never-inventoried ignore file would show as
+/// a removal and the next stack would commit it.
+#[test]
+fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
+    let area = TestArea::new("sparse-legacy-scope");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.forkliftignore", "^src/build(/.*)?$\n");
+    area.write_file("dev/src/a.txt", "a v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+
+    // Rewrite the recorded scopes in the unversioned form an older Forklift wrote.
+    for file in ["sparse/.forklift/config/fetch-scope", "sparse/.forklift/scope"] {
+        assert!(area.path(file).exists(), "the sparse franchise records {}", file);
+        std::fs::write(area.path(file), "src\n").unwrap();
+    }
+
+    for verb in [&["stocktake"][..], &["stack", "nothing"][..]] {
+        let refused = area.forklift("sparse", verb);
+        assert!(!refused.status.success(), "{:?} must refuse: {}", verb, stdout(&refused));
+        assert!(stderr(&refused).contains("older version of Forklift"), "{:?}: {}", verb, stderr(&refused));
+        assert!(stderr(&refused).contains("Franchise the remote again"), "{:?}: {}", verb, stderr(&refused));
+    }
+}
+
 #[test]
 fn lift_franchise_lower_round_trip() {
     let area = TestArea::new("round-trip");
@@ -4460,7 +4597,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     // Simulate an interrupted prune by hand: narrow the shared fetch scope directly (step one of
     // a real prune, already durable) and delete only the blob — the child, freed before its
     // parent tree in a real run's order — leaving the parent tree behind (step two, interrupted).
-    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), "src/api\n").unwrap();
+    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), "/forklift-scope 2\nsrc/api\n").unwrap();
     std::fs::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
     assert!(object_present(&area, "sparse", &web_tree),
         "the simulated interruption leaves the parent tree behind");
@@ -5199,6 +5336,49 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
         "the remainder must be exactly unchanged — nothing was actually recovered");
     assert!(!object_store_path(&area, "dev", &blob).exists(),
         "nothing was actually fetched by the failed attempt");
+}
+
+#[test]
+fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
+    // A fetch scope this build refuses skips the user pallets' history fetches. Re-running heal
+    // cannot fix that, so the remedy must name the scope file and its way out, not only the
+    // "once connectivity is restored" wording a transient failure gets, and must keep the
+    // reproduce-it remedy, since the remote was still asked for the object by hash.
+    //
+    // Mutation: map the skipped fetch to `ConsultedWithErrors` → the remedy never names the
+    // scope file → red.
+    let area = TestArea::new("heal-refetch-unreadable-scope");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/a.txt", "content the remote has\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // A second parcel the remote never saw, so no pass can bring its blob back.
+    area.write_file("dev/b.txt", "content only this warehouse ever had\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "local parcel"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let blob = path_object_hash(&area, "dev", &head, "b.txt");
+    let relative = loose_object_relative_path(&blob);
+
+    std::fs::remove_file(object_store_path(&area, "dev", &blob)).unwrap();
+    area.write_file("dev/.forklift/config/fetch-scope", "src\n");
+    plant_taint(&area, "dev", &[&relative]);
+
+    let status = area.forklift("dev", &["heal"]);
+    assert_eq!(status.status.code(), Some(21));
+
+    let output = format!("{}{}", stdout(&status), stderr(&status));
+    assert!(output.contains("fetch-scope") && output.contains("older version of Forklift"),
+        "the remedy must name the unreadable scope file: {}", output);
+    assert!(output.contains("Franchise the remote again"),
+        "the remedy must name the way out: {}", output);
+    assert!(output.contains("checked the configured remote") && output.contains("\"forklift load\" then \"forklift stack\""),
+        "the remote was still asked by hash, and reproducing it is still a way out: {}", output);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
+use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{inventory_utils, object_utils, pallet_utils, scope_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
@@ -60,7 +60,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     // A dropped prefix that still contains a kept (more specific) prefix cannot be cleanly
     // de-materialized — part of it is still needed. Refuse rather than remove kept files.
     for prefix in &dropped {
-        if let Some(inner) = keep.iter().find(|kept| is_strictly_under(kept, prefix)) {
+        if let Some(inner) = keep.iter().find(|kept| scope_utils::is_strictly_under(kept, prefix)) {
             return Err(format!(
                 "Cannot narrow away \"{}\": the kept path \"{}\" is inside it. Narrow the inner \
                 path first, or drop both.",
@@ -101,12 +101,10 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 /// precedent (`shift` refuses rather than overwrite untracked content) — narrow's delete is
 /// unconditional once it decides to act, so the decision itself must be conservative.
 async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
-    // Reuses the classifier to test "at or under `prefix`": a scope of exactly this one prefix
-    // classifies a path at or under it as `InScope` — the only case this check acts on. An
-    // ancestor of `prefix` (e.g. "src" for "src/api") classifies `Spine`, not `InScope`, exactly
-    // as it would in the bay's real scope — correctly excluded here too, since a change to
-    // something merely on the path to `prefix` is not a change inside the subtree being narrowed.
-    let under = MaterializationScope::from_prefixes([prefix.to_string()]);
+    // A pure path test, not a one-prefix scope's classifier: every scope also holds the root
+    // ignore file in scope, and a change to that file is not a change inside the subtree being
+    // narrowed. An ancestor of `prefix` is excluded for the same reason.
+    let under = |path: &str| scope_utils::is_at_or_under(path, prefix);
 
     let pallet = pallet_utils::get_current_pallet_name()?;
     let head_tree = match pallet_utils::get_pallet_head(&pallet)? {
@@ -116,13 +114,13 @@ async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
 
     let staged_dirty = stocktake_utils::collect_staged_changes(head_tree.as_deref()).await?
         .into_iter()
-        .any(|change| under.classify(&change.path) == ScopeClass::InScope);
+        .any(|change| under(&change.path));
 
     let unstaged = stocktake_utils::collect_unstaged_changes().await?;
 
     let unstaged_tracked_dirty = unstaged.iter()
         .any(|change| change.kind != ChangeKind::Untracked
-            && under.classify(&change.path) == ScopeClass::InScope);
+            && under(&change.path));
 
     if staged_dirty || unstaged_tracked_dirty {
         return Err(scope_utils::narrow_unclean_refusal(prefix, "uncommitted tracked changes"));
@@ -130,7 +128,7 @@ async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
 
     let untracked: Vec<&str> = unstaged.iter()
         .filter(|change| change.kind == ChangeKind::Untracked
-            && under.classify(&change.path) == ScopeClass::InScope)
+            && under(&change.path))
         .map(|change| change.path.as_str())
         .collect();
 
@@ -152,13 +150,6 @@ fn remove_working_subtree(prefix: &str) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while de-materializing \"{}\": {}", prefix, e)),
     }
-}
-
-/// Whether `child` is a strict descendant of the `ancestor` directory (both non-root keys).
-fn is_strictly_under(child: &str, ancestor: &str) -> bool {
-    child.len() > ancestor.len()
-        && child.as_bytes()[ancestor.len()] == b'/'
-        && child.starts_with(ancestor)
 }
 
 /// The result of a narrow: the paths dropped and the scope that remains.
