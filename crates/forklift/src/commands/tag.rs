@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use serde::Serialize;
+use forklift_core::error::sanitize;
 use forklift_core::util::office_utils::{OfficeState, Role};
 use forklift_core::util::tag_utils::{AttributedTag, Tag};
 use forklift_core::util::{config_utils, file_utils, office_utils, pallet_utils, remote_utils, stack_utils, tag_utils};
@@ -68,12 +69,13 @@ async fn create(name: &str, revision: Option<String>, message: Option<String>) -
     }
 
     // A tag name is immutable: refuse one already reachable from the tags head. `existing` came
-    // out of `@tags` (synced in wholesale, unvalidated — see `render_safe`'s doc comment), so its
-    // subject is rendered the same untrusted way every other tag-record string is.
+    // out of `@tags`, which `franchise`'s `adopt_meta_pallets` syncs in wholesale and nothing
+    // validates on the way in, so its subject is rendered the same untrusted way every other
+    // tag-record string is.
     if let Some(existing) = tag_utils::find_tag(name)? {
         return Err(format!(
             "Tag \"{}\" already exists (points at {}); tags are immutable.",
-            name, render_safe(&truncate_chars(&existing.tag.subject, 12))
+            name, sanitize(&truncate_chars(&existing.tag.subject, 12))
         ));
     }
 
@@ -257,13 +259,14 @@ impl CommandOutput for TagList {
         }
 
         // Sanitized once here (not stored on `TagView`, which `--json` also reads — see
-        // `render_safe`'s doc comment) so the column width matches what actually prints.
-        let names: Vec<String> = self.tags.iter().map(|tag| render_safe(&tag.name)).collect();
+        // `sanitize`'s doc comment) so the column width matches what actually prints; a padded
+        // column also spaces its tabs, since a tab prints wider than the one character it counts.
+        let names: Vec<String> = self.tags.iter().map(|tag| sanitize(&tag.name).replace('\t', " ")).collect();
         let width = names.iter().map(|name| name.chars().count()).max().unwrap_or(0);
 
         for (tag, name) in self.tags.iter().zip(names) {
             let message = tag.message.lines().next().filter(|line| !line.is_empty())
-                .map(|line| format!("  {}", render_safe(line)))
+                .map(|line| format!("  {}", sanitize(line)))
                 .unwrap_or_default();
 
             // Placed ahead of `tagger`/`message` — both remote-authored text — rather than
@@ -287,7 +290,7 @@ impl CommandOutput for TagList {
                 "{}{:<width$}  {}  {}by {}{}",
                 name_prefix,
                 name,
-                render_safe(&truncate_chars(&tag.subject, 12)),
+                sanitize(&truncate_chars(&tag.subject, 12)),
                 absent_marker,
                 tag.tagger_label(),
                 message,
@@ -379,13 +382,13 @@ impl TagView {
     }
 
     /// The tagger label for the list: display name (or operator id), plus role when known.
-    /// Sanitized (see [`render_safe`]): `tagger_name` is a remote directory lookup and `tagger`
+    /// Sanitized (see [`sanitize`]): `tagger_name` is a remote directory lookup and `tagger`
     /// falls back to a signature's raw `key_id` when the office does not recognize it, so either
     /// can carry attacker-chosen text; `tagger_role` cannot — it is one of a fixed local set of
     /// strings ([`office_utils::Role::as_str`]), never interpolated user content.
     fn tagger_label(&self) -> String {
         let who = self.tagger_name.clone().unwrap_or_else(|| self.tagger.clone());
-        let who = render_safe(&who);
+        let who = sanitize(&who);
 
         match &self.tagger_role {
             Some(role) => format!("{} ({})", who, role),
@@ -396,8 +399,8 @@ impl TagView {
 
 impl CommandOutput for TagView {
     fn render_human(&self) {
-        let name = render_safe(&self.name);
-        let subject = render_safe(&self.subject);
+        let name = sanitize(&self.name);
+        let subject = sanitize(&self.subject);
 
         // "tag <name>" is the very first line — an ANSI/SGR sequence in `name` would otherwise
         // land ahead of (and could restyle or blank) every warning line below it, including the
@@ -411,7 +414,8 @@ impl CommandOutput for TagView {
         if self.name_invalid {
             println!(
                 "warning: this tag's recorded name does not meet the naming rules \"tag create\" \
-                enforces (letters, digits, \".\", \"_\", \"-\" only) — shown exactly as recorded."
+                enforces (letters, digits, \".\", \"_\", \"-\" only) — shown as recorded, with any control or \
+                direction-changing characters as spaces."
             );
         }
 
@@ -446,7 +450,7 @@ impl CommandOutput for TagView {
             println!();
 
             for line in self.message.lines() {
-                println!("    {}", render_safe(line));
+                println!("    {}", sanitize(line));
             }
         }
     }
@@ -468,42 +472,6 @@ impl CommandOutput for TagView {
 /// * `s`, truncated to at most `chars` characters (unchanged if already shorter).
 fn truncate_chars(s: &str, chars: usize) -> String {
     s.chars().take(chars).collect()
-}
-
-/// Neutralize every control character in `s` — replaced with a space, never dropped, so a
-/// length or column width computed before this call still roughly matches what renders. Applied
-/// to every remote-authored string a `tag` command prints for a human: `@tags` syncs in wholesale
-/// (`franchise`'s `adopt_meta_pallets`), `parse_tag` validates none of `Tag`'s fields, and
-/// `tag create` is the *only* code path that ever validates one (its own `name`, at creation) —
-/// so a foreign or older client's record can carry a `name`, `subject`, or `message` containing
-/// anything, and an unrecognized signature falls back to its raw, equally unvalidated `key_id`
-/// (see `tagger_label`). `--json` output is unaffected: `TagView`'s stored fields are never
-/// mutated by this, only the copies `render_human` prints — a `--json` consumer needs the real
-/// bytes, and escaping is a terminal-rendering concern, not a wire-format one.
-///
-/// The same technique `forklift_core::error::sanitize` already uses for `CoreError`'s human
-/// message/next-step (`char::is_control`, replace with a space) — not reused directly, since
-/// that helper is private and tied specifically to `CoreError`'s frame-safety contract, a
-/// different reason to want the same effect than this module's terminal-rendering one; making it
-/// a general-purpose cross-crate utility for an unrelated concern would conflate the two.
-/// Replace-with-space, not drop, both to match that precedent and because a run of controls
-/// collapsing to nothing could accidentally weld two words together into a third, unintended one.
-///
-/// This single pass is also why an ANSI/SGR escape sequence needs no separate handling: every
-/// such sequence opens with the ESC control byte (`\x1b`), and with that byte gone the rest of
-/// the sequence (`[31m`, …) is inert — just printable text a terminal never treats specially. The
-/// same pass catches a bare `\r` (which can move a real terminal's cursor back to the start of
-/// the line without a matching `\n`, letting later text overwrite earlier text on screen) and an
-/// embedded `\n` (which would otherwise split a `tag list` row — and the marker position it
-/// depends on — across more than the one line the format assumes).
-///
-/// # Arguments
-/// * `s` - The text to neutralize.
-///
-/// # Returns
-/// * `s`, with every [`char::is_control`] character replaced by a single space.
-fn render_safe(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// Render a Unix timestamp as RFC 3339 (UTC), the JSON form.
@@ -649,32 +617,11 @@ mod tests {
         );
     }
 
-    // --- Round 3: every `@tags` string is remote-authored and arbitrary — a `TagView`'s stored
-    // fields (which `--json` serializes verbatim) are never sanitized; only what `render_human`
-    // prints to a terminal is. These tests exercise `render_safe`/`truncate_chars` directly, plus
-    // the `TagView` fields (`name_invalid`) that surface an anomaly rather than hide or reject
-    // it, matching `subject_malformed`'s own precedent.
-
-    #[test]
-    fn render_safe_neutralizes_every_control_character_and_nothing_else() {
-        // An ANSI/SGR sequence needs no special-case handling: stripping the leading ESC control
-        // byte alone is enough to make the rest of it ("[31m", "[0m") inert, ordinary text.
-        let ansi = "\x1b[31mHIDDEN\x1b[0m";
-        assert_eq!(render_safe(ansi), " [31mHIDDEN [0m");
-        assert!(!render_safe(ansi).contains('\x1b'), "the raw ESC byte must never survive");
-
-        // A bare `\r` (cursor-to-line-start on a real terminal, no matching `\n`) and an embedded
-        // `\n` (which would otherwise split one row into more than one line) are both neutralized
-        // by the same pass, not special-cased.
-        assert_eq!(render_safe("a\rb"), "a b");
-        assert_eq!(render_safe("a\nb"), "a b");
-
-        // Ordinary Unicode — including non-ASCII printable text, which is not a control character
-        // — passes through untouched; this is a control-character filter, not an ASCII filter.
-        assert_eq!(render_safe("héllo wörld"), "héllo wörld");
-        assert_eq!(render_safe(""), "");
-        assert_eq!(render_safe("plain text, no controls"), "plain text, no controls");
-    }
+    // Every `@tags` string is remote-authored and arbitrary: a `TagView`'s stored fields (which
+    // `--json` serializes verbatim) are never sanitized; only what `render_human` prints to a
+    // terminal is. These tests exercise `truncate_chars` directly (the sanitizer's own tests sit
+    // beside it in `forklift_core::error`), plus the `TagView` fields (`name_invalid`) that
+    // surface an anomaly rather than hide or reject it, matching `subject_malformed`'s precedent.
 
     #[test]
     fn truncate_chars_is_byte_safe_on_multi_byte_input_and_never_panics() {

@@ -127,20 +127,12 @@ impl Entry {
     }
 }
 
-/// Whether `c` must not reach a line: a control character, a character some readers treat as
-/// a line break (U+2028, U+2029), or a bidirectional formatting character, which can make the
-/// displayed text (a file path, say) read differently from what it is.
-fn is_unsafe_in_a_line(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{061C}' | '\u{200E}' | '\u{200F}'
-                       | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-}
-
 /// Build one event line: `head` (the verb and its fixed arguments, ending in a space), then the
-/// text with every [unsafe character](is_unsafe_in_a_line) turned into a space, trimmed, cut to fit
-/// [`MAX_LINE_BYTES`] on a character boundary, and a newline.
+/// text [sanitized](forklift_core::error::sanitize) with its tabs spaced too (a protocol line is
+/// read by a machine, not laid out for a reader), trimmed, cut to fit [`MAX_LINE_BYTES`] on a
+/// character boundary, and a newline.
 fn format_line(head: &str, text: &str) -> String {
-    let clean: String = text.chars().map(|c| if is_unsafe_in_a_line(c) { ' ' } else { c }).collect();
+    let clean = forklift_core::error::sanitize(text).replace('\t', " ");
     let clean = clean.trim();
 
     let mut line = String::with_capacity(head.len() + clean.len() + 1);

@@ -1,5 +1,6 @@
 use serde::Serialize;
 use forklift_core::enums::object::parsed_object::ParsedObject;
+use forklift_core::error::sanitize;
 use forklift_core::enums::object_type::ObjectType;
 use forklift_core::model::blob::Blob;
 use forklift_core::model::chunk::Chunk;
@@ -386,7 +387,10 @@ fn peek_tree(tree: TreeItem) -> Result<(), String> {
 /// # Arguments
 /// * `tree_item` - The tree item to print.
 fn print_tree_item(tree_item: &TreeItem) {
-    println!("{} {}\t{}", tree_item.item_type.get_name_for_peek(), tree_item.hash, tree_item.name);
+    println!(
+        "{} {}\t{}",
+        tree_item.item_type.get_name_for_peek(), sanitize(&tree_item.hash), sanitize(&tree_item.name)
+    );
 }
 
 /// Print details of the given parcel to stdout.
@@ -398,6 +402,8 @@ fn print_tree_item(tree_item: &TreeItem) {
 /// * `Ok(())`      - If the parcel was printed successfully.
 /// * `Err(String)` - If an error occurred while printing the parcel.
 fn peek_parcel(parcel: Parcel) -> Result<(), String> {
+    // Its hashes were checked at parse; its text may have arrived from a remote, so that is
+    // sanitized for the terminal, line by line.
     println!("{} {}", PARCEL_FIELD_TREE, parcel.tree_hash);
 
     for parent in parcel.parents {
@@ -409,7 +415,8 @@ fn peek_parcel(parcel: Parcel) -> Result<(), String> {
     }
 
     if let Some(description) = &parcel.description {
-        println!("\n{}", description);
+        println!();
+        print_lines(description);
     }
 
     Ok(())
@@ -424,15 +431,23 @@ fn print_parcel_action(action: &ParcelAction) {
         "{} {} {} {}",
         PARCEL_FIELD_ACTION,
         action.action.get_name_for_peek(),
-        action.operator.identifier,
+        sanitize(&action.operator.identifier),
         action.timestamp.to_rfc3339(),
     );
 
     action.description.as_ref().inspect(|description| {
         if description.len() > 0 {
-            println!("{}\n", **description);
+            print_lines(description);
+            println!();
         }
     });
+}
+
+/// Print multi-line record text one [sanitized](sanitize) line at a time.
+fn print_lines(text: &str) {
+    for line in text.lines() {
+        println!("{}", sanitize(line));
+    }
 }
 
 

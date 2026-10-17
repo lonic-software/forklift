@@ -90,7 +90,7 @@ pub async fn handle_command(check: bool) -> Result<(), String> {
 async fn fetch_latest() -> Result<Option<String>, String> {
     if let Ok(injected) = std::env::var("FORKLIFT_SELFUPDATE_LATEST") {
         let trimmed = injected.trim().trim_start_matches('v');
-        return Ok((!trimmed.is_empty()).then(|| trimmed.to_string()));
+        return (!trimmed.is_empty()).then(|| version_shaped(trimmed)).transpose();
     }
 
     let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
@@ -118,7 +118,23 @@ async fn fetch_latest() -> Result<Option<String>, String> {
             JsonReadError::Parse(e) => format!("Could not read GitHub's response: {}", e),
         })?;
 
-    Ok(body["tag_name"].as_str().map(|tag| tag.trim_start_matches('v').to_string()))
+    body["tag_name"].as_str().map(|tag| version_shaped(tag.trim_start_matches('v'))).transpose()
+}
+
+/// `version` back, if it is shaped like a release version: ASCII alphanumerics, `.`, `-` and
+/// `+` only. The tag is remote text that is both printed and handed to the install script, so
+/// anything else is refused loudly rather than rendered or installed.
+fn version_shaped(version: &str) -> Result<String, String> {
+    let shaped = !version.is_empty()
+        && version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+
+    if shaped {
+        Ok(version.to_string())
+    } else {
+        // Debug-quoting escapes every control and invisible character, so the refusal shows
+        // exactly what was wrong with the tag.
+        Err(format!("The latest release tag is not a version ({:?}); refusing to use it.", version))
+    }
 }
 
 /// Whether `candidate` is a strictly newer x.y.z version than `current` (a missing or
@@ -272,7 +288,7 @@ impl CommandOutput for SelfUpdate {
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::{is_newer, version_shaped};
 
     #[test]
     fn compares_versions() {
@@ -282,6 +298,20 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn only_version_shaped_tags_are_accepted() {
+        for good in ["0.5.2", "1.0.0-rc.1", "1.0.0+build.7"] {
+            assert_eq!(version_shaped(good).as_deref(), Ok(good));
+        }
+
+        for bad in ["", "1.0.0\x1b[2J", "1.0 0", "1.0.0\n", "1.0.0;rm", "1.0.0\u{202E}"] {
+            assert!(version_shaped(bad).is_err(), "{:?} must be refused", bad);
+        }
+
+        // The refusal shows the offending character escaped, not as a blank.
+        assert!(version_shaped("1.0.0\u{202E}").unwrap_err().contains("\\u{202e}"));
     }
 }
 

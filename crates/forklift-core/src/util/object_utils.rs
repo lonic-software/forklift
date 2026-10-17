@@ -263,7 +263,11 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
     // `ParcelReadMemo` guard (held only for that phase) collapses those re-reads to one decode.
     let bytes = read_parcel_bytes(hash)?;
 
-    match parser::object::loose_object_parser::parse(&bytes)? {
+    // A refusal names the parcel it came from, so a walk that meets a malformed one says which.
+    let parsed = parser::object::loose_object_parser::parse(&bytes)
+        .map_err(|e| format!("Parcel {} could not be read: {}", hash, e))?;
+
+    match parsed {
         ParsedObject::Parcel(parcel) => Ok(parcel),
         other => Err(format!("Object {} is a {}, not a parcel.", hash, other.get_type())),
     }

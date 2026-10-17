@@ -1,4 +1,5 @@
 use chrono::Utc;
+use forklift_core::error::sanitize;
 use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
@@ -338,7 +339,7 @@ impl CommandOutput for ParkedList {
         }
 
         for entry in &self.parked {
-            println!("{} {}", entry.parcel, entry.description);
+            println!("{} {}", entry.parcel, sanitize(&entry.description));
         }
     }
 }

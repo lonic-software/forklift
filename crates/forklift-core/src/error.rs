@@ -204,8 +204,8 @@ pub enum CoreError {
     Refusal {
         /// The stable classification.
         code: RefusalCode,
-        /// The human explanation. Rendered verbatim by [`fmt::Display`]; control characters are
-        /// stripped at construction so it stays frame-safe.
+        /// The human explanation. Rendered verbatim by [`fmt::Display`]; [sanitized](sanitize) at
+        /// construction so it stays frame-safe (every control character but tab becomes a space).
         message: String,
         /// The machine-actionable recovery step.
         next_step: String,
@@ -219,8 +219,8 @@ pub enum CoreError {
 }
 
 impl CoreError {
-    /// Build a classified refusal. Strips ASCII control characters (including `\u{1f}`, the frame
-    /// separator) out of the message and next step so the value is safe to render *and* safe to
+    /// Build a classified refusal. [Sanitizes](sanitize) every control character but tab (including
+    /// `\u{1f}`, the frame separator) out of the message and next step so the value is safe to render *and* safe to
     /// carry through the bridge shim regardless of where the interpolated text came from — a path
     /// read back off disk (a tree or inventory entry) can carry a control character that
     /// `WarehousePath::from_user_input`'s guard never saw.
@@ -350,11 +350,37 @@ fn with_next_step(human: &str, next_step: &str) -> String {
     }
 }
 
-/// Strip control characters (replacing each with a space) so text is frame-safe and
-/// render-safe — also for a head printing a remote-supplied value outside a refusal. See
-/// [`CoreError::refusal`].
+/// Whether `c` must not reach a line of output: a control character, a character some readers
+/// treat as a line break (U+2028, U+2029), or a bidirectional formatting character, which can
+/// make the displayed text read differently from what it is.
+///
+/// Control characters cover what a terminal acts on: ESC opens every ANSI/SGR sequence, so with
+/// it gone the rest (`[31m`, …) is inert text and no escape grammar needs parsing; a bare `\r`
+/// returns the cursor so later text overwrites earlier; an embedded `\n` splits one line into two.
+/// A tab is the one control character kept: it only advances the cursor over blank cells, so it
+/// can neither overwrite nor reorder text, and indented record text keeps its layout.
+fn is_unsafe_in_a_line(c: char) -> bool {
+    (c.is_control() && c != '\t')
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{061C}' | '\u{200E}' | '\u{200F}'
+                       | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Replace every [unsafe character](is_unsafe_in_a_line) with a space, so text is frame-safe and
+/// render-safe. A head applies it to the rendered copy of any value that came from a record or a
+/// remote, never to what `--json` emits: escaping is a terminal concern, and a consumer of the
+/// JSON needs the real content. Replaced rather than dropped, so a column width computed before
+/// the call still matches what prints, and two words are never welded into a third. Text that
+/// may span lines goes through [`sanitize_lines`] instead; see [`CoreError::refusal`] for the
+/// frame side.
 pub fn sanitize(text: &str) -> String {
-    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+    text.chars().map(|c| if is_unsafe_in_a_line(c) { ' ' } else { c }).collect()
+}
+
+/// [`sanitize`] each line of `text` and rejoin them with `\n`, so multi-line text keeps its
+/// lines while each line is inert. For a sink that prints one block (an error, a warning, a
+/// body); a render that indents or prefixes each line splits with [`str::lines`] itself.
+pub fn sanitize_lines(text: &str) -> String {
+    text.lines().map(sanitize).collect::<Vec<_>>().join("\n")
 }
 
 /// Build the sentinel frame for a refusal. Re-sanitizes defensively so a `Refusal` assembled
@@ -544,5 +570,33 @@ mod tests {
         let framed: String = error.clone().into();
         let relifted: CoreError = framed.into();
         assert_eq!(relifted, error);
+    }
+
+    #[test]
+    fn sanitize_neutralizes_every_unsafe_character_and_nothing_else() {
+        // ANSI needs no grammar: with the ESC byte gone, the rest of the sequence is inert text.
+        assert_eq!(sanitize("\x1b[31mHIDDEN\x1b[0m"), " [31mHIDDEN [0m");
+
+        // Cursor return, line splits (ASCII and Unicode), NUL and DEL each become one space.
+        for unsafe_char in ['\r', '\n', '\0', '\u{7f}', '\u{85}', '\u{2028}', '\u{2029}'] {
+            assert_eq!(sanitize(&format!("a{}b", unsafe_char)), "a b", "{:?}", unsafe_char);
+        }
+
+        // Every bidirectional formatting character, so text cannot display reordered.
+        for bidi in ['\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}'] {
+            assert_eq!(sanitize(&format!("a{}b", bidi)), "a b", "{:?}", bidi);
+        }
+
+        // Printable text passes untouched, non-ASCII included: this is not an ASCII filter, and
+        // the neighbours of each excluded range survive.
+        for kept in ["héllo wörld", "日本語", "\u{2027}\u{202F}\u{2065}\u{206A}", "", "plain", "\tindented"] {
+            assert_eq!(sanitize(kept), kept);
+        }
+    }
+
+    #[test]
+    fn sanitize_lines_keeps_the_lines_and_neutralizes_each() {
+        assert_eq!(sanitize_lines("one \x1b[2J\ntwo\r\n\tthree\u{202E}"), "one  [2J\ntwo\n\tthree ");
+        assert_eq!(sanitize_lines("single"), "single");
     }
 }
