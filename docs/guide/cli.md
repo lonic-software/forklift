@@ -534,12 +534,14 @@ token to hand back, not something to construct.
 
 Descriptions, titles, comments, operator names and the other free text in a record were
 written by whoever authored the record — once it syncs, possibly another operator, and
-nothing checks that text on the way in. Human output never lets it drive your terminal:
-control characters (ANSI escapes, carriage returns) and invisible bidirectional overrides
-print as spaces, and a multi-line text is printed line by line rather than as one
-string. `--json` is never touched — it carries the record's text exactly as
-stored. File content (`show`, `peek` of a blob, `blame`'s lines) prints as-is, the way
-`cat` and git do.
+nothing checks that text on the way in. Human output, error messages included, never lets
+it drive your terminal: control characters (ANSI escapes, carriage returns) and invisible
+bidirectional overrides print as spaces; tabs are kept. A multi-line text is printed line
+by line, except in a listing that gives each record one row, where it is flattened onto
+that row. `--json` is never touched — it carries the record's text exactly as stored.
+File content (`show`, `peek` of a blob, `blame`'s lines) prints as-is, the way `cat` and
+git do. The hashes a parcel names are checked when it is read, and a parcel naming
+anything that is not a hash is refused.
 
 ### `blame` — who wrote each line (`bl`, `annotate`)
 

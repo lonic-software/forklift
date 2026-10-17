@@ -281,7 +281,9 @@ fn data_value<T: Serialize>(data: &T) -> Result<serde_json::Value, ForkliftError
 /// command's own failure and for a usage error alike.
 pub fn report_error(error: &ForkliftError) {
     match mode() {
-        OutputMode::Human => eprintln!("{}", error.message),
+        // A message can quote a record or a remote's answer, so the human copy is made inert
+        // here, at the one place every error is printed; the JSON body stays exact.
+        OutputMode::Human => eprintln!("{}", forklift_core::error::sanitize_lines(&error.message)),
         OutputMode::Json => print_document::<()>(None, Some(ErrorBody {
             code: error.code.as_str(),
             message: &error.message,
@@ -675,7 +677,7 @@ fn standing_taint_warning_text(mode: OutputMode, gate_message: &str) -> String {
         OutputMode::Human => format!(
             "Warning: {} Left standing by automatic background maintenance; the command above \
              already completed successfully. {}",
-            gate_message, heal_utils::DURABILITY_TAINT_NEXT_STEP
+            forklift_core::error::sanitize_lines(gate_message), heal_utils::DURABILITY_TAINT_NEXT_STEP
         ),
         OutputMode::Json => warning_envelope(
             heal_utils::CODE_DURABILITY_TAINT,
@@ -738,7 +740,7 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
     match mode {
         OutputMode::Human => format!(
             "Warning: background object-store maintenance was skipped. {} {}",
-            error, MAINTENANCE_UNAVAILABLE_NEXT_STEP
+            forklift_core::error::sanitize_lines(error), MAINTENANCE_UNAVAILABLE_NEXT_STEP
         ),
         OutputMode::Json => warning_envelope(
             CODE_MAINTENANCE_UNAVAILABLE,

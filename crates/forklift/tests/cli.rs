@@ -3259,27 +3259,40 @@ fn record_text_renders_inert_for_humans_and_verbatim_in_json() {
         .expect("the planted parcel is in history")["parcel"]
         .as_str().unwrap().to_string();
 
-    let renders: [&[&str]; 6] = [
+    let note = format!("note {}\nnext {}", ESCAPE, OVERRIDE);
+    assert_success(&warehouse.run(&["manifest", "note", &parcel, "-m", &note]));
+    let model = format!("model-{}", ESCAPE);
+    assert_success(&warehouse.run(&["manifest", "provenance", &parcel, "--model", &model]));
+
+    let renders: [&[&str]; 7] = [
         &["history"],
         &["history", "--oneline"],
         &["peek", &parcel],
         &["haul", "list"],
         &["haul", "show", &id],
         &["query", &parcel],
+        &["manifest", "show", &parcel],
     ];
 
-    for args in renders {
-        let output = warehouse.run(args);
-        assert_success(&output);
-        let text = stdout(&output);
+    // An error that quotes its input is printed through the same guard, to stderr.
+    let unknown = warehouse.run(&["haul", "show", ESCAPE]);
+    assert!(!unknown.status.success());
+    let outputs = renders.iter()
+        .map(|args| {
+            let output = warehouse.run(args);
+            assert_success(&output);
+            (format!("{:?}", args), stdout(&output))
+        })
+        .chain(std::iter::once(("haul show <escape> (stderr)".to_string(), stderr(&unknown))));
 
-        assert!(text.contains("forged"), "{:?} must still show the text: {}", args, text);
+    for (args, text) in outputs {
+        assert!(text.contains("forged"), "{} must still show the text: {}", args, text);
         // Some renders colour their own output, so look for the payload's escapes, not any.
         assert!(
             !text.contains("\x1b[2J") && !text.contains("\x1b[31mforged"),
-            "{:?} printed the payload's escapes raw: {:?}", args, text
+            "{} printed the payload's escapes raw: {:?}", args, text
         );
-        assert!(!text.contains('\u{202E}'), "{:?} printed a raw override: {:?}", args, text);
+        assert!(!text.contains('\u{202E}'), "{} printed a raw override: {:?}", args, text);
     }
 
     // The lines of a multi-line text stay lines: the second never lands on the first's row.
@@ -3287,6 +3300,25 @@ fn record_text_renders_inert_for_humans_and_verbatim_in_json() {
     let second = shown.lines().filter(|line| line.contains("second")).count();
     assert!(second >= 2, "every multi-line text keeps its second line: {}", shown);
     assert!(!shown.lines().any(|line| line.contains("first") && line.contains("second")), "{}", shown);
+
+    let manifest = stdout(&warehouse.run(&["manifest", "show", &parcel]));
+    assert!(
+        manifest.lines().any(|line| line.contains("next")) &&
+            !manifest.lines().any(|line| line.contains("note") && line.contains("next")),
+        "a manifest body keeps its lines: {}", manifest
+    );
+
+    // Undoing names the parcel it undid by its description's first line.
+    let undo_description = format!("undone {}", ESCAPE);
+    warehouse.write_file("undo.txt", "undo\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", &undo_description]));
+    let undone = warehouse.run(&["undo"]);
+    assert_success(&undone);
+    assert!(
+        stdout(&undone).contains("forged") && !stdout(&undone).contains("\x1b[2J"),
+        "undo printed the payload's escapes raw: {:?}", stdout(&undone)
+    );
 
     // JSON is the record itself.
     let shown = json(&warehouse.run(&["haul", "show", &id, "--json"]));

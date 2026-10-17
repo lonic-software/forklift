@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
-use forklift_core::error::sanitize;
+use forklift_core::error::{sanitize, sanitize_lines};
 use forklift_core::util::manifest_utils::{self, AttributedEntry, ManifestEntry, ManifestKind, Provenance};
 use forklift_core::util::{config_utils, pallet_utils};
 use crate::cli::ManifestAction;
@@ -126,10 +126,11 @@ impl CommandOutput for Recorded {
     fn render_human(&self) {
         print!("Recorded {} of parcel {} by \"{}\".", self.kind, self.subject, self.operator);
 
+        // The body is the operator's own, just recorded; it still prints line by line.
         if self.body.is_empty() {
             println!();
         } else {
-            println!(" \"{}\"", self.body);
+            println!(" \"{}\"", sanitize_lines(&self.body));
         }
     }
 }
@@ -220,16 +221,25 @@ impl CommandOutput for ManifestView {
                 None => format!("  {}", short(&entry.subject)),
             };
 
-            let body = if entry.body.is_empty() {
-                String::new()
-            } else {
-                format!("  \"{}\"", sanitize(&entry.body))
+            // A body keeps its line structure: the first line on the entry's row, the rest
+            // indented under it.
+            let mut body_lines = entry.body.lines();
+            let body = match body_lines.next() {
+                Some(first) => format!("  \"{}", sanitize(first)),
+                None => String::new(),
             };
+            let rest: Vec<&str> = body_lines.collect();
 
             println!(
-                "  {:<10}{}  {}{}",
-                entry.kind, where_clause, sanitize(&entry.author), body
+                "  {:<10}{}  {}{}{}",
+                entry.kind, where_clause, sanitize(&entry.author), body,
+                if rest.is_empty() && !body.is_empty() { "\"" } else { "" }
             );
+
+            for (index, line) in rest.iter().enumerate() {
+                let close = if index + 1 == rest.len() { "\"" } else { "" };
+                println!("             {}{}", sanitize(line), close);
+            }
 
             // Provenance carries the how-it-was-made detail on a second, indented line.
             if let Some(model) = &entry.model {

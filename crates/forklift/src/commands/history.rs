@@ -394,7 +394,7 @@ impl HistoryEntry {
         writeln!(out, "\x1b[33mparcel {}\x1b[0m", self.parcel)?;
 
         if !self.consolidates.is_empty() {
-            writeln!(out, "consolidates {}", sanitize(&self.consolidates.join(" + ")))?;
+            writeln!(out, "consolidates {}", self.consolidates.join(" + "))?;
         }
 
         // Every string below the parcel line is read out of a parcel or the office, either of

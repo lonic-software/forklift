@@ -179,10 +179,15 @@ impl BlamedParcel {
 
 impl CommandOutput for Blame {
     fn render_human(&self) {
-        // Column widths: the author label and the line-number gutter, sized to the content.
+        // Each parcel's label is built once, not once per line it blames. Column widths: the
+        // author label (in characters, as `{:<w$}` pads) and the line-number gutter.
+        let labels: HashMap<&str, String> = self.parcels.iter()
+            .map(|(hash, parcel)| (hash.as_str(), parcel.author_label()))
+            .collect();
+
         let author_width = self.lines.iter()
-            .filter_map(|line| self.parcels.get(&line.parcel))
-            .map(|parcel| parcel.author_label().len())
+            .filter_map(|line| labels.get(line.parcel.as_str()))
+            .map(|label| label.chars().count())
             .max()
             .unwrap_or(0);
 
@@ -191,9 +196,9 @@ impl CommandOutput for Blame {
         for line in &self.lines {
             let short = &line.parcel[..line.parcel.len().min(10)];
 
-            let (author, date) = match self.parcels.get(&line.parcel) {
-                Some(parcel) => (parcel.author_label(), parcel.short_date()),
-                None => (String::from("?"), String::new()),
+            let (author, date) = match (labels.get(line.parcel.as_str()), self.parcels.get(&line.parcel)) {
+                (Some(label), Some(parcel)) => (label.as_str(), parcel.short_date()),
+                _ => ("?", String::new()),
             };
 
             // git-blame layout: hash, author, date, line number, then the line.

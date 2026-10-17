@@ -131,10 +131,9 @@ fn version_shaped(version: &str) -> Result<String, String> {
     if shaped {
         Ok(version.to_string())
     } else {
-        Err(format!(
-            "The latest release tag is not a version ({:?}); refusing to use it.",
-            forklift_core::error::sanitize(version)
-        ))
+        // Debug-quoting escapes every control and invisible character, so the refusal shows
+        // exactly what was wrong with the tag.
+        Err(format!("The latest release tag is not a version ({:?}); refusing to use it.", version))
     }
 }
 
@@ -310,6 +309,9 @@ mod tests {
         for bad in ["", "1.0.0\x1b[2J", "1.0 0", "1.0.0\n", "1.0.0;rm", "1.0.0\u{202E}"] {
             assert!(version_shaped(bad).is_err(), "{:?} must be refused", bad);
         }
+
+        // The refusal shows the offending character escaped, not as a blank.
+        assert!(version_shaped("1.0.0\u{202E}").unwrap_err().contains("\\u{202e}"));
     }
 }
 

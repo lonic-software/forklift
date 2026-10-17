@@ -413,7 +413,8 @@ impl CommandOutput for TagView {
         if self.name_invalid {
             println!(
                 "warning: this tag's recorded name does not meet the naming rules \"tag create\" \
-                enforces (letters, digits, \".\", \"_\", \"-\" only) — shown exactly as recorded."
+                enforces (letters, digits, \".\", \"_\", \"-\" only) — shown as recorded, with any control or \
+                direction-changing characters as spaces."
             );
         }
 

@@ -128,10 +128,11 @@ impl Entry {
 }
 
 /// Build one event line: `head` (the verb and its fixed arguments, ending in a space), then the
-/// text [sanitized](forklift_core::error::sanitize), trimmed, cut to fit [`MAX_LINE_BYTES`] on a
+/// text [sanitized](forklift_core::error::sanitize) with its tabs spaced too (a protocol line is
+/// read by a machine, not laid out for a reader), trimmed, cut to fit [`MAX_LINE_BYTES`] on a
 /// character boundary, and a newline.
 fn format_line(head: &str, text: &str) -> String {
-    let clean = forklift_core::error::sanitize(text);
+    let clean = forklift_core::error::sanitize(text).replace('\t', " ");
     let clean = clean.trim();
 
     let mut line = String::with_capacity(head.len() + clean.len() + 1);

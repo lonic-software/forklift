@@ -402,13 +402,12 @@ fn print_tree_item(tree_item: &TreeItem) {
 /// * `Ok(())`      - If the parcel was printed successfully.
 /// * `Err(String)` - If an error occurred while printing the parcel.
 fn peek_parcel(parcel: Parcel) -> Result<(), String> {
-    // A parcel may have arrived from a remote, and its parser checks the shape of none of these
-    // strings, so each is sanitized for the terminal; multi-line text is split first so its
-    // lines survive.
-    println!("{} {}", PARCEL_FIELD_TREE, sanitize(&parcel.tree_hash));
+    // Its hashes were checked at parse; its text may have arrived from a remote, so that is
+    // sanitized for the terminal, line by line.
+    println!("{} {}", PARCEL_FIELD_TREE, parcel.tree_hash);
 
     for parent in parcel.parents {
-        println!("{} {}", PARCEL_FIELD_PARENT, sanitize(&parent));
+        println!("{} {}", PARCEL_FIELD_PARENT, parent);
     }
 
     for action in parcel.actions {

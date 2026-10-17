@@ -1,6 +1,6 @@
 use crate::enums::object::compact_parcel_version::CompactParcelVersion;
 use crate::model::parcel::Parcel;
-use crate::util::byte_utils;
+use crate::util::{byte_utils, object_utils};
 
 /// Parse a compact parcel object.
 ///
@@ -23,9 +23,20 @@ pub fn parse_compact_parcel(offset: usize, content: &[u8]) -> Result<Parcel, Str
         .map_err(|e| format!("Failed to parse compact parcel version: {}", e))?;
 
     let version = CompactParcelVersion::from_code(version_code)?;
-    let parcel = version.get_parser()(offset + cursor, content);
+    let parcel = version.get_parser()(offset + cursor, content)?;
 
-    parcel
+    // Every hash a parcel names is later printed, walked and turned into a store path, and the
+    // parcel may have arrived from a remote: one that is not hash-shaped is refused here, once,
+    // rather than trusted by every reader.
+    if !object_utils::is_object_hash(&parcel.tree_hash) {
+        return Err("The parcel's tree hash is not an object hash.".to_string());
+    }
+
+    if parcel.parents.iter().any(|parent| !object_utils::is_object_hash(parent)) {
+        return Err("A parent of the parcel is not an object hash.".to_string());
+    }
+
+    Ok(parcel)
 }
 #[cfg(test)]
 mod tests {
@@ -105,5 +116,21 @@ mod tests {
 
         assert_eq!(parsed.actions[0].description.as_deref(), Some("line one\nline two\u{3}with EOT"));
         assert_eq!(parsed.description.as_deref(), Some("Title\n\nBody paragraph."));
+    }
+
+    #[test]
+    fn a_hash_that_is_not_hash_shaped_is_refused() {
+        let good = "9028a15ad613bcd9853a3e780cfe3c78361b56ce95a2430484ba75ade5198cdc".to_string();
+        let bad = format!("{}\x1b[2J", &good[..60]);
+
+        let parse = |tree_hash: String, parents: Vec<String>| {
+            let parcel = Parcel { tree_hash, parents, actions: vec![action(None)], description: None };
+            parse_compact_parcel(0, &ParcelObjectBuilder::build_compact(&parcel).content)
+        };
+
+        assert!(parse(good.clone(), vec![good.clone()]).is_ok());
+        assert!(parse(bad.clone(), vec![]).err().unwrap().contains("tree hash"));
+        assert!(parse(good.clone(), vec![good.clone(), bad]).err().unwrap().contains("parent"));
+        assert!(parse(good.to_uppercase(), vec![]).is_err(), "only the canonical spelling is a hash");
     }
 }
