@@ -221,7 +221,8 @@ time_hyperfine() {
                      f = (unit=="s") ? 1000 : (unit=="ms") ? 1 : (unit=="us"||unit=="µs") ? 0.001 : -1
                      if (f < 0) exit 1; printf "%d\n", $m * f + 0.5; ok=1 }
              END   { if (!ok) exit 1 }' "$csv" \
-        || { echo "error: could not read hyperfine's mean from $csv (format changed?)" >&2; exit 1; }
+        || { echo "error: could not read hyperfine's mean from $csv (format changed?)" >&2
+             rm -f "$log"; exit 1; }
     rm -f "$csv" "$log"
 }
 
