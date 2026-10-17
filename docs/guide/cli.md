@@ -1289,7 +1289,8 @@ commands hold), so two bays or two processes never compact the same store at onc
 compaction is already running, an explicit `forklift compact` reports it and stops; the
 automatic background compaction simply skips (the other run is doing the same work). An
 incremental compaction never blocks ordinary mutating commands; a full repack does, briefly (see
-below).
+below). Compaction of either kind is refused while a `scope-prune` or `forklift-server gc` runs
+on the warehouse.
 
 Plain `compact` is **incremental**: it packs the loose objects into a *new* pack and leaves
 existing packs alone (cheap, but packs accumulate over time). `compact --all` is a **full

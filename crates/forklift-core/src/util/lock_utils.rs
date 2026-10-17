@@ -250,16 +250,63 @@ pub struct StoreAccessExclusive {
     _file: std::fs::File,
 }
 
+/// `OPEN_MAX` from macOS's `<sys/syslimits.h>`, which the `libc` crate does not export: what
+/// macOS accepts for `RLIMIT_NOFILE` when it refuses the hard limit (an unlimited hard limit).
+#[cfg(target_os = "macos")]
+const MACOS_OPEN_MAX: libc::rlim_t = 10240;
+
+/// Raise this process's soft limit on open files toward its hard limit. A server keeps one
+/// store-access hold — one open file — per warehouse it serves, for as long as it serves it, so in
+/// multi-warehouse mode the count grows with the warehouses served, and the default soft limit
+/// (256 on macOS) is far below what the hard limit allows. Tries the hard limit, then, on macOS,
+/// `OPEN_MAX`; never lowers the limit. Best-effort: a limit that cannot be read or raised is left
+/// as it is. A no-op off Unix, which has no such per-process soft limit.
+pub fn raise_open_file_limit() {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: `getrlimit` writes into the `rlimit` it is given and reads nothing else.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        let targets = [limit.rlim_max, MACOS_OPEN_MAX.min(limit.rlim_max)];
+        #[cfg(not(target_os = "macos"))]
+        let targets = [limit.rlim_max];
+
+        let current = limit.rlim_cur;
+        for target in targets.into_iter().filter(|&target| target > current) {
+            limit.rlim_cur = target;
+            // SAFETY: `setrlimit` only reads the `rlimit` it is given.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 {
+                return;
+            }
+        }
+    }
+}
+
 /// Open (creating if needed) the store-access sidecar at the current storage root, at an absolute
 /// path. The forklift root folder must exist.
 fn open_store_access_sidecar() -> Result<(std::fs::File, PathBuf), String> {
     let path = absolute(forklift_root().join(FILE_NAME_STORE_ACCESS_LOCK));
-
-    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
-        .open(&path)
-        .map_err(|e| format!("Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e))?;
+    let file = open_lock_sidecar(&path)?;
 
     Ok((file, path))
+}
+
+/// Open (creating if needed) the sidecar of a kernel lock. A sidecar is never deleted, so it
+/// outlives the process that created it, and on a shared warehouse it may belong to a user whose
+/// file mode leaves it read-only to us. A kernel lock needs only a read handle, so a refused
+/// read-write open falls back to a read-only one rather than locking that user out.
+fn open_lock_sidecar(path: &Path) -> Result<std::fs::File, String> {
+    let opened = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path);
+
+    match opened {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && path.is_file() =>
+            std::fs::File::open(path),
+        opened => opened,
+    }.map_err(|e| format!("Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e))
 }
 
 fn lock_error(path: &Path, error: &std::io::Error) -> String {
@@ -303,12 +350,8 @@ impl ConfigFileLock {
     pub fn acquire(config_path: &Path) -> Result<ConfigFileLock, String> {
         let path = config_lock_path(config_path)?;
 
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
-            .open(&path)
-            .map_err(|e| format!("Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e))?;
-
-        file.lock()
-            .map_err(|e| format!("Error while locking \"{}\": {}", path.to_string_lossy(), e))?;
+        let file = open_lock_sidecar(&path)?;
+        file.lock().map_err(|e| lock_error(&path, &e))?;
 
         Ok(ConfigFileLock { _file: file })
     }
@@ -467,6 +510,66 @@ mod tests {
             "the sidecar stays: it is never deleted");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A sidecar another user created can be read-only to this one. Taking either side of the lock
+    /// needs only a read handle, so a read-only sidecar must not lock this user out of the store.
+    /// The read-only permission stands in for another owner's file mode.
+    #[test]
+    fn a_read_only_store_access_sidecar_still_locks_both_ways() {
+        let temp = std::env::temp_dir().join(format!("forklift-storeaccess-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let sidecar = temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_STORE_ACCESS_LOCK);
+        std::fs::write(&sidecar, b"").unwrap();
+        let mut permissions = std::fs::metadata(&sidecar).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&sidecar, permissions.clone()).unwrap();
+
+        let writer = StoreAccessLock::try_shared();
+        let writer_ok = writer.is_ok();
+        drop(writer);
+        let deleter = StoreAccessLock::try_exclusive();
+        let deleter_ok = deleter.is_ok();
+        drop(deleter);
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&sidecar, permissions).unwrap();
+        std::fs::remove_dir_all(&temp).ok();
+
+        assert!(writer_ok, "a writer takes the shared side through a read-only sidecar");
+        assert!(deleter_ok, "a deleter takes the exclusive side through a read-only sidecar");
+    }
+
+    /// A low soft open-file limit is raised. The test lowers it to 1024 at most first (and puts it
+    /// back after), so the raise has something to do whatever limit the test runs under, while the
+    /// tests running beside it keep more files than they ever open at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_low_open_file_limit_is_raised() {
+        let read = || {
+            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+            limit
+        };
+        let original = read();
+        let low = original.rlim_cur.min(1024);
+        if original.rlim_max <= low {
+            return; // A hard limit this low leaves nothing to raise.
+        }
+        let mut lowered = original;
+        lowered.rlim_cur = low;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+
+        raise_open_file_limit();
+        let raised = read().rlim_cur;
+
+        if raised < original.rlim_cur {
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) }, 0);
+        }
+        assert!(raised > low, "the soft limit was raised above {}: it is {}", low, raised);
     }
 
     #[test]

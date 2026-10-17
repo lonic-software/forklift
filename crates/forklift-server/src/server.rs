@@ -35,7 +35,7 @@ use forklift_core::model::remote::{
     distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
-use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock};
+use forklift_core::util::lock_utils::{self, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
     office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
@@ -430,6 +430,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         )
         .with_writer(std::io::stderr)
         .try_init();
+
+    // Every warehouse served keeps an open file (its store-access hold) until the server stops.
+    lock_utils::raise_open_file_limit();
 
     // Kept past the `match` below (which consumes `options.tokens`) so the startup refusal can
     // name the empty-`[operators]`-table case distinctly from "no --tokens/tokens file at all":
@@ -1413,18 +1416,21 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
             // already served (a re-PUT stays an idempotent 200), else a locked one built under
             // the registry mutex, so exactly one handle (one write mutex) ever exists per
             // warehouse. Never `serving` directly: the serve lock refuses even its own holder.
-            if let Err(error) = resolve_warehouse(&state, &params) {
-                return error_response(error);
-            }
+            let served = resolve_warehouse(&state, &params);
 
+            // The warehouse exists from here on, served or not: a retry after a refused
+            // registration finds it existing and answers 200, so this is the only chance to
+            // announce it.
             if created {
                 let mut event = HookEvent::new(EVENT_WAREHOUSE_CREATED);
                 event.warehouse = Some(id);
                 emit_event(&state, event);
+            }
 
-                StatusCode::CREATED.into_response()
-            } else {
-                StatusCode::OK.into_response()
+            match served {
+                Err(error) => error_response(error),
+                Ok(_) if created => StatusCode::CREATED.into_response(),
+                Ok(_) => StatusCode::OK.into_response(),
             }
         }
         Err(error) => error_response(error),
