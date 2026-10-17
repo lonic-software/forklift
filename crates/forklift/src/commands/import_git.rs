@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use forklift_core::model::operator::Operator;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::model::tree_item::TreeItem;
+use forklift_core::parser::object::tree::tree_parser;
 use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
 use forklift_core::util::{file_utils, inventory_utils, object_utils, office_utils, pallet_utils, shift_utils};
@@ -286,6 +287,9 @@ struct Converter {
     oid_len: usize,
     blobs: HashMap<String, String>,
     trees: HashMap<String, String>,
+    /// Git trees already checked as a commit's root (`ensure_importable_root`), so a reused
+    /// root is read again at most once.
+    checked_roots: HashSet<String>,
     commits: HashMap<String, String>,
     warnings: Vec<String>,
 
@@ -347,6 +351,7 @@ impl Converter {
             oid_len,
             blobs: HashMap::new(),
             trees: HashMap::new(),
+            checked_roots: HashSet::new(),
             commits: HashMap::new(),
             warnings: Vec::new(),
             ingest: pack_direct.then(StoreIngest::new).transpose()?,
@@ -428,11 +433,16 @@ impl Converter {
     /// unchanged subtrees, so — like the bundle builder's closure walk — only changed paths
     /// are revisited, and each blob is considered exactly where history changed it.
     fn convert_tree(&mut self, git_hash: &str, path_prefix: &str) -> Result<String, String> {
-        if let Some(hash) = self.trees.get(git_hash) {
+        if let Some(hash) = self.trees.get(git_hash).cloned() {
+            // A tree first converted as a subdirectory, where any name is fine, can come back as
+            // a commit's root; a fresh conversion checks its root entries in the loop below.
+            if path_prefix.is_empty() && !self.checked_roots.contains(git_hash) {
+                self.ensure_importable_root(git_hash)?;
+                self.checked_roots.insert(git_hash.to_string());
+            }
             // Already imported (an identical directory elsewhere in history) — nothing to
             // store, but it is now the newest version at *this* path, so a later version
             // here deltas against it.
-            let hash = hash.clone();
             if self.ingest.is_some() {
                 self.latest_tree_at_path.insert(path_prefix.to_string(), git_hash.to_string());
             }
@@ -442,7 +452,16 @@ impl Converter {
         let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
 
         let (_, bytes) = self.batch.read(git_hash)?;
-        for entry in parse_raw_tree(&bytes, self.oid_len)? {
+        // A refused name stops the whole import, so say where it is: the directory, from the root.
+        let entries = parse_raw_tree(&bytes, self.oid_len).map_err(|e| format!(
+            "{} It is in the directory {:?} of the git history.",
+            e, if path_prefix.is_empty() { "/" } else { path_prefix }
+        ))?;
+        for entry in entries {
+            if path_prefix.is_empty() {
+                refuse_metadata_alias(git_hash, &entry.name)?;
+            }
+
             let path = join_path(path_prefix, &entry.name);
             let child = match entry.mode.as_str() {
                 "40000" | "040000" => {
@@ -471,6 +490,9 @@ impl Converter {
         let mut object = LooseObjectBuilder::build_tree(&tree);
         self.store_tree(&mut object, path_prefix, git_hash)?;
 
+        if path_prefix.is_empty() {
+            self.checked_roots.insert(git_hash.to_string());
+        }
         self.trees.insert(git_hash.to_string(), object.hash.clone());
 
         Ok(object.hash)
@@ -545,6 +567,16 @@ impl Converter {
         let depth = self.stored_depth.get(&base_hash).copied().unwrap_or(u32::MAX);
 
         Ok(Some((base_hash, bytes, depth)))
+    }
+
+    /// [`refuse_metadata_alias`] over every entry of the root tree `git_hash`, read again: for a
+    /// tree whose conversion is reused, so its entries were never checked as a root.
+    fn ensure_importable_root(&mut self, git_hash: &str) -> Result<(), String> {
+        let (_, bytes) = self.batch.read(git_hash)?;
+
+        let entries = parse_raw_tree(&bytes, self.oid_len)
+            .map_err(|e| format!("{} It is in the directory \"/\" of the git history.", e))?;
+        entries.iter().try_for_each(|entry| refuse_metadata_alias(git_hash, &entry.name))
     }
 
     /// Rebuild a tree's object bytes from its git hash, for when the cache has evicted them.
@@ -747,7 +779,7 @@ fn git(path: &str, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Run a git command and return its stdout as a string, coercing lossily.
 ///
-/// Git object text — author/committer names, messages, tree entry names — is a byte
+/// Git object text — author/committer names, messages — is a byte
 /// string with no UTF-8 guarantee: git.git and the Linux kernel both carry commits whose
 /// author names are Latin-1 (e.g. "David_Kågedal", byte 0xE5), which strict decoding would
 /// reject, aborting the whole import. Forklift's model already stores these fields as UTF-8
@@ -842,6 +874,20 @@ fn parse_identity(text: &str) -> Result<(Operator, i64), String> {
     Ok((Operator { name, identifier: email }, time))
 }
 
+/// Refuse `name` as a top-level entry of the root tree `git_hash` if some file system opens it as
+/// `.forklift`, as `stack` does: a parcel carrying it could never be checked out there.
+fn refuse_metadata_alias(git_hash: &str, name: &str) -> Result<(), String> {
+    if office_utils::is_metadata_folder_name(name) {
+        return Err(format!(
+            "The git tree {} has the top-level entry {:?}, which some file systems open as the \
+            warehouse's metadata folder, so it cannot be imported.",
+            git_hash, name
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parse a raw git tree object. `git cat-file --batch` hands back the object's own bytes
 /// (not the text `ls-tree` prints): a packed sequence of `<octal-mode> SP <name> NUL
 /// <oid-bytes>`, where the child hash is raw binary (`oid_len` bytes) and must be hex-encoded
@@ -858,7 +904,14 @@ fn parse_raw_tree(bytes: &[u8], oid_len: usize) -> Result<Vec<GitTreeEntry>, Str
         let name_start = space + 1;
         let nul = name_start + bytes[name_start..].iter().position(|&b| b == 0)
             .ok_or("A git tree entry has an unterminated name.".to_string())?;
-        let name = String::from_utf8_lossy(&bytes[name_start..nul]).into_owned();
+        // A name becomes a working-directory path on checkout, so unlike display text it is not
+        // coerced: a lossy name would check out under a path the source never had, and two names
+        // could collapse into one entry. Refuse it, and anything the tree parser would refuse.
+        let name = String::from_utf8(bytes[name_start..nul].to_vec()).map_err(|e| format!(
+            "A git tree entry name is not UTF-8 ({:?}), so it cannot be imported.",
+            String::from_utf8_lossy(e.as_bytes())
+        ))?;
+        tree_parser::check_entry_name(&name)?;
 
         let oid_start = nul + 1;
         let oid_end = oid_start + oid_len;
@@ -986,4 +1039,39 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<ImportReport>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One raw git tree entry with a 20-byte object id.
+    fn raw_entry(mode: &str, name: &[u8]) -> Vec<u8> {
+        let mut bytes = format!("{} ", mode).into_bytes();
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0xab; 20]);
+        bytes
+    }
+
+    #[test]
+    fn a_git_tree_name_that_is_not_one_path_component_is_refused() {
+        for name in [&b".."[..], b".", b"a/b"] {
+            let error = parse_raw_tree(&raw_entry("100644", name), 20).err().expect("must be refused");
+            assert!(error.contains(&format!("{:?}", String::from_utf8_lossy(name))), "{}", error);
+        }
+    }
+
+    #[test]
+    fn a_git_tree_name_that_is_not_utf8_is_refused_not_coerced() {
+        let error = parse_raw_tree(&raw_entry("100644", b"caf\xe9.txt"), 20).err().expect("must be refused");
+        assert!(error.contains("not UTF-8"), "{}", error);
+    }
+
+    #[test]
+    fn an_ordinary_git_tree_name_is_parsed() {
+        let entries = parse_raw_tree(&raw_entry("100644", "café.txt".as_bytes()), 20).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "café.txt");
+    }
 }

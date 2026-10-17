@@ -12,20 +12,23 @@ use crate::util::byte_utils;
 /// * `input`  - The bytes of the tree object.
 ///
 /// # Returns
-/// * `Ok(TreeItem)` - The parsed tree object.
-/// * `Err(String)`  - The error message.
-pub fn parse(offset: usize, input: &[u8]) -> Result<TreeItem, String> {
+/// * `Ok(Vec<TreeItem>)` - The entries, in the order they are stored. They are not validated
+///                         here: [`tree_parser::parse_tree`] does that for every version.
+/// * `Err(String)`       - The error message.
+///
+/// [`tree_parser::parse_tree`]: crate::parser::object::tree::tree_parser::parse_tree
+pub fn parse(offset: usize, input: &[u8]) -> Result<Vec<TreeItem>, String> {
     let mut cursor = offset;
-    let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    let mut entries = Vec::new();
 
     while cursor < input.len() {
         let (item, bytes_read) = parse_entry(cursor, input)?;
 
         cursor += bytes_read;
-        tree.add_child(item);
+        entries.push(item);
     }
 
-    Ok(tree)
+    Ok(entries)
 }
 
 /// Parse a single entry in the tree object.

@@ -439,8 +439,9 @@ pub struct TrustAnchor {
     pub adopts: Option<String>,
 }
 
-/// Ensure a tree is a normal content tree: office parcel trees carry a top-level
-/// `.forklift` entry and must never be materialized into a working directory.
+/// Ensure a tree is a normal content tree: meta pallet trees (the office, manifest, haul) carry a
+/// top-level `.forklift` entry and must never be materialized into a working directory, where
+/// that entry would land in the warehouse's own metadata folder.
 ///
 /// # Arguments
 /// * `root_tree_hash` - The hash of the tree to check.
@@ -449,19 +450,40 @@ pub struct TrustAnchor {
 /// * `Ok(())`      - If the tree carries no tracked-metadata namespace.
 /// * `Err(String)` - If it does (or could not be read).
 pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
-    let root = object_utils::load_tree(root_tree_hash)?;
+    ensure_not_metadata_root(&object_utils::load_tree(root_tree_hash)?)
+}
 
-    let has_namespace = root.get_subtrees().any(|(name, _)| name == TREE_NAME_FORKLIFT)
-        || root.get_files().any(|(name, _)| name == TREE_NAME_FORKLIFT);
+/// Whether a top-level working-directory name opens the warehouse's metadata folder. The match is
+/// wider than the exact name: a file system that ignores case (macOS, Windows) or drops trailing
+/// dots and spaces (Windows) opens `.forklift` for `.ForkLift` or `.forklift.` too. Case is folded
+/// by Unicode rules, as those file systems fold it, so `.for\u{212A}lift` (KELVIN SIGN) matches.
+pub fn is_metadata_folder_name(name: &str) -> bool {
+    name.trim_end_matches(['.', ' ']).to_lowercase() == TREE_NAME_FORKLIFT
+}
 
-    if has_namespace {
-        return Err(
-            "This parcel carries tracked metadata (an office parcel); it cannot be \
-            materialized into a working directory.".to_string()
-        );
+/// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with
+/// [`is_metadata_folder_name`].
+///
+/// # Arguments
+/// * `root` - The root tree to check.
+///
+/// # Returns
+/// * `Ok(())`      - If no top-level entry names the metadata folder.
+/// * `Err(String)` - The refusal, naming the entry Debug-quoted.
+pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
+    let found = root.get_subtrees().chain(root.get_files())
+        .map(|(name, _)| name)
+        .find(|name| is_metadata_folder_name(name));
+
+    match found {
+        Some(name) => Err(format!(
+            "This parcel's tree has a top-level entry {:?}, which is the warehouse's metadata \
+            folder (a meta pallet's tree, or a crafted one); it cannot be materialized into a \
+            working directory.",
+            name
+        )),
+        None => Ok(()),
     }
-
-    Ok(())
 }
 
 /// Read the trust anchor, if signing has been established.

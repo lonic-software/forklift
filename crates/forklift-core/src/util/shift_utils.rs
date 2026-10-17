@@ -5,7 +5,7 @@ use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{file_utils, inventory_utils, object_utils, tree_utils};
+use crate::util::{file_utils, inventory_utils, object_utils, office_utils, tree_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -49,6 +49,10 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
         None => None,
     };
     let to_tree = object_utils::load_tree(to)?;
+
+    // Every materializer comes through here, so the metadata-folder refusal is enforced once for
+    // all of them rather than by each caller remembering it.
+    office_utils::ensure_not_metadata_root(&to_tree)?;
 
     let mut ops: Vec<FileOp> = Vec::new();
     let mut removed_dirs: Vec<String> = Vec::new();
@@ -281,6 +285,8 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
     match op {
         FileOp::Write { path, hash, item_type, .. } => write_tracked_file(path, hash, *item_type),
         FileOp::Remove { path } => {
+            check_working_path(path)?;
+
             match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 // The file being gone already is the desired outcome.
@@ -303,6 +309,8 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
 /// * `Ok(())`      - If the file was written.
 /// * `Err(String)` - If the blob could not be loaded or a file system operation failed.
 pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Result<(), String> {
+    check_working_path(path)?;
+
     let fs_path = Path::new(path);
 
     if let Some(parent) = fs_path.parent() {
@@ -343,12 +351,143 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
         ));
     }
 
-    std::fs::write(fs_path, &blob.content)
+    write_regular_file(fs_path, path, &blob.content, item_type)
+}
+
+/// Write `content` to the working directory at `path` as a regular file, creating parent
+/// directories as needed, after [`check_working_path`] — for content that comes from no blob
+/// (a merge result).
+///
+/// # Arguments
+/// * `path`      - The warehouse path of the file.
+/// * `content`   - The bytes to write.
+/// * `item_type` - The entry type, for the executable bit.
+///
+/// # Returns
+/// * `Ok(())`      - If the file was written.
+/// * `Err(String)` - If the path is refused or a file system operation failed.
+pub fn write_working_file(path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
+    check_working_path(path)?;
+
+    let fs_path = Path::new(path);
+
+    if let Some(parent) = fs_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            file_utils::create_folder_if_not_exists(parent)?;
+        }
+    }
+
+    write_regular_file(fs_path, path, content, item_type)
+}
+
+/// Write a regular file in place. A symlink already at the path (one this tree turns into a
+/// regular file) is removed first: writing through it would land in whatever it points at.
+fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
+    if std::fs::symlink_metadata(fs_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        std::fs::remove_file(fs_path)
+            .map_err(|e| format!("Error while replacing the symlink \"{}\": {}", path, e))?;
+    }
+
+    std::fs::write(fs_path, content)
         .map_err(|e| format!("Error while writing \"{}\": {}", path, e))?;
 
-    set_file_mode(fs_path, path, item_type)?;
+    set_file_mode(fs_path, path, item_type)
+}
+
+/// Refuse a warehouse path that would put a working-directory write or removal anywhere but the
+/// place the path names inside the working directory. Every write and removal of tracked content
+/// goes through here, because the path comes from a tree that may have arrived from a remote.
+///
+/// Refused:
+/// * a first component that is the warehouse's metadata folder, in any case and with any
+///   trailing dots or spaces (see [`office_utils::ensure_not_metadata_root`]);
+/// * a parent directory, at any depth, that is a symlink: following it would write or remove
+///   wherever it points. A file system that ignores case also reaches a symlink `lib` through a
+///   tree directory `LIB`;
+/// * on Windows, a component the file system would not take as one plain file name (see
+///   [`windows_component_problem`]).
+///
+/// The tree parser has already refused empty, `.`, `..`, `/` and NUL names.
+///
+/// # Arguments
+/// * `path` - The warehouse path, relative to the working directory, `/`-separated.
+///
+/// # Returns
+/// * `Ok(())`      - If the path is safe to write or remove.
+/// * `Err(String)` - The refusal, naming the path Debug-quoted.
+pub fn check_working_path(path: &str) -> Result<(), String> {
+    let components: Vec<&str> = path.split('/').collect();
+
+    if components.first().is_some_and(|first| office_utils::is_metadata_folder_name(first)) {
+        return Err(format!(
+            "Refusing to touch {:?}: it is inside the warehouse's metadata folder.", path
+        ));
+    }
+
+    #[cfg(windows)]
+    for component in &components {
+        if let Some(problem) = windows_component_problem(component) {
+            return Err(format!("Refusing to touch {:?}: the name {:?} {}.", path, component, problem));
+        }
+    }
+
+    let mut ancestor = PathBuf::new();
+
+    for component in &components[..components.len().saturating_sub(1)] {
+        ancestor.push(component);
+
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "Refusing to touch {:?}: its parent {:?} is a symlink, and following it could \
+                    leave the working directory.",
+                    path,
+                    ancestor.to_string_lossy()
+                ));
+            }
+            Ok(_) => {}
+            // Nothing further down exists yet, so nothing further down can be a symlink.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(format!("Error while checking \"{}\": {}", ancestor.to_string_lossy(), e)),
+        }
+    }
 
     Ok(())
+}
+
+/// Why Windows would not take `name` as one plain file name, if it would not: a `\` (a path
+/// separator there), a `:` (a drive prefix or an alternate data stream), a trailing dot or space
+/// (dropped, so `.. ` opens `..`), or a reserved device name (`CON`, `NUL`, `COM1`, … with or
+/// without an extension). Compiled everywhere so it is tested everywhere; enforced on Windows.
+pub fn windows_component_problem(name: &str) -> Option<&'static str> {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+
+    if name.contains('\\') {
+        return Some("contains a backslash, a path separator on Windows");
+    }
+    if name.contains(':') {
+        return Some("contains a colon, which Windows reads as a drive or a data stream");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("ends with a dot or a space, which Windows drops");
+    }
+
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    // On bytes: a four-byte stem may end in a multi-byte character, which a `str` slice at
+    // byte 3 would split.
+    let is_port = |prefix: &str| {
+        let bytes = stem.as_bytes();
+        bytes.len() == 4
+            && bytes[..3].eq_ignore_ascii_case(prefix.as_bytes())
+            && bytes[3].is_ascii_digit()
+            && bytes[3] != b'0'
+    };
+
+    if RESERVED.iter().any(|reserved| stem.eq_ignore_ascii_case(reserved)) || is_port("COM") || is_port("LPT") {
+        return Some("is a reserved device name on Windows");
+    }
+
+    None
 }
 
 /// Materialize a chunked file by streaming its recipe's chunks to `fs_path` in order, verifying
@@ -375,14 +514,9 @@ fn write_chunked_file(path: &str,
     // atomic rename replaces a regular file or a symlink in one step (it does not follow the
     // symlink); replacing a directory is the shift command's deletes-before-writes concern, not
     // this one.
-    let temp_path = fs_path.with_file_name(format!(
-        ".{}.forklift-assemble.tmp",
-        fs_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-    ));
+    let (temp_path, file) = create_assembly_temp(path)?;
 
     let assemble = || -> Result<(), String> {
-        let file = std::fs::File::create(&temp_path)
-            .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
         let mut writer = std::io::BufWriter::new(file);
 
         object_utils::assemble_chunked_file(recipe_hash, &mut writer)?;
@@ -392,17 +526,118 @@ fn write_chunked_file(path: &str,
         Ok(())
     };
 
-    if let Err(e) = assemble() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
+    let placed = assemble().and_then(|()| {
+        set_file_mode(&temp_path, path, item_type)?;
+
+        match std::fs::rename(&temp_path, fs_path) {
+            Ok(()) => Ok(()),
+            // A bay may live on another file system than the metadata folder.
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_into_place(&temp_path, fs_path, path, item_type)
+            }
+            Err(e) => Err(format!("Error while finalizing \"{}\": {}", path, e)),
+        }
+    });
+
+    let _ = std::fs::remove_file(&temp_path);
+    placed
+}
+
+/// The bay-local folder chunked files are assembled in. It is in the metadata folder, not beside
+/// the file: the working directory is the user's namespace, so a temp file there could collide
+/// with a tracked name, push a long name past the file system's limit, or be left behind for a
+/// later `load` to stack.
+const FOLDER_NAME_ASSEMBLY: &str = "assembly";
+
+/// Create a fresh temp file to assemble a chunked file into, in [`FOLDER_NAME_ASSEMBLY`]. Its name
+/// is unique to this process and attempt and it is created new, so nothing already there is ever
+/// opened (a symlink would be followed). Once per process and folder, leftovers from other
+/// processes are cleared first: every command that materializes holds the warehouse lock, so none
+/// of them is still assembling.
+fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CLEARED: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+    const MAX_ATTEMPTS: usize = 64;
+
+    let dir = crate::globals::bay_root().join(FOLDER_NAME_ASSEMBLY);
+    file_utils::create_folder_if_not_exists(&dir)?;
+
+    let pid = std::process::id();
+    {
+        let mut cleared = CLEARED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keyed absolute: a command may change directory mid-run (`bay add`), and the relative
+        // path would then name another folder.
+        let key = std::path::absolute(&dir).unwrap_or_else(|_| dir.clone());
+        if cleared.get_or_insert_with(Default::default).insert(key) {
+            clear_other_assemblies(&dir, pid);
+        }
     }
 
-    set_file_mode(&temp_path, path, item_type)?;
+    let candidates = (0..MAX_ATTEMPTS).map(|_| {
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        dir.join(format!("{}-{}.tmp", pid, attempt))
+    });
 
-    std::fs::rename(&temp_path, fs_path)
-        .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))?;
+    create_first_new(path, candidates)
+}
 
-    Ok(())
+/// Remove every entry of the assembly folder that this process did not create. Best effort: a
+/// leftover that cannot be removed only costs space.
+fn clear_other_assemblies(dir: &Path, pid: u32) {
+    let ours = format!("{}-", pid);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&ours) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Place an assembled file across file systems: copy it into a fresh temp file beside `fs_path`
+/// and rename that into place, so the swap is still atomic. The beside-the-file name is short
+/// and created new, as in [`create_assembly_temp`].
+fn copy_into_place(assembled: &Path, fs_path: &Path, path: &str, item_type: DirEntryType) -> Result<(), String> {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let pid = std::process::id();
+    let candidates = (0..64).map(|_| {
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        fs_path.with_file_name(format!(".forklift-place-{}-{}.tmp", pid, attempt))
+    });
+    let (beside, mut file) = create_first_new(path, candidates)?;
+
+    let placed = (|| -> Result<(), String> {
+        let mut source = std::fs::File::open(assembled)
+            .map_err(|e| format!("Error while reading the assembly of \"{}\": {}", path, e))?;
+        std::io::copy(&mut source, &mut file)
+            .map_err(|e| format!("Error while copying \"{}\" into place: {}", path, e))?;
+        drop(file);
+
+        set_file_mode(&beside, path, item_type)?;
+
+        std::fs::rename(&beside, fs_path)
+            .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))
+    })();
+
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&beside);
+    }
+    placed
+}
+
+/// Create the first of `candidates` that does not exist yet, skipping (never opening) any that
+/// does: opening it would follow a symlink, or truncate a file someone else owns.
+fn create_first_new(path: &str, candidates: impl Iterator<Item = PathBuf>) -> Result<(PathBuf, std::fs::File), String> {
+    for temp_path in candidates {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Error while creating a temp file for \"{}\": {}", path, e)),
+        }
+    }
+
+    Err(format!("Error while creating a temp file for \"{}\": every name tried already exists.", path))
 }
 
 /// Set a materialized file's mode: executable (`0o755`) for an executable (chunked or plain)
@@ -437,9 +672,11 @@ fn set_file_mode(fs_path: &Path, path: &str, item_type: DirEntryType) -> Result<
 /// * `removed_dirs` - The directories to remove, deepest first.
 pub fn remove_empty_directories(removed_dirs: &[String]) {
     for dir in removed_dirs {
-        // A failure means the directory is not empty (untracked content) or already gone;
-        // both are fine.
-        let _ = std::fs::remove_dir(dir);
+        // A refused path is left alone. A failure means the directory is not empty (untracked
+        // content) or already gone; both are fine.
+        if check_working_path(dir).is_ok() {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 
@@ -601,4 +838,85 @@ pub fn materialize_tree(from_tree: Option<&str>,
     crate::util::inventory_utils::replace_all_inventories(&shards)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_refuses_names_that_are_not_one_plain_file_name() {
+        for name in ["a\\b", "C:", "file.txt:stream", "trailing.", "trailing ", "..  ", "CON", "con.txt",
+            "Nul", "aux.tar.gz", "COM1", "lpt9.log", "PRN "] {
+            assert!(windows_component_problem(name).is_some(), "{:?} must be refused", name);
+        }
+    }
+
+    #[test]
+    fn windows_accepts_names_that_only_resemble_reserved_ones() {
+        for name in ["CONSOLE", "con_", "COM0", "COM10", "LPT", "auxiliary.txt", ".con", "a.CON", "café",
+            "...a", "file.txt", "abé.txt", "a€", "€"] {
+            assert_eq!(windows_component_problem(name), None, "{:?} must be accepted", name);
+        }
+    }
+
+    #[test]
+    fn a_path_inside_the_metadata_folder_is_refused_in_any_case() {
+        for path in [".forklift/config", ".ForkLift/objects/x", ".forklift./x", ".FORKLIFT /x", ".forklift",
+            ".for\u{212A}lift/config"] {
+            let error = check_working_path(path).expect_err(path);
+            assert!(error.contains(&format!("{:?}", path)), "{}", error);
+        }
+    }
+
+    #[test]
+    fn a_metadata_name_below_the_top_level_is_an_ordinary_path() {
+        // Only the working directory's own `.forklift` is the metadata folder; these name paths
+        // that do not exist here, so no ancestor can be a symlink either.
+        for path in ["docs/.forklift/x", "no-such-dir/.ForkLift", "x.forklift"] {
+            assert_eq!(check_working_path(path), Ok(()), "{:?} must be accepted", path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_candidate_that_exists_is_skipped_not_opened() {
+        let dir = std::env::temp_dir().join(format!("forklift-assembly-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "untouched\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("taken")).unwrap();
+
+        let (temp_path, file) = create_first_new("big.bin", [dir.join("taken"), dir.join("fresh")].into_iter()).unwrap();
+        std::io::Write::write_all(&mut &file, b"assembled").unwrap();
+
+        assert_eq!(temp_path, dir.join("fresh"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_into_place_replaces_a_symlink_and_leaves_no_temp() {
+        // The cross-device fallback: the rename from the metadata folder failed, so the assembly
+        // is copied beside the file and renamed over it, replacing (not following) a symlink.
+        let dir = std::env::temp_dir().join(format!("forklift-copy-into-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "untouched\n").unwrap();
+        let assembled = dir.join("assembled.tmp");
+        std::fs::write(&assembled, "assembled\n").unwrap();
+        let target = dir.join("work").join("big.bin");
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+
+        copy_into_place(&assembled, &target, "big.bin", DirEntryType::NormalChunked).unwrap();
+
+        assert!(!std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "assembled\n");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched\n");
+        assert_eq!(std::fs::read_dir(dir.join("work")).unwrap().count(), 1, "a temp file was left beside it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1,6 +1,5 @@
 use serde::Serialize;
 use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
-use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::blob::Blob;
 use forklift_core::model::inventory::InventoryItem;
@@ -483,6 +482,8 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         }
 
         MergeAction::Delete { path } => {
+            shift_utils::check_working_path(path)?;
+
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -511,7 +512,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         }
 
         MergeAction::Merged { path, content, item_type } => {
-            write_merged_file(path, content, *item_type)?;
+            shift_utils::write_working_file(path, content, *item_type)?;
 
             // The merged content is new — store its blob so the next stack can point at it. A
             // three-way merge only ever runs on plain text files, so a `Merged` result is always
@@ -524,7 +525,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
 
         MergeAction::Conflict { path, content, entry_hash, item_type } => {
             if let Some(content) = content {
-                write_merged_file(path, content, *item_type)?;
+                shift_utils::write_working_file(path, content, *item_type)?;
             } else if item_type.is_chunked() {
                 // A chunked (binary) conflict carries no inline content: materialize the
                 // should-be-on-disk version from its recipe (`entry_hash` is ours when we keep
@@ -556,36 +557,6 @@ pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<
         // parcel's tree by the completing stack's overlay. Nothing to apply here.
         MergeAction::ResolveOutOfScope { .. } => Ok(()),
     }
-}
-
-/// Write merged content to the working directory (creating parent directories), applying
-/// the executable bit when needed.
-fn write_merged_file(path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
-    let fs_path = std::path::Path::new(path);
-
-    if let Some(parent) = fs_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            forklift_core::util::file_utils::create_folder_if_not_exists(parent)?;
-        }
-    }
-
-    std::fs::write(fs_path, content)
-        .map_err(|e| format!("Error while writing \"{}\": {}", path, e))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = if item_type == DirEntryType::Executable { 0o755 } else { 0o644 };
-
-        std::fs::set_permissions(fs_path, std::fs::Permissions::from_mode(mode))
-            .map_err(|e| format!("Error while setting the permissions of \"{}\": {}", path, e))?;
-    }
-
-    #[cfg(windows)]
-    let _ = item_type;
-
-    Ok(())
 }
 
 /// Split a warehouse path into its parent directory key and file name.

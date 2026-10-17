@@ -5,8 +5,9 @@ use crate::util::{byte_utils, object_utils};
 /// Build a tree object with version `V2026_07_02`.
 ///
 /// This version length-prefixes entry names instead of terminating them with an EOT byte:
-/// file names may legally contain any byte (including EOT and new line), so a terminator
-/// byte cannot delimit them safely.
+/// file names may legally contain almost any byte, EOT and new line included (the parser
+/// refuses a name that is not one path component, see `tree_parser::check_entry_name`), so a
+/// terminator byte cannot delimit them safely.
 ///
 /// # Arguments
 /// * `version` - The version of the object.

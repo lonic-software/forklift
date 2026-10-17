@@ -1612,6 +1612,7 @@ impl Command {
                 | Command::Expand { .. }
                 | Command::Heal
                 | Command::ImportGit { .. }
+                | Command::Lift
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
@@ -1634,7 +1635,8 @@ impl Command {
     /// Whether finishing this command should kick off background object-store maintenance
     /// (git's `gc --auto`): the mutating commands that add loose objects, so the store stays
     /// packed without the user remembering to `compact`. `compact` itself is excluded (or it
-    /// would re-trigger), and `import-git` is (it compacts on its own). The actual work is
+    /// would re-trigger), and `import-git` is (it compacts on its own). `lift` and `lower` are
+    /// included on purpose: both bring in objects from a remote. The actual work is
     /// still gated on a cheap loose/pack threshold, so triggering here is only a *check*.
     ///
     /// # Returns

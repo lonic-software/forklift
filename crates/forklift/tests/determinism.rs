@@ -309,3 +309,20 @@ fn a_mutating_command_is_refused_while_the_warehouse_lock_is_held() {
     warehouse.run_ok(&["load", "a.txt"]);
     warehouse.run_ok(&["stack", "after the lock cleared"]);
 }
+
+#[test]
+fn lift_takes_the_warehouse_lock() {
+    // A diverged `lift` merges into the working directory, and moves refs, so it is a mutating
+    // command like any other: it must not run beside another process that holds the lock.
+    let warehouse = Warehouse::new("lift-lock");
+    warehouse.prepare();
+    warehouse.write_file("a.txt", "hello\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    std::fs::write(warehouse.root.join(".forklift").join("lock"), "424242\n").unwrap();
+
+    let refused = warehouse.run(&["lift"]);
+    assert_eq!(refused.status.code(), Some(6), "lift must be refused while the lock is held: {}",
+        String::from_utf8_lossy(&refused.stderr));
+}

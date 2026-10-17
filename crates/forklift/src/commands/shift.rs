@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::stocktake_utils::ChangeKind;
-use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, shift_utils, stocktake_utils};
+use forklift_core::util::{inventory_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
@@ -76,10 +76,6 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
         None => None,
     };
     let target_tree_hash = object_utils::load_parcel(&target_head)?.tree_hash;
-
-    // A hand-made ref could point at an office parcel; its tracked-metadata namespace
-    // must never land in a working directory.
-    office_utils::ensure_not_metadata_tree(&target_tree_hash)?;
 
     ensure_warehouse_is_clean(current_tree_hash.as_deref()).await?;
 

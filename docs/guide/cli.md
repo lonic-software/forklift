@@ -60,7 +60,10 @@ there is none) so a colocated repo reads clean. That edit is left in the working
 not stacked: `load .forkliftignore` and stack it with your next parcel. Requires `git` on your PATH. The imported history is **unsigned** (it
 predates trust) — import into a fresh warehouse, then `office enroll` to anchor it as the
 legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules
-(gitlinks) are skipped with a warning. For agents, this means a project can be moved onto
+(gitlinks) are skipped with a warning. A file or directory name that is not valid UTF-8, or that
+is not one path component (`..`, a name containing `/`), stops the import with an error naming it
+and its directory, rather than being imported under a different path; so does a top-level entry
+that some file system opens as `.forklift` (`.Forklift`, `.forklift.`). For agents, this means a project can be moved onto
 forklift with one command.
 
 A large history lands hundreds of thousands of objects at once — the case the loose store
@@ -308,7 +311,10 @@ state. If a consolidation is in progress, `stack` completes it. On a warehouse
 where trust is established, `stack` also signs the parcel (see
 [Identity, signing, and agents](#7-identity-signing-and-agents)).
 
-`stack` requires staged changes — it refuses to create an empty parcel. It also
+`stack` requires staged changes — it refuses to create an empty parcel. It refuses a
+top-level entry that some file system opens as the warehouse's `.forklift` folder (`.Forklift`,
+`.forklift.`, …), since no working directory there could check it out: rename it, or unload it
+and add it to `.forkliftignore`. It also
 refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
 named `load`(s), or `restore --staged` the affected path(s) to abandon them, then

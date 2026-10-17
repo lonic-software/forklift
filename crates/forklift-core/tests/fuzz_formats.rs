@@ -116,7 +116,9 @@ fn tree_seed(rng: &mut Rng) -> TreeItem {
     let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
     let mut names = std::collections::HashSet::new();
     for _ in 0..rng.below(6) {
-        let name = random_name(rng);
+        // A tree entry is one path component, so the parser refuses a `/` the pool carries for
+        // inventory paths.
+        let name = random_name(rng).replace('/', ".");
         if !names.insert(name.clone()) {
             continue;
         }
