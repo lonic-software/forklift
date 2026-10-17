@@ -1256,11 +1256,15 @@ fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
     assert!(!untracked.iter().any(|(_, path)| path.starts_with("notes.txt/")),
         "the rule still covers the folder's untracked content: {:?}", untracked);
 
-    // Loading the folder by name stages the tracked file's removal, and nothing the rule covers.
-    assert_success(&warehouse.run(&["load", "notes.txt"]));
+    // Loading the parent stages the tracked file's removal, and nothing the rule covers; the
+    // folder is not registered, so after the stack the rule covers it whole.
+    assert_success(&warehouse.run(&["load", "."]));
     let staged = changes(&warehouse, "staged");
     assert!(staged.contains(&("removed".to_string(), "notes.txt".to_string())), "{:?}", staged);
     assert!(!staged.iter().any(|(_, path)| path.starts_with("notes.txt/")), "{:?}", staged);
+    assert_success(&warehouse.run(&["stack", "notes.txt is gone"]));
+    let remove = warehouse.run(&["remove", "notes.txt"]);
+    assert!(!remove.status.success(), "notes.txt must be untracked: {}", stdout(&remove));
 }
 
 #[test]
@@ -1291,10 +1295,10 @@ fn an_ancestor_registered_only_for_removed_content_stops_being_tracked() {
     assert_success(&warehouse.run(&["remove", "a/b"]));
     assert_success(&warehouse.run(&["stack", "drop a/b"]));
 
-    // "a" was registered only as the parent of a/b: with a/b gone it holds nothing tracked.
-    let remove = warehouse.run(&["remove", "a"]);
-    assert!(!remove.status.success(), "a must no longer be tracked: {}", stdout(&remove));
-    assert!(stderr(&remove).contains("No inventory found for folder \"a\""), "{}", stderr(&remove));
+    // "a" was registered only as the parent of a/b: with a/b gone it holds nothing tracked, so
+    // it must leave the registered keys (no command reports registration as such).
+    let registered = read(&warehouse, ".forklift/inventory/metadata");
+    assert!(!registered.lines().any(|key| key == "a"), "a must no longer be registered: {:?}", registered);
 }
 
 #[test]

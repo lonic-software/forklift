@@ -979,19 +979,14 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // by its parent's per-entry filter below. A folder load never force-tracks, so an
         // untracked root the rules cover adds nothing. A tracked one is walked: its tracked
         // content is refreshed, and its untracked content stays skipped by the filter below.
-        // Trackedness is by name, as in the per-entry filter, so the parent's shard is read, but
-        // only when the rules would exclude the path.
+        // The root is asked as the directory it is, by registration: a stale file entry under its
+        // name (a file replaced by this folder) is the parent's business, and the parent's walk
+        // stages its removal. Walking the folder for it would only register an empty directory.
         if !path.is_root() {
-            let (parent, name) = path.split_parent()?;
-            let parent_coverage = ignore_rules.coverage_of(parent.as_key());
+            let (parent, _) = path.split_parent()?;
 
-            if ignore_rules.excludes(path.as_key(), registered.contains(path.as_key()), parent_coverage) {
-                let (_, parent_inventory) = retrieve_inventory_or_empty(&parent)?;
-                let tracked = entry_is_tracked(Some(&parent_inventory), &name, path.as_key(), &registered);
-
-                if ignore_rules.excludes(path.as_key(), tracked, parent_coverage) {
-                    return Ok(());
-                }
+            if ignore_rules.excludes(path.as_key(), registered.contains(path.as_key()), ignore_rules.coverage_of(parent.as_key())) {
+                return Ok(());
             }
         }
 
