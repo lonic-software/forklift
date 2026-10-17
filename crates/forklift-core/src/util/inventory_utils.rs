@@ -2801,6 +2801,37 @@ mod tests {
             "a symlink's identity must not change when its target appears");
     }
 
+    /// The alias probe's full id names an entry, not a spelling: two hard links to one file share
+    /// it, two files never do, and a symlink has its own, stable while it dangles.
+    #[cfg(windows)]
+    #[test]
+    fn the_full_file_id_tells_entries_apart_on_windows() {
+        let scratch = Scratch::new("full-file-id");
+        let first = scratch.root.join("first.txt");
+        let second = scratch.root.join("second.txt");
+        let hard_link = scratch.root.join("hard-link.txt");
+        std::fs::write(&first, "one\n").unwrap();
+        std::fs::write(&second, "two\n").unwrap();
+        std::fs::hard_link(&first, &hard_link).unwrap();
+
+        let first_id = file_utils::get_full_file_id(&first).unwrap();
+        assert_eq!(file_utils::get_full_file_id(&hard_link).unwrap(), first_id,
+            "two hard links to one file must share an id");
+        assert_ne!(file_utils::get_full_file_id(&second).unwrap(), first_id,
+            "two files must not share an id");
+
+        let link = scratch.root.join("link");
+        if std::os::windows::fs::symlink_file("missing.txt", &link).is_err() {
+            eprintln!("skipped the symlink half: this runner cannot create symlinks");
+            return;
+        }
+
+        let dangling_id = file_utils::get_full_file_id(&link).expect("a dangling symlink must have an id");
+        assert_ne!(dangling_id, first_id, "a symlink must have its own id");
+        assert_eq!(file_utils::get_full_file_id(&link).unwrap(), dangling_id,
+            "a dangling symlink's id must be stable");
+    }
+
     #[test]
     fn prepare_stack_inventory_reports_a_conflict_found_before_a_later_corrupt_shard() {
         // Regression: a single up-front parse pass must not let an unrelated corrupt shard mask
