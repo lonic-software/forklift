@@ -633,8 +633,8 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // Metadata must never claim a directory's shard is on disk when publishing it may not have
     // actually happened: a key with a recorded `ShardOutcome` only belongs in the registered set
     // when phase B is known to have durably published every outcome (one shared batch — see
-    // above). Every other visited directory (no outcome: its shard was already correct and
-    // durable from before this walk, untouched either way) is unaffected by phase A/B and is
+    // above). Every other directory whose task finished (no outcome: its shard was already
+    // correct and durable from before this walk, untouched either way) is unaffected by phase A/B and is
     // always safe to (re-)register.
     let keys_to_add: BTreeSet<String> = {
         let new_inventory_paths = context.new_inventory_paths.lock().await;
@@ -976,11 +976,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // newly built) — see the case (a)/(b) split below.
         let mut any_entry_rebuilt = false;
 
-        {
-            let key = path.as_key().to_string();
-            context.new_inventory_paths.lock().await.insert(key.clone());
-            context.dirty_inventory_paths.lock().await.remove(&key);
-        }
+        context.dirty_inventory_paths.lock().await.remove(path.as_key());
 
         for entry_result in directory {
             let entry = entry_result.map_err(|e|
@@ -1106,6 +1102,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             context.clear_keys.lock().await.extend(ancestor_keys_root_first(&key));
             context.outcomes.lock().await.insert(key, ShardOutcome::Changed(inventory, verified_at));
         }
+
+        // Registered only once this directory's content is decided: registration is what makes
+        // a directory tracked, so a task that failed partway must not leave its key registered
+        // with nothing decided for it.
+        context.new_inventory_paths.lock().await.insert(path.as_key().to_string());
 
         Ok(())
     }
