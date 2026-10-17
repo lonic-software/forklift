@@ -1323,7 +1323,8 @@ fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_
     assert!(stderr(&load).contains("cannot be read"), "{}", stderr(&load));
 
     // The way out the message names works, and x.log is still tracked afterwards.
-    assert!(stderr(&load).contains("forklift restore --staged '.'"), "{}", stderr(&load));
+    let suggested = if cfg!(windows) { "forklift restore --staged \".\"" } else { "forklift restore --staged '.'" };
+    assert!(stderr(&load).contains(suggested), "{}", stderr(&load));
     assert!(stderr(&load).contains("every folder below it"), "the reset's scope must be named: {}", stderr(&load));
     assert_success(&warehouse.run(&["restore", "--staged", "."]));
     assert_success(&warehouse.run(&["load", "."]));

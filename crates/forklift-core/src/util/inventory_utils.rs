@@ -1054,7 +1054,13 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         let existing_inventory = match file_utils::retrieve_inventory_or_none_by_key(path.as_key())? {
             (shard_path, Some(bytes)) => {
                 let folder = if path.is_root() { "." } else { path.as_key() };
-                let quoted = format!("'{}'", folder.replace('\'', "'\\''"));
+                // Quoted for the shell the user is likely in: POSIX single quotes, or double quotes
+                // on Windows (where a path cannot contain one, and cmd.exe ignores single quotes).
+                let quoted = if cfg!(windows) {
+                    format!("\"{}\"", folder)
+                } else {
+                    format!("'{}'", folder.replace('\'', "'\\''"))
+                };
                 let unreadable = |e: String| format!(
                     "The inventory of folder \"{}\" cannot be read: {}. \"forklift restore --staged {}\" \
                     resets it, and every folder below it, to the pallet head, unstaging everything staged \
