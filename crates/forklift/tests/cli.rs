@@ -4134,6 +4134,29 @@ fn a_bay_whose_path_file_cannot_be_read_is_neither_listed_blank_nor_half_removed
 }
 
 #[test]
+fn a_bay_whose_path_file_is_missing_still_lists_and_removes() {
+    let warehouse = TestWarehouse::new("bay-missing-path");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-missing");
+    assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
+
+    // No path file is recorded, unlike a damaged one: nothing is misread, and the bay is removable.
+    std::fs::remove_file(warehouse.root.join(".forklift/bays/feature/path")).unwrap();
+
+    let listed = warehouse.run(&["bay"]);
+    assert_success(&listed);
+    assert!(stdout(&listed).contains("feature"), "{}", stdout(&listed));
+
+    assert_success(&warehouse.run(&["bay", "remove", "feature"]));
+    assert!(!warehouse.root.join(".forklift/bays/feature").exists());
+}
+
+#[test]
 fn deliver_squashes_a_draft_trail_and_keeps_it_as_post_metadata() {
     let warehouse = TestWarehouse::new("deliver");
     warehouse.write_file("code.txt", "v1\n");
@@ -5750,9 +5773,14 @@ fn a_malformed_marker_reads_as_the_whole_warehouse_until_a_full_load_and_refuses
     let value = json(&stacked);
     assert_eq!(value["error"]["code"], "incomplete_load");
     assert!(
-        value["error"]["next_step"].as_str().unwrap().contains("restore"),
+        value["error"]["next_step"].as_str().unwrap().contains("forklift load ."),
         "points at a recovery path: {:?}", value["error"]
     );
+
+    // The way out it names works.
+    warehouse.write_file("a.txt", "y\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "second"]));
 }
 
 #[test]
@@ -9195,7 +9223,7 @@ fn a_torn_taint_exits_21_and_survives() {
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
     // No terminator line: torn by construction.
-    std::fs::write(dir.join("taint-1-0"), b"objects/ab/cdef\n").unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
 
     let status = warehouse.run(&["stocktake", "--json"]);
     assert_eq!(status.status.code(), Some(21));
@@ -9439,7 +9467,7 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
     // the torn record's own (lower-bound, untrusted) recorded set.
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("taint-1-0"), b"objects/aa/an-unrelated-surviving-line\n").unwrap();
+    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 1\nobjects/aa/an-unrelated-surviving-line\n").unwrap();
 
     let status = warehouse.run(&["heal", "--json"]);
     assert_eq!(status.status.code(), Some(21));

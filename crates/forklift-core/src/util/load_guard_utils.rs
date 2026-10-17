@@ -268,8 +268,8 @@ fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
 fn malformed_marker_refusal(read_error: &str) -> CoreError {
     let path = marker_path();
     let next_step = format!(
-        "Fix or remove \"{}\" by hand, or run \"forklift restore --staged <path>\" over the \
-        affected area, then try again.",
+        "Run \"forklift load .\": it rewrites \"{}\" as an incomplete load of the whole \
+        warehouse and, once it completes, clears it. Then try again.",
         path.to_string_lossy()
     );
 

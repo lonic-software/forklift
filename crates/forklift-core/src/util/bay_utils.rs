@@ -31,10 +31,19 @@ const BAY_PATH_VERSION: u32 = 1;
 
 /// A filesystem path as the text a bay record stores. A path that is not UTF-8 is refused rather
 /// than written lossily, which would record a different path.
-pub fn path_text<'a>(path: &'a Path, what: &str) -> Result<&'a str, String> {
+fn path_text<'a>(path: &'a Path, what: &str) -> Result<&'a str, String> {
     path.to_str().ok_or_else(|| format!(
         "The {} \"{}\" is not valid UTF-8, so a bay cannot record it.", what, path.to_string_lossy()
     ))
+}
+
+/// Check that a bay's records can hold both of its paths — the same check [`write_bay_redirect`]
+/// and [`write_bay_path`] make — so that `bay add` can refuse before it creates anything.
+pub fn check_bay_paths_recordable(warehouse_root: &Path, bay_dir: &Path) -> Result<(), String> {
+    path_text(warehouse_root, "warehouse root")?;
+    path_text(bay_dir, "bay directory")?;
+
+    Ok(())
 }
 
 /// A parsed bay `.forklift` redirect: the warehouse it belongs to, and the bay's name.
@@ -123,17 +132,22 @@ pub fn write_bay_path(name: &str, bay_dir: &Path) -> Result<(), String> {
     )
 }
 
-/// Read a bay's recorded working directory.
-pub fn read_bay_path(name: &str) -> Result<PathBuf, String> {
+/// Read a bay's recorded working directory, or `None` when the bay never recorded one (a bay
+/// whose creation failed before its `path` file was written). A file that is present but cannot
+/// be read is an error, never `None`.
+pub fn read_bay_path(name: &str) -> Result<Option<PathBuf>, String> {
     let path = bay_state_dir(name).join(FILE_NAME_BAY_PATH);
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("Error while reading the bay path \"{}\": {}", path.to_string_lossy(), e))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Error while reading the bay path \"{}\": {}", path.to_string_lossy(), e)),
+    };
 
     let fields = record_utils::from_bytes(&bytes, BAY_PATH_RECORD, BAY_PATH_VERSION)
         .map_err(|e| format!("The bay path file \"{}\" {}", path.to_string_lossy(), e.describe()))?;
 
     match <[String; 1]>::try_from(fields) {
-        Ok([bay_dir]) if !bay_dir.is_empty() => Ok(PathBuf::from(bay_dir)),
+        Ok([bay_dir]) if !bay_dir.is_empty() => Ok(Some(PathBuf::from(bay_dir))),
         _ => Err(format!("The bay path file \"{}\" is malformed.", path.to_string_lossy())),
     }
 }
@@ -489,7 +503,7 @@ mod tests {
 
         for bay_dir in ["/srv/bay\nreview", "/srv/bay\r", "/srv/a\\nb"] {
             write_bay_path("review", Path::new(bay_dir)).unwrap();
-            assert_eq!(read_bay_path("review").unwrap(), PathBuf::from(bay_dir));
+            assert_eq!(read_bay_path("review").unwrap(), Some(PathBuf::from(bay_dir)));
         }
 
         std::fs::write(bay_state_dir("review").join(FILE_NAME_BAY_PATH), "/srv/bay\n").unwrap();

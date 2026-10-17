@@ -5659,7 +5659,7 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let error = match compact(false, false, &Progress::NONE) {
             Err(e) => e,

@@ -4128,7 +4128,7 @@ mod tests {
         // (a crash-survivor / sibling-process taint neither this batch nor this process caused).
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("dd").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4163,7 +4163,7 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("ee").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4198,7 +4198,7 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("gg").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4254,7 +4254,7 @@ mod tests {
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("hh").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -4398,7 +4398,7 @@ mod tests {
         // And a hand-written (pre-existing) taint file must not be honored by the re-check either.
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-1-0"), b"objects/zz/preexisting\nEND\n").unwrap();
+        std::fs::write(taint_dir.join("taint-1-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
         let target = forklift.join("objects").join("cc").join("fresh-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();

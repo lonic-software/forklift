@@ -77,8 +77,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
 
     // The bay's records store both paths as text; refuse one that is not before anything is
     // created, so a refusal leaves no half-made bay behind.
-    bay_utils::path_text(&warehouse_root, "warehouse root")?;
-    bay_utils::path_text(&bay_dir, "bay directory")?;
+    bay_utils::check_bay_paths_recordable(&warehouse_root, &bay_dir)?;
 
     // The bay's pallet, at the current head (a shared ref).
     pallet_utils::set_pallet_head(name, &head)?;
@@ -219,7 +218,10 @@ fn list() -> Result<(), String> {
     let bays = bay_utils::list_bays()?
         .into_iter()
         .map(|name| {
-            let path = bay_utils::read_bay_path(&name)?.to_string_lossy().into_owned();
+            // A bay whose creation failed before recording its directory lists with none.
+            let path = bay_utils::read_bay_path(&name)?
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let pallet = bay_utils::read_bay_current_pallet(&name);
 
             Ok(BayEntry { name, path, pallet })
@@ -238,8 +240,9 @@ fn remove(name: &str) -> Result<(), String> {
         return Err(format!("There is no bay named \"{}\".", name));
     }
 
-    // Without the bay's working directory its redirect cannot be dropped, and removing the
-    // state alone would leave that directory redirecting to a bay that no longer exists.
+    // A bay that never recorded its working directory (its creation failed first) has no
+    // redirect to drop. One whose record cannot be read refuses: removing the state alone would
+    // leave that directory redirecting to a bay that no longer exists.
     let bay_dir = bay_utils::read_bay_path(name).map_err(|e| format!(
         "{} To remove the bay by hand, delete the \".forklift\" file in its working directory and \
         the folder \"{}\".",
@@ -248,7 +251,9 @@ fn remove(name: &str) -> Result<(), String> {
 
     // Drop the redirect so the directory is no longer a bay (best effort — the working
     // tree may already be gone).
-    let _ = std::fs::remove_file(bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT));
+    if let Some(bay_dir) = bay_dir {
+        let _ = std::fs::remove_file(bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT));
+    }
 
     bay_utils::remove_bay_state(name)?;
 
