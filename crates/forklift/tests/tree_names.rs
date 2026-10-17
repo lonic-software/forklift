@@ -169,3 +169,19 @@ fn an_ordinary_crafted_name_still_shifts() {
         "payload\n"
     );
 }
+
+#[test]
+fn a_root_forklift_entry_is_refused_and_leaves_the_metadata_alone() {
+    let warehouse = Warehouse::new("metadata");
+    warehouse.craft_pallet(|blob| subtree(".forklift", blob));
+
+    assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), "\".forklift\"");
+}
+
+#[test]
+fn a_root_forklift_entry_in_another_case_is_refused() {
+    let warehouse = Warehouse::new("metadata-case");
+    warehouse.craft_pallet(|blob| subtree(".ForkLift", blob));
+
+    assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), "\".ForkLift\"");
+}
