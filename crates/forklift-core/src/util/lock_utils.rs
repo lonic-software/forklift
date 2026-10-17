@@ -253,17 +253,17 @@ pub struct StoreAccessExclusive {
     _file: std::fs::File,
 }
 
-/// `OPEN_MAX` from macOS's `<sys/syslimits.h>`, which the `libc` crate does not export: where the
-/// search starts when macOS refuses the hard limit (an unlimited one).
+/// `OPEN_MAX` from macOS's `<sys/syslimits.h>`, which the `libc` crate does not export: the first
+/// limit tried when macOS refuses the hard limit (an unlimited one).
 #[cfg(target_os = "macos")]
 const MACOS_OPEN_MAX: libc::rlim_t = 10240;
 
 /// Raise this process's soft limit on open files toward its hard limit. A server keeps one
 /// store-access hold — one open file — per warehouse it serves, for as long as it serves it, so in
 /// multi-warehouse mode the count grows with the warehouses served, and the default soft limit
-/// (256 on macOS) is far below what the hard limit allows. Tries the hard limit, then halves down
-/// from it (from `OPEN_MAX` on macOS, whose kernel also caps the limit at `kern.maxfilesperproc`)
-/// until the kernel accepts one; never lowers the limit. Best-effort: a limit that cannot be read
+/// (256 on macOS) is far below what the hard limit allows. Tries the hard limit, then searches for
+/// the largest limit below it the kernel accepts (from `OPEN_MAX` up on macOS, whose kernel also
+/// caps the limit at `kern.maxfilesperproc`); never lowers the limit. Best-effort: a limit that cannot be read
 /// or raised is left as it is. A no-op off Unix, which has no such per-process soft limit.
 pub fn raise_open_file_limit() {
     #[cfg(unix)]
@@ -284,12 +284,27 @@ pub fn raise_open_file_limit() {
             return;
         }
 
+        // Search for the largest limit the kernel accepts, between the current one (accepted) and
+        // the first refused one.
+        let (mut accepted, mut refused) = (current, hard);
         #[cfg(target_os = "macos")]
-        let mut target = MACOS_OPEN_MAX.min(hard);
-        #[cfg(not(target_os = "macos"))]
-        let mut target = hard / 2;
-        while target > current && !try_raise(target) {
-            target /= 2;
+        {
+            let start = MACOS_OPEN_MAX.min(hard);
+            if start > current {
+                if try_raise(start) {
+                    accepted = start;
+                } else {
+                    refused = start;
+                }
+            }
+        }
+        while refused > accepted && refused - accepted > 1 {
+            let middle = accepted + (refused - accepted) / 2;
+            if try_raise(middle) {
+                accepted = middle;
+            } else {
+                refused = middle;
+            }
         }
     }
 }

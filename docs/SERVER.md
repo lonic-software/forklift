@@ -218,7 +218,8 @@ revocation by more than about a day.
   that writes objects runs against the root, which could reuse an unreachable object the
   sweep is about to delete; that lock is a kernel lock, so it never outlives its process.
   A server keeps that lock's file open for every warehouse it serves, so in multi-warehouse
-  mode it raises its own soft limit on open files to the hard limit at startup. A served
+  mode it raises its own soft limit on open files at startup, as far toward the hard limit as
+  the kernel allows. A served
   warehouse stays open until the server stops, so that limit also bounds how many distinct
   warehouses one server process can serve; raise the hard limit (`ulimit -Hn`, systemd
   `LimitNOFILE`) to match the fleet.
