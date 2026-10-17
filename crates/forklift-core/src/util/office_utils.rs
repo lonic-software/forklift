@@ -453,11 +453,15 @@ pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
     ensure_not_metadata_root(&object_utils::load_tree(root_tree_hash)?)
 }
 
-/// [`ensure_not_metadata_tree`] over a root tree already loaded.
-///
-/// The match is wider than the exact name: a file system that ignores case (macOS, Windows) or
-/// drops trailing dots and spaces (Windows) opens `.forklift` for `.ForkLift` or `.forklift.`
-/// too, so any of those is refused as well.
+/// Whether a top-level working-directory name opens the warehouse's metadata folder. The match is
+/// wider than the exact name: a file system that ignores case (macOS, Windows) or drops trailing
+/// dots and spaces (Windows) opens `.forklift` for `.ForkLift` or `.forklift.` too.
+pub fn is_metadata_folder_name(name: &str) -> bool {
+    name.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(TREE_NAME_FORKLIFT)
+}
+
+/// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with
+/// [`is_metadata_folder_name`].
 ///
 /// # Arguments
 /// * `root` - The root tree to check.
@@ -468,7 +472,7 @@ pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
 pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
     let found = root.get_subtrees().chain(root.get_files())
         .map(|(name, _)| name)
-        .find(|name| name.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(TREE_NAME_FORKLIFT));
+        .find(|name| is_metadata_folder_name(name));
 
     match found {
         Some(name) => Err(format!(

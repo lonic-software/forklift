@@ -13,6 +13,7 @@ use forklift_core::model::operator::Operator;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::model::tree_item::TreeItem;
+use forklift_core::parser::object::tree::tree_parser;
 use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
 use forklift_core::util::{file_utils, inventory_utils, object_utils, office_utils, pallet_utils, shift_utils};
@@ -747,7 +748,7 @@ fn git(path: &str, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Run a git command and return its stdout as a string, coercing lossily.
 ///
-/// Git object text — author/committer names, messages, tree entry names — is a byte
+/// Git object text — author/committer names, messages — is a byte
 /// string with no UTF-8 guarantee: git.git and the Linux kernel both carry commits whose
 /// author names are Latin-1 (e.g. "David_Kågedal", byte 0xE5), which strict decoding would
 /// reject, aborting the whole import. Forklift's model already stores these fields as UTF-8
@@ -858,7 +859,14 @@ fn parse_raw_tree(bytes: &[u8], oid_len: usize) -> Result<Vec<GitTreeEntry>, Str
         let name_start = space + 1;
         let nul = name_start + bytes[name_start..].iter().position(|&b| b == 0)
             .ok_or("A git tree entry has an unterminated name.".to_string())?;
-        let name = String::from_utf8_lossy(&bytes[name_start..nul]).into_owned();
+        // A name becomes a working-directory path on checkout, so unlike display text it is not
+        // coerced: a lossy name would check out under a path the source never had, and two names
+        // could collapse into one entry. Refuse it, and anything the tree parser would refuse.
+        let name = String::from_utf8(bytes[name_start..nul].to_vec()).map_err(|e| format!(
+            "A git tree entry name is not UTF-8 ({:?}), so it cannot be imported.",
+            String::from_utf8_lossy(e.as_bytes())
+        ))?;
+        tree_parser::check_entry_name(&name)?;
 
         let oid_start = nul + 1;
         let oid_end = oid_start + oid_len;
@@ -986,4 +994,39 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<ImportReport>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One raw git tree entry with a 20-byte object id.
+    fn raw_entry(mode: &str, name: &[u8]) -> Vec<u8> {
+        let mut bytes = format!("{} ", mode).into_bytes();
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0xab; 20]);
+        bytes
+    }
+
+    #[test]
+    fn a_git_tree_name_that_is_not_one_path_component_is_refused() {
+        for name in [&b".."[..], b".", b"a/b"] {
+            let error = parse_raw_tree(&raw_entry("100644", name), 20).err().expect("must be refused");
+            assert!(error.contains(&format!("{:?}", String::from_utf8_lossy(name))), "{}", error);
+        }
+    }
+
+    #[test]
+    fn a_git_tree_name_that_is_not_utf8_is_refused_not_coerced() {
+        let error = parse_raw_tree(&raw_entry("100644", b"caf\xe9.txt"), 20).err().expect("must be refused");
+        assert!(error.contains("not UTF-8"), "{}", error);
+    }
+
+    #[test]
+    fn an_ordinary_git_tree_name_is_parsed() {
+        let entries = parse_raw_tree(&raw_entry("100644", "café.txt".as_bytes()), 20).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "café.txt");
+    }
 }

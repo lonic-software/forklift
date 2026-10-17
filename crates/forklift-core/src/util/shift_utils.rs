@@ -285,6 +285,8 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
     match op {
         FileOp::Write { path, hash, item_type, .. } => write_tracked_file(path, hash, *item_type),
         FileOp::Remove { path } => {
+            check_working_path(path)?;
+
             match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 // The file being gone already is the desired outcome.
@@ -307,6 +309,8 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
 /// * `Ok(())`      - If the file was written.
 /// * `Err(String)` - If the blob could not be loaded or a file system operation failed.
 pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Result<(), String> {
+    check_working_path(path)?;
+
     let fs_path = Path::new(path);
 
     if let Some(parent) = fs_path.parent() {
@@ -347,12 +351,140 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType) -> Re
         ));
     }
 
-    std::fs::write(fs_path, &blob.content)
+    write_regular_file(fs_path, path, &blob.content, item_type)
+}
+
+/// Write `content` to the working directory at `path` as a regular file, creating parent
+/// directories as needed, after [`check_working_path`] — for content that comes from no blob
+/// (a merge result).
+///
+/// # Arguments
+/// * `path`      - The warehouse path of the file.
+/// * `content`   - The bytes to write.
+/// * `item_type` - The entry type, for the executable bit.
+///
+/// # Returns
+/// * `Ok(())`      - If the file was written.
+/// * `Err(String)` - If the path is refused or a file system operation failed.
+pub fn write_working_file(path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
+    check_working_path(path)?;
+
+    let fs_path = Path::new(path);
+
+    if let Some(parent) = fs_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            file_utils::create_folder_if_not_exists(parent)?;
+        }
+    }
+
+    write_regular_file(fs_path, path, content, item_type)
+}
+
+/// Write a regular file in place. A symlink already at the path (one this tree turns into a
+/// regular file) is removed first: writing through it would land in whatever it points at.
+fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: DirEntryType) -> Result<(), String> {
+    if std::fs::symlink_metadata(fs_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        std::fs::remove_file(fs_path)
+            .map_err(|e| format!("Error while replacing the symlink \"{}\": {}", path, e))?;
+    }
+
+    std::fs::write(fs_path, content)
         .map_err(|e| format!("Error while writing \"{}\": {}", path, e))?;
 
-    set_file_mode(fs_path, path, item_type)?;
+    set_file_mode(fs_path, path, item_type)
+}
+
+/// Refuse a warehouse path that would put a working-directory write or removal anywhere but the
+/// place the path names inside the working directory. Every write and removal of tracked content
+/// goes through here, because the path comes from a tree that may have arrived from a remote.
+///
+/// Refused:
+/// * a first component that is the warehouse's metadata folder, in any case and with any
+///   trailing dots or spaces (see [`office_utils::ensure_not_metadata_root`]);
+/// * a parent directory, at any depth, that is a symlink: following it would write or remove
+///   wherever it points. A file system that ignores case also reaches a symlink `lib` through a
+///   tree directory `LIB`;
+/// * on Windows, a component the file system would not take as one plain file name (see
+///   [`windows_component_problem`]).
+///
+/// The tree parser has already refused empty, `.`, `..`, `/` and NUL names.
+///
+/// # Arguments
+/// * `path` - The warehouse path, relative to the working directory, `/`-separated.
+///
+/// # Returns
+/// * `Ok(())`      - If the path is safe to write or remove.
+/// * `Err(String)` - The refusal, naming the path Debug-quoted.
+pub fn check_working_path(path: &str) -> Result<(), String> {
+    let components: Vec<&str> = path.split('/').collect();
+
+    if components.first().is_some_and(|first| office_utils::is_metadata_folder_name(first)) {
+        return Err(format!(
+            "Refusing to touch {:?}: it is inside the warehouse's metadata folder.", path
+        ));
+    }
+
+    #[cfg(windows)]
+    for component in &components {
+        if let Some(problem) = windows_component_problem(component) {
+            return Err(format!("Refusing to touch {:?}: the name {:?} {}.", path, component, problem));
+        }
+    }
+
+    let mut ancestor = PathBuf::new();
+
+    for component in &components[..components.len().saturating_sub(1)] {
+        ancestor.push(component);
+
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "Refusing to touch {:?}: its parent {:?} is a symlink, and following it could \
+                    leave the working directory.",
+                    path,
+                    ancestor.to_string_lossy()
+                ));
+            }
+            Ok(_) => {}
+            // Nothing further down exists yet, so nothing further down can be a symlink.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(format!("Error while checking \"{}\": {}", ancestor.to_string_lossy(), e)),
+        }
+    }
 
     Ok(())
+}
+
+/// Why Windows would not take `name` as one plain file name, if it would not: a `\` (a path
+/// separator there), a `:` (a drive prefix or an alternate data stream), a trailing dot or space
+/// (dropped, so `.. ` opens `..`), or a reserved device name (`CON`, `NUL`, `COM1`, … with or
+/// without an extension). Compiled everywhere so it is tested everywhere; enforced on Windows.
+pub fn windows_component_problem(name: &str) -> Option<&'static str> {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+
+    if name.contains('\\') {
+        return Some("contains a backslash, a path separator on Windows");
+    }
+    if name.contains(':') {
+        return Some("contains a colon, which Windows reads as a drive or a data stream");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("ends with a dot or a space, which Windows drops");
+    }
+
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let is_port = |prefix: &str| {
+        stem.len() == 4
+            && stem[..3].eq_ignore_ascii_case(prefix)
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0'
+    };
+
+    if RESERVED.iter().any(|reserved| stem.eq_ignore_ascii_case(reserved)) || is_port("COM") || is_port("LPT") {
+        return Some("is a reserved device name on Windows");
+    }
+
+    None
 }
 
 /// Materialize a chunked file by streaming its recipe's chunks to `fs_path` in order, verifying
@@ -441,9 +573,11 @@ fn set_file_mode(fs_path: &Path, path: &str, item_type: DirEntryType) -> Result<
 /// * `removed_dirs` - The directories to remove, deepest first.
 pub fn remove_empty_directories(removed_dirs: &[String]) {
     for dir in removed_dirs {
-        // A failure means the directory is not empty (untracked content) or already gone;
-        // both are fine.
-        let _ = std::fs::remove_dir(dir);
+        // A refused path is left alone. A failure means the directory is not empty (untracked
+        // content) or already gone; both are fine.
+        if check_working_path(dir).is_ok() {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 
@@ -605,4 +739,42 @@ pub fn materialize_tree(from_tree: Option<&str>,
     crate::util::inventory_utils::replace_all_inventories(&shards)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_refuses_names_that_are_not_one_plain_file_name() {
+        for name in ["a\\b", "C:", "file.txt:stream", "trailing.", "trailing ", "..  ", "CON", "con.txt",
+            "Nul", "aux.tar.gz", "COM1", "lpt9.log", "PRN "] {
+            assert!(windows_component_problem(name).is_some(), "{:?} must be refused", name);
+        }
+    }
+
+    #[test]
+    fn windows_accepts_names_that_only_resemble_reserved_ones() {
+        for name in ["CONSOLE", "con_", "COM0", "COM10", "LPT", "auxiliary.txt", ".con", "a.CON", "café",
+            "...a", "file.txt"] {
+            assert_eq!(windows_component_problem(name), None, "{:?} must be accepted", name);
+        }
+    }
+
+    #[test]
+    fn a_path_inside_the_metadata_folder_is_refused_in_any_case() {
+        for path in [".forklift/config", ".ForkLift/objects/x", ".forklift./x", ".FORKLIFT /x", ".forklift"] {
+            let error = check_working_path(path).expect_err(path);
+            assert!(error.contains(&format!("{:?}", path)), "{}", error);
+        }
+    }
+
+    #[test]
+    fn a_metadata_name_below_the_top_level_is_an_ordinary_path() {
+        // Only the working directory's own `.forklift` is the metadata folder; these name paths
+        // that do not exist here, so no ancestor can be a symlink either.
+        for path in ["docs/.forklift/x", "no-such-dir/.ForkLift", "x.forklift"] {
+            assert_eq!(check_working_path(path), Ok(()), "{:?} must be accepted", path);
+        }
+    }
 }
