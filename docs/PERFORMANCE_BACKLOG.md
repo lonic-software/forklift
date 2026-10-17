@@ -229,26 +229,37 @@ about 1 ms between runs.
 ## FORK-185: commit-graph write amplification on a cold build (2026-10-18)
 
 **Measured** on the benchmark's git.git warehouse (24,423-parcel first-parent chain), with
-`.forklift/graph` removed and `forklift blame Makefile` run once. Writes were counted with a
-throwaway build that logged each shard write; the counting build was never committed.
+`.forklift/graph` removed and `forklift blame Makefile` run once. Writes before the fix were
+counted with a throwaway build that logged each shard write; after it, with the test-only
+`FORKLIFT_DEBUG_GRAPH_WRITES` counter.
 
 - **Before:** 105,037 shard writes, 1.37 GB written, to leave a 7 MB graph. One shard was
-  rewritten 480 times. Blame walks its chain oldest first, so each step persists a small batch:
-  the `ensure` for the next parcel's few missing ancestors, then that parcel's changed-path filter.
-  Every persist rewrote whole shards.
-- **Fix:** `graph_utils::DeferredWrites`. While a guard is live, a persist marks the resident
-  shard dirty, and the guard's drop writes each dirty shard once. The CLI holds one guard per
-  command. The server holds none and keeps writing eagerly, because a long-lived process would
-  never reach the drop.
-- **After:** 256 writes and 6.85 MB written. The blame output is byte-identical.
+  rewritten 480 times. Blame walks its chain oldest first and filled the graph one query at a
+  time: each step persisted the `ensure` for the next parcel's few missing ancestors, then that
+  parcel's changed-path filter, and every persist rewrites whole shards.
+- **Fix:** `graph_utils::ensure_path_filters`, which blame calls on its chain before the walk.
+  One `ensure` from the newest parcel records the whole ancestry at once. The missing filters
+  are then computed in parallel (`fanout_map`) and persisted 4,096 at a time, so each shard is
+  rewritten once per batch. A finished batch is on disk, so a walk cut short by a closed pipe
+  or a Ctrl-C keeps everything up to its last batch. The pass sits in core, so the server and
+  the MCP head's blame get it too.
+- **After:** 1,792 writes (7 per shard: one for the records, one per filter batch), about
+  50 MB written. The blame output is byte-identical.
 
 | Cold `blame Makefile` (hyperfine, 3 runs, graph removed before each) | before | after |
 |---|---|---|
-| wall time | 1.0 ± 0.2 min | 0.5 ± 0.0 min (2.1x) |
+| wall time | 50.8 ± 0.4 s | 15.5 ± 0.1 s (3.3x) |
+| peak memory | 1.5 GiB | 1.7 GiB (+9%) |
 
-The remaining ~29 s cold (16.5 s warm) is blame itself: computing changed-path filters by tree
-diff, and attributing the versions that touch the file. git blames the same file in 0.68 s,
-which is FORK-190.
+Peak memory rose because the filter workers each hold the trees they diff. A cold blame now
+costs about what a warm one does (16.5 s). That remaining time is blame itself,
+attributing the versions that touch the file: git blames the same file in 0.68 s, which is
+FORK-190.
+
+The same change fixed a latent dirty-tracking bug. A shard's version was a per-shard counter
+reset to 0 on load, so a shard evicted and reloaded between a persist's snapshot and its
+clean-mark could climb back to the snapshot's number and be marked clean with a record that
+was in no file. Versions now come from one process-wide counter.
 
 ---
 

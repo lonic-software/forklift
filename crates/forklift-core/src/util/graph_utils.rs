@@ -35,18 +35,6 @@
 //! would report. Any shard that passes the check holds only correct records, whichever version
 //! of the file a crash left behind, because a record is a pure function of its parcel's hash.
 //!
-//! # Why a command writes each shard once
-//!
-//! A persist rewrites its whole shard, so a walk that persists a few records per step rewrites
-//! every shard over and over. A cold `blame Makefile` on git.git (a 24k-parcel first-parent
-//! chain, walked oldest first, persisting one changed-path filter per step) wrote 105k shards,
-//! 1.37 GB, to produce a 7 MB graph. A head that runs one command per process therefore holds a
-//! [`DeferredWrites`] guard for the command: while any guard is live a persist only updates the
-//! resident shard and marks it dirty, and dropping a guard writes every dirty shard once. A
-//! process that ends without the drop (killed, or exiting from inside the command) loses only
-//! records that are recomputed on the next miss. Without a guard, a persist writes eagerly, which
-//! is what a long-lived process (the server) wants: nothing there would ever reach a drop.
-//!
 //! # Why it is sharded (not one file)
 //!
 //! Forklift's invariant is bounded RAM: the per-directory inventory shards so a `stocktake`
@@ -65,12 +53,23 @@
 //! did not touch the queried path. The substrate stores the field (absent by default); the
 //! filter machinery lives in [`changed_paths`]. A false "maybe" only costs a redundant real
 //! check, never a wrong answer.
+//!
+//! # Why a walk computes its filters in batches
+//!
+//! A record's filter is computed on its first query and persisted, and a persist rewrites the
+//! whole shard. A cold `blame` queries every parcel of its first-parent chain, so filling the
+//! filters one query at a time rewrote each shard once per parcel in it: on git.git's history
+//! that was about 105,000 shard writes and 1.4 GB written for one command. A walk that knows
+//! its parcels up front calls [`ensure_path_filters`] first, which computes the missing filters
+//! in parallel and persists them a batch at a time, so each shard is rewritten once per batch.
+//! The batch bounds what an interrupted walk loses (a `| head` that closes the pipe, a Ctrl-C):
+//! every finished batch is already on disk.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::util::{file_utils, object_utils, sign_utils};
+use crate::util::{fanout_utils, file_utils, object_utils, sign_utils};
 
 /// Magic bytes at the head of every shard file.
 const GRAPH_MAGIC: &[u8; 8] = b"FORKGRPH";
@@ -167,11 +166,13 @@ struct Shard {
     /// O(1) stamp, so a hot walk that hits a shard tens of thousands of times pays nothing per
     /// hit (a `blame` or a `history` frontier lookup would otherwise scan a recency list).
     last_access: u64,
-    /// Bumped on every mutation to `records`. A flush serializes a snapshot under the lock, then
-    /// writes it with the lock released; on re-lock it clears `dirty` only if `version` is
-    /// unchanged, so a record another thread inserted meanwhile (raising `version`) is never
-    /// falsely marked flushed — it stays dirty until a later write carries it (its own persist,
-    /// a guard's drop, or an eviction).
+    /// Set from [`next_shard_version`] on every mutation to `records`, and 0 when the shard is
+    /// loaded. A flush serializes a snapshot under the lock, then writes it with the lock
+    /// released; on re-lock it clears `dirty` only if `version` is unchanged, so a record another
+    /// thread inserted meanwhile is never falsely marked flushed — it stays dirty until its own
+    /// writer persists it. The values come from one process-wide counter rather than a per-shard
+    /// one, so a shard evicted and reloaded in the gap can never climb back to the snapshot's
+    /// value and be marked clean by a write that did not carry its records.
     version: u64,
     /// False only for a stand-in served after the shard file failed to read for a reason other
     /// than its absence (see [`with_shard`]): it is never cached and never written back, so a
@@ -201,49 +202,23 @@ fn cache() -> &'static Mutex<Cache> {
     GRAPH_CACHE.get_or_init(|| Mutex::new(Cache { shards: HashMap::new(), access_clock: 0 }))
 }
 
-/// How many [`DeferredWrites`] guards are live in this process. Process-wide rather than
-/// per-thread, because a command's graph work runs on executor worker threads as well as its own.
-static DEFERRAL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// The source of [`Shard::version`] values. It starts at 1 so no mutation ever produces the 0 a
+/// freshly loaded shard carries.
+static NEXT_SHARD_VERSION: AtomicU64 = AtomicU64::new(1);
 
-/// While this guard is live, a persist updates the resident shard and marks it dirty instead of
-/// writing it; dropping the guard writes every dirty shard once (see the module docs). Guards may
-/// overlap: a persist defers while any is live, and every drop flushes, so a dirty shard is
-/// written by the first drop that follows it.
-#[must_use = "writes are deferred only while the guard is live"]
-pub struct DeferredWrites(());
-
-/// Defer commit-graph shard writes until the returned guard drops.
-pub fn defer_writes() -> DeferredWrites {
-    DEFERRAL_DEPTH.fetch_add(1, Ordering::SeqCst);
-    DeferredWrites(())
+/// A shard version no shard has carried before in this process.
+fn next_shard_version() -> u64 {
+    NEXT_SHARD_VERSION.fetch_add(1, Ordering::Relaxed)
 }
 
-impl Drop for DeferredWrites {
-    fn drop(&mut self) {
-        // Leave the deferral first, so a persist racing this flush writes for itself rather than
-        // leaving a dirty shard behind the snapshot taken below.
-        DEFERRAL_DEPTH.fetch_sub(1, Ordering::SeqCst);
-        flush_dirty();
-    }
-}
+/// How many shard files this process has written. Undocumented and test-only: the CLI prints it
+/// under `FORKLIFT_DEBUG_GRAPH_WRITES`, so a test can prove across the subprocess boundary that
+/// a cold walk rewrote each shard a bounded number of times, not once per parcel.
+static SHARD_WRITES: AtomicU64 = AtomicU64::new(0);
 
-fn writes_deferred() -> bool {
-    DEFERRAL_DEPTH.load(Ordering::SeqCst) > 0
-}
-
-/// Write every dirty resident shard, each once. Best-effort, like every shard write: a shard whose
-/// write fails stays dirty, and a later persist, flush or eviction retries it.
-fn flush_dirty() {
-    let snapshots: Vec<(String, String, Vec<u8>, u64)> = match cache().lock() {
-        Ok(cache) => cache.shards.values()
-            .filter(|shard| shard.dirty)
-            .map(|shard| (shard.root.clone(), shard.prefix.clone(), serialize_shard(&shard.records), shard.version))
-            .collect(),
-        Err(_) => return,
-    };
-    for (root, prefix, bytes, version) in snapshots {
-        let _ = write_snapshot(&root, &prefix, &bytes, version);
-    }
+/// The current value of the process-wide shard-write counter — see [`SHARD_WRITES`].
+pub fn shard_write_count() -> u64 {
+    SHARD_WRITES.load(Ordering::Relaxed)
 }
 
 /// The shard prefix for a parcel hash (its first [`SHARD_PREFIX_LEN`] hex characters).
@@ -513,7 +488,9 @@ fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<
 /// writes its checksummed shards, and a shard the failing device mangles simply reads as absent.
 fn write_shard_bytes(root: &str, prefix: &str, bytes: &[u8]) -> Result<(), String> {
     file_utils::create_folder_if_not_exists(std::path::Path::new(root))?;
-    file_utils::replace_file_unsynced(&shard_path(root, prefix), bytes)
+    file_utils::replace_file_unsynced(&shard_path(root, prefix), bytes)?;
+    SHARD_WRITES.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Fetch a parcel's record if it is already stored (in a resident shard or on disk). Does not
@@ -524,9 +501,7 @@ fn stored_record(root: &str, hash: &str) -> Result<Option<Record>, String> {
 }
 
 /// Persist a batch of freshly computed records, grouped so each affected shard is rewritten
-/// exactly once (never once per record), or not at all while a [`DeferredWrites`] guard is live:
-/// then the shard is only marked dirty, and the guard's drop writes it. Updates the resident copy
-/// of any loaded shard too.
+/// exactly once (never once per record). Updates the resident copy of any loaded shard too.
 fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), String> {
     if new.is_empty() {
         return Ok(());
@@ -536,54 +511,56 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
         by_prefix.entry(shard_prefix(hash)).or_default().push((hash, record));
     }
     for (prefix, records) in by_prefix {
-        // Insert the records and, unless writes are deferred, snapshot the shard's bytes and
-        // version under the lock; the file write then happens with the lock released. The
-        // deferral is read under the lock too: a guard's drop leaves the deferral before it takes
-        // the lock to snapshot the dirty shards, so this insert is either in that snapshot or
-        // sees the deferral already over and writes for itself.
-        let snapshot = with_shard(root, &prefix, |shard| {
-            if !shard.writable {
-                return None;
-            }
-            for (hash, record) in records {
-                shard.records.insert(hash.clone(), record.clone());
-            }
-            shard.dirty = true;
-            shard.version = shard.version.wrapping_add(1);
-            if writes_deferred() {
-                return None;
-            }
-            Some((serialize_shard(&shard.records), shard.version))
-        })?;
-        // An unreadable shard is never written back over (see `Shard::writable`), and a deferred
-        // one is written by the guard's drop.
+        // Insert the records and snapshot the shard's bytes + version under the lock; the file
+        // write then happens with the lock released.
+        let snapshot = with_shard(root, &prefix, |shard| stage_records(shard, records))?;
+        // An unreadable shard is never written back over (see `Shard::writable`).
         let Some((bytes, version)) = snapshot else {
             continue;
         };
 
-        // Write now so the memoization outlives this process. A failed write (a full or
-        // read-only disk) is not an error: the records are already resident for this process.
-        write_snapshot(root, &prefix, &bytes, version)?;
+        // Write eagerly so the memoization outlives this process — off the lock, so a concurrent
+        // graph access never waits on the file write. A failed write (a full or read-only disk)
+        // is not an error: the shard stays dirty, so a later persist or eviction retries it, and
+        // the records are already resident for this process.
+        if write_shard_bytes(root, &prefix, &bytes).is_err() {
+            continue;
+        }
+
+        mark_clean(root, &prefix, version)?;
     }
     Ok(())
 }
 
-/// Write a shard snapshot taken under the lock at `version`, off the lock so a concurrent graph
-/// access never waits on the file write, then mark the shard clean only if nothing changed it
-/// since the snapshot: a record another thread inserted meanwhile (a higher `version`) is newer
-/// than what was just written and stays dirty until it is flushed. (If the shard was evicted and
-/// reloaded in the gap, its `version` reset to 0, so this simply no-ops — its records are already
-/// on disk.) A failed write leaves the shard dirty, so a later persist, flush or eviction retries
-/// it; only a poisoned cache lock is an error.
-fn write_snapshot(root: &str, prefix: &str, bytes: &[u8], version: u64) -> Result<(), String> {
-    if write_shard_bytes(root, prefix, bytes).is_err() {
-        return Ok(());
+/// Insert `records` into a resident shard, mark it dirty with a fresh version, and return the
+/// serialized snapshot plus that version for the caller to write off the lock. A stand-in for an
+/// unreadable shard is never written back over (see `Shard::writable`), so it yields `None`.
+fn stage_records<'a>(shard: &mut Shard, records: impl IntoIterator<Item = (&'a String, &'a Record)>)
+    -> Option<(Vec<u8>, u64)>
+{
+    if !shard.writable {
+        return None;
     }
-    with_shard(root, prefix, |shard| {
+    for (hash, record) in records {
+        shard.records.insert(hash.clone(), record.clone());
+    }
+    shard.dirty = true;
+    shard.version = next_shard_version();
+    Some((serialize_shard(&shard.records), shard.version))
+}
+
+/// Mark a shard clean after a snapshot taken at `version` reached disk — only if nothing changed
+/// the shard since: a record another thread inserted meanwhile carries a newer version and stays
+/// dirty until that writer flushes it. A shard that is no longer resident is left alone. Its
+/// eviction wrote it, and reloading it here would only read back the file just written.
+fn mark_clean(root: &str, prefix: &str, version: u64) -> Result<(), String> {
+    let mut cache = cache().lock().map_err(poisoned)?;
+    if let Some(shard) = cache.shards.get_mut(&cache_key(root, prefix)) {
         if shard.version == version {
             shard.dirty = false;
         }
-    })
+    }
+    Ok(())
 }
 
 // ---- generation computation (iterative — survives 85k-deep chains) ------------------------
@@ -902,6 +879,75 @@ pub fn path_maybe_changed(parcel_hash: &str, path: &str) -> Result<bool, String>
         PathFilter::Bloom(bytes) => bloom_contains(&bytes, path),
         _ => true, // TooLarge (a root or a sweeping change) or Unknown (uncomputable) → maybe
     })
+}
+
+/// The most filters [`ensure_path_filters`] computes before persisting them. Each persist rewrites
+/// every shard the batch touches, so a larger batch writes less in total; a smaller one loses
+/// less when the walk is interrupted.
+const FILTER_BATCH: usize = 4096;
+
+/// Below this many missing filters, [`ensure_path_filters`] computes them on the calling thread:
+/// one filter is a tree diff against the parent, cheap enough that a short chain does not pay
+/// for spawning a worker per core.
+const PARALLEL_FILTER_THRESHOLD: usize = 64;
+
+/// Compute and store the changed-path filter of every parcel in `parcels` that lacks one, so a
+/// walk that then calls [`path_maybe_changed`] on each of them finds every answer on the hot
+/// path. Records missing altogether are computed first, from the newest parcel back, so one
+/// ancestry walk covers them all. The filters are then computed in parallel and persisted
+/// [`FILTER_BATCH`] at a time — each shard is rewritten once per batch, never once per parcel
+/// (see the module docs for what that saves).
+///
+/// Purely an accelerator: a caller may ignore its error, because [`path_maybe_changed`] still
+/// computes anything this left missing. A filter whose computation fails (an object absent from
+/// a sparse store) stays unknown, exactly as on the per-query path.
+///
+/// # Arguments
+/// * `parcels` - The parcels whose filters the caller is about to query, oldest first.
+///
+/// # Returns
+/// * `Ok(())`      - Every filter that could be computed is stored.
+/// * `Err(String)` - If a record could not be resolved or the cache lock was poisoned.
+pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
+    let root = file_utils::get_path_graph_root();
+
+    // Newest first: one `ensure` from the newest parcel records its whole missing ancestry and
+    // persists it once, so every older parcel after it is already a hit.
+    for hash in parcels.iter().rev() {
+        if stored_record(&root, hash)?.is_none() {
+            ensure(&root, hash)?;
+        }
+    }
+
+    let mut missing: Vec<(String, Record)> = Vec::new();
+    for hash in parcels {
+        if let Some(record) = stored_record(&root, hash)? {
+            if matches!(record.filter, PathFilter::Unknown) {
+                missing.push((hash.clone(), record));
+            }
+        }
+    }
+
+    let compute = |(hash, record): &(String, Record)| {
+        compute_filter(hash, record.parents.first().map(String::as_str)).unwrap_or(PathFilter::Unknown)
+    };
+    for batch in missing.chunks(FILTER_BATCH) {
+        let filters = if batch.len() < PARALLEL_FILTER_THRESHOLD {
+            batch.iter().map(compute).collect()
+        } else {
+            fanout_utils::fanout_map(batch, compute)
+        };
+        let updated: HashMap<String, Record> = batch.iter().zip(filters)
+            .filter(|(_, filter)| !matches!(filter, PathFilter::Unknown))
+            .map(|((hash, record), filter)| (hash.clone(), Record {
+                generation: record.generation,
+                parents: record.parents.clone(),
+                filter,
+            }))
+            .collect();
+        persist_records(&root, &updated)?;
+    }
+    Ok(())
 }
 
 /// Compute a parcel's changed-path filter: the file paths that differ between the parcel's tree
@@ -1347,6 +1393,31 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_from_before_an_eviction_never_marks_the_reloaded_shard_clean() {
+        // A persist snapshots a shard, writes it off the lock, then marks it clean if its version
+        // is unchanged. If the shard is evicted and reloaded in that gap, and the reloaded copy
+        // takes a record of its own, the stale snapshot must not mark it clean: that record is
+        // in no file yet, and a clean shard is never written again.
+        let dir = scratch_dir("aba");
+        let root = dir.join("graph").to_string_lossy().into_owned();
+        let record = Record { generation: 1, parents: vec![], filter: PathFilter::Unknown };
+        let first = "ab".repeat(32);
+        let second = format!("ab{}", "cd".repeat(31));
+
+        let (_, stale) = with_shard(&root, "ab", |shard| stage_records(shard, [(&first, &record)]))
+            .unwrap().expect("a fresh shard is writable");
+        cache().lock().unwrap().shards.remove(&cache_key(&root, "ab"));
+        with_shard(&root, "ab", |shard| stage_records(shard, [(&second, &record)]))
+            .unwrap().expect("a fresh shard is writable");
+        mark_clean(&root, "ab", stale).unwrap();
+
+        let dirty = with_shard(&root, "ab", |shard| shard.dirty).unwrap();
+        cache().lock().unwrap().shards.remove(&cache_key(&root, "ab"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dirty, "a snapshot taken before the eviction must not mark the reloaded shard clean");
+    }
+
+    #[test]
     fn concurrent_persists_to_one_shard_never_lose_a_record() {
         // P2 stress: many threads persist distinct records that all hash into the *same* shard,
         // so they contend on the out-of-lock shard load, the re-lock insert, and the double-load
@@ -1400,64 +1471,5 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// Serializes the tests that observe when a persist writes. The deferral is process-wide, so a
-    /// guard live in one test would defer the other's writes.
-    static WRITE_TIMING_TESTS: Mutex<()> = Mutex::new(());
-
-    /// The records a shard file holds, read back from disk through the checksum.
-    fn records_on_disk(root: &std::path::Path, prefix: &str) -> Option<HashMap<String, u32>> {
-        let bytes = std::fs::read(root.join(prefix)).ok()?;
-        let records = parse_verified_shard(&bytes)?;
-        Some(records.into_iter().map(|(hash, record)| (hash, record.generation)).collect())
-    }
-
-    fn generation_only(generation: u32) -> Record {
-        Record { generation, parents: vec![], filter: PathFilter::Unknown }
-    }
-
-    #[test]
-    fn deferred_persists_write_each_shard_once_the_guard_drops() {
-        let _serial = WRITE_TIMING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch_dir("deferred");
-        let root_path = dir.join("graph");
-        let root = root_path.to_string_lossy().into_owned();
-        let (first, second, other) = (format!("a1{}", "01".repeat(31)), format!("a1{}", "02".repeat(31)),
-            format!("a2{}", "03".repeat(31)));
-
-        let guard = defer_writes();
-        persist_records(&root, &HashMap::from([(first.clone(), generation_only(1))])).unwrap();
-        persist_records(&root, &HashMap::from([(second.clone(), generation_only(2))])).unwrap();
-        persist_records(&root, &HashMap::from([(other.clone(), generation_only(3))])).unwrap();
-        let written_while_deferred = root_path.join("a1").exists() || root_path.join("a2").exists();
-        let resident = stored_record(&root, &second).unwrap().map(|r| r.generation);
-        drop(guard);
-
-        let a1 = records_on_disk(&root_path, "a1");
-        let a2 = records_on_disk(&root_path, "a2");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert!(!written_while_deferred, "a persist under a live guard must not write its shard");
-        assert_eq!(resident, Some(2), "a deferred record must still read back from the resident shard");
-        assert_eq!(a1, Some(HashMap::from([(first, 1), (second, 2)])),
-            "the drop must write the shard with every record deferred into it");
-        assert_eq!(a2, Some(HashMap::from([(other, 3)])), "the drop must write every dirty shard");
-    }
-
-    #[test]
-    fn without_a_guard_a_persist_writes_its_shard_at_once() {
-        let _serial = WRITE_TIMING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch_dir("eager");
-        let root_path = dir.join("graph");
-        let root = root_path.to_string_lossy().into_owned();
-        let hash = format!("b7{}", "04".repeat(31));
-
-        persist_records(&root, &HashMap::from([(hash.clone(), generation_only(4))])).unwrap();
-        let on_disk = records_on_disk(&root_path, "b7");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert_eq!(on_disk, Some(HashMap::from([(hash, 4)])),
-            "a long-lived process holds no guard, so its persists must reach the disk themselves");
     }
 }

@@ -85,12 +85,7 @@ async fn async_main() {
     // stdout, and only for read-only display commands so a passphrase prompt can never
     // deadlock behind it. Torn down after the command so the shell waits for the user to quit.
     let pager = if cli.command.pages_output() { pager::setup(cli.no_pager) } else { None };
-    // One command per process: the commit-graph shards the command touches are written once, at
-    // the end, rather than once per persist (a cold blame otherwise rewrites each shard hundreds
-    // of times).
-    let graph_writes = forklift_core::util::graph_utils::defer_writes();
     let result = forklift(cli).await;
-    drop(graph_writes);
     events::finish();
     if let Some(pager) = pager {
         pager.close();
@@ -116,6 +111,12 @@ async fn async_main() {
     if std::env::var("FORKLIFT_DEBUG_PACK_COUNTS").is_ok() {
         eprintln!("pack-set-reads: {}", forklift_core::util::pack_utils::pack_set_read_count());
         eprintln!("pack-preloads: {}", forklift_core::util::pack_utils::pack_preload_count());
+    }
+
+    // Undocumented, test-only debug hook, same shape again: lets the commit-graph tests prove a
+    // cold walk rewrote each shard a bounded number of times, not once per parcel.
+    if std::env::var("FORKLIFT_DEBUG_GRAPH_WRITES").is_ok() {
+        eprintln!("graph-shard-writes: {}", forklift_core::util::graph_utils::shard_write_count());
     }
 
     if let Err(error) = result {
