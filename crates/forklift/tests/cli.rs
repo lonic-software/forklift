@@ -3178,7 +3178,11 @@ fn import_git_warnings_are_sanitized_for_the_terminal() {
     git(&["add", "a.txt"]);
     git(&["commit", "-qm", "first commit"]);
     let head = git(&["rev-parse", "HEAD"]);
-    git(&["update-index", "--add", "--cacheinfo", &format!("160000,{},sub\u{1b}]0;pwned\u{7}", head)]);
+    // A right-to-left override makes the name display reversed; git on Windows refuses control
+    // characters in a path, so the escape sequence is tried where git accepts it.
+    let (name, shown) = if cfg!(unix) { ("sub\u{202E}fdp.exe\u{1b}]0;pwned\u{7}", "sub fdp.exe ]0;pwned ") }
+                        else { ("sub\u{202E}fdp.exe", "sub fdp.exe") };
+    git(&["update-index", "--add", "--cacheinfo", &format!("160000,{},{}", head, name)]);
     git(&["commit", "-qm", "add a submodule"]);
 
     let warehouse = TestWarehouse::new("import-git-warning-target");
@@ -3187,8 +3191,8 @@ fn import_git_warnings_are_sanitized_for_the_terminal() {
     configure_operator(&warehouse);
     let imported = warehouse.run(&["import-git", source.root.to_str().unwrap()]);
     assert_success(&imported);
-    assert!(stdout(&imported).contains("  warning: skipped submodule \"sub ]0;pwned \""), "{:?}", stdout(&imported));
-    assert!(!stdout(&imported).contains('\u{1b}') && !stdout(&imported).contains('\u{7}'), "{:?}", stdout(&imported));
+    assert!(stdout(&imported).contains(&format!("  warning: skipped submodule \"{}\"", shown)), "{:?}", stdout(&imported));
+    assert!(!stdout(&imported).contains(['\u{202E}', '\u{1b}', '\u{7}']), "{:?}", stdout(&imported));
 }
 
 #[test]
