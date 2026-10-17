@@ -603,10 +603,13 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
     assert_success(&area.forklift(".",
         &["franchise", &server.url, "sparse", "--only", "src", "--only", "docs"]));
 
-    // A staged edit to the rules unstages back to the head's version.
+    // A staged edit to the rules unstages back to the head's version, by name and as part of
+    // the root folder — the folder form rebuilds the root shard, whose files are on the spine.
     area.write_file("sparse/.forkliftignore", "^src/build(/.*)?$\n\\.log$\n");
     assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
     assert_success(&area.forklift("sparse", &["restore", "--staged", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["restore", "--staged", "."]));
     let status = area.forklift("sparse", &["--json", "stocktake"]);
     assert_success(&status);
     let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
