@@ -279,3 +279,20 @@ fn a_symlink_at_the_chunked_assembly_temp_path_is_not_written_through() {
 
     assert!(std::fs::read(&outside).unwrap() == b"untouched\n", "the assembly wrote through the symlink");
 }
+
+#[cfg(unix)]
+#[test]
+fn stacking_a_top_level_alias_of_the_metadata_folder_is_refused() {
+    // `.forklift.` is an ordinary directory here, but Windows opens `.forklift` for it, so a
+    // parcel carrying it could never be checked out there: refuse it when stacking, not later.
+    let warehouse = Warehouse::new("stack-alias");
+    std::fs::create_dir_all(warehouse.root.join(".forklift.")).unwrap();
+    std::fs::write(warehouse.root.join(".forklift.").join("notes.txt"), "notes\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+
+    let output = warehouse.run(&["stack", "alias"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "stack accepted the alias; stderr: {}", stderr);
+    assert!(stderr.contains("\".forklift.\""), "the refusal must name the entry; stderr: {}", stderr);
+}

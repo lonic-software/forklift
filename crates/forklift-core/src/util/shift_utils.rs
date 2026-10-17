@@ -473,11 +473,14 @@ pub fn windows_component_problem(name: &str) -> Option<&'static str> {
     }
 
     let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    // On bytes: a four-byte stem may end in a multi-byte character, which a `str` slice at
+    // byte 3 would split.
     let is_port = |prefix: &str| {
-        stem.len() == 4
-            && stem[..3].eq_ignore_ascii_case(prefix)
-            && stem.as_bytes()[3].is_ascii_digit()
-            && stem.as_bytes()[3] != b'0'
+        let bytes = stem.as_bytes();
+        bytes.len() == 4
+            && bytes[..3].eq_ignore_ascii_case(prefix.as_bytes())
+            && bytes[3].is_ascii_digit()
+            && bytes[3] != b'0'
     };
 
     if RESERVED.iter().any(|reserved| stem.eq_ignore_ascii_case(reserved)) || is_port("COM") || is_port("LPT") {

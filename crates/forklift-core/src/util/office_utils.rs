@@ -455,9 +455,10 @@ pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
 
 /// Whether a top-level working-directory name opens the warehouse's metadata folder. The match is
 /// wider than the exact name: a file system that ignores case (macOS, Windows) or drops trailing
-/// dots and spaces (Windows) opens `.forklift` for `.ForkLift` or `.forklift.` too.
+/// dots and spaces (Windows) opens `.forklift` for `.ForkLift` or `.forklift.` too. Case is folded
+/// by Unicode rules, as those file systems fold it, so `.for\u{212A}lift` (KELVIN SIGN) matches.
 pub fn is_metadata_folder_name(name: &str) -> bool {
-    name.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(TREE_NAME_FORKLIFT)
+    name.trim_end_matches(['.', ' ']).to_lowercase() == TREE_NAME_FORKLIFT
 }
 
 /// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with
