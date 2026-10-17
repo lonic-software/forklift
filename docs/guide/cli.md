@@ -151,8 +151,8 @@ is a leftover conflict marker (consolidating two edits of the file writes them),
 a pattern holds a control or invisible character (a tab, a carriage return, a
 zero-width space, a soft hyphen, a bidirectional override; a joiner between two
 characters of an emoji or a Persian or Indic name is fine, as is a flag emoji),
-when a pattern starts or ends with whitespace, or when a pattern matches the empty string (`.*`, `x*`, `a|`): such a
-pattern matches every path. Whitespace around a pattern would be part of the regex,
+when a pattern starts or ends with whitespace, or when a pattern matches the empty
+string (`.*`, `x*`, `a|`): such a pattern matches every path. Whitespace around a pattern would be part of the regex,
 so `^build$ ` never matches `build`; write a space the pattern needs at its edge as
 `\x20`, and a tab as `\t`. A space inside a pattern is fine. The error names the
 character's code point and its escape, so an invisible one can be found. Save the file
