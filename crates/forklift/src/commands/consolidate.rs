@@ -40,11 +40,11 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     }
 
     if merge_utils::read_consolidation_state()?.is_some() {
-        return Err(
-            "A consolidation is already in progress. Resolve its conflicts and \"stack\", \
-            or remove \".forklift/consolidation\" (and \".forklift/consolidation-skeleton\", \
-            if present) to abort it.".to_string()
-        );
+        return Err(format!(
+            "A consolidation is already in progress. Resolve its conflicts and \"stack\", or {} \
+            to abort it.",
+            merge_utils::abort_hint_in(&forklift_core::globals::bay_root())
+        ));
     }
 
     if forklift_core::util::cherry_pick_utils::read_state()?.is_some() {

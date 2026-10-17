@@ -251,7 +251,7 @@ impl MaterializationScope {
     /// Serialize the scope to its on-disk form, a [`record_utils`] file of kind [`SCOPE_RECORD`]:
     /// one prefix per line, escaped, so a prefix may hold a line break or edge whitespace. A
     /// full scope serializes to the empty string.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
         if self.prefixes.is_empty() {
             return Vec::new();
         }
@@ -284,7 +284,7 @@ impl MaterializationScope {
             ),
             RecordError::OtherVersion(ref header) => {
                 let older = header.rsplit(' ').next()
-                    .and_then(|version| version.parse::<u32>().ok())
+                    .and_then(|version| version.trim().parse::<u32>().ok())
                     .is_some_and(|version| version < SCOPE_VERSION);
                 if older {
                     format!("{} An older version of Forklift wrote it. {}", e.describe(), remedy)
@@ -858,6 +858,10 @@ mod tests {
         let raw = MaterializationScope::from_bytes(b"/forklift-scope 2\nsrc\n", "Do the remedy.").unwrap_err();
         assert!(raw.contains("/forklift-scope 2") && raw.contains("Do the remedy."), "{}", raw);
         assert!(!raw.contains("Use the Forklift that wrote it"), "{}", raw);
+
+        // Line endings rewritten to CRLF still read as the older format they are.
+        let crlf = MaterializationScope::from_bytes(b"/forklift-scope 2\r\nsrc\r\n", "Do the remedy.").unwrap_err();
+        assert!(crlf.contains("Do the remedy."), "{}", crlf);
 
         // And a header with no prefix after it, which would otherwise read as the full scope.
         let bare = MaterializationScope::from_bytes(b"/forklift-scope 3\n", "Do the remedy.").unwrap_err();

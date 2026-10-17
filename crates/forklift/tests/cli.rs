@@ -4106,6 +4106,34 @@ fn bays_are_parallel_working_directories_sharing_the_warehouse() {
 }
 
 #[test]
+fn a_bay_whose_path_file_cannot_be_read_is_neither_listed_blank_nor_half_removed() {
+    let warehouse = TestWarehouse::new("bay-unreadable-path");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-unreadable");
+    assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
+
+    // A path file an older Forklift wrote, without its format header.
+    let path_file = warehouse.root.join(".forklift/bays/feature/path");
+    std::fs::write(&path_file, format!("{}\n", bay_dir.to_str().unwrap())).unwrap();
+
+    let listed = warehouse.run(&["bay"]);
+    assert!(!listed.status.success(), "a bay with an unreadable path must not list with a blank one");
+    assert!(stderr(&listed).contains("has no format header"), "{}", stderr(&listed));
+
+    // Removing it refuses, naming the way out, and leaves both the state and the redirect.
+    let removed = warehouse.run(&["bay", "remove", "feature"]);
+    assert!(!removed.status.success());
+    assert!(stderr(&removed).contains("To remove the bay by hand"), "{}", stderr(&removed));
+    assert!(warehouse.root.join(".forklift/bays/feature").is_dir());
+    assert!(bay_dir.join(".forklift").is_file());
+}
+
+#[test]
 fn deliver_squashes_a_draft_trail_and_keeps_it_as_post_metadata() {
     let warehouse = TestWarehouse::new("deliver");
     warehouse.write_file("code.txt", "v1\n");
@@ -9098,13 +9126,7 @@ fn taint_dir_path(warehouse: &TestWarehouse) -> PathBuf {
 fn plant_taint(warehouse: &TestWarehouse, paths: &[&str]) {
     let dir = taint_dir_path(warehouse);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut content = String::new();
-    for path in paths {
-        content.push_str(path);
-        content.push('\n');
-    }
-    content.push_str("END\n");
-    std::fs::write(dir.join("taint-1-0"), content).unwrap();
+    std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
 #[test]

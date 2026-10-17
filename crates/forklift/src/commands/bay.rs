@@ -75,6 +75,11 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
         ));
     }
 
+    // The bay's records store both paths as text; refuse one that is not before anything is
+    // created, so a refusal leaves no half-made bay behind.
+    bay_utils::path_text(&warehouse_root, "warehouse root")?;
+    bay_utils::path_text(&bay_dir, "bay directory")?;
+
     // The bay's pallet, at the current head (a shared ref).
     pallet_utils::set_pallet_head(name, &head)?;
 
@@ -214,14 +219,12 @@ fn list() -> Result<(), String> {
     let bays = bay_utils::list_bays()?
         .into_iter()
         .map(|name| {
-            let path = bay_utils::read_bay_path(&name)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let path = bay_utils::read_bay_path(&name)?.to_string_lossy().into_owned();
             let pallet = bay_utils::read_bay_current_pallet(&name);
 
-            BayEntry { name, path, pallet }
+            Ok(BayEntry { name, path, pallet })
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     output::emit(&BayList { bays });
 
@@ -235,11 +238,17 @@ fn remove(name: &str) -> Result<(), String> {
         return Err(format!("There is no bay named \"{}\".", name));
     }
 
+    // Without the bay's working directory its redirect cannot be dropped, and removing the
+    // state alone would leave that directory redirecting to a bay that no longer exists.
+    let bay_dir = bay_utils::read_bay_path(name).map_err(|e| format!(
+        "{} To remove the bay by hand, delete the \".forklift\" file in its working directory and \
+        the folder \"{}\".",
+        e, bay_utils::bay_state_dir(name).to_string_lossy()
+    ))?;
+
     // Drop the redirect so the directory is no longer a bay (best effort — the working
     // tree may already be gone).
-    if let Ok(bay_dir) = bay_utils::read_bay_path(name) {
-        let _ = std::fs::remove_file(bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT));
-    }
+    let _ = std::fs::remove_file(bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT));
 
     bay_utils::remove_bay_state(name)?;
 

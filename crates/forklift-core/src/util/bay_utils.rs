@@ -17,8 +17,8 @@ use crate::util::{file_utils, merge_utils, park_utils, record_utils};
 use crate::util::record_utils::RecordError;
 
 /// The [`record_utils`] kind and version of a bay's `.forklift` redirect file: the warehouse root,
-/// then the bay's name. Its header is how discovery tells a bay's redirect from an accidental
-/// file named `.forklift`.
+/// then the bay's name. Its header is how reading one refuses a stray file named `.forklift`
+/// instead of misreading it as a bay.
 const BAY_REDIRECT_RECORD: &str = "bay";
 const BAY_REDIRECT_VERSION: u32 = 1;
 
@@ -31,7 +31,7 @@ const BAY_PATH_VERSION: u32 = 1;
 
 /// A filesystem path as the text a bay record stores. A path that is not UTF-8 is refused rather
 /// than written lossily, which would record a different path.
-fn path_text<'a>(path: &'a Path, what: &str) -> Result<&'a str, String> {
+pub fn path_text<'a>(path: &'a Path, what: &str) -> Result<&'a str, String> {
     path.to_str().ok_or_else(|| format!(
         "The {} \"{}\" is not valid UTF-8, so a bay cannot record it.", what, path.to_string_lossy()
     ))

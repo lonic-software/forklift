@@ -43,9 +43,21 @@ const CONSOLIDATION_VERSION: u32 = 1;
 const SKELETON_RECORD: &str = "consolidation-skeleton";
 const SKELETON_VERSION: u32 = 1;
 
-/// The way out of an unreadable consolidation: both of its files go, and the merge starts over.
-const ABORT_REMEDY: &str = "Abort the consolidation (remove \".forklift/consolidation\" and \
-    \".forklift/consolidation-skeleton\") and consolidate again.";
+/// How to abort the consolidation whose files live in the bay-local state dir `dir`: remove both
+/// of them. A phrase such as `remove "<a>" and "<b>"`, naming that bay's own paths.
+pub fn abort_hint_in(dir: &Path) -> String {
+    format!(
+        "remove \"{}\" and \"{}\"",
+        dir.join(FILE_NAME_CONSOLIDATION).to_string_lossy(),
+        dir.join(FILE_NAME_SKELETON).to_string_lossy()
+    )
+}
+
+/// The way out of an unreadable consolidation in `dir`: both of its files go, and the merge
+/// starts over.
+fn abort_remedy_in(dir: &Path) -> String {
+    format!("Abort the consolidation ({}) and consolidate again.", abort_hint_in(dir))
+}
 
 /// Get the path of the consolidation-state file (bay-local: a merge in progress belongs
 /// to the bay resolving it).
@@ -76,7 +88,7 @@ pub fn read_consolidation_state_in(dir: &Path) -> Result<Option<ConsolidationSta
         .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
 
     let malformed = |reason: String| format!(
-        "The consolidation state file \"{}\" {} {}", path.to_string_lossy(), reason, ABORT_REMEDY
+        "The consolidation state file \"{}\" {} {}", path.to_string_lossy(), reason, abort_remedy_in(dir)
     );
 
     let lines = record_utils::from_bytes(&bytes, CONSOLIDATION_RECORD, CONSOLIDATION_VERSION)
@@ -218,7 +230,7 @@ impl OutOfScopeSkeleton {
             Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
         };
 
-        OutOfScopeSkeleton::from_bytes(&bytes)
+        OutOfScopeSkeleton::from_bytes(&bytes, &path)
     }
 
     /// Read the skeleton beside an in-progress consolidation, **requiring the file to exist**.
@@ -239,18 +251,19 @@ impl OutOfScopeSkeleton {
 
         let bytes = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "A consolidation is in progress but its out-of-scope skeleton \
-                (\".forklift/consolidation-skeleton\") is missing — most likely an interrupted \
-                write (a crash mid-merge). The completing stack cannot tell what out-of-scope \
-                entries the merge resolved, so it refuses rather than silently drop them. Abort \
-                the consolidation (remove \".forklift/consolidation\" and \
-                \".forklift/consolidation-skeleton\") and consolidate again.".to_string()
+format!(
+                    "A consolidation is in progress but its out-of-scope skeleton (\"{}\") is \
+                    missing — most likely an interrupted write (a crash mid-merge). The completing \
+                    stack cannot tell what out-of-scope entries the merge resolved, so it refuses \
+                    rather than silently drop them. {}",
+                    path.to_string_lossy(), abort_remedy_in(&bay_root())
+                )
             } else {
                 format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)
             }
         })?;
 
-        OutOfScopeSkeleton::from_bytes(&bytes)
+        OutOfScopeSkeleton::from_bytes(&bytes, &path)
     }
 
     /// Write the skeleton (atomically) beside the consolidation-state file.
@@ -283,15 +296,20 @@ impl OutOfScopeSkeleton {
     }
 
     /// Parse the on-disk form produced by [`OutOfScopeSkeleton::to_bytes`].
-    fn from_bytes(bytes: &[u8]) -> Result<OutOfScopeSkeleton, String> {
-        let lines = record_utils::from_bytes(bytes, SKELETON_RECORD, SKELETON_VERSION)
-            .map_err(|e| format!("The consolidation skeleton file {} {}", e.describe(), ABORT_REMEDY))?;
+    ///
+    /// `path` is where `bytes` were read from; an error names it, and the way out in its bay.
+    fn from_bytes(bytes: &[u8], path: &Path) -> Result<OutOfScopeSkeleton, String> {
+        let remedy = abort_remedy_in(path.parent().unwrap_or(Path::new("")));
+        let lines = record_utils::from_bytes(bytes, SKELETON_RECORD, SKELETON_VERSION).map_err(|e| format!(
+            "The consolidation skeleton file \"{}\" {} {}", path.to_string_lossy(), e.describe(), remedy
+        ))?;
 
         let mut entries: BTreeMap<String, Option<(String, DirEntryType)>> = BTreeMap::new();
 
         for line in &lines {
             let malformed = || format!(
-                "The consolidation skeleton line \"{}\" is malformed. {}", line.escape_debug(), ABORT_REMEDY
+                "The consolidation skeleton file \"{}\" has a malformed line \"{}\". {}",
+                path.to_string_lossy(), line.escape_debug(), remedy
             );
 
             match line.split_once(' ') {
@@ -1444,14 +1462,14 @@ mod tests {
         }
         let skeleton = OutOfScopeSkeleton { entries: entries.clone() };
 
-        let read_back = OutOfScopeSkeleton::from_bytes(&skeleton.to_bytes()).unwrap();
+        let read_back = OutOfScopeSkeleton::from_bytes(&skeleton.to_bytes(), Path::new("consolidation-skeleton")).unwrap();
 
         assert_eq!(read_back.entries, entries);
     }
 
     #[test]
     fn a_skeleton_without_its_format_header_is_refused() {
-        let refused = OutOfScopeSkeleton::from_bytes(b"D src/a\n").err().expect("a headerless skeleton must be refused");
+        let refused = OutOfScopeSkeleton::from_bytes(b"D src/a\n", Path::new("consolidation-skeleton")).err().expect("a headerless skeleton must be refused");
 
         assert!(refused.contains("format"), "{}", refused);
     }

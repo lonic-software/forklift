@@ -1,6 +1,7 @@
 //! The shared on-disk form of Forklift's small line-per-entry state files: the out-of-scope
 //! skeleton and consolidation state of a merge in progress, the load-guard marker, scope files,
-//! bay redirects and the inventory metadata.
+//! bay redirects and the inventory metadata. Taint files escape their entries the same way, under
+//! a header of their own, but keep their own torn-file reading (see `taint_utils`).
 //!
 //! The entries of these files are names: warehouse paths, pallet labels, filesystem paths. A tree
 //! entry name may hold any character but `/` and NUL, line breaks included, so an entry cannot be
@@ -9,9 +10,10 @@
 //! entry holds no line break, so a line is exactly one entry, and the file stays readable by eye.
 //!
 //! A file opens with a header line naming its kind and format version, such as
-//! `/forklift-marker 1`. No entry of any of these files can begin with `/` (path keys are
-//! relative), so a header is never mistaken for an entry. A reader refuses a file whose header is
-//! missing or names another version, rather than guessing at a format it does not know.
+//! `/forklift-marker 1`. The header is always the first line and only the first line is read as
+//! one, so an entry is never mistaken for a header, even an absolute path that happens to begin
+//! `/forklift-`. A reader refuses a file whose header is missing or names another version, rather
+//! than guessing at a format it does not know.
 //!
 //! ## Format
 //!
@@ -25,7 +27,7 @@
 //! records the warehouse root as the empty key), which is an empty line.
 
 /// Why a record file could not be read. [`RecordError::describe`] phrases it to follow
-/// "The <file> ", so each caller names its own file and adds its own way out.
+/// "The <file> ", so each caller names its own file and adds its own way out, if it has one.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RecordError {
     /// The bytes are not UTF-8.
@@ -83,7 +85,7 @@ pub fn escape(entry: &str) -> String {
 }
 
 /// Undo [`escape`]. `None` for anything [`escape`] cannot have produced.
-fn unescape(line: &str) -> Option<String> {
+pub fn unescape(line: &str) -> Option<String> {
     let mut entry = String::with_capacity(line.len());
     let mut chars = line.chars();
 

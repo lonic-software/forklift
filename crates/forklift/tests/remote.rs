@@ -1673,7 +1673,7 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
 fn plant_torn_taint(area: &TestArea, warehouse: &str) {
     let taint_dir = area.path(warehouse).join(".forklift").join("taint");
     std::fs::create_dir_all(&taint_dir).unwrap();
-    std::fs::write(taint_dir.join("taint-99999-0"), b"objects/ab/cdef\n").unwrap();
+    std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\n").unwrap();
 }
 
 /// Set up warehouse A on a server with static token "root", enrolled and lifted, then re-genesis
@@ -4660,8 +4660,11 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     // Simulate an interrupted prune by hand: narrow the shared fetch scope directly (step one of
     // a real prune, already durable) and delete only the blob — the child, freed before its
     // parent tree in a real run's order — leaving the parent tree behind (step two, interrupted).
-    let narrowed = forklift_core::util::scope_utils::MaterializationScope::from_prefixes(["src/api"]);
-    std::fs::write(area.path("sparse/.forklift/config/fetch-scope"), narrowed.to_bytes()).unwrap();
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
+        let narrowed = forklift_core::util::scope_utils::MaterializationScope::from_prefixes(["src/api"]);
+        forklift_core::util::scope_utils::set_fetch_scope(&narrowed).unwrap();
+    }
     std::fs::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
     assert!(object_present(&area, "sparse", &web_tree),
         "the simulated interruption leaves the parent tree behind");
@@ -5052,13 +5055,7 @@ fn taint_dir_path(area: &TestArea, dir: &str) -> PathBuf {
 fn plant_taint(area: &TestArea, dir: &str, paths: &[&str]) {
     let dir_path = taint_dir_path(area, dir);
     std::fs::create_dir_all(&dir_path).unwrap();
-    let mut content = String::new();
-    for path in paths {
-        content.push_str(path);
-        content.push('\n');
-    }
-    content.push_str("END\n");
-    std::fs::write(dir_path.join("taint-1-0"), content).unwrap();
+    std::fs::write(dir_path.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
 /// Every regular taint file's recorded lines, unioned (dropping the `END` terminator) — used to

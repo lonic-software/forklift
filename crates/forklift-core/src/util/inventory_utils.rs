@@ -2255,9 +2255,10 @@ fn write_metadata_to_file(path: &Path, metadata: &BTreeSet<String>) -> Result<()
         file_utils::INVENTORY_METADATA_RECORD, file_utils::INVENTORY_METADATA_VERSION, &closed
     );
 
-    std::fs::write(path, metadata_bytes).map_err(|e|
-        format!("Error while writing inventory metadata to file \"{}\": {}", path.to_string_lossy(), e)
-    )
+    // Replaced atomically, so a crash mid-write leaves the old metadata and never a torn file
+    // the reader refuses. Not `write_file_atomically`, which only stages a write inside a bulk
+    // store session, where a later read in the same command would still see the old metadata.
+    file_utils::replace_file_atomically(path, &metadata_bytes)
 }
 
 /// Close a set of metadata entries under ancestors: add the entry of every ancestor of every
