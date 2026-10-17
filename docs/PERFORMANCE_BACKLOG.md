@@ -390,8 +390,10 @@ qualified.
   is rebuilt. A torn shard can no longer be misparsed into wrong ancestry, which is the case the
   checksum exists for. `crash_consistency.rs` pins the barrier count of a cold build at zero.
   Because a shard is only a cache, a shard that cannot be read or written (a full or read-only
-  disk, a squatted path) never fails the query: it reads as absent, and a failed write leaves
-  the records resident and dirty for a later retry. Shard writes run no directory sync, so they
+  disk, a squatted path, a transient EMFILE) never fails the query. A missing or damaged shard
+  reads as empty and is rebuilt over. One that fails to read for any other reason is answered
+  from the object store and never written over, since the file may still be valid. A failed
+  write leaves the records resident and dirty for a later retry. Shard writes run no directory sync, so they
   never consult or record a durability taint. `compact` walks through already-recorded parcels
   rather than pruning at them, so a lost ancestor shard behind a surviving head is rebuilt.
 * **The undo journal stays durable.** Its push is best-effort by contract and costs about 4 ms
