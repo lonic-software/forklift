@@ -34,9 +34,9 @@ Where:
 - An **absent or empty file** means **full scope** — no restriction, the whole tree is in
   scope. This is what makes a scoped bay opt-in: without a scope file, every scope-aware
   operation behaves exactly as an unscoped workspace.
-- A header followed by no prefix is **refused**, and so is one whose only prefix is the empty
-  string (the warehouse root) or `/`, which reads as no prefix. Forklift never writes either:
-  the full scope is the empty file.
+- A header followed by no prefix is **refused**, and so is one with a root prefix (an empty
+  string or `/`) anywhere among its prefixes, since the root takes in everything. Forklift
+  never writes either: the full scope is the empty file.
 - On read, blank lines and surrounding whitespace are ignored; prefixes are trimmed of
   surrounding `/`, de-duplicated and sorted, giving a canonical on-disk form.
 - A non-empty file whose first line is not the header is the unversioned format 1, written

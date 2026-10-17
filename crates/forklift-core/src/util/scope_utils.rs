@@ -311,8 +311,8 @@ impl MaterializationScope {
 
         if scope.is_full() {
             return Err(format!(
-                "has a format header but names no prefix, so it is not a scope this version of \
-                Forklift writes. {}",
+                "has a format header but no prefix narrower than the warehouse root, so it is not \
+                a scope this version of Forklift writes. {}",
                 remedy
             ));
         }
@@ -868,7 +868,9 @@ mod tests {
 
         // And a header with no prefix after it, which would otherwise read as the full scope.
         let bare = MaterializationScope::from_bytes(b"/forklift-scope 2\n", "Do the remedy.").unwrap_err();
-        assert!(bare.contains("names no prefix"), "{}", bare);
+        assert!(bare.contains("no prefix narrower than the warehouse root"), "{}", bare);
+        let rooted = MaterializationScope::from_bytes(b"/forklift-scope 2\nsrc\n/\n", "").unwrap_err();
+        assert!(rooted.contains("no prefix narrower than the warehouse root"), "{}", rooted);
         assert!(bare.ends_with("Do the remedy."), "{}", bare);
     }
 

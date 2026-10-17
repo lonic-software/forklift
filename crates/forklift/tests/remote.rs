@@ -5341,11 +5341,12 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
 #[test]
 fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
     // A fetch scope this build refuses skips the user pallets' history fetches. Re-running heal
-    // can never fix that, so the remedy must name the scope file and its way out, never the
-    // "once connectivity is restored" wording a transient failure gets.
+    // cannot fix that, so the remedy must name the scope file and its way out, not only the
+    // "once connectivity is restored" wording a transient failure gets, and must keep the
+    // reproduce-it remedy, since the remote was still asked for the object by hash.
     //
-    // Mutation: map the skipped fetch to `ConsultedWithErrors` as before → the remedy says
-    // "connectivity" and never names the scope file → red.
+    // Mutation: map the skipped fetch to `ConsultedWithErrors` → the remedy never names the
+    // scope file → red.
     let area = TestArea::new("heal-refetch-unreadable-scope");
     let server = Server::start(&area, None);
 
@@ -5376,8 +5377,8 @@ fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
         "the remedy must name the unreadable scope file: {}", output);
     assert!(output.contains("Franchise the remote again"),
         "the remedy must name the way out: {}", output);
-    assert!(!output.contains("connectivity"),
-        "an unreadable scope is not a connectivity problem: {}", output);
+    assert!(output.contains("checked the configured remote") && output.contains("\"forklift load\" then \"forklift stack\""),
+        "the remote was still asked by hash, and reproducing it is still a way out: {}", output);
 }
 
 #[test]

@@ -2096,10 +2096,11 @@ enum RemoteConsultation {
     /// a hash still missing below was not necessarily *confirmed* absent upstream, only not yet
     /// recovered; retrying once connectivity is restored may still help.
     ConsultedWithErrors,
-    /// The fetch scope could not be read, so the user pallets' history fetches were skipped —
-    /// retrying cannot help until the scope file itself is dealt with. Carries the reason, which
-    /// names the file and the way out.
-    ScopeUnreadable(String),
+    /// The fetch scope could not be read, so the user pallets' history fetches were skipped;
+    /// the hash-addressed passes still asked the remote. `reason` names the scope file and its
+    /// way out; `other_errors` is whether some other part of the consultation also failed, so a
+    /// re-run might still help.
+    ScopeUnreadable { reason: String, other_errors: bool },
 }
 
 /// The remedies that actually exist for a vanished-and-referenced (or still-corrupt) object —
@@ -2126,8 +2127,18 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
             reproduce it by re-running the operation that created it if its content still exists \
             in your working tree (\"forklift load\" then \"forklift stack\") — there is no \
             in-tool way to abandon a single dangling reference yet",
-        RemoteConsultation::ScopeUnreadable(reason) => return format!(
-            "this heal could not check the configured remote for it: {}", reason
+        RemoteConsultation::ScopeUnreadable { reason, other_errors } => return format!(
+            "this heal checked the configured remote for it but skipped the history fetch of the \
+            working pallets: {} {}reproduce it by re-running the operation that created it if its \
+            content still exists in your working tree (\"forklift load\" then \"forklift \
+            stack\") — there is no in-tool way to abandon a single dangling reference yet",
+            reason,
+            if *other_errors {
+                "Part of that check also failed; re-run \"forklift heal\" once connectivity is \
+                restored, or "
+            } else {
+                "Otherwise, "
+            }
         ),
     }.to_string()
 }
@@ -2226,7 +2237,7 @@ async fn attempt_heal_driven_refetch(
                     (None, Ok(scope)) => remote_utils::fetch_history_scoped(&client, remote_head, scope, &Progress::NONE).await,
                     (None, Err(reason)) => {
                         scope_failure = Some(reason.clone());
-                        Err(reason.clone())
+                        continue;
                     }
                 };
 
@@ -2257,10 +2268,10 @@ async fn attempt_heal_driven_refetch(
         corrupt_failures = failures;
     }
 
-    // An unreadable scope outranks a transient failure: re-running cannot fix it, so its reason
-    // (the file and the way out) is what the remedy names.
+    // A skipped history fetch is not a transient failure, so it is reported apart from one:
+    // re-running cannot fix it, but a transient failure alongside it may still clear on a re-run.
     let consultation = match (scope_failure, clean) {
-        (Some(reason), _) => RemoteConsultation::ScopeUnreadable(reason),
+        (Some(reason), clean) => RemoteConsultation::ScopeUnreadable { reason, other_errors: !clean },
         (None, true) => RemoteConsultation::ConsultedCleanly,
         (None, false) => RemoteConsultation::ConsultedWithErrors,
     };
