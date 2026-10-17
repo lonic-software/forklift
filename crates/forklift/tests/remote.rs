@@ -5058,8 +5058,9 @@ fn plant_taint(area: &TestArea, dir: &str, paths: &[&str]) {
     std::fs::write(dir_path.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
-/// Every regular taint file's recorded lines, unioned (dropping the `END` terminator) — used to
-/// inspect exactly what a recovery attempt left standing.
+/// Every regular taint file's recorded lines, unioned (dropping the header and the `END`
+/// terminator) — used to inspect exactly what a recovery attempt left standing. The paths these
+/// tests plant are plain object paths, which escaping leaves as they are.
 fn recorded_taint_paths(area: &TestArea, dir: &str) -> Vec<String> {
     let dir_path = taint_dir_path(area, dir);
     if !dir_path.exists() {
@@ -5073,7 +5074,9 @@ fn recorded_taint_paths(area: &TestArea, dir: &str) -> Vec<String> {
             continue;
         }
         let content = std::fs::read_to_string(entry.path()).unwrap();
-        paths.extend(content.lines().filter(|line| *line != "END").map(|line| line.to_string()));
+        paths.extend(content.lines()
+            .filter(|line| *line != "END" && !line.starts_with("/forklift-taint "))
+            .map(|line| line.to_string()));
     }
     paths
 }

@@ -5719,7 +5719,7 @@ fn restore_staged_of_an_unrelated_path_never_clears_a_broader_recorded_root() {
 /// (the check side) must fail closed rather than silently treat unreadable content as "nothing
 /// recorded", and must point at a recovery path.
 #[test]
-fn a_malformed_marker_self_heals_on_load_but_refuses_stack_conservatively() {
+fn a_malformed_marker_reads_as_the_whole_warehouse_until_a_full_load_and_refuses_stack() {
     let warehouse = TestWarehouse::new("incomplete-load-malformed");
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
@@ -5729,10 +5729,15 @@ fn a_malformed_marker_self_heals_on_load_but_refuses_stack_conservatively() {
     let marker_path = incomplete_load_marker_path(&warehouse);
     std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
 
-    // Hand-corrupt the marker (invalid UTF-8 — never producible by this module itself). The
-    // write side self-heals: load overwrites it with fresh, readable content and proceeds.
+    // Hand-corrupt the marker (invalid UTF-8 — never producible by this module itself). A load
+    // still proceeds, but the unreadable file may have recorded any load, so it becomes the
+    // whole warehouse: a load of one file does not clear it, a load of the root does.
     std::fs::write(&marker_path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
     assert_success(&warehouse.run(&["load", "a.txt"]));
+    let refused = warehouse.run(&["stack", "first", "--json"]);
+    assert_eq!(refused.status.code(), Some(20));
+    assert!(json(&refused)["error"]["message"].as_str().unwrap().contains("./"), "{}", json(&refused));
+    assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "first"]));
 
     // Corrupt it again, with no load in between this time: the check side must refuse
@@ -9198,8 +9203,9 @@ fn a_torn_taint_exits_21_and_survives() {
     assert!(dir.join("taint-1-0").exists(), "a torn taint file must survive the refusal");
 }
 
-/// Every regular taint file's recorded lines, unioned (dropping the `END` terminator) — used to
-/// inspect exactly what a recovery attempt left standing.
+/// Every regular taint file's recorded lines, unioned (dropping the header and the `END`
+/// terminator) — used to inspect exactly what a recovery attempt left standing. The paths these
+/// tests plant are plain object paths, which escaping leaves as they are.
 fn recorded_taint_paths(warehouse: &TestWarehouse) -> Vec<String> {
     let dir = taint_dir_path(warehouse);
     if !dir.exists() {
@@ -9213,7 +9219,9 @@ fn recorded_taint_paths(warehouse: &TestWarehouse) -> Vec<String> {
             continue;
         }
         let content = std::fs::read_to_string(entry.path()).unwrap();
-        paths.extend(content.lines().filter(|line| *line != "END").map(|line| line.to_string()));
+        paths.extend(content.lines()
+            .filter(|line| *line != "END" && !line.starts_with("/forklift-taint "))
+            .map(|line| line.to_string()));
     }
     paths
 }
