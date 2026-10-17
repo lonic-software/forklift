@@ -2060,15 +2060,44 @@ fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
     }
 }
 
-/// Whether a commit-graph shard file holds at least one record and its trailing blake3 matches
-/// the bytes before it (the v2 seal), checked from the outside.
+/// Whether a commit-graph shard file is whole, checked from the outside: its trailing blake3
+/// matches the bytes before it (the v2 seal), and the body after the 12-byte header walks as a
+/// sequence of complete records — at least one, ending exactly at the checksum — each keyed by a
+/// parcel hash that belongs in this shard (its first byte is the file's 2-hex name).
 fn graph_shard_is_sealed_with_records(shard: &std::path::Path) -> bool {
     let bytes = std::fs::read(shard).unwrap();
-    if bytes.len() <= 12 + 32 {
+    if bytes.len() < 12 + 32 {
         return false;
     }
     let (body, checksum) = bytes.split_at(bytes.len() - 32);
-    blake3::hash(body).as_bytes() == checksum
+    if blake3::hash(body).as_bytes() != checksum {
+        return false;
+    }
+    let prefix = u8::from_str_radix(shard.file_name().unwrap().to_str().unwrap(), 16).unwrap();
+    let u32_at = |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+    let (mut offset, mut records) = (12, 0);
+    while offset < body.len() {
+        // hash(32) + generation(4) + parent count(1), the parents, then a filter length (4).
+        if offset + 37 > body.len() || body[offset] != prefix {
+            return false;
+        }
+        let parents = body[offset + 36] as usize;
+        offset += 37 + parents * 32;
+        if offset + 4 > body.len() {
+            return false;
+        }
+        let filter_len = u32_at(offset);
+        offset += 4;
+        // u32::MAX and u32::MAX - 1 are the "no filter" / "too large" sentinels, with no bytes.
+        if filter_len < u32::MAX - 1 {
+            offset += filter_len as usize;
+        }
+        if offset > body.len() {
+            return false;
+        }
+        records += 1;
+    }
+    records > 0
 }
 
 /// A shard is written with no durability barrier, so a power loss can keep a descendant's shard
@@ -2103,6 +2132,30 @@ fn compact_rebuilds_lost_ancestor_shards_behind_a_recorded_head() {
         assert!(shard.exists() && graph_shard_is_sealed_with_records(shard),
             "compact must rebuild the lost ancestor shard {}", shard.display());
     }
+
+    // The checker itself: a correctly sealed shard whose body ends in a stray byte, or whose
+    // record sits in the wrong shard, must not pass as whole.
+    let mut body = std::fs::read(&head_shard).unwrap();
+    body.truncate(body.len() - 32);
+    let reseal = |body: &[u8]| {
+        let mut sealed = body.to_vec();
+        sealed.extend_from_slice(blake3::hash(body).as_bytes());
+        sealed
+    };
+    let probe_dir = warehouse.root.join("probe");
+    std::fs::create_dir_all(&probe_dir).unwrap();
+    let mut stray = body.clone();
+    stray.push(0);
+    std::fs::write(probe_dir.join(&head[..2]), reseal(&stray)).unwrap();
+    assert!(!graph_shard_is_sealed_with_records(&probe_dir.join(&head[..2])),
+        "a sealed body with a stray trailing byte must not pass");
+    let elsewhere = if &head[..2] == "00" { "01" } else { "00" };
+    std::fs::write(probe_dir.join(elsewhere), reseal(&body)).unwrap();
+    assert!(!graph_shard_is_sealed_with_records(&probe_dir.join(elsewhere)),
+        "a record filed under the wrong shard must not pass");
+    std::fs::write(probe_dir.join(&head[..2]), reseal(&body)).unwrap();
+    assert!(graph_shard_is_sealed_with_records(&probe_dir.join(&head[..2])),
+        "sanity: the untouched body, resealed, passes");
 }
 
 /// The commit-graph is a cache: when it cannot be read or written at all, a query still answers

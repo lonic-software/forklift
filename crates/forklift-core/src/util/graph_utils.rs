@@ -159,6 +159,10 @@ struct Shard {
     /// unchanged, so a record another thread inserted meanwhile (raising `version`) is never
     /// falsely marked flushed — it stays dirty until its own writer persists it.
     version: u64,
+    /// False only for a stand-in served after the shard file failed to read for a reason other
+    /// than its absence (see [`with_shard`]): it is never cached and never written back, so a
+    /// valid file on disk is never replaced by a copy missing its records.
+    writable: bool,
 }
 
 /// The process-global resident shard cache, keyed by `root\0prefix` so warehouses never mix.
@@ -342,11 +346,27 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
         }
     }
 
-    // Miss: read and parse the shard file with the lock released. A shard that cannot be read,
-    // for whatever reason, is absent: its records are recomputed from the object store.
-    let records = std::fs::read(shard_path(root, prefix))
-        .map(|bytes| parse_shard(&bytes))
-        .unwrap_or_default();
+    // Miss: read and parse the shard file with the lock released. A missing or damaged shard
+    // is empty and is rebuilt over. Any other read error (a transient EMFILE or EIO, or a path
+    // something else squats) must not fail a query of a cache, but the file may still hold
+    // valid records: serve an uncached, never-written stand-in, so this access answers from the
+    // object store and the next one retries the read.
+    let records = match std::fs::read(shard_path(root, prefix)) {
+        Ok(bytes) => parse_shard(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(_) => {
+            let mut stand_in = Shard {
+                root: root.to_string(),
+                prefix: prefix.to_string(),
+                records: HashMap::new(),
+                dirty: false,
+                last_access: 0,
+                version: 0,
+                writable: false,
+            };
+            return Ok(f(&mut stand_in));
+        }
+    };
 
     // Re-take the lock to install the shard and run `f`. Any dirty eviction victims are removed
     // here but flushed to disk *after* the lock is released, below.
@@ -366,6 +386,7 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
                 dirty: false,
                 last_access: 0,
                 version: 0,
+                writable: true,
             });
             victim_writes
         };
@@ -456,14 +477,21 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
     for (prefix, records) in by_prefix {
         // Insert the records and snapshot the shard's bytes + version under the lock; the file
         // write then happens with the lock released.
-        let (bytes, version) = with_shard(root, &prefix, |shard| {
+        let snapshot = with_shard(root, &prefix, |shard| {
+            if !shard.writable {
+                return None;
+            }
             for (hash, record) in records {
                 shard.records.insert(hash.clone(), record.clone());
             }
             shard.dirty = true;
             shard.version = shard.version.wrapping_add(1);
-            (serialize_shard(&shard.records), shard.version)
+            Some((serialize_shard(&shard.records), shard.version))
         })?;
+        // An unreadable shard is never written back over (see `Shard::writable`).
+        let Some((bytes, version)) = snapshot else {
+            continue;
+        };
 
         // Write eagerly so the memoization outlives this process — off the lock, so a concurrent
         // graph access never waits on the file write. A failed write (a full or read-only disk)
@@ -612,9 +640,11 @@ pub fn parents(hash: &str) -> Result<Vec<String>, String> {
 /// Populate the graph for everything reachable from `heads`, computing only the records that
 /// are still missing. An already-recorded parcel is walked through by its stored parents rather
 /// than treated as proof its ancestors are recorded, so a lost or damaged ancestor shard is
-/// found and rebuilt. Cheap to call repeatedly; meant to run inside `compact`, which already
-/// holds the warehouse lock and has warm object caches, so a warehouse is graph-ready right
-/// after an import or a repack. Returns the number of new records written.
+/// found and rebuilt. The cost is one record lookup per reachable parcel, against shards that
+/// end up resident, even when nothing is missing: linear in history, but never an object read
+/// for a recorded parcel. Meant to run inside `compact`, which already holds the warehouse lock,
+/// does work linear in the store, and has warm object caches, so a warehouse is graph-ready
+/// right after an import or a repack. Returns the number of new records written.
 ///
 /// # Arguments
 /// * `heads` - Parcel hashes to populate the ancestry of (all pallet heads, typically).
@@ -1167,27 +1197,70 @@ mod tests {
         assert_eq!(order.len(), 2);
     }
 
+    /// A fresh scratch directory for one test, unique per process and per test name.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-graph-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_shard_that_cannot_be_written_is_not_an_error() {
         // The graph is a cache: a full or read-only disk must not fail the query that computed
-        // the records. A file squatting the graph root makes every shard write fail; the persist
-        // still succeeds and the records stay resident for this process.
-        let dir = std::env::temp_dir()
-            .join(format!("forklift-graph-unwritable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let squat = dir.join("graph");
-        std::fs::write(&squat, "not a directory").unwrap();
-        let root = squat.to_string_lossy().into_owned();
+        // the records. A read-only graph root makes the shard write fail while its read is an
+        // ordinary NotFound; the persist still succeeds and the record stays resident.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("unwritable");
+        let root_path = dir.join("graph");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let root = root_path.to_string_lossy().into_owned();
 
         let hash = "cd".repeat(32);
         let mut new = HashMap::new();
         new.insert(hash.clone(), Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
-        persist_records(&root, &new).expect("a failed shard write must not fail the persist");
-        assert_eq!(stored_record(&root, &hash).unwrap().map(|r| r.generation), Some(1),
-            "the record must stay resident after its write failed");
-        assert!(squat.is_file(), "sanity: the squat blocked the write");
+        let persisted = persist_records(&root, &new);
+        let resident = stored_record(&root, &hash).unwrap().map(|r| r.generation);
+        let written = root_path.join("cd").exists();
+        std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(persisted.is_ok(), "a failed shard write must not fail the persist: {:?}", persisted);
+        assert_eq!(resident, Some(1), "the record must stay resident after its write failed");
+        assert!(!written, "sanity: the read-only root blocked the write");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shard_that_cannot_be_read_is_never_written_over() {
+        // A shard file that exists but fails to read (here: no read permission; in the field a
+        // transient EMFILE or EIO) may still hold valid records. The persist must not fail, and
+        // it must not replace the file with a copy holding only the new records.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("unreadable");
+        let root_path = dir.join("graph");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = root_path.to_string_lossy().into_owned();
+
+        let mut kept = HashMap::new();
+        kept.insert("ef".repeat(32), Record { generation: 3, parents: vec![], filter: PathFilter::Unknown });
+        let original = serialize_shard(&kept);
+        let shard_file = root_path.join("ef");
+        std::fs::write(&shard_file, &original).unwrap();
+        std::fs::set_permissions(&shard_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut new = HashMap::new();
+        new.insert(format!("ef{}", "01".repeat(31)),
+            Record { generation: 1, parents: vec![], filter: PathFilter::Unknown });
+        let persisted = persist_records(&root, &new);
+        std::fs::set_permissions(&shard_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let after = std::fs::read(&shard_file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(persisted.is_ok(), "an unreadable shard must not fail the persist: {:?}", persisted);
+        assert_eq!(after, original, "an unreadable shard must never be written over");
     }
 
     #[test]
