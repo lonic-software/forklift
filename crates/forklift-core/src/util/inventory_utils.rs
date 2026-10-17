@@ -2754,6 +2754,26 @@ mod tests {
         }
     }
 
+    /// The stat cache's writer and reader must agree on a symlink's identity, or every symlink
+    /// misses the cache and rehashes on every walk. Both take it from the link's own `lstat`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_recorded_from_stat_reads_unchanged_against_its_own_lstat() {
+        let scratch = Scratch::new("symlink-identity");
+        let target = scratch.root.join("target.txt");
+        let link = scratch.root.join("link");
+        std::fs::write(&target, "content\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", &link).unwrap();
+
+        let recorded = build_inventory_item_from_stat(&link, "link", "hash".to_string(),
+                                                      DirEntryType::SymbolicLink).unwrap();
+        let link_metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert_eq!(recorded.inode, std::os::unix::fs::MetadataExt::ino(&link_metadata));
+
+        assert!(is_entry_unchanged(&recorded, &link_metadata, DirEntryType::SymbolicLink, &link, u64::MAX),
+            "a symlink recorded from its own stat must hit the stat cache");
+    }
+
     #[test]
     fn prepare_stack_inventory_reports_a_conflict_found_before_a_later_corrupt_shard() {
         // Regression: a single up-front parse pass must not let an unrelated corrupt shard mask
