@@ -514,22 +514,9 @@ fn write_chunked_file(path: &str,
     // atomic rename replaces a regular file or a symlink in one step (it does not follow the
     // symlink); replacing a directory is the shift command's deletes-before-writes concern, not
     // this one.
-    let temp_path = fs_path.with_file_name(format!(
-        ".{}.forklift-assemble.tmp",
-        fs_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-    ));
-
-    // Whatever already sits at the temp path (a leftover from an interrupted assembly, or an
-    // entry a tree planted there, a symlink included) is removed, and the temp file is created
-    // new: opening an existing path would follow a symlink and assemble into its target.
-    if std::fs::symlink_metadata(&temp_path).is_ok() {
-        std::fs::remove_file(&temp_path)
-            .map_err(|e| format!("Error while clearing \"{}\": {}", temp_path.to_string_lossy(), e))?;
-    }
+    let (temp_path, file) = create_assembly_temp(path, fs_path)?;
 
     let assemble = || -> Result<(), String> {
-        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)
-            .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
         let mut writer = std::io::BufWriter::new(file);
 
         object_utils::assemble_chunked_file(recipe_hash, &mut writer)?;
@@ -544,12 +531,46 @@ fn write_chunked_file(path: &str,
         return Err(e);
     }
 
-    set_file_mode(&temp_path, path, item_type)?;
+    let finalize = || -> Result<(), String> {
+        set_file_mode(&temp_path, path, item_type)?;
 
-    std::fs::rename(&temp_path, fs_path)
-        .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))?;
+        std::fs::rename(&temp_path, fs_path)
+            .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))
+    };
+
+    if let Err(e) = finalize() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
 
     Ok(())
+}
+
+/// Create a fresh temp file beside `fs_path` to assemble a chunked file into. The temp name sits in
+/// the working directory, the user's namespace, so it is never taken over: it is unique to this
+/// process and attempt, and created new, so an existing entry of that name (a tracked file, a
+/// leftover, or a symlink a tree planted, which opening would follow) is skipped, never
+/// truncated, removed or written through.
+fn create_assembly_temp(path: &str, fs_path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const MAX_ATTEMPTS: usize = 64;
+
+    let name = fs_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+
+    for _ in 0..MAX_ATTEMPTS {
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_path = fs_path.with_file_name(format!(
+            ".{}.{}-{}.forklift-assemble.tmp", name, std::process::id(), attempt
+        ));
+
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Error while creating a temp file for \"{}\": {}", path, e)),
+        }
+    }
+
+    Err(format!("Error while creating a temp file for \"{}\": every name tried already exists.", path))
 }
 
 /// Set a materialized file's mode: executable (`0o755`) for an executable (chunked or plain)

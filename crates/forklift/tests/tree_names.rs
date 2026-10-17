@@ -249,9 +249,9 @@ fn a_symlink_replaced_by_a_file_is_not_written_through() {
 #[cfg(unix)]
 #[test]
 fn a_symlink_at_the_chunked_assembly_temp_path_is_not_written_through() {
-    // A chunked file is assembled into `.<name>.forklift-assemble.tmp` and renamed into place. A
-    // tree that plants a symlink under that name, sorted before the chunked entry, must not get
-    // the assembly written into the symlink's target.
+    // A chunked file is assembled into a temp file beside it and renamed into place. A tree that
+    // plants a symlink under a temp-like name, sorted before the chunked entry, must not get the
+    // assembly written into the symlink's target.
     let warehouse = Warehouse::new("assemble-temp");
     let first = {
         let _scope = StorageRootScope::enter(&warehouse.root);
@@ -298,10 +298,10 @@ fn stacking_a_top_level_alias_of_the_metadata_folder_is_refused() {
 }
 
 #[test]
-fn a_leftover_assembly_temp_file_does_not_wedge_checkout() {
-    // An interrupted assembly can leave `.<name>.forklift-assemble.tmp` behind. The temp file is
-    // created new (so a symlink there is never followed), which must not turn that leftover into
-    // a permanent refusal: it is cleared first.
+fn a_leftover_assembly_temp_file_neither_wedges_checkout_nor_is_deleted() {
+    // An interrupted assembly can leave a temp file behind. The temp file is always created new
+    // (so a symlink there is never followed), which must not turn a leftover into a permanent
+    // refusal; it is untracked content, so it is left alone, not deleted.
     let warehouse = Warehouse::new("assemble-leftover");
     let first = {
         let _scope = StorageRootScope::enter(&warehouse.root);
@@ -323,7 +323,7 @@ fn a_leftover_assembly_temp_file_does_not_wedge_checkout() {
     warehouse.run_ok(&["shift", "main"]);
 
     assert!(std::fs::read(warehouse.root.join("big.bin")).unwrap() == big);
-    assert!(!warehouse.root.join(".big.bin.forklift-assemble.tmp").exists());
+    assert_eq!(std::fs::read_to_string(warehouse.root.join(".big.bin.forklift-assemble.tmp")).unwrap(), "half an assembly");
 }
 
 #[test]
