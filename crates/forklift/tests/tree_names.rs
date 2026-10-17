@@ -325,3 +325,34 @@ fn a_leftover_assembly_temp_file_does_not_wedge_checkout() {
     assert!(std::fs::read(warehouse.root.join("big.bin")).unwrap() == big);
     assert!(!warehouse.root.join(".big.bin.forklift-assemble.tmp").exists());
 }
+
+#[test]
+fn a_tracked_file_named_like_an_assembly_temp_file_survives_checkout() {
+    // The temp name sits in the user's namespace, so a tree may track a file that happens to
+    // carry it. Assembling the chunked sibling must neither delete nor overwrite that file.
+    let warehouse = Warehouse::new("assemble-namesake");
+    let first = {
+        let _scope = StorageRootScope::enter(&warehouse.root);
+        pallet_utils::get_pallet_head("main").unwrap().unwrap()
+    };
+
+    let big: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    std::fs::write(warehouse.root.join("big.bin"), &big).unwrap();
+    std::fs::write(warehouse.root.join(".big.bin.forklift-assemble.tmp"), "tracked\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "big"]);
+
+    {
+        let _scope = StorageRootScope::enter(&warehouse.root);
+        pallet_utils::set_pallet_head("before", &first).unwrap();
+    }
+    warehouse.run_ok(&["shift", "before"]);
+    warehouse.run_ok(&["shift", "main"]);
+
+    assert!(std::fs::read(warehouse.root.join("big.bin")).unwrap() == big);
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join(".big.bin.forklift-assemble.tmp")).unwrap(),
+        "tracked\n",
+        "the assembly clobbered a tracked file"
+    );
+}
