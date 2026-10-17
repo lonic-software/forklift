@@ -5,6 +5,7 @@ use std::sync::Arc;
 use chrono::{TimeZone, Utc};
 use serde::Serialize;
 use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+use forklift_core::error::sanitize;
 use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::blob::Blob;
@@ -148,16 +149,16 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     // `.git` folder here to ignore. The history is already imported by now, so a failure to add
     // it is reported as a warning naming the rule, not as a failed import.
     let mut warnings = converter.warnings;
-    let ignored_git = if forklift_core::globals::warehouse_root().join(".git").exists() {
-        ignore_git_directory().unwrap_or_else(|e| {
+    let git_rule = if forklift_core::globals::warehouse_root().join(".git").exists() {
+        ignore_git_directory().map(Some).unwrap_or_else(|e| {
             warnings.push(format!(
                 "the \".git\" folder is not ignored ({}); add the rule {} to \".forkliftignore\" by hand",
                 e, GIT_DIRECTORY_PATTERN
             ));
-            false
+            None
         })
     } else {
-        false
+        None
     };
 
     output::emit(&ImportReport {
@@ -166,7 +167,11 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         blobs: converter.blobs.len(),
         pallets: imported.iter().map(|(_, pallet)| pallet.clone()).collect(),
         current,
-        ignored_git,
+        ignored_git: matches!(git_rule, Some(GitRule::Added)),
+        git_already_ignored: match git_rule {
+            Some(GitRule::Present { line, pattern }) => Some(ExistingRule { line, pattern }),
+            _ => None,
+        },
         compacted: packed,
         warnings,
     });
@@ -179,19 +184,35 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
 /// tracked content, and ignoring them makes the next `load .` stage their removal.
 const GIT_DIRECTORY_PATTERN: &str = r"^\.git(/.*)?$";
 
-/// Add a `.git` ignore pattern to `.forkliftignore` if it is not already there, so a
-/// colocated git repository's metadata folder is not treated as untracked content.
-fn ignore_git_directory() -> Result<bool, String> {
+/// What [`ignore_git_directory`] found or did.
+enum GitRule {
+    /// The rule was appended to the ignore file.
+    Added,
+
+    /// A rule already in the file covers `.git`, so nothing was written.
+    Present { line: usize, pattern: String },
+}
+
+/// Add a `.git` ignore pattern to `.forkliftignore` unless a rule there already covers `.git`,
+/// so a colocated git repository's metadata folder is not treated as untracked content.
+///
+/// # Returns
+/// * `Ok(GitRule)`  - Whether the rule was added, or which line already covers `.git`.
+/// * `Err(String)`  - The file could not be read, was refused as rules, or could not be written.
+fn ignore_git_directory() -> Result<GitRule, String> {
     let pattern = GIT_DIRECTORY_PATTERN;
 
     // Only a missing file starts empty: on any other read error, writing would replace the
     // user's rules with this one.
     let existing = file_utils::read_ignore_file()?.unwrap_or_default();
 
-    // Compared exactly, as the rules are compiled: a copy with stray whitespace is a different
-    // pattern, and would not ignore `.git`.
-    if existing.lines().any(|line| line == pattern) {
-        return Ok(false);
+    // Parsed as the walks parse it. A refused file is left alone, since appending a rule would
+    // leave it refused. A rule matching the key `.git` covers the folder and all beneath it,
+    // however it is spelled; one that does not (an indented copy is refused above) is no rule
+    // for `.git`.
+    let rules = file_utils::parse_ignore_file(&existing)?;
+    if let Some(rule) = rules.into_iter().find(|rule| rule.matches(".git")) {
+        return Ok(GitRule::Present { line: rule.line, pattern: rule.pattern });
     }
 
     let mut content = existing;
@@ -205,7 +226,7 @@ fn ignore_git_directory() -> Result<bool, String> {
     std::fs::write(file_utils::ignore_file_path(), content)
         .map_err(|e| format!("Error while updating the ignore file: {}", e))?;
 
-    Ok(true)
+    Ok(GitRule::Added)
 }
 
 /// A long-lived `git cat-file --batch` process. Every commit, tree and blob is read through
@@ -971,6 +992,11 @@ pub(crate) struct ImportReport {
     /// Whether a `.git` ignore pattern was added to `.forkliftignore`.
     ignored_git: bool,
 
+    /// The rule already in `.forkliftignore` that covers `.git`, when one did and so none was
+    /// added.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_already_ignored: Option<ExistingRule>,
+
     /// What the pack-direct import wrote (absent with `--no-compact`). The field keeps its
     /// original name: it reports the same fact — the imported store is packed — that the old
     /// post-import compaction pass did.
@@ -980,6 +1006,17 @@ pub(crate) struct ImportReport {
     /// Anything skipped or worth flagging (e.g. submodules).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+}
+
+/// A rule of the ignore file, by where it stands.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct ExistingRule {
+    /// The line number, counting from 1.
+    line: usize,
+
+    /// The pattern, as written on that line.
+    pattern: String,
 }
 
 /// The packed-store summary (a slim view of `pack_utils::IngestStats`).
@@ -1013,6 +1050,14 @@ impl CommandOutput for ImportReport {
 
         if self.ignored_git {
             println!("Added \".git/\" to \".forkliftignore\". Load and stack it to keep the rule in the history.");
+        }
+
+        if let Some(rule) = &self.git_already_ignored {
+            // The pattern is tracked content, so it may have come from a remote.
+            println!(
+                "\".git/\" is already ignored by line {} of \".forkliftignore\": {}",
+                rule.line, sanitize(&rule.pattern)
+            );
         }
 
         if let Some(packed) = &self.compacted {

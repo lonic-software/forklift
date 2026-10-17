@@ -56,7 +56,8 @@ One-way migration of a git repo's history into the warehouse: git commits become
 parcels, trees become trees, blobs become blobs, and each **local branch becomes a
 pallet** (git's author/committer split maps onto forklift's author/stack). Git's HEAD
 branch is checked out, and `.git/` is added to `.forkliftignore` (creating the file if
-there is none) so a colocated repo reads clean. That edit is left in the working tree,
+there is none) so a colocated repo reads clean, unless a rule there already matches `.git`, which
+it then names. An ignore file Forklift refuses to read is left as it is, with a warning. The edit is left in the working tree,
 not stacked: `load .forkliftignore` and stack it with your next parcel. Requires `git` on your PATH. The imported history is **unsigned** (it
 predates trust) — import into a fresh warehouse, then `office enroll` to anchor it as the
 legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules
@@ -126,7 +127,7 @@ forklift config --unset <key>         # remove a value
 
 Create a `.forkliftignore` at the warehouse root when you need one; `prepare`
 does not write it. Each line is a **regex** (not a glob) matched against
-warehouse-relative, `/`-separated paths. Empty lines and lines starting with `#`
+warehouse-relative, `/`-separated paths. Blank lines and lines starting with `#`
 are skipped; a `#` anywhere else is part of the pattern, so put comments on their
 own lines:
 
@@ -146,9 +147,11 @@ the warehouse root. Every sparse scope holds that file, whatever its prefixes: a
 an edit to it stacks like any in-scope file.
 
 Forklift refuses to read the file, and stops, when it is a symbolic link, when a line
-is a leftover conflict marker (consolidating two edits of the file writes them), or
-when a pattern matches the empty string (`.*`, `x*`, `a|`): such a pattern matches
-every path.
+is a leftover conflict marker (consolidating two edits of the file writes them), when
+a pattern starts or ends with whitespace, or when a pattern matches the empty string
+(`.*`, `x*`, `a|`): such a pattern matches every path. Whitespace around a pattern would
+be part of the regex, so `^build$ ` never matches `build`; write a space the pattern
+needs at its edge as `\x20`. A space inside a pattern is fine.
 
 As in git, a rule covers only **untracked** paths. A path inside a folder a rule
 covers is covered too, even where no rule matches the path itself. A tracked path

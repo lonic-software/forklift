@@ -3152,12 +3152,101 @@ fn import_git_from_elsewhere_writes_no_ignore_file() {
     configure_operator(&colocated);
     std::fs::create_dir(colocated.root.join(".git")).unwrap();
     colocated.write_file("a.txt", "hello\n");
-    // An indented copy of the rule is a different pattern (rules compile untrimmed) that never
-    // matches `.git`, so it must not count as the rule being present.
-    colocated.write_file(".forkliftignore", "  ^\\.git(/.*)?$\n");
     assert_success(&colocated.run(&["import-git", source.root.to_str().unwrap()]));
     let rules = std::fs::read_to_string(colocated.root.join(".forkliftignore")).unwrap();
     assert!(rules.lines().any(|line| line == r"^\.git(/.*)?$"), "{:?}", rules);
+}
+
+#[test]
+fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alone() {
+    let source = TestWarehouse::new("import-git-rule-source");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&source.root)
+            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    source.write_file("a.txt", "hello\n");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-qm", "first commit"]);
+
+    let colocated = |name: &str, rules: &str| {
+        let warehouse = TestWarehouse::new(name);
+        assert_success(&warehouse.run(&["prepare"]));
+        configure_operator(&warehouse);
+        std::fs::create_dir(warehouse.root.join(".git")).unwrap();
+        warehouse.write_file("a.txt", "hello\n");
+        warehouse.write_file(".forkliftignore", rules);
+        warehouse
+    };
+
+    // A differently spelled rule that covers `.git` is reported by line, and none is added.
+    let rules = "^x$\n^\\.git($|/)\n";
+    let spelled = colocated("import-git-rule-spelled", rules);
+    let imported = spelled.run(&["--json", "import-git", source.root.to_str().unwrap()]);
+    assert_success(&imported);
+    let report = json(&imported);
+    assert_eq!(report["data"]["ignored_git"], false, "{}", report);
+    assert_eq!(report["data"]["git_already_ignored"], serde_json::json!({"line": 2, "pattern": "^\\.git($|/)"}), "{}", report);
+    assert_eq!(std::fs::read_to_string(spelled.root.join(".forkliftignore")).unwrap(), rules);
+    let human = colocated("import-git-rule-spelled-human", rules).run(&["import-git", source.root.to_str().unwrap()]);
+    assert_success(&human);
+    assert!(stdout(&human).contains("\".git/\" is already ignored by line 2 of \".forkliftignore\": ^\\.git($|/)"),
+        "{}", stdout(&human));
+
+    // A rule that does not match `.git` itself is no rule for it: the rule is added.
+    let unrelated = colocated("import-git-rule-unrelated", "^\\.github$\n");
+    let imported = json(&unrelated.run(&["--json", "import-git", source.root.to_str().unwrap()]));
+    assert_eq!(imported["data"]["ignored_git"], true, "{}", imported);
+    assert!(imported["data"].get("git_already_ignored").is_none(), "{}", imported);
+
+    // An indented copy of the rule is refused as rules, and appending to a refused file would
+    // leave it refused: the file is left as it was, with a warning naming why.
+    let rules = "  ^\\.git(/.*)?$\n";
+    let indented = colocated("import-git-rule-indented", rules);
+    let imported = indented.run(&["import-git", source.root.to_str().unwrap()]);
+    assert_success(&imported);
+    assert!(stdout(&imported).contains("starts or ends with whitespace"), "{}", stdout(&imported));
+    assert!(stdout(&imported).contains(r"add the rule ^\.git(/.*)?$ to"), "{}", stdout(&imported));
+    assert!(!stdout(&imported).contains("Added \".git/\""), "{}", stdout(&imported));
+    assert_eq!(std::fs::read_to_string(indented.root.join(".forkliftignore")).unwrap(), rules);
+}
+
+#[test]
+fn a_blank_looking_ignore_line_hides_nothing_and_whitespace_around_a_rule_is_refused() {
+    // Compiled as a pattern, a whitespace-only line matches every path holding a space: such a
+    // path is hidden from stocktake, and the next `load .` stages the removal of a tracked one.
+    let warehouse = TestWarehouse::new("ignore-whitespace");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file(".forkliftignore", "^x$\n \n\t\n");
+    warehouse.write_file("a b.txt", "a\n");
+    warehouse.write_file("plain.txt", "p\n");
+
+    let unstaged = changes(&warehouse, "unstaged");
+    for path in ["a b.txt", "plain.txt"] {
+        assert!(unstaged.contains(&("untracked".to_string(), path.to_string())), "{}: {:?}", path, unstaged);
+    }
+
+    // A rule with whitespace around it would never match the name it spells; it is refused.
+    warehouse.write_file(".forkliftignore", "^x$\n^a b\\.txt$ \n");
+    for args in [&["stocktake"][..], &["load", "."][..]] {
+        let refused = warehouse.run(args);
+        assert!(!refused.status.success(), "{:?} must refuse the rules: {}", args, stdout(&refused));
+        assert!(stderr(&refused).contains("line 2: the pattern") && stderr(&refused).contains("starts or ends with whitespace"),
+            "{}", stderr(&refused));
+    }
+
+    // Without the whitespace, the same rule matches the path holding a space.
+    warehouse.write_file(".forkliftignore", "^x$\n^a b\\.txt$\n");
+    let unstaged = changes(&warehouse, "unstaged");
+    assert!(!unstaged.iter().any(|(_, path)| path == "a b.txt"), "{:?}", unstaged);
+    assert!(unstaged.contains(&("untracked".to_string(), "plain.txt".to_string())), "{:?}", unstaged);
 }
 
 #[test]

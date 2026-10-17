@@ -1496,6 +1496,26 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "ExistingRule": {
+      "description": "A rule of the ignore file, by where it stands.",
+      "properties": {
+        "line": {
+          "description": "The line number, counting from 1.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pattern": {
+          "description": "The pattern, as written on that line.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "line",
+        "pattern"
+      ],
+      "type": "object"
+    },
     "Packed": {
       "description": "The packed-store summary (a slim view of `pack_utils::IngestStats`).",
       "properties": {
@@ -1556,6 +1576,17 @@ A command not listed here either reports only the generic human-message shape `{
         "string",
         "null"
       ]
+    },
+    "git_already_ignored": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExistingRule"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The rule already in `.forkliftignore` that covers `.git`, when one did and so none was\nadded."
     },
     "ignored_git": {
       "description": "Whether a `.git` ignore pattern was added to `.forkliftignore`.",

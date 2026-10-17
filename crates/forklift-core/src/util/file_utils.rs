@@ -2528,12 +2528,13 @@ impl IgnoreRules {
 /// # Returns
 /// * Ok(IgnoreRules) - The rules.
 /// * Err(String)     - If the ignore file could not be read, or was refused: a symbolic link or
-///                     folder, a conflict marker, or a pattern matching the empty string.
+///                     folder, a conflict marker, whitespace around a pattern, or a pattern
+///                     matching the empty string.
 pub fn get_ignore_rules() -> Result<IgnoreRules, String> {
     let built_in = get_default_ignored_paths()?;
 
     let user = match read_ignore_file()? {
-        Some(content) => parse_ignore_rules(&content)?,
+        Some(content) => parse_ignore_file(&content)?.into_iter().map(|rule| rule.regex).collect(),
         None => Vec::new(),
     };
 
@@ -2576,20 +2577,46 @@ pub fn read_ignore_file() -> Result<Option<String>, String> {
         .map_err(|e| format!("Error while reading \"{}\": {}", FILENAME_IGNORE, e))
 }
 
-/// Parse the ignore file's content into rules: one regex per line, skipping empty lines and lines
-/// that start with `#`.
+/// One rule of the ignore file, with the line it was read from.
+#[derive(Debug)]
+pub struct IgnoreFileRule {
+    /// The line number, counting from 1.
+    pub line: usize,
+
+    /// The pattern, as written on that line.
+    pub pattern: String,
+
+    regex: Regex,
+}
+
+impl IgnoreFileRule {
+    /// Whether the rule matches the given warehouse path key.
+    pub fn matches(&self, key: &str) -> bool {
+        self.regex.is_match(key)
+    }
+}
+
+/// Parse the ignore file's content into rules: one regex per line, skipping blank lines (empty,
+/// or whitespace only) and lines that start with `#`.
 ///
-/// Two kinds of line are refused rather than compiled:
+/// Three kinds of line are refused rather than compiled:
 /// * a merge conflict marker, which consolidating two edits of the file writes into it. One of
 ///   them, `||||||| base`, compiles to a pattern that matches every path, so the next `load .`
 ///   would stage the removal of the whole tree;
+/// * a pattern with whitespace at its start or end. It would be part of the regex, so `^build$ `
+///   never matches `build`. Trimming it instead would guess: a space the pattern needs is
+///   written `\x20`;
 /// * a pattern that matches the empty string. Matching is a search anywhere in the path, so
 ///   such a pattern (`.*`, `x*`, `a|`) matches every path.
-fn parse_ignore_rules(content: &str) -> Result<Vec<Regex>, String> {
+///
+/// # Returns
+/// * `Ok(Vec<IgnoreFileRule>)` - The rules, in file order.
+/// * `Err(String)`             - The first refused line, by number.
+pub fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
     let mut rules = Vec::new();
 
     for (index, line) in content.lines().enumerate() {
-        if line.is_empty() || line.starts_with(IGNORE_FILE_COMMENT_PREFIX) {
+        if line.trim().is_empty() || line.starts_with(IGNORE_FILE_COMMENT_PREFIX) {
             continue;
         }
 
@@ -2597,6 +2624,14 @@ fn parse_ignore_rules(content: &str) -> Result<Vec<Regex>, String> {
             return Err(format!(
                 "\"{}\" has an unresolved conflict marker on line {}. Resolve the file first.",
                 FILENAME_IGNORE, index + 1
+            ));
+        }
+
+        if line.trim() != line {
+            return Err(format!(
+                "\"{}\", line {}: the pattern {:?} starts or ends with whitespace, which would be part of \
+                the regex. Remove it, or write a space the pattern needs as \\x20.",
+                FILENAME_IGNORE, index + 1, line
             ));
         }
 
@@ -2610,7 +2645,7 @@ fn parse_ignore_rules(content: &str) -> Result<Vec<Regex>, String> {
             ));
         }
 
-        rules.push(regex);
+        rules.push(IgnoreFileRule { line: index + 1, pattern: line.to_string(), regex });
     }
 
     Ok(rules)
@@ -2723,7 +2758,7 @@ mod tests {
     fn a_user_rule_covers_only_untracked_paths_and_their_descendants() {
         let rules = IgnoreRules {
             built_in: get_default_ignored_paths().unwrap(),
-            user: parse_ignore_rules("^build$\n\\.log$\n").unwrap(),
+            user: parse_ignore_file("^build$\n\\.log$\n").unwrap().into_iter().map(|rule| rule.regex).collect(),
         };
         let excludes = |key: &str, tracked: bool| {
             let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
@@ -2744,17 +2779,44 @@ mod tests {
 
     #[test]
     fn ignore_rules_refuse_conflict_markers_and_match_everything_patterns() {
-        let rules = parse_ignore_rules("# comment\n\n^build(/.*)?$\n\\.log$\n").unwrap();
+        let rules = parse_ignore_file("# comment\n\n^build(/.*)?$\n\\.log$\n").unwrap();
         assert_eq!(rules.len(), 2);
 
         for marker in ["<<<<<<< ours", "||||||| base", "=======", ">>>>>>> theirs"] {
-            let error = parse_ignore_rules(&format!("^a$\n{}\n", marker)).unwrap_err();
+            let error = parse_ignore_file(&format!("^a$\n{}\n", marker)).unwrap_err();
             assert!(error.contains("unresolved conflict marker on line 2"), "{}: {}", marker, error);
         }
         for pattern in [".*", "x*", "a|", "|"] {
-            let error = parse_ignore_rules(&format!("{}\n", pattern)).unwrap_err();
+            let error = parse_ignore_file(&format!("{}\n", pattern)).unwrap_err();
             assert!(error.contains("matches the empty string"), "{}: {}", pattern, error);
         }
+    }
+
+    #[test]
+    fn a_blank_ignore_line_is_skipped_and_whitespace_around_a_pattern_is_refused() {
+        // A whitespace-only line compiled as a pattern matches every path holding that whitespace.
+        for blank in [" ", "\t", "  \t "] {
+            let rules = parse_ignore_file(&format!("^x$\n{}\n", blank)).unwrap();
+            assert_eq!(rules.len(), 1, "{:?}", blank);
+            assert!(!rules.iter().any(|rule| rule.matches("a b.txt")), "{:?}", blank);
+        }
+
+        // Whitespace around a pattern is refused, naming the line, rather than trimmed or kept.
+        for (content, line) in [("^a$\n^b$ \n", 2), (" ^a$\n", 1), ("^a$\t\n", 1), ("  # note\n", 1), ("^a$\r", 1)] {
+            let error = parse_ignore_file(content).unwrap_err();
+            assert!(error.contains(&format!("line {}: the pattern", line)) && error.contains("starts or ends with whitespace"),
+                "{:?}: {}", content, error);
+        }
+
+        // A space inside a pattern, or spelled as the escape the refusal suggests, still matches.
+        let rules = parse_ignore_file("^a b\\.txt$\n\\x20x$\n").unwrap();
+        assert_eq!(rules.iter().map(|rule| (rule.line, rule.pattern.as_str())).collect::<Vec<_>>(),
+            [(1, "^a b\\.txt$"), (2, "\\x20x$")]);
+        assert!(rules[0].matches("a b.txt") && !rules[0].matches("ab.txt"));
+        assert!(rules[1].matches("dir/a x") && !rules[1].matches("dir/ax"));
+
+        // A CRLF file reads as its lines, so its line endings are not whitespace around a pattern.
+        assert_eq!(parse_ignore_file("^a$\r\n^b$\r\n").unwrap().len(), 2);
     }
 
     #[test]
