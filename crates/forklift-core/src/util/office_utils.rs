@@ -439,7 +439,7 @@ pub struct TrustAnchor {
     pub adopts: Option<String>,
 }
 
-/// Ensure a tree is a normal content tree: meta pallet trees (the office, manifest, haul) carry a
+/// Ensure a tree is a normal content tree: meta pallet trees (the office and the meta-tree pallets) carry a
 /// top-level `.forklift` entry and must never be materialized into a working directory, where
 /// that entry would land in the warehouse's own metadata folder.
 ///
@@ -1396,10 +1396,8 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
 /// the record kind and field ("has no ... entry"), and so does a *present* key that is not a
 /// string — but with its own wording ("is present but is not a string"), so a hand-edited
 /// `genesis = 7` is never reported as missing. Same two-arm shape as [`read_integer`], for a
-/// field this record kind always writes. `pub(crate)`: `haul_utils` shares this instead of
-/// duplicating it as a private per-module closure
-/// (FORK-81 follow-up: the class sweep this PR's own strictness fix missed).
-pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
+/// field this record kind always writes.
+fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
     let Some(item) = doc.get(field) else {
         return Err(format!("{} has no \"{}\" entry.", record_kind_prefix(record_kind), field));
     };
@@ -1413,7 +1411,7 @@ pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> 
 
 /// Record kinds that exist exactly once per warehouse, so `"a {kind}"` would misleadingly
 /// suggest there could be more than one — these take the definite article instead. Every
-/// other record kind recurs many times (`"a haul event"`, `"a tag record"`, ...). Explicit
+/// other record kind recurs many times (`"a user record"`, `"a key record"`, ...). Explicit
 /// list, not a single hardcoded comparison (PR #122 round 5 F6): a future unique-per-
 /// warehouse kind must be added here, or it silently falls through to the indefinite article
 /// below.
@@ -1464,10 +1462,8 @@ pub(crate) fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) ->
 /// shape for a field the writer genuinely omits — but a *present* key must be a string, or
 /// this errors naming the record kind and field. Never conflates "absent" with "present but
 /// the wrong type" the way `doc.get(field).and_then(|item| item.as_str())` collapsing both
-/// cases to `None` would (FORK-81 follow-up: the same lenience `pallets` had). `pub(crate)`:
-/// `haul_utils` shares this instead of duplicating the same lenient
-/// shape as a private per-module `optional_string` closure.
-pub(crate) fn read_optional_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Option<String>, String> {
+/// cases to `None` would (FORK-81 follow-up: the same lenience `pallets` had).
+fn read_optional_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Option<String>, String> {
     let Some(item) = doc.get(field) else { return Ok(None); };
 
     item.as_str()
@@ -2013,7 +2009,7 @@ mod tests {
     /// changed `The trust file has no "genesis" entry.` to `A trust file has no ...` — two
     /// lines below the surviving, hardcoded `The trust file is not valid TOML`. There is
     /// exactly one trust file per warehouse, so it takes the definite article like every other
-    /// message about it; a record kind that recurs across a warehouse (a haul event, a tag
+    /// message about it; a record kind that recurs across a warehouse (a user record, a key
     /// record, ...) keeps the indefinite one.
     #[test]
     fn trust_file_errors_take_the_definite_article_other_record_kinds_the_indefinite() {
@@ -2025,16 +2021,16 @@ mod tests {
             "the trust file is unique per warehouse and must take \"The\": {}", trust_file_error
         );
 
-        let haul_event_error = read_string(&doc, "haul", "haul event").unwrap_err();
+        let user_record_error = read_string(&doc, "identifier", "user record").unwrap_err();
         assert!(
-            haul_event_error.starts_with("A haul event has no"),
-            "a haul event recurs across a warehouse and must keep \"A\": {}", haul_event_error
+            user_record_error.starts_with("A user record has no"),
+            "a user record recurs across a warehouse and must keep \"A\": {}", user_record_error
         );
 
-        let tag_record_error = read_string(&doc, "subject", "tag record").unwrap_err();
+        let key_record_error = read_string(&doc, "key_id", "key record").unwrap_err();
         assert!(
-            tag_record_error.starts_with("A tag record has no"),
-            "a tag record recurs across a warehouse and must keep \"A\": {}", tag_record_error
+            key_record_error.starts_with("A key record has no"),
+            "a key record recurs across a warehouse and must keep \"A\": {}", key_record_error
         );
     }
 
@@ -2056,7 +2052,7 @@ mod tests {
         assert_eq!(record_kind_prefix("trust file"), "The trust file");
 
         // Ordinary consonant-initial kinds are unaffected.
-        assert_eq!(record_kind_prefix("haul event"), "A haul event");
+        assert_eq!(record_kind_prefix("user record"), "A user record");
         assert_eq!(record_kind_prefix("tag record"), "A tag record");
         assert_eq!(record_kind_prefix("key record"), "A key record");
         assert_eq!(record_kind_prefix("manifest entry"), "A manifest entry");

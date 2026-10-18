@@ -1,91 +1,64 @@
-//! Hauls: reviewable merge proposals (pull requests), as tracked metadata.
+//! Hauls: reviewable merge proposals (pull requests), on the meta-tree substrate (`meta_tree`).
 //!
-//! A *haul* proposes merging a source pallet into a target pallet, with discussion and
-//! signed reviews. It is built on the exact substrate the manifest proved out: a
-//! dedicated `@haul` meta pallet whose parcels each carry **one signed event**, so a
-//! haul's whole life is an append-only log — Opened, Pushed, Comment, Review, Merged,
-//! Closed, Reopened — and its current state is the *fold* of that log.
+//! A *haul* proposes merging a source pallet into a target pallet, with discussion and signed
+//! reviews. Each haul is a directory of cells on the `@haul` meta pallet, at `<h[0..2]>/<h>/` for
+//! haul id `h`:
 //!
-//! Because authorship is the parcel's **signature** (never a stored field), "who approved
-//! this" is forge-proof and carries the operator's §7.1 identity class — a human's
-//! approval is distinguishable from an agent's. The ordinary `verify_pallet_history` is
-//! the whole verification (no server special-case), and two diverged `@haul` heads merge
-//! with a plain two-parent join: the union of independent events, never a conflict.
+//! - `opened` — the proposal: source, target, title, description, the opener's operator id and
+//!   when it was opened. The haul id is derived from it, so two hauls opened against the same
+//!   target never share an id. Never changed or removed.
+//! - `head` — the proposed source head. Moves when the proposal is updated; never removed.
+//! - `status` — open, closed or merged; absent means open. Once merged, never changed again.
+//! - `review/<op>` — one review per operator `op` (the blake3 of its identifier), naming the head
+//!   it reviewed, so a review never silently carries over to a later head.
+//! - `comment/<op>/<id>` — a comment, under its writer's directory, at an id derived from it.
 //!
-//! MVP scope (approved 2026-07-05): intra-warehouse (pallet → pallet); reviews are
-//! recorded but merging is not gated on them; a haul id is the content-addressed id of its
-//! Opened event (shown as a prefix).
+//! A haul directory holds no cell unless its `opened` cell is present. Who wrote a cell is its
+//! signer stamp; the pallet rule lets a parcel write or remove `review/` and `comment/` cells only
+//! under its own signer's `<op>`, and lets only the opener write `opened`.
+//!
+//! Scope: intra-warehouse (pallet → pallet); reviews are recorded but merging is not gated on
+//! them.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use chrono::Utc;
-use toml_edit::{value, DocumentMut};
-use crate::builder::object::loose_object_builder::LooseObjectBuilder;
-use crate::enums::dir_entry_type::DirEntryType;
-use crate::enums::parcel_action_type::ParcelActionType;
-use crate::model::blob::Blob;
+use toml_edit::{value, Table};
 use crate::model::operator::Operator;
-use crate::model::parcel::Parcel;
-use crate::model::parcel_action::ParcelAction;
-use crate::model::tree_item::TreeItem;
-use crate::util::{object_utils, office_utils, pallet_utils, sign_utils};
+use crate::util::manifest_utils::operator_leaf;
+use crate::util::meta_tree::{
+    self, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+};
+use crate::util::office_utils::{self, OfficeState};
+use crate::util::object_utils;
 
 /// The name of the haul meta pallet — reached as `@haul` (DESIGN.html §3.3).
 pub const HAUL_PALLET_NAME: &str = "haul";
 
-/// The tree namespace of haul events: `.forklift/tracked/haul/…` (shares the tracked root
-/// with the office and manifest, so it inherits their collision-proofing).
-const TREE_NAME_FORKLIFT: &str = ".forklift";
-const TREE_NAME_TRACKED: &str = "tracked";
-const TREE_NAME_HAUL: &str = "haul";
-const RECORD_SUFFIX: &str = ".toml";
+const CELL_OPENED: &str = "opened";
+const CELL_HEAD: &str = "head";
+const CELL_STATUS: &str = "status";
+const DIR_REVIEW: &str = "review";
+const DIR_COMMENT: &str = "comment";
 
-/// The kind of a haul event.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HaulEventKind {
-    /// Genesis: the proposal itself. Its content id is the haul id.
-    Opened,
-    /// The source pallet advanced — a new proposed head.
-    Pushed,
-    /// A discussion message.
-    Comment,
-    /// A review: approve, request changes, or a review comment.
-    Review,
-    /// The haul was merged (records the resulting merge parcel on the target).
-    Merged,
-    /// Closed without merging.
-    Closed,
-    /// Reopened after closing.
-    Reopened,
-}
+pub(crate) const SCHEMA_OPENED: &str = "haul.opened 1";
+pub(crate) const SCHEMA_HEAD: &str = "haul.head 1";
+pub(crate) const SCHEMA_STATUS: &str = "haul.status 1";
+pub(crate) const SCHEMA_REVIEW: &str = "haul.review 1";
+pub(crate) const SCHEMA_COMMENT: &str = "haul.comment 1";
 
-impl HaulEventKind {
-    /// The wire value of the kind.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HaulEventKind::Opened => "opened",
-            HaulEventKind::Pushed => "pushed",
-            HaulEventKind::Comment => "comment",
-            HaulEventKind::Review => "review",
-            HaulEventKind::Merged => "merged",
-            HaulEventKind::Closed => "closed",
-            HaulEventKind::Reopened => "reopened",
-        }
-    }
-
-    /// Parse a kind from its wire value.
-    pub fn parse(value: &str) -> Result<HaulEventKind, String> {
-        match value {
-            "opened" => Ok(HaulEventKind::Opened),
-            "pushed" => Ok(HaulEventKind::Pushed),
-            "comment" => Ok(HaulEventKind::Comment),
-            "review" => Ok(HaulEventKind::Review),
-            "merged" => Ok(HaulEventKind::Merged),
-            "closed" => Ok(HaulEventKind::Closed),
-            "reopened" => Ok(HaulEventKind::Reopened),
-            other => Err(format!("\"{}\" is not a haul event kind.", other)),
-        }
-    }
-}
+const FIELD_SOURCE: &str = "source";
+const FIELD_TARGET: &str = "target";
+const FIELD_TITLE: &str = "title";
+const FIELD_DESCRIPTION: &str = "description";
+const FIELD_OPENER: &str = "opener";
+const FIELD_OPENED_AT: &str = "opened_at";
+const FIELD_HEAD: &str = "head";
+const FIELD_STATE: &str = "state";
+const FIELD_MERGE_PARCEL: &str = "merge_parcel";
+const FIELD_VERDICT: &str = "verdict";
+const FIELD_BODY: &str = "body";
+const FIELD_REVIEWED_AT: &str = "reviewed_at";
+const FIELD_COMMENTED_AT: &str = "commented_at";
 
 /// A review's verdict.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -114,85 +87,7 @@ impl ReviewVerdict {
     }
 }
 
-/// One event on the `@haul` log. Optional fields are present only for the kinds that use
-/// them; the whole event is content-addressed by [`HaulEvent::id`].
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct HaulEvent {
-    /// The haul this event belongs to (the Opened event's id). Empty on the Opened event
-    /// itself — its own id *is* the haul id.
-    pub haul: String,
-
-    pub kind: HaulEventKind,
-
-    /// When the event was recorded. Display metadata only — never a security input.
-    pub recorded_at: i64,
-
-    /// Free text (a comment/review body, or the description on Opened). May be empty.
-    pub body: String,
-
-    /// Opened: the source pallet (wire ref).
-    pub source: Option<String>,
-
-    /// Opened: the target pallet (wire ref).
-    pub target: Option<String>,
-
-    /// Opened: the title.
-    pub title: Option<String>,
-
-    /// Opened / Pushed: the proposed source head.
-    pub head: Option<String>,
-
-    /// Review: the verdict.
-    pub verdict: Option<ReviewVerdict>,
-
-    /// Merged: the merge parcel created on the target.
-    pub merge_parcel: Option<String>,
-}
-
-impl HaulEvent {
-    /// The event's content-derived id — the filename it is stored under, and (for an
-    /// Opened event) the haul id.
-    pub fn id(&self) -> String {
-        let material = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            self.haul,
-            self.kind.as_str(),
-            self.recorded_at,
-            self.body,
-            self.source.as_deref().unwrap_or(""),
-            self.target.as_deref().unwrap_or(""),
-            self.title.as_deref().unwrap_or(""),
-            self.head.as_deref().unwrap_or(""),
-            self.verdict.map(|v| v.as_str()).unwrap_or(""),
-            self.merge_parcel.as_deref().unwrap_or(""),
-        );
-
-        blake3::hash(material.as_bytes()).to_hex().to_string()
-    }
-}
-
-/// An event together with its forge-proof authorship.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct AttributedEvent {
-    pub event: HaulEvent,
-
-    /// The operator resolved from the introducing parcel's signature.
-    pub author: String,
-
-    /// The `@haul` parcel that introduced the event.
-    pub parcel: String,
-}
-
-/// A review, folded to the latest verdict per author.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Review {
-    pub author: String,
-    pub verdict: ReviewVerdict,
-    pub body: String,
-    pub at: i64,
-}
-
-/// The status of a haul (the fold of its close/reopen/merge events).
+/// The status of a haul.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HaulStatus {
     Open,
@@ -200,219 +95,630 @@ pub enum HaulStatus {
     Closed,
 }
 
-/// A haul: the folded state of one proposal's event log.
-#[derive(Clone)]
-pub struct Haul {
-    pub id: String,
+impl HaulStatus {
+    /// The status's name, as `haul list --state` spells it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HaulStatus::Open => "open",
+            HaulStatus::Merged(_) => "merged",
+            HaulStatus::Closed => "closed",
+        }
+    }
+}
+
+/// The proposal itself — the `opened` cell's value.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Opened {
     pub source: String,
     pub target: String,
     pub title: String,
     pub description: String,
 
-    /// The current proposed head (latest Pushed, else the Opened head).
+    /// The operator who opened the haul. The content check holds it equal to the operator of
+    /// the key that signed the cell.
+    pub opener: String,
+
+    /// When the haul was opened. Part of the haul's identity, never a security input.
+    pub opened_at: i64,
+}
+
+impl Opened {
+    /// The haul id: the blake3 of every field, each length-prefixed so no two field lists share
+    /// an encoding.
+    pub fn id(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+
+        for field in [&self.source, &self.target, &self.title, &self.description, &self.opener] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+
+        hasher.update(&self.opened_at.to_le_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+}
+
+/// A review, as its writer last recorded it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Review {
+    /// The operator whose key the cell is stamped with, or the key id when the office does not
+    /// know that key.
+    pub author: String,
+
+    pub verdict: ReviewVerdict,
+    pub body: String,
+
+    /// The haul head the review is of.
+    pub head: String,
+
+    /// When it was recorded — display metadata only.
+    pub reviewed_at: i64,
+}
+
+/// A comment.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Comment {
+    /// As [`Review::author`].
+    pub author: String,
+
+    pub body: String,
+
+    /// When it was recorded — display metadata only.
+    pub commented_at: i64,
+}
+
+/// A haul cell this build cannot read: a newer schema or cell, or a malformed one. It is
+/// listed, never dropped and never allowed to fail a read of the others.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UnreadableCell {
+    /// The cell path, relative to `cells/`.
+    pub path: String,
+
+    /// Why it cannot be read.
+    pub reason: String,
+}
+
+/// A haul: the state of one proposal's cells.
+#[derive(Clone, Debug)]
+pub struct Haul {
+    pub id: String,
+    pub opened: Opened,
+
+    /// The current proposed head.
     pub head: String,
 
     pub status: HaulStatus,
-    pub opened_by: String,
-    pub opened_at: i64,
 
-    /// The latest review per author.
+    /// One review per writer, in path order.
     pub reviews: Vec<Review>,
 
-    /// Comments and reviews in the order they were recorded.
-    pub thread: Vec<AttributedEvent>,
+    /// Every comment, oldest first.
+    pub comments: Vec<Comment>,
+
+    /// The haul's review and comment cells this build cannot read.
+    pub unreadable: Vec<UnreadableCell>,
 }
 
-/// Read and fold every haul reachable from the `@haul` head, newest first (by open time).
-///
-/// # Returns
-/// * `Ok(Vec<Haul>)` - The hauls (empty when the pallet is unborn).
-/// * `Err(String)`   - If an object could not be read.
-pub fn read_hauls() -> Result<Vec<Haul>, String> {
-    let events = read_events()?;
-
-    // Group events by haul id: the Opened event's own id, or the referenced id otherwise.
-    let mut groups: HashMap<String, Vec<AttributedEvent>> = HashMap::new();
-
-    for attributed in events {
-        let id = if attributed.event.kind == HaulEventKind::Opened {
-            attributed.event.id()
-        } else {
-            attributed.event.haul.clone()
-        };
-
-        groups.entry(id).or_default().push(attributed);
-    }
-
-    let mut hauls: Vec<Haul> = groups.into_iter()
-        .filter_map(|(id, events)| fold_haul(id, events))
-        .collect();
-
-    hauls.sort_by(|a, b| b.opened_at.cmp(&a.opened_at).then(b.id.cmp(&a.id)));
-
-    Ok(hauls)
-}
-
-/// Find one haul by an id prefix (like a parcel hash prefix). Errors if none or several
-/// match.
-pub fn find_haul(id_prefix: &str) -> Result<Haul, String> {
-    let matches: Vec<Haul> = read_hauls()?
-        .into_iter()
-        .filter(|haul| haul.id.starts_with(id_prefix))
-        .collect();
-
-    match matches.len() {
-        0 => Err(format!("No haul matches \"{}\".", id_prefix)),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        n => Err(format!("\"{}\" is ambiguous — it matches {} hauls.", id_prefix, n)),
+impl Haul {
+    /// The reviews of the current head; a review of an earlier head no longer speaks for it.
+    pub fn current_reviews(&self) -> impl Iterator<Item = &Review> {
+        self.reviews.iter().filter(|review| review.head == self.head)
     }
 }
 
-/// Fold one haul's event log into its current state. `None` when there is no Opened event
-/// (a dangling reference).
-fn fold_haul(id: String, mut events: Vec<AttributedEvent>) -> Option<Haul> {
-    events.sort_by(|a, b| a.event.recorded_at.cmp(&b.event.recorded_at).then(a.parcel.cmp(&b.parcel)));
+/// A haul whose `opened`, `head` or `status` cell this build cannot read. Nothing about it is
+/// shown as though it were known, and every command addressing it refuses.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UnreadableHaul {
+    pub id: String,
 
-    let opened = events.iter().find(|e| e.event.kind == HaulEventKind::Opened)?;
+    /// Why it cannot be read, naming the cell.
+    pub reason: String,
+}
 
-    let mut haul = Haul {
-        id,
-        source: opened.event.source.clone().unwrap_or_default(),
-        target: opened.event.target.clone().unwrap_or_default(),
-        title: opened.event.title.clone().unwrap_or_default(),
-        description: opened.event.body.clone(),
-        head: opened.event.head.clone().unwrap_or_default(),
-        status: HaulStatus::Open,
-        opened_by: opened.author.clone(),
-        opened_at: opened.event.recorded_at,
-        reviews: Vec::new(),
-        thread: Vec::new(),
+/// Every haul at one head.
+#[derive(Clone, Debug, Default)]
+pub struct HaulsRead {
+    /// Every readable haul, newest first by open time.
+    pub hauls: Vec<Haul>,
+
+    /// Every haul this build cannot read.
+    pub unreadable: Vec<UnreadableHaul>,
+
+    /// Cells outside any haul's known shape (a path this build cannot place).
+    pub stray: Vec<UnreadableCell>,
+}
+
+/// The directory of a haul, relative to `cells/`.
+pub(crate) fn haul_dir(id: &str) -> String {
+    format!("{}/{}", &id[..2], id)
+}
+
+/// The cell path of a comment by `operator`.
+pub(crate) fn comment_path(id: &str, operator: &str, comment: &Table) -> String {
+    format!("{}/{}/{}/{}", haul_dir(id), DIR_COMMENT, operator_leaf(operator), comment_id(comment))
+}
+
+/// The id of a comment: the blake3 of its value's fields, each length-prefixed. The writer is
+/// not part of it — the id sits under the writer's own directory.
+fn comment_id(comment: &Table) -> String {
+    let body = meta_tree::value_string(comment, FIELD_BODY).unwrap_or_default();
+    let at = meta_tree::value_integer(comment, FIELD_COMMENTED_AT).unwrap_or_default();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(body.len() as u64).to_le_bytes());
+    hasher.update(body.as_bytes());
+    hasher.update(&at.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// One cell of a haul, by where it sits.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum CellName<'a> {
+    Opened,
+    Head,
+    Status,
+
+    /// `review/<op>`.
+    Review { owner: &'a str },
+
+    /// `comment/<op>/<id>`.
+    Comment { owner: &'a str, id: &'a str },
+
+    /// A cell name this build does not know — written by a newer forklift.
+    Other,
+}
+
+/// The parts of a haul cell path.
+struct CellPath<'a> {
+    haul: &'a str,
+    name: CellName<'a>,
+}
+
+/// Split a cell path, refusing any path that is not under `<h[0..2]>/<h>/` for a 64-hex haul id,
+/// or that puts a known cell at a shape it does not take.
+fn parse_cell_path(path: &str) -> Result<CellPath<'_>, String> {
+    let parts: Vec<&str> = path.split('/').collect();
+
+    let [fan, haul, rest @ ..] = parts.as_slice() else {
+        return Err(format!("{} is not a cell under a haul's directory", path));
     };
 
-    let mut merged: Option<String> = None;
-    let mut closed = false;
-    let mut latest_review: BTreeMap<String, Review> = BTreeMap::new();
+    if !object_utils::is_object_hash(haul) || fan != &&haul[..2] {
+        return Err(format!("{} does not sit under the directory of a haul id", path));
+    }
 
-    for attributed in &events {
-        match attributed.event.kind {
-            HaulEventKind::Pushed => {
-                if let Some(head) = &attributed.event.head {
-                    haul.head = head.clone();
+    let hex = |part: &str| object_utils::is_object_hash(part);
+
+    let name = match rest {
+        [CELL_OPENED] => CellName::Opened,
+        [CELL_HEAD] => CellName::Head,
+        [CELL_STATUS] => CellName::Status,
+        [DIR_REVIEW, owner] if hex(owner) => CellName::Review { owner },
+        [DIR_COMMENT, owner, id] if hex(owner) && hex(id) => CellName::Comment { owner, id },
+        [first, ..] if ![CELL_OPENED, CELL_HEAD, CELL_STATUS, DIR_REVIEW, DIR_COMMENT].contains(first) =>
+            CellName::Other,
+        _ => return Err(format!("{} is not at a shape its cell takes", path)),
+    };
+
+    Ok(CellPath { haul, name })
+}
+
+/// The schema a known cell name holds.
+fn schema_of(name: &CellName) -> Option<&'static str> {
+    match name {
+        CellName::Opened => Some(SCHEMA_OPENED),
+        CellName::Head => Some(SCHEMA_HEAD),
+        CellName::Status => Some(SCHEMA_STATUS),
+        CellName::Review { .. } => Some(SCHEMA_REVIEW),
+        CellName::Comment { .. } => Some(SCHEMA_COMMENT),
+        CellName::Other => None,
+    }
+}
+
+/// A full parcel hash in a value field.
+fn value_hash(table: &Table, field: &str) -> Result<String, String> {
+    let hash = meta_tree::value_string(table, field)?;
+
+    if !object_utils::is_object_hash(&hash) {
+        return Err(format!("has a {} field that is not a full parcel hash", field));
+    }
+
+    Ok(hash)
+}
+
+pub(crate) fn opened_value(opened: &Opened) -> Table {
+    let mut table = Table::new();
+    table.insert(FIELD_SOURCE, value(opened.source.as_str()));
+    table.insert(FIELD_TARGET, value(opened.target.as_str()));
+    table.insert(FIELD_TITLE, value(opened.title.as_str()));
+    table.insert(FIELD_DESCRIPTION, value(opened.description.as_str()));
+    table.insert(FIELD_OPENER, value(opened.opener.as_str()));
+    table.insert(FIELD_OPENED_AT, value(opened.opened_at));
+
+    table
+}
+
+fn parse_opened(table: &Table) -> Result<Opened, String> {
+    meta_tree::value_fields_only(table, &[
+        FIELD_SOURCE, FIELD_TARGET, FIELD_TITLE, FIELD_DESCRIPTION, FIELD_OPENER, FIELD_OPENED_AT,
+    ])?;
+
+    Ok(Opened {
+        source: meta_tree::value_string(table, FIELD_SOURCE)?,
+        target: meta_tree::value_string(table, FIELD_TARGET)?,
+        title: meta_tree::value_string(table, FIELD_TITLE)?,
+        description: meta_tree::value_string(table, FIELD_DESCRIPTION)?,
+        opener: meta_tree::value_string(table, FIELD_OPENER)?,
+        opened_at: meta_tree::value_integer(table, FIELD_OPENED_AT)?,
+    })
+}
+
+pub(crate) fn head_value(head: &str) -> Table {
+    let mut table = Table::new();
+    table.insert(FIELD_HEAD, value(head));
+
+    table
+}
+
+fn parse_head(table: &Table) -> Result<String, String> {
+    meta_tree::value_fields_only(table, &[FIELD_HEAD])?;
+
+    value_hash(table, FIELD_HEAD)
+}
+
+pub(crate) fn status_value(status: &HaulStatus) -> Table {
+    let mut table = Table::new();
+    table.insert(FIELD_STATE, value(status.as_str()));
+
+    if let HaulStatus::Merged(parcel) = status {
+        table.insert(FIELD_MERGE_PARCEL, value(parcel.as_str()));
+    }
+
+    table
+}
+
+/// Parse a status strictly: a merge parcel exactly when merged.
+fn parse_status(table: &Table) -> Result<HaulStatus, String> {
+    match meta_tree::value_string(table, FIELD_STATE)?.as_str() {
+        "merged" => {
+            meta_tree::value_fields_only(table, &[FIELD_STATE, FIELD_MERGE_PARCEL])?;
+            Ok(HaulStatus::Merged(value_hash(table, FIELD_MERGE_PARCEL)?))
+        }
+        state @ ("open" | "closed") => {
+            meta_tree::value_fields_only(table, &[FIELD_STATE])?;
+            Ok(if state == "open" { HaulStatus::Open } else { HaulStatus::Closed })
+        }
+        other => Err(format!("has the state \"{}\", which is not open, closed or merged", other)),
+    }
+}
+
+pub(crate) fn review_value(verdict: ReviewVerdict, body: &str, head: &str, reviewed_at: i64) -> Table {
+    let mut table = Table::new();
+    table.insert(FIELD_VERDICT, value(verdict.as_str()));
+    table.insert(FIELD_BODY, value(body));
+    table.insert(FIELD_HEAD, value(head));
+    table.insert(FIELD_REVIEWED_AT, value(reviewed_at));
+
+    table
+}
+
+/// Parse a review, with `author` filled in by the caller.
+fn parse_review(table: &Table) -> Result<Review, String> {
+    meta_tree::value_fields_only(table, &[FIELD_VERDICT, FIELD_BODY, FIELD_HEAD, FIELD_REVIEWED_AT])?;
+
+    Ok(Review {
+        author: String::new(),
+        verdict: ReviewVerdict::parse(&meta_tree::value_string(table, FIELD_VERDICT)?)
+            .map_err(|why| format!("has a verdict field that does not parse: {}", why))?,
+        body: meta_tree::value_string(table, FIELD_BODY)?,
+        head: value_hash(table, FIELD_HEAD)?,
+        reviewed_at: meta_tree::value_integer(table, FIELD_REVIEWED_AT)?,
+    })
+}
+
+pub(crate) fn comment_value(body: &str, commented_at: i64) -> Table {
+    let mut table = Table::new();
+    table.insert(FIELD_BODY, value(body));
+    table.insert(FIELD_COMMENTED_AT, value(commented_at));
+
+    table
+}
+
+/// Parse a comment, with `author` filled in by the caller.
+fn parse_comment(table: &Table) -> Result<Comment, String> {
+    meta_tree::value_fields_only(table, &[FIELD_BODY, FIELD_COMMENTED_AT])?;
+
+    Ok(Comment {
+        author: String::new(),
+        body: meta_tree::value_string(table, FIELD_BODY)?,
+        commented_at: meta_tree::value_integer(table, FIELD_COMMENTED_AT)?,
+    })
+}
+
+/// Check a known cell's value strictly, by the schema its name holds.
+fn check_value(name: &CellName, table: &Table) -> Result<(), String> {
+    match name {
+        CellName::Opened => parse_opened(table).map(|_| ()),
+        CellName::Head => parse_head(table).map(|_| ()),
+        CellName::Status => parse_status(table).map(|_| ()),
+        CellName::Review { .. } => parse_review(table).map(|_| ()),
+        CellName::Comment { .. } => parse_comment(table).map(|_| ()),
+        CellName::Other => Ok(()),
+    }
+}
+
+/// The pallet rules of `@haul`:
+///
+/// - `opened` is written once, by its opener, at the id its content derives, together with a
+///   `head`, and is never changed or removed;
+/// - a haul directory holds no other cell unless its `opened` cell is present;
+/// - `head` is never removed;
+/// - a `status` that reads merged is never changed or removed, and a status this build cannot
+///   read is never changed either, since it might read merged;
+/// - `review/<op>` and `comment/<op>/…` are written or removed only by the operator `op` names;
+/// - every cell holds its own schema and a strictly valid value, and no cell this build does
+///   not know is written.
+pub struct HaulRules;
+
+impl PalletRules for HaulRules {
+    fn kind(&self) -> MetaKind {
+        MetaKind::Haul
+    }
+
+    fn knows_schema(&self, schema: &str) -> bool {
+        [SCHEMA_OPENED, SCHEMA_HEAD, SCHEMA_STATUS, SCHEMA_REVIEW, SCHEMA_COMMENT].contains(&schema)
+    }
+
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+        let operator = &change.signer.operator;
+        let owner = operator_leaf(operator);
+
+        for cell in change.changes {
+            let path = parse_cell_path(&cell.path)?;
+            let dir = haul_dir(path.haul);
+
+            match &path.name {
+                CellName::Opened if cell.before.is_some() => return Err(format!(
+                    "{} is the proposal of a haul, which is never changed or removed", cell.path
+                )),
+                CellName::Head if cell.after.is_none() => return Err(format!(
+                    "{} is the head of a haul, which is never removed", cell.path
+                )),
+                CellName::Review { owner: written } | CellName::Comment { owner: written, .. }
+                    if *written != owner => return Err(format!(
+                        "the cell at {} sits under another operator's directory, so only they may \
+                        write or remove it",
+                        cell.path
+                    )),
+                // A cell no rule here covers would be stored unchecked; a newer forklift's cell
+                // waits for a remote that knows its rules.
+                CellName::Other => return Err(format!(
+                    "{} is not a cell this forklift knows a haul to hold", cell.path
+                )),
+                _ => {}
+            }
+
+            if path.name == CellName::Status {
+                if let Some(before) = &cell.before {
+                    let merged = match meta_tree::read_cell_blob(before, self)? {
+                        CellRead::Readable(envelope) => parse_status(&envelope.value)
+                            .map(|status| matches!(status, HaulStatus::Merged(_)))
+                            .map_err(|why| format!("the status at {} {}", cell.path, why))?,
+                        _ => return Err(format!(
+                            "the status at {} cannot be read by this forklift, so it cannot tell \
+                            whether the haul was merged; upgrade to change it",
+                            cell.path
+                        )),
+                    };
+
+                    if merged {
+                        return Err(format!("the haul {} is merged, and a merge is final", path.haul));
+                    }
                 }
             }
-            HaulEventKind::Merged => merged = attributed.event.merge_parcel.clone(),
-            HaulEventKind::Closed => closed = true,
-            HaulEventKind::Reopened => closed = false,
-            HaulEventKind::Comment => haul.thread.push(attributed.clone()),
-            HaulEventKind::Review => {
-                if let Some(verdict) = attributed.event.verdict {
-                    latest_review.insert(attributed.author.clone(), Review {
-                        author: attributed.author.clone(),
-                        verdict,
-                        body: attributed.event.body.clone(),
-                        at: attributed.event.recorded_at,
-                    });
-                }
-                haul.thread.push(attributed.clone());
+
+            let Some(after) = &cell.after else { continue };
+
+            if meta_tree::read_cell_in(change.cells, &format!("{}/{}", dir, CELL_OPENED), self)?.is_none() {
+                return Err(format!(
+                    "the cell at {} belongs to a haul with no proposal; resolve the whole haul \
+                    (its id) rather than its proposal alone",
+                    cell.path
+                ));
             }
-            HaulEventKind::Opened => {}
+
+            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+            let Some(schema) = schema_of(&path.name) else { continue };
+
+
+            if envelope.schema != schema {
+                // A newer schema at a known cell is carried, except at the proposal, which the
+                // rules must read to check its id and its opener.
+                if self.knows_schema(&envelope.schema) || path.name == CellName::Opened {
+                    return Err(format!("the cell at {} holds a {} value", cell.path, envelope.schema));
+                }
+
+                continue;
+            }
+
+            check_value(&path.name, &envelope.value).map_err(|why| format!("the value at {} {}", cell.path, why))?;
+
+            match &path.name {
+                CellName::Opened => {
+                    let opened = parse_opened(&envelope.value)?;
+
+                    if opened.id() != path.haul {
+                        return Err(format!("the proposal at {} is not at the id its content derives", cell.path));
+                    }
+
+                    if &opened.opener != operator {
+                        return Err(format!(
+                            "the proposal at {} names {} as its opener, but is signed by {}",
+                            cell.path, opened.opener, operator
+                        ));
+                    }
+
+                    if meta_tree::read_cell_in(change.cells, &format!("{}/{}", dir, CELL_HEAD), self)?.is_none() {
+                        return Err(format!("the haul {} is opened without a head", path.haul));
+                    }
+                }
+                CellName::Comment { id, .. } if comment_id(&envelope.value) != *id => {
+                    return Err(format!("the comment at {} is not at the id its content derives", cell.path));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `<id>` or any path beneath it, for a full haul id.
+    fn resolution_path(&self, spelled: &str) -> Result<String, String> {
+        let haul = spelled.split('/').next().unwrap_or_default();
+
+        if !object_utils::is_object_hash(haul) {
+            return Err(format!(
+                "\"{}\" does not name a haul by its full id (64 lowercase hex characters).", haul
+            ));
+        }
+
+        meta_tree::validate_cell_path(spelled)?;
+
+        Ok(format!("{}/{}", &haul[..2], spelled))
+    }
+
+    fn display_path(&self, path: &str) -> String {
+        match path.split_once('/') {
+            Some((_fan, rest)) => rest.to_string(),
+            None => path.to_string(),
         }
     }
 
-    // A merge is final; otherwise the latest close/reopen decides.
-    haul.status = match merged {
-        Some(parcel) => HaulStatus::Merged(parcel),
-        None if closed => HaulStatus::Closed,
-        None => HaulStatus::Open,
-    };
-    haul.reviews = latest_review.into_values().collect();
+    fn display_value(&self, envelope: &CellEnvelope) -> String {
+        let table = &envelope.value;
 
-    Some(haul)
+        let shown = match envelope.schema.as_str() {
+            SCHEMA_OPENED => parse_opened(table).map(|opened| format!("\"{}\" ({} → {})", opened.title, opened.source, opened.target)),
+            SCHEMA_HEAD => parse_head(table).map(|head| format!("head {}", head)),
+            SCHEMA_STATUS => parse_status(table).map(|status| match status {
+                HaulStatus::Merged(parcel) => format!("merged as {}", parcel),
+                status => status.as_str().to_string(),
+            }),
+            SCHEMA_REVIEW => parse_review(table).map(|review| format!("{} of {}", review.verdict.as_str(), review.head)),
+            SCHEMA_COMMENT => parse_comment(table).map(|comment| comment.body),
+            _ => Ok(table.to_string()),
+        };
+
+        shown.unwrap_or_else(|why| format!("(unreadable: the value {})", why))
+    }
 }
 
-/// Open a haul: stack the genesis (Opened) event and return the new haul id.
+/// Stack edits to the local `@haul` head as one signed parcel. `None` when they changed nothing.
+fn stack(edits: &[CellEdit],
+         office: &OfficeState,
+         actor: &Operator,
+         description: &str,
+         signer: &MetaSigner) -> Result<Option<String>, String> {
+    meta_tree::stack_meta_edits(HAUL_PALLET_NAME, &HaulRules, office, edits, actor, description, signer)
+}
+
+/// The operator a signing key belongs to.
+fn signing_operator(office: &OfficeState, signer: &MetaSigner) -> Result<String, String> {
+    Ok(office.find_key(&signer.key_id)
+        .ok_or(format!("The signing key {} is not in the office.", signer.key_id))?
+        .operator
+        .clone())
+}
+
+/// Open a haul: its proposal and its head, as one signed parcel. The caller holds the warehouse
+/// lock and passes the verified office. Returns the new haul id.
 pub fn open_haul(source: &str,
                  target: &str,
                  head: &str,
                  title: &str,
                  description: &str,
+                 office: &OfficeState,
                  actor: &Operator,
-                 signing_key_id: &str) -> Result<String, String> {
-    let event = HaulEvent {
-        haul: String::new(),
-        kind: HaulEventKind::Opened,
-        recorded_at: Utc::now().timestamp(),
-        body: description.to_string(),
-        source: Some(source.to_string()),
-        target: Some(target.to_string()),
-        title: Some(title.to_string()),
-        head: Some(head.to_string()),
-        verdict: None,
-        merge_parcel: None,
+                 signer: &MetaSigner) -> Result<String, String> {
+    let opened = Opened {
+        source: source.to_string(),
+        target: target.to_string(),
+        title: title.to_string(),
+        description: description.to_string(),
+        opener: signing_operator(office, signer)?,
+        opened_at: Utc::now().timestamp(),
     };
 
-    let id = event.id();
-    record_event(&event, actor, format!("Opened haul \"{}\".", title), signing_key_id)?;
+    let id = opened.id();
+    let dir = haul_dir(&id);
+
+    let edits = [
+        meta_tree::set_cell(&format!("{}/{}", dir, CELL_OPENED), &signer.key_id, SCHEMA_OPENED, &opened_value(&opened))?,
+        meta_tree::set_cell(&format!("{}/{}", dir, CELL_HEAD), &signer.key_id, SCHEMA_HEAD, &head_value(head))?,
+    ];
+
+    stack(&edits, office, actor, &format!("Opened haul \"{}\".", title), signer)?
+        .ok_or(format!("Haul {} is already open.", short(&id)))?;
 
     Ok(id)
 }
 
 /// Record a comment on a haul.
-pub fn record_comment(haul_id: &str, body: &str, actor: &Operator, signing_key_id: &str) -> Result<String, String> {
-    record_event(&event(haul_id, HaulEventKind::Comment, body), actor,
-        format!("Commented on haul {}.", short(haul_id)), signing_key_id)
+pub fn record_comment(haul_id: &str,
+                      body: &str,
+                      office: &OfficeState,
+                      actor: &Operator,
+                      signer: &MetaSigner) -> Result<Option<String>, String> {
+    let comment = comment_value(body, Utc::now().timestamp());
+    let path = comment_path(haul_id, &signing_operator(office, signer)?, &comment);
+    let edit = meta_tree::set_cell(&path, &signer.key_id, SCHEMA_COMMENT, &comment)?;
+
+    stack(&[edit], office, actor, &format!("Commented on haul {}.", short(haul_id)), signer)
 }
 
-/// Record a review on a haul.
-pub fn record_review(haul_id: &str, verdict: ReviewVerdict, body: &str, actor: &Operator, signing_key_id: &str) -> Result<String, String> {
-    let mut event = event(haul_id, HaulEventKind::Review, body);
-    event.verdict = Some(verdict);
-    record_event(&event, actor, format!("Reviewed haul {} ({}).", short(haul_id), verdict.as_str()), signing_key_id)
+/// Record the signer's review of a haul's `head`, replacing any earlier review of theirs.
+pub fn record_review(haul_id: &str,
+                     verdict: ReviewVerdict,
+                     body: &str,
+                     head: &str,
+                     office: &OfficeState,
+                     actor: &Operator,
+                     signer: &MetaSigner) -> Result<Option<String>, String> {
+    let path = format!("{}/{}/{}", haul_dir(haul_id), DIR_REVIEW, operator_leaf(&signing_operator(office, signer)?));
+    let review = review_value(verdict, body, head, Utc::now().timestamp());
+    let edit = meta_tree::set_cell(&path, &signer.key_id, SCHEMA_REVIEW, &review)?;
+
+    stack(&[edit], office, actor, &format!("Reviewed haul {} ({}).", short(haul_id), verdict.as_str()), signer)
 }
 
-/// Record that the source advanced to a new head.
-pub fn record_pushed(haul_id: &str, head: &str, actor: &Operator, signing_key_id: &str) -> Result<String, String> {
-    let mut event = event(haul_id, HaulEventKind::Pushed, "");
-    event.head = Some(head.to_string());
-    record_event(&event, actor, format!("Updated haul {}.", short(haul_id)), signing_key_id)
+/// Record a new proposed head. `None` when it is already the head.
+pub fn record_head(haul_id: &str,
+                   head: &str,
+                   office: &OfficeState,
+                   actor: &Operator,
+                   signer: &MetaSigner) -> Result<Option<String>, String> {
+    let edit = meta_tree::set_cell(&format!("{}/{}", haul_dir(haul_id), CELL_HEAD), &signer.key_id, SCHEMA_HEAD, &head_value(head))?;
+
+    stack(&[edit], office, actor, &format!("Updated haul {}.", short(haul_id)), signer)
 }
 
-/// Record that the haul was merged (the merge parcel is on the target).
-pub fn record_merged(haul_id: &str, merge_parcel: &str, actor: &Operator, signing_key_id: &str) -> Result<String, String> {
-    let mut event = event(haul_id, HaulEventKind::Merged, "");
-    event.merge_parcel = Some(merge_parcel.to_string());
-    record_event(&event, actor, format!("Merged haul {}.", short(haul_id)), signing_key_id)
-}
+/// Record a haul's status: closed, reopened, or merged as a parcel on the target.
+pub fn record_status(haul_id: &str,
+                     status: &HaulStatus,
+                     office: &OfficeState,
+                     actor: &Operator,
+                     signer: &MetaSigner) -> Result<Option<String>, String> {
+    let path = format!("{}/{}", haul_dir(haul_id), CELL_STATUS);
+    let edit = meta_tree::set_cell(&path, &signer.key_id, SCHEMA_STATUS, &status_value(status))?;
 
-/// Record that the haul was closed or reopened.
-pub fn record_closed(haul_id: &str, closed: bool, actor: &Operator, signing_key_id: &str) -> Result<String, String> {
-    let kind = if closed { HaulEventKind::Closed } else { HaulEventKind::Reopened };
-    let verb = if closed { "Closed" } else { "Reopened" };
-    record_event(&event(haul_id, kind, ""), actor, format!("{} haul {}.", verb, short(haul_id)), signing_key_id)
-}
+    let verb = match status {
+        HaulStatus::Open => "Reopened",
+        HaulStatus::Closed => "Closed",
+        HaulStatus::Merged(_) => "Merged",
+    };
 
-/// Merge another `@haul` head into the local one: a two-parent join (union of events).
-pub fn merge_hauls(other_head: &str, actor: &Operator, description: String, signing_key_id: &str) -> Result<String, String> {
-    let local_head = pallet_utils::get_meta_pallet_head(HAUL_PALLET_NAME)?
-        .ok_or("There is no local haul log to merge into.".to_string())?;
-
-    stack_haul_parcel(None, vec![local_head, other_head.to_string()], actor, description, signing_key_id)
-}
-
-/// Build a bare event referencing a haul.
-fn event(haul_id: &str, kind: HaulEventKind, body: &str) -> HaulEvent {
-    HaulEvent {
-        haul: haul_id.to_string(),
-        kind,
-        recorded_at: Utc::now().timestamp(),
-        body: body.to_string(),
-        source: None,
-        target: None,
-        title: None,
-        head: None,
-        verdict: None,
-        merge_parcel: None,
-    }
+    stack(&[edit], office, actor, &format!("{} haul {}.", verb, short(haul_id)), signer)
 }
 
 /// A short display form of a haul id.
@@ -420,380 +726,284 @@ fn short(id: &str) -> String {
     id.chars().take(12).collect()
 }
 
-/// Read every event reachable from the `@haul` head, each attributed to its signer.
-fn read_events() -> Result<Vec<AttributedEvent>, String> {
-    let Some(head) = pallet_utils::get_meta_pallet_head(HAUL_PALLET_NAME)? else {
-        return Ok(Vec::new());
+/// The cells of one haul directory, by name, while reading.
+#[derive(Default)]
+struct HaulCells {
+    opened: Option<CellRead>,
+    head: Option<CellRead>,
+    status: Option<CellRead>,
+    reviews: Vec<(String, CellRead)>,
+    comments: Vec<(String, CellRead)>,
+    other: Vec<(String, CellRead)>,
+}
+
+/// Read every haul at the local head, attributed through the office (read best-effort, so a
+/// cell whose key the local office does not know is attributed by key id). An unborn pallet
+/// reads as empty.
+pub fn read_hauls() -> Result<HaulsRead, String> {
+    let Some(state) = meta_tree::read_meta_head(HAUL_PALLET_NAME, &HaulRules)? else {
+        return Ok(HaulsRead::default());
     };
 
     let office = office_utils::read_office_state()
-        .unwrap_or(office_utils::OfficeState { users: Vec::new(), keys: Vec::new() });
+        .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    let mut collected: Vec<AttributedEvent> = Vec::new();
-    let mut deduped: HashSet<(String, String)> = HashSet::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = vec![head];
+    let mut read = HaulsRead::default();
+    let mut dirs: BTreeMap<String, HaulCells> = BTreeMap::new();
 
-    while let Some(hash) = queue.pop() {
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
-
-        let parcel = object_utils::load_parcel(&hash)?;
-        queue.extend(parcel.parents.clone());
-
-        let Some(haul_tree) = resolve_subtree(&parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_HAUL])? else {
-            continue; // A join parcel: no event.
+    for (path, cell) in state.cells {
+        let parsed = match parse_cell_path(&path) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                read.stray.push(UnreadableCell { path, reason });
+                continue;
+            }
         };
 
-        let author = resolve_author(&hash, &office);
+        let cells = dirs.entry(parsed.haul.to_string()).or_default();
 
-        for (_, file) in haul_tree.get_files() {
-            let event = parse_event(&load_record(&file.hash)?)?;
-
-            if deduped.insert((author.clone(), event.id())) {
-                collected.push(AttributedEvent { event, author: author.clone(), parcel: hash.clone() });
-            }
+        match parsed.name {
+            CellName::Opened => cells.opened = Some(cell),
+            CellName::Head => cells.head = Some(cell),
+            CellName::Status => cells.status = Some(cell),
+            CellName::Review { .. } => cells.reviews.push((path, cell)),
+            CellName::Comment { .. } => cells.comments.push((path, cell)),
+            CellName::Other => cells.other.push((path, cell)),
         }
     }
 
-    Ok(collected)
-}
+    let author = |signer: &str| office.find_key(signer).map(|key| key.operator.clone()).unwrap_or(signer.to_string());
 
-/// The operator who signed a haul parcel.
-fn resolve_author(parcel_hash: &str, office: &office_utils::OfficeState) -> String {
-    match sign_utils::load_parcel_signature(parcel_hash) {
-        Ok(Some(signature)) => office.find_key(&signature.key_id)
-            .map(|key| key.operator.clone())
-            .unwrap_or(signature.key_id),
-        _ => "unsigned".to_string(),
-    }
-}
-
-/// Record a new haul event: stack a single-event parcel signed by the actor onto the
-/// `@haul` head.
-fn record_event(event: &HaulEvent, actor: &Operator, description: String, signing_key_id: &str) -> Result<String, String> {
-    let parents: Vec<String> = pallet_utils::get_meta_pallet_head(HAUL_PALLET_NAME)?
-        .into_iter()
-        .collect();
-
-    let file_name = format!("{}{}", event.id(), RECORD_SUFFIX);
-    let blob_hash = store_record(&event_to_toml(event))?;
-
-    let mut haul_tree = TreeItem::new(TREE_NAME_HAUL.to_string(), String::new(), DirEntryType::Tree);
-    haul_tree.add_child(TreeItem::new(file_name, blob_hash, DirEntryType::Normal));
-
-    stack_haul_parcel(Some(haul_tree), parents, actor, description, signing_key_id)
-}
-
-/// Build, sign and store a haul parcel with the given (optional) event subtree and
-/// parents, and advance the `@haul` head. `event_subtree` is `None` for a join parcel.
-fn stack_haul_parcel(event_subtree: Option<TreeItem>,
-                     parents: Vec<String>,
-                     actor: &Operator,
-                     description: String,
-                     signing_key_id: &str) -> Result<String, String> {
-    let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-
-    if let Some(mut haul_tree) = event_subtree {
-        store_subtree(&mut haul_tree)?;
-
-        let mut tracked_tree = TreeItem::new(TREE_NAME_TRACKED.to_string(), String::new(), DirEntryType::Tree);
-        tracked_tree.add_child(haul_tree);
-        store_subtree(&mut tracked_tree)?;
-
-        let mut forklift_tree = TreeItem::new(TREE_NAME_FORKLIFT.to_string(), String::new(), DirEntryType::Tree);
-        forklift_tree.add_child(tracked_tree);
-        store_subtree(&mut forklift_tree)?;
-
-        root_tree.add_child(forklift_tree);
-    }
-
-    let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
-    root_object.store()?;
-
-    let timestamp = Utc::now();
-
-    let parcel = Parcel {
-        tree_hash: root_object.hash.clone(),
-        parents,
-        actions: vec![
-            ParcelAction { operator: actor.clone(), action: ParcelActionType::Author, description: None, timestamp },
-            ParcelAction { operator: actor.clone(), action: ParcelActionType::Stack, description: None, timestamp },
-        ],
-        description: Some(description),
-    };
-
-    let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
-    parcel_object.store()?;
-
-    let signature = sign_utils::sign_parcel_hash(signing_key_id, &parcel_object.hash)?;
-    sign_utils::store_parcel_signature(&parcel_object.hash, &signature)?;
-
-    pallet_utils::set_meta_pallet_head(HAUL_PALLET_NAME, &parcel_object.hash)?;
-
-    Ok(parcel_object.hash)
-}
-
-/// Build and store one subtree's object, recording the hash on the tree item.
-fn store_subtree(tree: &mut TreeItem) -> Result<(), String> {
-    let mut object = LooseObjectBuilder::build_tree(tree);
-    tree.hash = object.hash.clone();
-    object.store()?;
-
-    Ok(())
-}
-
-/// Store a record blob and return its hash.
-fn store_record(toml: &str) -> Result<String, String> {
-    let blob = Blob { content: toml.as_bytes().to_vec() };
-    let mut object = LooseObjectBuilder::build_blob(&blob);
-    object.store()?;
-
-    Ok(object.hash)
-}
-
-/// Load one record blob as a string.
-fn load_record(hash: &str) -> Result<String, String> {
-    String::from_utf8(object_utils::load_blob(hash)?.content)
-        .map_err(|_| format!("The haul record {} is not valid UTF-8.", hash))
-}
-
-/// Resolve a chain of subtree names from a root tree.
-fn resolve_subtree(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, String> {
-    let mut current = object_utils::load_tree(root_tree_hash)?;
-
-    for component in path {
-        let subtree_hash = current.get_subtrees()
-            .find(|(name, _)| name == component)
-            .map(|(_, item)| item.hash.clone());
-
-        match subtree_hash {
-            Some(hash) => current = object_utils::load_tree(&hash)?,
-            None => return Ok(None),
+    for (id, cells) in dirs {
+        match read_haul(&id, cells, &author) {
+            Ok(haul) => read.hauls.push(haul),
+            Err(reason) => read.unreadable.push(UnreadableHaul { id, reason }),
         }
     }
 
-    Ok(Some(current))
+    read.hauls.sort_by(|a, b| b.opened.opened_at.cmp(&a.opened.opened_at).then(b.id.cmp(&a.id)));
+
+    Ok(read)
 }
 
-/// Serialize a haul event as TOML.
-fn event_to_toml(event: &HaulEvent) -> String {
-    let mut doc = DocumentMut::new();
-
-    doc["haul"] = value(event.haul.as_str());
-    doc["kind"] = value(event.kind.as_str());
-    doc["recorded_at"] = value(event.recorded_at);
-    doc["body"] = value(event.body.as_str());
-
-    if let Some(source) = &event.source { doc["source"] = value(source.as_str()); }
-    if let Some(target) = &event.target { doc["target"] = value(target.as_str()); }
-    if let Some(title) = &event.title { doc["title"] = value(title.as_str()); }
-    if let Some(head) = &event.head { doc["head"] = value(head.as_str()); }
-    if let Some(verdict) = event.verdict { doc["verdict"] = value(verdict.as_str()); }
-    if let Some(merge_parcel) = &event.merge_parcel { doc["merge_parcel"] = value(merge_parcel.as_str()); }
-
-    doc.to_string()
+/// A cell's value, by the schema its name holds; an error naming why it cannot be read.
+fn readable<'c>(path: &str, cell: &'c CellRead, schema: &str) -> Result<&'c CellEnvelope, String> {
+    match cell {
+        CellRead::Readable(envelope) if envelope.schema == schema => Ok(envelope),
+        CellRead::Readable(envelope) => Err(format!("the cell {} holds a {} value", path, envelope.schema)),
+        CellRead::Unknown { schema, .. } =>
+            Err(format!("the cell {} is written with the schema \"{}\", which this forklift does not know", path, schema)),
+        CellRead::Malformed(why) => Err(format!("the cell {} is malformed: {}", path, why)),
+    }
 }
 
-/// Parse a haul event from TOML.
-fn parse_event(toml: &str) -> Result<HaulEvent, String> {
-    let doc: DocumentMut = toml.parse()
-        .map_err(|e| format!("A haul event is not valid TOML: {}", e))?;
+/// Read one haul directory. Its proposal, head and status must all read, or nothing about the
+/// haul does; a review or comment that cannot read is listed beside the rest.
+fn read_haul(id: &str, cells: HaulCells, author: &dyn Fn(&str) -> String) -> Result<Haul, String> {
+    let dir = haul_dir(id);
+    let named = |name: &str| format!("{}/{}", id, name);
 
-    // Optional, strict (FORK-81 follow-up: the class sweep PR #122 missed): `event_to_toml`
-    // omits each of these five keys entirely when the event carries no value for them, so an
-    // absent key legitimately means `None`. A *present* non-string value must still error
-    // rather than silently collapse to that same `None` — for `verdict` specifically, a
-    // present-but-malformed value would otherwise be read as "no verdict" by `fold_haul`
-    // instead of naming the actual damage, exactly the `revocation_reason` shape PR #122 fixed
-    // in `office_utils`. Uses the office's shared strict reader rather than a duplicated
-    // per-module `optional_string` closure with the old lenient shape.
-    let verdict = match office_utils::read_optional_string(&doc, "verdict", "haul event")? {
-        Some(value) => Some(ReviewVerdict::parse(&value)?),
-        None => None,
+    let opened = cells.opened.as_ref().ok_or(format!("the haul has cells but no {} cell", CELL_OPENED))?;
+    let opened = readable(&named(CELL_OPENED), opened, SCHEMA_OPENED)?;
+    let opened = parse_opened(&opened.value).map_err(|why| format!("the proposal {}", why))?;
+
+    let head = cells.head.as_ref().ok_or(format!("the haul has no {} cell", CELL_HEAD))?;
+    let head = parse_head(&readable(&named(CELL_HEAD), head, SCHEMA_HEAD)?.value)
+        .map_err(|why| format!("the head {}", why))?;
+
+    let status = match &cells.status {
+        Some(status) => parse_status(&readable(&named(CELL_STATUS), status, SCHEMA_STATUS)?.value)
+            .map_err(|why| format!("the status {}", why))?,
+        None => HaulStatus::Open,
     };
 
-    Ok(HaulEvent {
-        haul: office_utils::read_string(&doc, "haul", "haul event")?,
-        kind: HaulEventKind::parse(&office_utils::read_string(&doc, "kind", "haul event")?)?,
-        recorded_at: office_utils::read_integer(&doc, "recorded_at", "haul event")?,
-        body: office_utils::read_string(&doc, "body", "haul event")?,
-        source: office_utils::read_optional_string(&doc, "source", "haul event")?,
-        target: office_utils::read_optional_string(&doc, "target", "haul event")?,
-        title: office_utils::read_optional_string(&doc, "title", "haul event")?,
-        head: office_utils::read_optional_string(&doc, "head", "haul event")?,
-        verdict,
-        merge_parcel: office_utils::read_optional_string(&doc, "merge_parcel", "haul event")?,
-    })
+    let mut haul = Haul {
+        id: id.to_string(),
+        opened,
+        head,
+        status,
+        reviews: Vec::new(),
+        comments: Vec::new(),
+        unreadable: Vec::new(),
+    };
+
+    let display = |path: &str| path.strip_prefix(&format!("{}/", &dir[..2])).unwrap_or(path).to_string();
+
+    for (path, cell) in &cells.reviews {
+        let parsed = readable(&display(path), cell, SCHEMA_REVIEW).and_then(|envelope| {
+            parse_review(&envelope.value)
+                .map(|review| Review { author: author(&envelope.signer), ..review })
+                .map_err(|why| format!("the review at {} {}", display(path), why))
+        });
+
+        match parsed {
+            Ok(review) => haul.reviews.push(review),
+            Err(reason) => haul.unreadable.push(UnreadableCell { path: display(path), reason }),
+        }
+    }
+
+    for (path, cell) in &cells.comments {
+        let parsed = readable(&display(path), cell, SCHEMA_COMMENT).and_then(|envelope| {
+            parse_comment(&envelope.value)
+                .map(|comment| Comment { author: author(&envelope.signer), ..comment })
+                .map_err(|why| format!("the comment at {} {}", display(path), why))
+        });
+
+        match parsed {
+            Ok(comment) => haul.comments.push(comment),
+            Err(reason) => haul.unreadable.push(UnreadableCell { path: display(path), reason }),
+        }
+    }
+
+    for (path, _) in &cells.other {
+        haul.unreadable.push(UnreadableCell {
+            path: display(path),
+            reason: "a cell this forklift does not know".to_string(),
+        });
+    }
+
+    haul.comments.sort_by_key(|comment| comment.commented_at);
+
+    Ok(haul)
+}
+
+/// Find one haul by an id prefix (like a parcel hash prefix). Errors if none or several match,
+/// or if the one that matches cannot be read.
+pub fn find_haul(id_prefix: &str) -> Result<Haul, String> {
+    let read = read_hauls()?;
+
+    let unreadable: Vec<&UnreadableHaul> = read.unreadable.iter().filter(|haul| haul.id.starts_with(id_prefix)).collect();
+    let mut matches: Vec<Haul> = read.hauls.into_iter().filter(|haul| haul.id.starts_with(id_prefix)).collect();
+
+    match (matches.len(), unreadable.as_slice()) {
+        (0, []) => Err(format!("No haul matches \"{}\".", id_prefix)),
+        (1, []) => Ok(matches.remove(0)),
+        (0, [haul]) => Err(format!("Haul {} cannot be read: {}.", short(&haul.id), haul.reason)),
+        (n, more) => Err(format!("\"{}\" is ambiguous — it matches {} hauls.", id_prefix, n + more.len())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn events_round_trip_through_toml() {
-        let opened = HaulEvent {
-            haul: String::new(),
-            kind: HaulEventKind::Opened,
-            recorded_at: 100,
-            body: "please review".to_string(),
-            source: Some("feature".to_string()),
-            target: Some("main".to_string()),
-            title: Some("Add the thing".to_string()),
-            head: Some("a".repeat(64)),
-            verdict: None,
-            merge_parcel: None,
-        };
-        assert_eq!(parse_event(&event_to_toml(&opened)).unwrap(), opened);
-
-        let review = HaulEvent {
-            haul: opened.id(),
-            kind: HaulEventKind::Review,
-            recorded_at: 200,
-            body: "looks good".to_string(),
-            source: None,
-            target: None,
-            title: None,
-            head: None,
-            verdict: Some(ReviewVerdict::Approve),
-            merge_parcel: None,
-        };
-        assert_eq!(parse_event(&event_to_toml(&review)).unwrap(), review);
-    }
-
-    /// A minimal, otherwise-valid haul event TOML string with one extra clause spliced in —
-    /// the shared fixture for the strictness tests below.
-    fn haul_event_toml(extra_clause: &str) -> String {
-        format!(
-            "haul = \"h\"\n\
-             kind = \"opened\"\n\
-             recorded_at = 1\n\
-             body = \"b\"\n\
-             {}",
-            extra_clause
-        )
-    }
-
-    /// FORK-81 follow-up (the class sweep PR #122's own strictness fix missed): a present but
-    /// non-string `verdict` must error, never silently parse as "no verdict" the way the old
-    /// `optional_string` closure's `.and_then(as_str)` would — `fold_haul` folds `verdict` into
-    /// the review's recorded stance, so a damaged review would otherwise be dropped rather than
-    /// reported.
-    #[test]
-    fn a_present_non_string_verdict_in_a_haul_event_errors_naming_it() {
-        let toml = haul_event_toml("verdict = 7\n");
-
-        let error = match parse_event(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string verdict value must error, not silently become none"),
-        };
-        assert!(error.contains("\"verdict\""), "the error must name the field: {}", error);
+    fn opened() -> Opened {
+        Opened {
+            source: "feature".to_string(),
+            target: "main".to_string(),
+            title: "Add the thing".to_string(),
+            description: "please\nreview".to_string(),
+            opener: "alice".to_string(),
+            opened_at: 100,
+        }
     }
 
     #[test]
-    fn a_present_non_string_source_in_a_haul_event_errors_naming_it() {
-        let toml = haul_event_toml("source = 7\n");
+    fn every_value_round_trips() {
+        assert_eq!(parse_opened(&opened_value(&opened())).unwrap(), opened());
 
-        let error = match parse_event(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string source value must error, not silently become none"),
-        };
-        assert!(error.contains("\"source\""), "the error must name the field: {}", error);
+        let head = "a".repeat(64);
+        assert_eq!(parse_head(&head_value(&head)).unwrap(), head);
+
+        for status in [HaulStatus::Open, HaulStatus::Closed, HaulStatus::Merged("b".repeat(64))] {
+            assert_eq!(parse_status(&status_value(&status)).unwrap(), status);
+        }
+
+        let review = parse_review(&review_value(ReviewVerdict::RequestChanges, "not yet", &head, 7)).unwrap();
+        assert_eq!((review.verdict, review.body.as_str(), review.head.as_str(), review.reviewed_at),
+                   (ReviewVerdict::RequestChanges, "not yet", head.as_str(), 7));
+
+        let comment = parse_comment(&comment_value("hi", 9)).unwrap();
+        assert_eq!((comment.body.as_str(), comment.commented_at), ("hi", 9));
     }
 
     #[test]
-    fn a_present_non_string_target_in_a_haul_event_errors_naming_it() {
-        let toml = haul_event_toml("target = 7\n");
+    fn values_are_parsed_strictly() {
+        let mut extra = opened_value(&opened());
+        extra.insert("recorded_at", value(1));
+        assert!(parse_opened(&extra).unwrap_err().contains("unexpected field \"recorded_at\""));
 
-        let error = match parse_event(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string target value must error, not silently become none"),
-        };
-        assert!(error.contains("\"target\""), "the error must name the field: {}", error);
+        assert!(parse_head(&head_value("abc")).unwrap_err().contains("full parcel hash"));
+
+        let mut open_with_parcel = status_value(&HaulStatus::Open);
+        open_with_parcel.insert(FIELD_MERGE_PARCEL, value("b".repeat(64)));
+        assert!(parse_status(&open_with_parcel).is_err(), "only a merged status names a parcel");
+
+        let mut merged_without = status_value(&HaulStatus::Merged("b".repeat(64)));
+        merged_without.remove(FIELD_MERGE_PARCEL);
+        assert!(parse_status(&merged_without).is_err(), "a merged status names its parcel");
+
+        let mut unknown_state = status_value(&HaulStatus::Open);
+        unknown_state.insert(FIELD_STATE, value("draft"));
+        assert!(parse_status(&unknown_state).unwrap_err().contains("\"draft\""));
+
+        let mut bad_verdict = review_value(ReviewVerdict::Approve, "", &"a".repeat(64), 1);
+        bad_verdict.insert(FIELD_VERDICT, value("lgtm"));
+        assert!(parse_review(&bad_verdict).is_err());
+
+        let mut unpinned = review_value(ReviewVerdict::Approve, "", &"a".repeat(64), 1);
+        unpinned.remove(FIELD_HEAD);
+        assert!(parse_review(&unpinned).unwrap_err().contains("head"), "a review names the head it reviewed");
     }
 
     #[test]
-    fn a_present_non_string_title_in_a_haul_event_errors_naming_it() {
-        let toml = haul_event_toml("title = 7\n");
+    fn the_haul_id_derives_from_every_field_of_the_proposal() {
+        let base = opened().id();
+        assert_eq!(base, opened().id());
 
-        let error = match parse_event(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string title value must error, not silently become none"),
-        };
-        assert!(error.contains("\"title\""), "the error must name the field: {}", error);
+        let mut variants = Vec::new();
+        for change in 0..6 {
+            let mut other = opened();
+            match change {
+                0 => other.source.push('x'),
+                1 => other.target.push('x'),
+                2 => other.title.push('x'),
+                3 => other.description.push('x'),
+                4 => other.opener = "bob".to_string(),
+                _ => other.opened_at += 1,
+            }
+            variants.push(other.id());
+        }
+
+        assert!(variants.iter().all(|id| *id != base), "two hauls against one target never share an id");
+
+        // Length prefixes: moving a character between fields changes the id.
+        let mut shifted = opened();
+        shifted.source = "featur".to_string();
+        shifted.target = "emain".to_string();
+        assert_ne!(shifted.id(), base);
     }
 
     #[test]
-    fn a_present_non_string_head_in_a_haul_event_errors_naming_it() {
-        let toml = haul_event_toml("head = 7\n");
+    fn a_cell_path_parses_only_at_its_shape() {
+        let id = opened().id();
+        let dir = haul_dir(&id);
+        let hex = "e".repeat(64);
 
-        let error = match parse_event(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string head value must error, not silently become none"),
-        };
-        assert!(error.contains("\"head\""), "the error must name the field: {}", error);
+        assert_eq!(parse_cell_path(&format!("{}/opened", dir)).unwrap().name, CellName::Opened);
+        assert_eq!(parse_cell_path(&format!("{}/review/{}", dir, hex)).unwrap().name, CellName::Review { owner: &hex });
+        assert_eq!(
+            parse_cell_path(&format!("{}/comment/{}/{}", dir, hex, hex)).unwrap().name,
+            CellName::Comment { owner: &hex, id: &hex }
+        );
+        assert_eq!(parse_cell_path(&format!("{}/label", dir)).unwrap().name, CellName::Other);
+
+        for wrong in [
+            format!("{}/opened/extra", dir),
+            format!("{}/review", dir),
+            format!("{}/review/short", dir),
+            format!("{}/comment/{}", dir, hex),
+            format!("zz/{}/opened", id),
+            format!("{}/opened", &id[..2]),
+        ] {
+            assert!(parse_cell_path(&wrong).is_err(), "{} must not parse", wrong);
+        }
     }
 
     #[test]
-    fn a_present_non_string_merge_parcel_in_a_haul_event_errors_naming_it() {
-        let toml = haul_event_toml("merge_parcel = 7\n");
-
-        let error = match parse_event(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string merge_parcel value must error, not silently become none"),
-        };
-        assert!(error.contains("\"merge_parcel\""), "the error must name the field: {}", error);
-    }
-
-    /// The absent-key case must stay exactly as lenient as before: `event_to_toml` omits every
-    /// one of these six keys when the event carries no value for them (proven for all six by
-    /// `events_round_trip_through_toml` above), and a record with none of them present must
-    /// still parse with every one of them `None` — the strictness fix above must not narrow that.
-    #[test]
-    fn a_haul_event_with_none_of_the_optional_keys_parses_with_all_none() {
-        let toml = haul_event_toml("");
-
-        let parsed = parse_event(&toml).expect("a record with no optional keys must still parse");
-        assert_eq!(parsed.source, None);
-        assert_eq!(parsed.target, None);
-        assert_eq!(parsed.title, None);
-        assert_eq!(parsed.head, None);
-        assert_eq!(parsed.verdict, None);
-        assert_eq!(parsed.merge_parcel, None);
-    }
-
-    #[test]
-    fn fold_derives_status_head_and_latest_review() {
-        let opened = HaulEvent {
-            haul: String::new(), kind: HaulEventKind::Opened, recorded_at: 1,
-            body: "d".to_string(), source: Some("feat".to_string()), target: Some("main".to_string()),
-            title: Some("t".to_string()), head: Some("h1".to_string()), verdict: None, merge_parcel: None,
-        };
-        let id = opened.id();
-        let attributed = |event: HaulEvent, author: &str, parcel: &str| AttributedEvent {
-            event, author: author.to_string(), parcel: parcel.to_string(),
-        };
-        let mut pushed = event(&id, HaulEventKind::Pushed, "");
-        pushed.recorded_at = 3;
-        pushed.head = Some("h2".to_string());
-
-        let mut approve = event(&id, HaulEventKind::Review, "ok");
-        approve.recorded_at = 2;
-        approve.verdict = Some(ReviewVerdict::Approve);
-
-        let events = vec![
-            attributed(opened, "alice", "p1"),
-            attributed(approve, "bob", "p2"),
-            attributed(pushed, "alice", "p3"),
-        ];
-
-        let haul = fold_haul(id.clone(), events).unwrap();
-        assert_eq!(haul.head, "h2");                       // latest Pushed wins
-        assert_eq!(haul.status, HaulStatus::Open);
-        assert_eq!(haul.reviews.len(), 1);
-        assert_eq!(haul.reviews[0].verdict, ReviewVerdict::Approve);
-        assert_eq!(haul.opened_by, "alice");
+    fn a_comment_id_separates_body_and_time() {
+        assert_eq!(comment_id(&comment_value("a", 1)), comment_id(&comment_value("a", 1)));
+        assert_ne!(comment_id(&comment_value("a", 1)), comment_id(&comment_value("a", 2)));
+        assert_ne!(comment_id(&comment_value("a", 1)), comment_id(&comment_value("b", 1)));
     }
 }

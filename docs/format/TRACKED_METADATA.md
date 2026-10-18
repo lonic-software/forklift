@@ -43,10 +43,9 @@ paths. Trees carrying a top-level `.forklift` entry are refused by every operati
 materializes or merges trees.
 
 ## The meta-tree format
-`forklift-core`'s `meta_tree` module defines the format the non-office meta pallets move to,
-one pallet per change. `@kv`, `@manifest` and `@tags` are written in it; `@haul` keeps its own
-format until its change lands. A meta tree is the pallet's whole state, and its chain is linear (a parcel has at most
-one parent), as with the office:
+`forklift-core`'s `meta_tree` module defines the format of every meta pallet but the office:
+`@kv`, `@manifest`, `@tags` and `@haul`. A meta tree is the pallet's whole state, and its chain
+is linear (a parcel has at most one parent), as with the office:
 
 ```
 .forklift/tracked/format          a blob reading exactly "forklift-meta 1 <kind>"
@@ -172,6 +171,68 @@ never wedges the history it admitted. And no parcel may change or remove an exis
 tag name is immutable everywhere. Two tags created concurrently under one name are a conflict
 at `lower`: keeping `theirs` drops the local tag, and keeping `ours` is refused by the
 immutability rule.
+
+### `@haul`
+
+Merge proposals (pull requests). Each haul is a directory of cells:
+
+```
+cells/<h[0..2]>/<h>/opened              schema "haul.opened 1"
+cells/<h[0..2]>/<h>/head                schema "haul.head 1"
+cells/<h[0..2]>/<h>/status              schema "haul.status 1"     (absent: open)
+cells/<h[0..2]>/<h>/review/<op>         schema "haul.review 1"
+cells/<h[0..2]>/<h>/comment/<op>/<id>   schema "haul.comment 1"
+```
+
+`h` is the haul id: the `Blake3` of every field of the `opened` value, each length-prefixed. The
+opener and the time are among them, so two hauls never share an id. `op` is the `Blake3` of the
+writer's operator identifier, as in `@manifest`, and a comment's `id` the `Blake3` of its fields.
+The values, each with exactly these fields:
+
+```toml
+# opened
+source = "feature"                  # the pallet proposed for merging
+target = "main"                     # the pallet it merges into
+title = "Add X"
+description = "why"                 # may be empty
+opener = "alice@example.com"        # the operator who opened it — must be the signer's
+opened_at = 1782205234              # part of the id; never a security input
+
+# head
+head = "0f1877dd…"                  # the full hash of the proposed source head
+
+# status
+state = "merged"                    # open | closed | merged
+merge_parcel = "9a03c1e2…"          # present exactly when merged
+
+# review — one per operator, replaced when they review again
+verdict = "approve"                 # approve | request-changes | comment
+body = "LGTM"                       # may be empty
+head = "0f1877dd…"                  # the head reviewed; a review of an earlier head does not count
+reviewed_at = 1782205234            # display only
+
+# comment
+body = "…"
+commented_at = 1782205234           # display only
+```
+
+The pallet rules, checked wherever the content check runs:
+
+- `opened` is written once, by the operator it names, at the id its value derives, in the same
+  parcel as a `head`, and is never changed or removed.
+- No other cell may exist in a haul directory without its `opened`.
+- `head` may move but is never removed.
+- A `status` that reads merged is never changed or removed. A status this build cannot read is
+  never changed either, since it cannot tell whether it reads merged.
+- `review/<op>` and `comment/<op>/…` are written or removed only by the operator `op` names.
+- A cell of a known schema holds the schema its name takes and a strictly valid value. A cell
+  name not listed above is refused, so no cell is stored that no rule covers.
+
+A cell of a newer schema at a known name is carried, except at `opened`, which the rules must
+read; it is listed as unreadable. When a haul's `opened`, `head` or `status` cannot be read, the whole haul is listed
+as unreadable and every command addressing it refuses. Conflicts are resolved at any path from
+`<h>` down to a cell; keeping `theirs` at `<h>` drops a locally opened haul whole. Two operators
+closing and reopening, or moving the head, concurrently is a conflict on that cell.
 
 ## Record formats (TOML)
 A user record:

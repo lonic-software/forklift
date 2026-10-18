@@ -1100,6 +1100,7 @@ A command not listed here either reports only the generic human-message shape `{
     "HaulSummary": {
       "properties": {
         "approvals": {
+          "description": "Approvals of the haul's current head; an approval of an earlier head is not counted.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -1129,6 +1130,23 @@ A command not listed here either reports only the generic human-message shape `{
         "approvals"
       ],
       "type": "object"
+    },
+    "UnreadableLine": {
+      "description": "A haul, or a cell of one, that this forklift cannot read.",
+      "properties": {
+        "path": {
+          "description": "The haul id, or the cell path within the pallet.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "reason"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1141,11 +1159,19 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "state": {
       "type": "string"
+    },
+    "unreadable": {
+      "description": "Hauls and cells this forklift cannot read, whatever the state filter.",
+      "items": {
+        "$ref": "#/$defs/UnreadableLine"
+      },
+      "type": "array"
     }
   },
   "required": [
     "state",
-    "hauls"
+    "hauls",
+    "unreadable"
   ],
   "title": "HaulList",
   "type": "object"
@@ -1157,6 +1183,26 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "CommentLine": {
+      "properties": {
+        "author": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "commented_at": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "author",
+        "body",
+        "commented_at"
+      ],
+      "type": "object"
+    },
     "ReviewLine": {
       "properties": {
         "author": {
@@ -1171,6 +1217,18 @@ A command not listed here either reports only the generic human-message shape `{
             "null"
           ]
         },
+        "current": {
+          "description": "Whether that is the haul's current head; a review of an earlier head no longer counts.",
+          "type": "boolean"
+        },
+        "head": {
+          "description": "The head the review is of.",
+          "type": "string"
+        },
+        "reviewed_at": {
+          "format": "int64",
+          "type": "integer"
+        },
         "verdict": {
           "type": "string"
         }
@@ -1178,32 +1236,40 @@ A command not listed here either reports only the generic human-message shape `{
       "required": [
         "author",
         "verdict",
-        "body"
+        "body",
+        "head",
+        "current",
+        "reviewed_at"
       ],
       "type": "object"
     },
-    "ThreadLine": {
+    "UnreadableLine": {
+      "description": "A haul, or a cell of one, that this forklift cannot read.",
       "properties": {
-        "author": {
+        "path": {
+          "description": "The haul id, or the cell path within the pallet.",
           "type": "string"
         },
-        "body": {
-          "type": "string"
-        },
-        "kind": {
+        "reason": {
           "type": "string"
         }
       },
       "required": [
-        "author",
-        "kind",
-        "body"
+        "path",
+        "reason"
       ],
       "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "comments": {
+      "description": "Oldest first.",
+      "items": {
+        "$ref": "#/$defs/CommentLine"
+      },
+      "type": "array"
+    },
     "description": {
       "type": "string"
     },
@@ -1213,7 +1279,18 @@ A command not listed here either reports only the generic human-message shape `{
     "id": {
       "type": "string"
     },
-    "opened_by": {
+    "merge_parcel": {
+      "description": "The merge parcel, when merged.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "opened_at": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "opener": {
       "type": "string"
     },
     "reviews": {
@@ -1231,14 +1308,15 @@ A command not listed here either reports only the generic human-message shape `{
     "target": {
       "type": "string"
     },
-    "thread": {
-      "items": {
-        "$ref": "#/$defs/ThreadLine"
-      },
-      "type": "array"
-    },
     "title": {
       "type": "string"
+    },
+    "unreadable": {
+      "description": "The haul's review and comment cells this forklift cannot read.",
+      "items": {
+        "$ref": "#/$defs/UnreadableLine"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -1248,10 +1326,12 @@ A command not listed here either reports only the generic human-message shape `{
     "target",
     "status",
     "head",
-    "opened_by",
+    "opener",
+    "opened_at",
     "description",
     "reviews",
-    "thread"
+    "comments",
+    "unreadable"
   ],
   "title": "HaulDetail",
   "type": "object"
@@ -1276,6 +1356,33 @@ A command not listed here either reports only the generic human-message shape `{
     "action"
   ],
   "title": "Acted",
+  "type": "object"
+}
+```
+
+### `Updated`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "changed": {
+      "description": "False when the haul already proposed that head.",
+      "type": "boolean"
+    },
+    "head": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "head",
+    "changed"
+  ],
+  "title": "Updated",
   "type": "object"
 }
 ```
@@ -1896,13 +2003,6 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "Meta pallets that failed to sync. Never in a successful report.",
       "items": {
         "$ref": "#/$defs/MetaPalletFailure"
-      },
-      "type": "array"
-    },
-    "meta_merged": {
-      "description": "Meta pallets whose diverged history was merged with the remote's.",
-      "items": {
-        "type": "string"
       },
       "type": "array"
     },

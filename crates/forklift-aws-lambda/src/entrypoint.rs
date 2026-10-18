@@ -290,8 +290,8 @@ fn unauthorized() -> HeadError {
 /// after authentication has already passed: closure presence (`verify_parcel_closure_with`),
 /// fast-forward-only refs, and — on a trusted warehouse — `verify_office_chain_memoized` +
 /// `verify_office_privileges` for an office-pallet update, `verify_converted_update` for a meta
-/// pallet on the meta-tree format (`@kv`, `@manifest`, `@tags`), or `verify_office_chain_memoized`
-/// + `verify_pallet_history` for any other pallet (an ordinary working pallet, or `@haul`). The
+/// pallet on the meta-tree format (`@kv`, `@manifest`, `@tags`, `@haul`), or
+/// `verify_office_chain_memoized` + `verify_pallet_history` for a working pallet. The
 /// office and pallet-history checks differ: `verify_office_privileges` checks each
 /// office-modifying parcel's *signer* against the office role they held as of that parcel's own
 /// signing; `verify_pallet_history` accepts a parcel when it is either (a) validly signed

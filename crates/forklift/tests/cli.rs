@@ -4430,11 +4430,48 @@ fn haul_reviews_carry_signed_identity_and_merges() {
         "the agent's review must carry its class: {:?}", reviews
     );
 
+    let approvals = |warehouse: &TestWarehouse| json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["approvals"].clone();
+    assert_eq!(approvals(&warehouse), 1);
+
+    // New work on the source: until the haul is updated it still proposes the old head, and
+    // once it is, the earlier reviews are listed against the head they reviewed but no longer
+    // count.
+    assert_success(&warehouse.run(&["shift", "feature"]));
+    warehouse.write_file("feature.txt", "feat 2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "more feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    let old_head = shown["data"]["head"].as_str().unwrap().to_string();
+    let updated = json(&warehouse.run(&["haul", "update", &id, "--json"]));
+    assert_eq!(updated["data"]["changed"], true);
+    assert_ne!(updated["data"]["head"], old_head.as_str());
+    assert_eq!(json(&warehouse.run(&["haul", "update", &id, "--json"]))["data"]["changed"], false);
+
+    let shown = json(&warehouse.run(&["haul", "show", &id, "--json"]));
+    assert!(
+        shown["data"]["reviews"].as_array().unwrap().iter().all(|r| r["current"] == false && r["head"] == old_head.as_str()),
+        "a review stays pinned to the head it reviewed: {}", shown
+    );
+    assert_eq!(approvals(&warehouse), 0, "an approval of an earlier head does not count");
+
+    assert_success(&warehouse.run(&["haul", "review", &id, "-m", "still good"]));
+    assert_eq!(approvals(&warehouse), 1);
+
     // Merge is recorded, not gated on the request-changes (MVP policy) → merged, and the
     // source's file is now on the target.
     assert_success(&warehouse.run(&["haul", "merge", &id]));
-    assert_eq!(std::fs::read_to_string(warehouse.root.join("feature.txt")).unwrap(), "feat\n");
-    assert_eq!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "merged");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("feature.txt")).unwrap(), "feat 2\n");
+    let shown = json(&warehouse.run(&["haul", "show", &id, "--json"]));
+    assert_eq!(shown["data"]["status"], "merged");
+    assert!(shown["data"]["merge_parcel"].as_str().is_some_and(|p| p.len() == 64), "{}", shown);
+
+    // A merged haul is final.
+    for action in ["reopen", "close", "update", "merge"] {
+        let refused = warehouse.run(&["haul", action, &id]);
+        assert!(!refused.status.success(), "haul {} of a merged haul must be refused", action);
+        assert!(stderr(&refused).contains("merged"), "{}", stderr(&refused));
+    }
 }
 
 /// Record text is authored by whoever wrote the record — a remote operator, once it syncs — so a

@@ -2098,8 +2098,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     // role" check: @office's parcels are checked, per parcel, against the
                     // signer's role (`verify_office_privileges`); a converted pallet's against
                     // its own rules (`verify_meta_content`), which for @tags include an
-                    // admin rule; @haul takes the same `verify_pallet_history` path as an
-                    // ordinary working pallet and gets no role or grant check at all.
+                    // admin rule. No meta pallet gets a pallet grant check.
                     user.role != office_utils::Role::Reader
                 } else {
                     user.may_write_pallet(&bare)
@@ -2235,8 +2234,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             ).map_err(unprocessable)?;
         } else if let Some(anchor) = anchor {
             // A trusted warehouse accepts nothing a local audit would reject. This is the
-            // user-pallet path, and that of a meta pallet still on its own code (the office
-            // and converted pallets took the branches above). The office head is the one
+            // user-pallet path (the office and the meta-tree pallets took the branches above). The office head is the one
             // already read above, not a second lookup.
             let office_head = office_head.ok_or(unprocessable(
                 "Trust is established but the office pallet is missing; lift the \

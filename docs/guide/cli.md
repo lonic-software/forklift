@@ -773,6 +773,7 @@ values. A tag this forklift cannot read (a newer schema, say) is listed as `unre
 forklift haul open --target main --source feature --title "Add X" -m "why"
 forklift haul list [--state open|merged|closed|all]
 forklift haul show <id>
+forklift haul update <id>                                          # propose the source's new head
 forklift haul comment <id> -m "…"
 forklift haul review <id> [--request-changes | --comment] -m "…"   # approves by default
 forklift shift main && forklift haul merge <id>                    # merge lands on the target
@@ -780,12 +781,15 @@ forklift haul close <id> | reopen <id>
 ```
 
 A **haul** proposes merging one pallet into another, with discussion and reviews — forklift's
-pull request. Like the manifest, it lives on a meta pallet (`@haul`), here as an **append-only
-log of signed events** (Opened / Pushed / Comment / Review / Merged / Closed), folded into current
-state; it lifts/lowers/franchises with your warehouse and a diverged `@haul` **auto-merges**
-(the union of events). Because every event is signed, authorship — **including who approved** —
-is forge-proof and carries the reviewer's identity class, so a human's approval is
-distinguishable from an agent's (`haul show` tags automated reviewers). `merge` reuses
+pull request. Like the manifest, it lives on a meta pallet (`@haul`), as signed cells: the
+proposal, the proposed head, the status, one review per reviewer, and the comments. It
+lifts/lowers/franchises with your warehouse, and a diverged `@haul` replays your changes onto
+the remote's like the other meta pallets. Because every cell is signed, authorship —
+**including who approved** — is forge-proof and carries the reviewer's identity class, so a
+human's approval is distinguishable from an agent's (`haul show` tags automated reviewers).
+A review records the head it reviewed: after `haul update` moves the haul to new work, an
+earlier approval is still shown, marked with the head it was of, but no longer counts. A merged
+haul stays merged — no one can reopen or close it, on any head. `merge` reuses
 `consolidate` (a clean disjoint merge auto-stacks; a conflict leaves the consolidation in
 progress — resolve, `stack`, then re-run `haul merge` to record it). A haul id is
 content-addressed; use any unique prefix.
@@ -1180,7 +1184,7 @@ warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-sco
 content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
 
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
-working pallet still lowers. A diverged `@haul` merges; a diverged `@kv`, `@manifest` or `@tags`
+working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`
 replays your changes onto the remote's, and `--keep` resolves the paths both sides changed (see
 `kv`).
 
