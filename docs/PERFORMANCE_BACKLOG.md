@@ -526,7 +526,18 @@ itself as well as the findings.
      shared multi-mutation join-point primitive as findings 2/4, so a change that touches many
      distinct directories still costs more than one that touches a few; queued for PR B.
 4. **`restore <dir>` (plain) and `park pop`** — ~9.2–9.6 ms/file; same join-point
-   primitive as #2, bundles with it. Queued for PR B.
+   primitive as #2, bundles with it.
+   * **`restore <dir>`: done (FORK-112, slice 1).** `inventory_utils::ShardMutationBatch` is
+     the shared primitive: per-file shard edits collect in memory and publish once through
+     `publish_shard_outcomes`, with a shard that only had its stat data refreshed carried as
+     `Carry`. `restore .` now pays 1 barrier for 10 or 50 files (it paid 11 and 51), and no
+     longer strips the rollups above the files it rewrites, so the next `stocktake` still
+     skips them. Synthetic, 48 dirtied files: 721 → 20 ms. git.git, `restore Documentation`
+     (982 tracked files, 200 of them dirtied): 18.6 s → 0.55 s (34×), 982 barriers → 1. Each shard is published at the moment of its last change. A caller must stat each file
+     right after writing it, then call `update`; writing many files first and statting them
+     later would trust an edit made in between.
+   * `park pop` (FORK-195), and `consolidate`/`cherry-pick`'s merge actions (FORK-196), are the
+     remaining slices, one PR each.
 5. **`remove <dir>`'s per-shard loop** — untimed, small, rare; demand-gated. (The
    commit-graph's multi-shard writes, once listed here, pay no barrier at all since
    FORK-162 — see "Best-effort state" below.)
@@ -581,8 +592,10 @@ same shard; the batching work needs to collapse same-shard actions into one
 read-modify-write, not merely share one fsync across N rewrites of the same file.
 PR A's `refresh_tracked_entries` rewrite does this implicitly for its blob layer (one
 shared blob batch across every shard it touches); the shard-content layer itself
-(one `write_shard_mutation`/`save_inventory` call per shard) is unchanged, left for
-PR B's shared primitive.
+(one `write_shard_mutation`/`save_inventory` call per shard) is unchanged. That shared
+primitive is now `ShardMutationBatch` (FORK-112): it applies every same-shard action to one
+in-memory copy and publishes each shard once. `restore <dir>` uses it; `park pop` and
+`consolidate`/`cherry-pick` still call `update_shard` per file.
 
 **git.git sanity (PR A, re-verified after review round 2).** A full first-time `load` of
 git.git's working tree (4,775 files, every file brand-new — the same per-file blob-store

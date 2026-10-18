@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
-use forklift_core::model::inventory::Inventory;
+use forklift_core::model::inventory::{Inventory, InventoryItem};
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::inventory_utils::TrackedKind;
@@ -142,6 +142,8 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 
     let mut restored_any = false;
     let mut restored_count = 0usize;
+    let mut batch = inventory_utils::ShardMutationBatch::new();
+    let mut result: Result<(), String> = Ok(());
 
     for entry in &metadata {
         let shard_key = inventory_utils::metadata_entry_to_key(entry);
@@ -152,23 +154,44 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 
         restored_any = true;
 
-        let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(shard_key)?;
-
-        let Some(bytes) = shard_bytes else {
-            continue;
+        let inventory = match read_shard(shard_key) {
+            Ok(Some(inventory)) => inventory,
+            Ok(None) => continue,
+            Err(e) => { result = Err(e); break; }
         };
-
-        let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
-            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", shard_key, e))?;
 
         for (name, item) in inventory.get_items() {
             if item.state == InventoryItemState::Deleted {
                 continue;
             }
 
-            restore_file_and_refresh_entry(shard_key, name, &item.hash, item.item_type)?;
+            // Stat right after the write, as one `update_shard` per file did: a file statted
+            // later would record an editor's save in between against the staged hash.
+            let refreshed = write_restored_file(shard_key, name, &item.hash, item.item_type)
+                .and_then(|()| refreshed_item(shard_key, name, &item.hash, item.item_type))
+                .and_then(|refreshed| batch.update(shard_key, |shard| shard.add_item(refreshed)));
+
+            if let Err(e) = refreshed {
+                result = Err(e);
+                break;
+            }
+
             restored_count += 1;
         }
+
+        if result.is_err() {
+            break;
+        }
+    }
+
+    // What was decided before a failure is still published, as one `update_shard` per file
+    // would already have published it — the failure is reported after, together with the
+    // publish's own failure if that failed too. A failed publish records none of the batch's
+    // entries, though every file restored before it is already on disk.
+    match (result, batch.publish()) {
+        (Err(first), Err(publish)) => return Err(format!("{}\n{}", first, publish)),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => return Err(e),
+        (Ok(()), Ok(())) => {}
     }
 
     if !restored_any {
@@ -181,6 +204,19 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     output::message(format!("Restored {} file(s) from the inventory.", restored_count));
 
     Ok(())
+}
+
+/// The parsed shard at `key`, or `None` when it has no shard file.
+fn read_shard(key: &str) -> Result<Option<Inventory>, String> {
+    let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+    let Some(bytes) = shard_bytes else {
+        return Ok(None);
+    };
+
+    forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
+        .map(Some)
+        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))
 }
 
 /// Write one tracked file from its blob and refresh its inventory entry with the new
@@ -199,11 +235,42 @@ fn restore_file_and_refresh_entry(parent_key: &str,
                                   name: &str,
                                   hash: &str,
                                   item_type: DirEntryType) -> Result<(), String> {
-    let file_path = if parent_key.is_empty() {
+    write_restored_file(parent_key, name, hash, item_type)?;
+
+    let refreshed = refreshed_item(parent_key, name, hash, item_type)?;
+
+    inventory_utils::update_shard(parent_key, |inventory| {
+        inventory.add_item(refreshed);
+        Ok(())
+    })
+}
+
+/// The warehouse path of the file `name` in the directory `parent_key`.
+fn tracked_path(parent_key: &str, name: &str) -> String {
+    if parent_key.is_empty() {
         name.to_string()
     } else {
         format!("{}/{}", parent_key, name)
-    };
+    }
+}
+
+/// Write one tracked file from its blob, refusing a path that would overwrite another file
+/// through an alias or that needs a directory where a file is. The inventory is not touched.
+///
+/// # Arguments
+/// * `parent_key` - The warehouse path key of the file's directory.
+/// * `name`       - The name of the file.
+/// * `hash`       - The blob hash of the staged content.
+/// * `item_type`  - The type of the entry.
+///
+/// # Returns
+/// * `Ok(())`      - If the file was written.
+/// * `Err(String)` - If the path was refused or the write failed.
+fn write_restored_file(parent_key: &str,
+                       name: &str,
+                       hash: &str,
+                       item_type: DirEntryType) -> Result<(), String> {
+    let file_path = tracked_path(parent_key, name);
 
     // The inventory can hold two spellings of one file on a case-insensitive volume (a
     // case-only directory rename staged under the new name while the old one stays): writing
@@ -227,19 +294,21 @@ fn restore_file_and_refresh_entry(parent_key: &str,
         alias_utils::Occupancy::Vacant | alias_utils::Occupancy::Listed => {}
     }
 
-    shift_utils::write_tracked_file(&file_path, hash, item_type, false)?;
+    shift_utils::write_tracked_file(&file_path, hash, item_type, false)
+}
 
-    let refreshed = inventory_utils::build_inventory_item_from_stat(
-        std::path::Path::new(&file_path),
+/// The inventory entry of a file `write_restored_file` just wrote: its staged hash, with the
+/// file's new stat data.
+fn refreshed_item(parent_key: &str,
+                  name: &str,
+                  hash: &str,
+                  item_type: DirEntryType) -> Result<InventoryItem, String> {
+    inventory_utils::build_inventory_item_from_stat(
+        std::path::Path::new(&tracked_path(parent_key, name)),
         name,
         hash.to_string(),
         item_type,
-    )?;
-
-    inventory_utils::update_shard(parent_key, |inventory| {
-        inventory.add_item(refreshed);
-        Ok(())
-    })
+    )
 }
 
 /// Reset the inventory entries of the given path to the pallet head (unstage). The

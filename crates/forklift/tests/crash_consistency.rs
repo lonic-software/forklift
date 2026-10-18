@@ -823,6 +823,67 @@ fn load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count() {
     assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
 }
 
+/// One `restore .` over 5 directories, each holding `files_per_dir` tracked files that were all
+/// edited after the stack, with `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the barrier count
+/// that run paid.
+fn restore_barrier_count_for(files_per_dir: usize) -> u64 {
+    let area = Area::new(&format!("restore-barrier-count-{}", files_per_dir));
+    let warehouse = area.warehouse();
+
+    const DIR_COUNT: usize = 5;
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("edited {dir} {f}\n")).unwrap();
+        }
+    }
+
+    let mut command = area.command(&["restore", "."]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "restore failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    // The restore really rewrote every file, so the count below measures a full restore.
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            assert_eq!(std::fs::read_to_string(dir_path.join(format!("file{f}.txt"))).unwrap(),
+                format!("v1 {dir} {f}\n"));
+        }
+    }
+
+    barrier_count(&output)
+}
+
+/// `restore` of a directory publishes every shard it refreshes in one batch, so its barrier
+/// count does not grow with the number of files it rewrites — before the batch it paid one
+/// shard publish per file.
+#[test]
+fn restore_pays_a_constant_number_of_barriers_regardless_of_restored_file_count() {
+    let count_1 = restore_barrier_count_for(1);
+    let count_10 = restore_barrier_count_for(10);
+
+    assert_eq!(count_1, count_10,
+        "restore's barrier count must not scale with the number of restored files: {count_1} for 1 \
+         file/directory, {count_10} for 10 files/directory (the same 5 directories either way)");
+    assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}
+
 /// The incomplete-load marker (`load_guard_utils`) must ride a load's own first durable barrier
 /// instead of paying a second, standalone one. For a directory `load`
 /// with real content to publish, that first barrier is the walk's blob-publish batch (Phase 0 —
