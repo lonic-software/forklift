@@ -467,25 +467,32 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
 
     for action in actions {
         if matches!(action, MergeAction::Delete { .. }) {
-            apply_merge_action(action, &mut conflict_paths)?;
+            apply_merge_action(action, None, &mut conflict_paths)?;
         }
     }
 
-    for action in actions {
-        if !matches!(action, MergeAction::Delete { .. }) {
-            apply_merge_action(action, &mut conflict_paths)?;
-        }
-    }
+    let writes: Vec<&MergeAction> = actions.iter().filter(|action| !matches!(action, MergeAction::Delete { .. })).collect();
+
+    // Their blobs load ahead on worker threads while the writes land here, in order.
+    shift_utils::write_in_order(&writes, |action| match action {
+        MergeAction::TakeTheirs { hash, item_type, .. } => shift_utils::prefetch_blob(hash, *item_type),
+        _ => None,
+    }, |action, content| apply_merge_action(action, content, &mut conflict_paths))?;
 
     Ok(conflict_paths)
 }
 
 /// Apply one merge action to the working directory and the inventory. Shared with
 /// `cherry-pick`, which applies a parcel's diff through the same `MergeAction`s.
-pub(crate) fn apply_merge_action(action: &MergeAction, conflict_paths: &mut Vec<String>) -> Result<(), String> {
+///
+/// `content` is a `TakeTheirs` blob already loaded by [`shift_utils::write_in_order`]'s
+/// prefetch, or `None` to load it here.
+pub(crate) fn apply_merge_action(action: &MergeAction,
+                                 content: Option<Result<Vec<u8>, String>>,
+                                 conflict_paths: &mut Vec<String>) -> Result<(), String> {
     match action {
         MergeAction::TakeTheirs { path, hash, item_type, is_new } => {
-            shift_utils::write_tracked_file(path, hash, *item_type, *is_new)?;
+            shift_utils::write_tracked_file_from(path, hash, *item_type, *is_new, content)?;
             inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)
         }
 
