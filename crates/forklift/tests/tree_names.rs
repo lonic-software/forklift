@@ -471,6 +471,28 @@ fn a_leftover_from_an_interrupted_assembly_is_cleared_and_never_reaches_the_work
 }
 
 #[test]
+fn assembly_leftovers_are_cleared_by_any_command_that_takes_the_lock() {
+    // A warehouse that never checks out another chunked file must not keep leftovers forever.
+    // A read-only command does not hold the lock, so it may not clear them: an assembly could
+    // be in flight.
+    let warehouse = Warehouse::new("assemble-sweep");
+    let assembly = warehouse.root.join(".forklift").join("assembly");
+    std::fs::create_dir_all(&assembly).unwrap();
+    std::fs::write(assembly.join("1-0.tmp"), "half an assembly").unwrap();
+    std::fs::write(assembly.join("2-7.tmp"), "another").unwrap();
+
+    warehouse.run_ok(&["stocktake"]);
+    assert!(assembly.join("1-0.tmp").exists(), "a command without the lock cleared a leftover");
+
+    warehouse.run_ok(&["heal"]);
+
+    let left: Vec<_> = std::fs::read_dir(&assembly).unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "the lock holder left assembly leftovers: {:?}", left);
+}
+
+#[test]
 fn a_chunked_file_with_a_name_near_the_length_limit_checks_out() {
     // The temp name must not grow with the file's name, or a name the file system took when the
     // file was stacked could never be checked out again.

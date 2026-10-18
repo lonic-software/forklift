@@ -32,7 +32,8 @@ pub struct WarehouseLock {
 
 impl WarehouseLock {
     /// Acquire the warehouse lock. The current directory must be the warehouse root
-    /// (see `warehouse_utils::enter_warehouse`).
+    /// (see `warehouse_utils::enter_warehouse`). Once it is held, leftovers of interrupted
+    /// chunked-file assemblies in the bay are removed.
     ///
     /// # Returns
     /// * `Ok(WarehouseLock)` - The acquired lock (released when dropped).
@@ -47,6 +48,9 @@ impl WarehouseLock {
         // created — a relative path would resolve against the new cwd on drop.
         let path = absolute(bay_root().join(FILE_NAME_LOCK));
         acquire_lock_file(&path, "warehouse")?;
+
+        // Holding the lock is what makes anything in the bay's assembly folder a leftover.
+        crate::util::shift_utils::clear_assembly_leftovers();
         Ok(WarehouseLock { path })
     }
 }
