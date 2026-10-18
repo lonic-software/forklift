@@ -885,7 +885,7 @@ fn restore_pays_a_constant_number_of_barriers_regardless_of_restored_file_count(
 }
 
 /// One `park pop` over 5 directories, each holding `files_per_dir` tracked files that were all
-/// edited and one more tracked file that was removed before the `park`, with
+/// edited and `files_per_dir` more that were removed before the `park`, with
 /// `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the barrier count that run paid.
 fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
     let area = Area::new(&format!("park-pop-barrier-count-{}", files_per_dir));
@@ -898,8 +898,8 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
         std::fs::create_dir_all(&dir_path).unwrap();
         for f in 0..files_per_dir {
             std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+            std::fs::write(dir_path.join(format!("gone{f}.txt")), format!("gone {dir} {f}\n")).unwrap();
         }
-        std::fs::write(dir_path.join("gone.txt"), format!("gone {dir}\n")).unwrap();
     }
 
     assert!(area.run(&["prepare"]).status.success());
@@ -912,8 +912,8 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
         let dir_path = warehouse.join(format!("dir{dir}"));
         for f in 0..files_per_dir {
             std::fs::write(dir_path.join(format!("file{f}.txt")), format!("parked {dir} {f}\n")).unwrap();
+            std::fs::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
         }
-        std::fs::remove_file(dir_path.join("gone.txt")).unwrap();
     }
 
     assert!(area.run(&["load", "."]).status.success());
@@ -921,7 +921,7 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
 
     // The park put the head back, so the pop below re-applies every edit and every removal.
     assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file0.txt")).unwrap(), "v1 0 0\n");
-    assert!(warehouse.join("dir0").join("gone.txt").exists());
+    assert!(warehouse.join("dir0").join("gone0.txt").exists());
 
     let mut command = area.command(&["park", "pop"]);
     command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
@@ -933,8 +933,8 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
         for f in 0..files_per_dir {
             assert_eq!(std::fs::read_to_string(dir_path.join(format!("file{f}.txt"))).unwrap(),
                 format!("parked {dir} {f}\n"));
+            assert!(!dir_path.join(format!("gone{f}.txt")).exists());
         }
-        assert!(!dir_path.join("gone.txt").exists());
     }
 
     barrier_count(&output)
@@ -987,15 +987,31 @@ fn park_pop_whose_staging_fails_keeps_the_parcel_parked() {
         .expect("dir0 has a shard folder");
 
     std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root writes through a read-only folder, so the failure cannot be staged; nothing to test.
+    if std::fs::write(shard_folder.join("probe"), "").is_ok() {
+        std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
     let output = area.run(&["park", "pop"]);
     std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "park pop must fail when its staging fails");
-    assert!(stderr.contains("They are still parked."), "the failure says the parcel is still parked: {stderr}");
+    assert!(stderr.contains("The parcel is still parked."), "the failure says the parcel is still parked: {stderr}");
 
     // The working directory was rewritten before the staging failed.
     assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file.txt")).unwrap(), "parked\n");
+
+    // ...and the shard that could not be published still lists the head's version, so the
+    // rewritten file shows as an unstaged change.
+    let status = area.run(&["--json", "stocktake"]);
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status_json["data"]["unstaged"].as_array().unwrap().iter()
+            .any(|entry| entry["path"] == "dir0/file.txt" && entry["kind"] == "modified"),
+        "dir0/file.txt is not staged: {status_json}");
 
     let list = area.run(&["--json", "park", "list"]);
     assert!(list.status.success());
