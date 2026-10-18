@@ -76,6 +76,11 @@ pub fn blame(head: &str, path: &str) -> Result<FileBlame, String> {
     // The first-parent chain, oldest first: the linear history the blame is computed over.
     let chain = first_parent_chain(head)?;
 
+    // Fill the filters the walk below queries in one batched pass, so a cold graph is written a
+    // shard at a time per batch rather than once per parcel. Best-effort: each query still
+    // computes whatever this left missing.
+    let _ = graph_utils::ensure_path_filters(chain.get(1..).unwrap_or(&[]));
+
     // Walk the versions oldest to newest, carrying the current attribution forward. A line
     // unchanged from the previous version (an LCS match) keeps its attribution; a new line
     // is attributed to the parcel that introduced it.

@@ -4339,6 +4339,19 @@ fn path_maybe_changed_absorbs_an_absent_out_of_scope_object() {
     let answer = forklift_core::util::graph_utils::path_maybe_changed(&sparse_head, "src/api/a.txt");
     assert_eq!(answer, Ok(true),
         "the cold path must absorb the absent out-of-scope object into a total \"maybe\", not an Err");
+
+    // The uncomputable filter stays unknown, and storing unknown over unknown changes nothing, so
+    // asking again must not rewrite the shard: a shard is replaced by renaming a new file over
+    // it, which gives it a new inode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let shard = area.path("sparse/.forklift/graph").join(&sparse_head[..2]);
+        let inode = std::fs::metadata(&shard).expect("the first query recorded the parcel").ino();
+        assert_eq!(forklift_core::util::graph_utils::path_maybe_changed(&sparse_head, "src/api/a.txt"), Ok(true));
+        assert_eq!(std::fs::metadata(&shard).unwrap().ino(), inode,
+            "a filter that stays unknown must not rewrite its shard on every query");
+    }
 }
 
 #[test]

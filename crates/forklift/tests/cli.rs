@@ -2198,6 +2198,74 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
     assert!(graph_root.is_file(), "sanity: the squatting file is still in place");
 }
 
+/// A cold `blame` fills the changed-path filter of every parcel in its chain. Filling them one
+/// query at a time rewrote each shard once per parcel in it; the batched pass writes each shard
+/// once for the generation records and once per filter batch. A history long enough to put
+/// several parcels in every shard tells the two apart.
+#[test]
+fn a_cold_blame_writes_each_commit_graph_shard_a_bounded_number_of_times() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    const COMMITS: usize = 600;
+    let warehouse = TestWarehouse::new("commit-graph-write-once");
+
+    // One file rewritten by every commit, so every parcel's filter is a real (small) diff.
+    let mut stream = String::new();
+    for i in 0..COMMITS {
+        let content = format!("line {}\n", i);
+        stream.push_str(&format!(
+            "commit refs/heads/main\ncommitter Ada <ada@example.com> {} +0000\ndata 7\nchange\n",
+            1_700_000_000 + i
+        ));
+        stream.push_str(&format!("M 100644 inline a.txt\ndata {}\n{}\n", content.len(), content));
+    }
+    let git = |args: &[&str], input: Option<&str>| {
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(&warehouse.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git must be installed to run this test");
+        if let Some(input) = input {
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init", "-q", "-b", "main"], None);
+    git(&["fast-import", "--quiet"], Some(&stream));
+    git(&["reset", "-q", "--hard", "main"], None);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", ".", "--no-compact"]));
+
+    let graph_root = warehouse.root.join(".forklift/graph");
+    let _ = std::fs::remove_dir_all(&graph_root);
+    let blame = warehouse.run_with_env(&["blame", "a.txt"], &[("FORKLIFT_DEBUG_GRAPH_WRITES", "1")]);
+    assert_success(&blame);
+    assert!(stdout(&blame).contains(&format!("line {}", COMMITS - 1)), "blame output: {}", stdout(&blame));
+
+    let writes: usize = stderr(&blame).lines()
+        .find_map(|line| line.strip_prefix("graph-shard-writes: "))
+        .expect("the debug hook must report the shard writes")
+        .trim().parse().unwrap();
+    let shards: Vec<_> = std::fs::read_dir(&graph_root).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    for shard in &shards {
+        assert!(graph_shard_is_sealed_with_records(shard), "a written shard must be whole: {}", shard.display());
+    }
+    assert!(COMMITS > 2 * shards.len(),
+        "sanity: the history must put several parcels in a shard to tell batched writes from per-parcel ones");
+    assert!(writes <= 2 * shards.len(),
+        "a cold blame must write each of the {} shards at most twice, not once per parcel; it wrote {}",
+        shards.len(), writes);
+}
+
 #[test]
 fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     let warehouse = TestWarehouse::new("consolidate-conflict");

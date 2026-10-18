@@ -53,11 +53,23 @@
 //! did not touch the queried path. The substrate stores the field (absent by default); the
 //! filter machinery lives in [`changed_paths`]. A false "maybe" only costs a redundant real
 //! check, never a wrong answer.
+//!
+//! # Why a walk computes its filters in batches
+//!
+//! A record's filter is computed on its first query and persisted, and a persist rewrites the
+//! whole shard. A cold `blame` queries every parcel of its first-parent chain, so filling the
+//! filters one query at a time rewrote each shard once per parcel in it: on git.git's history
+//! that was about 105,000 shard writes and 1.4 GB written for one command. A walk that knows
+//! its parcels up front calls [`ensure_path_filters`] first, which computes the missing filters
+//! in parallel and persists them a batch at a time, so each shard is rewritten once per batch.
+//! The batch bounds what an interrupted walk loses (a `| head` that closes the pipe, a Ctrl-C):
+//! every finished batch is already on disk.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::util::{file_utils, object_utils, sign_utils};
+use crate::util::{fanout_utils, file_utils, object_utils, sign_utils};
 
 /// Magic bytes at the head of every shard file.
 const GRAPH_MAGIC: &[u8; 8] = b"FORKGRPH";
@@ -154,10 +166,13 @@ struct Shard {
     /// O(1) stamp, so a hot walk that hits a shard tens of thousands of times pays nothing per
     /// hit (a `blame` or a `history` frontier lookup would otherwise scan a recency list).
     last_access: u64,
-    /// Bumped on every mutation to `records`. A flush serializes a snapshot under the lock, then
-    /// writes it with the lock released; on re-lock it clears `dirty` only if `version` is
-    /// unchanged, so a record another thread inserted meanwhile (raising `version`) is never
-    /// falsely marked flushed — it stays dirty until its own writer persists it.
+    /// Set from [`next_shard_version`] on every mutation to `records`, and 0 when the shard is
+    /// loaded. A flush serializes a snapshot under the lock, then writes it with the lock
+    /// released; on re-lock it clears `dirty` only if `version` is unchanged, so a record another
+    /// thread inserted meanwhile is never falsely marked flushed — it stays dirty until its own
+    /// writer persists it. The values come from one process-wide counter rather than a per-shard
+    /// one, so a shard evicted and reloaded in the gap can never climb back to the snapshot's
+    /// value and be marked clean by a write that did not carry its records.
     version: u64,
     /// False only for a stand-in served after the shard file failed to read for a reason other
     /// than its absence (see [`with_shard`]): it is never cached and never written back, so a
@@ -185,6 +200,25 @@ static GRAPH_CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<Cache> {
     GRAPH_CACHE.get_or_init(|| Mutex::new(Cache { shards: HashMap::new(), access_clock: 0 }))
+}
+
+/// The source of [`Shard::version`] values. It starts at 1 so no mutation ever produces the 0 a
+/// freshly loaded shard carries.
+static NEXT_SHARD_VERSION: AtomicU64 = AtomicU64::new(1);
+
+/// A shard version no shard has carried before in this process.
+fn next_shard_version() -> u64 {
+    NEXT_SHARD_VERSION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How many shard files this process has written. Undocumented and test-only: the CLI prints it
+/// under `FORKLIFT_DEBUG_GRAPH_WRITES`, so a test can prove across the subprocess boundary that
+/// a cold walk rewrote each shard a bounded number of times, not once per parcel.
+static SHARD_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// The current value of the process-wide shard-write counter — see [`SHARD_WRITES`].
+pub fn shard_write_count() -> u64 {
+    SHARD_WRITES.load(Ordering::Relaxed)
 }
 
 /// The shard prefix for a parcel hash (its first [`SHARD_PREFIX_LEN`] hex characters).
@@ -454,7 +488,9 @@ fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<
 /// writes its checksummed shards, and a shard the failing device mangles simply reads as absent.
 fn write_shard_bytes(root: &str, prefix: &str, bytes: &[u8]) -> Result<(), String> {
     file_utils::create_folder_if_not_exists(std::path::Path::new(root))?;
-    file_utils::replace_file_unsynced(&shard_path(root, prefix), bytes)
+    file_utils::replace_file_unsynced(&shard_path(root, prefix), bytes)?;
+    SHARD_WRITES.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Fetch a parcel's record if it is already stored (in a resident shard or on disk). Does not
@@ -477,17 +513,7 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
     for (prefix, records) in by_prefix {
         // Insert the records and snapshot the shard's bytes + version under the lock; the file
         // write then happens with the lock released.
-        let snapshot = with_shard(root, &prefix, |shard| {
-            if !shard.writable {
-                return None;
-            }
-            for (hash, record) in records {
-                shard.records.insert(hash.clone(), record.clone());
-            }
-            shard.dirty = true;
-            shard.version = shard.version.wrapping_add(1);
-            Some((serialize_shard(&shard.records), shard.version))
-        })?;
+        let snapshot = with_shard(root, &prefix, |shard| stage_records(shard, records))?;
         // An unreadable shard is never written back over (see `Shard::writable`).
         let Some((bytes, version)) = snapshot else {
             continue;
@@ -501,15 +527,38 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
             continue;
         }
 
-        // Mark clean only if nothing changed the shard since the snapshot: a record another
-        // thread inserted meanwhile (a higher `version`) is newer than what we just wrote and
-        // stays dirty until that writer flushes it. (If the shard was evicted and reloaded in the
-        // gap, its `version` reset to 0, so this simply no-ops — its records are already on disk.)
-        with_shard(root, &prefix, |shard| {
-            if shard.version == version {
-                shard.dirty = false;
-            }
-        })?;
+        mark_clean(root, &prefix, version)?;
+    }
+    Ok(())
+}
+
+/// Insert `records` into a resident shard, mark it dirty with a fresh version, and return the
+/// serialized snapshot plus that version for the caller to write off the lock. A stand-in for an
+/// unreadable shard is never written back over (see `Shard::writable`), so it yields `None`.
+fn stage_records<'a>(shard: &mut Shard, records: impl IntoIterator<Item = (&'a String, &'a Record)>)
+    -> Option<(Vec<u8>, u64)>
+{
+    if !shard.writable {
+        return None;
+    }
+    for (hash, record) in records {
+        shard.records.insert(hash.clone(), record.clone());
+    }
+    shard.dirty = true;
+    shard.version = next_shard_version();
+    Some((serialize_shard(&shard.records), shard.version))
+}
+
+/// Mark a shard clean after a snapshot taken at `version` reached disk — only if nothing changed
+/// the shard since: a record another thread inserted meanwhile carries a newer version and stays
+/// dirty until that writer flushes it. A shard that is no longer resident is left alone. Its
+/// eviction wrote it, and reloading it here would only read back the file just written.
+fn mark_clean(root: &str, prefix: &str, version: u64) -> Result<(), String> {
+    let mut cache = cache().lock().map_err(poisoned)?;
+    if let Some(shard) = cache.shards.get_mut(&cache_key(root, prefix)) {
+        if shard.version == version {
+            shard.dirty = false;
+        }
     }
     Ok(())
 }
@@ -520,6 +569,8 @@ fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), Stri
 /// an **iterative** post-order DAG walk (no recursion — the parent chain can be tens of
 /// thousands deep). Returns the freshly computed records, already persisted.
 fn ensure(root: &str, hash: &str) -> Result<HashMap<String, Record>, String> {
+    #[cfg(test)]
+    tests::ENSURE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut computed: HashMap<String, Record> = HashMap::new();
     // DFS state per node: `gray` = on the stack (being expanded); a node is "known" once it is
     // in `computed` or already stored. A gray parent encountered while expanding is a cycle.
@@ -819,17 +870,113 @@ pub fn path_maybe_changed(parcel_hash: &str, path: &str) -> Result<bool, String>
     // rather than propagating the read error out of a query the caller expects to be total.
     let filter = compute_filter(parcel_hash, record.parents.first().map(String::as_str))
         .unwrap_or(PathFilter::Unknown);
-    let updated = Record {
-        generation: record.generation,
-        parents: record.parents,
-        filter: filter.clone(),
-    };
-    persist_records(&root, &HashMap::from([(parcel_hash.to_string(), updated)]))?;
+    // An uncomputable filter stays unknown, and storing unknown over unknown would only rewrite
+    // the shard on every query of this parcel.
+    if !matches!(filter, PathFilter::Unknown) {
+        let updated = Record {
+            generation: record.generation,
+            parents: record.parents,
+            filter: filter.clone(),
+        };
+        persist_records(&root, &HashMap::from([(parcel_hash.to_string(), updated)]))?;
+    }
 
     Ok(match filter {
         PathFilter::Bloom(bytes) => bloom_contains(&bytes, path),
         _ => true, // TooLarge (a root or a sweeping change) or Unknown (uncomputable) → maybe
     })
+}
+
+/// The most filters [`ensure_path_filters`] computes before persisting them. Each persist rewrites
+/// every shard the batch touches, so a larger batch writes less in total; a smaller one loses
+/// less when the walk is interrupted.
+const FILTER_BATCH: usize = 4096;
+
+/// Below this many missing filters, [`ensure_path_filters`] computes them on the calling thread:
+/// one filter is a tree diff against the parent, cheap enough that a short chain does not pay
+/// for spawning a worker per core.
+const PARALLEL_FILTER_THRESHOLD: usize = 64;
+
+/// Compute and store the changed-path filter of every parcel in `parcels` that lacks one, so a
+/// walk that then calls [`path_maybe_changed`] on each of them finds every answer on the hot
+/// path. Records missing altogether are computed first, from the newest parcel back, so one
+/// ancestry walk covers them all. The filters are then computed in parallel and persisted
+/// [`FILTER_BATCH`] at a time — each shard is rewritten once per batch, never once per parcel
+/// (see the module docs for what that saves).
+///
+/// Purely an accelerator: a caller may ignore its error, because [`path_maybe_changed`] still
+/// computes anything this left missing. A filter whose computation fails (an object absent from
+/// a sparse store) stays unknown and is not stored, exactly as on the per-query path; a parcel
+/// whose record cannot be computed is skipped.
+///
+/// # Arguments
+/// * `parcels` - The parcels whose filters the caller is about to query: a first-parent chain,
+///   oldest first, as `blame` walks it. Any other list is still handled correctly, but less of it
+///   may be batched when an ancestry cannot be resolved.
+///
+/// # Returns
+/// * `Ok(())`      - Every filter that could be computed is stored.
+/// * `Err(String)` - If the cache lock was poisoned.
+pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
+    let root = file_utils::get_path_graph_root();
+
+    // Records first. Along a first-parent chain each parcel's ancestry contains every older
+    // parcel's, so one `ensure` from the newest parcel records them all and persists once. When
+    // that ancestry cannot be resolved (an unreadable parent in a partial store), the failed
+    // `ensure` persists nothing; but resolvability only grows toward the root, so a binary search
+    // finds the newest parcel that does resolve in a logarithmic number of walks, and its
+    // `ensure` records everything below it. Retrying from every parcel instead would walk to the
+    // same unreadable parent once per parcel above it — quadratic in the chain. Parcels left
+    // without a record are left to the per-query path. (`ensure` on a recorded parcel is a
+    // single lookup.)
+    if let Some(newest) = parcels.len().checked_sub(1) {
+        if ensure(&root, &parcels[newest]).is_err() {
+            // Invariant: every parcel below `resolved` is recorded; `parcels[unresolved]` fails.
+            let (mut resolved, mut unresolved) = (0, newest);
+            while resolved < unresolved {
+                let mid = resolved + (unresolved - resolved) / 2;
+                if ensure(&root, &parcels[mid]).is_ok() {
+                    resolved = mid + 1;
+                } else {
+                    unresolved = mid;
+                }
+            }
+        }
+    }
+
+    // One lookup per parcel that clones nothing, so a warm graph pays almost nothing here.
+    let mut missing: Vec<(String, Record)> = Vec::new();
+    for hash in parcels {
+        let filter_unknown = with_shard(&root, &shard_prefix(hash), |shard| {
+            shard.records.get(hash).map(|record| matches!(record.filter, PathFilter::Unknown))
+        })?;
+        if filter_unknown == Some(true) {
+            if let Some(record) = stored_record(&root, hash)? {
+                missing.push((hash.clone(), record));
+            }
+        }
+    }
+
+    let compute = |(hash, record): &(String, Record)| {
+        compute_filter(hash, record.parents.first().map(String::as_str)).unwrap_or(PathFilter::Unknown)
+    };
+    for batch in missing.chunks(FILTER_BATCH) {
+        let filters = if batch.len() < PARALLEL_FILTER_THRESHOLD {
+            batch.iter().map(compute).collect()
+        } else {
+            fanout_utils::fanout_map(batch, compute)
+        };
+        let updated: HashMap<String, Record> = batch.iter().zip(filters)
+            .filter(|(_, filter)| !matches!(filter, PathFilter::Unknown))
+            .map(|((hash, record), filter)| (hash.clone(), Record {
+                generation: record.generation,
+                parents: record.parents.clone(),
+                filter,
+            }))
+            .collect();
+        persist_records(&root, &updated)?;
+    }
+    Ok(())
 }
 
 /// Compute a parcel's changed-path filter: the file paths that differ between the parcel's tree
@@ -1272,6 +1419,96 @@ mod tests {
 
         assert!(persisted.is_ok(), "an unreadable shard must not fail the persist: {:?}", persisted);
         assert_eq!(after, original, "an unreadable shard must never be written over");
+    }
+
+    thread_local! {
+        /// How many times [`ensure`] ran on this thread — a test can count the ancestry walks a
+        /// pass made without racing the other tests in the process.
+        pub(super) static ENSURE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn the_filter_pass_records_below_an_unresolvable_ancestry_in_logarithmic_walks() {
+        // A merge whose second parent is not in the store: every parcel from it up has an
+        // ancestry `ensure` cannot finish, and a failed `ensure` persists nothing. The pass must
+        // not walk back to the same missing parent once per parcel above it (quadratic in the
+        // chain), and it must still record every parcel below the merge, whose ancestry is whole.
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+
+        let dir = scratch_dir("unresolvable");
+        let _scope = StorageRootScope::enter(&dir);
+        let store = |parents: Vec<String>, tag: &str| -> String {
+            let parcel = Parcel {
+                tree_hash: "0".repeat(64),
+                parents,
+                actions: vec![],
+                description: Some(tag.to_string()),
+            };
+            let mut object = LooseObjectBuilder::build_parcel(&parcel);
+            let hash = object.hash.clone();
+            object.store().unwrap();
+            hash
+        };
+
+        const BELOW: usize = 30;
+        const ABOVE: usize = 50;
+        let mut chain = vec![store(vec![], "root")];
+        for i in 0..BELOW {
+            let next = store(vec![chain.last().unwrap().clone()], &format!("below {i}"));
+            chain.push(next);
+        }
+        let merge = store(vec![chain.last().unwrap().clone(), "f".repeat(64)], "merge");
+        chain.push(merge);
+        for i in 0..ABOVE {
+            let next = store(vec![chain.last().unwrap().clone()], &format!("above {i}"));
+            chain.push(next);
+        }
+
+        ENSURE_CALLS.with(|calls| calls.set(0));
+        let result = ensure_path_filters(&chain[1..]);
+        let walks = ENSURE_CALLS.with(|calls| calls.get());
+        let graph_root = file_utils::get_path_graph_root();
+        let recorded: Vec<bool> = chain.iter()
+            .map(|hash| stored_record(&graph_root, hash).unwrap().is_some())
+            .collect();
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_ok(), "an unresolvable ancestry is not an error of the pass: {:?}", result);
+        // One failed walk from the newest parcel, then a binary search over the rest: about
+        // log2(81) more, against one per parcel above the merge if every parcel retried.
+        assert!(walks <= 1 + 8, "the pass must find the resolvable boundary in a logarithmic number of walks; it made {walks}");
+        assert!(recorded[..=BELOW].iter().all(|r| *r),
+            "every parcel below the unreadable merge must be recorded by the pass: {:?}", recorded);
+        assert!(recorded[BELOW + 1..].iter().all(|r| !*r),
+            "sanity: no parcel from the merge up can be recorded: {:?}", recorded);
+    }
+
+    #[test]
+    fn a_snapshot_from_before_an_eviction_never_marks_the_reloaded_shard_clean() {
+        // A persist snapshots a shard, writes it off the lock, then marks it clean if its version
+        // is unchanged. If the shard is evicted and reloaded in that gap, and the reloaded copy
+        // takes a record of its own, the stale snapshot must not mark it clean: that record is
+        // in no file yet, and a clean shard is never written again.
+        let dir = scratch_dir("aba");
+        let root = dir.join("graph").to_string_lossy().into_owned();
+        let record = Record { generation: 1, parents: vec![], filter: PathFilter::Unknown };
+        let first = "ab".repeat(32);
+        let second = format!("ab{}", "cd".repeat(31));
+
+        let (_, stale) = with_shard(&root, "ab", |shard| stage_records(shard, [(&first, &record)]))
+            .unwrap().expect("a fresh shard is writable");
+        cache().lock().unwrap().shards.remove(&cache_key(&root, "ab"));
+        with_shard(&root, "ab", |shard| stage_records(shard, [(&second, &record)]))
+            .unwrap().expect("a fresh shard is writable");
+        mark_clean(&root, "ab", stale).unwrap();
+
+        let dirty = with_shard(&root, "ab", |shard| shard.dirty).unwrap();
+        cache().lock().unwrap().shards.remove(&cache_key(&root, "ab"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dirty, "a snapshot taken before the eviction must not mark the reloaded shard clean");
     }
 
     #[test]

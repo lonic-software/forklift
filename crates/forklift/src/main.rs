@@ -113,6 +113,12 @@ async fn async_main() {
         eprintln!("pack-preloads: {}", forklift_core::util::pack_utils::pack_preload_count());
     }
 
+    // Undocumented, test-only debug hook, same shape again: lets the commit-graph tests prove a
+    // cold walk rewrote each shard a bounded number of times, not once per parcel.
+    if std::env::var("FORKLIFT_DEBUG_GRAPH_WRITES").is_ok() {
+        eprintln!("graph-shard-writes: {}", forklift_core::util::graph_utils::shard_write_count());
+    }
+
     if let Err(error) = result {
         // A result that failed to serialize already wrote this process's one document.
         if !output::result_unserializable() {
