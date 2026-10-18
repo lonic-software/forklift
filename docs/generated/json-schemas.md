@@ -3554,7 +3554,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "object"
     },
     "PackIndexIssue": {
-      "description": "One entry in [`StoreReport::quarantined_packs`]/[`StoreReport::unenumerable_indexes`].",
+      "description": "One entry in any of [`StoreReport`]'s pack problem lists.",
       "properties": {
         "error": {
           "description": "Why it could not be fully trusted.",
@@ -3625,6 +3625,13 @@ A command not listed here either reports only the generic human-message shape `{
     "densify_suggested": {
       "description": "Whether this store was bulk-ingested (`import-git`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
       "type": "boolean"
+    },
+    "foreign_version_indexes": {
+      "description": "Pack indexes written by a build with another pack format version: every read one might\nanswer fails naming the version. Re-create the warehouse with this build; moving one aside\nwould make its objects read as missing. Empty on a healthy store.",
+      "items": {
+        "$ref": "#/$defs/PackIndexIssue"
+      },
+      "type": "array"
     },
     "loose_bytes": {
       "description": "Total on-disk bytes of the loose objects.",
@@ -3701,7 +3708,8 @@ A command not listed here either reports only the generic human-message shape `{
     "densify_suggested",
     "quarantined_packs",
     "damaged_packs",
-    "unenumerable_indexes"
+    "unenumerable_indexes",
+    "foreign_version_indexes"
   ],
   "title": "StoreReport",
   "type": "object"

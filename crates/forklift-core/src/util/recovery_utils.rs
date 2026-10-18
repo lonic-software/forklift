@@ -417,14 +417,17 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
     resolve_the_rest(root, &state.recorded, &attempt, &state.files).await
 }
 
-/// Load an uncached snapshot of the pack registry's quarantined/unenumerable indexes
+/// Load an uncached snapshot of the pack folder's problem indexes
 /// ([`pack_utils::pack_health_snapshot`]) and render it into the warning lines [`run`] folds into
 /// every outgoing result. Wording mirrors `quarantine_reason`'s own for the quarantined case (names
-/// the index and its data-load error); the unenumerable case is worded as its own remedy, since
-/// there is nothing to refetch — only the file itself to move aside.
+/// the index and its data-load error); each other case is worded as its own remedy: a damaged
+/// pack still serves its sound parts, a foreign-version index means re-creating the warehouse
+/// (moving it aside would hide its objects), and an unparseable one is a file to move aside.
 fn pack_health_warning_lines() -> Result<Vec<String>, String> {
     let snapshot = pack_utils::pack_health_snapshot()?;
-    let mut lines = Vec::with_capacity(snapshot.quarantined.len() + snapshot.unenumerable.len() + snapshot.damaged.len());
+    let mut lines = Vec::with_capacity(
+        snapshot.quarantined.len() + snapshot.unenumerable.len() + snapshot.damaged.len() + snapshot.foreign.len()
+    );
 
     for (index_path, error) in &snapshot.quarantined {
         lines.push(format!(
@@ -438,6 +441,14 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
         lines.push(format!(
             "pack index \"{}\" is damaged ({}); its sound parts are still read, but an object in a \
             damaged part reads as unverifiable until it is stored again",
+            index_path.to_string_lossy(), error
+        ));
+    }
+    for (index_path, error) in &snapshot.foreign {
+        lines.push(format!(
+            "pack index \"{}\" was written with another pack format ({}); every read it might answer \
+            fails until the warehouse is re-created with this build — do not move it aside, which \
+            would make its objects read as missing",
             index_path.to_string_lossy(), error
         ));
     }

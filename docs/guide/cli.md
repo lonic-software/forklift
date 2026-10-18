@@ -1433,13 +1433,13 @@ Object store
 `--json` reports `{loose_objects, loose_bytes, packed_objects, pack_files, deltas, pack_bytes,
 total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
 pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_packs, damaged_packs,
-unenumerable_indexes}`
+unenumerable_indexes, foreign_version_indexes}`
 — every size an exact byte count. Nothing is written; run `compact` to act on what it reports.
 `densify_suggested` (and, in the human view, a one-line tip) appears once the store was
 bulk-ingested (`import-git` or a franchise's bundle install) and clears once a `compact --all
 --redelta` pass has run (see [`--redelta`](#compact--pack-the-object-store)).
 
-`quarantined_packs`, `damaged_packs` and `unenumerable_indexes` are ordinarily all empty. A pack pair loses its
+The four problem lists are ordinarily all empty. A pack pair loses its
 data file only in unusual circumstances (a file removed by hand, a partial restore); when that
 happens, `store` lists it under `quarantined_packs` — `[{index_path, error}]` — rather than
 failing the census: the objects it named are not lost, only unreachable through that copy, and
@@ -1449,9 +1449,10 @@ Ordinary reads keep using its sound parts; an object in a damaged part reads as 
 it is stored again. `unenumerable_indexes` — the same `[{index_path,
 error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
 is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
-aside and re-run. An index written by a build with a different pack format is listed there too,
-naming its version, and every read it might answer fails with that error rather than reporting the
-object missing: re-create the warehouse with this build. In the human view all three appear as a `pack problems:` section, only when non-empty.
+aside and re-run. `foreign_version_indexes` (same shape) lists an index written by a build with a
+different pack format, naming its version. Every read it might answer fails with that error rather
+than reporting the object missing, so re-create the warehouse with this build — do not move the
+file aside, which would make its objects read as missing. In the human view all four appear as a `pack problems:` section, only when non-empty.
 
 ### `heal` — resolve a standing durability taint
 
@@ -1520,11 +1521,12 @@ refusal before ever reaching its own fetch):
 every other command refuses first, precisely so nothing durable is ever recorded on top of
 unproven state.
 
-Every `heal` run also checks the pack registry for the same quarantined/unenumerable indexes
-`store` reports (see above) and prints a warning line for each one it finds — unconditionally,
-whether or not anything else was tainted this run, and whether or not that index is what caused
-the taint. A quarantined index's objects are left recoverable (`heal` can refetch them); an
-unenumerable one names the file to move aside. This appears even when `heal` still has to refuse
+Every `heal` run also checks the pack folder for the same problem indexes `store` reports (see
+above) and prints a warning line for each one it finds — unconditionally, whether or not anything
+else was tainted this run, and whether or not that index is what caused the taint. A quarantined
+index's objects are left recoverable (`heal` can refetch them); a damaged pack still serves its
+sound parts; an index of another format means re-creating the warehouse; an unenumerable one names
+the file to move aside. This appears even when `heal` still has to refuse
 on an unrelated dangling reference — as a clearly-separated "Pack index problems (unrelated to
 this refusal, clear them separately)" section, never as though it were the cause of the refusal —
 since a broken pack index is inert on its own and the only time it coincides with a refusal is

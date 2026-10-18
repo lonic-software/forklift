@@ -261,6 +261,11 @@ pub struct StoreStatus {
     /// file aside and re-run. The exception is an index of another format version, which gates
     /// every read it might answer (see `quarantine_reason`). Empty on a healthy store.
     pub unenumerable_indexes: Vec<PackIndexProblem>,
+    /// Pack indexes written by a build with another pack format version. Unlike an unparseable
+    /// file, each gates every read it might answer: such a read fails naming the version rather
+    /// than reporting the object absent. Moving one aside would make its objects read as missing;
+    /// the remedy is re-creating the warehouse with this build. Empty on a healthy store.
+    pub foreign_version_indexes: Vec<PackIndexProblem>,
 }
 
 /// Take an exact, read-only census of the object store: how many objects are loose vs packed,
@@ -321,7 +326,12 @@ pub fn store_status() -> Result<StoreStatus, String> {
         index_path: q.index_path.to_string_lossy().into_owned(),
         error: q.error,
     }).collect();
+    let (foreign, unenumerable): (Vec<_>, Vec<_>) = unenumerable.into_iter().partition(|u| u.foreign_version);
     let unenumerable_indexes = unenumerable.into_iter().map(|u| PackIndexProblem {
+        index_path: u.index_path.to_string_lossy().into_owned(),
+        error: u.error,
+    }).collect();
+    let foreign_version_indexes = foreign.into_iter().map(|u| PackIndexProblem {
         index_path: u.index_path.to_string_lossy().into_owned(),
         error: u.error,
     }).collect();
@@ -346,6 +356,7 @@ pub fn store_status() -> Result<StoreStatus, String> {
         quarantined_packs,
         damaged_packs,
         unenumerable_indexes,
+        foreign_version_indexes,
     })
 }
 
@@ -499,18 +510,23 @@ mod index_format {
     /// lookup's validation to about 1.5 KiB of crc.
     const TARGET_BUCKET_RECORDS: usize = 32;
 
-    /// The fanout bits the writer picks for `count` records: the smallest that brings the average
-    /// bucket to [`TARGET_BUCKET_RECORDS`] or below, capped at [`MAX_FANOUT_BITS`].
     /// The bytes that identify an index: its magic and its version.
     pub(super) const IDENTITY_LEN: usize = 12;
 
-    /// The version of an index that carries this format's magic but another version, which this
-    /// build refuses by name. `None` for this version, and for anything without the magic.
+    /// Versions below this are ones a build could plausibly have written; anything above it in
+    /// a version field is rot, not another build.
+    const PLAUSIBLE_VERSION_LIMIT: u32 = 256;
+
+    /// The version of an index that carries this format's magic but another plausible version —
+    /// one written by another build, which this build refuses by name. `None` for this version,
+    /// for a version field too large to be anything but corruption, and for anything without the
+    /// magic.
     pub(super) fn foreign_version(bytes: &[u8]) -> Option<u32> {
         if bytes.len() < IDENTITY_LEN || &bytes[0..8] != PACK_INDEX_MAGIC {
             return None;
         }
-        Some(read_u32_le(bytes, 8)).filter(|version| *version != PACK_FORMAT_VERSION)
+        Some(read_u32_le(bytes, 8))
+            .filter(|version| *version != PACK_FORMAT_VERSION && *version < PLAUSIBLE_VERSION_LIMIT)
     }
 
     /// The error for a bucket of the index at `path` that failed validation.
@@ -518,6 +534,8 @@ mod index_format {
         format!("Pack index \"{}\" is corrupt (bucket {}).", path.to_string_lossy(), bucket)
     }
 
+    /// The fanout bits the writer picks for `count` records: the smallest that brings the average
+    /// bucket to [`TARGET_BUCKET_RECORDS`] or below, capped at [`MAX_FANOUT_BITS`].
     pub(super) const fn fanout_bits_for(count: usize) -> u32 {
         let mut bits = 0;
         while bits < MAX_FANOUT_BITS && count.div_ceil(1 << bits) > TARGET_BUCKET_RECORDS {
@@ -1556,10 +1574,13 @@ pub(crate) struct PackHealthSnapshot {
     pub quarantined: Vec<(PathBuf, String)>,
     pub unenumerable: Vec<(PathBuf, String)>,
     pub damaged: Vec<(PathBuf, String)>,
+    pub foreign: Vec<(PathBuf, String)>,
 }
 
-/// A point-in-time snapshot of the pack registry's two problem lists (FORK-47, DESIGN.html
-/// §3.1.1), loaded **uncached** — `load_packs_from_disk` directly, exactly the pattern
+/// A point-in-time snapshot of the pack folder's problem lists (FORK-47, DESIGN.html §3.1.1):
+/// quarantined, unenumerable and foreign-version indexes as the registry classifies them, plus
+/// damaged packs, which only this census load ([`IndexCheck::Full`]) tells apart. Loaded
+/// **uncached** — `load_packs_from_disk` directly, exactly the pattern
 /// [`store_status`] uses, reading nothing from and writing nothing to the shared registry
 /// [`loaded_packs`] caches. A report path (this one, and `store_status`) must never
 /// `invalidate_cache()` or otherwise perturb a live registry a concurrent read depends on; the
@@ -1569,7 +1590,7 @@ pub(crate) struct PackHealthSnapshot {
 /// fresh, per hash, by the read path itself at the moment it runs.
 ///
 /// `forklift heal`'s recovery pass ([`crate::util::recovery_utils::run`]) calls this once at
-/// entry so a quarantined or unenumerable index is warned about on every run, independent of
+/// entry so every problem index is warned about on every run, independent of
 /// what (if anything) is actually tainted.
 ///
 /// # Returns
@@ -1578,10 +1599,12 @@ pub(crate) struct PackHealthSnapshot {
 ///                              failure — see [`load_packs_from_disk`]).
 pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
     let PackSet { quarantined, unenumerable, damaged, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
+    let (foreign, unenumerable): (Vec<_>, Vec<_>) = unenumerable.into_iter().partition(|u| u.foreign_version);
 
     Ok(PackHealthSnapshot {
         quarantined: quarantined.into_iter().map(|q| (q.index_path, q.error)).collect(),
         unenumerable: unenumerable.into_iter().map(|u| (u.index_path, u.error)).collect(),
+        foreign: foreign.into_iter().map(|u| (u.index_path, u.error)).collect(),
         damaged: damaged.into_iter().map(|d| (d.index_path, d.error)).collect(),
     })
 }
@@ -7274,8 +7297,9 @@ mod tests {
     /// version, never `Absent`, while an object stored loose reads `Verified`. Short indexes name
     /// their version too: a 16-byte version-2 index has no fanout header to be measured against.
     ///
-    /// Mutation: drop the foreign-version loop from `quarantine_reason` → the never-stored hash
-    /// reads `Absent` (red).
+    /// Mutations: drop the foreign-version loop from `quarantine_reason` → the never-stored hash
+    /// reads `Absent` (red). Leave foreign-version indexes among the unenumerable ones in the
+    /// census → it lists the index as a file to move aside (red).
     #[test]
     fn a_pack_index_of_another_version_fails_reads_by_name_instead_of_reading_absent() {
         use crate::util::file_utils::StoreReadOutcome;
@@ -7310,8 +7334,14 @@ mod tests {
         }
 
         let census = store_status().unwrap();
-        assert_eq!(census.unenumerable_indexes.len(), 1);
-        assert!(census.unenumerable_indexes[0].error.contains("format version 2"), "{}", census.unenumerable_indexes[0].error);
+        assert!(census.unenumerable_indexes.is_empty(), "an old-version index is not reported as a stray file to move aside");
+        // A version field too large for any build to have written is rot, not another build.
+        let mut rotted = old_index.clone();
+        rotted[8..12].copy_from_slice(&0x0100_0003u32.to_le_bytes());
+        assert_eq!(index_format::foreign_version(&rotted), None);
+        assert_eq!(index_format::foreign_version(&old_index), Some(2));
+        assert_eq!(census.foreign_version_indexes.len(), 1);
+        assert!(census.foreign_version_indexes[0].error.contains("format version 2"), "{}", census.foreign_version_indexes[0].error);
 
         std::fs::remove_dir_all(&temp).ok();
     }
