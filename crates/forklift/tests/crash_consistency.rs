@@ -1085,8 +1085,9 @@ fn find_dir_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Five lines whose first `feature` edits and whose last `main` edits, so the two merge cleanly.
-fn merge_lines(first: &str, last: &str) -> String {
-    format!("{first}\nb\nc\nd\n{last}\n")
+/// The middle line is the file's own, so no two merged files share a blob.
+fn merge_lines(first: &str, middle: &str, last: &str) -> String {
+    format!("{first}\nb\n{middle}\nd\n{last}\n")
 }
 
 /// A warehouse with 5 directories, each holding `files_per_dir` files of every kind of merge
@@ -1105,7 +1106,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
         for f in 0..files_per_dir {
             std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
             std::fs::write(dir_path.join(format!("gone{f}.txt")), format!("gone {dir} {f}\n")).unwrap();
-            std::fs::write(dir_path.join(format!("merged{f}.txt")), merge_lines("a", "e")).unwrap();
+            std::fs::write(dir_path.join(format!("merged{f}.txt")), merge_lines("a", &format!("{dir} {f}"), "e")).unwrap();
             if clash {
                 std::fs::write(dir_path.join(format!("clash{f}.txt")), format!("clash {dir} {f}\n")).unwrap();
             }
@@ -1125,7 +1126,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
         for f in 0..files_per_dir {
             std::fs::write(dir_path.join(format!("file{f}.txt")), format!("theirs {dir} {f}\n")).unwrap();
             std::fs::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
-            std::fs::write(dir_path.join(format!("merged{f}.txt")), merge_lines("theirs", "e")).unwrap();
+            std::fs::write(dir_path.join(format!("merged{f}.txt")), merge_lines("theirs", &format!("{dir} {f}"), "e")).unwrap();
             if clash {
                 std::fs::write(dir_path.join(format!("clash{f}.txt")), format!("theirs {dir} {f}\n")).unwrap();
             }
@@ -1142,7 +1143,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
     for dir in 0..DIR_COUNT {
         let dir_path = warehouse.join(format!("dir{dir}"));
         for f in 0..files_per_dir {
-            std::fs::write(dir_path.join(format!("merged{f}.txt")), merge_lines("a", "ours")).unwrap();
+            std::fs::write(dir_path.join(format!("merged{f}.txt")), merge_lines("a", &format!("{dir} {f}"), "ours")).unwrap();
             if clash {
                 std::fs::write(dir_path.join(format!("clash{f}.txt")), format!("ours {dir} {f}\n")).unwrap();
             }
@@ -1170,7 +1171,7 @@ fn assert_diverged_merge_applied(area: &Area, files_per_dir: usize) {
                 format!("theirs {dir} {f}\n"));
             assert!(!dir_path.join(format!("gone{f}.txt")).exists());
             assert_eq!(std::fs::read_to_string(dir_path.join(format!("merged{f}.txt"))).unwrap(),
-                merge_lines("theirs", "ours"));
+                merge_lines("theirs", &format!("{dir} {f}"), "ours"));
         }
     }
 
@@ -1222,7 +1223,7 @@ fn consolidate_pays_a_constant_number_of_barriers_regardless_of_action_count() {
 
     assert_eq!(count_1, count_10,
         "consolidate's barrier count must not scale with the number of merge actions: {count_1} \
-         for 1 edit + 1 removal/directory, {count_10} for 10 + 10 (the same 5 directories either way)");
+         for 1 action of each kind/directory, {count_10} for 10 (the same 5 directories)");
     assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
 }
 
@@ -1269,7 +1270,7 @@ fn cherry_pick_pays_a_constant_number_of_barriers_regardless_of_action_count() {
 
     assert_eq!(count_1, count_10,
         "cherry-pick's barrier count must not scale with the number of merge actions: {count_1} \
-         for 1 edit + 1 removal/directory, {count_10} for 10 + 10 (the same 5 directories either way)");
+         for 1 action of each kind/directory, {count_10} for 10 (the same 5 directories)");
     assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
 }
 
