@@ -385,6 +385,43 @@ When nothing can be skipped (every leaf changed, all 20,421 shards read), the de
 read costs ~240 ms against ~225 ms for the one-shot read, inside a ~7 s stack dominated by its
 writes.
 
+## FORK-173: the per-write path checks — measured, not worth memoizing (2026-10-18)
+
+Every materializer write or removal passes `check_working_path`. It refuses a path whose top-level
+name opens the metadata folder, then `lstat`s each existing ancestor and refuses a symlink. For a
+top-level name holding a `~`, `opens_metadata_folder` also asks the volume whether the name resolves
+to `.forklift`. The ticket asked whether the ancestor walk should be memoized per directory, or
+replaced with `openat`.
+
+**Measured** with hyperfine, using release builds of main (af5af44). The ancestor walk was A/B'd
+against a throwaway build that skips it (`&components[..0]`).
+
+| Corpus, full-tree `shift` | with the checks | without | cost |
+|---|---|---|---|
+| git.git, `shift old` → `master` | 400.0 ± 4.7 ms | 393.3 ± 3.8 ms | +1.7% |
+| 40,000 files, six ancestors each (240k `lstat`s) | 4.46–4.47 s | 4.33 s | +3.0–3.3%, ~0.6 µs per `lstat` |
+
+The volume probe was measured on two 40,000-file corpora, each with 100 top-level directories of
+400 files: `t~00`…`t~99`, against `t_00`…`t_99`. Every write in the first corpus pays a probe:
+
+| 40,000 files, full-tree `shift` | `t_NN` | `t~NN` | cost |
+|---|---|---|---|
+| run 1 | 2.135 ± 0.033 s | 2.191 ± 0.019 s | +2.6% |
+| run 2, order reversed | 2.131 ± 0.070 s | 2.280 ± 0.099 s | +7.0% |
+
+That is roughly 1.5–3.5 µs per probe. Only names containing `~` pay it, and those are rare outside
+8.3 short names.
+
+**Not done.** At 200,000 files six levels deep, the walk projects to ~0.7 s of a ~22 s checkout,
+about 3%. A memo would keep that 3% but add an invariant every write path must keep. The
+materializer itself creates and removes directories between writes, and a memo goes stale the
+moment something else swaps a directory for a symlink. A fresh `lstat` per write keeps the window
+to one syscall. `openat` would close the window entirely, but it rewrites every write sink. Its
+case is safety rather than speed, so file it on its own if it is ever wanted. The volume probe is a
+few percent, paid only on names that hold a `~`.
+
+---
+
 ## Remaining items
 
 ### b. Pack-index validation tax — fixed (FORK-118, 2026-10-18)
