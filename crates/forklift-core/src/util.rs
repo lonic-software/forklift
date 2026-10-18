@@ -17,6 +17,7 @@ pub mod haul_utils;
 pub mod sign_utils;
 pub mod merge_utils;
 pub mod meta_tree;
+pub mod kv_utils;
 pub mod stack_utils;
 pub mod tag_utils;
 pub mod cherry_pick_utils;

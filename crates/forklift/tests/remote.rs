@@ -6083,3 +6083,193 @@ fn a_lower_across_a_case_only_rename_keeps_the_file() {
     assert_success(&status);
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 }
+
+/// The full hash of a revision in a warehouse.
+fn parcel_hash(area: &TestArea, dir: &str, revision: &str) -> String {
+    let set = area.forklift(dir, &["--json", "kv", "list", revision]);
+    assert_success(&set);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&set)).unwrap();
+
+    value["data"]["subject"].as_str().expect("a scoped listing names its subject").to_string()
+}
+
+#[test]
+fn kv_needs_an_office_and_refuses_readers() {
+    let area = TestArea::new("kv-office");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+
+    // No office: a write is refused before anything is stacked.
+    let refused = area.forklift("a", &["kv", "set", "main", "ci", "green"]);
+    assert!(!refused.status.success(), "a kv write without an office must be refused");
+    assert!(stderr(&refused).contains("office"), "{}", stderr(&refused));
+    assert!(stdout(&area.forklift("a", &["kv", "list"])).contains("No custom metadata"));
+
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+
+    // A reader may not write, though reading stays open to it.
+    let reader = keygen_admit_args(&area, "reader@forklift");
+    assert_success(&area.forklift("a", &[
+        "office", "admit", &reader[0], &reader[1], &reader[2], "--role", "reader",
+    ]));
+    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "green"]));
+
+    assert_success(&area.forklift("a", &["config", "operator.identifier", "reader@forklift"]));
+    let refused = area.forklift("a", &["kv", "set", "main", "ci", "red"]);
+    assert!(!refused.status.success(), "a reader's kv write must be refused");
+    assert!(stderr(&refused).contains("reader"), "{}", stderr(&refused));
+    let refused = area.forklift("a", &["kv", "unset", "main", "ci"]);
+    assert!(!refused.status.success(), "a reader's kv unset must be refused");
+    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "green");
+}
+
+#[test]
+fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
+    let area = TestArea::new("kv-remote");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+
+    let subject = parcel_hash(&area, "a", "main");
+
+    // Set, read and lift — @kv rides along with the working pallet.
+    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "green"]));
+    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "green");
+    let again = area.forklift("a", &["kv", "set", "main", "ci", "green"]);
+    assert_success(&again);
+    assert!(stdout(&again).contains("nothing to change"), "{}", stdout(&again));
+
+    let lifted = area.forklift("a", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @kv pallet"), "{}", stdout(&lifted));
+
+    // A franchise carries it, readable by the full hash too.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_eq!(stdout(&area.forklift("b", &["kv", "get", &subject, "ci"])).trim(), "green");
+
+    // Disjoint divergence: B sets one key and lifts, A another without lowering. A's lift is
+    // refused for @kv alone, and lowering replays A's change onto the remote's and lifts it.
+    assert_success(&area.forklift("b", &["kv", "set", "main", "from-b", "b"]));
+    assert_success(&area.forklift("b", &["lift"]));
+
+    assert_success(&area.forklift("a", &["kv", "set", "main", "from-a", "a"]));
+    let refused = area.forklift("a", &["lift"]);
+    assert!(!refused.status.success(), "a diverged @kv lift must be refused");
+    assert!(stderr(&refused).contains("lower"), "{}", stderr(&refused));
+
+    let lowered = area.forklift("a", &["lower"]);
+    assert_success(&lowered);
+    assert!(stdout(&lowered).contains("Replayed the local @kv changes"), "{}", stdout(&lowered));
+
+    assert_success(&area.forklift("b", &["lower"]));
+    for dir in ["a", "b"] {
+        let listing = stdout(&area.forklift(dir, &["kv", "list", "main"]));
+        assert!(listing.contains("from-a = a") && listing.contains("from-b = b") && listing.contains("ci = green"),
+                "{}: {}", dir, listing);
+    }
+
+    // A conflict: both change the same key. Lowering lifts nothing for @kv and exits 24,
+    // naming the path and both sides.
+    assert_success(&area.forklift("b", &["kv", "set", "main", "ci", "red"]));
+    assert_success(&area.forklift("b", &["lift"]));
+    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "amber"]));
+
+    let conflicted = area.forklift("a", &["--json", "lower"]);
+    assert_eq!(conflicted.status.code(), Some(24), "{}", stdout(&conflicted));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&conflicted)).unwrap();
+    assert_eq!(value["error"]["code"], "meta_conflict");
+    let pallets = &value["error"]["details"]["pallets"];
+    assert_eq!(pallets[0]["pallet"], "@kv");
+    assert_eq!(pallets[0]["conflicts"][0]["path"], format!("{}/ci", subject));
+    assert_eq!(pallets[0]["conflicts"][0]["ours"]["value"], "amber");
+    assert_eq!(pallets[0]["conflicts"][0]["theirs"]["value"], "red");
+    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "amber",
+               "a conflicted lower leaves the local @kv as it was");
+
+    // Keeps that cannot apply are refused: a pallet without resolutions, a malformed side.
+    let refused = area.forklift("a", &["lower", "--keep", "manifest:main=ours"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("takes no resolutions"), "{}", stderr(&refused));
+    let refused = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=mine", subject)]);
+    assert!(!refused.status.success());
+
+    // Keeping ours lifts the local value over the remote's.
+    let kept = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=ours", subject)]);
+    assert_success(&kept);
+    assert!(stdout(&kept).contains("Replayed"), "{}", stdout(&kept));
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(stdout(&area.forklift("b", &["kv", "get", "main", "ci"])).trim(), "amber");
+
+    // Keeping theirs takes the remote's value.
+    assert_success(&area.forklift("b", &["kv", "set", "main", "ci", "blue"]));
+    assert_success(&area.forklift("b", &["lift"]));
+    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "violet"]));
+    let kept = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/ci=theirs", subject)]);
+    assert_success(&kept);
+    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "blue");
+
+    // A keep for a pallet that did not diverge is refused rather than silently ignored.
+    let stale = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=theirs", subject)]);
+    assert!(!stale.status.success(), "a keep with nothing to resolve must be refused");
+
+    // Unset removes the key; the log shows every change, newest first.
+    assert_success(&area.forklift("a", &["kv", "unset", "main", "ci"]));
+    assert!(!area.forklift("a", &["kv", "get", "main", "ci"]).status.success());
+    let log = stdout(&area.forklift("a", &["kv", "log", "main", "ci"]));
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines[0].ends_with("removed") && lines[1].ends_with("= blue"), "{}", log);
+    assert!(log.contains("= green"), "{}", log);
+    assert_success(&area.forklift("a", &["lift"]));
+}
+
+#[test]
+fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
+    let area = TestArea::new("kv-isolation");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "green"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    let base = parcel_hash(&area, "a", "main");
+
+    // B moves the working pallet and @kv; A changes the same key without lowering.
+    area.write_file("b/code.txt", "v2\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "second"]));
+    assert_success(&area.forklift("b", &["kv", "set", &base, "ci", "red"]));
+    assert_success(&area.forklift("b", &["lift"]));
+    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "amber"]));
+
+    // The lower still brings the working pallet down, then reports the @kv conflict, naming the
+    // head the working pallet lowered to.
+    let lowered = area.forklift("a", &["--json", "lower"]);
+    assert_eq!(lowered.status.code(), Some(24), "{}{}", stdout(&lowered), stderr(&lowered));
+    assert_eq!(area.read_file("a/code.txt"), "v2\n", "the working pallet must lower despite @kv");
+    let value: serde_json::Value = serde_json::from_str(&stdout(&lowered)).unwrap();
+    assert_eq!(value["error"]["details"]["lowered"]["pallet"], "main");
+    assert_eq!(value["error"]["details"]["lowered"]["head"], parcel_hash(&area, "b", "main"));
+
+    let again = area.forklift("a", &["lower"]);
+    assert_eq!(again.status.code(), Some(24));
+    assert!(stdout(&again).contains("ours") && stdout(&again).contains("theirs"), "{}", stdout(&again));
+
+    // When the working pallet itself fails, its error leads and still names the conflict.
+    assert_success(&area.forklift("a", &["palletize", "side"]));
+    let failed = area.forklift("a", &["lower"]);
+    assert!(!failed.status.success());
+    assert_ne!(failed.status.code(), Some(24), "the working pallet's failure outranks the conflict");
+    assert!(stderr(&failed).contains("no pallet") && stderr(&failed).contains("@kv conflicted"), "{}", stderr(&failed));
+}

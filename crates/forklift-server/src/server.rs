@@ -37,8 +37,8 @@ use forklift_core::model::remote::{
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::{self, ServeLock, StoreAccessLock};
 use forklift_core::util::{
-    audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
-    office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
+    audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, meta_tree,
+    object_utils, office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
 
@@ -1454,8 +1454,8 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
         let mut pallets = std::collections::BTreeMap::new();
 
         // Both namespaces travel in one map, keyed by the qualified reference form: user
-        // pallets bare, meta pallets as `@office` — so clients (and future meta
-        // pallets) route by namespace, never by a hard-coded name.
+        // pallets bare, meta pallets as `@office` — so clients route by namespace, never by a
+        // hard-coded name.
         for (pallet_ref, head) in pallet_utils::all_pallet_refs().map_err(internal)? {
             pallets.insert(pallet_ref.to_wire(), head);
         }
@@ -2059,6 +2059,13 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         let is_meta = namespace == pallet_utils::PalletNamespace::Meta;
         let is_office = is_meta && bare == OFFICE_PALLET_NAME;
 
+        // A meta name this server does not know is refused outright, never stored unchecked.
+        if is_meta {
+            meta_tree::check_meta_pallet_name(&bare).map_err(unprocessable)?;
+        }
+
+        let converted = if is_meta { meta_tree::converted_rules(&bare) } else { None };
+
         // The CAS read-check-write is one critical section. The trust anchor and
         // office state are read here too, once, so transport authorization below and
         // the audit that follows consume exactly the same values — the lock that
@@ -2088,10 +2095,11 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 let allowed = if is_meta {
                     // Anyone but a reader may transport a meta pallet's history. Content
                     // authorization below differs by meta pallet, not a uniform "signer's
-                    // role" check: only @office's parcels are checked, per parcel, against
-                    // the signer's role (`verify_office_privileges`); @manifest/@haul/@tags
-                    // take the same `verify_pallet_history` path as an ordinary working
-                    // pallet and get no role or grant check at all.
+                    // role" check: @office's parcels are checked, per parcel, against the
+                    // signer's role (`verify_office_privileges`); a converted pallet's against
+                    // its own rules (`verify_meta_content`); @manifest/@haul/@tags take the
+                    // same `verify_pallet_history` path as an ordinary working pallet and get
+                    // no role or grant check at all.
                     user.role != office_utils::Role::Reader
                 } else {
                     user.may_write_pallet(&bare)
@@ -2211,11 +2219,24 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     events.push(event);
                 }
             }
+        } else if let Some(rules) = converted {
+            // A converted meta pallet exists only under an office, so a missing anchor or
+            // office refuses here instead of skipping the check. Its content check subsumes
+            // the signature audit below: every new parcel must be signed by an office key,
+            // stamp only its own cells, and keep the pallet's rules.
+            meta_tree::verify_converted_update(
+                &bare,
+                rules,
+                anchor.as_ref(),
+                office_head.as_deref(),
+                request.old_head.as_deref(),
+                &request.new_head
+            ).map_err(unprocessable)?;
         } else if let Some(anchor) = anchor {
             // A trusted warehouse accepts nothing a local audit would reject. This is the
-            // user-pallet path (the office took the branch above); a future non-office
-            // meta pallet will bring its own verification here. The office head is the
-            // one already read above, not a second lookup.
+            // user-pallet path, and that of a meta pallet still on its own code (the office
+            // and converted pallets took the branches above). The office head is the one
+            // already read above, not a second lookup.
             let office_head = office_head.ok_or(unprocessable(
                 "Trust is established but the office pallet is missing; lift the \
                 office first.".to_string()
@@ -4023,7 +4044,7 @@ mod tests {
     async fn the_bootstrap_window_office_lift_still_commits() {
         let root = scratch_dir("post-ref-bootstrap-lift");
         let _scope = StorageRootScope::enter(&root);
-        let keys_lock = KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _keys_lock = KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keys_dir = root.join("keys");
         std::fs::create_dir_all(&keys_dir).unwrap();
         // Declared after `keys_lock`, so it restores while the lock is still held.
@@ -4091,12 +4112,104 @@ mod tests {
 
         drop(_scope);
         let _ = std::fs::remove_dir_all(&root);
-        // `keys_lock` is NOT dropped here. It must outlive `_keys_restore`, which runs at
+        // `_keys_lock` is NOT dropped here. It must outlive `_keys_restore`, which runs at
         // scope end — releasing the lock first would let another test acquire it and set
         // its own FORKLIFT_KEYS_DIR, only for this test's restore to clobber it mid-run.
         // Declaration order (lock, then restore) gives the reverse drop order that is
         // correct on both the passing and the panicking path.
-        drop(keys_lock);
+    }
+
+    /// The office fixture's state with an admin token, for the converted-pallet falsifiers.
+    fn admin_token_state(fixture: &OfficeFixture) -> Arc<AppState> {
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-alice".to_string(), fixture.admin.identifier.clone());
+
+        Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) })
+    }
+
+    /// Falsifier: a meta pallet name outside the known list is refused, even when its history
+    /// is signed by an admin and would pass the signature-only check older names get.
+    #[tokio::test]
+    async fn an_unknown_meta_pallet_name_is_refused() {
+        let fixture = OfficeFixture::genesis("post-ref-unknown-meta");
+        let new_head = store_signed_parcel(&fixture.admin, &fixture.admin_key_id, Vec::new(), "@foo");
+
+        let response = post_ref_update(
+            State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
+            Path(ref_update_params("@foo")), Json(RefUpdateRequest { old_head: None, new_head })
+        ).await;
+
+        assert_eq!(response.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Falsifier: a `@kv` head whose cell is stamped with a key other than the one that signed
+    /// its parcel is refused by the content check, though every signature in it verifies.
+    #[tokio::test]
+    async fn a_kv_cell_stamped_by_another_key_is_refused() {
+        use forklift_core::util::{kv_utils, meta_tree};
+
+        let fixture = OfficeFixture::genesis("post-ref-kv-forged-stamp");
+        let bob_key_id = fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
+        let office = office_utils::read_office_state().unwrap();
+
+        // Signed by alice, stamped as bob: the writer's own check refuses it after the parcel
+        // is stored, so the signing closure keeps the hash for the push.
+        let forged = std::cell::RefCell::new(None);
+        let signer = meta_tree::MetaSigner::new(&fixture.admin_key_id, |hash| {
+            *forged.borrow_mut() = Some(hash.to_string());
+            forklift_core::util::sign_utils::sign_parcel_hash(&fixture.admin_key_id, hash)
+        });
+        let edit = meta_tree::set_cell(
+            &kv_utils::cell_path(&"c".repeat(64), "ci"), &bob_key_id, kv_utils::KV_TEXT_SCHEMA,
+            &kv_utils::text_value("green")
+        ).unwrap();
+
+        let refused = meta_tree::stack_meta_edits(
+            kv_utils::KV_PALLET_NAME, &kv_utils::KvRules, &office, &[edit], &fixture.admin, "forged",
+            &signer
+        );
+        assert!(refused.is_err(), "the writer must refuse its own forged stamp");
+        drop(signer);
+
+        let new_head = forged.into_inner().expect("the forged parcel was signed");
+        let response = post_ref_update(
+            State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
+            Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head })
+        ).await;
+
+        assert_eq!(response.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Falsifier: a remote without an office refuses `@kv`, where any other meta pallet would be
+    /// taken unverified.
+    // `KEYS_ENV_LOCK` is held across the request for the reason the bootstrap test gives.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn kv_without_an_office_is_refused() {
+        let root = scratch_dir("post-ref-kv-no-office");
+        let _scope = StorageRootScope::enter(&root);
+        let _keys_lock = KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keys_dir = root.join("keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        let _keys_restore = KeysDirRestore(std::env::var("FORKLIFT_KEYS_DIR").ok());
+        std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
+
+        warehouse_utils::prepare_warehouse().unwrap();
+
+        let actor = Operator { name: "alice".to_string(), identifier: "alice".to_string() };
+        let (key_id, _) = forklift_core::util::sign_utils::generate_keypair(&actor.identifier).unwrap();
+        let new_head = store_signed_parcel(&actor, &key_id, Vec::new(), "@kv without an office");
+
+        let response = post_ref_update(
+            State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(),
+            Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head })
+        ).await;
+
+        assert_eq!(response.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&root);
+        // The lock outlives `_keys_restore` by declaration order, as in the bootstrap test.
     }
 
     /// Coverage (over-tightened direction, second half): two writers pushing to two

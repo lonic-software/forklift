@@ -39,6 +39,7 @@ pub mod peek;
 pub mod show;
 pub mod load;
 pub mod mcp;
+pub mod kv;
 pub mod manifest;
 pub mod office;
 pub mod profile;

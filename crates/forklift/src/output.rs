@@ -421,6 +421,11 @@ error_codes! {
     /// A remote answered with something the protocol never produces (such as a non-canonical
     /// pallet head). Not a transport failure: retrying gets the same answer.
     RemoteProtocolViolation,
+
+    /// A meta pallet changed differently on both sides at the same path. `error.details` carries
+    /// `{pallets: [{pallet, conflicts: [{path, ours: {value?, signer?}, theirs}]}],
+    /// lowered: {pallet, head}}`.
+    MetaConflict,
 }
 
 impl ErrorCode {
@@ -449,6 +454,7 @@ impl ErrorCode {
             ErrorCode::DurabilityTaint => heal_utils::CODE_DURABILITY_TAINT,
             ErrorCode::TrustChanged => RefusalCode::TrustChanged.as_str(),
             ErrorCode::RemoteProtocolViolation => RefusalCode::RemoteProtocolViolation.as_str(),
+            ErrorCode::MetaConflict => RefusalCode::MetaConflict.as_str(),
         }
     }
 
@@ -480,6 +486,7 @@ impl ErrorCode {
             ErrorCode::DurabilityTaint => 21,
             ErrorCode::TrustChanged => 22,
             ErrorCode::RemoteProtocolViolation => 23,
+            ErrorCode::MetaConflict => 24,
         }
     }
 
@@ -533,6 +540,9 @@ impl ErrorCode {
             ErrorCode::RemoteProtocolViolation =>
                 "A remote answered with something the protocol never produces; it is \
                  misbehaving or corrupt, and retrying gets the same answer",
+            ErrorCode::MetaConflict =>
+                "A meta pallet changed differently on both sides at the same path; nothing was \
+                 lifted for it, and \"lower --keep\" resolves each named path",
         }
     }
 
@@ -559,6 +569,7 @@ impl ErrorCode {
             RefusalCode::DurabilityTaint => ErrorCode::DurabilityTaint,
             RefusalCode::TrustChanged => ErrorCode::TrustChanged,
             RefusalCode::RemoteProtocolViolation => ErrorCode::RemoteProtocolViolation,
+            RefusalCode::MetaConflict => ErrorCode::MetaConflict,
         }
     }
 }
@@ -954,6 +965,7 @@ mod tests {
             (RefusalCode::DurabilityTaint, "durability_taint", 21),
             (RefusalCode::TrustChanged, "trust_changed", 22),
             (RefusalCode::RemoteProtocolViolation, "remote_protocol_violation", 23),
+            (RefusalCode::MetaConflict, "meta_conflict", 24),
         ];
 
         for (code, code_str, exit) in table {

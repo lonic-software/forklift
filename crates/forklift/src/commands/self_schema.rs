@@ -78,6 +78,10 @@ const FORKLIFT: Tables = Tables {
         ("office link", "public_key", "the public half of a key pair"),
         ("office authorize", "public_key", "the public half of a key pair"),
         ("office retire", "key_id", "an identifier, not key material"),
+        ("kv set", "key", "a custom-metadata key name, not key material"),
+        ("kv get", "key", "a custom-metadata key name, not key material"),
+        ("kv unset", "key", "a custom-metadata key name, not key material"),
+        ("kv log", "key", "a custom-metadata key name, not key material"),
     ],
 };
 

@@ -468,6 +468,36 @@ pub enum Command {
                          anchor the remote holds, and says which."
         )]
         expect: Option<String>,
+
+        /// Resolve a metadata conflict: keep ours or theirs at a path (repeatable)
+        #[arg(
+            long = "keep",
+            value_name = "PALLET:PATH=SIDE",
+            long_help = "Resolve a metadata conflict that a previous lower named. PALLET is the \
+                         metadata pallet (kv), PATH the subject (a full parcel hash) and, \
+                         optionally, the key, as in kv:<subject>/<key>, and SIDE is ours or \
+                         theirs. \"theirs\" drops every local change at or beneath the path; \
+                         \"ours\" puts the local value back on top of the remote one, and must \
+                         name a conflicted key exactly. \"theirs\" also discards a local change \
+                         nobody else made. A resolution naming a path with nothing to resolve is \
+                         refused. Repeat the flag for each path."
+        )]
+        keep: Vec<String>,
+    },
+
+    /// Custom metadata: signed text values keyed by parcel and key
+    #[command(
+        long_about = "Attach custom metadata to a parcel: a text value under a key, as in a \
+                      build status or a ticket link. Values live on the \"@kv\" meta pallet; every \
+                      change is one parcel signed by its writer, and every value carries the key \
+                      that wrote it, verifiable offline against the office chain. Lower syncs \
+                      them: changes to different keys combine, and a key changed differently on \
+                      both sides is a conflict that \"lower --keep\" resolves. Writing needs the \
+                      office and a writer or admin role."
+    )]
+    Kv {
+        #[command(subcommand)]
+        action: KvAction,
     },
 
     /// Attach signed post-metadata to a parcel: approvals, review notes (`mf`)
@@ -1076,6 +1106,69 @@ pub enum TagAction {
 }
 
 #[derive(Subcommand)]
+pub enum KvAction {
+    /// Set a key on a parcel
+    #[command(
+        long_about = "Set a key on a parcel to a text value, replacing any value it held. A key \
+                      is ASCII letters, digits, \".\", \"_\" and \"-\", at most 128 bytes, and \
+                      never begins with \".\" or \"-\"; a value is at most 64 KiB of text. \
+                      Requires an enrolled signing key and a writer or admin role."
+    )]
+    Set {
+        /// The parcel the value is about (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
+
+        /// The value
+        value: String,
+    },
+
+    /// Show a key's value on a parcel
+    Get {
+        /// The parcel (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
+    },
+
+    /// Remove a key from a parcel
+    #[command(
+        long_about = "Remove a key from a parcel. A key that holds no value is refused. Requires \
+                      an enrolled signing key and a writer or admin role."
+    )]
+    Unset {
+        /// The parcel (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
+    },
+
+    /// List every value, or a parcel's
+    List {
+        /// Only this parcel's values (a pallet name, or a parcel hash / unique prefix)
+        revision: Option<String>,
+    },
+
+    /// Show every change to a key, newest first, with who made it
+    #[command(
+        long_about = "Show every change to a key on a parcel, newest first: the parcel that made \
+                      it, when, by whom, and the value after it. Walks the whole history of the \
+                      kv pallet."
+    )]
+    Log {
+        /// The parcel (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ManifestAction {
     /// Attach a free-form note to a parcel
     #[command(
@@ -1546,6 +1639,7 @@ impl Command {
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
+                | Command::Kv { .. }
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }
                 | Command::Office { .. }
@@ -1619,6 +1713,7 @@ impl Command {
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
+                | Command::Kv { .. }
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }
                 | Command::Office { .. }

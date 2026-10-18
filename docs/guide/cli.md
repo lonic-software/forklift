@@ -694,6 +694,37 @@ record entries concurrently the manifest diverges, and `lower` **merges it autom
 — entries are independent, so the union is always conflict-free; you then `lift` the
 merge. (The office, whose records interdepend, stays linear and is reconciled by hand.)
 
+### `kv` — custom metadata on parcels
+
+```sh
+forklift kv set main ci green        # set a key on a parcel (any revision)
+forklift kv get main ci              # its value
+forklift kv unset main ci            # remove it
+forklift kv list main                # every key on a parcel; `kv list` for all of them
+forklift kv log main ci              # every change to a key, newest first
+```
+
+Free-form text values, keyed by parcel and key, for whatever your tooling wants to record — a CI
+result, a ticket, a review state. A key is one name of at most 128 bytes; a value is UTF-8 text of
+at most 64 KiB. Values live on the `@kv` meta pallet and sync like the manifest, but **each value
+is signed by whoever wrote it**: every write is a parcel signed with your key, and a remote
+refuses any value stamped by a key other than the one that signed it. Writing needs an enrolled
+signing key and a writer or admin role (a reader may only read), and the office must exist —
+`@kv` is never kept without one. A value about a parcel this warehouse does not hold stays
+readable and removable by its full hash.
+
+If two people change `@kv` concurrently, `lower` replays your changes onto the remote's and
+lifts them, as long as they touched different keys. When both changed the same key, `lower`
+lifts nothing for `@kv`, lists each such key with both values, and exits 24 (`meta_conflict`);
+choose a side per key and lower again:
+
+```sh
+forklift lower --keep kv:<parcel-hash>/ci=theirs   # take the remote's value
+forklift lower --keep kv:<parcel-hash>/ci=ours     # keep yours, lifted over theirs
+```
+
+`theirs` on a bare `kv:<parcel-hash>` takes the remote's side for every key on that parcel.
+
 ### `tag` — signed tags / releases
 
 ```sh
@@ -1131,6 +1162,7 @@ remote that doesn't, `lift` refuses up front, before uploading anything
 ```sh
 forklift lower
 forklift lower --expect <genesis>   # refuse unless the remote's trust anchor is this one
+forklift lower --keep kv:<hash>/<key>=theirs   # resolve a custom-metadata conflict
 ```
 
 Fetches the remote's new parcels for the current pallet and fast-forwards to them
@@ -1146,6 +1178,10 @@ divergence, and you consolidate deliberately (`palletize` the remote head into
 its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
 warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
 content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
+
+The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
+working pallet still lowers. A diverged `@manifest` or `@haul` merges; a diverged `@kv` replays
+your changes onto the remote's, and `--keep` resolves the keys both sides changed (see `kv`).
 
 ### `expand` — widen a sparse warehouse's fetch scope
 

@@ -8,6 +8,7 @@ use forklift_core::util::{
     remote_utils, scope_utils,
 };
 use crate::commands::consolidate::{self, MergeStatus};
+use crate::commands::lower::{self, MetaPalletFailure};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -45,12 +46,19 @@ pub async fn handle_command() -> Result<(), String> {
         };
 
         // The office carries the keys, so it lifts first (above); the manifest and any
-        // other meta pallet follow, once the remote can verify their signatures.
-        let meta_pallets: Vec<String> = remote_utils::lift_meta_pallets(&client, &info).await?
-            .into_iter()
-            .filter(|lift| matches!(lift.result, LiftResult::Lifted(_)))
-            .map(|lift| lift.pallet)
-            .collect();
+        // other meta pallet follow, once the remote can verify their signatures. Each lifts
+        // on its own: one that fails is reported after the rest, and the working pallet,
+        // have gone through.
+        let mut meta_pallets = Vec::new();
+        let mut meta_failed = Vec::new();
+
+        for lift in remote_utils::lift_meta_pallets(&client, &info).await? {
+            match lift.result {
+                Ok(LiftResult::Lifted(_)) => meta_pallets.push(lift.pallet),
+                Ok(LiftResult::UpToDate) => {}
+                Err(why) => meta_failed.push(MetaPalletFailure { pallet: lift.pallet, error: why }),
+            }
+        }
 
         let pallet = pallet_utils::get_current_pallet_name()?;
 
@@ -75,6 +83,7 @@ pub async fn handle_command() -> Result<(), String> {
         let mut report = LiftReport {
             office_new_parcels,
             meta_pallets,
+            meta_failed,
             auto_merged,
             pallet: pallet.clone(),
             up_to_date: false,
@@ -84,13 +93,30 @@ pub async fn handle_command() -> Result<(), String> {
             uploaded_signatures: 0,
         };
 
-        match remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await? {
-            LiftResult::UpToDate => report.up_to_date = true,
-            LiftResult::Lifted(stats) => {
+        let lifted = remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await;
+
+        match lifted {
+            Ok(LiftResult::UpToDate) => report.up_to_date = true,
+            Ok(LiftResult::Lifted(stats)) => {
                 report.new_parcels = stats.new_parcels;
                 report.uploaded_objects = stats.uploaded_objects;
                 report.uploaded_signatures = stats.uploaded_signatures;
             }
+            Err(why) => {
+                if !output::is_json() {
+                    report.render_meta();
+                }
+
+                return Err(lower::with_meta_failures(why, &report.meta_failed));
+            }
+        }
+
+        if !report.meta_failed.is_empty() {
+            if !output::is_json() {
+                report.render_human();
+            }
+
+            return Err(lower::meta_failure_error(&report.meta_failed));
         }
 
         output::emit(&report);
@@ -187,6 +213,11 @@ pub(crate) struct LiftReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     meta_pallets: Vec<String>,
 
+    /// The meta pallets that failed to lift. Never in a successful report: a failure makes the
+    /// command fail, after the rest have gone through.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    meta_failed: Vec<MetaPalletFailure>,
+
     /// How many times the lift auto-merged a diverged remote before it went through
     /// (optimistic lift).
     #[serde(skip_serializing_if = "is_zero")]
@@ -208,8 +239,9 @@ fn is_zero(count: &usize) -> bool {
     *count == 0
 }
 
-impl CommandOutput for LiftReport {
-    fn render_human(&self) {
+impl LiftReport {
+    /// The office and meta pallet lines: what went through before the working pallet.
+    fn render_meta(&self) {
         if let Some(new_parcels) = self.office_new_parcels {
             println!("Lifted the office pallet: {} new parcel(s).", new_parcels);
         }
@@ -217,6 +249,12 @@ impl CommandOutput for LiftReport {
         for pallet in &self.meta_pallets {
             println!("Lifted the {} pallet.", pallet);
         }
+    }
+}
+
+impl CommandOutput for LiftReport {
+    fn render_human(&self) {
+        self.render_meta();
 
         if self.auto_merged > 0 {
             println!(
