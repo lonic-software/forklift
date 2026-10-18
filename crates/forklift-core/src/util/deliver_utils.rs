@@ -154,7 +154,10 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
 
     // Record the delivery as signed post-metadata on the clean parcel, referencing the
     // kept trail so "what the agent tried" stays discoverable. It is recorded before the target
-    // moves, so a refused record leaves the target where it was.
+    // moves, so a refused record leaves the target where it was. The converse — the ref write
+    // failing after the record stood — leaves a record about a parcel no pallet holds, and a
+    // retry records a second squash. That is accepted: a stray record misleads no reader about
+    // a pallet, whereas a moved target with no record would lose the trail's evidence.
     let entry = ManifestEntry {
         subject: object.hash.clone(),
         kind: ManifestKind::Delivery,

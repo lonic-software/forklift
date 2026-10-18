@@ -319,8 +319,10 @@ impl QueryContext {
                 let read = manifest_utils::read_manifest()?;
                 let mut index = ProvenanceIndex::default();
 
-                // An entry this build cannot read may be provenance (or a kind it does not know),
-                // so its subject's provenance is incomplete; one with no subject leaves them all so.
+                // An entry this build cannot read may be provenance, so its subject's provenance
+                // is incomplete; one with no subject leaves them all so. Only a known kind other
+                // than provenance is ruled out: those never carry provenance, but a kind this
+                // build does not know might, and a verdict must not claim what it cannot read.
                 for unreadable in read.unreadable {
                     let kind = unreadable.path.split('/').nth(2).unwrap_or_default();
 
