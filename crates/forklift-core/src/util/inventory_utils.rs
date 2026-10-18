@@ -1502,33 +1502,6 @@ pub fn build_inventory_item_from_stat(path: &Path,
     )
 }
 
-/// Stage a fresh inventory entry (with current stat data) for a file whose blob or recipe is
-/// already stored (e.g. one just written from a tree or merge).
-///
-/// # Arguments
-/// * `path`      - The warehouse path of the file.
-/// * `hash`      - The blob or recipe hash of the file's content.
-/// * `item_type` - The authoritative entry type (from the tree / merge action), carried through
-///   so a chunked entry keeps its `*Chunked` type in the inventory rather than being demoted to
-///   a plain type a `stat` would report.
-///
-/// # Returns
-/// * `Ok(())`      - If the entry was staged.
-/// * `Err(String)` - If the file's metadata could not be gathered or the shard written.
-pub fn stage_file_entry_from_stat(path: &str, hash: String, item_type: DirEntryType) -> Result<(), String> {
-    let (parent_key, name) = match path.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
-        Some((parent, name)) => (parent, name),
-        None => ("", path),
-    };
-
-    let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type)?;
-
-    update_shard(parent_key, |inventory| {
-        inventory.add_item(entry);
-        Ok(())
-    })
-}
-
 /// Whether the directory at `path` may be safely replaced (by a file, or cleared to make
 /// way for one) without losing data: it is tracked — its key is registered, see
 /// [`is_tracked_directory`] — and every entry beneath it, recursively, is tracked too. Called for a path a merge or shift

@@ -462,12 +462,43 @@ fn conflict_writes(action: &MergeAction) -> bool {
 /// write is about to turn into a directory) is emptied — and, via `apply_merge_action`'s
 /// parent-chain cleanup, itself removed — before that write lands. Writing first would
 /// otherwise fail (`EISDIR`/`EEXIST`) for a tracked type flip in either direction.
+///
+/// Every inventory change goes through one [`inventory_utils::ShardMutationBatch`], published
+/// before this returns, so the caller records its in-progress state only over a published
+/// inventory. What was applied before a failure is still published, and the error says how far
+/// the merge got: the caller has recorded nothing as in progress yet.
 pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
+    let mut batch = inventory_utils::ShardMutationBatch::new();
 
+    let applied = apply_merge_actions_to(actions, &mut batch, &mut conflict_paths);
+
+    match (applied, batch.publish()) {
+        (Ok(()), Ok(())) => Ok(conflict_paths),
+        (Err(e), Ok(())) => Err(format!(
+            "{}\nThe changes applied before this error are in the working directory and staged. \
+            Nothing was recorded as in progress.",
+            e
+        )),
+        (applied, Err(publish)) => {
+            let first = applied.err().map(|e| format!("{}\n", e)).unwrap_or_default();
+
+            Err(format!(
+                "{}{}\nThe working directory holds the changes applied so far, but staging them \
+                failed, so some or all of them are not staged. Nothing was recorded as in progress.",
+                first, publish
+            ))
+        }
+    }
+}
+
+/// The body of [`apply_merge_actions`]: every deletion, then every write, staged into `batch`.
+fn apply_merge_actions_to(actions: &[MergeAction],
+                          batch: &mut inventory_utils::ShardMutationBatch,
+                          conflict_paths: &mut Vec<String>) -> Result<(), String> {
     for action in actions {
         if matches!(action, MergeAction::Delete { .. }) {
-            apply_merge_action(action, None, &mut conflict_paths)?;
+            apply_merge_action(action, None, batch, conflict_paths)?;
         }
     }
 
@@ -477,23 +508,24 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
     shift_utils::write_in_order(&writes, |action| match action {
         MergeAction::TakeTheirs { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
         _ => None,
-    }, |action, content| apply_merge_action(action, content, &mut conflict_paths))?;
-
-    Ok(conflict_paths)
+    }, |action, content| apply_merge_action(action, content, batch, conflict_paths))
 }
 
-/// Apply one merge action to the working directory and the inventory. Shared with
-/// `cherry-pick`, which applies a parcel's diff through the same `MergeAction`s.
+/// Apply one merge action to the working directory, and stage its inventory change into
+/// `batch`. Shared with `cherry-pick`, which applies a parcel's diff through the same
+/// `MergeAction`s.
 ///
 /// `content` is a `TakeTheirs` blob already loaded by [`shift_utils::write_in_order`]'s
-/// prefetch, or `None` to load it here.
-pub(crate) fn apply_merge_action(action: &MergeAction,
-                                 content: Option<Result<Vec<u8>, String>>,
-                                 conflict_paths: &mut Vec<String>) -> Result<(), String> {
+/// prefetch, or `None` to load it here. A written file is statted right after its write, as the
+/// batch requires.
+fn apply_merge_action(action: &MergeAction,
+                      content: Option<Result<Vec<u8>, String>>,
+                      batch: &mut inventory_utils::ShardMutationBatch,
+                      conflict_paths: &mut Vec<String>) -> Result<(), String> {
     match action {
         MergeAction::TakeTheirs { path, hash, item_type, is_new } => {
             shift_utils::write_tracked_file_from(path, hash, *item_type, *is_new, content)?;
-            inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)
+            batch.stage_file_from_stat(path, hash.clone(), *item_type)
         }
 
         MergeAction::Delete { path } => {
@@ -505,12 +537,9 @@ pub(crate) fn apply_merge_action(action: &MergeAction,
                 Err(e) => return Err(format!("Error while removing \"{}\": {}", path, e)),
             }
 
-            let (parent_key, name) = split_path(path);
+            let (parent_key, name) = inventory_utils::split_path_key(path);
 
-            inventory_utils::update_shard(parent_key, |inventory| {
-                inventory.remove_item_by_name(name);
-                Ok(())
-            })?;
+            batch.update(parent_key, |inventory| { inventory.remove_item_by_name(name); })?;
 
             // Clean up the directory chain if the removal emptied it.
             let mut dir = std::path::Path::new(path).parent();
@@ -531,11 +560,14 @@ pub(crate) fn apply_merge_action(action: &MergeAction,
 
             // The merged content is new — store its blob so the next stack can point at it. A
             // three-way merge only ever runs on plain text files, so a `Merged` result is always
-            // a plain blob, never chunked.
+            // a plain blob, never chunked. Stored durably here, one barrier per blob, rather
+            // than deferred to one write batch finished before the publish: the batch may
+            // publish early (a key that may alias one it touched), and every blob it names
+            // must be durable by then.
             let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
             object.store()?;
 
-            inventory_utils::stage_file_entry_from_stat(path, object.hash, *item_type)
+            batch.stage_file_from_stat(path, object.hash, *item_type)
         }
 
         MergeAction::Conflict { path, content, entry_hash, item_type } => {
@@ -552,7 +584,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction,
                 shift_utils::write_tracked_file(path, entry_hash, *item_type, create)?;
             }
 
-            let (parent_key, name) = split_path(path);
+            let (parent_key, name) = inventory_utils::split_path_key(path);
 
             let mut entry = inventory_utils::build_stale_inventory_item(
                 name,
@@ -561,10 +593,7 @@ pub(crate) fn apply_merge_action(action: &MergeAction,
             );
             entry.state = InventoryItemState::FirstParentConflict;
 
-            inventory_utils::update_shard(parent_key, |inventory| {
-                inventory.add_item(entry);
-                Ok(())
-            })?;
+            batch.update(parent_key, |inventory| inventory.add_item(entry))?;
 
             conflict_paths.push(path.clone());
 
@@ -575,14 +604,6 @@ pub(crate) fn apply_merge_action(action: &MergeAction,
         // inventory: it is carried in the out-of-scope skeleton and spliced into the merge
         // parcel's tree by the completing stack's overlay. Nothing to apply here.
         MergeAction::ResolveOutOfScope { .. } => Ok(()),
-    }
-}
-
-/// Split a warehouse path into its parent directory key and file name.
-fn split_path(path: &str) -> (&str, &str) {
-    match path.rsplit_once('/') {
-        Some((parent, name)) => (parent, name),
-        None => ("", path),
     }
 }
 

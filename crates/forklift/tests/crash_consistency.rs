@@ -1038,6 +1038,224 @@ fn find_dir_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// A warehouse with 5 directories, each holding `files_per_dir` files the `feature` pallet edits
+/// and `files_per_dir` more it removes, while `main` moves on in a file of its own so the two
+/// diverge. Leaves `main` checked out, and returns the `feature` head.
+fn diverged_merge_fixture(area: &Area, files_per_dir: usize) -> String {
+    let warehouse = area.warehouse();
+
+    const DIR_COUNT: usize = 5;
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+            std::fs::write(dir_path.join(format!("gone{f}.txt")), format!("gone {dir} {f}\n")).unwrap();
+        }
+    }
+    std::fs::write(warehouse.join("main.txt"), "base\n").unwrap();
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["palletize", "feature"]).status.success());
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("theirs {dir} {f}\n")).unwrap();
+            std::fs::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
+        }
+    }
+
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "feature work"]).status.success());
+    let feature = std::fs::read_to_string(warehouse.join(".forklift").join("pallets").join("feature"))
+        .unwrap().trim().to_string();
+
+    assert!(area.run(&["shift", "main"]).status.success());
+    std::fs::write(warehouse.join("main.txt"), "main moved on\n").unwrap();
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "main work"]).status.success());
+
+    // The merge below applies every edit and every removal.
+    assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file0.txt")).unwrap(), "v1 0 0\n");
+    assert!(warehouse.join("dir0").join("gone0.txt").exists());
+
+    feature
+}
+
+/// Every edit and removal of [`diverged_merge_fixture`] is in the working directory, and the
+/// merge left nothing unstaged or in progress behind it.
+fn assert_diverged_merge_applied(area: &Area, files_per_dir: usize) {
+    let warehouse = area.warehouse();
+
+    for dir in 0..5 {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            assert_eq!(std::fs::read_to_string(dir_path.join(format!("file{f}.txt"))).unwrap(),
+                format!("theirs {dir} {f}\n"));
+            assert!(!dir_path.join(format!("gone{f}.txt")).exists());
+        }
+    }
+
+    let status = area.run(&["--json", "stocktake"]);
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status_json["data"]["unstaged_count"], 0, "{status_json}");
+    assert_eq!(status_json["data"]["staged_count"], 0, "{status_json}");
+}
+
+/// The barrier count of one clean `consolidate feature` over [`diverged_merge_fixture`].
+fn consolidate_barrier_count_for(files_per_dir: usize) -> u64 {
+    let area = Area::new(&format!("consolidate-barrier-count-{}", files_per_dir));
+    diverged_merge_fixture(&area, files_per_dir);
+
+    let mut command = area.command(&["consolidate", "feature"]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "consolidate failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    assert_diverged_merge_applied(&area, files_per_dir);
+
+    barrier_count(&output)
+}
+
+/// The barrier count of one clean `cherry-pick` of `feature`'s head over
+/// [`diverged_merge_fixture`].
+fn cherry_pick_barrier_count_for(files_per_dir: usize) -> u64 {
+    let area = Area::new(&format!("cherry-pick-barrier-count-{}", files_per_dir));
+    let feature = diverged_merge_fixture(&area, files_per_dir);
+
+    let mut command = area.command(&["cherry-pick", &feature]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "cherry-pick failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    assert_diverged_merge_applied(&area, files_per_dir);
+
+    barrier_count(&output)
+}
+
+/// `consolidate` stages every merge action through one batch, so its barrier count does not grow
+/// with the number of files the merge writes or removes — before the batch it paid one shard
+/// publish per action.
+#[test]
+fn consolidate_pays_a_constant_number_of_barriers_regardless_of_action_count() {
+    let count_1 = consolidate_barrier_count_for(1);
+    let count_10 = consolidate_barrier_count_for(10);
+
+    assert_eq!(count_1, count_10,
+        "consolidate's barrier count must not scale with the number of merge actions: {count_1} \
+         for 1 edit + 1 removal/directory, {count_10} for 10 + 10 (the same 5 directories either way)");
+    assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}
+
+/// `cherry-pick` applies the same merge actions through the same batch.
+#[test]
+fn cherry_pick_pays_a_constant_number_of_barriers_regardless_of_action_count() {
+    let count_1 = cherry_pick_barrier_count_for(1);
+    let count_10 = cherry_pick_barrier_count_for(10);
+
+    assert_eq!(count_1, count_10,
+        "cherry-pick's barrier count must not scale with the number of merge actions: {count_1} \
+         for 1 edit + 1 removal/directory, {count_10} for 10 + 10 (the same 5 directories either way)");
+    assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}
+
+/// A conflict the merge records in a deep directory changes only its entry's state there (its
+/// hash stays ours), yet it must still clear every ancestor's rollup, or stocktake would trust
+/// the rollups above it and never see the conflict.
+#[test]
+fn a_merge_conflict_clears_the_rollups_above_it() {
+    let area = Area::new("merge-conflict-rollups");
+    let warehouse = area.warehouse();
+    let deep = warehouse.join("a").join("b").join("c");
+
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("f.txt"), "base\n").unwrap();
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["palletize", "feature"]).status.success());
+    std::fs::write(deep.join("f.txt"), "theirs\n").unwrap();
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "feature work"]).status.success());
+    assert!(area.run(&["shift", "main"]).status.success());
+    std::fs::write(deep.join("f.txt"), "ours\n").unwrap();
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "main work"]).status.success());
+
+    // A clean warehouse whose rollups stocktake trusts, before the merge.
+    let before = area.run(&["--json", "stocktake"]);
+    let before_json: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(before_json["data"]["staged_count"], 0, "{before_json}");
+    assert_eq!(before_json["data"]["unstaged_count"], 0, "{before_json}");
+
+    let output = area.run(&["consolidate", "feature"]);
+    assert!(output.status.success(), "consolidate failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(warehouse.join(".forklift").join("consolidation").exists(), "the merge stopped on its conflict");
+
+    let status = area.run(&["--json", "stocktake"]);
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let all: Vec<&serde_json::Value> = ["staged", "unstaged"].iter()
+        .flat_map(|side| status_json["data"][side].as_array().into_iter().flatten())
+        .collect();
+    assert!(all.iter().any(|entry| entry["path"] == "a/b/c/f.txt" && entry["kind"] == "conflict"),
+        "stocktake reports the conflict: {status_json}");
+}
+
+/// A `consolidate` whose staging fails after it rewrote the working directory records nothing as
+/// in progress and says so; the files it wrote stay on disk, unstaged. The staging is made to
+/// fail by making one shard's folder read-only, so nothing can be published into it.
+#[cfg(unix)]
+#[test]
+fn consolidate_whose_staging_fails_records_nothing_in_progress() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("consolidate-publish-fails");
+    let warehouse = area.warehouse();
+    diverged_merge_fixture(&area, 1);
+
+    let shard_folder = find_dir_named(&warehouse.join(".forklift"), "inv_dir0")
+        .expect("dir0 has a shard folder");
+
+    std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root writes through a read-only folder, so the failure cannot be staged; nothing to test.
+    if std::fs::write(shard_folder.join("probe"), "").is_ok() {
+        std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let output = area.run(&["consolidate", "feature"]);
+    std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "consolidate must fail when its staging fails");
+    assert!(stderr.contains("some or all of them are not staged. Nothing was recorded as in progress."),
+        "the failure says what is staged and that nothing is in progress: {stderr}");
+    assert!(!warehouse.join(".forklift").join("consolidation").exists(), "no consolidation is in progress");
+
+    // The working directory was rewritten before the staging failed...
+    assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file0.txt")).unwrap(), "theirs 0 0\n");
+
+    // ...and the shard that could not be published still lists the head's version, so the
+    // rewritten file shows as an unstaged change.
+    let status = area.run(&["--json", "stocktake"]);
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status_json["data"]["unstaged"].as_array().unwrap().iter()
+            .any(|entry| entry["path"] == "dir0/file0.txt" && entry["kind"] == "modified"),
+        "dir0/file0.txt is not staged: {status_json}");
+}
+
 /// The incomplete-load marker (`load_guard_utils`) must ride a load's own first durable barrier
 /// instead of paying a second, standalone one. For a directory `load`
 /// with real content to publish, that first barrier is the walk's blob-publish batch (Phase 0 —
