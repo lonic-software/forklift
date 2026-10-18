@@ -1941,15 +1941,13 @@ fn read_unskipped_shards(metadata: &BTreeSet<String>,
                     prune_keys_under(key, &children, &mut plan.pruned);
                     record_rollup_skip();
 
-                    match key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
-                        _ if key.is_empty() => {
-                            plan.whole_tree_hash = Some(rollup.clone());
-                            return Ok(());
-                        }
-                        Some((parent, name)) => plan.injections.entry(parent.to_string()).or_default().push((name.to_string(), rollup.clone())),
-                        None => plan.injections.entry(String::new()).or_default().push((key.to_string(), rollup.clone())),
+                    if key.is_empty() {
+                        plan.whole_tree_hash = Some(rollup.clone());
+                        return Ok(());
                     }
 
+                    let (parent, name) = key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).unwrap_or(("", key));
+                    plan.injections.entry(parent.to_string()).or_default().push((name.to_string(), rollup.clone()));
                     continue;
                 }
             }

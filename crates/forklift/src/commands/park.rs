@@ -78,9 +78,10 @@ pub async fn park_changes() -> Result<(), String> {
     // shards across several steps of one `stack` — `park` only reads the inventory once here),
     // but after `refresh_tracked_entries` above so this snapshot reflects the just-rehashed
     // working directory, not stale pre-refresh content. Passing the head and the scope gives
-    // `park` the same rollup-based skip `stack` has: a subtree whose shard's rollup already
-    // matches the head subtree hash is never read, hashed or (re)stored — its parent's tree
-    // includes it by hash.
+    // this read and the tree build the same rollup-based skip `stack` has: a subtree whose
+    // shard's rollup already matches the head subtree hash is not read here, nor hashed or
+    // (re)stored — its parent's tree includes it by hash. `park` as a whole still reads every
+    // shard: the conflict check and `refresh_tracked_entries` above both do.
     let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory(Some((&head_tree_hash, &scope)))?);
 
     // `prepare_stack_inventory` stops collecting at the first conflict entry it finds (sorted key
