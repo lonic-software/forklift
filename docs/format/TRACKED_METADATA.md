@@ -216,7 +216,7 @@ commented_at = 1782205234           # display only
 The pallet rules, checked wherever the content check runs:
 
 - `opened` is written once, by the operator it names, at the id its value derives, in the same
-  parcel as a `state`, and is never changed or removed.
+  parcel as a `state` that reads open, and is never changed or removed.
 - No other cell may exist in a haul directory without its `opened`.
 - `state` is never removed, and never changed once it reads merged. Anyone may close, reopen or
   merge at the current head; only the opener moves the head, to any parcel (a review of an
@@ -232,7 +232,9 @@ A review or comment of a newer schema is carried, and listed as unreadable. When
 `opened` or `state` cannot be read, the whole haul is listed as unreadable and every
 command addressing it refuses. Conflicts are resolved at any path from `<h>` down to a cell;
 keeping `theirs` at `<h>` drops a locally opened haul whole. Any two concurrent changes to
-a haul's state — a close, a reopen, an update, a merge — are a conflict on `<h>/state`.
+a haul's state — a close, a reopen, an update, a merge — are a conflict on `<h>/state`. Keeping
+`ours` over the opener's update replays the old head, so only the opener can; anyone else keeps
+`theirs` and runs the merge or close again.
 
 A `merged` status names the parcel the merge stacked, but nothing yet checks that the parcel
 exists or contains the haul's head, nor who may merge: any operator in the office can record

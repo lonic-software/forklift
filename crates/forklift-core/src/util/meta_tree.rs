@@ -3199,6 +3199,13 @@ mod tests {
         let stateless = haul_parcel(None, &alice, &open_edits(&alice, &opened)[..1]);
         assert!(verify_haul(&office, None, &stateless).unwrap_err().contains("opened without a state"));
 
+        for born in [HaulStatus::Closed, HaulStatus::Merged("ef".repeat(32))] {
+            let mut edits = open_edits(&alice, &opened);
+            edits[1] = set(&state, &state_cell(&alice, &born, &"ab".repeat(32)));
+            let error = verify_haul(&office, None, &haul_parcel(None, &alice, &edits)).unwrap_err();
+            assert!(error.contains("but a haul is opened open"), "{}", error);
+        }
+
         // Once opened, the proposal never changes or goes, and the state never goes.
         let mut retitled = opened.clone();
         retitled.title = "Renamed".to_string();
@@ -3282,8 +3289,12 @@ mod tests {
         }
 
         // A merge records the head it merged: no one but the opener records it at another head.
+        // That is also what refuses a non-opener's merge replayed over the opener's update, and
+        // the refusal says how out: keep theirs, and merge again.
         let elsewhere = haul_parcel(Some(&head), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Merged("ef".repeat(32)), &"cd".repeat(32)))]);
-        assert!(verify_haul(&office, Some(&head), &elsewhere).unwrap_err().contains("only the haul's opener"));
+        let error = verify_haul(&office, Some(&head), &elsewhere).unwrap_err();
+        assert!(error.contains("only the haul's opener"), "{}", error);
+        assert!(error.contains(&format!("keeps theirs at {}/state and runs again", id)), "{}", error);
 
         // A review sits under its writer's directory and names a full head.
         let review = |key: &Key| haul_cell(key.id(), haul_utils::SCHEMA_REVIEW,

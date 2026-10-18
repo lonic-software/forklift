@@ -577,8 +577,13 @@ impl PalletRules for HaulRules {
                         ));
                     }
 
-                    if meta_tree::read_cell_in(change.cells, &format!("{}/{}", dir, CELL_STATE), self)?.is_none() {
-                        return Err(format!("the haul {} is opened without a state", path.haul));
+                    // A haul is opened open: never born closed, or merged without a merge.
+                    match state_in(change.cells, &dir, self)? {
+                        None => return Err(format!("the haul {} is opened without a state", path.haul)),
+                        Some((HaulStatus::Open, _)) => {}
+                        Some((status, _)) => return Err(format!(
+                            "the haul {} is opened {}, but a haul is opened open", path.haul, status.as_str()
+                        )),
                     }
                 }
                 // A state written with its proposal is the opener's by the proposal's own rule.
@@ -588,8 +593,9 @@ impl PalletRules for HaulRules {
                     if &moved != head && &opened.opener != operator {
                         return Err(format!(
                             "the state at {} moves the head, but is signed by {}; only the haul's \
-                            opener, {}, moves it",
-                            cell.path, operator, opened.opener
+                            opener, {}, moves it. A merge or close that raced the opener's update \
+                            keeps theirs at {} and runs again",
+                            cell.path, operator, opened.opener, self.display_path(&cell.path)
                         ));
                     }
                 }
