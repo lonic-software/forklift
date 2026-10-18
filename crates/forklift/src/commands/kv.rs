@@ -111,7 +111,7 @@ fn get(revision: &str, key: &str) -> Result<(), String> {
     let subject = subject_of(revision)?;
 
     let entry = kv_utils::get(&subject, key)?.ok_or(format!(
-        "{} has no value for the key \"{}\".", &subject[..12], key
+        "{} has no value for the key \"{}\".", kv_utils::short(&subject), key
     ))?;
 
     output::emit(&EntryView::from(&entry));
@@ -255,7 +255,7 @@ impl CommandOutput for KvListing {
 
         for entry in &self.entries {
             if self.subject.is_none() {
-                println!("{} {} = {}", &entry.subject[..12], sanitize(&entry.key), entry.render_value());
+                println!("{} {} = {}", kv_utils::short(&entry.subject), sanitize(&entry.key), entry.render_value());
             } else {
                 println!("{} = {}", sanitize(&entry.key), entry.render_value());
             }
@@ -338,7 +338,7 @@ impl CommandOutput for KvLog {
                 (None, None, _) => String::new(),
             };
 
-            println!("{} {} {} {}", &change.parcel[..12], when, sanitize(&change.operator), what);
+            println!("{} {} {} {}", kv_utils::short(&change.parcel), when, sanitize(&change.operator), what);
         }
     }
 }

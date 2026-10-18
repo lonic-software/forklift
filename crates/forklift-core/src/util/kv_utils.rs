@@ -332,7 +332,8 @@ pub fn log(subject: &str, key: &str) -> Result<Vec<KvChange>, String> {
     Ok(changes)
 }
 
-fn short(hash: &str) -> &str {
+/// The first 12 characters of a hash, as messages and listings abbreviate it.
+pub fn short(hash: &str) -> &str {
     &hash[..hash.len().min(12)]
 }
 

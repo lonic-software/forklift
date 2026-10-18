@@ -43,7 +43,7 @@ use crate::model::tree_item::TreeItem;
 use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust};
 use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustAnchor};
 use crate::util::sign_utils::ParcelSignature;
-use crate::util::{kv_utils, object_utils, pallet_utils, sign_utils};
+use crate::util::{haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, sign_utils, tag_utils};
 
 /// The spine every meta tree keeps: `.forklift/tracked/`.
 const TREE_NAME_FORKLIFT: &str = ".forklift";
@@ -67,7 +67,13 @@ const FIELD_VALUE: &str = "value";
 /// Every meta pallet name a remote stores: the office, and the four kinds below. A meta ref
 /// update for any other name is refused, so a newer client's new pallet fails loudly against
 /// an older remote instead of being stored unchecked.
-pub const META_PALLET_NAMES: [&str; 5] = ["office", "manifest", "haul", "tags", "kv"];
+pub const META_PALLET_NAMES: [&str; 5] = [
+    office_utils::OFFICE_PALLET_NAME,
+    manifest_utils::MANIFEST_PALLET_NAME,
+    haul_utils::HAUL_PALLET_NAME,
+    tag_utils::TAGS_PALLET_NAME,
+    kv_utils::KV_PALLET_NAME,
+];
 
 /// The rules of a converted meta pallet, or `None` for a pallet still on its own code.
 pub fn converted_rules(name: &str) -> Option<&'static dyn PalletRules> {
@@ -912,7 +918,8 @@ pub fn read_cell_blob(blob: &str, rules: &dyn PalletRules) -> Result<CellRead, S
     Ok(classify_cell(&object_utils::load_blob(blob)?.content, rules))
 }
 
-fn read_cell_in(cells: Option<&str>, path: &str, rules: &dyn PalletRules) -> Result<Option<CellRead>, String> {
+/// The cell at a path in a `cells/` tree read with [`cells_at`], or `None` when none is there.
+pub fn read_cell_in(cells: Option<&str>, path: &str, rules: &dyn PalletRules) -> Result<Option<CellRead>, String> {
     match resolve_entry(cells, path)? {
         Entry::Blob(blob) => Ok(Some(classify_cell(&object_utils::load_blob(&blob)?.content, rules))),
         _ => Ok(None),

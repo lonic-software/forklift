@@ -86,7 +86,7 @@ pub async fn handle_command(expect: Option<String>, keep: Vec<String>) -> Result
             report.render_meta();
         }
 
-        return Err(with_meta_failures(why, &report.meta_failed));
+        return Err(with_meta_conflicts(with_meta_failures(why, &report.meta_failed), &report.meta_conflicts));
     }
 
     if !report.meta_failed.is_empty() || !report.meta_conflicts.is_empty() {
@@ -336,7 +336,7 @@ impl LowerReport {
 fn describe_side(side: &MetaConflictSide) -> String {
     match (&side.value, &side.signer) {
         (Some(value), Some(signer)) => format!(
-            "\"{}\" (key {})", forklift_core::error::sanitize(value), &signer[..signer.len().min(12)]
+            "\"{}\" (key {})", forklift_core::error::sanitize(value), kv_utils::short(signer)
         ),
         (Some(value), None) => format!("\"{}\"", forklift_core::error::sanitize(value)),
         (None, _) => "(removed)".to_string(),
@@ -578,27 +578,31 @@ async fn replay(client: &RemoteClient,
     };
 
     // The cells the replay re-signed: in the replayed parcel under the current key, stamped
-    // with another key on the local side.
-    for change in meta_tree::net_diff(cells_of(name, rules, remote_head)?.as_deref(), cells_of(name, rules, &parcel)?.as_deref())? {
+    // with another key on the local side. Reported only once the replay is lifted.
+    let local_cells = meta_tree::cells_at(name, &local, rules)?;
+    let mut resigned = Vec::new();
+
+    let changes = meta_tree::net_diff(
+        meta_tree::cells_at(name, remote_head, rules)?.as_deref(),
+        meta_tree::cells_at(name, &parcel, rules)?.as_deref(),
+    )?;
+
+    for change in changes {
         let Some(after) = &change.after else { continue };
 
-        if let Some(CellRead::Readable(local_cell)) = meta_tree::read_cell(name, &local, rules, &change.path)? {
+        if let Some(CellRead::Readable(local_cell)) = meta_tree::read_cell_in(local_cells.as_deref(), &change.path, rules)? {
             if local_cell.signer != signing_key_id
                 && matches!(meta_tree::read_cell_blob(after, rules)?, CellRead::Readable(ref cell) if cell.signer == signing_key_id) {
-                restamped.push(format!("{} {}", wire, rules.display_path(&change.path)));
+                resigned.push(format!("{} {}", wire, rules.display_path(&change.path)));
             }
         }
     }
 
     remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), info.chunking, &Progress::NONE).await?;
     pallet_utils::set_meta_pallet_head(name, &parcel)?;
+    restamped.extend(resigned);
 
     Ok(Reconciled::Replayed)
-}
-
-/// The `cells/` tree at a head.
-fn cells_of(name: &str, rules: &dyn PalletRules, head: &str) -> Result<Option<String>, String> {
-    meta_tree::cells_at(name, head, rules)
 }
 
 /// The office, verified against the anchor, and the operator's signing key in it. A converted
@@ -696,6 +700,23 @@ pub(crate) fn with_meta_failures(error: String, failed: &[MetaPalletFailure]) ->
     }
 
     forklift_core::error::append_to_message(error, &format!("Also: {}", meta_failure_error(failed)))
+}
+
+/// A working pallet's error, with any meta pallet conflicts named, so they are not first heard
+/// of on the lower after the working pallet is fixed.
+fn with_meta_conflicts(error: String, conflicts: &[MetaPalletConflicts]) -> String {
+    if conflicts.is_empty() {
+        return error;
+    }
+
+    let pallets: Vec<&str> = conflicts.iter().map(|pallet| pallet.pallet.as_str()).collect();
+
+    forklift_core::error::append_to_message(error, &format!(
+        "Also: {} conflicted with the remote; nothing was lifted for {}, and lowering again lists \
+        the conflicting paths.",
+        pallets.join(", "),
+        if pallets.len() == 1 { "it" } else { "them" }
+    ))
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).

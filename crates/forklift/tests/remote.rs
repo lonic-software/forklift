@@ -6265,4 +6265,11 @@ fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
     let again = area.forklift("a", &["lower"]);
     assert_eq!(again.status.code(), Some(24));
     assert!(stdout(&again).contains("ours") && stdout(&again).contains("theirs"), "{}", stdout(&again));
+
+    // When the working pallet itself fails, its error leads and still names the conflict.
+    assert_success(&area.forklift("a", &["palletize", "side"]));
+    let failed = area.forklift("a", &["lower"]);
+    assert!(!failed.status.success());
+    assert_ne!(failed.status.code(), Some(24), "the working pallet's failure outranks the conflict");
+    assert!(stderr(&failed).contains("no pallet") && stderr(&failed).contains("@kv conflicted"), "{}", stderr(&failed));
 }

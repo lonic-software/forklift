@@ -423,7 +423,8 @@ error_codes! {
     RemoteProtocolViolation,
 
     /// A meta pallet changed differently on both sides at the same path. `error.details` carries
-    /// `{pallets: [{pallet, conflicts: [{path, subject?, key?, ours, theirs}]}]}`.
+    /// `{pallets: [{pallet, conflicts: [{path, ours: {value?, signer?}, theirs}]}],
+    /// lowered: {pallet, head}}`.
     MetaConflict,
 }
 
