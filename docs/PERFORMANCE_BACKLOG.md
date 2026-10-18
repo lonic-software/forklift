@@ -399,8 +399,10 @@ The ticket asked whether the ancestor walk should be memoized per directory or r
 `openat`.
 
 **Measured** on macOS (APFS) with hyperfine, using release builds of af5af44, the parent of the
-FORK-175 merge. FORK-175 changed only what taking the lock does, not the per-write path. hyperfine
-ran each pair in both orders, because the command run second came out slower in every pair.
+FORK-175 merge. FORK-175 did not touch the per-write path checks. Both 40,000-file corpora were
+timed in both orders, because the checked build was the slower one in every pair, and its lead grew
+whenever it ran second. The git.git row was timed once, with the walk first, which is the order that
+showed the smaller gap.
 
 The ancestor walk was A/B'd against a throwaway build that skips the walk alone
 (`&components[..0]`); the top-level check still runs in both builds.
