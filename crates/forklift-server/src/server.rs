@@ -2097,9 +2097,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     // authorization below differs by meta pallet, not a uniform "signer's
                     // role" check: @office's parcels are checked, per parcel, against the
                     // signer's role (`verify_office_privileges`); a converted pallet's against
-                    // its own rules (`verify_meta_content`); @manifest/@haul/@tags take the
-                    // same `verify_pallet_history` path as an ordinary working pallet and get
-                    // no role or grant check at all.
+                    // its own rules (`verify_meta_content`), which for @tags include an
+                    // admin rule; @haul takes the same `verify_pallet_history` path as an
+                    // ordinary working pallet and gets no role or grant check at all.
                     user.role != office_utils::Role::Reader
                 } else {
                     user.may_write_pallet(&bare)
@@ -2227,6 +2227,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             meta_tree::verify_converted_update(
                 &bare,
                 rules,
+                meta_tree::Admission::Admit,
                 anchor.as_ref(),
                 office_head.as_deref(),
                 request.old_head.as_deref(),

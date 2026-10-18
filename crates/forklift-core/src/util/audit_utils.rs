@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
-use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, sign_utils};
+use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
 
 /// Verify the office chain from the genesis forward and return the final office state.
 ///
@@ -732,6 +732,17 @@ impl OfficeChainMemo {
 
         tick
     }
+}
+
+/// This warehouse's office, verified against its trust anchor. A converted meta pallet's writes
+/// are judged against the verified office, never the unverified local read.
+pub fn verified_local_office() -> Result<OfficeState, String> {
+    let anchor = office_utils::read_trust_anchor()?
+        .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?;
+    let office_head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
+        .ok_or("The office pallet is unborn; use \"office enroll\" first.".to_string())?;
+
+    verify_office_chain_memoized(&anchor, &office_head)
 }
 
 /// [`verify_office_chain`], remembered for the life of the process.

@@ -1097,7 +1097,7 @@ fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_st
 }
 
 #[test]
-fn manifest_syncs_across_remotes_and_merges_when_diverged() {
+fn manifest_syncs_across_remotes_and_replays_when_diverged() {
     let area = TestArea::new("manifest-remote");
     let server = Server::start(&area, None);
 
@@ -1129,11 +1129,11 @@ fn manifest_syncs_across_remotes_and_merges_when_diverged() {
     assert!(!refused.status.success(), "a diverged manifest lift must be refused");
     assert!(stderr(&refused).contains("lower"), "{}", stderr(&refused));
 
-    // Lowering merges the two branches (conflict-free: the records are independent), and
-    // the merge lifts cleanly.
+    // Lowering replays A's note onto B's head (conflict-free: the entries sit at different
+    // cells) and lifts the result.
     let lowered = area.forklift("a", &["lower"]);
     assert_success(&lowered);
-    assert!(stdout(&lowered).contains("Merged the remote @manifest"), "{}", stdout(&lowered));
+    assert!(stdout(&lowered).contains("Replayed the local @manifest changes"), "{}", stdout(&lowered));
     assert_success(&area.forklift("a", &["lift"]));
 
     // Both notes and the approval are now visible from A, and B sees them after lowering.
@@ -1146,6 +1146,82 @@ fn manifest_syncs_across_remotes_and_merges_when_diverged() {
 
     // The merged manifest audits clean on both sides.
     assert!(stdout(&area.forklift("b", &["audit", "@manifest"])).contains("verified"));
+}
+
+/// The tag rules across a remote: the server admits a tag only from a signer who is an admin
+/// as it admits it, while a warehouse adopting tags already admitted keeps one whose tagger has
+/// been demoted since; and a name both sides tagged replays only by keeping the remote's tag.
+#[test]
+fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
+    let area = TestArea::new("tags-remote");
+    area.write_file("tokens.toml", "[operators]\n\"w-token\" = \"worker@forklift\"\n");
+    let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
+
+    prepare_warehouse(&area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    let base = pallet_head(&area, "a", "main");
+    area.write_file("a/code.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+
+    let worker_id = "worker@forklift";
+    let worker = keygen_admit_args(&area, worker_id);
+    assert_success(&area.forklift("a", &[
+        "office", "admit", &worker[0], &worker[1], &worker[2], "--role", "admin",
+    ]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // The worker, an admin for now, tags and publishes a release; a second tag stays local.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift("b", &["config", "operator.identifier", worker_id]));
+    assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main", "-m", "release"]));
+    let lifted = area.forklift("b", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @tags pallet"), "{}", stdout(&lifted));
+    assert_success(&area.forklift("b", &["tag", "create", "v1.1", "main"]));
+
+    // Meanwhile the admin tags the same name at another parcel. The lower conflicts on it; keeping
+    // ours would move a published tag, so only keeping theirs replays.
+    assert_success(&area.forklift("a", &["tag", "create", "v1.0", &base]));
+    let conflicted = area.forklift("a", &["--json", "lower"]);
+    assert_eq!(conflicted.status.code(), Some(24), "{}", stdout(&conflicted));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&conflicted)).unwrap();
+    assert_eq!(value["error"]["details"]["pallets"][0]["pallet"], "@tags");
+    assert_eq!(value["error"]["details"]["pallets"][0]["conflicts"][0]["path"], "v1.0");
+
+    let refused = area.forklift("a", &["lower", "--keep", "tags:v1.0=ours"]);
+    assert!(!refused.status.success(), "keeping ours would move a published tag");
+    assert!(stderr(&refused).contains("never changed or removed"), "{}", stderr(&refused));
+
+    assert_success(&area.forklift("a", &["lower", "--keep", "tags:v1.0=theirs"]));
+    let shown = stdout(&area.forklift("a", &["--json", "tag", "show", "v1.0"]));
+    let value: serde_json::Value = serde_json::from_str(&shown).unwrap();
+    assert_eq!(value["data"]["tagger"], worker_id, "{}", shown);
+    assert_ne!(value["data"]["subject"], base.as_str(), "{}", shown);
+
+    // The admin demotes the worker.
+    assert_success(&area.forklift("a", &["office", "role", worker_id, "writer"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // A fresh franchise adopts the admitted release although its tagger is no longer an admin.
+    let franchised = area.forklift(".", &["franchise", &server.url, "c", "--token", "root"]);
+    assert_success(&franchised);
+    assert!(stdout(&franchised).contains("Adopted the @tags pallet"), "{}", stdout(&franchised));
+    assert!(stdout(&area.forklift("c", &["tag", "show", "v1.0"])).contains("release"));
+
+    // The worker's unpublished tag is now refused by the server, and a new one locally.
+    assert_success(&area.forklift("b", &["lower"]));
+    let refused = area.forklift("b", &["lift"]);
+    assert!(!refused.status.success(), "a demoted tagger's tag must not be admitted");
+    assert!(stderr(&refused).contains("not an admin"), "{}", stderr(&refused));
+
+    let refused = area.forklift("b", &["tag", "create", "v2.0", "main"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("is not an admin"), "{}", stderr(&refused));
 }
 
 #[test]
@@ -6195,7 +6271,7 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
                "a conflicted lower leaves the local @kv as it was");
 
     // Keeps that cannot apply are refused: a pallet without resolutions, a malformed side.
-    let refused = area.forklift("a", &["lower", "--keep", "manifest:main=ours"]);
+    let refused = area.forklift("a", &["lower", "--keep", "haul:main=ours"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("takes no resolutions"), "{}", stderr(&refused));
     let refused = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=mine", subject)]);

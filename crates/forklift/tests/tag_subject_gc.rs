@@ -1,53 +1,23 @@
-//! FORK-79: `Tag.subject` is a bare parcel hash inside `@tags` (tag_utils.rs:51). Nothing roots
-//! it — `gc_utils::collect_live_set` marks pallet heads, bay-scoped parcels and the trust pins
+//! FORK-79: `Tag.subject` is a bare parcel hash inside a `@tags` cell. Nothing roots it —
+//! `gc_utils::collect_live_set` marks pallet heads, bay-scoped parcels and the trust pins
 //! (`office_utils::collect_trust_pin_roots`: the anchor's `adopts`, its enrollment `boundary`,
 //! and every key's revocation `distrust_boundary` — FORK-81). A tag subject is in none of those
-//! sets, which is what this file is about. `undo` moves a pallet head *backwards* to
-//! `pre_head` (journal_utils.rs:191), so tagging a parcel and then undoing the stack that
-//! created it leaves the tag's subject reachable from no ref at all — and gc collects it.
+//! sets, which is what this file is about. `undo` moves a pallet head *backwards* to its
+//! `pre_head`, so tagging a parcel and then undoing the stack that created it leaves the tag's
+//! subject reachable from no ref at all — and gc collects it.
 //!
-//! This needs no pallet-deletion verb, which is why it is a live defect: `tag show` used to name
-//! an absent parcel with a success exit and no marker at all — a silent misread. The settled fix
-//! is a presence *probe* at the reader (`crate::commands::tag::probe_subject`), not rooting the
-//! subject (see `tag_utils.rs` and `gc_utils.rs` for why rooting was refuted) — and not a refusal
+//! The settled fix is a presence *probe* at the reader (`crate::commands::tag::probe_subject`),
+//! not rooting the subject (see `gc_utils.rs` for why rooting was refuted) — and not a refusal
 //! either: `show` renders and marks rather than refuses, because "collected here" and "never
 //! fetched here" are the same local state, and a sparse or franchised clone legitimately holds
 //! tags whose subject it never fetched. Only a genuinely indeterminate probe (an I/O error, never
-//! a definite answer) is still an ordinary command error — see the third test below.
+//! a definite answer) is still an ordinary command error — see the probe-failure test below.
 //!
-//! A third classification followed: `Tag.subject` is an unvalidated free string
-//! (`tag_utils.rs:328`, `read_string("subject")`), and `@tags` records sync in wholesale via
-//! `adopt_meta_pallets`, so a foreign or older client can author one that is not even hash-shaped.
-//! Before that fix, `probe_subject`'s presence check (`file_utils::does_object_exist`) reached
-//! `get_path_for_object`, which refuses a non-hash string outright — turning one bad record into
-//! an anonymous, whole-command failure for `tag list`/`tag show` alike. A malformed subject is
-//! now classified explicitly (`file_utils::is_object_hash_or_prefix`) and marks, exactly like an
-//! ordinary absence, with its own accurate wording. **This case is not covered end-to-end here**:
-//! no shipped `forklift` command can construct a malformed-subject `@tags` record locally (`tag
-//! create`'s only two subject sources already verify hash shape and object presence before
-//! returning — `pallet_utils::resolve_revision`/`get_pallet_head`), and hand-planting one on disk
-//! would mean reproducing `LooseObject::store`'s compression from the test, not just writing
-//! plain bytes the way `plant_taint` does for a taint record elsewhere in this suite — that is
-//! exactly the "reach into internals" this was told not to do. See
-//! `crate::commands::tag::tests` (`crates/forklift/src/commands/tag.rs`) for the unit-level
-//! coverage of the classification and rendering logic instead.
-//!
-//! That fix was itself incomplete: `parse_tag` validates none of `Tag`'s fields (only
-//! `tag create` validates the one it creates, `name`), so `name`/`subject`/`message`/`tagger` are
-//! *all* remote-authored and arbitrary, and the render path did not honour that — a subject
-//! sliced by byte range (`&s[..12]`) could panic on multi-byte UTF-8, and `name` renders even
-//! further ahead of the marker than `message` does, so a positional fix did not cover it.
-//! The fix moved from field-by-field patching to a boundary: every tag-record string a human
-//! render prints goes through `forklift_core::error::sanitize` (neutralizes control
-//! characters, including ANSI escapes) and, where truncated for display,
-//! `crate::commands::tag::truncate_chars` (character-safe, never a byte range). A name that fails
-//! `tag create`'s own naming rules is surfaced (`TagView::name_invalid`) rather than hidden or
-//! rejected, the same way a malformed subject already was. `--json` is untouched by any of this —
-//! `TagView`'s stored fields are never sanitized, only the copies `render_human` prints are; see
-//! `list_row_fields_cannot_forge_hide_or_corrupt_the_absent_marker`'s own `--json` leg. The
-//! multi-byte-subject panic and the name-forgery case are both unreachable through the shipped
-//! CLI for the same reason the malformed-subject case is (see above) — pinned at the unit level
-//! instead, in `crate::commands::tag::tests`.
+//! A tag's name and subject are checked wherever a `@tags` parcel is admitted or audited — one
+//! bounded path component, and a full parcel hash — so neither can carry a forged marker. Its
+//! message is free text, so every tag string a human render prints goes through
+//! `forklift_core::error::sanitize` (neutralizes control characters, including ANSI escapes),
+//! while `--json` carries the raw values.
 //!
 //! This file is trimmed from a shared spike (`boundary_gc.rs`, on another branch) down to the
 //! tag leg and the harness it actually needs; the anchor-boundary legs are FORK-81's evidence
@@ -314,12 +284,12 @@ fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
 /// before it can revoke that directory's permissions and mean only the subject by it.
 ///
 /// `tag create` does not only touch the subject: it also stores the `@tags` parcel itself,
-/// the tree chain leading to it (`.forklift`, `tracked`, `tags`), and the tag record blob —
+/// its meta tree (the spine, the format marker and the `cells` tree), and the tag cell blob —
 /// each a distinct object, each landing in a fan-out directory keyed by ITS OWN hash, which by
 /// pure hash coincidence (~1-in-256 per object) can be the same two-hex-character directory as
 /// the subject. When that happens, revoking the directory collaterally blocks that other
-/// object too, and since `tag_utils::read_tags` reads the parcel/tree chain/record blob with a
-/// bare `?` before it has parsed any tag name at all, a collision there makes `tag
+/// object too, and since `tag_utils::read_tags` reads the parcel/tree chain/cell blob with a
+/// bare `?` before it has read any tag at all, a collision there makes `tag
 /// list`/`show` fail with the raw, anonymous loose-object-read error instead of
 /// `probe_subject`'s tag-naming one — a fixture-caused false red. Confirmed directly (not
 /// merely suspected): forcing this collision reproduces `Error while reading object from file
@@ -379,9 +349,8 @@ fn warehouse_with_an_exclusive_tag_subject(name: &str) -> (Warehouse, String) {
 /// a genuinely different answer from a definite absence, and must not be folded into
 /// `subject_absent: true` — this ticket exists to stop `tag` from asserting things it has not
 /// established, and mislabeling an unknown as absent is the same defect wearing a different
-/// hash. Review round 2 added a second requirement over the same failure: the command's error
-/// must name the offending tag — round 1's fix propagated `does_object_exist`'s raw, anonymous
-/// error, so a user hitting this had no way to find which record was responsible.
+/// hash. The command's error must also name the offending tag — `does_object_exist`'s raw
+/// error is anonymous, so a user hitting it would have no way to find which tag was responsible.
 ///
 /// This test constructs the probe failure as a plain I/O error, not a durability taint: revoke
 /// read/execute permission on the loose object's containing fan-out directory, so
@@ -398,11 +367,11 @@ fn warehouse_with_an_exclusive_tag_subject(name: &str) -> (Warehouse, String) {
 ///
 /// PRECONDITION — the subject must be the *only* object in its fan-out directory (its own
 /// `.sig` sidecar aside) before permissions are revoked. `tag create` writes more than the
-/// subject: the `@tags` parcel, the tree chain leading to it, and the tag record blob are each
+/// subject: the `@tags` parcel, the tree chain leading to it, and the tag cell blob are each
 /// distinct objects that land in fan-out directories keyed by their OWN hash, and by pure
 /// hash coincidence (~1-in-256 per object) one of them can land in the SAME directory as the
-/// subject. `tag_utils::read_tags` reads that parcel/tree chain/record blob with a bare `?`
-/// before it has parsed any tag name at all, so when the collateral object is what the
+/// subject. `tag_utils::read_tags` reads that parcel/tree chain/cell blob with a bare `?`
+/// before it has read any tag at all, so when the collateral object is what the
 /// revoked directory blocks, `read_tags` fails first with the raw, anonymous loose-object-read
 /// error — never reaching `probe_subject`, so the failure never names "v1.0" and this test
 /// goes red for a reason that has nothing to do with the contract under test. This is not
@@ -505,8 +474,8 @@ fn tag_list_and_show_fail_loudly_and_name_the_tag_when_the_probe_is_indeterminat
         stdout
     );
 
-    // THE NEW ASSERTION: the failure names the tag, so a user can find the offending record —
-    // round 1's error was anonymous (`does_object_exist`'s raw message alone). If this ever
+    // The failure names the tag, so a user can find the offending one — `does_object_exist`'s
+    // raw message alone is anonymous. If this ever
     // fails despite `warehouse_with_an_exclusive_tag_subject`'s precondition, the failure
     // message below dumps the subject hash and the fan-out directory's pre-revoke contents so
     // the occurrence is self-diagnosing rather than another anonymous report.
@@ -524,25 +493,12 @@ fn tag_list_and_show_fail_loudly_and_name_the_tag_when_the_probe_is_indeterminat
     );
 }
 
-/// Round 2 found: `TagList::render_human`'s absent-subject marker trailed the row, after the
-/// tag's own message — remote-authored, unvalidated text a franchise/lower can bring in from
-/// anyone. A message ending in text that imitates the marker could forge marking on a perfectly
-/// healthy row, and an ANSI escape at the start of a message could restyle or blank a real
-/// marker that preceded it. The marker now renders ahead of the tagger and message, where
-/// neither can reach it.
-///
-/// Round 3 found the fix incomplete: **every** `@tags` string is remote-authored (`parse_tag`
-/// validates nothing; only `tag create` validates its own `name`, never a synced-in one), and
-/// `name` renders even further ahead than the marker — first in the row. A `name` containing
-/// space/paren characters could, in principle, spell a fake marker and a fake " by " boundary
-/// ahead of the real one. It cannot reach that state through `tag create` here (`validate_tag_
-/// name`'s charset excludes space and `(`/`)` outright, so this test cannot construct one — see
-/// `crate::commands::tag::tests::tag_view_of_sets_name_invalid_only_for_a_name_tag_create_would_
-/// never_produce`, which pins the same defense — a `[invalid name] ` prefix, printed by code
-/// ahead of anything `name` supplies — at the unit level instead), but two things ARE reachable
-/// here and are what this test now covers: an ANSI/control-character forgery through `message`
-/// (unvalidated at every layer, so directly constructible via `-m`), and that `--json` keeps
-/// message/name raw — sanitizing is a terminal-rendering concern, not a wire-format one.
+/// `TagList::render_human`'s absent-subject marker renders ahead of the tagger and the message,
+/// so a message — free text a lower can bring in from anyone — can neither forge marking on a
+/// healthy row by imitating the marker, nor restyle or blank a real marker with an ANSI escape.
+/// The name renders first in the row, but it is one checked path component, so it cannot spell
+/// a marker or a " by " boundary. And `--json` keeps the message raw: sanitizing is a
+/// terminal-rendering concern, not a wire-format one.
 #[test]
 fn list_row_fields_cannot_forge_hide_or_corrupt_the_absent_marker() {
     let warehouse = Warehouse::new("marker-spoof");

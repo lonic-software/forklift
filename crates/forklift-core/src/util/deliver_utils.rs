@@ -18,6 +18,7 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::manifest_utils::{Delivery, ManifestEntry, ManifestKind};
+use crate::util::meta_tree::MetaSigner;
 use crate::util::{audit_utils, config_utils, manifest_utils, merge_utils, object_utils,
                   office_utils, pallet_utils, sign_utils, stack_utils};
 
@@ -38,7 +39,7 @@ pub struct DeliverOutcome {
     /// How many checkpoint parcels the delivery squashed.
     pub checkpoints: usize,
 
-    /// The manifest parcel that recorded the delivery.
+    /// The manifest head that holds the delivery record.
     pub manifest_head: String,
 }
 
@@ -70,6 +71,10 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         "Deliver records the checkpoint trail as signed post-metadata, so it needs an \
         enrolled key. Establish trust with \"office enroll\" first.".to_string()
     )?;
+
+    // The delivery record is judged against the verified office; verify it before anything is
+    // written, so a refusal leaves no half-delivered target behind.
+    let office = audit_utils::verified_local_office()?;
 
     let draft_head = pallet_utils::get_pallet_head(&source)?.ok_or(format!(
         "Pallet \"{}\" has nothing stacked yet; there is nothing to deliver.", source
@@ -147,7 +152,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     let entry = ManifestEntry {
         subject: object.hash.clone(),
         kind: ManifestKind::Delivery,
-        recorded_at: timestamp.timestamp(),
+        recorded_at: None,
         body: description.unwrap_or_default(),
         provenance: None,
         delivery: Some(Delivery {
@@ -161,7 +166,13 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         "Delivered {} checkpoint(s) from \"{}\" as parcel {}.",
         checkpoints, source, object.hash
     );
-    let manifest_head = manifest_utils::record_entry(&entry, &operator, manifest_description, &signing_key_id)?;
+    let signer = MetaSigner::local(&signing_key_id);
+    let recorded = manifest_utils::record_entry(&entry, &office, &operator, &manifest_description, &signer)?;
+    let manifest_head = match recorded {
+        Some(head) => head,
+        // The record already stood: the head that holds it.
+        None => pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?.unwrap_or_default(),
+    };
 
     // The delivered tree equals the draft's, so switching the current pallet needs no
     // materialization — the working directory already matches.

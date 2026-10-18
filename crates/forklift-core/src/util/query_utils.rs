@@ -290,13 +290,13 @@ impl QueryContext {
             .is_some()
             .then(|| {
                 let mut index: HashMap<String, Vec<ProvenanceRecord>> = HashMap::new();
-                for attributed in manifest_utils::read_manifest()? {
+                for attributed in manifest_utils::read_manifest()?.entries {
                     if let Some(provenance) = attributed.entry.provenance {
                         index.entry(attributed.entry.subject).or_default().push(ProvenanceRecord {
                             model: provenance.model,
                             tool: provenance.tool,
                             session: provenance.session,
-                            recorded_at: attributed.entry.recorded_at,
+                            recorded_at: attributed.entry.recorded_at.unwrap_or_default(),
                         });
                     }
                 }
@@ -308,7 +308,7 @@ impl QueryContext {
             .is_some()
             .then(|| {
                 let mut index: HashMap<String, Vec<String>> = HashMap::new();
-                for attributed in tag_utils::read_tags()? {
+                for attributed in tag_utils::read_tags()?.tags {
                     index.entry(attributed.tag.subject).or_default().push(attributed.tag.name);
                 }
                 Ok::<_, String>(index)

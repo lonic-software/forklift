@@ -1,10 +1,14 @@
 use chrono::Utc;
 use serde::Serialize;
 use forklift_core::error::{sanitize, sanitize_lines};
-use forklift_core::util::manifest_utils::{self, AttributedEntry, ManifestEntry, ManifestKind, Provenance};
+use forklift_core::util::manifest_utils::{
+    self, AttributedEntry, ManifestEntry, ManifestKind, ManifestRead, Provenance, UnreadableEntry,
+};
+use forklift_core::util::meta_tree::MetaSigner;
+use forklift_core::util::office_utils::Role;
 use forklift_core::util::{config_utils, pallet_utils};
 use crate::cli::ManifestAction;
-use crate::commands::office;
+use crate::commands::lower;
 use crate::output::{self, CommandOutput};
 
 /// Handle the manifest command: signed post-metadata attached to parcels.
@@ -14,7 +18,7 @@ use crate::output::{self, CommandOutput};
 /// * `manifest show <rev>`         - show the entries attached to a parcel.
 /// * `manifest`                    - list the whole manifest.
 ///
-/// Authorship is the parcel's signature, so `manifest` needs no author argument — you
+/// Authorship is the entry's signer stamp, so `manifest` needs no author argument — you
 /// record as yourself, verifiably.
 ///
 /// # Arguments
@@ -53,12 +57,27 @@ fn record(revision: &str, kind: ManifestKind, body: String, provenance: Option<P
     let subject = pallet_utils::resolve_revision(revision)?;
 
     let actor = config_utils::get_operator()?;
-    let (_state, signing_key_id, actor_id) = office::require_signing_actor(&actor)?;
+    let (office, signing_key_id) = lower::verified_signing_office(&actor)?;
+
+    let user = office.find_user(&actor.identifier).ok_or(format!(
+        "\"{}\" is not enrolled; ask an enrolled operator to admit you.", actor.identifier
+    ))?;
+
+    if user.role == Role::Reader {
+        return Err(format!(
+            "\"{}\" is a reader; only writers and admins may record manifest entries.", user.identifier
+        ));
+    }
+
+    let actor_id = user.identifier.clone();
+
+    // Only provenance carries a time; identical entries of the other kinds collapse.
+    let recorded_at = (kind == ManifestKind::Provenance).then(|| Utc::now().timestamp());
 
     let entry = ManifestEntry {
         subject: subject.clone(),
         kind,
-        recorded_at: Utc::now().timestamp(),
+        recorded_at,
         body: body.clone(),
         provenance: provenance.clone(),
         delivery: None,
@@ -69,14 +88,16 @@ fn record(revision: &str, kind: ManifestKind, body: String, provenance: Option<P
         kind.as_str(), subject, actor_id
     );
 
-    let manifest_head = manifest_utils::record_entry(&entry, &actor, description, &signing_key_id)?;
+    let signer = MetaSigner::local(&signing_key_id);
+    let head = manifest_utils::record_entry(&entry, &office, &actor, &description, &signer)?;
 
     output::emit(&Recorded {
         kind: kind.as_str().to_string(),
         subject,
         operator: actor_id,
         body,
-        manifest_head,
+        unchanged: head.is_none(),
+        manifest_head: head.or(pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?),
     });
 
     Ok(())
@@ -89,22 +110,16 @@ fn record(revision: &str, kind: ManifestKind, body: String, provenance: Option<P
 fn show(revision: &str) -> Result<(), String> {
     let subject = pallet_utils::resolve_revision(revision)?;
 
-    let entries = manifest_utils::read_manifest()?
-        .iter()
-        .filter(|attributed| attributed.entry.subject == subject)
-        .map(EntryView::from)
-        .collect();
+    let read = manifest_utils::read_manifest()?;
 
-    output::emit(&ManifestView { subject: Some(subject), entries });
+    output::emit(&ManifestView::of(read, Some(subject)));
 
     Ok(())
 }
 
 /// List the whole manifest (every entry, about every parcel).
 fn list() -> Result<(), String> {
-    let entries = manifest_utils::read_manifest()?.iter().map(EntryView::from).collect();
-
-    output::emit(&ManifestView { subject: None, entries });
+    output::emit(&ManifestView::of(manifest_utils::read_manifest()?, None));
 
     Ok(())
 }
@@ -118,12 +133,20 @@ pub(crate) struct Recorded {
     operator: String,
     body: String,
 
-    /// The new head of the manifest pallet.
-    manifest_head: String,
+    /// Whether the operator had already recorded exactly this entry, so nothing was written.
+    unchanged: bool,
+
+    /// The head of the manifest pallet that holds the entry.
+    manifest_head: Option<String>,
 }
 
 impl CommandOutput for Recorded {
     fn render_human(&self) {
+        if self.unchanged {
+            println!("\"{}\" had already recorded this {} of parcel {}.", self.operator, self.kind, self.subject);
+            return;
+        }
+
         print!("Recorded {} of parcel {} by \"{}\".", self.kind, self.subject, self.operator);
 
         // The body is the operator's own, just recorded; it still prints line by line.
@@ -144,6 +167,57 @@ pub(crate) struct ManifestView {
     subject: Option<String>,
 
     entries: Vec<EntryView>,
+
+    /// Entries this forklift cannot read — a newer kind or schema, or a malformed cell. Listed,
+    /// never dropped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unreadable: Vec<UnreadableView>,
+}
+
+impl ManifestView {
+    fn of(read: ManifestRead, subject: Option<String>) -> ManifestView {
+        let about = |candidate: Option<&str>| match &subject {
+            Some(subject) => candidate == Some(subject.as_str()),
+            None => true,
+        };
+
+        ManifestView {
+            entries: read.entries.iter()
+                .filter(|attributed| about(Some(&attributed.entry.subject)))
+                .map(EntryView::from)
+                .collect(),
+            unreadable: read.unreadable.iter()
+                .filter(|unreadable| about(unreadable.subject.as_deref()))
+                .map(UnreadableView::from)
+                .collect(),
+            subject,
+        }
+    }
+}
+
+/// A manifest cell this forklift cannot read.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct UnreadableView {
+    /// The subject, when the cell's path names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+
+    /// The cell's path in the pallet.
+    path: String,
+
+    /// Why it cannot be read.
+    reason: String,
+}
+
+impl From<&UnreadableEntry> for UnreadableView {
+    fn from(unreadable: &UnreadableEntry) -> Self {
+        UnreadableView {
+            subject: unreadable.subject.clone(),
+            path: unreadable.path.clone(),
+            reason: unreadable.reason.clone(),
+        }
+    }
 }
 
 /// One manifest entry in a view, with its forge-proof author.
@@ -153,7 +227,10 @@ pub(crate) struct EntryView {
     kind: String,
     subject: String,
     author: String,
-    recorded_at: i64,
+
+    /// When a provenance entry was recorded (Unix seconds); only provenance carries a time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorded_at: Option<i64>,
     body: String,
 
     /// Provenance fields, present only on a provenance entry.
@@ -199,7 +276,7 @@ impl From<&AttributedEntry> for EntryView {
 
 impl CommandOutput for ManifestView {
     fn render_human(&self) {
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && self.unreadable.is_empty() {
             match &self.subject {
                 Some(subject) => println!("No manifest entries for parcel {}.", subject),
                 None => println!("The manifest is empty."),
@@ -267,6 +344,10 @@ impl CommandOutput for ManifestView {
                     entry.trail_head.as_deref().map(short).unwrap_or_default()
                 );
             }
+        }
+
+        for unreadable in &self.unreadable {
+            println!("  {:<10}  {}  {}", "unreadable", sanitize(&unreadable.path), sanitize(&unreadable.reason));
         }
     }
 }

@@ -1,47 +1,41 @@
 //! Signed tags / releases (§9.4d): a named, signed pointer at a parcel.
 //!
 //! A tag marks a parcel — a release, a milestone — with a name. The Forklift twist is the
-//! same one the manifest uses: the tag is a signed record on a meta pallet, so who tagged
-//! it is the parcel's signature, not a self-declared field, and it is **verifiable offline
-//! against the office chain**. The on-brand convention (§9.4d) is a release tag signed by
-//! an *admin* key — an authoritative act — which the `tag` command enforces at creation.
+//! same one the manifest uses: the tag is a signed cell on a meta pallet (`@tags`, on the
+//! meta-tree substrate, `meta_tree`), so who tagged it is the cell's signer stamp, not a
+//! self-declared field, and it is **verifiable offline against the office chain**.
 //!
-//! Tags live on their own meta pallet (`@tags`, at `.forklift/meta/tags`), reached as
-//! `@tags` and reserving no user pallet name — the exact pattern the office and `@manifest`
-//! established. The pallet is an append-only DAG of single-record parcels; reading unions
-//! every reachable record, so two diverged tag pallets merge with a plain join. A tag name
-//! is immutable: `tag create` refuses a name already reachable from the head.
+//! A tag sits at `cells/<name>` and holds a `tags.tag 1` value: the subject, the message and
+//! when it was tagged. Two rules hold wherever the content check runs: a parcel that adds a tag
+//! must be signed by an Admin of the office as it stands when the parcel is admitted (the
+//! release convention), and no parcel may change or remove an existing tag, so a tag name is
+//! immutable everywhere.
 
-use std::collections::HashSet;
-use toml_edit::{value, DocumentMut};
-use crate::builder::object::loose_object_builder::LooseObjectBuilder;
-use crate::enums::dir_entry_type::DirEntryType;
-use crate::enums::parcel_action_type::ParcelActionType;
-use crate::model::blob::Blob;
+use toml_edit::{value, Table};
 use crate::model::operator::Operator;
-use crate::model::parcel::Parcel;
-use crate::model::parcel_action::ParcelAction;
-use crate::model::tree_item::TreeItem;
-use chrono::Utc;
-use crate::util::{object_utils, office_utils, pallet_utils, sign_utils};
+use crate::util::meta_tree::{
+    self, Admission, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+};
+use crate::util::office_utils::{self, OfficeState, Role};
+use crate::util::object_utils;
 
 /// The name of the tags meta pallet. Lives in the meta namespace, so it is reached as
 /// `@tags` and reserves no user pallet name (DESIGN.html §3.3).
 pub const TAGS_PALLET_NAME: &str = "tags";
 
-/// The tree namespace of tag records: `.forklift/tracked/tags/…`. Shares the
-/// `.forklift/tracked` root with the office and the manifest, inheriting the same
-/// collision-proofing and materialization guard.
-const TREE_NAME_FORKLIFT: &str = ".forklift";
-const TREE_NAME_TRACKED: &str = "tracked";
-const TREE_NAME_TAGS: &str = "tags";
+/// The one value schema this build writes and reads.
+pub const TAG_SCHEMA: &str = "tags.tag 1";
 
-/// The filename suffix of a stored tag record blob.
-const RECORD_SUFFIX: &str = ".toml";
+/// The longest tag name, in bytes.
+pub const MAX_TAG_NAME_BYTES: usize = 128;
+
+const FIELD_SUBJECT: &str = "subject";
+const FIELD_MESSAGE: &str = "message";
+const FIELD_TAGGED_AT: &str = "tagged_at";
 
 /// One signed tag: a named pointer at a subject parcel. Carries no tagger field — the
-/// tagger is the signer of the parcel that introduces it (resolved by [`read_tags`]), which
-/// is forge-proof, unlike a self-declared string.
+/// tagger is the signer stamped on its cell, which is forge-proof, unlike a self-declared
+/// string.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Tag {
     /// The tag name (a release label, e.g. `v1.2.0`). Immutable once created.
@@ -57,303 +51,251 @@ pub struct Tag {
     pub tagged_at: i64,
 }
 
-/// A tag together with its forge-proof authorship: the operator whose key signed the parcel
-/// that introduced it, and that parcel's hash.
+/// A tag together with its forge-proof authorship.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AttributedTag {
     pub tag: Tag,
 
-    /// The operator id resolved from the introducing parcel's signature (the signing key's
-    /// owner in the office). Falls back to the key id, then `"unsigned"`.
+    /// The operator whose key the cell is stamped with, or the key id when the office does not
+    /// know that key.
     pub tagger: String,
 
-    /// The parcel that introduced the tag.
-    pub parcel: String,
+    /// The key id the cell is stamped with.
+    pub signer: String,
 }
 
-/// Validate a tag name. Tags are flat release labels: non-empty, ASCII letters, digits,
-/// `.`, `_` and `-`, and never starting with `-` (indistinguishable from a flag). Unlike
-/// pallet names, a tag name has no `/` components — it is a single label and a single file.
-///
-/// # Arguments
-/// * `name` - The tag name to validate.
-///
-/// # Returns
-/// * `Ok(())`      - If the name is valid.
-/// * `Err(String)` - If the name is not valid.
+/// A tag cell this build cannot read: a newer schema, or a malformed cell. It is listed, never
+/// dropped and never allowed to fail a read of the others.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UnreadableTag {
+    /// The tag name — the cell's path.
+    pub name: String,
+
+    /// Why it cannot be read.
+    pub reason: String,
+}
+
+/// Every tag at one head.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct TagsRead {
+    /// Every readable tag, by name.
+    pub tags: Vec<AttributedTag>,
+
+    /// Every tag cell this build cannot read.
+    pub unreadable: Vec<UnreadableTag>,
+}
+
+/// Validate a tag name. Tags are flat release labels: one metadata path component (ASCII
+/// letters, digits, `.`, `_` and `-`, never starting with `.` or `-`) of at most
+/// [`MAX_TAG_NAME_BYTES`] bytes.
 pub fn validate_tag_name(name: &str) -> Result<(), String> {
-    let error = |reason: &str| Err(format!("\"{}\" is not a valid tag name: {}", name, reason));
+    meta_tree::validate_component(name)
+        .map_err(|why| format!("\"{}\" is not a valid tag name: {}", name, why))?;
 
-    if name.is_empty() {
-        return error("it is empty");
-    }
-
-    if name.starts_with('-') {
-        return error("it must not start with \"-\"");
-    }
-
-    let is_valid_char = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
-
-    if !name.chars().all(is_valid_char) {
-        return error("only ASCII letters, digits, \".\", \"_\" and \"-\" are allowed (no \"/\")");
+    if name.len() > MAX_TAG_NAME_BYTES {
+        return Err(format!(
+            "The tag name \"{}…\" is {} bytes long; a tag name may be at most {} bytes.",
+            name.chars().take(32).collect::<String>(), name.len(), MAX_TAG_NAME_BYTES
+        ));
     }
 
     Ok(())
 }
 
-/// Read every tag reachable from the tags pallet head, each attributed to the operator who
-/// signed its parcel. Returned sorted by name, de-duplicated per (tagger, tag).
-///
-/// # Returns
-/// * `Ok(Vec<AttributedTag>)` - The attributed tags (empty when unborn).
-/// * `Err(String)`            - If an object could not be read.
-pub fn read_tags() -> Result<Vec<AttributedTag>, String> {
-    let Some(head) = pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME)? else {
-        return Ok(Vec::new());
-    };
+/// A `tags.tag 1` value table.
+fn tag_value(tag: &Tag) -> Table {
+    let mut table = Table::new();
+    table.insert(FIELD_SUBJECT, value(tag.subject.as_str()));
+    table.insert(FIELD_MESSAGE, value(tag.message.as_str()));
+    table.insert(FIELD_TAGGED_AT, value(tag.tagged_at));
 
-    // The office maps a signing key to its operator; best-effort (a fresh clone that has
-    // not fetched the office yet still lists tags, attributed by key id).
-    let office = office_utils::read_office_state()
-        .unwrap_or(office_utils::OfficeState { users: Vec::new(), keys: Vec::new() });
+    table
+}
 
-    let mut collected: Vec<AttributedTag> = Vec::new();
-    let mut deduped: HashSet<(String, String)> = HashSet::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = vec![head];
+/// Parse a `tags.tag 1` value table, strictly: exactly its three fields, and a subject that is
+/// a full parcel hash.
+fn parse_value(name: &str, table: &Table) -> Result<Tag, String> {
+    meta_tree::value_fields_only(table, &[FIELD_SUBJECT, FIELD_MESSAGE, FIELD_TAGGED_AT])?;
 
-    while let Some(hash) = queue.pop() {
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
+    let subject = meta_tree::value_string(table, FIELD_SUBJECT)?;
 
-        let parcel = object_utils::load_parcel(&hash)?;
-        queue.extend(parcel.parents.clone());
+    if !object_utils::is_object_hash(&subject) {
+        return Err("has a subject that is not a full parcel hash".to_string());
+    }
 
-        let Some(tags_tree) = resolve_subtree(&parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_TAGS])? else {
-            continue; // A merge (join) parcel: no record.
-        };
+    Ok(Tag {
+        name: name.to_string(),
+        subject,
+        message: meta_tree::value_string(table, FIELD_MESSAGE)?,
+        tagged_at: meta_tree::value_integer(table, FIELD_TAGGED_AT)?,
+    })
+}
 
-        let tagger = resolve_author(&hash, &office);
+/// The pallet rules of `@tags`: one cell per valid name, a strict value, an Admin to add one
+/// (checked when a parcel is admitted, not when admitted history is audited), and immutability.
+pub struct TagsRules;
 
-        for (_, file) in tags_tree.get_files() {
-            let tag = parse_tag(&load_record(&file.hash)?)?;
+impl PalletRules for TagsRules {
+    fn kind(&self) -> MetaKind {
+        MetaKind::Tags
+    }
 
-            if deduped.insert((tagger.clone(), tag.name.clone())) {
-                collected.push(AttributedTag { tag, tagger: tagger.clone(), parcel: hash.clone() });
+    fn knows_schema(&self, schema: &str) -> bool {
+        schema == TAG_SCHEMA
+    }
+
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+        for cell in change.changes {
+            validate_tag_name(&cell.path)?;
+
+            if cell.before.is_some() {
+                return Err(format!("the tag {} already exists, and a tag is never changed or removed", cell.path));
+            }
+
+            let Some(after) = &cell.after else { continue };
+
+            if change.admission == Admission::Admit {
+                let operator = &change.signer.operator;
+                let is_admin = change.office.find_user(operator)
+                    .is_some_and(|user| matches!(user.role, Role::Admin));
+
+                if !is_admin {
+                    return Err(format!("the tag {} is signed by {}, who is not an admin", cell.path, operator));
+                }
+            }
+
+            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+
+            if envelope.schema == TAG_SCHEMA {
+                parse_value(&cell.path, &envelope.value).map_err(|why| format!("the tag {} {}", cell.path, why))?;
             }
         }
+
+        Ok(())
     }
 
-    collected.sort_by(|a, b| a.tag.name.cmp(&b.tag.name).then(a.parcel.cmp(&b.parcel)));
+    fn resolution_path(&self, spelled: &str) -> Result<String, String> {
+        validate_tag_name(spelled)?;
 
-    Ok(collected)
-}
+        Ok(spelled.to_string())
+    }
 
-/// Find a tag by name (the first reachable record with that name), if any.
-///
-/// # Arguments
-/// * `name` - The tag name.
-///
-/// # Returns
-/// * `Ok(Some(AttributedTag))` - The tag.
-/// * `Ok(None)`                - If no tag by that name exists.
-/// * `Err(String)`             - If an object could not be read.
-pub fn find_tag(name: &str) -> Result<Option<AttributedTag>, String> {
-    Ok(read_tags()?.into_iter().find(|attributed| attributed.tag.name == name))
-}
-
-/// The operator who authored a tag parcel: the owner of the key that signed it.
-fn resolve_author(parcel_hash: &str, office: &office_utils::OfficeState) -> String {
-    match sign_utils::load_parcel_signature(parcel_hash) {
-        Ok(Some(signature)) => office.find_key(&signature.key_id)
-            .map(|key| key.operator.clone())
-            .unwrap_or(signature.key_id),
-        _ => "unsigned".to_string(),
+    fn display_value(&self, envelope: &CellEnvelope) -> String {
+        match meta_tree::value_string(&envelope.value, FIELD_SUBJECT) {
+            Ok(subject) => format!("points at {}", subject),
+            Err(why) => format!("(unreadable: the value {})", why),
+        }
     }
 }
 
-/// Record a new tag: stack a single-record parcel signed by the tagger, on top of the
-/// current tags head.
-///
-/// # Arguments
-/// * `tag`            - The tag to record.
-/// * `actor`          - The operator recording it.
-/// * `signing_key_id` - The key to sign with (its private half must be local).
-///
-/// # Returns
-/// * `Ok(String)`  - The hash of the new tags parcel.
-/// * `Err(String)` - If an object could not be stored, or the parcel signed.
-pub fn record_tag(tag: &Tag, actor: &Operator, signing_key_id: &str) -> Result<String, String> {
-    let parents: Vec<String> = pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME)?
-        .into_iter()
-        .collect();
+/// Create a tag, as one signed cell on the local `@tags` head. The caller holds the warehouse
+/// lock and passes the verified office; the content check refuses a signer who is not an
+/// admin, and a name that already exists.
+pub fn record_tag(tag: &Tag,
+                  office: &OfficeState,
+                  actor: &Operator,
+                  signer: &MetaSigner) -> Result<String, String> {
+    validate_tag_name(&tag.name)?;
 
-    let file_name = format!("{}{}", tag.name, RECORD_SUFFIX);
-    let blob_hash = store_record(&tag_to_toml(tag))?;
+    if !object_utils::is_object_hash(&tag.subject) {
+        return Err(format!("\"{}\" is not a full parcel hash.", tag.subject));
+    }
 
-    let mut tags_tree = TreeItem::new(TREE_NAME_TAGS.to_string(), String::new(), DirEntryType::Tree);
-    tags_tree.add_child(TreeItem::new(file_name, blob_hash, DirEntryType::Normal));
+    let edit = meta_tree::set_cell(&tag.name, &signer.key_id, TAG_SCHEMA, &tag_value(tag))?;
+    let description = format!("tag {} {}", tag.name, tag.subject);
 
-    let description = format!("Tagged {} as \"{}\".", &tag.subject[..tag.subject.len().min(12)], tag.name);
-
-    stack_tag_parcel(tags_tree, parents, actor, description, signing_key_id)
+    meta_tree::stack_meta_edits(TAGS_PALLET_NAME, &TagsRules, office, &[edit], actor, &description, signer)?
+        .ok_or(format!("Tag \"{}\" already exists.", tag.name))
 }
 
-/// Build, sign and store a tag parcel with the given tag subtree and parents, and advance
-/// the tags pallet head.
-fn stack_tag_parcel(mut tags_tree: TreeItem,
-                    parents: Vec<String>,
-                    actor: &Operator,
-                    description: String,
-                    signing_key_id: &str) -> Result<String, String> {
-    // Nest the record under `.forklift/tracked/tags/`, storing each subtree's object.
-    store_subtree(&mut tags_tree)?;
-
-    let mut tracked_tree = TreeItem::new(TREE_NAME_TRACKED.to_string(), String::new(), DirEntryType::Tree);
-    tracked_tree.add_child(tags_tree);
-    store_subtree(&mut tracked_tree)?;
-
-    let mut forklift_tree = TreeItem::new(TREE_NAME_FORKLIFT.to_string(), String::new(), DirEntryType::Tree);
-    forklift_tree.add_child(tracked_tree);
-    store_subtree(&mut forklift_tree)?;
-
-    let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-    root_tree.add_child(forklift_tree);
-
-    let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
-    root_object.store()?;
-
-    let timestamp = Utc::now();
-
-    let parcel = Parcel {
-        tree_hash: root_object.hash.clone(),
-        parents,
-        actions: vec![
-            ParcelAction {
-                operator: actor.clone(),
-                action: ParcelActionType::Author,
-                description: None,
-                timestamp,
-            },
-            ParcelAction {
-                operator: actor.clone(),
-                action: ParcelActionType::Stack,
-                description: None,
-                timestamp,
-            },
-        ],
-        description: Some(description),
+/// Read every tag at the local head, attributed through the office (read best-effort, so a
+/// tag whose key the local office does not know is attributed by key id), with every cell this
+/// build cannot read. An unborn pallet reads as empty.
+pub fn read_tags() -> Result<TagsRead, String> {
+    let Some(state) = meta_tree::read_meta_head(TAGS_PALLET_NAME, &TagsRules)? else {
+        return Ok(TagsRead::default());
     };
 
-    let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
-    parcel_object.store()?;
+    let office = office_utils::read_office_state()
+        .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    let signature = sign_utils::sign_parcel_hash(signing_key_id, &parcel_object.hash)?;
-    sign_utils::store_parcel_signature(&parcel_object.hash, &signature)?;
+    let mut read = TagsRead::default();
 
-    pallet_utils::set_meta_pallet_head(TAGS_PALLET_NAME, &parcel_object.hash)?;
+    for (name, cell) in state.cells {
+        let parsed = match cell {
+            CellRead::Readable(envelope) => parse_value(&name, &envelope.value)
+                .map(|tag| (tag, envelope.signer))
+                .map_err(|why| format!("the value {}", why)),
+            CellRead::Unknown { schema, .. } =>
+                Err(format!("written with the schema \"{}\", which this forklift does not know", schema)),
+            CellRead::Malformed(why) => Err(why),
+        };
 
-    Ok(parcel_object.hash)
-}
-
-/// Build and store one subtree's object, recording the hash on the tree item.
-fn store_subtree(tree: &mut TreeItem) -> Result<(), String> {
-    let mut object = LooseObjectBuilder::build_tree(tree);
-    tree.hash = object.hash.clone();
-    object.store()?;
-
-    Ok(())
-}
-
-/// Store a record blob and return its hash.
-fn store_record(toml: &str) -> Result<String, String> {
-    let blob = Blob { content: toml.as_bytes().to_vec() };
-    let mut object = LooseObjectBuilder::build_blob(&blob);
-    object.store()?;
-
-    Ok(object.hash)
-}
-
-/// Load one record blob as a string.
-fn load_record(hash: &str) -> Result<String, String> {
-    String::from_utf8(object_utils::load_blob(hash)?.content)
-        .map_err(|_| format!("The tag record {} is not valid UTF-8.", hash))
-}
-
-/// Resolve a chain of subtree names from a root tree.
-fn resolve_subtree(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, String> {
-    let mut current = object_utils::load_tree(root_tree_hash)?;
-
-    for component in path {
-        let subtree_hash = current.get_subtrees()
-            .find(|(name, _)| name == component)
-            .map(|(_, item)| item.hash.clone());
-
-        match subtree_hash {
-            Some(hash) => current = object_utils::load_tree(&hash)?,
-            None => return Ok(None),
+        match parsed {
+            Ok((tag, signer)) => read.tags.push(AttributedTag {
+                tag,
+                tagger: office.find_key(&signer).map(|key| key.operator.clone()).unwrap_or(signer.clone()),
+                signer,
+            }),
+            Err(reason) => read.unreadable.push(UnreadableTag { name, reason }),
         }
     }
 
-    Ok(Some(current))
+    Ok(read)
 }
 
-/// Serialize a tag as TOML.
-fn tag_to_toml(tag: &Tag) -> String {
-    let mut doc = DocumentMut::new();
+/// The tag of a name at the local head, or `None` when there is none. A tag cell this build
+/// cannot read is an error naming why.
+pub fn find_tag(name: &str) -> Result<Option<AttributedTag>, String> {
+    validate_tag_name(name)?;
 
-    doc["name"] = value(tag.name.as_str());
-    doc["subject"] = value(tag.subject.as_str());
-    doc["message"] = value(tag.message.as_str());
-    doc["tagged_at"] = value(tag.tagged_at);
+    let read = read_tags()?;
 
-    doc.to_string()
-}
+    if let Some(unreadable) = read.unreadable.iter().find(|tag| tag.name == name) {
+        return Err(format!("Tag \"{}\" cannot be read: {}.", name, unreadable.reason));
+    }
 
-/// Parse a tag from TOML.
-fn parse_tag(toml: &str) -> Result<Tag, String> {
-    let doc: DocumentMut = toml.parse()
-        .map_err(|e| format!("A tag record is not valid TOML: {}", e))?;
-
-    // FORK-81 follow-up (the class sweep PR #122 missed): shares the office's required-string
-    // reader instead of duplicating it as a private per-module closure. `Tag` has no optional
-    // fields, so this is pure de-duplication — no parse behaviour changes.
-    Ok(Tag {
-        name: office_utils::read_string(&doc, "name", "tag record")?,
-        subject: office_utils::read_string(&doc, "subject", "tag record")?,
-        message: office_utils::read_string(&doc, "message", "tag record")?,
-        tagged_at: office_utils::read_integer(&doc, "tagged_at", "tag record")?,
-    })
+    Ok(read.tags.into_iter().find(|tag| tag.tag.name == name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn tags_round_trip_through_toml() {
-        let original = Tag {
-            name: "v1.2.0".to_string(),
-            subject: "a".repeat(64),
-            message: "the second release".to_string(),
-            tagged_at: 1_700_000_000,
-        };
-
-        assert_eq!(parse_tag(&tag_to_toml(&original)).unwrap(), original);
+    fn tag() -> Tag {
+        Tag { name: "v1.0".to_string(), subject: "a".repeat(64), message: "first".to_string(), tagged_at: 7 }
     }
 
     #[test]
-    fn valid_tag_names_are_accepted() {
-        for name in ["v1", "v1.2.0", "release_2024", "rc-1"] {
-            assert!(validate_tag_name(name).is_ok(), "expected valid: {}", name);
-        }
+    fn a_tag_round_trips_through_its_value() {
+        assert_eq!(parse_value("v1.0", &tag_value(&tag())).unwrap(), tag());
     }
 
     #[test]
-    fn invalid_tag_names_are_rejected() {
-        for name in ["", "-v1", "v1/2", "with space", "emoji📦", "a\nb"] {
-            assert!(validate_tag_name(name).is_err(), "expected invalid: {}", name);
+    fn a_value_is_parsed_strictly() {
+        let mut extra = tag_value(&tag());
+        extra.insert("tagger", value("mallory"));
+        assert!(parse_value("v1.0", &extra).unwrap_err().contains("unexpected field \"tagger\""));
+
+        let mut short = tag();
+        short.subject = "abc".to_string();
+        assert!(parse_value("v1.0", &tag_value(&short)).unwrap_err().contains("full parcel hash"));
+
+        let mut untimed = tag_value(&tag());
+        untimed.insert(FIELD_TAGGED_AT, value("yesterday"));
+        assert!(parse_value("v1.0", &untimed).unwrap_err().contains("not an integer"));
+    }
+
+    #[test]
+    fn tag_names_are_one_bounded_component() {
+        for good in ["v1.2.0", "release_2", "rc-1", "a"] {
+            assert!(validate_tag_name(good).is_ok(), "{}", good);
         }
+
+        for bad in ["", "-v1", ".hidden", "a/b", "v 1", "ü", &"t".repeat(MAX_TAG_NAME_BYTES + 1)] {
+            assert!(validate_tag_name(bad).is_err(), "{:?} must be refused", bad);
+        }
+
+        assert!(validate_tag_name(&"t".repeat(MAX_TAG_NAME_BYTES)).is_ok());
     }
 }

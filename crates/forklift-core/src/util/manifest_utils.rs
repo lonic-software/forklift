@@ -1,51 +1,42 @@
-//! The manifest: post-metadata about parcels as tracked metadata.
+//! The manifest: post-metadata about parcels, on the meta-tree substrate (`meta_tree`).
 //!
 //! A *manifest entry* is a signed statement attached to a parcel after the fact — an
-//! approval, a review note, and (later, §7.2) machine-authorship provenance. Entries are
-//! ordinary blobs under the reserved `.forklift/tracked/…` tree namespace, carried by
-//! parcels on a dedicated meta pallet (`@manifest`, at `.forklift/meta/manifest`). An
-//! entry *references* its subject parcel and never mutates it (the §4.4 immutability
-//! invariant); the manifest is the "GitHub layer" living inside the warehouse instead of
-//! a hosting provider's database.
+//! approval, a review note, machine-authorship provenance (§7.2) or a delivery record
+//! (§7.3). An entry *references* its subject parcel and never mutates it (the §4.4
+//! immutability invariant).
 //!
-//! **The manifest is an append-only DAG of single-entry parcels, and authorship is the
-//! parcel's signature — never a stored field.** Each `manifest note/approve` stacks one
-//! parcel carrying one entry, signed by its author; the author *is* whoever signed it, so
-//! there is nothing to forge and the ordinary `verify_pallet_history` (which checks every
-//! parcel is signed by a tracked key) is the whole verification — no per-pallet server
-//! special-case. Reading collects every entry *reachable* from the head, so two diverged
-//! branches merge with a plain two-parent join parcel: the union of independent records,
-//! never a conflict. (Contrast the office, whose interdependent records stay linear.)
+//! Cells sit under `<s[0..2]>/<s>/<kind>/` for subject parcel `s`. An approval is single-valued
+//! per operator and lives at `approval/<op>`, where `op` is the blake3 of the operator
+//! identifier. Every other kind is multi-valued and lives at `<kind>/<id>`, where `id` is
+//! derived from the writer's operator identifier and the entry, so identical entries from one
+//! writer collapse and the same text from two writers never shares a cell. Who wrote an entry is
+//! its cell's signer stamp; the content check keeps that honest, and the pallet rule below lets a
+//! cell be written or removed only by the operator it belongs to.
 
-use std::collections::HashSet;
-use chrono::Utc;
-use toml_edit::{value, DocumentMut};
-use crate::builder::object::loose_object_builder::LooseObjectBuilder;
-use crate::enums::dir_entry_type::DirEntryType;
-use crate::enums::parcel_action_type::ParcelActionType;
-use crate::model::blob::Blob;
+use toml_edit::{value, Table};
 use crate::model::operator::Operator;
-use crate::model::parcel::Parcel;
-use crate::model::parcel_action::ParcelAction;
-use crate::model::tree_item::TreeItem;
-use crate::util::{object_utils, office_utils, pallet_utils, sign_utils};
+use crate::util::meta_tree::{
+    self, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+};
+use crate::util::office_utils::{self, OfficeState};
+use crate::util::object_utils;
 
 /// The name of the manifest meta pallet. Lives in the meta namespace, so it is reached
 /// as `@manifest` and reserves no user pallet name (DESIGN.html §3.3).
 pub const MANIFEST_PALLET_NAME: &str = "manifest";
 
-/// The tree namespace of manifest entries: `.forklift/tracked/manifest/…`. Shares the
-/// `.forklift/tracked` root with the office, so it inherits the same collision-proofing
-/// (the `.forklift` folder is never tracked) and materialization guard.
-const TREE_NAME_FORKLIFT: &str = ".forklift";
-const TREE_NAME_TRACKED: &str = "tracked";
-const TREE_NAME_MANIFEST: &str = "manifest";
-
-/// The filename suffix of a stored record blob.
-const RECORD_SUFFIX: &str = ".toml";
+const FIELD_BODY: &str = "body";
+const FIELD_MODEL: &str = "model";
+const FIELD_TOOL: &str = "tool";
+const FIELD_SESSION: &str = "session";
+const FIELD_TRANSCRIPT: &str = "transcript";
+const FIELD_RECORDED_AT: &str = "recorded_at";
+const FIELD_SOURCE: &str = "source";
+const FIELD_TRAIL_HEAD: &str = "trail_head";
+const FIELD_CHECKPOINTS: &str = "checkpoints";
 
 /// What a manifest entry asserts about its subject parcel.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ManifestKind {
     /// A free-form note.
     Note,
@@ -58,7 +49,7 @@ pub enum ManifestKind {
 }
 
 impl ManifestKind {
-    /// The on-chain string form.
+    /// The string form, which is also the kind's directory under a subject.
     pub fn as_str(self) -> &'static str {
         match self {
             ManifestKind::Note => "note",
@@ -80,6 +71,23 @@ impl ManifestKind {
                 other
             )),
         }
+    }
+
+    /// The one value schema this build writes and reads for the kind.
+    pub fn schema(self) -> &'static str {
+        match self {
+            ManifestKind::Note => "manifest.note 1",
+            ManifestKind::Approval => "manifest.approval 1",
+            ManifestKind::Provenance => "manifest.provenance 1",
+            ManifestKind::Delivery => "manifest.delivery 1",
+        }
+    }
+
+    const ALL: [ManifestKind; 4] =
+        [ManifestKind::Note, ManifestKind::Approval, ManifestKind::Provenance, ManifestKind::Delivery];
+
+    fn of_schema(schema: &str) -> Option<ManifestKind> {
+        ManifestKind::ALL.into_iter().find(|kind| kind.schema() == schema)
     }
 }
 
@@ -115,14 +123,13 @@ pub struct Provenance {
     pub session: Option<String>,
 
     /// A hash or fingerprint of the prompt or transcript: a commitment the signer makes
-    /// at authorship time, so the transcript can be verified against it later (the full
-    /// transcript-as-a-blob option rides on this without weakening it).
+    /// at authorship time, so the transcript can be verified against it later.
     pub transcript: Option<String>,
 }
 
 /// One post-metadata statement about a subject parcel. Deliberately carries no author
-/// field: the author is the signer of the parcel that introduces the entry (resolved by
-/// [`read_manifest`]), which is forge-proof, unlike a self-declared string.
+/// field: the author is the signer stamped on the entry's cell, which is forge-proof, unlike a
+/// self-declared string.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ManifestEntry {
     /// The parcel this entry is about.
@@ -131,8 +138,9 @@ pub struct ManifestEntry {
     /// What the entry asserts.
     pub kind: ManifestKind,
 
-    /// When the entry was recorded. Display metadata only — never a security input.
-    pub recorded_at: i64,
+    /// When a provenance entry was recorded — display metadata only, never a security input.
+    /// Only provenance carries a time, so the other kinds' identical entries collapse.
+    pub recorded_at: Option<i64>,
 
     /// The entry's message (may be empty, e.g. a bare approval).
     pub body: String,
@@ -144,460 +152,507 @@ pub struct ManifestEntry {
     pub delivery: Option<Delivery>,
 }
 
-impl ManifestEntry {
-    /// The entry's content-derived id — the filename it is stored under.
-    pub fn id(&self) -> String {
-        let provenance = self.provenance.as_ref().map(|p| format!(
-            "{}\n{}\n{}\n{}",
-            p.model,
-            p.tool.as_deref().unwrap_or(""),
-            p.session.as_deref().unwrap_or(""),
-            p.transcript.as_deref().unwrap_or("")
-        )).unwrap_or_default();
-
-        let delivery = self.delivery.as_ref()
-            .map(|d| format!("{}\n{}\n{}", d.source, d.trail_head, d.checkpoints))
-            .unwrap_or_default();
-
-        let material = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
-            self.subject, self.kind.as_str(), self.recorded_at, self.body, provenance, delivery
-        );
-
-        blake3::hash(material.as_bytes()).to_hex().to_string()
-    }
-}
-
-/// An entry together with its forge-proof authorship: the operator whose key signed the
-/// parcel that introduced it, and that parcel's hash.
+/// An entry together with its forge-proof authorship.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AttributedEntry {
     pub entry: ManifestEntry,
 
-    /// The operator id resolved from the introducing parcel's signature (the signing
-    /// key's owner in the office). Falls back to the key id, then `"unsigned"`, when the
-    /// author cannot be resolved.
+    /// The operator whose key the cell is stamped with, or the key id when the office does not
+    /// know that key.
     pub author: String,
 
-    /// The manifest parcel that introduced the entry.
-    pub parcel: String,
+    /// The key id the cell is stamped with.
+    pub signer: String,
 }
 
-/// Read the whole manifest: every entry reachable from the manifest pallet head, each
-/// attributed to the operator who signed its parcel. Entries are returned oldest first
-/// (by record time, then parcel hash) and de-duplicated per (author, entry).
-///
-/// # Returns
-/// * `Ok(Vec<AttributedEntry>)` - The attributed entries (empty when unborn).
-/// * `Err(String)`              - If an object could not be read.
-pub fn read_manifest() -> Result<Vec<AttributedEntry>, String> {
-    let Some(head) = pallet_utils::get_meta_pallet_head(MANIFEST_PALLET_NAME)? else {
-        return Ok(Vec::new());
+/// A manifest cell this build cannot read: a newer kind or schema, or a malformed cell. It is
+/// listed, never dropped and never allowed to fail a read of the others.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UnreadableEntry {
+    /// The subject, when the path names one.
+    pub subject: Option<String>,
+
+    /// The cell path, relative to `cells/`.
+    pub path: String,
+
+    /// Why it cannot be read.
+    pub reason: String,
+}
+
+/// The manifest at one head.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ManifestRead {
+    /// Every readable entry, in cell path order.
+    pub entries: Vec<AttributedEntry>,
+
+    /// Every cell this build cannot read.
+    pub unreadable: Vec<UnreadableEntry>,
+}
+
+/// The blake3 of an operator identifier, as `approval/<op>` names it.
+pub fn operator_leaf(operator: &str) -> String {
+    blake3::hash(operator.as_bytes()).to_hex().to_string()
+}
+
+/// The id of a multi-valued entry written by `operator`: the blake3 of the operator identifier
+/// and every field of the entry, each length-prefixed so no two field lists share an encoding.
+pub fn entry_id(operator: &str, entry: &ManifestEntry) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     };
 
-    // The office maps a signing key to its operator; best-effort (a fresh clone that has
-    // not fetched the office yet still lists entries, attributed by key id).
-    let office = office_utils::read_office_state()
-        .unwrap_or(office_utils::OfficeState { users: Vec::new(), keys: Vec::new() });
+    let optional = |text: &Option<String>| match text {
+        Some(text) => format!("+{}", text),
+        None => "-".to_string(),
+    };
 
-    let mut collected: Vec<AttributedEntry> = Vec::new();
-    let mut deduped: HashSet<(String, String)> = HashSet::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = vec![head];
+    field(operator.as_bytes());
+    field(entry.subject.as_bytes());
+    field(entry.kind.as_str().as_bytes());
+    field(entry.body.as_bytes());
+    field(entry.recorded_at.map(|at| at.to_string()).unwrap_or_default().as_bytes());
 
-    while let Some(hash) = queue.pop() {
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
+    if let Some(provenance) = &entry.provenance {
+        field(provenance.model.as_bytes());
+        field(optional(&provenance.tool).as_bytes());
+        field(optional(&provenance.session).as_bytes());
+        field(optional(&provenance.transcript).as_bytes());
+    }
 
-        let parcel = object_utils::load_parcel(&hash)?;
-        queue.extend(parcel.parents.clone());
+    if let Some(delivery) = &entry.delivery {
+        field(delivery.source.as_bytes());
+        field(delivery.trail_head.as_bytes());
+        field(delivery.checkpoints.to_string().as_bytes());
+    }
 
-        let Some(manifest) = resolve_subtree(&parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_MANIFEST])? else {
-            continue; // A merge parcel (or non-manifest parcel): no entry.
-        };
+    hasher.finalize().to_hex().to_string()
+}
 
-        let author = resolve_author(&hash, &office);
+/// The leaf an entry by `operator` is stored under.
+fn leaf_of(operator: &str, entry: &ManifestEntry) -> String {
+    match entry.kind {
+        ManifestKind::Approval => operator_leaf(operator),
+        _ => entry_id(operator, entry),
+    }
+}
 
-        for (_, file) in manifest.get_files() {
-            let entry = parse_entry(&load_record(&file.hash)?)?;
+/// The cell path of an entry by `operator`, relative to `cells/`.
+pub fn cell_path(operator: &str, entry: &ManifestEntry) -> String {
+    format!("{}/{}/{}/{}", &entry.subject[..2], entry.subject, entry.kind.as_str(), leaf_of(operator, entry))
+}
 
-            if deduped.insert((author.clone(), entry.id())) {
-                collected.push(AttributedEntry { entry, author: author.clone(), parcel: hash.clone() });
+/// The parts of a manifest cell path. The kind is kept as spelled, so a newer kind still parses.
+struct CellPath<'a> {
+    subject: &'a str,
+    kind: &'a str,
+    leaf: &'a str,
+}
+
+/// Split a cell path, refusing any path that is not `<s[0..2]>/<s>/<kind>/<leaf>` for a parcel
+/// hash `s` and a 64-hex leaf.
+fn parse_cell_path(path: &str) -> Result<CellPath<'_>, String> {
+    let parts: Vec<&str> = path.split('/').collect();
+
+    let [fan, subject, kind, leaf] = parts.as_slice() else {
+        return Err(format!("{} is not a <subject>/<kind>/<id> cell path", path));
+    };
+
+    if !object_utils::is_object_hash(subject) || *fan != &subject[..2] {
+        return Err(format!("{} does not sit under the directory of a parcel hash", path));
+    }
+
+    meta_tree::validate_component(kind)?;
+
+    if !object_utils::is_object_hash(leaf) {
+        return Err(format!("{} does not end in a 64-hex id", path));
+    }
+
+    Ok(CellPath { subject, kind, leaf })
+}
+
+/// The value table of an entry.
+fn entry_value(entry: &ManifestEntry) -> Table {
+    let mut table = Table::new();
+    table.insert(FIELD_BODY, value(entry.body.as_str()));
+
+    if let Some(provenance) = &entry.provenance {
+        table.insert(FIELD_MODEL, value(provenance.model.as_str()));
+
+        for (field, text) in [
+            (FIELD_TOOL, &provenance.tool),
+            (FIELD_SESSION, &provenance.session),
+            (FIELD_TRANSCRIPT, &provenance.transcript),
+        ] {
+            if let Some(text) = text {
+                table.insert(field, value(text.as_str()));
             }
         }
     }
 
-    collected.sort_by(|a, b| a.entry.recorded_at.cmp(&b.entry.recorded_at).then(a.parcel.cmp(&b.parcel)));
-
-    Ok(collected)
-}
-
-/// The operator who authored a manifest parcel: the owner of the key that signed it.
-fn resolve_author(parcel_hash: &str, office: &office_utils::OfficeState) -> String {
-    match sign_utils::load_parcel_signature(parcel_hash) {
-        Ok(Some(signature)) => office.find_key(&signature.key_id)
-            .map(|key| key.operator.clone())
-            .unwrap_or(signature.key_id),
-        _ => "unsigned".to_string(),
-    }
-}
-
-/// Record a new manifest entry: stack a single-entry parcel signed by the author, on top
-/// of the current manifest head.
-///
-/// # Arguments
-/// * `entry`          - The entry to record.
-/// * `actor`          - The operator recording it.
-/// * `description`    - The parcel description (the audit line).
-/// * `signing_key_id` - The key to sign with (its private half must be local).
-///
-/// # Returns
-/// * `Ok(String)`  - The hash of the new manifest parcel.
-/// * `Err(String)` - If an object could not be stored, or the parcel signed.
-pub fn record_entry(entry: &ManifestEntry,
-                    actor: &Operator,
-                    description: String,
-                    signing_key_id: &str) -> Result<String, String> {
-    let parents: Vec<String> = pallet_utils::get_meta_pallet_head(MANIFEST_PALLET_NAME)?
-        .into_iter()
-        .collect();
-
-    let file_name = format!("{}{}", entry.id(), RECORD_SUFFIX);
-    let blob_hash = store_record(&entry_to_toml(entry))?;
-
-    let mut manifest_tree = TreeItem::new(TREE_NAME_MANIFEST.to_string(), String::new(), DirEntryType::Tree);
-    manifest_tree.add_child(TreeItem::new(file_name, blob_hash, DirEntryType::Normal));
-
-    stack_manifest_parcel(Some(manifest_tree), parents, actor, description, signing_key_id)
-}
-
-/// Merge another manifest head into the local one: a two-parent join parcel that carries
-/// no entry of its own. Because reading unions every reachable entry, the join is the
-/// merge — no conflict is possible between independent records.
-///
-/// # Arguments
-/// * `other_head`     - The other manifest head to merge in.
-/// * `actor`          - The operator performing the merge.
-/// * `description`    - The parcel description.
-/// * `signing_key_id` - The key to sign the join parcel with.
-///
-/// # Returns
-/// * `Ok(String)`  - The hash of the new (merge) manifest parcel.
-/// * `Err(String)` - If the local manifest is unborn, or an object could not be signed.
-pub fn merge_manifest(other_head: &str,
-                      actor: &Operator,
-                      description: String,
-                      signing_key_id: &str) -> Result<String, String> {
-    let local_head = pallet_utils::get_meta_pallet_head(MANIFEST_PALLET_NAME)?
-        .ok_or("There is no local manifest to merge into.".to_string())?;
-
-    let parents = vec![local_head, other_head.to_string()];
-
-    stack_manifest_parcel(None, parents, actor, description, signing_key_id)
-}
-
-/// Build, sign and store a manifest parcel with the given (optional) manifest subtree and
-/// parents, and advance the manifest pallet head. `entry_subtree` is `None` for a merge
-/// (join) parcel, which carries no entry of its own.
-fn stack_manifest_parcel(entry_subtree: Option<TreeItem>,
-                         parents: Vec<String>,
-                         actor: &Operator,
-                         description: String,
-                         signing_key_id: &str) -> Result<String, String> {
-    let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-
-    // A merge parcel has an empty root tree; a record parcel nests its single entry under
-    // `.forklift/tracked/manifest/`.
-    if let Some(mut manifest_tree) = entry_subtree {
-        store_subtree(&mut manifest_tree)?;
-
-        let mut tracked_tree = TreeItem::new(TREE_NAME_TRACKED.to_string(), String::new(), DirEntryType::Tree);
-        tracked_tree.add_child(manifest_tree);
-        store_subtree(&mut tracked_tree)?;
-
-        let mut forklift_tree = TreeItem::new(TREE_NAME_FORKLIFT.to_string(), String::new(), DirEntryType::Tree);
-        forklift_tree.add_child(tracked_tree);
-        store_subtree(&mut forklift_tree)?;
-
-        root_tree.add_child(forklift_tree);
+    if let Some(recorded_at) = entry.recorded_at {
+        table.insert(FIELD_RECORDED_AT, value(recorded_at));
     }
 
-    let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
-    root_object.store()?;
+    if let Some(delivery) = &entry.delivery {
+        table.insert(FIELD_SOURCE, value(delivery.source.as_str()));
+        table.insert(FIELD_TRAIL_HEAD, value(delivery.trail_head.as_str()));
+        table.insert(FIELD_CHECKPOINTS, value(delivery.checkpoints));
+    }
 
-    let timestamp = Utc::now();
+    table
+}
 
-    let parcel = Parcel {
-        tree_hash: root_object.hash.clone(),
-        parents,
-        actions: vec![
-            ParcelAction {
-                operator: actor.clone(),
-                action: ParcelActionType::Author,
-                description: None,
-                timestamp,
-            },
-            ParcelAction {
-                operator: actor.clone(),
-                action: ParcelActionType::Stack,
-                description: None,
-                timestamp,
-            },
-        ],
-        description: Some(description),
+/// Parse an entry of a known kind from its value table, strictly: exactly the kind's fields.
+fn parse_value(subject: &str, kind: ManifestKind, table: &Table) -> Result<ManifestEntry, String> {
+    let mut entry = ManifestEntry {
+        subject: subject.to_string(),
+        kind,
+        recorded_at: None,
+        body: meta_tree::value_string(table, FIELD_BODY)?,
+        provenance: None,
+        delivery: None,
     };
 
-    let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
-    parcel_object.store()?;
+    match kind {
+        ManifestKind::Note | ManifestKind::Approval => meta_tree::value_fields_only(table, &[FIELD_BODY])?,
+        ManifestKind::Provenance => {
+            meta_tree::value_fields_only(table, &[
+                FIELD_BODY, FIELD_MODEL, FIELD_TOOL, FIELD_SESSION, FIELD_TRANSCRIPT, FIELD_RECORDED_AT,
+            ])?;
 
-    let signature = sign_utils::sign_parcel_hash(signing_key_id, &parcel_object.hash)?;
-    sign_utils::store_parcel_signature(&parcel_object.hash, &signature)?;
+            entry.recorded_at = Some(meta_tree::value_integer(table, FIELD_RECORDED_AT)?);
+            entry.provenance = Some(Provenance {
+                model: meta_tree::value_string(table, FIELD_MODEL)?,
+                tool: meta_tree::value_optional_string(table, FIELD_TOOL)?,
+                session: meta_tree::value_optional_string(table, FIELD_SESSION)?,
+                transcript: meta_tree::value_optional_string(table, FIELD_TRANSCRIPT)?,
+            });
+        }
+        ManifestKind::Delivery => {
+            meta_tree::value_fields_only(table, &[FIELD_BODY, FIELD_SOURCE, FIELD_TRAIL_HEAD, FIELD_CHECKPOINTS])?;
 
-    pallet_utils::set_meta_pallet_head(MANIFEST_PALLET_NAME, &parcel_object.hash)?;
+            entry.delivery = Some(Delivery {
+                source: meta_tree::value_string(table, FIELD_SOURCE)?,
+                trail_head: meta_tree::value_string(table, FIELD_TRAIL_HEAD)?,
+                checkpoints: meta_tree::value_integer(table, FIELD_CHECKPOINTS)?,
+            });
+        }
+    }
 
-    Ok(parcel_object.hash)
+    Ok(entry)
 }
 
-/// Build and store one subtree's object, recording the hash on the tree item.
-fn store_subtree(tree: &mut TreeItem) -> Result<(), String> {
-    let mut object = LooseObjectBuilder::build_tree(tree);
-    tree.hash = object.hash.clone();
-    object.store()?;
+/// Check an entry before it is written: a full parcel hash for a subject, and the details
+/// exactly its kind carries.
+fn validate_entry(entry: &ManifestEntry) -> Result<(), String> {
+    if !object_utils::is_object_hash(&entry.subject) {
+        return Err(format!("\"{}\" is not a full parcel hash.", entry.subject));
+    }
+
+    let shaped = match entry.kind {
+        ManifestKind::Note | ManifestKind::Approval =>
+            entry.provenance.is_none() && entry.delivery.is_none() && entry.recorded_at.is_none(),
+        ManifestKind::Provenance =>
+            entry.provenance.is_some() && entry.delivery.is_none() && entry.recorded_at.is_some(),
+        ManifestKind::Delivery =>
+            entry.delivery.is_some() && entry.provenance.is_none() && entry.recorded_at.is_none(),
+    };
+
+    if !shaped {
+        return Err(format!("A {} entry does not carry the details its kind needs.", entry.kind.as_str()));
+    }
 
     Ok(())
 }
 
-/// Store a record blob and return its hash.
-fn store_record(toml: &str) -> Result<String, String> {
-    let blob = Blob { content: toml.as_bytes().to_vec() };
-    let mut object = LooseObjectBuilder::build_blob(&blob);
-    object.store()?;
-
-    Ok(object.hash)
+/// The operator a stamped key belongs to.
+fn operator_of<'o>(office: &'o OfficeState, key_id: &str) -> Option<&'o str> {
+    office.find_key(key_id).map(|key| key.operator.as_str())
 }
 
-/// Load one record blob as a string.
-fn load_record(hash: &str) -> Result<String, String> {
-    String::from_utf8(object_utils::load_blob(hash)?.content)
-        .map_err(|_| format!("The manifest record {} is not valid UTF-8.", hash))
-}
+/// The pallet rules of `@manifest`: the cell layout, the value shapes, and ownership — every
+/// cell belongs to the operator it was written by. A cell may be added only where that
+/// operator's path or id puts it, and changed or removed only by a parcel signed by the same
+/// operator.
+pub struct ManifestRules;
 
-/// Resolve a chain of subtree names from a root tree.
-fn resolve_subtree(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, String> {
-    let mut current = object_utils::load_tree(root_tree_hash)?;
+impl PalletRules for ManifestRules {
+    fn kind(&self) -> MetaKind {
+        MetaKind::Manifest
+    }
 
-    for component in path {
-        let subtree_hash = current.get_subtrees()
-            .find(|(name, _)| name == component)
-            .map(|(_, item)| item.hash.clone());
+    fn knows_schema(&self, schema: &str) -> bool {
+        ManifestKind::of_schema(schema).is_some()
+    }
 
-        match subtree_hash {
-            Some(hash) => current = object_utils::load_tree(&hash)?,
-            None => return Ok(None),
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+        let operator = change.signer.operator.as_str();
+
+        for cell in change.changes {
+            let path = parse_cell_path(&cell.path)?;
+
+            if let Some(before) = &cell.before {
+                let owner = meta_tree::parse_cell(&object_utils::load_blob(before)?.content)
+                    .ok()
+                    .and_then(|envelope| operator_of(change.office, &envelope.signer).map(str::to_string));
+
+                if owner.as_deref() != Some(operator) {
+                    return Err(format!(
+                        "the entry at {} belongs to another operator, so only they may change or remove it",
+                        cell.path
+                    ));
+                }
+            }
+
+            let Some(after) = &cell.after else { continue };
+            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+            let kind = ManifestKind::parse(path.kind).ok();
+
+            // An approval's leaf names its operator whatever schema it carries.
+            if kind == Some(ManifestKind::Approval) && path.leaf != operator_leaf(operator) {
+                return Err(format!("the approval at {} is not at its signer's own path", cell.path));
+            }
+
+            let Some(schema_kind) = ManifestKind::of_schema(&envelope.schema) else { continue };
+
+            if kind != Some(schema_kind) {
+                return Err(format!(
+                    "the cell at {} holds a {} entry under the {} directory",
+                    cell.path, schema_kind.as_str(), path.kind
+                ));
+            }
+
+            let entry = parse_value(path.subject, schema_kind, &envelope.value)
+                .map_err(|why| format!("the value at {} {}", cell.path, why))?;
+
+            if path.leaf != leaf_of(operator, &entry) {
+                return Err(format!("the entry at {} is not at the id its signer and content derive", cell.path));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `<subject>`, `<subject>/<kind>` or `<subject>/<kind>/<id>`, for a full parcel hash.
+    fn resolution_path(&self, spelled: &str) -> Result<String, String> {
+        let subject = spelled.split('/').next().unwrap_or_default();
+
+        if !object_utils::is_object_hash(subject) {
+            return Err(format!(
+                "\"{}\" does not name a subject by its full parcel hash (64 lowercase hex characters).",
+                subject
+            ));
+        }
+
+        meta_tree::validate_cell_path(spelled)?;
+
+        Ok(format!("{}/{}", &subject[..2], spelled))
+    }
+
+    fn display_path(&self, path: &str) -> String {
+        match path.split_once('/') {
+            Some((_fan, rest)) => rest.to_string(),
+            None => path.to_string(),
         }
     }
 
-    Ok(Some(current))
 }
 
-/// Serialize a manifest entry as TOML.
-fn entry_to_toml(entry: &ManifestEntry) -> String {
-    let mut doc = DocumentMut::new();
+/// Record an entry, as one signed cell edit on the local `@manifest` head. The caller holds
+/// the warehouse lock and passes the verified office.
+///
+/// # Returns
+/// * `Ok(Some(hash))` - The new head.
+/// * `Ok(None)`       - The signer had already recorded exactly this entry.
+pub fn record_entry(entry: &ManifestEntry,
+                    office: &OfficeState,
+                    actor: &Operator,
+                    description: &str,
+                    signer: &MetaSigner) -> Result<Option<String>, String> {
+    validate_entry(entry)?;
 
-    doc["subject"] = value(entry.subject.as_str());
-    doc["kind"] = value(entry.kind.as_str());
-    doc["recorded_at"] = value(entry.recorded_at);
-    doc["body"] = value(entry.body.as_str());
+    let operator = office.find_key(&signer.key_id)
+        .ok_or(format!("The signing key {} is not in the office.", signer.key_id))?
+        .operator
+        .clone();
 
-    // Provenance fields (present only on a provenance entry).
-    if let Some(provenance) = &entry.provenance {
-        doc["model"] = value(provenance.model.as_str());
+    let path = cell_path(&operator, entry);
+    let edit = meta_tree::set_cell(&path, &signer.key_id, entry.kind.schema(), &entry_value(entry))?;
 
-        if let Some(tool) = &provenance.tool {
-            doc["tool"] = value(tool.as_str());
-        }
-        if let Some(session) = &provenance.session {
-            doc["session"] = value(session.as_str());
-        }
-        if let Some(transcript) = &provenance.transcript {
-            doc["transcript"] = value(transcript.as_str());
-        }
-    }
-
-    // Delivery fields (present only on a delivery entry).
-    if let Some(delivery) = &entry.delivery {
-        doc["source"] = value(delivery.source.as_str());
-        doc["trail_head"] = value(delivery.trail_head.as_str());
-        doc["checkpoints"] = value(delivery.checkpoints);
-    }
-
-    doc.to_string()
+    meta_tree::stack_meta_edits(MANIFEST_PALLET_NAME, &ManifestRules, office, &[edit], actor, description, signer)
 }
 
-/// Parse a manifest entry from TOML.
-fn parse_entry(toml: &str) -> Result<ManifestEntry, String> {
-    let doc: DocumentMut = toml.parse()
-        .map_err(|e| format!("A manifest entry is not valid TOML: {}", e))?;
-
-    let kind = ManifestKind::parse(&office_utils::read_string(&doc, "kind", "manifest entry")?)?;
-
-    // Optional, strict (FORK-81 follow-up: the class sweep PR #122 missed): `entry_to_toml`
-    // omits `tool`/`session`/`transcript` entirely when a provenance entry carries no value for
-    // them, so an absent key legitimately means `None`. A *present* non-string value must still
-    // error rather than silently collapse to that same `None` — a query by tool (or session, or
-    // transcript) would otherwise silently miss a record that actually carries one, exactly the
-    // under-counting hazard PR #122 closed for `office_utils`. Uses the office's shared strict
-    // reader rather than a duplicated per-module `optional_string` closure with the old lenient
-    // shape.
-    let provenance = match kind {
-        ManifestKind::Provenance => Some(Provenance {
-            model: office_utils::read_string(&doc, "model", "manifest entry")?,
-            tool: office_utils::read_optional_string(&doc, "tool", "manifest entry")?,
-            session: office_utils::read_optional_string(&doc, "session", "manifest entry")?,
-            transcript: office_utils::read_optional_string(&doc, "transcript", "manifest entry")?,
-        }),
-        _ => None,
+/// Read the manifest at the local head: every entry, attributed through the office (read
+/// best-effort, so an entry whose key the local office does not know is attributed by key id),
+/// and every cell this build cannot read. An unborn manifest reads as empty.
+pub fn read_manifest() -> Result<ManifestRead, String> {
+    let Some(state) = meta_tree::read_meta_head(MANIFEST_PALLET_NAME, &ManifestRules)? else {
+        return Ok(ManifestRead::default());
     };
 
-    let delivery = match kind {
-        ManifestKind::Delivery => Some(Delivery {
-            source: office_utils::read_string(&doc, "source", "manifest entry")?,
-            trail_head: office_utils::read_string(&doc, "trail_head", "manifest entry")?,
-            checkpoints: office_utils::read_integer(&doc, "checkpoints", "delivery entry")?,
-        }),
-        _ => None,
-    };
+    let office = office_utils::read_office_state()
+        .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    Ok(ManifestEntry {
-        subject: office_utils::read_string(&doc, "subject", "manifest entry")?,
-        kind,
-        recorded_at: office_utils::read_integer(&doc, "recorded_at", "manifest entry")?,
-        body: office_utils::read_string(&doc, "body", "manifest entry")?,
-        provenance,
-        delivery,
-    })
+    let mut read = ManifestRead::default();
+
+    for (path, cell) in state.cells {
+        let parsed = parse_cell_path(&path);
+        let subject = parsed.as_ref().ok().map(|parsed| parsed.subject.to_string());
+
+        let mut unreadable = |reason: String| read.unreadable.push(UnreadableEntry {
+            subject: subject.clone(), path: path.clone(), reason,
+        });
+
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(why) => {
+                unreadable(why);
+                continue;
+            }
+        };
+
+        let envelope = match cell {
+            CellRead::Readable(envelope) => envelope,
+            CellRead::Unknown { schema, .. } => {
+                unreadable(format!("written with the schema \"{}\", which this forklift does not know", schema));
+                continue;
+            }
+            CellRead::Malformed(why) => {
+                unreadable(why);
+                continue;
+            }
+        };
+
+        // A readable schema always names a known kind (see `knows_schema`).
+        let Some(kind) = ManifestKind::of_schema(&envelope.schema) else { continue };
+
+        if parsed.kind != kind.as_str() {
+            unreadable(format!("a {} entry under the {} directory", kind.as_str(), parsed.kind));
+            continue;
+        }
+
+        match parse_value(parsed.subject, kind, &envelope.value) {
+            Ok(entry) => read.entries.push(AttributedEntry {
+                entry,
+                author: operator_of(&office, &envelope.signer).unwrap_or(&envelope.signer).to_string(),
+                signer: envelope.signer,
+            }),
+            Err(why) => unreadable(format!("the value {}", why)),
+        }
+    }
+
+    Ok(read)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn entry(subject: &str, kind: ManifestKind, body: &str) -> ManifestEntry {
+    fn subject() -> String {
+        "ab".to_string() + &"c".repeat(62)
+    }
+
+    fn entry(kind: ManifestKind, body: &str) -> ManifestEntry {
         ManifestEntry {
-            subject: subject.to_string(),
-            kind,
-            recorded_at: 100,
-            body: body.to_string(),
-            provenance: None,
-            delivery: None,
+            subject: subject(), kind, recorded_at: None, body: body.to_string(), provenance: None, delivery: None,
         }
     }
 
-    #[test]
-    fn entries_round_trip_through_toml() {
-        for kind in [ManifestKind::Note, ManifestKind::Approval] {
-            let original = entry(&"a".repeat(64), kind, "looks good");
-            let parsed = parse_entry(&entry_to_toml(&original)).unwrap();
-            assert_eq!(parsed, original);
-        }
-    }
-
-    #[test]
-    fn provenance_entries_round_trip_through_toml() {
-        let mut original = entry(&"a".repeat(64), ManifestKind::Provenance, "generated the module");
-        original.provenance = Some(Provenance {
+    fn provenance(tool: Option<&str>) -> ManifestEntry {
+        let mut entry = entry(ManifestKind::Provenance, "generated the module");
+        entry.recorded_at = Some(100);
+        entry.provenance = Some(Provenance {
             model: "claude-opus-4-8".to_string(),
-            tool: Some("claude-code".to_string()),
-            session: Some("sess-123".to_string()),
-            transcript: None, // an absent optional field must round-trip as None
-        });
-
-        let parsed = parse_entry(&entry_to_toml(&original)).unwrap();
-        assert_eq!(parsed, original);
-        assert_eq!(parsed.provenance.unwrap().model, "claude-opus-4-8");
-    }
-
-    /// The absent-key case for the two fields the round-trip test above never leaves absent:
-    /// `entry_to_toml` omits `tool` and `session` (as well as `transcript`, already covered
-    /// above) when a provenance entry carries no value for them, so a provenance entry with
-    /// none of the three present must still parse with all three `None` — the strictness fix
-    /// below must not narrow that.
-    #[test]
-    fn a_provenance_entry_with_no_optional_keys_parses_with_all_none() {
-        let mut original = entry(&"a".repeat(64), ManifestKind::Provenance, "generated the module");
-        original.provenance = Some(Provenance {
-            model: "claude-opus-4-8".to_string(),
-            tool: None,
+            tool: tool.map(str::to_string),
             session: None,
             transcript: None,
         });
 
-        let parsed = parse_entry(&entry_to_toml(&original)).expect("must still parse");
-        assert_eq!(parsed, original);
-    }
-
-    /// A minimal, otherwise-valid provenance manifest entry TOML string with one extra clause
-    /// spliced in — the shared fixture for the strictness tests below.
-    fn provenance_entry_toml(extra_clause: &str) -> String {
-        format!(
-            "subject = \"{}\"\n\
-             kind = \"provenance\"\n\
-             recorded_at = 100\n\
-             body = \"generated the module\"\n\
-             model = \"claude-opus-4-8\"\n\
-             {}",
-            "a".repeat(64),
-            extra_clause
-        )
-    }
-
-    /// FORK-81 follow-up (the class sweep PR #122 missed): a present but non-string `tool` must
-    /// error, never silently vanish from the entry the way the old `optional_string` closure's
-    /// `.and_then(as_str)` would — a query by tool would otherwise silently miss a record that
-    /// actually carries one, exactly the under-counting hazard PR #122 closed for `office_utils`.
-    #[test]
-    fn a_present_non_string_tool_in_a_provenance_entry_errors_naming_it() {
-        let toml = provenance_entry_toml("tool = 7\n");
-
-        let error = match parse_entry(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string tool value must error, not silently vanish"),
-        };
-        assert!(error.contains("\"tool\""), "the error must name the field: {}", error);
+        entry
     }
 
     #[test]
-    fn a_present_non_string_session_in_a_provenance_entry_errors_naming_it() {
-        let toml = provenance_entry_toml("session = 7\n");
+    fn every_kind_round_trips_through_its_value() {
+        let mut delivery = entry(ManifestKind::Delivery, "delivered");
+        delivery.delivery = Some(Delivery { source: "draft".to_string(), trail_head: "d".repeat(64), checkpoints: 3 });
 
-        let error = match parse_entry(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string session value must error, not silently vanish"),
-        };
-        assert!(error.contains("\"session\""), "the error must name the field: {}", error);
+        for original in [
+            entry(ManifestKind::Note, "multi\nline"),
+            entry(ManifestKind::Approval, ""),
+            provenance(Some("claude-code")),
+            provenance(None),
+            delivery,
+        ] {
+            validate_entry(&original).unwrap();
+            assert_eq!(parse_value(&subject(), original.kind, &entry_value(&original)).unwrap(), original);
+        }
     }
 
     #[test]
-    fn a_present_non_string_transcript_in_a_provenance_entry_errors_naming_it() {
-        let toml = provenance_entry_toml("transcript = 7\n");
+    fn a_value_is_parsed_strictly() {
+        let mut extra = entry_value(&entry(ManifestKind::Note, "x"));
+        extra.insert(FIELD_MODEL, value("m"));
+        let error = parse_value(&subject(), ManifestKind::Note, &extra).unwrap_err();
+        assert!(error.contains("unexpected field \"model\""), "{}", error);
 
-        let error = match parse_entry(&toml) {
-            Err(e) => e,
-            Ok(_) => panic!("a non-string transcript value must error, not silently vanish"),
-        };
-        assert!(error.contains("\"transcript\""), "the error must name the field: {}", error);
+        // A present field of the wrong type is an error, never an absence: a query by tool
+        // would otherwise miss an entry that carries one.
+        for field in [FIELD_TOOL, FIELD_SESSION, FIELD_TRANSCRIPT] {
+            let mut wrong = entry_value(&provenance(None));
+            wrong.insert(field, value(7));
+            let error = parse_value(&subject(), ManifestKind::Provenance, &wrong).unwrap_err();
+            assert!(error.contains(field) && error.contains("not a string"), "{}", error);
+        }
+
+        let mut timeless = entry_value(&provenance(None));
+        timeless.remove(FIELD_RECORDED_AT);
+        assert!(parse_value(&subject(), ManifestKind::Provenance, &timeless).is_err());
     }
 
     #[test]
-    fn entry_id_is_content_derived_and_stable() {
-        let a = entry(&"a".repeat(64), ManifestKind::Approval, "ok");
-        let same = entry(&"a".repeat(64), ManifestKind::Approval, "ok");
-        let different_body = entry(&"a".repeat(64), ManifestKind::Approval, "nope");
-        let different_kind = entry(&"a".repeat(64), ManifestKind::Note, "ok");
+    fn ids_collapse_one_writers_duplicates_and_separate_two_writers() {
+        let note = entry(ManifestKind::Note, "ok");
 
-        assert_eq!(a.id(), same.id());
-        assert_ne!(a.id(), different_body.id());
-        assert_ne!(a.id(), different_kind.id());
+        assert_eq!(entry_id("alice", &note), entry_id("alice", &note.clone()));
+        assert_ne!(entry_id("alice", &note), entry_id("bob", &note), "the writer salts the id");
+        assert_ne!(entry_id("alice", &note), entry_id("alice", &entry(ManifestKind::Note, "nope")));
+        assert_ne!(entry_id("alice", &note), entry_id("alice", &entry(ManifestKind::Approval, "ok")));
+        assert_ne!(entry_id("alice", &provenance(Some("x"))), entry_id("alice", &provenance(None)));
+
+        // An approval is one per operator, whatever it says.
+        let (approve_a, approve_b) = (entry(ManifestKind::Approval, "a"), entry(ManifestKind::Approval, "b"));
+        assert_eq!(cell_path("alice", &approve_a), cell_path("alice", &approve_b));
+        assert_ne!(cell_path("alice", &approve_a), cell_path("bob", &approve_a));
+    }
+
+    #[test]
+    fn a_cell_path_round_trips_and_nothing_else_parses() {
+        let path = cell_path("alice", &entry(ManifestKind::Note, "x"));
+        let parsed = parse_cell_path(&path).unwrap();
+        assert_eq!((parsed.subject, parsed.kind), (subject().as_str(), "note"));
+
+        for wrong in [
+            format!("ab/{}/note", subject()),
+            format!("cd/{}/note/{}", subject(), "e".repeat(64)),
+            format!("ab/{}/note/short", subject()),
+            format!("ab/{}/note/{}/deeper", subject(), "e".repeat(64)),
+        ] {
+            assert!(parse_cell_path(&wrong).is_err(), "{} must not parse", wrong);
+        }
+    }
+
+    #[test]
+    fn an_entry_without_its_kinds_details_is_refused_before_writing() {
+        let mut bare = entry(ManifestKind::Provenance, "x");
+        assert!(validate_entry(&bare).is_err());
+        bare.kind = ManifestKind::Note;
+        bare.recorded_at = Some(1);
+        assert!(validate_entry(&bare).is_err(), "only provenance carries a time");
+
+        let mut short = entry(ManifestKind::Note, "x");
+        short.subject = "abc".to_string();
+        assert!(validate_entry(&short).is_err());
     }
 }
