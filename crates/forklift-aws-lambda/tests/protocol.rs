@@ -516,6 +516,43 @@ fn kv_lifts_under_the_office_and_unknown_meta_names_are_refused() {
     assert_eq!(head.handshake().expect("handshake").pallets.get("@kv"), Some(&second));
 }
 
+/// `@haul` lifts through the content check: under the office the head holds, and never on a
+/// warehouse without one, where a working pallet would lift unaudited.
+#[test]
+fn a_haul_lifts_only_under_the_office() {
+    let area = Area::new("haul");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["palletize", "feature"]);
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "feature"]);
+    area.forklift("wh", &["haul", "open", "--target", "main", "--title", "Feature"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let hauls = harvest.head_of("@haul").expect("haul head");
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+
+    let untrusted = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&untrusted, &harvest);
+    let err = untrusted
+        .ref_update("@haul", &RefUpdateRequest { old_head: None, new_head: hauls.clone() })
+        .expect_err("a haul on a warehouse without an office");
+    assert_eq!(err.status, Status::Unprocessable);
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest);
+    head.put_trust(&harvest.trust.clone().expect("trust")).expect("put trust");
+    head.ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest { old_head: None, new_head: office_head })
+        .expect("lift office");
+    head.ref_update("@haul", &RefUpdateRequest { old_head: None, new_head: hauls.clone() })
+        .expect("lift haul under the office");
+    assert_eq!(head.handshake().expect("handshake").pallets.get("@haul"), Some(&hauls));
+}
+
 /// A `@tags` lift is checked against the office the head holds as it admits it: a tag whose
 /// tagger is an admin there is admitted, and the same tag under an office that has demoted the
 /// tagger since is refused.
