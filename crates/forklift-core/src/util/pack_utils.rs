@@ -258,8 +258,8 @@ pub struct StoreStatus {
     pub damaged_packs: Vec<PackIndexProblem>,
     /// Pack index files that could not even be parsed (FORK-47, DESIGN.html §3.1.1) — their hash
     /// set is unknown, so they are inert (never gate a read verdict) but worth fixing: move the
-    /// file aside and re-run. The exception is an index of another format version, which gates
-    /// every read it might answer (see `quarantine_reason`). Empty on a healthy store.
+    /// file aside and re-run. An index of another format version is listed in
+    /// `foreign_version_indexes` instead. Empty on a healthy store.
     pub unenumerable_indexes: Vec<PackIndexProblem>,
     /// Pack indexes written by a build with another pack format version. Unlike an unparseable
     /// file, each gates every read it might answer: such a read fails naming the version rather
@@ -513,20 +513,20 @@ mod index_format {
     /// The bytes that identify an index: its magic and its version.
     pub(super) const IDENTITY_LEN: usize = 12;
 
-    /// Versions below this are ones a build could plausibly have written; anything above it in
+    /// Versions from 1 up to this are ones a build could plausibly have written; anything else in
     /// a version field is rot, not another build.
     const PLAUSIBLE_VERSION_LIMIT: u32 = 256;
 
     /// The version of an index that carries this format's magic but another plausible version —
     /// one written by another build, which this build refuses by name. `None` for this version,
-    /// for a version field too large to be anything but corruption, and for anything without the
-    /// magic.
+    /// for a version field that can only be corruption (zero, or too large), and for anything
+    /// without the magic.
     pub(super) fn foreign_version(bytes: &[u8]) -> Option<u32> {
         if bytes.len() < IDENTITY_LEN || &bytes[0..8] != PACK_INDEX_MAGIC {
             return None;
         }
         Some(read_u32_le(bytes, 8))
-            .filter(|version| *version != PACK_FORMAT_VERSION && *version < PLAUSIBLE_VERSION_LIMIT)
+            .filter(|version| *version != PACK_FORMAT_VERSION && (1..PLAUSIBLE_VERSION_LIMIT).contains(version))
     }
 
     /// The error for a bucket of the index at `path` that failed validation.
@@ -635,7 +635,7 @@ mod index_format {
                     path.to_string_lossy(), version, PACK_FORMAT_VERSION
                 ));
             }
-            if bytes.len() < HEADER_LEN || &bytes[0..8] != PACK_INDEX_MAGIC {
+            if bytes.len() < HEADER_LEN || &bytes[0..8] != PACK_INDEX_MAGIC || read_u32_le(bytes, 8) != PACK_FORMAT_VERSION {
                 return Err(corrupt());
             }
 
@@ -7340,6 +7340,19 @@ mod tests {
         rotted[8..12].copy_from_slice(&0x0100_0003u32.to_le_bytes());
         assert_eq!(index_format::foreign_version(&rotted), None);
         assert_eq!(index_format::foreign_version(&old_index), Some(2));
+        // Nor is a zeroed one, which no build ever wrote. And a well-formed index carrying either
+        // version, its header crc intact, is refused as corrupt rather than read as version 3.
+        for version in [0u32, 0x0100_0003] {
+            let mut index = build_index_bytes(&[]);
+            index[8..12].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(index_format::foreign_version(&index), None, "version {version}");
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&index[..20]);
+            crc.update(&index[24..]);
+            index[20..24].copy_from_slice(&crc.finalize().to_le_bytes());
+            let refused = index_format::Layout::parse(&index, Path::new("v.idx")).err();
+            assert!(refused.is_some_and(|error| error.contains("is corrupt")), "version {version}");
+        }
         assert_eq!(census.foreign_version_indexes.len(), 1);
         assert!(census.foreign_version_indexes[0].error.contains("format version 2"), "{}", census.foreign_version_indexes[0].error);
 
