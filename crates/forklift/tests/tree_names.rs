@@ -261,6 +261,15 @@ fn a_top_level_name_this_volume_resolves_to_the_metadata_folder_is_not_loaded() 
         .output()
         .unwrap();
 
+    // A parcel naming the alias is refused up front, by that name, before anything trips over the
+    // entry it opens.
+    warehouse.craft_pallet(|blob| vec![subtree("meta~1", blob)]);
+    let shifted = run(&["shift", "evil"]);
+    let stderr = String::from_utf8_lossy(&shifted.stderr);
+    assert!(!shifted.status.success(), "shift accepted the alias; stderr: {}", stderr);
+    assert!(stderr.contains("\"meta~1\", which is the warehouse's metadata"),
+        "the refusal must name the alias as the metadata folder; stderr: {}", stderr);
+
     let refused = run(&["load", "meta~1"]);
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(!refused.status.success(), "the alias was loaded; stderr: {}", stderr);

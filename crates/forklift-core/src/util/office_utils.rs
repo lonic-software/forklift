@@ -495,7 +495,8 @@ pub fn opens_metadata_folder(name: &str) -> bool {
 }
 
 /// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with
-/// [`is_metadata_folder_name`].
+/// [`opens_metadata_folder`], so a short name the volume resolves to the metadata folder is refused
+/// by name here rather than left to whatever later check trips over the folder it opens.
 ///
 /// # Arguments
 /// * `root` - The root tree to check.
@@ -506,7 +507,7 @@ pub fn opens_metadata_folder(name: &str) -> bool {
 pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
     let found = root.get_subtrees().chain(root.get_files())
         .map(|(name, _)| name)
-        .find(|name| is_metadata_folder_name(name));
+        .find(|name| opens_metadata_folder(name));
 
     match found {
         Some(name) => Err(format!(
