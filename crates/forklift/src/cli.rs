@@ -1285,8 +1285,7 @@ pub enum HaulAction {
     /// Propose the source pallet's current head
     #[command(
         long_about = "Move an open haul to the source pallet's current head. Only the haul's opener \
-                      moves it, and only forward: the new head must descend from the haul's current \
-                      one. Reviews record the head they reviewed, so a review of an earlier head stays \
+                      moves it; a rewound or rebased source moves the haul with it. Reviews record the head they reviewed, so a review of an earlier head stays \
                       listed but no longer counts as an approval of the haul."
     )]
     Update {

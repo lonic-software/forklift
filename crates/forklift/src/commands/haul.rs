@@ -119,8 +119,8 @@ fn find_open(id: &str, action: &str) -> Result<Haul, String> {
     }
 }
 
-/// Propose the source pallet's current head. Reviews of the earlier head stay recorded, but no
-/// longer count for the haul.
+/// Propose the source pallet's current head, whatever it is — a rewound or rebased source moves
+/// the haul with it. Reviews of the earlier head stay recorded, but no longer count for the haul.
 fn update(id: &str) -> Result<(), String> {
     let haul = find_open(id, "updated")?;
 
@@ -132,19 +132,12 @@ fn update(id: &str) -> Result<(), String> {
     if haul.opened.opener != haul_utils::signing_operator(&office, &signer)? {
         return Err(format!(
             "Haul {} was opened by {}; only its opener updates its head.",
-            haul.id, haul.opened.opener
+            short(&haul.id), haul.opened.opener
         ));
     }
 
-    if head != haul.head && !merge_utils::is_ancestor(&haul.head, &head)? {
-        return Err(format!(
-            "The head of \"{}\" no longer descends from the haul's head {}; a haul's head only \
-            moves forward.",
-            haul.opened.source, haul.head
-        ));
-    }
-
-    let changed = haul_utils::record_head(&haul.id, &head, &office, &actor, &signer)?.is_some();
+    let changed = haul_utils::record_state(&haul.id, &HaulStatus::Open, &head, "Updated", &office, &actor, &signer)?
+        .is_some();
 
     output::emit(&Updated { id: haul.id, head, changed });
 
@@ -196,7 +189,8 @@ fn set_status(id: &str, status: HaulStatus) -> Result<(), String> {
     }
 
     let (office, actor, signer) = signing()?;
-    haul_utils::record_status(&haul.id, &status, &office, &actor, &signer)?;
+    let action = if status == HaulStatus::Closed { "Closed" } else { "Reopened" };
+    haul_utils::record_state(&haul.id, &status, &haul.head, action, &office, &actor, &signer)?;
 
     output::emit(&Acted {
         id: haul.id,
@@ -210,7 +204,10 @@ fn set_status(id: &str, status: HaulStatus) -> Result<(), String> {
 async fn merge(id: &str) -> Result<(), String> {
     let haul = find_open(id, "merged")?;
     let (office, actor, signer) = signing()?;
-    let record = |parcel: &str| haul_utils::record_status(&haul.id, &HaulStatus::Merged(parcel.to_string()), &office, &actor, &signer);
+    // The merge is recorded at the head it merged, in the one cell a concurrent update writes.
+    let record = |parcel: &str| haul_utils::record_state(
+        &haul.id, &HaulStatus::Merged(parcel.to_string()), &haul.head, "Merged", &office, &actor, &signer,
+    );
 
     // The merge lands on the target pallet, so it must be the current one.
     let current = pallet_utils::get_current_pallet_name()?;

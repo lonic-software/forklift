@@ -787,8 +787,8 @@ lifts/lowers/franchises with your warehouse, and a diverged `@haul` replays your
 the remote's like the other meta pallets. Because every cell is signed, authorship —
 **including who approved** — is forge-proof and carries the reviewer's identity class, so a
 human's approval is distinguishable from an agent's (`haul show` tags automated reviewers).
-Only the haul's opener runs `haul update`, and only forward: the source's head must descend from
-the haul's. A review records the head it reviewed: after `haul update` moves the haul to new work, an
+Only the haul's opener runs `haul update`; a rewound or rebased source moves the haul with it. A
+review records the head it reviewed: after `haul update` moves the haul to new work, an
 earlier approval is still shown, marked with the head it was of, but no longer counts. A merged
 haul stays merged — no one can reopen or close it, on any head. `merge` reuses
 `consolidate` (a clean disjoint merge auto-stacks; a conflict leaves the consolidation in
