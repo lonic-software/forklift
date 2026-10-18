@@ -15,6 +15,7 @@ use crate::traits::task_context::TaskContext;
 use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
+use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 
 /// The metadata entry used for the warehouse root (its key is the empty string,
 /// which would be confusing as a line in the metadata file).
@@ -1732,27 +1733,16 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     result
 }
 
-/// A single read-and-parse pass over every registered inventory shard.
+/// One read-and-parse pass over the inventory shards a tree build can need.
 ///
-/// Built once per `stack` (`prepare_stack_inventory`) and shared by three steps that used to
-/// each read+parse the whole shard set independently — `has_conflict_entries`, the tree build
-/// and `cleanup_after_stack` (§ perf: on a large tree this was three full O(shard count) passes
-/// over the same on-disk state per stacked parcel). See
-/// `stack_utils::stack_parcel`: it builds this once, checks conflicts on it (still strictly
-/// before any warehouse mutation — parse-then-check-then-write is preserved), threads it into
-/// the tree build, and reuses it again for the post-stack cleanup's rewrite decision.
+/// Built once per `stack` (`prepare_stack_inventory`) and shared by the three steps that used to
+/// each read the whole shard set on their own: the conflict check, the tree build and
+/// [`cleanup_after_stack_with`]. `park` push (`park::park_changes`) builds its own, single-use one,
+/// because `build_tree_from_inventory_deferred` reads shard content from it. Both check
+/// [`has_conflict_entries_in`] on it before anything consumes `shards`.
 ///
-/// `park` push (`park::park_changes`, DESIGN.html §5.0 D item 10, finding #3) also builds one now
-/// — its own, single-use snapshot (it has no second or third step to share it with, unlike
-/// `stack`) — for the same reason: `build_tree_from_inventory_deferred` needs a
-/// `PreparedInventory` to read shard content from. `park` checks `has_conflict_entries_in` on its
-/// own snapshot immediately after building it, exactly like `stack_parcel` does, before the
-/// snapshot's possibly-incomplete `shards` map (see below) is ever consumed by the tree build.
-///
-/// Held only for the duration of one `stack_parcel` (or `park_changes`) call — the same
-/// transient window the tree build's own parallel read pass already held the parsed shards for,
-/// so peak memory retention is unchanged (this does not hold anything longer than the code
-/// already did; it just stops re-reading and re-parsing the same bytes two more times).
+/// A shard strictly beneath a skip root of `skip` is never read (see [`prepare_stack_inventory`]),
+/// so `shards` covers only the part of the tree that can differ from head.
 pub struct PreparedInventory {
     /// `None` when there is no inventory metadata file at all (nothing was ever loaded).
     /// `Some` (possibly empty) mirrors the metadata file's own registered directory keys —
@@ -1761,100 +1751,249 @@ pub struct PreparedInventory {
     /// `cleanup_after_stack_with`'s early return when there was never a file to rewrite).
     pub metadata: Option<BTreeSet<String>>,
 
-    /// Every registered directory's parsed inventory, keyed by its warehouse path key. A key
-    /// present in `metadata` but absent here means its shard file could not be found on disk
-    /// (a stale metadata entry) — every original caller silently skips such an entry, and so
-    /// does everything built on this snapshot.
+    /// Every parsed shard, keyed by its warehouse path key. A registered key outside
+    /// `skip.pruned` and absent here has no shard file on disk (a stale metadata entry), and every
+    /// consumer treats it as empty. A key in `skip.pruned` other than a skip root is absent
+    /// because it was never read.
     ///
-    /// Incomplete (missing entries for keys past the one that tripped it) when `has_conflict` is
-    /// `true` — see [`prepare_stack_inventory`]'s doc comment. Harmless: `stack_parcel` aborts on
-    /// a conflict before this is ever consulted again.
+    /// Incomplete when `has_conflict` is `true` (see [`prepare_stack_inventory`]). Harmless: both
+    /// callers refuse on a conflict before this is consulted again.
     pub shards: BTreeMap<String, Inventory>,
 
-    /// Whether a conflict entry (an unresolved consolidation) was found while parsing. Set — and
-    /// the scan stopped — at the *first* shard (in sorted key order) found to have one; see
-    /// [`prepare_stack_inventory`]'s doc comment for why.
+    /// Whether a conflict entry (an unresolved consolidation) was found while parsing. Set at the
+    /// *first* read shard, in sorted key order, found to have one.
     pub has_conflict: bool,
+
+    /// Which subtrees the rollup skip proved unchanged from head. Empty without a head, with the
+    /// kill switch set, or when no rollup matched.
+    pub skip: RollupSkipPlan,
 }
 
-/// Read the inventory metadata file and parse every registered shard exactly once. See
-/// [`PreparedInventory`] for why (`stack` used to pay this read+parse cost three times per
-/// parcel).
+/// The subtrees a [`PreparedInventory`] proved unchanged from head, because each one's shard
+/// carries a rollup equal to the head subtree hash at its key. The tree build never reads, hashes
+/// or stores them, and `stack`'s cleanup leaves their shards as they sit.
+#[derive(Default)]
+pub struct RollupSkipPlan {
+    /// Set only when the *entire* staged tree is provably unchanged from head (a fully scoped
+    /// bay's root rollup matches the head root tree hash): every registered key is in `pruned`.
+    pub whole_tree_hash: Option<String>,
+
+    /// Every skip root and every key beneath one, ancestors-only keys included.
+    pub pruned: BTreeSet<String>,
+
+    /// For each *unpruned* directory key, the `(name, head_hash)` pairs of its immediate children
+    /// that are skip roots, added to that directory's tree by hash.
+    pub injections: BTreeMap<String, Vec<(String, String)>>,
+}
+
+/// Read the inventory metadata file and parse every shard a tree build against `skip`'s head can
+/// need, each exactly once.
 ///
-/// The read-and-parse work itself is fanned out across every core (DESIGN.html §5.0 D item 10,
-/// finding #5) — [`fanout_utils::fanout_map`], order-independent I/O plus CPU-bound parsing over
-/// a flat, already-collected key list. `park` push (`park::park_changes`) is the reason this
-/// matters here specifically: before it was switched onto this shared snapshot, its own tree
-/// build read every shard from inside its own per-directory `TaskExecutor` task, in parallel; a
-/// serial `prepare_stack_inventory` would have been a straight N-core-to-1-core regression on
-/// that read phase for a caller (`park`) that has no second or third step to amortize the serial
-/// cost against, unlike `stack`.
+/// **What is read.** With `skip` `Some((head_root_tree_hash, scope))` and the rollup skip enabled,
+/// the read walks the tree top-down, one depth at a time (each depth fanned out across every core
+/// with [`fanout_utils::fanout_map`]). A shard whose rollup equals the head subtree hash at its key
+/// becomes a skip root, and nothing beneath it is read: the shard-mutation funnel
+/// ([`write_shard_mutation`]) clears the rollup of a shard and of every ancestor before it writes
+/// any change of content (an entry's name, type, hash or state), so a matching rollup proves that
+/// no shard beneath it holds a staged change, a staged removal or a conflict entry. A shard
+/// beneath a skip root that would not parse is therefore not reported either: its content is not
+/// needed, and nothing reads it. A skip root is only taken where its parent is fully in scope —
+/// see the scoped-bay caveat below. Without `skip`, or with the kill switch set
+/// (`FORKLIFT_DISABLE_ROLLUP_SKIP`), every registered shard is read.
 ///
-/// What is *not* parallelized: the observable "first conflict, or first parse error, in sorted
-/// key order wins" priority the old serial loop gave (and `has_conflict_entries` below still
-/// gives, unchanged) — a real, actionable conflict in an earlier shard must never be masked by an
-/// unrelated corrupt shard later in the set reporting its parse error instead. That is preserved
-/// by processing every shard's result (already computed, off the lock, by the parallel pass
-/// above) in one final sorted-order fold that stops at the first anomaly, exactly reproducing the
-/// old loop's byte-for-byte reported error and `has_conflict`/`shards` result — the trade is that
-/// every shard is now read and parsed even when an early conflict exists (the old loop stopped
-/// there), instead of only the ones up to and including it. Conflicts are rare — a mid-merge
-/// state, not the common path — so this trade is a clear win on the path this fix exists for.
+/// **Scoped-bay caveat.** The outermost in-scope boundary directory (whose parent is `Spine`) is
+/// never a skip root: a scoped stack's spine splice (`tree_utils::build_scoped_root_tree`) later
+/// re-visits exactly that directory as an opaque `TreeItem` and prunes it if it reads as empty,
+/// which a hash-only stand-in would, silently dropping a real subtree from the signed tree. A
+/// scoped bay's root is `Spine` itself, so the whole-tree skip applies to a full bay only.
+///
+/// **Priority.** The first conflict or parse error, in sorted key order over the shards read,
+/// wins: a real conflict in an earlier shard is never masked by an unrelated corrupt shard later
+/// in the set. Every shard is read before that fold runs, so an early conflict does not stop the
+/// reads.
+///
+/// # Arguments
+/// * `skip` - `Some((head_root_tree_hash, scope))` to skip the subtrees whose rollup matches that
+///            head; `None` (no head yet) to read every registered shard.
 ///
 /// # Returns
 /// * `Ok(PreparedInventory)` - The snapshot (empty when there is nothing staged; incomplete, with
-///                             `has_conflict` set, when a conflict was found and the scan
-///                             stopped there).
-/// * `Err(String)`           - If the metadata file, or a shard at or before the first conflict in
-///                             sorted key order, could not be read or parsed.
-pub fn prepare_stack_inventory() -> Result<PreparedInventory, String> {
+///                             `has_conflict` set, when a conflict was found).
+/// * `Err(String)`           - If the metadata file, a head tree on the walk, or a read shard at
+///                             or before the first conflict in sorted key order could not be
+///                             read or parsed.
+pub fn prepare_stack_inventory(skip: Option<(&str, &MaterializationScope)>) -> Result<PreparedInventory, String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
     let Some(metadata) = metadata_opt else {
-        return Ok(PreparedInventory { metadata: None, shards: BTreeMap::new(), has_conflict: false });
+        return Ok(PreparedInventory {
+            metadata: None, shards: BTreeMap::new(), has_conflict: false, skip: RollupSkipPlan::default(),
+        });
     };
 
-    let keys: Vec<String> = metadata.iter().map(|entry| metadata_entry_to_key(entry).to_string()).collect();
+    let registered: BTreeSet<&str> = metadata.iter().map(|entry| metadata_entry_to_key(entry)).collect();
 
-    let parsed: Vec<Result<Option<(Inventory, bool)>, String>> = fanout_utils::fanout_map(&keys, |key| {
-        let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+    let mut parsed: BTreeMap<String, Result<Option<(Inventory, bool)>, String>> = BTreeMap::new();
+    let mut plan = RollupSkipPlan::default();
 
-        let Some(bytes) = bytes_opt else { return Ok(None); };
+    match skip.filter(|_| rollup_skip_enabled()) {
+        None => {
+            let keys: Vec<&str> = registered.iter().copied().collect();
+            for (key, result) in keys.iter().zip(fanout_utils::fanout_map(&keys, |key| read_stack_shard(key))) {
+                parsed.insert(key.to_string(), result);
+            }
+        }
+        Some((head_root_tree_hash, scope)) => {
+            read_unskipped_shards(&metadata, &registered, head_root_tree_hash, scope, &mut parsed, &mut plan)?;
+        }
+    }
 
-        let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
-            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
-
-        let has_conflict = inventory.get_items().any(|(_, item)| matches!(
-            item.state,
-            InventoryItemState::FirstParentConflict
-                | InventoryItemState::SecondParentConflict
-                | InventoryItemState::ThirdParentConflict
-        ));
-
-        Ok(Some((inventory, has_conflict)))
-    });
-
-    // The deterministic fold: `parsed` is positionally aligned with `keys` (`fanout_map`'s own
-    // contract), which is already in sorted key order (`metadata` is a `BTreeSet`) — so walking
-    // it in this order and stopping at the first `Err` or conflict reproduces the old serial
-    // loop's exact priority, whatever order the parallel workers actually finished in.
+    // The deterministic fold: `parsed` is a `BTreeMap`, so walking it stops at the first `Err` or
+    // conflict in sorted key order, whatever order the parallel workers finished in.
     let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
 
-    for (key, result) in keys.iter().zip(parsed) {
+    for (key, result) in parsed {
         match result {
             Ok(None) => {}
             Ok(Some((inventory, has_conflict))) => {
-                shards.insert(key.clone(), inventory);
+                shards.insert(key, inventory);
 
                 if has_conflict {
-                    return Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: true });
+                    return Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: true, skip: plan });
                 }
             }
             Err(e) => return Err(e),
         }
     }
 
-    Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: false })
+    Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: false, skip: plan })
+}
+
+/// Read and parse one registered shard for [`prepare_stack_inventory`], noting whether it holds a
+/// conflict entry. `Ok(None)` when the shard file does not exist.
+fn read_stack_shard(key: &str) -> Result<Option<(Inventory, bool)>, String> {
+    let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+    let Some(bytes) = bytes_opt else { return Ok(None); };
+
+    let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
+
+    let has_conflict = inventory.get_items().any(|(_, item)| matches!(
+        item.state,
+        InventoryItemState::FirstParentConflict
+            | InventoryItemState::SecondParentConflict
+            | InventoryItemState::ThirdParentConflict
+    ));
+
+    Ok(Some((inventory, has_conflict)))
+}
+
+/// The top-down walk behind [`prepare_stack_inventory`]'s skip: read one depth of the tree at a
+/// time, decide which of its keys are skip roots, and descend only into the rest.
+fn read_unskipped_shards(metadata: &BTreeSet<String>,
+                         registered: &BTreeSet<&str>,
+                         head_root_tree_hash: &str,
+                         scope: &MaterializationScope,
+                         parsed: &mut BTreeMap<String, Result<Option<(Inventory, bool)>, String>>,
+                         plan: &mut RollupSkipPlan) -> Result<(), String> {
+    // Every registered key plus all of its ancestors (an ancestor may have no shard of its own),
+    // and the parent → children relation over them, exactly as the tree build derives it.
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut known: BTreeSet<&str> = BTreeSet::new();
+
+    for entry in metadata {
+        let mut key = metadata_entry_to_key(entry);
+
+        while !key.is_empty() && known.insert(key) {
+            let parent = key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).map(|(parent, _)| parent).unwrap_or("");
+            children.entry(parent).or_default().push(key);
+            key = parent;
+        }
+    }
+
+    let scope_is_full = scope.is_full();
+    let in_scope = |key: &str| scope_is_full || scope.classify(key) == ScopeClass::InScope;
+
+    // (key, the head subtree hash at key if head has a subtree there, whether key's parent is
+    // fully in scope). The root has no parent: a whole-tree skip needs a full bay instead.
+    let mut frontier: Vec<(&str, Option<String>, bool)> =
+        vec![("", Some(head_root_tree_hash.to_string()), scope_is_full)];
+
+    while !frontier.is_empty() {
+        let to_read: Vec<&str> = frontier.iter().map(|(key, _, _)| *key).filter(|key| registered.contains(key)).collect();
+
+        for (key, result) in to_read.iter().zip(fanout_utils::fanout_map(&to_read, |key| read_stack_shard(key))) {
+            parsed.insert(key.to_string(), result);
+        }
+
+        // Keys the walk descends below, with their head subtree hash.
+        let mut descend: Vec<(&str, Option<String>)> = Vec::new();
+
+        for (key, head_hash, parent_in_scope) in frontier {
+            let rollup = match parsed.get(key) {
+                Some(Ok(Some((inventory, _)))) => inventory.get_rollup_hash().cloned(),
+                _ => None,
+            };
+
+            if let (true, Some(head_hash), Some(rollup)) = (parent_in_scope, &head_hash, &rollup) {
+                if rollup == head_hash {
+                    prune_keys_under(key, &children, &mut plan.pruned);
+                    record_rollup_skip();
+
+                    if key.is_empty() {
+                        plan.whole_tree_hash = Some(rollup.clone());
+                        return Ok(());
+                    }
+
+                    let (parent, name) = key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).unwrap_or(("", key));
+                    plan.injections.entry(parent.to_string()).or_default().push((name.to_string(), rollup.clone()));
+                    continue;
+                }
+            }
+
+            if children.contains_key(key) {
+                descend.push((key, head_hash));
+            }
+        }
+
+        // The head trees of one level load in parallel, so a stack that prunes nothing (every
+        // rollup cleared) costs a parallel pass per level rather than one serial load per key.
+        let head_trees = fanout_utils::fanout_map(&descend, |(_, head_hash)| match head_hash {
+            Some(hash) => object_utils::load_tree_shared(hash).map(Some),
+            None => Ok(None),
+        });
+        let mut next = Vec::new();
+
+        for ((key, _), head_tree) in descend.iter().zip(head_trees) {
+            let head_tree = head_tree?;
+            let head_subtrees: BTreeMap<&str, &str> = match &head_tree {
+                Some(tree) => tree.get_subtrees().map(|(name, item)| (name.as_str(), item.hash.as_str())).collect(),
+                None => BTreeMap::new(),
+            };
+            let key_in_scope = in_scope(key);
+
+            for &child_key in &children[key] {
+                let child_name = child_key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).map(|(_, name)| name).unwrap_or(child_key);
+                next.push((child_key, head_subtrees.get(child_name).map(|hash| hash.to_string()), key_in_scope));
+            }
+        }
+
+        frontier = next;
+    }
+
+    Ok(())
+}
+
+/// Add `key` and every key beneath it (through `children`) to `pruned`.
+fn prune_keys_under(key: &str, children: &BTreeMap<&str, Vec<&str>>, pruned: &mut BTreeSet<String>) {
+    pruned.insert(key.to_string());
+
+    if let Some(child_keys) = children.get(key) {
+        for child_key in child_keys {
+            prune_keys_under(child_key, children, pruned);
+        }
+    }
 }
 
 /// Check whether any inventory entry is in a conflict state (an unresolved consolidation).
@@ -2124,53 +2263,43 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
     Ok(())
 }
 
-/// Clean up the staged state after a parcel was stacked: the parcel consumed every staged
-/// removal, so `Deleted` entries are dropped from their shards, and the shards of
-/// directories that no longer exist in the working directory are removed entirely
-/// (together with their metadata entries).
+/// Clean up the staged state after a parcel was stacked, so the inventory describes exactly the
+/// tree that parcel recorded: the parcel consumed every staged removal, so `Deleted` entries are
+/// dropped from their shards, and a key with nothing left (no surviving entry of its own and no
+/// surviving registered key beneath it) is unregistered and its shard folder removed.
 ///
-/// Reuses an already-parsed [`PreparedInventory`] snapshot — the same one `stack` used for its
-/// conflict check and tree build — instead of reading and parsing every shard a third time (§
-/// perf; see [`PreparedInventory`]). The snapshot was taken before `stack` wrote anything, but
-/// nothing between then and this call mutates a shard's *content* on disk (tree/parcel objects,
-/// the pallet ref and the signature sidecar are the only writes stacking does before this point,
-/// none of them touch an inventory shard), so reusing it here produces exactly the same result
-/// as a fresh read would. The directory-existence checks below are unaffected — they always
-/// read the working directory fresh.
+/// Whether a key goes is decided from the inventory alone, never from the working directory. A
+/// directory deleted from disk without a `load` is still in the parcel just stacked, so its shard
+/// stays, and `stocktake` keeps reporting the removal as not yet loaded. Deciding from the disk
+/// instead would drop that shard after the parcel recorded its content, and the next `stack`
+/// would then commit a removal nobody staged.
 ///
-/// After a stack, staged state *is* the new head — so every surviving shard's rollup ends up in
+/// Reuses the [`PreparedInventory`] snapshot `stack` built before writing anything. Nothing
+/// between then and this call changes a shard's content on disk (stacking writes only
+/// tree/parcel objects, the pallet ref and the signature sidecar before this point), so reusing it
+/// produces exactly what a fresh read would.
+///
+/// After a stack, staged state *is* the new head, so every surviving shard's rollup ends up in
 /// one of three states:
 ///  * **Stamp** — `key` is in `stamp_hashes`: rewrite it with the just-built subtree hash from
 ///    the same tree build `stack` just ran.
-///  * **Untouched** — `key` is in `untouched_keys` (a rollup-skipped subtree `stack`'s tree
-///    build never even read): its on-disk rollup already names the right tree (that is *why* it
-///    was skipped) and its staged state provably did not change this stack, so it is left
-///    exactly as it sits — no read beyond the [`PreparedInventory`] snapshot already parsed
-///    up front, no write.
+///  * **Untouched** — `key` is in `prepared.skip.pruned` (a skip root or a key beneath one): its
+///    on-disk rollup already names the right tree (that is *why* it was skipped), and the funnel
+///    guarantees it holds no staged removal, so it is left exactly as it sits, unread.
 ///  * **Clear** — everything else (a key in neither set: an out-of-scope/spine shard in a
-///    scoped bay, or a genuinely empty subtree): stamped `None` instead of guessed, exactly as
-///    before stage 2 existed.
-///
-/// A key that is in `untouched_keys` but unexpectedly still carries a staged removal (the
-/// invariant `write_shard_mutation` maintains — a pending `Deleted` entry always clears its own
-/// rollup, so a shard with one still staged could never have had a rollup for the skip to have
-/// matched on in the first place — is violated) falls through to the normal stamp-or-clear
-/// handling below instead of being silently trusted.
+///    scoped bay, or a genuinely empty subtree): stamped `None` instead of guessed.
 ///
 /// # Arguments
-/// * `prepared`       - The snapshot from [`prepare_stack_inventory`].
-/// * `stamp_hashes`   - Warehouse path key → the subtree hash `stack` just built there. Trusted
-///                      for every key it names (see `stack_utils::stack_parcel`, which omits any
-///                      key a scoped bay's spine splice could have changed).
-/// * `untouched_keys` - Warehouse path keys `stack`'s tree build proved unchanged and skipped
-///                      entirely (a rollup-skipped subtree's root and every descendant).
+/// * `prepared`     - The snapshot from [`prepare_stack_inventory`].
+/// * `stamp_hashes` - Warehouse path key → the subtree hash `stack` just built there. Trusted
+///                    for every key it names (see `stack_utils::stack_parcel`, which omits any
+///                    key a scoped bay's spine splice could have changed).
 ///
 /// # Returns
 /// * `Ok(())`      - If the cleanup completed.
 /// * `Err(String)` - If a shard could not be written, or a folder could not be removed.
 pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
-                                stamp_hashes: &BTreeMap<String, String>,
-                                untouched_keys: &BTreeSet<String>) -> Result<(), String> {
+                                stamp_hashes: &BTreeMap<String, String>) -> Result<(), String> {
     let Some(metadata) = &prepared.metadata else {
         return Ok(());
     };
@@ -2185,48 +2314,52 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
     // few lost skips next time, never a wrong one.
     let batch = file_utils::WriteBatch::new();
 
-    for entry in metadata {
+    // Deepest first, so every key beneath `key` is decided before `key` itself.
+    for entry in metadata.iter().rev() {
         let key = metadata_entry_to_key(entry);
 
-        let dir_path = if key.is_empty() {
-            Path::new(".").to_path_buf()
-        } else {
-            std::path::PathBuf::from(key)
-        };
-
-        if !dir_path.is_dir() {
-            // The directory is gone from the working tree, and the parcel that was just
-            // stacked recorded its removal; its shard has served its purpose.
-            let folder = file_utils::get_inventory_folder_for_key(key);
-
-            // A parent directory earlier in the (sorted) set may have removed this folder.
-            if folder.exists() {
-                std::fs::remove_dir_all(&folder).map_err(|e|
-                    format!("Error while removing the inventory of folder \"{}\": {}", key, e)
-                )?;
-            }
-
-            removed_keys.insert(key.to_string());
+        if prepared.skip.pruned.contains(key) {
             continue;
         }
 
-        let Some(inventory) = prepared.shards.get(key) else {
+        let inventory = prepared.shards.get(key);
+        let has_survivor = inventory.is_some_and(|inventory| inventory.get_items()
+            .any(|(_, item)| item.state != InventoryItemState::Deleted));
+
+        if !key.is_empty() && !has_survivor {
+            let prefix = format!("{}/", key);
+            let has_registered_descendant = metadata.range(prefix.clone()..)
+                .take_while(|other| other.starts_with(&prefix))
+                .any(|other| !removed_keys.contains(metadata_entry_to_key(other)));
+
+            if !has_registered_descendant {
+                // Every key beneath this one is already removed, so the whole folder can go.
+                let folder = file_utils::get_inventory_folder_for_key(key);
+
+                if folder.exists() {
+                    std::fs::remove_dir_all(&folder).map_err(|e|
+                        format!("Error while removing the inventory of folder \"{}\": {}", key, e)
+                    )?;
+                }
+
+                removed_keys.insert(key.to_string());
+                continue;
+            }
+        }
+
+        let Some(inventory) = inventory else {
             continue;
         };
 
         let has_staged_removals = inventory.get_items()
             .any(|(_, item)| item.state == InventoryItemState::Deleted);
 
-        if untouched_keys.contains(key) && !has_staged_removals {
-            continue;
-        }
-
         let target_rollup = stamp_hashes.get(key).cloned();
 
-        // A rewrite is needed either to drop the now-consumed `Deleted` entries (unchanged
-        // behavior — dropping them never changes the tree `stack` already built, since the tree
-        // build itself excludes `Deleted` entries) or, even with nothing to drop, purely to
-        // stamp a rollup this shard did not already carry.
+        // A rewrite is needed either to drop the now-consumed `Deleted` entries (dropping them
+        // never changes the tree `stack` already built, since the tree build itself excludes
+        // `Deleted` entries) or, even with nothing to drop, purely to stamp a rollup this shard
+        // did not already carry.
         if has_staged_removals || inventory.get_rollup_hash() != target_rollup.as_ref() {
             let mut rebuilt = Inventory::new();
 
@@ -2258,28 +2391,6 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
     }
 
     batch.finish()?;
-
-    // A key registered only as the ancestor of tracked content has no shard of its own. Once
-    // that content is gone (its own keys removed above, or never more than a single file's
-    // parent), the key would otherwise stay registered, and so tracked, for good: an ignore rule
-    // could never cover the folder again. Deepest first, so a chain of such ancestors goes in
-    // one pass.
-    for key in metadata.iter().rev() {
-        let key = metadata_entry_to_key(key);
-
-        if key.is_empty() || removed_keys.contains(key) || prepared.shards.contains_key(key) {
-            continue;
-        }
-
-        let prefix = format!("{}/", key);
-        let has_registered_descendant = metadata.range(prefix.clone()..)
-            .take_while(|other| other.starts_with(&prefix))
-            .any(|other| !removed_keys.contains(metadata_entry_to_key(other)));
-
-        if !has_registered_descendant {
-            removed_keys.insert(key.to_string());
-        }
-    }
 
     update_inventory_metadata(&BTreeSet::new(), &removed_keys)
 }
@@ -3016,7 +3127,7 @@ mod tests {
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
-        let prepared = prepare_stack_inventory()
+        let prepared = prepare_stack_inventory(None)
             .expect("the conflict in \"aaa\" must be reported, not \"zzz\"'s parse error");
 
         assert!(prepared.has_conflict, "the conflict found while scanning must be recorded");
@@ -3049,7 +3160,7 @@ mod tests {
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
-        let error = match prepare_stack_inventory() {
+        let error = match prepare_stack_inventory(None) {
             Ok(_) => panic!("a corrupt shard must still fail the scan"),
             Err(message) => message,
         };
@@ -3387,12 +3498,12 @@ mod tests {
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
-        let prepared = prepare_stack_inventory().unwrap();
+        let prepared = prepare_stack_inventory(None).unwrap();
 
         let mut stamp_hashes: BTreeMap<String, String> = BTreeMap::new();
         stamp_hashes.insert("".to_string(), "fresh-rollup".to_string());
 
-        cleanup_after_stack_with(&prepared, &stamp_hashes, &BTreeSet::new()).unwrap();
+        cleanup_after_stack_with(&prepared, &stamp_hashes).unwrap();
 
         // The stamp itself must still take effect — this test is about the mtime, not about
         // whether the rewrite happens at all.
@@ -3429,11 +3540,11 @@ mod tests {
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
-        let prepared = prepare_stack_inventory().unwrap();
+        let prepared = prepare_stack_inventory(None).unwrap();
 
         // No stamp target at all — the rewrite is triggered purely by the staged `Deleted`
         // entry that needs dropping, not by a rollup mismatch.
-        cleanup_after_stack_with(&prepared, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        cleanup_after_stack_with(&prepared, &BTreeMap::new()).unwrap();
 
         assert!(read_rollup("").is_none());
 

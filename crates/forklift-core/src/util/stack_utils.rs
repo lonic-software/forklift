@@ -77,12 +77,23 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // stack before objects are written.
     let signing_key_id = resolve_signing_key(&operator)?;
 
-    // Every inventory shard is read and parsed exactly once here (§ perf: this used to be three
-    // separate full O(shard count) passes — the conflict check, the tree build and the
-    // post-stack cleanup each re-read and re-parsed the same on-disk shards). The parse happens
-    // up front, before anything is written, so the conflict check below still runs strictly
-    // before any warehouse mutation — parse-then-check-then-write, exactly as before.
-    let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory()?);
+    // Computed before the inventory is read, because the read skips every subtree whose rollup
+    // already matches the head (see `inventory_utils::prepare_stack_inventory`), and the scope
+    // gates which keys may be skipped at all.
+    let scope = scope_utils::current_scope()?;
+    let pallet = pallet_utils::get_current_pallet_name()?;
+    let head = pallet_utils::get_pallet_head(&pallet)?;
+    let head_root_hash = match &head {
+        Some(head_hash) => Some(object_utils::load_parcel(head_hash)?.tree_hash),
+        None => None,
+    };
+
+    // Every shard the tree build can need is read and parsed exactly once here, and shared by the
+    // conflict check, the tree build and the post-stack cleanup. The read happens before anything
+    // is written, so the conflict check below still runs strictly before any warehouse mutation.
+    let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory(
+        head_root_hash.as_deref().map(|hash| (hash, &scope)),
+    )?);
 
     if inventory_utils::has_conflict_entries_in(&prepared) {
         return Err(
@@ -107,9 +118,6 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // parcel's authors are preserved and this operator is recorded as the stacker.
     let cherry_pick = cherry_pick_utils::read_state()?;
 
-    let pallet = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&pallet)?;
-
     // Every tree object built below is staged into `batch`, not fsynced immediately — one
     // durability barrier for the whole burst instead of a per-object fsync pair (§ perf). The
     // tree build runs from `TaskExecutor`'s parallel workers, so this uses `WriteBatch` (its
@@ -120,22 +128,10 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // only ever set after that, never staged into this same batch (see the comment there).
     let batch = std::sync::Arc::new(file_utils::WriteBatch::new());
 
-    // Computed up front (not just inside the scoped-splice branch below, as before) because the
-    // rollup-based skip (stage 2) needs both: the head to compare rollups against, and the scope
-    // to gate which keys are ever eligible for a skip (see `tree_utils::compute_rollup_skip_plan`'s
-    // doc comment on the scoped-bay caveat).
-    let scope = scope_utils::current_scope()?;
-    let head_root_hash = match &head {
-        Some(head_hash) => Some(object_utils::load_parcel(head_hash)?.tree_hash),
-        None => None,
-    };
-
     // `track_tree_hashes: true` — the per-key hashes below are read to stamp shards' rollups
     // after a successful stack (DESIGN.html §5.0 D item 10, finding #8; `park`'s own call passes
     // `false`, since it discards the map immediately instead).
-    let (partial_root, tree_hashes, untouched_keys) = tree_utils::build_tree_from_inventory_deferred(
-        &prepared, &batch, head_root_hash.as_deref(), &scope, true,
-    ).await?;
+    let (partial_root, tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch, true).await?;
     let partial_root = partial_root
         .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
 
@@ -320,11 +316,11 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // The parcel consumed the staged removals (and the consolidation or cherry-pick, if any).
     // Reuses the same parsed snapshot the conflict check and tree build already read — nothing
     // between then and here changes a shard's content on disk, only the object store, the ref
-    // and the signature sidecar (see `cleanup_after_stack_with`'s doc comment). `untouched_keys`
-    // needs no scope filtering of its own (unlike `stamp_hashes` above): a rollup-skipped
-    // subtree is only ever InScope by construction (`compute_rollup_skip_plan`'s scoped-bay
-    // caveat), or the whole tree when the bay is fully in scope.
-    inventory_utils::cleanup_after_stack_with(&prepared, &stamp_hashes, &untouched_keys)?;
+    // and the signature sidecar (see `cleanup_after_stack_with`'s doc comment). The skipped keys
+    // it leaves untouched need no scope filtering of their own (unlike `stamp_hashes` above): a
+    // skip root's parent is always fully in scope (`prepare_stack_inventory`'s scoped-bay
+    // caveat).
+    inventory_utils::cleanup_after_stack_with(&prepared, &stamp_hashes)?;
     merge_utils::clear_consolidation_state()?;
     merge_utils::OutOfScopeSkeleton::clear()?;
     cherry_pick_utils::clear_state()?;
