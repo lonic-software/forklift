@@ -87,6 +87,21 @@ impl<V> TwoGenCache<V> {
         Self::retire_if_full(&mut state, self.budget);
     }
 
+    /// Drop every entry, in both generations, whose key starts with `prefix`.
+    pub(crate) fn remove_prefixed(&self, prefix: &str) {
+        let mut state = self.state.lock().expect("the cache lock is poisoned");
+        let mut removed = 0;
+        state.live.retain(|key, (_, weight)| {
+            let keep = !key.starts_with(prefix);
+            if !keep {
+                removed += *weight;
+            }
+            keep
+        });
+        state.live_weight -= removed;
+        state.old.retain(|key, _| !key.starts_with(prefix));
+    }
+
     /// Retire the live generation to the old one (dropping the previous old generation) once it
     /// fills — bounding the cache to ~2× `budget` with O(1) eviction.
     fn retire_if_full(state: &mut TwoGenCacheState<V>, budget: usize) {
@@ -94,5 +109,30 @@ impl<V> TwoGenCache<V> {
             state.old = std::mem::take(&mut state.live);
             state.live_weight = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `remove_prefixed` drops matching keys from both generations, keeps the rest, and leaves the
+    /// live weight counting only what is left, so the next retire still happens on budget.
+    #[test]
+    fn remove_prefixed_drops_only_matching_keys_from_both_generations() {
+        let cache = TwoGenCache::new(10, 10);
+        cache.put("a\u{0}old", Arc::new(1), 6);
+        cache.put("b\u{0}old", Arc::new(2), 4); // live weight 10 → retired to the old generation
+        cache.put("a\u{0}live", Arc::new(3), 3);
+        cache.put("b\u{0}live", Arc::new(4), 3);
+
+        cache.remove_prefixed("a\u{0}");
+
+        assert!(cache.get("a\u{0}old").is_none() && cache.get("a\u{0}live").is_none());
+        assert_eq!(cache.get("b\u{0}live").as_deref(), Some(&4));
+        assert_eq!(cache.get("b\u{0}old").as_deref(), Some(&2)); // promoted: live weight 3 + 4
+
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.live_weight, 7);
     }
 }
