@@ -5,7 +5,7 @@ use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{alias_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils};
+use crate::util::{alias_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -330,12 +330,71 @@ pub fn apply_ops_each(ops: &[FileOp],
 
     remove_empty_directories(removed_dirs);
 
-    for op in ops.iter().filter(|op| matches!(op, FileOp::Write { .. })) {
-        apply_file_op(op)?;
-        after(op)?;
+    let writes: Vec<&FileOp> = ops.iter().filter(|op| matches!(op, FileOp::Write { .. })).collect();
+
+    write_in_order(&writes, |op| match op {
+        FileOp::Write { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
+        FileOp::Remove { .. } => None,
+    }, |op, content| {
+        if let FileOp::Write { path, hash, item_type, is_new } = op {
+            write_tracked_file_from(path, hash, *item_type, *is_new, content)?;
+        }
+
+        after(op)
+    })
+}
+
+/// Below this many blobs to load, a materializer loads each one itself: the prefetch's threads
+/// cost more than they save on a handful of files.
+const PREFETCH_THRESHOLD: usize = 8;
+
+/// How many blobs the prefetch may load ahead of the write that needs the next one.
+const PREFETCH_WINDOW: usize = 256;
+
+/// The bytes of loaded, unwritten blobs at which the prefetch stops loading ahead. Loads already
+/// under way finish, so the most held is this plus one blob per worker, and a prefetched blob is
+/// under the chunk threshold (larger ones stream at write time).
+const PREFETCH_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// The blob a write loads ahead of time, if any: a chunked entry is streamed at write time
+/// instead, so nothing is loaded for it.
+fn prefetched<'a>(blob: Option<(&'a str, DirEntryType)>) -> Option<&'a str> {
+    blob.filter(|(_, item_type)| !item_type.is_chunked()).map(|(hash, _)| hash)
+}
+
+/// Run a materializer's writes in order on this thread while their blobs load ahead on worker
+/// threads (see [`fanout_utils::prefetch_in_order`]): reconstructing a blob from its delta chain
+/// is CPU work that overlaps, while the file system serializes the writes themselves, so they
+/// stay on one thread. Below [`PREFETCH_THRESHOLD`] blobs to load, each write loads its own.
+///
+/// # Arguments
+/// * `items` - The writes, in the order they must land.
+/// * `blob`  - The blob one item writes (its hash and type), or `None` if it writes no stored blob.
+/// * `write` - Applies one item with its prefetched content (`None` if nothing was loaded for it,
+///             e.g. a chunked entry, which streams); the first error stops the run.
+///
+/// # Returns
+/// * `Ok(())`      - If every write applied.
+/// * `Err(String)` - The first write's error, after every write before it has landed.
+pub fn write_in_order<T: Sync>(items: &[T],
+                               blob: impl Fn(&T) -> Option<(&str, DirEntryType)> + Sync,
+                               mut write: impl FnMut(&T, Option<Result<Vec<u8>, String>>) -> Result<(), String>)
+                               -> Result<(), String> {
+    if items.iter().filter(|item| prefetched(blob(item)).is_some()).take(PREFETCH_THRESHOLD).count() < PREFETCH_THRESHOLD {
+        return items.iter().try_for_each(|item| write(item, None));
     }
 
-    Ok(())
+    fanout_utils::prefetch_in_order(
+        items,
+        PREFETCH_WINDOW,
+        PREFETCH_BUDGET_BYTES,
+        |item| prefetched(blob(item)).map(|hash| object_utils::load_blob(hash).map(|loaded| loaded.content)),
+        |content| match content {
+            Some(Ok(bytes)) => bytes.len(),
+            _ => 0,
+        },
+        write,
+    )
 }
 
 /// The warehouse path a file operation acts on.
@@ -389,6 +448,17 @@ pub fn apply_file_op(op: &FileOp) -> Result<(), String> {
 /// * `Err(String)` - If the blob could not be loaded, something already exists at a `create`
 ///                   path, or a file system operation failed.
 pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType, create: bool) -> Result<(), String> {
+    write_tracked_file_from(path, hash, item_type, create, None)
+}
+
+/// [`write_tracked_file`], with the blob's content already loaded when `content` holds it (see
+/// [`write_in_order`]). A load's error surfaces only after the path checks, where the write's own
+/// load would have failed. `None` loads the blob here.
+pub fn write_tracked_file_from(path: &str,
+                               hash: &str,
+                               item_type: DirEntryType,
+                               create: bool,
+                               content: Option<Result<Vec<u8>, String>>) -> Result<(), String> {
     check_working_path(path)?;
 
     let fs_path = Path::new(path);
@@ -407,10 +477,13 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType, creat
         return write_chunked_file(path, fs_path, hash, item_type, create);
     }
 
-    let blob = object_utils::load_blob(hash)?;
+    let content = match content {
+        Some(loaded) => loaded?,
+        None => object_utils::load_blob(hash)?.content,
+    };
 
     if item_type == DirEntryType::SymbolicLink {
-        let target = String::from_utf8(blob.content)
+        let target = String::from_utf8(content)
             .map_err(|_| format!("The symlink target stored for \"{}\" is not valid UTF-8.", path))?;
 
         // A symlink cannot be overwritten in place; remove whatever is at the path first —
@@ -436,10 +509,10 @@ pub fn write_tracked_file(path: &str, hash: &str, item_type: DirEntryType, creat
     }
 
     if create {
-        return create_regular_file(fs_path, path, &blob.content, item_type);
+        return create_regular_file(fs_path, path, &content, item_type);
     }
 
-    write_regular_file(fs_path, path, &blob.content, item_type)
+    write_regular_file(fs_path, path, &content, item_type)
 }
 
 /// The error for a failed write of a new path: an occupant names the backstop that caught it.

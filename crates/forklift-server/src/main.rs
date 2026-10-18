@@ -103,8 +103,21 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() {
+/// Every handler reads objects on the runtime's `spawn_blocking` threads, and a delta chain's
+/// reconstruction recurses, so the runtime's threads get core's
+/// [`WORKER_STACK_SIZE`](forklift_core::util::fanout_utils::WORKER_STACK_SIZE), not tokio's
+/// 2 MiB default.
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(forklift_core::util::fanout_utils::WORKER_STACK_SIZE)
+        .enable_all()
+        .build()
+        .expect("failed to start the async runtime")
+        .block_on(async_main());
+}
+
+/// Parse the command line and run it.
+async fn async_main() {
     let cli = Cli::parse();
 
     let result = match cli.command {

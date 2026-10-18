@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
+use forklift_core::util::fanout_utils::WORKER_STACK_SIZE;
 use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
@@ -26,12 +27,12 @@ pub mod passphrase;
 /// future frame that might grow this further (more subcommands, longer help text), the real
 /// work runs on a dedicated thread with an explicit, generous stack size — the standard fix
 /// for this class of problem — so the platform difference in the OS-assigned main-thread
-/// stack never matters.
-const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
-
-/// The process entry point: hands off to a worker thread with an explicit stack size (see
-/// [`WORKER_STACK_SIZE`]) and waits for it. `main` itself does no work that could need a large
-/// stack, so its own (platform-default) stack size is irrelevant.
+/// stack never matters. The size is core's [`WORKER_STACK_SIZE`], which the runtime's threads
+/// get too: they read objects, and a delta chain's reconstruction recurses.
+///
+/// The process entry point: hands off to a worker thread with an explicit stack size and waits
+/// for it. `main` itself does no work that could need a large stack, so its own
+/// (platform-default) stack size is irrelevant.
 fn main() {
     // Before anything else opens a file descriptor: validating an inherited `PULT_EVENTS`
     // number is only sound while nothing of ours could have been given that number.
@@ -49,6 +50,7 @@ fn main() {
 /// Build the async runtime and run [`async_main`] on it, on the worker thread `main` spawns.
 fn run() {
     tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(WORKER_STACK_SIZE)
         .enable_all()
         .build()
         .expect("failed to start the async runtime")

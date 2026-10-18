@@ -1712,6 +1712,123 @@ fn shift_preserves_executables_and_symlinks() {
     );
 }
 
+/// The content a wide materialization test gives file `index` on `pallet`: distinct per file
+/// and per pallet, so a blob written to the wrong path never matches.
+fn wide_content(pallet: &str, index: usize) -> String {
+    format!("file {} on {}\n{}", index, pallet, "line\n".repeat(index))
+}
+
+/// The paths of a wide materialization test: more files than the write prefetch's threshold,
+/// spread over nested directories.
+fn wide_paths() -> Vec<String> {
+    (0..40).map(|index| format!("d{}/sub{}/f{}.txt", index % 3, index % 5, index)).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_wide_shift_writes_every_file_its_own_content_mode_and_type() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Past the write prefetch's threshold, blobs load on worker threads while the writes land in
+    // order on one: each file must still get its own blob, mode and type.
+    let warehouse = TestWarehouse::new("wide-shift");
+    let paths = wide_paths();
+    let big = large_bytes(0x51DE, CHUNK_THRESHOLD + 100_000);
+
+    for (index, path) in paths.iter().enumerate() {
+        warehouse.write_file(path, &wide_content("main", index));
+    }
+    std::fs::set_permissions(warehouse.root.join(&paths[7]), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("f0.txt", warehouse.root.join("d0/sub0/link")).unwrap();
+    write_bytes(&warehouse, "d1/big.bin", &big);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "main's files"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    for (index, path) in paths.iter().enumerate() {
+        warehouse.write_file(path, &wide_content("feature", index));
+    }
+    // A rewrite keeps the file's mode, so clear it: the shift back must set it, not inherit it.
+    std::fs::set_permissions(warehouse.root.join(&paths[7]), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::remove_file(warehouse.root.join("d0/sub0/link")).unwrap();
+    std::fs::remove_file(warehouse.root.join("d1/big.bin")).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature's files"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    for (index, path) in paths.iter().enumerate() {
+        assert_eq!(read(&warehouse, path), wide_content("main", index), "{} has the wrong content", path);
+    }
+    let mode = std::fs::metadata(warehouse.root.join(&paths[7])).unwrap().permissions().mode();
+    assert_ne!(mode & 0o111, 0, "the executable bit must be restored");
+    assert_eq!(std::fs::read_link(warehouse.root.join("d0/sub0/link")).unwrap().to_string_lossy(), "f0.txt");
+    assert_eq!(std::fs::read(warehouse.root.join("d1/big.bin")).unwrap(), big, "the chunked file must round-trip");
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The working directory matches the inventory"), "must be clean: {}", status);
+}
+
+#[test]
+fn a_wide_consolidate_writes_every_file_theirs_takes_its_own_content() {
+    // Every file changed on feature alone is a take-theirs write, more of them than the write
+    // prefetch's threshold; main's own change keeps the merge from fast-forwarding. Feature also
+    // adds a chunked file (streamed, never prefetched) and, on unix, an executable and a symlink.
+    let warehouse = TestWarehouse::new("wide-consolidate");
+    let paths = wide_paths();
+    let big = large_bytes(0xC0DE, CHUNK_THRESHOLD + 100_000);
+
+    for (index, path) in paths.iter().enumerate() {
+        warehouse.write_file(path, &wide_content("base", index));
+    }
+    warehouse.write_file("main-only.txt", "base\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    for (index, path) in paths.iter().enumerate() {
+        warehouse.write_file(path, &wide_content("feature", index));
+    }
+    write_bytes(&warehouse, "d1/big.bin", &big);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(warehouse.root.join(&paths[3]), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("f2.txt", warehouse.root.join("d2/sub2/link")).unwrap();
+    }
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature's files"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("main-only.txt", "changed on main\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "main's change"]));
+
+    assert_success(&warehouse.run(&["consolidate", "feature"]));
+
+    for (index, path) in paths.iter().enumerate() {
+        assert_eq!(read(&warehouse, path), wide_content("feature", index), "{} has the wrong content", path);
+    }
+    assert_eq!(read(&warehouse, "main-only.txt"), "changed on main\n");
+    assert_eq!(std::fs::read(warehouse.root.join("d1/big.bin")).unwrap(), big, "the chunked file must round-trip");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(warehouse.root.join(&paths[3])).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "the executable bit must be taken");
+        assert_eq!(std::fs::read_link(warehouse.root.join("d2/sub2/link")).unwrap().to_string_lossy(), "f2.txt");
+    }
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The working directory matches the inventory"), "must be clean: {}", status);
+}
+
 #[test]
 fn restore_discards_unstaged_changes() {
     let warehouse = TestWarehouse::new("restore");
