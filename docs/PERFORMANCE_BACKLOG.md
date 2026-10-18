@@ -94,7 +94,7 @@ defaults and 1.55x against `core.fsync=all`.
 (format `v2026_07_15`) — the tree hash `stack` would build for that shard's entire
 staged subtree, directly comparable against the corresponding head subtree's hash.
 `walk_directory_staged` (`stocktake`/`diff --staged`) and `stack`'s tree-build skip
-plan (`compute_rollup_skip_plan`) both skip load+parse+descend for a subtree the
+plan (now worked out during the shard read itself, see FORK-67 below) both skip load+parse+descend for a subtree the
 moment its shard's rollup matches the head subtree hash — the same short-circuit
 `diff`'s pallet-vs-pallet walk already had
 (`crates/forklift/src/commands/diff.rs:584-586`), now extended to the staged/stack
@@ -349,6 +349,41 @@ in the kernel. A ~0.7 ms median for a fatter tail and ~45% more CPU is not a tra
 so the walk stays one task per directory.
 
 ---
+
+## FORK-67: `stack` reads only the shards beneath a changed rollup (2026-10-18)
+
+**Problem.** `stack` read and parsed every registered inventory shard before building the
+tree, and only then worked out which subtrees the rollup skip let it leave alone. The skip
+saved the tree build, not the read. On a 20,421-directory synthetic warehouse (20 × 20 × 50
+leaf directories, two files each), a one-file `stack` spent ~150 of its ~205 ms (fsync off)
+reading shards it then ignored; on git.git's 224 directories the same read is a few ms.
+
+**Fix.** `prepare_stack_inventory` now takes the head and the bay's scope and walks the shard
+tree top-down, one depth at a time, reading each depth (and loading that depth's head trees)
+through `fanout_map`. A shard whose rollup equals the head subtree hash becomes a skip root and
+nothing beneath it is read; the skip plan the tree build used to compute afterwards is the
+walk's by-product. The cleanup after the stack leaves every key beneath a skip root alone, so
+the read set and the rewrite set are both O(changed spine), not O(directories).
+
+**A bug fixed on the way.** The old cleanup unregistered a shard whenever its directory was
+gone from disk, even when the removal had never been loaded and the parcel just stacked still
+contained the directory. It also stamped the ancestors' rollups as if nothing were missing, so
+`stocktake` then reported nothing staged and the *next* `stack` silently committed the removal.
+Whether a key goes is now decided from the inventory alone; the removal stays reported as not
+loaded until someone loads it.
+
+**Measured** (hyperfine, 20–30 runs, one file appended and loaded before each run):
+
+| Warehouse | before | after |
+|---|---|---|
+| 20,421 directories | 253 ms | 72 ms |
+| 20,421 directories, `FORKLIFT_FSYNC=0` | 211 ms | 28 ms |
+| git.git (densified store) | 51.2 ms | 50.0 ms |
+| git.git, `FORKLIFT_FSYNC=0` | 10.1 ms | 8.6 ms |
+
+When nothing can be skipped (every leaf changed, all 20,421 shards read), the depth-by-depth
+read costs ~240 ms against ~225 ms for the one-shot read, inside a ~7 s stack dominated by its
+writes.
 
 ## Remaining items
 

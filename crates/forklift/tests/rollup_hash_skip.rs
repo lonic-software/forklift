@@ -1,7 +1,7 @@
 //! Consumer-level coverage for the rollup-based skip (DESIGN.html §5.0 D item 8, stage 2):
-//! `stocktake`/`diff --staged` (`stocktake_utils::walk_directory_staged`) and `stack`'s tree
-//! build (`tree_utils::compute_rollup_skip_plan`) must never change *what* forklift reports or
-//! commits — only how much work it does to get there.
+//! `stocktake`/`diff --staged` (`stocktake_utils::walk_directory_staged`) and `stack`'s shard
+//! read and tree build (`inventory_utils::prepare_stack_inventory`) must never change *what*
+//! forklift reports or commits — only how much work it does to get there.
 //!
 //! The core technique is a "twin": the same script of file writes and commands is applied, in
 //! lockstep, to two otherwise-identical warehouses — one with the skip enabled (the default) and
@@ -740,3 +740,81 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
 // shard right after `refresh_tracked_entries` returns, so a shard's mtime observed after a full
 // `park` command reflects that later, unrelated rewrite — not what this refresh itself published.
 // That dedicated test calls `refresh_tracked_entries` directly instead.
+
+/// `stack` reads no shard beneath a subtree whose rollup matches the head: a shard there that
+/// would not even parse goes unnoticed with the skip on, and fails the stack with it off. The
+/// failing half proves the corruption is real, so the passing half cannot be vacuous.
+#[test]
+fn stack_never_reads_a_shard_beneath_a_rollup_that_matches_the_head() {
+    for disable_skip in [false, true] {
+        let warehouse = Warehouse::new("stack-reads-nothing-beneath", disable_skip);
+        warehouse.prepare();
+
+        warehouse.write_file("touched/file.txt", "v1\n");
+        warehouse.write_file("untouched/deep/file.txt", "deep\n");
+        warehouse.run_ok(&["load", "."]);
+        warehouse.run_ok(&["stack", "base"]);
+
+        let head_untouched = {
+            let output = warehouse.run_ok(&["--json", "peek", &warehouse.head_tree_hash("main")]);
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            value.to_string()
+        };
+        assert!(head_untouched.contains("untouched"), "the base stack must have committed untouched/");
+        assert!(shard_rollup(&warehouse, "untouched").is_some(),
+            "the base stack must have stamped untouched/'s rollup");
+
+        let deep_shard = {
+            let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+            forklift_core::util::file_utils::get_inventory_data_path_for_key("untouched/deep")
+        };
+        assert!(deep_shard.is_file(), "untouched/deep must have a shard of its own: {}", deep_shard.display());
+        std::fs::write(&deep_shard, b"not a shard").unwrap();
+
+        warehouse.write_file("touched/file.txt", "v2\n");
+        warehouse.run_ok(&["load", "touched/file.txt"]);
+        let output = warehouse.run(&["stack", "touch"]);
+
+        if disable_skip {
+            assert!(!output.status.success(),
+                "with the skip off, stack must read and reject the corrupt shard");
+        } else {
+            assert!(output.status.success(),
+                "with the skip on, stack must not read beneath untouched/: {}",
+                String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}
+
+/// A directory removed from disk without a `load` is still in the parcel `stack` builds, so the
+/// stack must keep its shards: the removal stays reported as not yet loaded, and a later stack
+/// keeps committing the directory instead of a removal nobody staged.
+#[test]
+fn a_directory_removed_without_a_load_survives_the_stacks_that_follow() {
+    let twin = Twin::new("unloaded-directory-removal");
+
+    twin.write_file("gone/inner/file.txt", "inner\n");
+    twin.write_file("kept/file.txt", "kept\n");
+    twin.write_file("top.txt", "v1\n");
+    twin.run_ok(&["load", "."]);
+    twin.run_ok(&["stack", "base"]);
+
+    for warehouse in [&twin.on, &twin.off] {
+        std::fs::remove_dir_all(warehouse.root.join("gone")).unwrap();
+    }
+
+    for (round, content) in [("second", "v2\n"), ("third", "v3\n")] {
+        twin.write_file("top.txt", content);
+        twin.run_ok(&["load", "top.txt"]);
+        twin.run_ok(&["stack", round]);
+        twin.assert_tree_matches("main");
+        twin.assert_equivalent();
+
+        let value = twin.assert_json_matches(&["--json", "stocktake"]);
+        assert_eq!(value["data"]["staged_count"], 0,
+            "after the {round} stack nothing is staged: {value}");
+        assert_eq!(value["data"]["unstaged"],
+            serde_json::json!([{ "kind": "removed", "path": "gone/inner/file.txt" }]),
+            "after the {round} stack the removal must still be reported as not loaded: {value}");
+    }
+}

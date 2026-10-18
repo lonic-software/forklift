@@ -63,8 +63,8 @@ pub async fn park_changes() -> Result<(), String> {
     // same root a full bay would — `park` is documented to inherit the overlay, and a truncated
     // parked tree would silently break that. The "nothing to park" check below must compare the
     // *spliced* root against head, or it never fires in a scoped bay. Computed before the tree
-    // build below (not just for the splice branch, as before) because the rollup-based skip
-    // (stage 2) needs it too — see `tree_utils::compute_rollup_skip_plan`'s scoped-bay caveat.
+    // read below (not just for the splice branch) because the rollup-based skip needs it too —
+    // see `inventory_utils::prepare_stack_inventory`'s scoped-bay caveat.
     let scope = scope_utils::current_scope()?;
 
     // Every tree object below (and, further down, the parcel object) is staged into `batch`
@@ -77,10 +77,13 @@ pub async fn park_changes() -> Result<(), String> {
     // Read fresh (not `stack`'s shared `PreparedInventory`, which exists to avoid re-parsing
     // shards across several steps of one `stack` — `park` only reads the inventory once here),
     // but after `refresh_tracked_entries` above so this snapshot reflects the just-rehashed
-    // working directory, not stale pre-refresh content.
-    let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory()?);
+    // working directory, not stale pre-refresh content. Passing the head and the scope gives
+    // `park` the same rollup-based skip `stack` has: a subtree whose shard's rollup already
+    // matches the head subtree hash is never read, hashed or (re)stored — its parent's tree
+    // includes it by hash.
+    let prepared = std::sync::Arc::new(inventory_utils::prepare_stack_inventory(Some((&head_tree_hash, &scope)))?);
 
-    // `prepare_stack_inventory` stops parsing at the first conflict entry it finds (sorted key
+    // `prepare_stack_inventory` stops collecting at the first conflict entry it finds (sorted key
     // order), so `prepared.shards` is silently *incomplete* past that point when `has_conflict`
     // is true — exactly like `stack_parcel`'s identical guard, checked immediately after building
     // its own `PreparedInventory` for the same reason. The `has_conflict_entries()` check at the
@@ -95,23 +98,10 @@ pub async fn park_changes() -> Result<(), String> {
         );
     }
 
-    // `Some(&head_tree_hash)` gives `park` the same rollup-based skip (stage 2) `stack` already
-    // has: a directory whose shard's rollup already matches the corresponding head subtree hash
-    // is never hashed or (re)stored — its subtree is spliced into its parent verbatim by hash
-    // instead of walked and rebuilt. Its shard *is* still fully read and parsed, by
-    // `prepare_stack_inventory` above, not just peeked past its header (DESIGN.html §5.0 D item
-    // 10, finding #5): the skip plan reads every candidate's rollup out of that already-parsed
-    // `prepared` snapshot (an in-memory lookup), which is what makes `prepare_stack_inventory`'s
-    // own read+parse pass worth parallelizing — it is real, unavoidable work here, not a header
-    // peek a skip could make disappear. The per-directory tree hashes this call also returns are
-    // `stack`-only bookkeeping (for stamping rollups after a successful stack) — `park`
-    // immediately overwrites every shard from head a few lines down (`replace_all_inventories`),
-    // so it passes `track_tree_hashes: false` (DESIGN.html §5.0 D item 10, finding #8) instead of
-    // making every one of the build's per-directory tasks pay a `Mutex` acquisition to populate a
-    // map nobody reads; the untouched-key set is discarded for the same reason.
-    let (partial_root, _tree_hashes, _untouched) = tree_utils::build_tree_from_inventory_deferred(
-        &prepared, &batch, Some(&head_tree_hash), &scope, false,
-    ).await?;
+    // The per-directory tree hashes the build can return are `stack`-only bookkeeping (for
+    // stamping rollups after a successful stack): `park` overwrites every shard from head a few
+    // lines down (`replace_all_inventories`), so it passes `track_tree_hashes: false`.
+    let (partial_root, _tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch, false).await?;
     let partial_root = partial_root.ok_or("There is nothing to park.".to_string())?;
 
     let root_tree = if scope.is_full() {

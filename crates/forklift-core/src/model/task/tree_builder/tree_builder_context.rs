@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::model::task::base_task_context::BaseTaskContext;
@@ -53,14 +53,6 @@ pub struct TreeBuilderContext {
     /// (never mutated) by every parallel task, so no lock is needed.
     pub track_tree_hashes: bool,
 
-    /// The rollup-skip plan's verbatim injections: for a directory key whose task graph was
-    /// *not* pruned, the `(name, head_hash)` pairs of its immediate children that a matching
-    /// rollup let the build skip entirely — added directly into that directory's tree with no
-    /// load, no task, no `built` lookup (mirrors `build_scoped_root_tree`'s
-    /// `splice_out_of_scope_entry` by-hash pattern). Empty when no skip plan applies (every
-    /// caller except `stack`'s optimized path, or the kill switch). Set once at construction,
-    /// read (never mutated) by every parallel task, so no lock is needed.
-    pub injections: Arc<BTreeMap<String, Vec<(String, String)>>>,
 }
 
 impl TreeBuilderContext {
@@ -70,8 +62,6 @@ impl TreeBuilderContext {
     /// * `pending_children`   - The initial child counts per directory key.
     /// * `prepared`           - The already-parsed shard snapshot to read directory content from.
     /// * `batch`              - Where each built tree object should be staged.
-    /// * `injections`         - The rollup-skip plan's verbatim injections (empty when no skip
-    ///                          plan applies).
     /// * `track_tree_hashes`  - Whether to populate `tree_hashes` at all — see its doc comment.
     ///
     /// # Returns
@@ -79,7 +69,6 @@ impl TreeBuilderContext {
     pub fn new(pending_children: HashMap<String, usize>,
               prepared: Arc<inventory_utils::PreparedInventory>,
               batch: Arc<file_utils::WriteBatch>,
-              injections: Arc<BTreeMap<String, Vec<(String, String)>>>,
               track_tree_hashes: bool) -> Self {
         Self {
             base_context: Arc::new(BaseTaskContext::new()),
@@ -89,7 +78,6 @@ impl TreeBuilderContext {
             batch,
             tree_hashes: Arc::new(Mutex::new(HashMap::new())),
             track_tree_hashes,
-            injections,
         }
     }
 }
