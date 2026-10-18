@@ -653,8 +653,9 @@ mod tests {
         let items: Vec<usize> = (0..500).collect();
         let mut seen = Vec::new();
 
-        // `usize::MAX` reads as "no window": the window's end must not overflow.
-        let result: Result<(), ()> = prefetch_in_order(&items, usize::MAX, usize::MAX, |n| *n, |_| 1, |item, loaded| {
+        // `usize::MAX` reads as "no window": the window's end must not overflow. A budget of two
+        // items keeps workers waiting for room, so they test the window again after each take.
+        let result: Result<(), ()> = prefetch_in_order(&items, usize::MAX, 2, |n| *n, |_| 1, |item, loaded| {
             assert_eq!(*item, loaded);
             seen.push(loaded);
             Ok(())
