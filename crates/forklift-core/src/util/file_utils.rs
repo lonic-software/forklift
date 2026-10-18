@@ -1801,7 +1801,10 @@ pub(crate) enum StoreReadOutcome {
     Absent,
     /// Something is at the address, but the ordinary read fails on it — this carries the exact
     /// error the read path would surface for it. Decisive, not an unknown: a subsequent ordinary
-    /// read of this hash *will* fail the same way.
+    /// read of this hash *will* fail the same way. (Except when it was produced inside a delta
+    /// reconstruction, for another object's base: there the forced reload is left to the read that
+    /// started the reconstruction — see [`read_object_classified`]. Every taint recheck and every
+    /// ordinary read a caller makes runs outside one.)
     Unverifiable(String),
 }
 
@@ -1812,6 +1815,14 @@ pub(crate) enum StoreReadOutcome {
 /// implementation. A prior recheck predicate that merely *resembled* the read path (rather than
 /// being it) was found, more than once, to disagree with it on an edge case — this function is
 /// the structural fix: there is only one read implementation now.
+///
+/// One input besides `hash` changes the outcome: whether this thread is inside a delta
+/// reconstruction ([`pack_utils::in_reconstruction`], i.e. this hash is another object's base).
+/// There, a located-but-broken record is not retried after a forced registry reload — the read
+/// that started the reconstruction does that once and re-walks the whole chain, where a reload at
+/// every level doubles per level. So inside a reconstruction, `Unverifiable` and the
+/// loose-I/O `Err` are not final for the hash; outside one (every taint recheck, every ordinary
+/// read a caller makes) they are.
 ///
 /// Mirrors [`read_object_uncached`]'s own shape branch for branch (packs first, then loose, then
 /// the packs again on a loose miss) — see that function's doc comment for why packs are consulted
@@ -2039,11 +2050,11 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
 
 /// The read cache's byte budget. When the live generation reaches it, it is retired to the
 /// second generation and a fresh one starts — an approximate LRU that never exceeds ~2× this.
-const READ_CACHE_BUDGET: usize = 128 * 1024 * 1024;
+pub(crate) const READ_CACHE_BUDGET: usize = 128 * 1024 * 1024;
 
 /// Objects larger than this are not cached (one huge object must not evict the whole working
 /// set of small trees and blobs a walk actually reuses).
-const READ_CACHE_MAX_ENTRY: usize = READ_CACHE_BUDGET / 8;
+pub(crate) const READ_CACHE_MAX_ENTRY: usize = READ_CACHE_BUDGET / 8;
 
 /// A bounded content-addressed object cache. Entries are `Arc`-shared, so a hit clones a pointer
 /// under the lock and the caller shares that one allocation — an owned-bytes caller copies out
@@ -2065,15 +2076,10 @@ pub(crate) fn read_cache_key(hash: &str) -> String {
     format!("{}\u{0}{}", get_path_objects_root(), hash)
 }
 
-fn read_cache_get(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+/// The read cache's copy of `hash`, if it holds one. Every entry hashed to its key before it was
+/// put there, which is why `pack_utils`'s unverified delta-base fetch looks here first.
+pub(crate) fn read_cache_get(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     read_cache().get(&read_cache_key(hash))
-}
-
-/// The read cache's copy of `hash`, if it holds one — without reading the store on a miss. For
-/// `pack_utils`'s unverified delta-base fetch, which prefers a copy known to verify. Every entry
-/// in this cache hashed to its key before it was put there.
-pub(crate) fn cached_verified_object(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
-    read_cache_get(hash)
 }
 
 fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {

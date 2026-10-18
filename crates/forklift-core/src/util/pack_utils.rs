@@ -1633,6 +1633,11 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
 pub fn invalidate_cache() {
     registry().lock().expect("the pack registry lock is poisoned")
         .remove(&file_utils::get_path_objects_root());
+    // Bytes reconstructed against the old mapping may be wrong (a record since rewritten); they
+    // are only ever a delta's dictionary, so keeping them is never wrong, but it would make every
+    // read built on them fail its fast attempt until they age out. The whole cache goes, not only
+    // this warehouse's entries: it is only ever a cache of work.
+    unverified_base_cache().clear();
 }
 
 /// The densify-pending marker's filename, in the pack folder. Presence-only — its content is
@@ -2622,9 +2627,11 @@ enum Bases {
 /// What this changes: a target whose delta was encoded against the bytes a corrupt base's record
 /// reconstructs to — only a crafted pack can hold one, since every writer encodes against verified
 /// bases — can now read, because its own bytes verify. Whether it does depends on which copy of
-/// the base this process meets first (a verified copy in the read cache wins), so such an object
-/// is servable but not reliably so. `compact` never copies one verbatim past its base's re-read
-/// (`collect_targets`), so it is never silently dropped either.
+/// the base this process meets first (a verified copy in the read cache wins, then pack order),
+/// so such an object is servable but not reliably so. `compact --all` never copies its delta
+/// verbatim once the base is repacked from another copy (`collect_targets`): it reads the object
+/// first, and either re-encodes it or fails loudly — the delta is never kept pointing at bytes
+/// the repack has thrown away.
 fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
     if record.first() == Some(&RECORD_DELTA) && !in_reconstruction() {
         if let Ok(bytes) = reconstruct_record(record, hash, Bases::Unverified) {
@@ -2672,7 +2679,8 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
                 return Err(format!("Packed delta {} exceeds the reconstruction depth limit (corrupt pack?).", hash));
             }
 
-            let base_hash = sign_utils::to_hex(&body[0..HASH_LEN]);
+            let base_bytes: [u8; HASH_LEN] = body[0..HASH_LEN].try_into().expect("checked above");
+            let base_hash = sign_utils::to_hex(&base_bytes);
             let (target_len, read) = byte_utils::number_from_vlq_bytes(HASH_LEN, body)?;
             let payload = &body[HASH_LEN + read..];
 
@@ -2680,7 +2688,7 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
             // cached `Arc` instead of copying the base out (hot on packed-delta reads and compact).
             let base = match bases {
                 Bases::Verified => file_utils::retrieve_object_by_hash_shared(&base_hash)?,
-                Bases::Unverified => unverified_delta_base(&base_hash)?,
+                Bases::Unverified => unverified_delta_base(&base_hash, &base_bytes)?,
             };
 
             delta_utils::decompress_delta(&base, payload, target_len as usize)
@@ -2690,15 +2698,16 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
 }
 
 /// A delta base for [`Bases::Unverified`]: the verified read cache's copy if it holds one, else
-/// a copy reconstructed earlier by this path, else the first loaded pack record that locates it,
-/// reconstructed (its own bases fetched the same way) and kept in [`unverified_base_cache`]. A
-/// base no loaded pack locates (loose, absent, behind a corrupt bucket) takes the ordinary
+/// a copy reconstructed earlier by this path, else the first loaded pack record that locates it
+/// and reconstructs (its own bases fetched the same way; a record that fails to decode moves on to
+/// the next pack that locates the hash), kept in [`unverified_base_cache`]. A base no loaded pack
+/// can reconstruct (loose, absent, behind a corrupt bucket, broken everywhere) takes the ordinary
 /// verified read, with all of its fallbacks.
 ///
 /// These bytes are never handed to a caller: the only consumer is [`reconstruct_record`], as a
 /// delta's dictionary, and the object built from them is hashed before anything returns it.
-fn unverified_delta_base(hash: &str) -> Result<Arc<Vec<u8>>, String> {
-    if let Some(bytes) = file_utils::cached_verified_object(hash) {
+fn unverified_delta_base(hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Result<Arc<Vec<u8>>, String> {
+    if let Some(bytes) = file_utils::read_cache_get(hash) {
         return Ok(bytes);
     }
 
@@ -2707,18 +2716,14 @@ fn unverified_delta_base(hash: &str) -> Result<Arc<Vec<u8>>, String> {
         return Ok(bytes);
     }
 
-    let Some(hash_bytes) = hash_to_bytes(hash) else {
-        return file_utils::retrieve_object_by_hash_shared(hash);
-    };
-
     let packs = loaded_packs()?;
     for pack in packs.packs.iter() {
-        if let Some((offset, length)) = pack.locate(&hash_bytes).found() {
-            let bytes = Arc::new(reconstruct_record(pack.slice(offset, length)?, hash, Bases::Unverified)?);
-            let weight = bytes.len();
-            unverified_base_cache().put(&key, Arc::clone(&bytes), weight);
-            return Ok(bytes);
-        }
+        let Some((offset, length)) = pack.locate(hash_bytes).found() else { continue };
+        let Ok(bytes) = reconstruct_record(pack.slice(offset, length)?, hash, Bases::Unverified) else { continue };
+        let bytes = Arc::new(bytes);
+        let weight = bytes.len();
+        unverified_base_cache().put(&key, Arc::clone(&bytes), weight);
+        return Ok(bytes);
     }
 
     file_utils::retrieve_object_by_hash_shared(hash)
@@ -2726,12 +2731,14 @@ fn unverified_delta_base(hash: &str) -> Result<Arc<Vec<u8>>, String> {
 
 /// The cache behind [`unverified_delta_base`], kept apart from the verified read cache so that
 /// cache only ever holds bytes that hashed to their key. Keyed by `file_utils::read_cache_key`
-/// (qualified by the warehouse), and smaller than the read cache: an object a walk reads directly
-/// lands there, verified, and is preferred as a base.
+/// (qualified by the warehouse) and bounded like the read cache, which held these bases before:
+/// a smaller per-entry ceiling would leave a large base uncached and rebuilt, chain and all, for
+/// every object on top of it.
 fn unverified_base_cache() -> &'static super::two_gen_cache::TwoGenCache<Vec<u8>> {
-    const BUDGET: usize = 64 * 1024 * 1024;
     static CACHE: OnceLock<super::two_gen_cache::TwoGenCache<Vec<u8>>> = OnceLock::new();
-    CACHE.get_or_init(|| super::two_gen_cache::TwoGenCache::new(BUDGET, BUDGET / 8))
+    CACHE.get_or_init(|| super::two_gen_cache::TwoGenCache::new(
+        file_utils::READ_CACHE_BUDGET, file_utils::READ_CACHE_MAX_ENTRY
+    ))
 }
 
 /// Every packed object hash (hex) that begins with `prefix`. The pack-aware half of
@@ -2861,7 +2868,8 @@ fn located_in(packs: &PackSet, hash_bytes: &[u8; HASH_LEN]) -> bool {
 enum Source {
     /// A loose file: read it, delta it (path-aware / window), and delete it once packed.
     Loose(PathBuf),
-    /// A record already in a pack whose delta base survives the repack — **copied verbatim**,
+    /// A record already in a pack whose delta base survives the repack *from the same copy* —
+    /// **copied verbatim**,
     /// never reconstructed or re-deltated, so the original (good) delta is preserved and the
     /// repack stays a byte-copy. `pack_index` indexes the source packs kept mapped for the run
     /// (`collect_targets` returns them), so the record is a zero-copy slice out of that pack's
@@ -2870,8 +2878,10 @@ enum Source {
     /// byte-identical, and demotes to `Source::Reconstruct` otherwise, so a duplicate is never
     /// carried forward unverified.
     CopyRecord { pack_index: usize, offset: u64, len: u64, is_delta: bool },
-    /// A packed object whose delta base is being dropped as garbage, or a duplicated hash whose
-    /// surviving copy `collect_targets` could not trust verbatim (FORK-55): reconstruct it
+    /// A packed object whose delta base is being dropped as garbage, a duplicated hash whose
+    /// surviving copy `collect_targets` could not trust verbatim (FORK-55), or a delta whose base
+    /// is itself one of these (so its record may have been encoded against a copy the repack
+    /// does not keep — see the pass at the end of `collect_targets`): reconstruct it
     /// (through the exhaustive verified read, `retrieve_object_by_hash`) and re-pack it
     /// path-aware, so nothing is left pointing at a dropped base and no unverified duplicate is
     /// ever carried forward. `loose_source` is `Some(path)` when this target was demoted from a
@@ -3653,7 +3663,8 @@ struct CollectedTargets {
 /// loose objects, plus live objects in existing packs, and every existing pack file to be
 /// deleted once the live set is safely re-packed. A live packed record is **copied verbatim**
 /// when its delta base also survives (the fast path); the rare object whose base is being
-/// dropped is reconstructed and re-deltated instead. A duplicated live hash rides the same
+/// dropped, or whose base is repacked from a different copy than its own pack's, is
+/// reconstructed and re-deltated instead. A duplicated live hash rides the same
 /// verbatim path only when every copy is byte-identical — a duplicate whose copies differ is
 /// demoted to the reconstruct path instead, so survival is decided by which bytes actually
 /// verify, not by which copy was enumerated first. Unreachable objects are simply not
@@ -3818,7 +3829,9 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
     // against different bytes and the object would be lost without ever having been read. Read
     // here, it is either re-encoded from bytes that verify or fails the run loudly. One pass is
     // enough: a reconstructed object's bytes are fixed by its hash, so a delta against *it* still
-    // decodes after the repack.
+    // decodes after the repack. The cost lands on a harmless duplicate too (a base both loose and
+    // packed after an interrupted sweep): its deltas are re-encoded once, by the `compact --all`
+    // that also removes the duplicate.
     for (index, base) in copied_deltas {
         let base_reread = seen.get(&base)
             .is_some_and(|&base_index| matches!(targets[base_index].source, Source::Reconstruct { .. }));
@@ -6829,9 +6842,11 @@ mod tests {
     /// `compact --all` never copies a delta verbatim once its base is repacked from a different
     /// copy than the one the delta was encoded against. Here the only pack holds a corrupt base
     /// record and a target encoded against what that record decodes to (so the target reads), and
-    /// a good loose copy of the base sits beside it: the base is repacked from the loose copy.
-    /// A verbatim copy of the target would then decode against the good bytes and be lost. The
-    /// repack must either keep the target readable or fail and leave everything in place.
+    /// a good loose copy of the base sits beside it: the base is repacked from the loose copy, and
+    /// a verbatim copy of the target would then decode against the good bytes — lost without the
+    /// repack ever reading it. Reading the base first puts its good copy in the read cache, so the
+    /// repack's read of the target deterministically decodes against it, fails, and must fail
+    /// the run loudly with the old pack left in place.
     ///
     /// Mutation: drop the copied-delta pass at the end of `collect_targets` → the compact succeeds
     /// and the target no longer reads → red.
@@ -6871,23 +6886,13 @@ mod tests {
         parcel.store().unwrap();
         pallet_utils::set_pallet_head("main", &parcel.hash).unwrap();
 
-        let read_target = || retrieve_from_packs(&target.hash).unwrap();
-        assert!(matches!(read_target(), PackRetrieval::Verified(_)), "the fixture's target must read before the repack");
+        assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
+            "the fixture's target must read before the repack");
+        assert_eq!(file_utils::retrieve_object_by_hash(&base.hash).unwrap(), base.content);
 
-        let crafted_pack = temp.join(".forklift/objects/pack/crafted.pack");
-        match compact(true, false, &Progress::NONE) {
-            Ok(_) => {
-                invalidate_cache();
-                match read_target() {
-                    PackRetrieval::Verified(bytes) => assert_eq!(bytes, target.content),
-                    other => panic!("a repack that succeeds must leave the target readable, got {:?}", other),
-                }
-            }
-            Err(error) => {
-                assert!(error.contains(&target.hash), "a failed repack must name the target: {}", error);
-                assert!(crafted_pack.exists(), "a failed repack must leave the old pack in place");
-            }
-        }
+        let error = compact(true, false, &Progress::NONE).expect_err("the repack must not copy the target unread");
+        assert!(error.contains(&target.hash), "the failed repack must name the target: {}", error);
+        assert!(temp.join(".forklift/objects/pack/crafted.pack").exists(), "a failed repack must leave the old pack in place");
 
         std::fs::remove_dir_all(&temp).ok();
     }

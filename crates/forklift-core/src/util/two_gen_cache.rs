@@ -87,6 +87,14 @@ impl<V> TwoGenCache<V> {
         Self::retire_if_full(&mut state, self.budget);
     }
 
+    /// Drop every entry in both generations.
+    pub(crate) fn clear(&self) {
+        let mut state = self.state.lock().expect("the cache lock is poisoned");
+        state.live.clear();
+        state.old.clear();
+        state.live_weight = 0;
+    }
+
     /// Retire the live generation to the old one (dropping the previous old generation) once it
     /// fills — bounding the cache to ~2× `budget` with O(1) eviction.
     fn retire_if_full(state: &mut TwoGenCacheState<V>, budget: usize) {
