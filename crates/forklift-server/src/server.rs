@@ -3914,7 +3914,7 @@ mod tests {
             object_utils::store_object_bytes(&blob, bytes).unwrap();
             let tree = object_utils::empty_tree_hash().unwrap();
             file_utils::retrieve_object_by_hash(&blob).unwrap();
-            object_utils::load_tree(&tree).unwrap();
+            object_utils::load_tree_shared(&tree).unwrap();
             (blob, tree)
         };
 
@@ -3928,7 +3928,7 @@ mod tests {
         let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
         let _scope = StorageRootScope::enter(&handle.root);
         assert!(file_utils::retrieve_object_by_hash(&blob).is_err(), "the deleted blob must not load");
-        assert!(object_utils::load_tree(&tree).is_err(), "the deleted tree must not load");
+        assert!(object_utils::load_tree_shared(&tree).is_err(), "the deleted tree must not load");
 
         drop((_scope, handle, state));
         let _ = std::fs::remove_dir_all(&base);
