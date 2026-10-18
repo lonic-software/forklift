@@ -60,13 +60,14 @@ pub fn same_entry(first: &Path, second: &Path) -> Result<bool, String> {
     Ok(resolved_identity(second)? == Some(identity_of_first))
 }
 
-/// [`identity`], telling a path that does not resolve (`None`) from an entry that cannot be
-/// identified (an error).
+/// [`identity`], telling a path that does not resolve (`None`: nothing there, or a name the file
+/// system cannot hold) from an entry that cannot be identified (an error).
 fn resolved_identity(path: &Path) -> Result<Option<Identity>, String> {
     use std::io::ErrorKind;
 
     match std::fs::symlink_metadata(path) {
-        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(None),
+        Err(error) if matches!(error.kind(),
+            ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::InvalidFilename) => Ok(None),
         Err(error) => Err(format!("Could not read {:?} to identify it: {}", path, error)),
         Ok(_) => identity(path)
             .map(Some)

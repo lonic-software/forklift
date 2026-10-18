@@ -484,14 +484,14 @@ pub fn is_metadata_folder_name(name: &str) -> bool {
 const HASHED_SHORT_NAME_PREFIX: &str = "focbb9";
 
 /// Whether the lowercased `name` is a hashed 8.3 short name of `.forklift`: a cut of
-/// [`HASHED_SHORT_NAME_PREFIX`], a `~`, then an ordinal not starting with `0`, eight characters at
-/// most.
+/// [`HASHED_SHORT_NAME_PREFIX`], a `~`, then an ordinal not starting with `0`, eight characters in
+/// all (the ordinal grows into the prefix: `focbb~10`).
 fn is_hashed_short_name(name: &str) -> bool {
     let Some((prefix, ordinal)) = name.split_once('~') else {
         return false;
     };
 
-    name.len() <= 8
+    name.len() == 8
         && !prefix.is_empty()
         && HASHED_SHORT_NAME_PREFIX.starts_with(prefix)
         && ordinal.starts_with(|c: char| ('1'..='9').contains(&c))
@@ -508,6 +508,8 @@ fn is_hfs_ignorable(c: char) -> bool {
 /// by [`is_metadata_folder_name`], or, for a name holding a `~` (the mark of every 8.3 short name,
 /// hashed ones included), because it resolves to the same entry as `.forklift` on this volume.
 ///
+/// Relative to the current directory, which is the working directory's root: every working-directory
+/// read and write resolves there, so the volume is asked about the very entry the caller touches.
 /// Every check of a top-level name that ends in the working directory (load, stack, every
 /// materializer) asks this one, so they agree on which names are the metadata folder.
 ///
@@ -516,7 +518,8 @@ fn is_hfs_ignorable(c: char) -> bool {
 /// * `Err(String)` - If the volume could not say: an entry that cannot be identified is never
 ///                   taken for a different one.
 pub fn opens_metadata_folder(name: &str) -> Result<bool, String> {
-    use crate::globals::{warehouse_root, FOLDER_NAME_FORKLIFT_ROOT};
+    use std::path::Path;
+    use crate::globals::FOLDER_NAME_FORKLIFT_ROOT;
 
     if is_metadata_folder_name(name) {
         return Ok(true);
@@ -525,9 +528,7 @@ pub fn opens_metadata_folder(name: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let root = warehouse_root();
-
-    alias_utils::same_entry(&root.join(name), &root.join(FOLDER_NAME_FORKLIFT_ROOT))
+    alias_utils::same_entry(Path::new(name), Path::new(FOLDER_NAME_FORKLIFT_ROOT))
 }
 
 /// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with

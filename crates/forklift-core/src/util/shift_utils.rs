@@ -656,8 +656,8 @@ pub fn check_working_path(path: &str) -> Result<(), String> {
 /// Why Windows would not take `name` as one plain file name, if it would not: a `\` (a path
 /// separator there), a `:` (a drive prefix or an alternate data stream), a trailing dot or space
 /// (dropped, so `.. ` opens `..`), or a reserved device name (`CON`, `CONIN$`, `NUL`, `COM1`,
-/// `COM¹`, … with or without an extension, as git's `is_valid_win32_path` lists them). Compiled everywhere so it is tested everywhere; enforced on
-/// Windows.
+/// `COM¹`, … with or without an extension, as git's `is_valid_win32_path` lists them). Compiled
+/// everywhere so it is tested everywhere; enforced on Windows.
 pub fn windows_component_problem(name: &str) -> Option<&'static str> {
     const RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 

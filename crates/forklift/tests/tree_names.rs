@@ -212,7 +212,7 @@ fn a_root_entry_some_file_system_opens_as_the_metadata_folder_is_refused() {
     // Each is an ordinary name here, but opens `.forklift` somewhere: a data stream of it and an
     // 8.3 short name on NTFS (listed or hashed), a name holding a code point HFS+ ignores.
     for (index, name) in [".forklift::$INDEX_ALLOCATION", ".forklift:x", ".fork\u{200C}lift", "\u{FEFF}.forklift",
-        "FORKLI~1", "forkli~4.", ".ForkLift\u{206F} ", "FOCBB9~1", "focbb9~7", "Foc~12"].into_iter().enumerate()
+        "FORKLI~1", "forkli~4.", ".ForkLift\u{206F} ", "FOCBB9~1", "focbb9~7", "Focbb~10", "foc~1234"].into_iter().enumerate()
     {
         let warehouse = Warehouse::new(&format!("metadata-alias-{}", index));
         warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
@@ -225,7 +225,8 @@ fn a_root_entry_some_file_system_opens_as_the_metadata_folder_is_refused() {
 fn a_root_entry_that_only_resembles_a_metadata_alias_still_shifts() {
     // The positive twin: names one step from an alias are ordinary on every file system.
     for (index, name) in ["forkli~5", "forkli~0", "forkli~12", "FORKLIF~1", "forklift", ".forklifts",
-        ".fork-lift", "x:.forklift", "focbb8~1", "focbb9~0", "focbb9~123", "~1"].into_iter().enumerate()
+        ".fork-lift", "x:.forklift", "focbb8~1", "focbb9~0", "focbb9~123", "~1", "f~1", "foc~1",
+        "focbb~1"].into_iter().enumerate()
     {
         #[cfg(windows)]
         if name.contains(':') {
