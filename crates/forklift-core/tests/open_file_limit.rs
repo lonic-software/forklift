@@ -16,8 +16,9 @@ fn a_low_open_file_limit_is_raised() {
         limit
     };
     let inherited = read();
-    raise_open_file_limit();
+    let reported = raise_open_file_limit();
     let original = read();
+    assert_eq!(reported, Some(u64::from(original.rlim_cur)), "the raise reports the limit in force");
     assert!(original.rlim_cur >= inherited.rlim_cur, "a raise never lowers the limit");
 
     let low = original.rlim_cur.min(1024);
@@ -28,8 +29,9 @@ fn a_low_open_file_limit_is_raised() {
     lowered.rlim_cur = low;
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
 
-    raise_open_file_limit();
+    let reported = raise_open_file_limit();
 
     let raised = read().rlim_cur;
     assert!(raised > low, "the soft limit was raised above {}: it is {}", low, raised);
+    assert_eq!(reported, Some(u64::from(raised)), "the raise reports the limit now in force");
 }

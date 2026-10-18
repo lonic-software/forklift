@@ -34,7 +34,9 @@ single warehouse at `/v1/…` (`--root`) or a folder of warehouses at
 administrative operation outside the `/v1` protocol surface: idempotent (`201`
 created, `200` already present), refused with `403` on servers without authentication
 configured (an open server must not be a junk farm), `422` for invalid ids (a single
-safe path component: ASCII letters, digits, `.`, `_`, `-`; no leading `.` or `-`).
+safe path component: ASCII letters, digits, `.`, `_`, `-`; no leading `.` or `-`), and `409`
+when something that is not a warehouse already holds the id. Of concurrent creations of one new
+id, exactly one answers `201`.
 
 **Authentication** is optional and out of protocol scope beyond the carrier: when a
 remote requires it, the client sends `Authorization: Bearer <token>` on every request.

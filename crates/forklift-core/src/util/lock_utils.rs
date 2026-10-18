@@ -14,6 +14,10 @@ const FILE_NAME_SERVE_LOCK: &str = "serve.lock";
 /// The name of the store-access lock sidecar (inside the forklift root folder). Never deleted.
 const FILE_NAME_STORE_ACCESS_LOCK: &str = "store-access.lock";
 
+/// The name of the base-folder lock sidecar of a multi-warehouse server (inside the base folder).
+/// Never deleted. It starts with a dot, which no warehouse id may, so it is never served as one.
+pub const FILE_NAME_BASE_SERVE_LOCK: &str = ".forklift-server.lock";
+
 /// An exclusive lock on the warehouse, held for the duration of a mutating command.
 ///
 /// This is the staging-area atomicity story (see the design document): commands that
@@ -166,7 +170,8 @@ impl Drop for ServeLock {
 ///   `scope-prune`, which host deleters (a process's own shared hold refuses its own exclusive
 ///   try). Taken right after the bay lock, so the order is always bay lock first and no cycle is
 ///   possible; released before auto-maintenance, which may repack.
-/// * **shared, try** — a server, for every warehouse it serves, for the handle's lifetime; and
+/// * **shared, try** — a server, for every warehouse it serves, for as long as it keeps that
+///   warehouse live; and
 ///   incremental compaction (explicit or automatic), which moves loose objects into a pack and
 ///   deletes the loose copies, so it must not interleave with a deleter's loose deletions.
 /// * **exclusive, try** — the deleters, at the deleter itself so no caller can forget it.
@@ -273,13 +278,17 @@ const MACOS_OPEN_MAX: libc::rlim_t = 10240;
 /// `kern.maxfilesperproc`, trying `OPEN_MAX` first when it is above the current limit); never
 /// lowers the limit. Best-effort: a limit that cannot be read or raised is left as it is. A no-op
 /// off Unix, which has no such per-process soft limit.
-pub fn raise_open_file_limit() {
+///
+/// # Returns
+/// The soft limit in force afterwards, or `None` when there is none to read (off Unix, or
+/// `getrlimit` failed).
+pub fn raise_open_file_limit() -> Option<u64> {
     #[cfg(unix)]
     {
         let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: `getrlimit` writes into the `rlimit` it is given and reads nothing else.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-            return;
+            return None;
         }
 
         let hard = limit.rlim_max;
@@ -288,12 +297,15 @@ pub fn raise_open_file_limit() {
         #[cfg(not(target_os = "macos"))]
         let fallback = None;
 
-        largest_accepted_limit(limit.rlim_cur, hard, fallback, |target| {
+        let reached = largest_accepted_limit(limit.rlim_cur, hard, fallback, |target| {
             let raised = libc::rlimit { rlim_cur: target, rlim_max: hard };
             // SAFETY: `setrlimit` only reads the `rlimit` it is given.
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 }
         });
+        Some(u64::from(reached))
     }
+    #[cfg(not(unix))]
+    None
 }
 
 /// The search behind [`raise_open_file_limit`], apart from the kernel so it can be tested against
@@ -332,6 +344,41 @@ fn largest_accepted_limit(current: libc::rlim_t,
     }
 
     accepted
+}
+
+/// The lock a multi-warehouse server holds on its base folder for as long as it runs, so one base
+/// folder is served by at most one server process. Per-warehouse serve locks cannot give that: a
+/// second server on the same base would only collide warehouse by warehouse, and the work a server
+/// does in the base folder itself (warehouse creation, and sweeping what an interrupted creation
+/// left behind) assumes no other server is doing it at the same time.
+///
+/// A *kernel* lock (`File::try_lock`) on a sidecar that is never deleted, like
+/// [`StoreAccessLock`], so a hard-killed server leaves nothing stale that would refuse its restart.
+pub struct BaseServeLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+impl BaseServeLock {
+    /// Take the lock on `base` without waiting.
+    ///
+    /// # Returns
+    /// * `Ok(BaseServeLock)` - The lock (released when dropped).
+    /// * `Err(String)`       - Another server holds it, or the sidecar could not be opened or
+    ///                         locked.
+    pub fn try_acquire(base: &Path) -> Result<BaseServeLock, String> {
+        let path = absolute(base.join(FILE_NAME_BASE_SERVE_LOCK));
+        let file = open_lock_sidecar(&path)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(BaseServeLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "Another forklift server is already serving the warehouses folder \"{}\".",
+                base.to_string_lossy()
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
+    }
 }
 
 /// Open (creating if needed) the store-access sidecar at the current storage root, at an absolute
@@ -565,6 +612,24 @@ mod tests {
     /// one — including when the current limit is already above the fallback, where a search that
     /// started from the fallback would run downward.
     #[cfg(unix)]
+    /// One base folder, one server: a second hold on it is refused while the first lives, and
+    /// taken once it is dropped. The lock is per open file, so this holds within one process too.
+    #[test]
+    fn a_base_folder_serve_lock_admits_one_holder() {
+        let base = std::env::temp_dir().join(format!("forklift-base-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let first = BaseServeLock::try_acquire(&base).unwrap();
+        let refused = BaseServeLock::try_acquire(&base).err().expect("a second holder is refused");
+        assert!(refused.contains("Another forklift server"), "{}", refused);
+
+        drop(first);
+        let _again = BaseServeLock::try_acquire(&base).expect("released with its holder");
+
+        drop(_again);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn the_open_file_search_finds_the_largest_accepted_limit_and_never_lowers() {
         let search = |current, hard, fallback, ceiling| {
