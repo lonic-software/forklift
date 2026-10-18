@@ -198,7 +198,7 @@ isn't sampled on macOS, so wall-clock attribution also came from `hyperfine` A/B
 | Serial per-file render in the worktree and staged modes | most of the 8.5 ms by which `diff --staged` exceeds its `--json` form (loose head after the benchmark's commit rows) | **Fixed:** both modes render through `fanout_map` past 8 files, like the pallet diff. Output is byte-identical, and a file that fails to render still prints every file before it, then the error. | diff --staged 17.5 → 12.5 ms, diff 14.7 → 13.4 ms |
 | Verification of every intermediate base in a delta chain | ~20% of the staged render's main thread (blake3), plus zstd ~13% and delta apply ~14% | **Filed: FORK-188.** It needs a design note: bases enter the shared cache. | up to ~2 ms on diff --staged |
 | One task per directory in the unstaged walk (t/ has 1129 files, the root 531) | walk ~7 ms wall for ~28 ms CPU over 6 P-cores | **Filed: FORK-189.** Measure the critical path first. | up to ~2 ms on stocktake and diff |
-| Residual pack-set open: index reads (~24 MB `read_to_end`) plus the linear validation pass (~0.7 ms) | ~4.4 ms per process wherever it can't overlap (e.g. `diff --staged`, whose first act is reading the head parcel) | **Commented on FORK-118** (lazy or sealed index). | ~3–4 ms on every command that reads an object first |
+| Residual pack-set open: index reads (~24 MB `read_to_end`) plus the linear validation pass (~0.7 ms) | ~4.4 ms per process wherever it can't overlap (e.g. `diff --staged`, whose first act is reading the head parcel) | **Fixed (FORK-118):** index format 3 — a checksummed fanout table; the index is mapped, and a command validates only the buckets it reads. | history -n 1 7.5 → 3.4 ms, diff --staged 7.4 → 3.3 ms |
 | Line interning hasher (`diff::lines`, SipHash) | ~0.2–0.6 ms per 20 files | Not worth a ticket alone. It now runs fanned out, so the wall-clock share is smaller still. | < 0.3 ms |
 
 **FORK-163.** This change covered that ticket's `diff` sites. Its materialize half is the
@@ -210,8 +210,8 @@ FORK-163 section below, and the rest is FORK-192.
 - FORK-182: the stat refresh stocktake never persists, which made copied warehouses rehash
   everything.
 
-No durability barrier or verification step was removed. The radix sort keeps every check
-`validate_index_records` made; the preload reads the same packs, and a failed preload is dropped
+No durability barrier or verification step was removed. The radix sort kept every check
+the then whole-index validation made (FORK-118 has since replaced that pass with per-bucket checks); the preload reads the same packs, and a failed preload is dropped
 so the first real lookup reports it as before.
 
 **After** (`bin/benchmark --repo git`, fresh work dir, 2026-10-18):
@@ -290,43 +290,25 @@ work, a stat-clean worktree read and the other commands' serial loads, is FORK-1
 
 ## Remaining items
 
-With the rollup hash fixed (above), **(b) pack-index validation tax is now the top
-remaining item** — a store-wide read-floor cost, not specific to one command.
+### b. Pack-index validation tax — fixed (FORK-118, 2026-10-18)
 
-### b. Pack-index validation tax
+Every process used to read every pack index in full and validate every record on its first
+packed-object read: ~6.4–6.9 ms warm (up to ~19 ms cold) before FORK-183's radix sort, ~4.4 ms
+after it. Index format 3 adds a fanout table whose entries carry a crc32 of their bucket's
+records. Opening a pack maps its index and checks only the header and the table; a lookup
+validates the one bucket it reads (crc, order, prefix, bounds) and caches the verdict. A corrupt
+bucket makes only its own prefix unreadable. Consumers that read every record — transport import,
+`compact --all`, `store` — validate the whole index, tiling included, first.
 
-**Update (FORK-183, 2026-10-17).** The comparison sort inside `validate_index_records` was most
-of this cost (5.1 of 5.8 ms on git.git) and is now a radix sort. Opening the whole pack set still
-costs ~4.4 ms per process, mostly reading the indexes; `stocktake` and `diff` now overlap it with
-their walks. What remains is FORK-118's design item.
+**Measured** (git.git, densified, 5 packs / 409k objects, hyperfine, release, c245fcf → this
+change):
 
-**Symptom.** ~6.4–6.9 ms warm (up to ~19 ms cold) added to **every** command that
-touches a packed object — which, on a densified store, is nearly every command.
-
-**Root cause.** `load_pack_pair`
-(`crates/forklift-core/src/util/pack_utils.rs:563-606`) calls
-`validate_index_records` — a linear scan over all ~403k index records on git.git —
-the first time a process touches a given pack. This is a per-*process* cost (the
-pack registry caches the loaded pack for the rest of that invocation, but a fresh
-CLI process pays it again), so it recurs on every single-shot command a user or
-script runs.
-
-**Direction (all store-wide design, not command-specific — benefits everything).**
-Several options, none evaluated in depth yet:
-
-- A lazily-validated or self-checksummed index format, so a read only validates the
-  record it actually touches rather than the whole index up front.
-- An mmap'd index that is trusted after a one-time "seal" (e.g. a whole-index hash
-  checked once when the pack is written or repacked, so a later open only needs to
-  check that seal, not walk every record).
-- Persistent warm state across invocations (a resident daemon or a cached
-  validation result keyed by pack identity) — a bigger architectural change, and in
-  tension with forklift's current all-state-on-disk, no-daemon design.
-
-**Effect.** Not attributable to one command — it is a fixed tax on every packed-object
-read, so fixing it moves the floor for `history`, `diff`, `stack`, `stocktake` and
-everything else at once. Worth prioritizing behind (a) mainly because it needs its
-own design pass on the index format, which is a bigger lift than a code-only fix.
+| Command | Before | After |
+|---------|--------|-------|
+| `history -n 1` | 7.5 ms | 3.4 ms (`palletize`, which reads no object: 3.3 ms) |
+| `diff --staged` | 7.4 ms | 3.3 ms |
+| `stocktake` | 11.5 ms | 10.7 ms |
+| `store` | 15.0 ms | 17.4 ms — the census now checks every bucket's crc and the tiling |
 
 ### c. History walk memory at scale (minor)
 

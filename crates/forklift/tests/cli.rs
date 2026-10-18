@@ -2718,6 +2718,55 @@ fn pack_counts(output: &Output) -> (u64, u64) {
     (count("pack-set-reads: "), count("pack-preloads: "))
 }
 
+/// The lazy pack-index counters of a run: (index buckets validated, whole packs validated).
+fn index_validation_counts(output: &Output) -> (u64, u64) {
+    let stderr = stderr(output);
+    let count = |prefix: &str| stderr.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("no {} line in stderr: {}", prefix, stderr))
+        .trim().parse::<u64>().unwrap();
+
+    (count("pack-buckets-validated: "), count("pack-full-validations: "))
+}
+
+/// (FORK-118) Opening a pack checks its index header and fanout table, then validates only the
+/// buckets a command reads: `history -n 1` over two packs of hundreds of objects each validates a
+/// handful of buckets and no whole pack. A full repack, which copies every record, validates each
+/// pack it reads in full exactly once.
+///
+/// Mutations: make `CheckedIndex::locate` validate every bucket → 32 buckets (red). Load the pack
+/// registry with `IndexCheck::Full` → two whole-pack validations for `history` (red).
+#[test]
+fn reading_a_pack_validates_only_the_index_buckets_it_touches() {
+    let warehouse = TestWarehouse::new("lazy-pack-index");
+    for round in 0..2 {
+        for index in 0..300 {
+            warehouse.write_file(&format!("r{}/f{:03}.txt", round, index), &format!("round {} file {}\n", round, index));
+        }
+        if round == 0 {
+            assert_success(&warehouse.run(&["prepare"]));
+            configure_operator(&warehouse);
+        }
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("round {}", round)]));
+        assert_success(&warehouse.run(&["compact"]));
+    }
+    let counts = [("FORKLIFT_DEBUG_PACK_COUNTS", "1")];
+
+    let history = warehouse.run_with_env(&["history", "-n", "1"], &counts);
+    assert_success(&history);
+    assert!(stdout(&history).contains("round 1"), "{}", stdout(&history));
+    let (buckets, full) = index_validation_counts(&history);
+    assert_eq!(full, 0, "reading one parcel must not validate a whole pack");
+    // Each pack holds 300+ records over 16 buckets, 32 in all. Each object `history -n 1` looks up
+    // costs at most one bucket per pack, found or not — a whole-index check would cost all 32.
+    assert!((1..=4).contains(&buckets), "one parcel read must validate a few buckets of 32, got {}", buckets);
+
+    let repack = warehouse.run_with_env(&["compact", "--all"], &counts);
+    assert_success(&repack);
+    assert_eq!(index_validation_counts(&repack).1, 2, "a full repack validates each of the two packs once");
+}
+
 /// `diff` opens the pack set during the walk, and only when a change needs an old side read:
 /// the render finds it cached (one read, the preload's), and a walk with nothing to render never
 /// pays for it.

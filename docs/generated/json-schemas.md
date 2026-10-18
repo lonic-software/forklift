@@ -538,6 +538,13 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "unvalidated_packs": {
+      "description": "Packs a full repack left exactly as found because their index failed validation: nothing\nwas copied out of them and they were not deleted. Each entry is the validation error, which\nnames the index file. Always empty without `--all`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -548,7 +555,8 @@ A command not listed here either reports only the generic human-message shape `{
     "deltas",
     "bytes_packed",
     "corrupt_skipped",
-    "over_ceiling_skipped"
+    "over_ceiling_skipped",
+    "unvalidated_packs"
   ],
   "title": "Compacted",
   "type": "object"
@@ -3546,7 +3554,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "object"
     },
     "PackIndexIssue": {
-      "description": "One entry in [`StoreReport::quarantined_packs`]/[`StoreReport::unenumerable_indexes`].",
+      "description": "One entry in any of [`StoreReport`]'s pack problem lists.",
       "properties": {
         "error": {
           "description": "Why it could not be fully trusted.",
@@ -3601,6 +3609,13 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The object-store census. The `Serialize` shape is the public `--json` schema; byte counts\nare exact integers there (the human view renders them in binary units).",
   "properties": {
+    "damaged_packs": {
+      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand an object in a damaged part reads as unverifiable until it is stored again. Empty on a\nhealthy store.",
+      "items": {
+        "$ref": "#/$defs/PackIndexIssue"
+      },
+      "type": "array"
+    },
     "deltas": {
       "description": "Objects stored as deltas across all packs.",
       "format": "uint",
@@ -3610,6 +3625,13 @@ A command not listed here either reports only the generic human-message shape `{
     "densify_suggested": {
       "description": "Whether this store was bulk-ingested (`import-git`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
       "type": "boolean"
+    },
+    "foreign_version_indexes": {
+      "description": "Pack indexes written by a build with another pack format version: every read one might\nanswer fails naming the version. Re-create the warehouse with this build; moving one aside\nwould make its objects read as missing. Empty on a healthy store.",
+      "items": {
+        "$ref": "#/$defs/PackIndexIssue"
+      },
+      "type": "array"
     },
     "loose_bytes": {
       "description": "Total on-disk bytes of the loose objects.",
@@ -3685,7 +3707,9 @@ A command not listed here either reports only the generic human-message shape `{
     "maintenance",
     "densify_suggested",
     "quarantined_packs",
-    "unenumerable_indexes"
+    "damaged_packs",
+    "unenumerable_indexes",
+    "foreign_version_indexes"
   ],
   "title": "StoreReport",
   "type": "object"

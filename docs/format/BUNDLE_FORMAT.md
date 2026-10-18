@@ -28,8 +28,8 @@ EOF
 
 The table is separate from the sections so the reader can validate every declared count and length
 before it copies a byte into quarantine. The current limits are 4,096 packs, approximately 578 MiB
-per data section (the 512 MiB rollover plus one maximum-size object and framing), and 4.8 MiB per
-index. A header newline must occur within 128 bytes. Trailing bytes are rejected.
+per data section (the 512 MiB rollover plus one maximum-size object and framing), and 4,832,792
+bytes per index (the index of a 100,000-object pack, the object-count rollover). A header newline must occur within 128 bytes. Trailing bytes are rejected.
 
 Parcel signature sidecars remain a separate envelope section because they are addressed by the
 parcel they sign rather than by their own content hash. They retain their existing sidecar storage
@@ -41,11 +41,11 @@ The data section is byte-for-byte a Forklift pack data file:
 
 ```text
 magic       8 bytes   FORKPACK
-version     u32 LE    currently 2
+version     u32 LE    currently 3
 records     concatenated native records
 ```
 
-Version-2 native records are:
+Native records are:
 
 ```text
 full:   kind 0x00 | zstd(object bytes)
@@ -56,14 +56,26 @@ delta:  kind 0x01 | base hash[32 raw bytes] | target length[VLQ] |
 The accompanying index section is byte-for-byte a Forklift pack index:
 
 ```text
-magic       8 bytes   FORKPIDX
-version     u32 LE    must match the data version
-count       u32 LE
-entries     count × (object hash[32 raw bytes], offset u64 LE, length u64 LE)
+magic        8 bytes   FORKPIDX
+version      u32 LE    3, and must match the data version
+count        u32 LE
+fanout_bits  u8        at most 20
+reserved     3 bytes   zero
+header_crc   u32 LE    crc32 over the 20 bytes above, then the whole fanout table
+fanout       2^fanout_bits × (end u32 LE, crc u32 LE)
+entries      count × (object hash[32 raw bytes], offset u64 LE, length u64 LE)
 ```
 
+The file is exactly `24 + 8 × 2^fanout_bits + 48 × count` bytes. Fanout bucket `b` holds the entries
+whose hash's top `fanout_bits` bits equal `b`; its `end` is the number of entries in buckets `0..=b`
+(so the ends never decrease and the last equals `count`), and its `crc` is the crc32 of those
+entries' bytes. Writers pick the smallest `fanout_bits` that keeps the average bucket at 32 entries
+or fewer. Readers refuse any other version by name.
+
 Index entries are strictly sorted by hash for binary search. Their record ranges must be non-empty,
-in bounds, non-overlapping, and together cover every byte after the data header exactly once. Pack
+in bounds, non-overlapping, and together cover every byte after the data header exactly once. A
+local reader checks a bucket's crc, order, prefix and bounds the first time it reads it; import
+checks every bucket and the whole tiling before it trusts any entry. Pack
 filenames are derived from the sorted `(hash, offset, length)` layout, the same as packs produced by
 local `compact`.
 

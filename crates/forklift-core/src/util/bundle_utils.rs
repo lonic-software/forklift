@@ -1366,6 +1366,46 @@ mod tests {
         assert!(fixture.hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
     }
 
+    /// (FORK-118) The largest pack a writer produces — exactly `PACK_ROLLOVER_OBJECTS` records,
+    /// so its index is exactly the transport cap — round-trips through a native bundle: the cap
+    /// admits it, import validates every bucket and the tiling, and every object lands.
+    ///
+    /// Mutation: compute `MAX_TRANSPORT_INDEX_BYTES` for one record fewer → the full pack's index no
+    /// longer equals the cap (red), so the import would refuse it as over the cap.
+    #[test]
+    fn a_full_rollover_pack_round_trips_through_a_native_bundle() {
+        let count = pack_utils::PACK_ROLLOVER_OBJECTS;
+        let hashes: Vec<String> = (0..count)
+            .map(|index| object_utils::hash_object_bytes(format!("rollover {}", index).as_bytes()))
+            .collect();
+
+        let bundle = {
+            let source = Scratch::new("bundle-rollover-src");
+            let staging = source.root.join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            let mut builder = pack_utils::TransportPackBuilder::new(&staging).unwrap();
+            for (index, hash) in hashes.iter().enumerate() {
+                builder.append_full(hash, format!("rollover {}", index).as_bytes()).unwrap();
+            }
+            let artifacts = builder.finish().unwrap();
+            assert_eq!(artifacts.len(), 1, "exactly the rollover count fits one pack");
+            assert_eq!(artifacts[0].index_path.metadata().unwrap().len(), pack_utils::MAX_TRANSPORT_INDEX_BYTES,
+                "a full pack's index is exactly the transport cap");
+
+            let signatures = staging.join("signatures");
+            std::fs::write(&signatures, b"").unwrap();
+            let bundle_path = source.root.join("rollover.bundle");
+            write_native_bundle(&bundle_path, &artifacts, &signatures, 0).unwrap();
+            std::fs::read(&bundle_path).unwrap()
+        };
+
+        let _destination = Scratch::new("bundle-rollover-dst");
+        import_bundle_bytes(&bundle).unwrap();
+        for hash in [&hashes[0], &hashes[count / 2], &hashes[count - 1]] {
+            assert!(file_utils::does_object_exist(hash).unwrap(), "{} must land", hash);
+        }
+    }
+
     /// Build a one-parcel/one-blob warehouse's native bundle in its own scratch, returning the
     /// bundle bytes, the signed parcel's hash and the blob's hash.
     fn build_tiny_native_bundle(name: &str) -> (Vec<u8>, String, String) {

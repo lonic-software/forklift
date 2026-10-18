@@ -37,6 +37,7 @@ pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
         bytes_packed: stats.bytes_packed,
         corrupt_skipped: stats.corrupt_skipped,
         over_ceiling_skipped: stats.over_ceiling_skipped,
+        unvalidated_packs: stats.unvalidated_packs,
     });
 
     Ok(())
@@ -72,6 +73,11 @@ pub(crate) struct Compacted {
     /// legitimate objects authored before that ceiling existed, not corruption; left in place
     /// rather than packed or removed.
     over_ceiling_skipped: usize,
+
+    /// Packs a full repack left exactly as found because their index failed validation: nothing
+    /// was copied out of them and they were not deleted. Each entry is the validation error, which
+    /// names the index file. Always empty without `--all`.
+    unvalidated_packs: Vec<String>,
 }
 
 impl Compacted {
@@ -83,6 +89,18 @@ impl Compacted {
                 "Skipped {} corrupt loose object{} — left in place. Run 'forklift audit' to check the store.",
                 self.corrupt_skipped,
                 if self.corrupt_skipped == 1 { "" } else { "s" },
+            );
+        }
+    }
+
+    /// Warn about packs a repack left in place because their index failed validation — shared by
+    /// both render paths.
+    fn print_unvalidated_packs_note(&self) {
+        for error in &self.unvalidated_packs {
+            println!(
+                "Left a pack in place, not repacked: {} Its sound parts are still read; an object in a \
+                damaged part reads as unverifiable until it is stored again.",
+                error
             );
         }
     }
@@ -112,6 +130,7 @@ impl CommandOutput for Compacted {
             println!("{}", nothing);
             self.print_corrupt_skipped_note();
             self.print_over_ceiling_skipped_note();
+            self.print_unvalidated_packs_note();
             return;
         }
 
@@ -136,6 +155,7 @@ impl CommandOutput for Compacted {
 
         self.print_corrupt_skipped_note();
         self.print_over_ceiling_skipped_note();
+        self.print_unvalidated_packs_note();
     }
 }
 

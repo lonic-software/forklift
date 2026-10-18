@@ -1368,6 +1368,12 @@ allowed; the automatic repack simply waits until the root is no longer served. A
 hard-killed leaves its `serve.lock` behind, which blocks repacks (automatic ones silently) until
 it is removed, exactly as it blocks `gc`.
 
+A full repack checks each pack's whole index before copying anything out of it. A pack whose
+index fails that check is **left in place, untouched**, and named in a `Left a pack in place, not
+repacked:` note (`--json`: `unvalidated_packs`, the list of those errors). Its sound parts are still
+read; an object in a damaged part reads as unverifiable until it is stored again. Ordinary commands never pay that
+whole-index check: they verify only the slice of an index they actually read.
+
 For the same reason a full repack is **refused while a mutating command is running in another
 bay** of the same warehouse: that command may have just decided to reuse an object the repack
 was about to drop. Run it again once the other command finishes. The opposite case waits
@@ -1426,20 +1432,27 @@ Object store
 
 `--json` reports `{loose_objects, loose_bytes, packed_objects, pack_files, deltas, pack_bytes,
 total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
-pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_packs, unenumerable_indexes}`
+pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_packs, damaged_packs,
+unenumerable_indexes, foreign_version_indexes}`
 — every size an exact byte count. Nothing is written; run `compact` to act on what it reports.
 `densify_suggested` (and, in the human view, a one-line tip) appears once the store was
 bulk-ingested (`import-git` or a franchise's bundle install) and clears once a `compact --all
 --redelta` pass has run (see [`--redelta`](#compact--pack-the-object-store)).
 
-`quarantined_packs` and `unenumerable_indexes` are ordinarily both empty. A pack pair loses its
+The four problem lists are ordinarily all empty. A pack pair loses its
 data file only in unusual circumstances (a file removed by hand, a partial restore); when that
 happens, `store` lists it under `quarantined_packs` — `[{index_path, error}]` — rather than
 failing the census: the objects it named are not lost, only unreachable through that copy, and
-`heal` can refetch them from a configured remote. `unenumerable_indexes` — the same `[{index_path,
+`heal` can refetch them from a configured remote. `store` checks every index in full: a pack whose
+index is damaged in places is listed under `damaged_packs` (same shape) and left out of the counts.
+Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable until
+it is stored again. `unenumerable_indexes` — the same `[{index_path,
 error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
 is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
-aside and re-run. In the human view both appear as a `pack problems:` section, only when non-empty.
+aside and re-run. `foreign_version_indexes` (same shape) lists an index written by a build with a
+different pack format, naming its version. Every read it might answer fails with that error rather
+than reporting the object missing, so re-create the warehouse with this build — do not move the
+file aside, which would make its objects read as missing. In the human view all four appear as a `pack problems:` section, only when non-empty.
 
 ### `heal` — resolve a standing durability taint
 
@@ -1508,11 +1521,12 @@ refusal before ever reaching its own fetch):
 every other command refuses first, precisely so nothing durable is ever recorded on top of
 unproven state.
 
-Every `heal` run also checks the pack registry for the same quarantined/unenumerable indexes
-`store` reports (see above) and prints a warning line for each one it finds — unconditionally,
-whether or not anything else was tainted this run, and whether or not that index is what caused
-the taint. A quarantined index's objects are left recoverable (`heal` can refetch them); an
-unenumerable one names the file to move aside. This appears even when `heal` still has to refuse
+Every `heal` run also checks the pack folder for the same problem indexes `store` reports (see
+above) and prints a warning line for each one it finds — unconditionally, whether or not anything
+else was tainted this run, and whether or not that index is what caused the taint. A quarantined
+index's objects are left recoverable (`heal` can refetch them); a damaged pack still serves its
+sound parts; an index of another format means re-creating the warehouse; an unenumerable one names
+the file to move aside. This appears even when `heal` still has to refuse
 on an unrelated dangling reference — as a clearly-separated "Pack index problems (unrelated to
 this refusal, clear them separately)" section, never as though it were the cause of the refusal —
 since a broken pack index is inert on its own and the only time it coincides with a refusal is

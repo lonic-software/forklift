@@ -1998,7 +1998,7 @@ fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// cache. The uncached body of [`retrieve_object_by_hash`].
 ///
 /// Packs are consulted *first*: locating an object in a pack is a syscall-free binary search of
-/// the resident index, so once a warehouse is compacted (the common case at scale — most objects
+/// one bucket of the mapped index, so once a warehouse is compacted (the common case at scale — most objects
 /// are packed) a read is served without the guaranteed-to-fail loose `open` it used to pay on
 /// every packed object. The loose store is the fallback for an object written but not yet packed.
 ///

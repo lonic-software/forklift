@@ -46,12 +46,20 @@ pub(crate) struct StoreReport {
     /// objects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a
     /// healthy store.
     quarantined_packs: Vec<PackIndexIssue>,
+    /// Packs that load but whose index is damaged in places: their sound parts are still read,
+    /// and an object in a damaged part reads as unverifiable until it is stored again. Empty on a
+    /// healthy store.
+    damaged_packs: Vec<PackIndexIssue>,
     /// Pack index files that could not even be parsed — move the file aside and
     /// re-run. Empty on a healthy store.
     unenumerable_indexes: Vec<PackIndexIssue>,
+    /// Pack indexes written by a build with another pack format version: every read one might
+    /// answer fails naming the version. Re-create the warehouse with this build; moving one aside
+    /// would make its objects read as missing. Empty on a healthy store.
+    foreign_version_indexes: Vec<PackIndexIssue>,
 }
 
-/// One entry in [`StoreReport::quarantined_packs`]/[`StoreReport::unenumerable_indexes`].
+/// One entry in any of [`StoreReport`]'s pack problem lists.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct PackIndexIssue {
@@ -120,7 +128,15 @@ impl From<StoreStatus> for StoreReport {
                 index_path: p.index_path,
                 error: p.error,
             }).collect(),
+            damaged_packs: status.damaged_packs.into_iter().map(|p| PackIndexIssue {
+                index_path: p.index_path,
+                error: p.error,
+            }).collect(),
             unenumerable_indexes: status.unenumerable_indexes.into_iter().map(|p| PackIndexIssue {
+                index_path: p.index_path,
+                error: p.error,
+            }).collect(),
+            foreign_version_indexes: status.foreign_version_indexes.into_iter().map(|p| PackIndexIssue {
                 index_path: p.index_path,
                 error: p.error,
             }).collect(),
@@ -173,19 +189,29 @@ impl CommandOutput for StoreReport {
             println!("{}", output::DENSIFY_TIP);
         }
 
-        // FORK-47: surfaced unconditionally whenever either list is non-empty — never silent.
-        if !self.quarantined_packs.is_empty() || !self.unenumerable_indexes.is_empty() {
+        // FORK-47: surfaced unconditionally whenever any list is non-empty — never silent.
+        let problems = [&self.quarantined_packs, &self.damaged_packs, &self.unenumerable_indexes, &self.foreign_version_indexes];
+        if problems.iter().any(|list| !list.is_empty()) {
             println!();
             println!("  pack problems:");
             for issue in &self.quarantined_packs {
                 println!("    quarantined:   \"{}\" — {}", issue.index_path, issue.error);
             }
+            for issue in &self.damaged_packs {
+                println!("    damaged:       \"{}\" — {}", issue.index_path, issue.error);
+            }
             for issue in &self.unenumerable_indexes {
                 println!("    unenumerable:  \"{}\" — {}", issue.index_path, issue.error);
             }
+            for issue in &self.foreign_version_indexes {
+                println!("    other format:  \"{}\" — {}", issue.index_path, issue.error);
+            }
             println!(
-                "    quarantined objects are recoverable via \"forklift heal\"; an unenumerable \
-                index should be moved aside, then re-run."
+                "    quarantined objects are recoverable via \"forklift heal\"; a damaged pack's \
+                sound parts are still read, and an object in a damaged part reads as unverifiable \
+                until it is stored again; an unenumerable index should be moved aside, then re-run; \
+                an index of another format means re-creating the warehouse with this build (moving \
+                it aside would make its objects read as missing)."
             );
         }
     }
