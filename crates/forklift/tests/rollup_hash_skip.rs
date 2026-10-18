@@ -459,6 +459,43 @@ fn a_no_op_load_dot_preserves_every_rollup_and_a_later_stack_still_skips() {
         "a stack after a no-op load must still skip the untouched sibling subtree");
 }
 
+/// `restore` writes each file back to the blob already staged for it, so the staged content —
+/// and every rollup over it — is unchanged: only the entries' stat data is refreshed.
+#[test]
+fn restore_dot_preserves_every_rollup_and_a_later_stocktake_still_skips() {
+    let warehouse = Warehouse::new("restore-preserves", false);
+    warehouse.prepare();
+
+    warehouse.write_file("a/b/c/file.txt", "deep v1\n");
+    warehouse.write_file("a/b/c/other.txt", "other v1\n");
+    warehouse.write_file("sibling/file.txt", "sibling v1\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "base"]);
+
+    let keys = ["", "a", "a/b", "a/b/c", "sibling"];
+    let before: Vec<Option<String>> = keys.iter().map(|key| shard_rollup(&warehouse, key)).collect();
+    for (key, rollup) in keys.iter().zip(&before) {
+        assert!(rollup.is_some(), "\"{key}\" must be stamped after the base stack");
+    }
+
+    warehouse.write_file("a/b/c/file.txt", "deep edited\n");
+    warehouse.write_file("sibling/file.txt", "sibling edited\n");
+    warehouse.run_ok(&["restore", "."]);
+
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a/b/c/file.txt")).unwrap(), "deep v1\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("sibling/file.txt")).unwrap(), "sibling v1\n");
+
+    for (key, rollup) in keys.iter().zip(&before) {
+        assert_eq!(&shard_rollup(&warehouse, key), rollup, "restore must keep the rollup of \"{key}\"");
+    }
+
+    let mut command = warehouse.command(&["stocktake"]);
+    command.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert!(skip_count(&output) >= 1, "a stocktake after restore must still skip the restored subtrees");
+}
+
 #[test]
 fn load_dot_after_a_deep_edit_invalidates_only_the_changed_spine() {
     let warehouse = Warehouse::new("load-dot-spine", false);

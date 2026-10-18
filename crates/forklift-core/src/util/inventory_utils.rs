@@ -965,6 +965,158 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
     phase_b_batch.finish()
 }
 
+/// One shard a [`ShardMutationBatch`] has touched: the bytes it read on first touch (`None` when
+/// the shard did not exist yet), the effective content those bytes parsed to, the in-memory copy
+/// every later change applies to, and the timestamp it will be published at.
+struct TouchedShard {
+    original_bytes: Option<Vec<u8>>,
+    original_content: Option<EffectiveContent>,
+    inventory: Inventory,
+    verified_at: std::time::SystemTime,
+}
+
+/// A shard's effective content: every entry's name, hash, type and state — exactly what a
+/// rollup hash depends on, and nothing a stat refresh changes.
+type EffectiveContent = Vec<(String, String, DirEntryType, InventoryItemState)>;
+
+fn effective_content(inventory: &Inventory) -> EffectiveContent {
+    inventory.get_items()
+        .map(|(name, item)| (name.clone(), item.hash.clone(), item.item_type, item.state))
+        .collect()
+}
+
+/// Many shard edits from one single-threaded operation, published together as one
+/// [`publish_shard_outcomes`] call — the third producer of [`ShardOutcome`]s, beside `load`'s walk
+/// and `park`'s refresh — instead of one [`update_shard`] (and so one ancestor-clear barrier, one
+/// shard write and one metadata rewrite) per edited entry.
+///
+/// [`update`](Self::update) reads a shard on its first touch and applies every later change for
+/// the same key to the same in-memory copy; nothing reaches disk before [`publish`](Self::publish).
+/// Each shard is then a [`ShardOutcome::Changed`] if its effective content (any entry's
+/// name/hash/type/state) differs from what was read, or the shard is new, and a
+/// [`ShardOutcome::Carry`] otherwise — so a pure stat refresh, such as `restore` writing a file
+/// back to the blob it already has staged, keeps every rollup above it.
+///
+/// Each shard is published at the moment of its first touch, captured before it is read: never
+/// later than the moment one [`update_shard`] per change would have published it, so
+/// `is_entry_unchanged`'s `mtime < shard_mtime` trust covers no entry the per-change funnel would
+/// not have covered — see [`save_inventory_deferred_with_mtime`]. That holds only while a caller
+/// keeps the order it had with `update_shard`: stat a file right after writing it, then
+/// `update`. Writing many files first and statting them later would record an edit made in
+/// between against the hash the caller wrote, and trust it.
+///
+/// Every blob a change makes an entry name must already be durable before `publish`, as
+/// [`publish_shard_outcomes`] requires.
+pub struct ShardMutationBatch {
+    shards: BTreeMap<String, TouchedShard>,
+}
+
+impl ShardMutationBatch {
+    pub fn new() -> ShardMutationBatch {
+        ShardMutationBatch { shards: BTreeMap::new() }
+    }
+
+    /// Apply `change` to the shard at `key`, reading it first if this batch has not touched it
+    /// yet. A `change` that fails leaves the shard as it was before this call.
+    ///
+    /// # Arguments
+    /// * `key`    - The warehouse path key of the shard.
+    /// * `change` - The change to apply to the inventory.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If the change was applied in memory.
+    /// * `Err(String)` - If the shard could not be read or parsed, or `change` failed.
+    pub fn update(&mut self,
+                  key: &str,
+                  change: impl FnOnce(&mut Inventory) -> Result<(), String>) -> Result<(), String> {
+        if !self.shards.contains_key(key) {
+            // Before the read, and before anything `change` stats — see the type's doc comment.
+            let verified_at = std::time::SystemTime::now();
+            let (_, original_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+            let inventory = match &original_bytes {
+                Some(bytes) => parser::inventory::inventory_parser::parse_inventory(bytes)
+                    .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?,
+                None => Inventory::new(),
+            };
+
+            let original_content = original_bytes.as_ref().map(|_| effective_content(&inventory));
+
+            self.shards.insert(key.to_string(), TouchedShard { original_bytes, original_content, inventory, verified_at });
+        }
+
+        let shard = self.shards.get_mut(key).unwrap();
+        let mut candidate = shard.inventory.clone();
+
+        change(&mut candidate)?;
+
+        shard.inventory = candidate;
+
+        Ok(())
+    }
+
+    /// Publish every touched shard, then register any key the metadata does not list yet.
+    ///
+    /// Each shard is re-read first, under `SHARD_MUTATION_LOCK`: if any changed on disk since this
+    /// batch read it, nothing is published and an error is returned — the batch would otherwise
+    /// overwrite that change, or carry a rollup decided against bytes no longer there. Within a
+    /// command (which holds the warehouse lock) that can only be a caller writing a touched shard
+    /// some other way before publishing.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Every touched shard is durably published and registered.
+    /// * `Err(String)` - If a shard changed underneath the batch, or the publish failed; no shard
+    ///                   of this batch may then be treated as published.
+    pub fn publish(self) -> Result<(), String> {
+        if self.shards.is_empty() {
+            return Ok(());
+        }
+
+        let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
+        let mut clear_keys: BTreeSet<String> = BTreeSet::new();
+
+        for (key, shard) in self.shards {
+            let (_, current_bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
+
+            if current_bytes != shard.original_bytes {
+                return Err(format!(
+                    "The inventory of folder \"{}\" changed while it was being updated; nothing was \
+                    written. Run the command again.",
+                    load_guard_utils::display_path(&key)
+                ));
+            }
+
+            let mut inventory = shard.inventory;
+
+            if shard.original_content.as_ref() == Some(&effective_content(&inventory)) {
+                outcomes.insert(key, ShardOutcome::Carry(inventory, shard.verified_at));
+            } else {
+                inventory.set_rollup_hash(None);
+                clear_keys.extend(ancestor_keys_root_first(&key));
+                outcomes.insert(key, ShardOutcome::Changed(inventory, shard.verified_at));
+            }
+        }
+
+        publish_shard_outcomes(&clear_keys, &mut outcomes)?;
+
+        let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+        let metadata = metadata_opt.unwrap_or_default();
+
+        let unregistered: BTreeSet<String> = outcomes.keys()
+            .filter(|key| !metadata.contains(&key_to_metadata_entry(key)))
+            .cloned()
+            .collect();
+
+        if unregistered.is_empty() {
+            return Ok(());
+        }
+
+        update_inventory_metadata(&unregistered, &BTreeSet::new())
+    }
+}
+
 /// A task for building an inventory file for a given directory.
 /// When encountering a subdirectory, a new task is created to build the inventory for that directory.
 ///
@@ -2912,6 +3064,126 @@ mod tests {
         let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
         let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
         inventory.get_rollup_hash().cloned()
+    }
+
+    /// A stamped chain `""` → `a` → `a/b`, plus a stamped sibling `x`, all registered.
+    fn stamped_chain_with_sibling() {
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+
+        for key in ["", "a", "a/b", "x"] {
+            write_stamped_shard(key, Some("rollup"));
+            metadata.insert(key_to_metadata_entry(key));
+        }
+
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+    }
+
+    #[test]
+    fn a_batch_that_only_refreshes_stat_data_keeps_every_rollup() {
+        let _scratch = Scratch::new("batch-carry");
+        stamped_chain_with_sibling();
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("a/b", |inventory| {
+            inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+        batch.publish().unwrap();
+
+        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key("a/b").unwrap();
+        let shard = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+        assert_eq!(shard.get_item_by_name("file.txt").unwrap().inode, 7, "the stat refresh must be published");
+
+        for key in ["", "a", "a/b", "x"] {
+            assert_eq!(read_rollup(key).as_deref(), Some("rollup"),
+                "a stat-only refresh must keep the rollup of \"{key}\"");
+        }
+    }
+
+    #[test]
+    fn a_batch_that_changes_content_clears_the_shard_and_its_ancestors_only() {
+        let _scratch = Scratch::new("batch-changed");
+        stamped_chain_with_sibling();
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("a/b", |inventory| {
+            inventory.add_item(item("file.txt", 1, InventoryItemState::FirstParentConflict));
+            Ok(())
+        }).unwrap();
+        batch.publish().unwrap();
+
+        for key in ["", "a", "a/b"] {
+            assert_eq!(read_rollup(key), None, "a state change must clear the rollup of \"{key}\"");
+        }
+        assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "an unrelated sibling must keep its rollup");
+    }
+
+    #[test]
+    fn a_batch_registers_a_shard_it_created() {
+        let _scratch = Scratch::new("batch-new-shard");
+        stamped_chain_with_sibling();
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("a/b/new", |inventory| {
+            inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+        batch.publish().unwrap();
+
+        assert!(is_tracked_directory("a/b/new").unwrap(), "a shard the batch created must be registered");
+        assert_eq!(read_rollup("a"), None, "a new shard is a content change for its ancestors");
+    }
+
+    #[test]
+    fn a_batch_refuses_to_publish_over_a_shard_rewritten_since_it_was_read() {
+        let _scratch = Scratch::new("batch-guard");
+        stamped_chain_with_sibling();
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("x", |inventory| {
+            inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+        batch.update("a/b", |inventory| {
+            inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+
+        // Someone else rewrites a touched shard before the batch publishes.
+        update_shard("a/b", |inventory| {
+            inventory.add_item(item("other.txt", 9, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+        let (_, rewritten) = file_utils::retrieve_inventory_or_none_by_key("a/b").unwrap();
+        let (_, sibling_before) = file_utils::retrieve_inventory_or_none_by_key("x").unwrap();
+
+        let error = batch.publish().unwrap_err();
+        assert!(error.contains("changed while it was being updated"), "unexpected error: {error}");
+
+        let (_, after) = file_utils::retrieve_inventory_or_none_by_key("a/b").unwrap();
+        assert_eq!(after, rewritten, "the other writer's change must not be overwritten");
+        let (_, sibling_after) = file_utils::retrieve_inventory_or_none_by_key("x").unwrap();
+        assert_eq!(sibling_after, sibling_before, "no shard of a refused batch may be published");
+    }
+
+    #[test]
+    fn a_failed_batch_change_leaves_the_shard_as_it_was() {
+        let _scratch = Scratch::new("batch-failed-change");
+        stamped_chain_with_sibling();
+
+        let mut batch = ShardMutationBatch::new();
+        let error = batch.update("a/b", |inventory| {
+            inventory.add_item(item("half.txt", 3, InventoryItemState::Normal));
+            Err("stat failed".to_string())
+        }).unwrap_err();
+        assert_eq!(error, "stat failed");
+        batch.publish().unwrap();
+
+        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key("a/b").unwrap();
+        let shard = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+        assert!(shard.get_item_by_name("half.txt").is_none(), "a failed change must not be published");
+        assert_eq!(read_rollup("a").as_deref(), Some("rollup"), "a failed change must clear nothing");
     }
 
     #[test]
