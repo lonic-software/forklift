@@ -484,12 +484,17 @@ itself as well as the findings.
      first occurrence of a given hash in a batch ever stages anything; a 50-occurrence regression
      test (`store_deferred_dedupes_repeated_identical_content_within_one_batch`) failed with 50
      staged temps before the fix, passes with exactly 1 after.
-2. **`consolidate`/cherry-pick's per-merge-action funnel** (`apply_merge_action`) —
-   measured ~9.1 ms/action; a 50-action merge is ≈570 ms, confirming this doc's
-   original ~100-barrier prediction. Needs the phased join-point shape (a shared
-   phase-A ancestor-clears sub-barrier, a shared phase-B content-writes
-   sub-barrier; the two phases must never merge into one). Medium risk — the
-   busiest write path — so needs adversarial review. Queued for PR B.
+2. **FIXED (FORK-196, FORK-112 slice 3). `consolidate`/cherry-pick's per-merge-action
+   funnel** (`apply_merge_action`) — measured ~9.1 ms/action; a 50-action merge was ≈570 ms,
+   confirming this doc's original ~100-barrier prediction. Every merge action now stages
+   through one `ShardMutationBatch` (see item 4), published before the caller records the
+   merge as in progress; the barrier count no longer grows with the action count. bench112,
+   50 actions over 5 directories: `consolidate` 882 → 85 ms; 30-action `cherry-pick`
+   556 → 78 ms. A `Merged` action still stores its blob durably, one barrier each, rather than
+   into one write batch finished before the publish: the batch can publish early (a key that
+   may alias one it already touched), and every blob it names must be durable by then. A
+   failure after the working directory was rewritten publishes what was applied, records
+   nothing as in progress, and says what is staged.
 3. **FIXED (PR A, hardened by review round 2). `park` push** — ~8.9 ms/changed file
    across three unbatched layers: the per-file blob store inside
    `refresh_tracked_entries`, the per-directory tree-object store inside
@@ -576,7 +581,7 @@ itself as well as the findings.
      parcel leaves the parked list; the barrier count no longer grows with the file count.
      Synthetic, 48 files: 694 → 28.8 ms. A publish that fails after the working directory was
      rewritten leaves the parcel parked and says that some or all of the changes are unstaged.
-   * `consolidate`/`cherry-pick`'s merge actions (FORK-196) are the remaining slice.
+   * **`consolidate`/`cherry-pick`: done (FORK-196, slice 3)** — see item 2.
 5. **`remove <dir>`'s per-shard loop** — untimed, small, rare; demand-gated. (The
    commit-graph's multi-shard writes, once listed here, pay no barrier at all since
    FORK-162 — see "Best-effort state" below.)
@@ -633,8 +638,8 @@ PR A's `refresh_tracked_entries` rewrite does this implicitly for its blob layer
 shared blob batch across every shard it touches); the shard-content layer itself
 (one `write_shard_mutation`/`save_inventory` call per shard) is unchanged. That shared
 primitive is now `ShardMutationBatch` (FORK-112): it applies every same-shard action to one
-in-memory copy and publishes each shard once. `restore <dir>` and `park pop` use it;
-`consolidate`/`cherry-pick` still call `update_shard` per file.
+in-memory copy and publishes each shard once. `restore <dir>`, `park pop`,
+`consolidate` and `cherry-pick` use it.
 
 **git.git sanity (PR A, re-verified after review round 2).** A full first-time `load` of
 git.git's working tree (4,775 files, every file brand-new — the same per-file blob-store
