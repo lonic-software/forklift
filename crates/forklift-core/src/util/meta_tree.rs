@@ -25,8 +25,9 @@
 //! theirs and names every path both sides changed differently, and [`replay_meta_pallet`]
 //! applies the local side's *net* change since base onto the remote head as one new parcel.
 //!
-//! No pallet runs on this module yet; the converted-pallet list that dispatches onto it
-//! arrives with the first conversion.
+//! Enforcement and sync dispatch on [`converted_rules`], a code-level list of converted pallet
+//! names, never on whether a pallet happens to carry a format marker. A pallet not on the list
+//! keeps running on its own code until its conversion adds it.
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 use chrono::Utc;
@@ -40,9 +41,9 @@ use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
 use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust};
-use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason};
+use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustAnchor};
 use crate::util::sign_utils::ParcelSignature;
-use crate::util::{object_utils, pallet_utils, sign_utils};
+use crate::util::{kv_utils, object_utils, pallet_utils, sign_utils};
 
 /// The spine every meta tree keeps: `.forklift/tracked/`.
 const TREE_NAME_FORKLIFT: &str = ".forklift";
@@ -62,6 +63,32 @@ const FORMAT_VERSION: u32 = 1;
 const FIELD_SIGNER: &str = "signer";
 const FIELD_SCHEMA: &str = "schema";
 const FIELD_VALUE: &str = "value";
+
+/// Every meta pallet name a remote stores: the office, and the four kinds below. A meta ref
+/// update for any other name is refused, so a newer client's new pallet fails loudly against
+/// an older remote instead of being stored unchecked.
+pub const META_PALLET_NAMES: [&str; 5] = ["office", "manifest", "haul", "tags", "kv"];
+
+/// The rules of a converted meta pallet, or `None` for a pallet still on its own code.
+pub fn converted_rules(name: &str) -> Option<&'static dyn PalletRules> {
+    match name {
+        kv_utils::KV_PALLET_NAME => Some(&kv_utils::KvRules),
+        _ => None,
+    }
+}
+
+/// Refuse a meta pallet name outside [`META_PALLET_NAMES`].
+pub fn check_meta_pallet_name(name: &str) -> Result<(), String> {
+    if META_PALLET_NAMES.contains(&name) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "@{} is not a meta pallet this forklift knows. It may have been written by a newer \
+        forklift; upgrade to sync it.",
+        name
+    ))
+}
 
 /// The kind of a meta pallet, named by its format marker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -229,6 +256,23 @@ pub trait PalletRules {
     /// The pallet's own rules over one parcel's changes (who may write what, what may never
     /// change). Runs after the substrate's own checks have passed.
     fn check(&self, change: &ParcelChange<'_>) -> Result<(), String>;
+
+    /// The cell path a resolution names, from how the operator spells it (`lower --keep`).
+    fn resolution_path(&self, spelled: &str) -> Result<String, String> {
+        validate_cell_path(spelled)?;
+
+        Ok(spelled.to_string())
+    }
+
+    /// A cell path as the operator spells it — the inverse of [`PalletRules::resolution_path`].
+    fn display_path(&self, path: &str) -> String {
+        path.to_string()
+    }
+
+    /// A readable cell's value, for showing to the operator.
+    fn display_value(&self, envelope: &CellEnvelope) -> String {
+        envelope.value.to_string()
+    }
 }
 
 /// One cell path whose blob differs between two trees.
@@ -850,6 +894,91 @@ pub fn read_meta_head(pallet: &str, rules: &dyn PalletRules) -> Result<Option<Me
     }
 }
 
+/// The cell at one path at a head, or `None` when the path holds no cell. Only the path's own
+/// levels are loaded.
+pub fn read_cell(pallet: &str, head: &str, rules: &dyn PalletRules, path: &str) -> Result<Option<CellRead>, String> {
+    let spine = read_pallet_spine(pallet, head, rules.kind())?;
+
+    read_cell_in(spine.cells.as_deref(), path, rules)
+}
+
+/// The `cells/` tree at a head (`None` when the state is empty).
+pub fn cells_at(pallet: &str, head: &str, rules: &dyn PalletRules) -> Result<Option<String>, String> {
+    Ok(read_pallet_spine(pallet, head, rules.kind())?.cells)
+}
+
+/// Read one stored cell blob as [`read_meta_state`] would.
+pub fn read_cell_blob(blob: &str, rules: &dyn PalletRules) -> Result<CellRead, String> {
+    Ok(classify_cell(&object_utils::load_blob(blob)?.content, rules))
+}
+
+fn read_cell_in(cells: Option<&str>, path: &str, rules: &dyn PalletRules) -> Result<Option<CellRead>, String> {
+    match resolve_entry(cells, path)? {
+        Entry::Blob(blob) => Ok(Some(classify_cell(&object_utils::load_blob(&blob)?.content, rules))),
+        _ => Ok(None),
+    }
+}
+
+/// One parcel that changed a cell, as [`cell_history`] reports it.
+#[derive(Debug)]
+pub struct CellHistoryEntry {
+    /// The parcel that changed the cell.
+    pub parcel: String,
+
+    /// The cell after the parcel, or `None` when the parcel removed it.
+    pub after: Option<CellRead>,
+}
+
+/// Every parcel from `head` back to the pallet's root that changed the cell at `path`, newest
+/// first. It walks the whole chain, so it runs only when asked for.
+pub fn cell_history(pallet: &str,
+                    head: &str,
+                    rules: &dyn PalletRules,
+                    path: &str) -> Result<Vec<CellHistoryEntry>, String> {
+    let mut history = Vec::new();
+    let mut cursor = Some(head.to_string());
+    let mut newer: Option<(String, Entry)> = None;
+
+    while let Some(hash) = cursor {
+        let parcel = object_utils::load_parcel(&hash)?;
+
+        if parcel.parents.len() > 1 {
+            return Err(format!(
+                "Parcel {} on @{} has {} parents, but a meta pallet is linear.",
+                hash, pallet, parcel.parents.len()
+            ));
+        }
+
+        let entry = resolve_entry(read_pallet_spine(pallet, &hash, rules.kind())?.cells.as_deref(), path)?;
+
+        if let Some((child, child_entry)) = newer.take() {
+            if child_entry != entry {
+                history.push(history_entry(child, &child_entry, rules)?);
+            }
+        }
+
+        cursor = parcel.parents.first().cloned();
+        newer = Some((hash, entry));
+    }
+
+    if let Some((root, entry)) = newer {
+        if entry != Entry::Absent {
+            history.push(history_entry(root, &entry, rules)?);
+        }
+    }
+
+    Ok(history)
+}
+
+fn history_entry(parcel: String, entry: &Entry, rules: &dyn PalletRules) -> Result<CellHistoryEntry, String> {
+    let after = match entry {
+        Entry::Blob(blob) => Some(classify_cell(&object_utils::load_blob(blob)?.content, rules)),
+        _ => None,
+    };
+
+    Ok(CellHistoryEntry { parcel, after })
+}
+
 fn collect_cells(path: &str,
                  hash: &str,
                  rules: &dyn PalletRules,
@@ -1107,6 +1236,28 @@ pub fn verify_meta_content(pallet: &str,
     }
 
     Ok(())
+}
+
+/// The content check for a converted pallet's update on a store that holds the office: the
+/// office chain must verify against the anchor, and the pallet's new parcels against that
+/// office. A converted pallet exists only under an office, so a missing anchor or an unborn
+/// office refuses rather than skipping the check. Returns the verified office.
+pub fn verify_converted_update(pallet: &str,
+                               rules: &dyn PalletRules,
+                               anchor: Option<&TrustAnchor>,
+                               office_head: Option<&str>,
+                               old_head: Option<&str>,
+                               new_head: &str) -> Result<OfficeState, String> {
+    let (Some(anchor), Some(office_head)) = (anchor, office_head) else {
+        return Err(format!(
+            "@{} needs an office: establish trust and lift the office before syncing it.", pallet
+        ));
+    };
+
+    let office = audit_utils::verify_office_chain_memoized(anchor, office_head)?;
+    verify_meta_content(pallet, rules, &office, old_head, new_head)?;
+
+    Ok(office)
 }
 
 /// Rule (b): the parcel's signature verifies against its key in the office, and a revoked key

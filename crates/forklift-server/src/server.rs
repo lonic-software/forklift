@@ -37,8 +37,8 @@ use forklift_core::model::remote::{
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::{self, ServeLock, StoreAccessLock};
 use forklift_core::util::{
-    audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
-    office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
+    audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, meta_tree,
+    object_utils, office_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
 
@@ -2059,6 +2059,13 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         let is_meta = namespace == pallet_utils::PalletNamespace::Meta;
         let is_office = is_meta && bare == OFFICE_PALLET_NAME;
 
+        // A meta name this server does not know is refused outright, never stored unchecked.
+        if is_meta {
+            meta_tree::check_meta_pallet_name(&bare).map_err(unprocessable)?;
+        }
+
+        let converted = if is_meta { meta_tree::converted_rules(&bare) } else { None };
+
         // The CAS read-check-write is one critical section. The trust anchor and
         // office state are read here too, once, so transport authorization below and
         // the audit that follows consume exactly the same values — the lock that
@@ -2088,10 +2095,11 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 let allowed = if is_meta {
                     // Anyone but a reader may transport a meta pallet's history. Content
                     // authorization below differs by meta pallet, not a uniform "signer's
-                    // role" check: only @office's parcels are checked, per parcel, against
-                    // the signer's role (`verify_office_privileges`); @manifest/@haul/@tags
-                    // take the same `verify_pallet_history` path as an ordinary working
-                    // pallet and get no role or grant check at all.
+                    // role" check: @office's parcels are checked, per parcel, against the
+                    // signer's role (`verify_office_privileges`); a converted pallet's against
+                    // its own rules (`verify_meta_content`); @manifest/@haul/@tags take the
+                    // same `verify_pallet_history` path as an ordinary working pallet and get
+                    // no role or grant check at all.
                     user.role != office_utils::Role::Reader
                 } else {
                     user.may_write_pallet(&bare)
@@ -2211,11 +2219,24 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     events.push(event);
                 }
             }
+        } else if let Some(rules) = converted {
+            // A converted meta pallet exists only under an office, so a missing anchor or
+            // office refuses here instead of skipping the check. Its content check subsumes
+            // the signature audit below: every new parcel must be signed by an office key,
+            // stamp only its own cells, and keep the pallet's rules.
+            meta_tree::verify_converted_update(
+                &bare,
+                rules,
+                anchor.as_ref(),
+                office_head.as_deref(),
+                request.old_head.as_deref(),
+                &request.new_head
+            ).map_err(unprocessable)?;
         } else if let Some(anchor) = anchor {
             // A trusted warehouse accepts nothing a local audit would reject. This is the
-            // user-pallet path (the office took the branch above); a future non-office
-            // meta pallet will bring its own verification here. The office head is the
-            // one already read above, not a second lookup.
+            // user-pallet path, and that of a meta pallet still on its own code (the office
+            // and converted pallets took the branches above). The office head is the one
+            // already read above, not a second lookup.
             let office_head = office_head.ok_or(unprocessable(
                 "Trust is established but the office pallet is missing; lift the \
                 office first.".to_string()

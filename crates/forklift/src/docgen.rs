@@ -255,6 +255,7 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "lift" => commands::lift::__docgen_schemas(),
         "load" => commands::load::__docgen_schemas(),
         "lower" => commands::lower::__docgen_schemas(),
+        "kv" => commands::kv::__docgen_schemas(),
         "manifest" => commands::manifest::__docgen_schemas(),
         "narrow" => commands::narrow::__docgen_schemas(),
         "office" => commands::office::__docgen_schemas(),

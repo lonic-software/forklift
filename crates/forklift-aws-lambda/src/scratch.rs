@@ -237,6 +237,22 @@ pub fn materialize(
     Ok(())
 }
 
+/// Mirror one parcel's whole tree, blobs included: the state a converted meta pallet's content
+/// check reads at the pallet's current head, whose tree [`materialize`]'s bound leaves out. It
+/// costs the size of the current state, never of the history. An absent parcel is skipped, as
+/// in [`materialize`].
+pub fn materialize_state(store: &dyn ObjectStore, parcel_hash: &str, mirror: &mut Mirror) -> Result<(), String> {
+    if !mirror_object(store, parcel_hash, mirror)? {
+        return Ok(());
+    }
+
+    let Ok(parcel) = object_utils::load_parcel(parcel_hash) else {
+        return Ok(());
+    };
+
+    materialize_tree(store, &parcel.tree_hash, true, mirror)
+}
+
 /// Ensure `hash`'s bytes are in the scratch, fetching them from the store only when they
 /// are not already there. Returns whether the object exists at all.
 ///

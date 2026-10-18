@@ -182,6 +182,11 @@ refusal_codes! {
     /// is not the canonical spelling of an object hash. A misbehaving or corrupt remote, not a
     /// transport failure: retrying gets the same answer.
     RemoteProtocolViolation => "remote_protocol_violation",
+
+    /// A meta pallet changed differently on both sides at the same path since the two last
+    /// agreed. Nothing is lifted for that pallet; the refusal's details name each path with both
+    /// values and their signers, and `lower --keep` resolves them (`meta_tree`).
+    MetaConflict => "meta_conflict",
 }
 
 impl RefusalCode {

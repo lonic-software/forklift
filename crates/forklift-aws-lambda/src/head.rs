@@ -46,11 +46,11 @@ use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::{
-    audit_utils, bundle_utils, file_utils, merge_utils, object_utils, sign_utils,
+    audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, sign_utils,
 };
 
 use crate::error::{HeadError, HeadResult};
-use crate::scratch::{materialize, Mirror, Scratch};
+use crate::scratch::{materialize, materialize_state, Mirror, Scratch};
 use crate::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
     RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
@@ -508,7 +508,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
     /// checks, and it differs by pallet: for the office pallet, every office-modifying parcel's
     /// *signer* is checked against the office role it held as of that parcel's own signing
-    /// (`verify_office_privileges`); for any other pallet, a parcel is accepted when it is
+    /// (`verify_office_privileges`); for a converted meta pallet (`meta_tree::converted_rules`),
+    /// every new parcel passes `verify_meta_content` against the verified office, and the pallet
+    /// is refused outright without one; for any other pallet, a parcel is accepted when it is
     /// either validly signed by a key the office currently tracks and has not revoked, or
     /// unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), or
     /// signed by a revoked key but reachable from that revocation's own distrust boundary — no
@@ -528,6 +530,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let bare = pallet_ref.name.clone();
         let is_meta = namespace == PalletNamespace::Meta;
         let is_office = is_meta && bare == OFFICE_PALLET_NAME;
+
+        // A meta name this head does not know is refused outright, never stored unchecked.
+        if is_meta {
+            meta_tree::check_meta_pallet_name(&bare).map_err(HeadError::unprocessable)?;
+        }
+
+        let converted = if is_meta { meta_tree::converted_rules(&bare) } else { None };
 
         // Fail fast on an obviously stale request; the conditional write below is the
         // authoritative gate that also catches a head that moves during the audit.
@@ -604,6 +613,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // working pallet's blobs are file content (leave them in the object store).
             materialize(&self.objects, &request.new_head, is_meta, known_complete, &mut mirror)
                 .map_err(HeadError::internal)?;
+
+            // A converted pallet's content check diffs each new parcel against its parent, so
+            // the current head's state is read too.
+            if let (Some(_), Some(old_head)) = (converted, &request.old_head) {
+                materialize_state(&self.objects, old_head, &mut mirror).map_err(HeadError::internal)?;
+            }
 
             // 1. Closure presence. A working blob and a chunked file's recipe are presence-checked
             // one hash at a time via `blob_exists`; a chunked file's recipe is read from the object
@@ -692,8 +707,22 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
             }
 
-            // 3. Trust: a trusted warehouse accepts nothing a local audit would reject.
-            if let Some(anchor) = &anchor {
+            // 3. Trust: a trusted warehouse accepts nothing a local audit would reject. A
+            // converted meta pallet exists only under an office, so it is checked even without
+            // an anchor — and refused for the lack of one. Its content check subsumes the
+            // signature audit: every new parcel is signed by an office key, stamps only its own
+            // cells, and keeps the pallet's rules.
+            if let Some(rules) = converted {
+                meta_tree::verify_converted_update(
+                    &bare,
+                    rules,
+                    anchor.as_ref(),
+                    office_head.as_deref(),
+                    request.old_head.as_deref(),
+                    &request.new_head,
+                )
+                .map_err(HeadError::unprocessable)?;
+            } else if let Some(anchor) = &anchor {
                 if is_office {
                     // The office chain carries the keys; verify it against the anchor, and
                     // that every new parcel stayed within its signer's privileges.

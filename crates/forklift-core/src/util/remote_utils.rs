@@ -25,7 +25,7 @@ use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
-    bundle_utils, config_utils, file_utils, merge_utils, object_utils, office_utils,
+    bundle_utils, config_utils, file_utils, merge_utils, meta_tree, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils, trust_utils,
 };
 
@@ -5904,16 +5904,22 @@ pub async fn push_local_trust(client: &RemoteClient,
 /// The outcome of lifting one meta pallet (its wire ref, e.g. `@manifest`).
 pub struct MetaPalletLift {
     pub pallet: String,
-    pub result: LiftResult,
+
+    /// The lift, or why it failed: a divergence (lower first), a remote that is ahead, a
+    /// refusal of the pallet's content, or a failed transfer.
+    pub result: Result<LiftResult, String>,
 }
 
 /// Lift every *non-office* meta pallet (the manifest, and future ones) to the remote,
 /// after the office and trust are already established there. Meta pallets are ordinary
 /// signed pallets from the server's point of view — object upload plus a fast-forward
-/// CAS — so this reuses `lift_pallet`; a diverged one errors (lower first), exactly like
+/// CAS — so this reuses `lift_pallet`; a diverged one fails (lower first), exactly like
 /// a working pallet. The office is excluded: it is lifted with the trust state
 /// (`push_local_trust`) so the remote holds the keys before any pallet that relies on
 /// them arrives.
+///
+/// Each pallet is lifted on its own: one that fails is reported in its outcome, and the
+/// rest are still lifted.
 ///
 /// # Arguments
 /// * `client` - The remote.
@@ -5921,8 +5927,7 @@ pub struct MetaPalletLift {
 ///
 /// # Returns
 /// * `Ok(Vec<MetaPalletLift>)` - Per-pallet outcomes (empty when none exist).
-/// * `Err(String)`             - If a pallet diverged, the remote is ahead, or a
-///                               transfer failed.
+/// * `Err(String)`             - If the local meta pallets cannot be listed.
 pub async fn lift_meta_pallets(client: &RemoteClient,
                                info: &WarehouseInfo) -> Result<Vec<MetaPalletLift>, String> {
     let mut lifts = Vec::new();
@@ -5932,15 +5937,21 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
             continue;
         }
 
-        let Some(local_head) = pallet_utils::get_meta_pallet_head(&name)? else {
-            continue;
+        let wire = pallet_utils::PalletRef::meta(&name).to_wire();
+
+        let local_head = match pallet_utils::get_meta_pallet_head(&name) {
+            Ok(Some(local_head)) => local_head,
+            Ok(None) => continue,
+            Err(why) => {
+                lifts.push(MetaPalletLift { pallet: wire, result: Err(why) });
+                continue;
+            }
         };
 
-        let wire = pallet_utils::PalletRef::meta(&name).to_wire();
         let remote_head = info.pallets.get(&wire).map(String::as_str);
 
         // Meta pallets never carry a chunked file; the capability is threaded for uniformity.
-        let result = lift_pallet(client, &wire, &local_head, remote_head, info.chunking, &Progress::NONE).await?;
+        let result = lift_pallet(client, &wire, &local_head, remote_head, info.chunking, &Progress::NONE).await;
         lifts.push(MetaPalletLift { pallet: wire, result });
     }
 
@@ -5954,26 +5965,45 @@ pub struct MetaAdoptResult {
     pub adopted: Vec<String>,
 
     /// Meta pallets whose local and remote heads diverged, as `(bare name, remote head)`.
-    /// Their remote history has been fetched; the caller applies the pallet's merge
-    /// policy (the manifest merges cleanly; nothing else has one yet).
+    /// Their remote history has been fetched — and, for a converted pallet, verified from the
+    /// two chains' common ancestor — and the caller applies the pallet's sync policy.
     pub diverged: Vec<(String, String)>,
+
+    /// Meta pallets that could not be adopted, as `(wire ref, why)`. One pallet failing never
+    /// stops the others.
+    pub failed: Vec<(String, String)>,
+}
+
+/// What adopting one meta pallet did.
+enum MetaAdoptStep {
+    /// Nothing to do: up to date, or the local side is ahead.
+    Unchanged,
+
+    /// The local ref moved to the remote head.
+    Adopted,
+
+    /// The two heads diverged.
+    Diverged,
 }
 
 /// Adopt the remote's *non-office* meta pallets (lower / franchise direction): fetch each
 /// and fast-forward the local ref, without ever materializing into the working directory
 /// (meta pallets are not working content). A pallet present only on the remote is adopted
 /// outright; one that diverged has its remote side fetched and is returned for the caller
-/// to merge. The office is excluded — `adopt_remote_trust` handles it.
+/// to reconcile. A converted pallet's remote parcels pass the content check against the local
+/// office before anything is adopted or reconciled. The office is excluded —
+/// `adopt_remote_trust` handles it, and runs first.
+///
+/// Each pallet is adopted on its own: a refusal or a failed transfer is recorded against that
+/// pallet, and the rest still sync.
 ///
 /// # Arguments
 /// * `client` - The remote.
 /// * `info`   - The remote's handshake.
 ///
 /// # Returns
-/// * `Ok(MetaAdoptResult)` - What was adopted, and what diverged.
-/// * `Err(String)`         - If a transfer failed.
-pub async fn adopt_meta_pallets(client: &RemoteClient,
-                                info: &WarehouseInfo) -> Result<MetaAdoptResult, String> {
+/// * `MetaAdoptResult` - What was adopted, what diverged, and what failed.
+pub async fn adopt_meta_pallets(client: &RemoteClient, info: &WarehouseInfo) -> MetaAdoptResult {
     let mut result = MetaAdoptResult::default();
 
     for (key, remote_head) in &info.pallets {
@@ -5985,32 +6015,63 @@ pub async fn adopt_meta_pallets(client: &RemoteClient,
             continue;
         }
 
-        match pallet_utils::get_meta_pallet_head(name)? {
-            None => {
-                fetch_history(client, remote_head, &Progress::NONE).await?;
-                pallet_utils::set_meta_pallet_head(name, remote_head)?;
-                result.adopted.push(key.clone());
-            }
-            // Up to date, or local is ahead — both decidable from the *local* ancestry
-            // alone (these walks never load the not-yet-fetched remote head).
-            Some(local) if &local == remote_head => {}
-            Some(local) if merge_utils::is_ancestor(remote_head, &local)? => {}
-            Some(local) => {
-                // A fast-forward or a divergence — deciding either needs the remote head's
-                // ancestry, so fetch it first, then classify.
-                fetch_history(client, remote_head, &Progress::NONE).await?;
-
-                if merge_utils::is_ancestor(&local, remote_head)? {
-                    pallet_utils::set_meta_pallet_head(name, remote_head)?;
-                    result.adopted.push(key.clone());
-                } else {
-                    result.diverged.push((name.to_string(), remote_head.clone()));
-                }
-            }
+        match adopt_meta_pallet(client, name, remote_head).await {
+            Ok(MetaAdoptStep::Unchanged) => {}
+            Ok(MetaAdoptStep::Adopted) => result.adopted.push(key.clone()),
+            Ok(MetaAdoptStep::Diverged) => result.diverged.push((name.to_string(), remote_head.clone())),
+            Err(why) => result.failed.push((key.clone(), why)),
         }
     }
 
-    Ok(result)
+    result
+}
+
+async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str) -> Result<MetaAdoptStep, String> {
+    meta_tree::check_meta_pallet_name(name)?;
+
+    let local = pallet_utils::get_meta_pallet_head(name)?;
+
+    // Up to date, or local is ahead — both decidable from the *local* ancestry alone (these
+    // walks never load the not-yet-fetched remote head).
+    if let Some(local) = &local {
+        if local == remote_head || merge_utils::is_ancestor(remote_head, local)? {
+            return Ok(MetaAdoptStep::Unchanged);
+        }
+    }
+
+    // A first adoption, a fast-forward or a divergence — deciding between the last two needs
+    // the remote head's ancestry, so fetch it first, then classify.
+    fetch_history(client, remote_head, &Progress::NONE).await?;
+
+    let fast_forward = match &local {
+        Some(local) => merge_utils::is_ancestor(local, remote_head)?,
+        None => true,
+    };
+
+    if let Some(rules) = meta_tree::converted_rules(name) {
+        // The verified local base: the local head on a fast-forward, else the newest parcel
+        // both chains share (a parcel the local side already verified).
+        let base = match (&local, fast_forward) {
+            (Some(local), true) => Some(local.clone()),
+            (Some(local), false) => meta_tree::linear_common_ancestor(local, remote_head)?,
+            (None, _) => None,
+        };
+
+        let anchor = office_utils::read_trust_anchor()?;
+        let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
+
+        meta_tree::verify_converted_update(
+            name, rules, anchor.as_ref(), office_head.as_deref(), base.as_deref(), remote_head
+        ).map_err(|why| format!("The remote @{} was refused: {}", name, why))?;
+    }
+
+    if !fast_forward {
+        return Ok(MetaAdoptStep::Diverged);
+    }
+
+    pallet_utils::set_meta_pallet_head(name, remote_head)?;
+
+    Ok(MetaAdoptStep::Adopted)
 }
 
 /// Resolve the display names of everyone enrolled in this warehouse's office, for the

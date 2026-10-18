@@ -242,7 +242,14 @@ async fn franchise_into_prepared_target(
 
     // Adopt the meta pallets too (the manifest, …), so a clone carries the post-metadata,
     // not just the working history. A fresh clone has none locally, so nothing diverges.
-    report.meta_adopted = remote_utils::adopt_meta_pallets(client, &info).await?.adopted;
+    // A clone fails loudly on a meta pallet it cannot verify, rather than arriving without it.
+    let meta = remote_utils::adopt_meta_pallets(client, &info).await;
+
+    if let Some((pallet, why)) = meta.failed.into_iter().next() {
+        return Err(format!("Could not adopt the remote {}: {}", pallet, why).into());
+    }
+
+    report.meta_adopted = meta.adopted;
 
     let PalletResolution { pallet_name, remote_head } = resolution;
 
