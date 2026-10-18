@@ -466,8 +466,8 @@ fn conflict_writes(action: &MergeAction) -> bool {
 /// Every inventory change goes through one [`inventory_utils::ShardMutationBatch`], published
 /// before this returns, so the caller records its in-progress state only over a published
 /// inventory. An action that fails leaves the batch unpublished: a half-applied merge staged with
-/// nothing in progress could leave conflict entries staged with no merge to complete or abort. The caller has
-/// recorded nothing as in progress yet, and the error says so.
+/// nothing in progress could leave conflict entries staged with no merge to complete or abort.
+/// The caller has recorded nothing as in progress yet, and the error says so.
 pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
     let mut batch = inventory_utils::ShardMutationBatch::new();
