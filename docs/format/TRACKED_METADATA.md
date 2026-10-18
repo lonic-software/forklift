@@ -101,7 +101,8 @@ Diverged heads are not merged. The local net change since the common ancestor is
 the remote head as one new parcel, and each replayed cell is re-stamped with the current key.
 That re-stamp is allowed only when the old stamp resolves to the same operator under a key that
 is active or was retired, never one revoked as compromised. Paths that both sides changed
-differently refuse until each is resolved, keeping ours or theirs.
+differently refuse until each is resolved, keeping ours or theirs; keeping theirs at a subject
+resolves every conflict beneath it.
 
 ## Record formats (TOML)
 A user record:

@@ -724,19 +724,33 @@ enum SpineFault {
 fn read_spine(tree_hash: &str) -> Result<Result<Spine, SpineFault>, String> {
     let root = object_utils::load_tree(tree_hash)?;
 
-    let Some(forklift) = subtree_named(&root, TREE_NAME_FORKLIFT) else {
+    // An older forklift's meta parcel held its records under `.forklift/tracked/`, or nothing
+    // at all for a join. Only those shapes read as older; any other tree is a corrupt spine.
+    if entry_count(&root) == 0 {
         return Ok(Err(SpineFault::NoFormat));
+    }
+
+    let no_spine = || Ok(Err(SpineFault::Malformed("its tree has no .forklift/tracked/ spine".to_string())));
+
+    let Some(forklift) = subtree_named(&root, TREE_NAME_FORKLIFT) else {
+        return no_spine();
     };
     let forklift = object_utils::load_tree(&forklift)?;
 
     let Some(tracked) = subtree_named(&forklift, TREE_NAME_TRACKED) else {
-        return Ok(Err(SpineFault::NoFormat));
+        return no_spine();
     };
     let tracked = object_utils::load_tree(&tracked)?;
 
     let Some((_, format)) = tracked.get_files().find(|(name, _)| name.as_str() == ENTRY_NAME_FORMAT) else {
         if subtree_named(&tracked, ENTRY_NAME_FORMAT).is_some() {
             return Ok(Err(SpineFault::Malformed("its format marker is a subtree, not a blob".to_string())));
+        }
+
+        if entry_count(&root) != 1 || entry_count(&forklift) != 1 {
+            return Ok(Err(SpineFault::Malformed(
+                "its tree holds entries besides .forklift/tracked/".to_string()
+            )));
         }
 
         return Ok(Err(SpineFault::NoFormat));
@@ -1441,6 +1455,9 @@ pub fn replay_meta_pallet(pallet: &str,
 /// the fork instead of loading both histories to their roots. What two linear chains share is
 /// one suffix, and each walk enters it at the fork, so the first parcel either walk reaches that
 /// the other has already passed is the fork itself.
+///
+/// Linearity is checked only on the parcels walked, down to the fork. Below it, both chains are
+/// the history a head was verified with when it was adopted (`verify_meta_content`).
 pub fn linear_common_ancestor(a: &str, b: &str) -> Result<Option<String>, String> {
     let mut cursors = [Some(a.to_string()), Some(b.to_string())];
     let mut seen: [HashSet<String>; 2] = [HashSet::new(), HashSet::new()];
@@ -1664,6 +1681,10 @@ mod tests {
 
     fn t(hash: &str) -> Entry {
         Entry::Tree(hash.to_string())
+    }
+
+    fn old_tracked_spine(tracked: &str) -> String {
+        tree(&[("tracked", t(tracked))])
     }
 
     fn tree(entries: &[(&str, Entry)]) -> String {
@@ -2162,12 +2183,25 @@ mod tests {
         let error = read_meta_state(PALLET, &tags, &TestRules).unwrap_err();
         assert!(error.contains("holds tags metadata"), "{}", error);
 
-        // A marker that is a subtree is a corrupt spine, not an older forklift's.
+        // An older forklift's join parcel had an empty tree.
+        let join = stack_signed_parcel(tree(&[]), Vec::new(), &actor("alice"), "join", &signer).unwrap();
+        assert!(read_meta_state(PALLET, &join, &TestRules).unwrap_err().contains("older forklift"));
+
+        // Any other shape without a marker is a corrupt spine, not an older forklift's.
         let format_tree = tree(&[("format", t(&tree(&[("x", b(&blob("1")))])))]);
-        let corrupt_tree = tree(&[(".forklift", t(&tree(&[("tracked", t(&format_tree))])))]);
-        let corrupt = stack_signed_parcel(corrupt_tree, Vec::new(), &actor("alice"), "corrupt", &signer).unwrap();
-        let error = read_meta_state(PALLET, &corrupt, &TestRules).unwrap_err();
-        assert!(error.contains("format marker is a subtree") && !error.contains("older forklift"), "{}", error);
+        let corrupt_spines = [
+            (tree(&[(".forklift", t(&tree(&[("tracked", t(&format_tree))])))]), "format marker is a subtree"),
+            (tree(&[(".forklift", b(&blob("1")))]), "no .forklift/tracked/ spine"),
+            (tree(&[(".forklift", t(&tree(&[("tracked", b(&blob("1")))])))]), "no .forklift/tracked/ spine"),
+            (tree(&[("src", t(&tree(&[("main.rs", b(&blob("fn main() {}")))])))]), "no .forklift/tracked/ spine"),
+            (tree(&[(".forklift", t(&old_tracked_spine(&old_tracked))), ("src", b(&blob("1")))]), "entries besides"),
+        ];
+
+        for (corrupt_tree, why) in corrupt_spines {
+            let corrupt = stack_signed_parcel(corrupt_tree, Vec::new(), &actor("alice"), "corrupt", &signer).unwrap();
+            let error = read_meta_state(PALLET, &corrupt, &TestRules).unwrap_err();
+            assert!(error.contains(why) && !error.contains("older forklift"), "{}", error);
+        }
 
         // The writer refuses to stack on any of them, too.
         pallet_utils::set_meta_pallet_head(PALLET, &old).unwrap();
