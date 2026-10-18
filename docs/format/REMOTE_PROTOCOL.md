@@ -290,8 +290,10 @@ that pallet permanently un-liftable.
 ### `POST /v1/pallets/{name}`
 
 The CAS ref update — the commit point of a `lift`. `{name}` is a qualified reference:
-a user pallet bare (`main`), a meta pallet with the `@` qualifier (`@office`). The server
-enforces meta-pallet rules by namespace, so the office lifts to `POST /v1/pallets/@office`.
+a user pallet bare (`main`), a meta pallet with the `@` qualifier (`@office`), so the office
+lifts to `POST /v1/pallets/@office`. The meta pallet names are a fixed list — `office`,
+`manifest`, `haul`, `tags`, `kv` — and any other `@name` is refused with `422` before any other
+check.
 
 ```json
 { "old_head": "<hash-or-null>", "new_head": "<hash>" }
@@ -310,6 +312,10 @@ enforces meta-pallet rules by namespace, so the office lifts to `POST /v1/pallet
 4. **Trust** (only when the remote holds an anchor):
    * for the office pallet: the whole office chain from the genesis to `new_head`
      verifies forward (each parcel signed by a key active in the *previous* state);
+   * for `@kv`: the office must be lifted (with no anchor or no office, `@kv` is refused
+     with `422`), and every parcel from `old_head` to `new_head` passes the meta content
+     check — one parent, signed by an office key, every cell it adds or changes stamped with
+     that key, the pallet's format and layout kept;
    * for any other pallet: the full history from `new_head` is audited — every parcel
      signed by a tracked key, unsigned parcels tolerated only when reachable from the
      anchor boundary. Failure is `422`.

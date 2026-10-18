@@ -1454,8 +1454,8 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
         let mut pallets = std::collections::BTreeMap::new();
 
         // Both namespaces travel in one map, keyed by the qualified reference form: user
-        // pallets bare, meta pallets as `@office` — so clients (and future meta
-        // pallets) route by namespace, never by a hard-coded name.
+        // pallets bare, meta pallets as `@office` — so clients route by namespace, never by a
+        // hard-coded name.
         for (pallet_ref, head) in pallet_utils::all_pallet_refs().map_err(internal)? {
             pallets.insert(pallet_ref.to_wire(), head);
         }

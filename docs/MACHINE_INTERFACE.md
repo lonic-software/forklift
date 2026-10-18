@@ -386,6 +386,32 @@ A first-contact adoption is not a refusal: the command succeeds, reports the gen
 `data.adopted_genesis`, and writes a `trust_adopted` warning (below) with the same `details`
 shape, `what_changed: "first_contact"` and no `previous`.
 
+### Custom metadata that changed on both sides: `meta_conflict`
+
+`lower` reconciles a diverged `@kv` path by path: changes to different keys replay onto the
+remote's and are lifted. When the same key changed differently here and on the remote, nothing
+is lifted for that pallet and `lower` refuses with `meta_conflict` (exit 24). The working pallet
+still lowers; only the conflicted meta pallets wait. `details` names every conflicted path and
+both sides of it:
+
+```json
+{
+  "pallets": [
+    { "pallet": "@kv",
+      "conflicts": [
+        { "path": "<subject>/<key>",
+          "ours":   { "value": "amber", "signer": "<key id>" },
+          "theirs": { "value": "red",   "signer": "<key id>" } }
+      ] }
+  ]
+}
+```
+
+A side without `value` removed the key. Rerun `lower` with one `--keep <pallet>:<path>=ours|theirs`
+per path (`--keep kv:<subject>/<key>=theirs`); `theirs` on a bare `<subject>` resolves every key
+under it. A keep that names no conflict, or a pallet that did not diverge, is refused rather than
+ignored, so a stale resolution never applies to a later conflict.
+
 ## Structured conflicts
 
 `forklift conflicts` lists the files an unresolved consolidation or cherry-pick left in conflict.

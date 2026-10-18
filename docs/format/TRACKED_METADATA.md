@@ -60,10 +60,10 @@ warehouse root and is never tracked by `load`, so no user file can ever occupy t
 paths. Trees carrying a top-level `.forklift` entry are refused by every operation that
 materializes or merges trees.
 
-## The meta-tree format (defined; no pallet uses it yet)
+## The meta-tree format
 `forklift-core`'s `meta_tree` module defines the format the non-office meta pallets move to,
-one pallet per change. Until a pallet's own change lands, that pallet keeps the format described
-above. A meta tree is the pallet's whole state, and its chain is linear (a parcel has at most
+one pallet per change. `@kv` is written in it; `@manifest`, `@haul` and `@tags` keep the format
+described above until their own change lands. A meta tree is the pallet's whole state, and its chain is linear (a parcel has at most
 one parent), as with the office:
 
 ```
@@ -104,6 +104,26 @@ is active or was retired, never one revoked as compromised. Paths that both side
 differently refuse until each is resolved, keeping ours or theirs; keeping theirs at a subject
 resolves every conflict beneath it.
 
+A pallet on this format exists only under an office: a server, the serverless head and a client
+adopting or lowering it all refuse it when trust is not established or the office is not
+lifted, and run `verify_meta_content` from the head they hold. The meta pallet names are a
+fixed list — `office`, `manifest`, `haul`, `tags`, `kv` — and any other `@name` is refused, so a
+newer forklift's pallet is never stored unchecked by one that cannot read it.
+
+### `@kv`
+
+Custom metadata: free-form text keyed by parcel and key.
+
+```
+cells/<s[0..2]>/<s>/<key>         schema "kv.text 1", value { text = "..." }
+```
+
+`s` is the full hash of the parcel the value is about (it need not be held). A key is one path
+component of at most 128 bytes; `text` is the only field of the value, UTF-8 of at most 64 KiB.
+Any operator in the office except a reader may set or unset any cell (the reader rule is
+enforced at transport and by the CLI, not in the content check). Conflicts are resolved per
+`<s>/<key>`, or per `<s>` for `theirs`.
+
 ## Record formats (TOML)
 A user record:
 ```toml
@@ -121,8 +141,8 @@ Roles (FORK-10) are tracked, signed metadata like everything else in the office:
 **writer** moves working pallets (all, or the `pallets` grants) and manages their own
 keys; **reader** moves nothing (key self-service still applies). **The `pallets` grant
 scopes working pallets only:** any operator who is not a `reader` may transport a ref
-update to any `@`-qualified pallet whatever their grant list says, because the server
-routes that decision by namespace and never consults the grant there. What lands in
+update to any meta pallet whatever their grant list says, because the server never consults
+the grant for one. What lands in
 `@office` is still constrained, per parcel, against the *signer*'s role. A record without a
 `role` predates privileges and reads as admin — exactly the pre-privilege behavior.
 

@@ -1638,6 +1638,25 @@ A command not listed here either reports only the generic human-message shape `{
 
 ```json
 {
+  "$defs": {
+    "MetaPalletFailure": {
+      "description": "A meta pallet that failed to sync, and why.",
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "pallet": {
+          "description": "The pallet's wire ref, e.g. `@kv`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "error"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a lift: the pallet's outcome, plus the office lift when trust\nrequired its keys to reach the remote first.",
   "properties": {
@@ -1649,6 +1668,13 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "head": {
       "type": "string"
+    },
+    "meta_failed": {
+      "description": "The meta pallets that failed to lift. Never in a successful report: a failure makes the\ncommand fail, after the rest have gone through.",
+      "items": {
+        "$ref": "#/$defs/MetaPalletFailure"
+      },
+      "type": "array"
     },
     "meta_pallets": {
       "description": "The meta pallets (e.g. `@manifest`) lifted with new parcels.",
@@ -1749,6 +1775,84 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         }
       ]
+    },
+    "MetaConflictEntry": {
+      "description": "A path both sides changed differently since they last agreed.",
+      "properties": {
+        "ours": {
+          "$ref": "#/$defs/MetaConflictSide"
+        },
+        "path": {
+          "description": "The path as `--keep` spells it, e.g. `<subject>/<key>` on `@kv`.",
+          "type": "string"
+        },
+        "theirs": {
+          "$ref": "#/$defs/MetaConflictSide"
+        }
+      },
+      "required": [
+        "path",
+        "ours",
+        "theirs"
+      ],
+      "type": "object"
+    },
+    "MetaConflictSide": {
+      "description": "One side's value at a conflicted path.",
+      "properties": {
+        "signer": {
+          "description": "The key id the value is stamped with, when there is a readable value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "The value, as the pallet shows it; absent when this side removed it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "MetaPalletConflicts": {
+      "description": "A meta pallet that conflicted, with every conflicted path. Nothing was lifted for it.",
+      "properties": {
+        "conflicts": {
+          "items": {
+            "$ref": "#/$defs/MetaConflictEntry"
+          },
+          "type": "array"
+        },
+        "pallet": {
+          "description": "The pallet's wire ref, e.g. `@kv`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "conflicts"
+      ],
+      "type": "object"
+    },
+    "MetaPalletFailure": {
+      "description": "A meta pallet that failed to sync, and why.",
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "pallet": {
+          "description": "The pallet's wire ref, e.g. `@kv`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "error"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1781,8 +1885,36 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "meta_conflicts": {
+      "description": "Meta pallets that conflicted. Never in a successful report: their paths are carried in\nthe `meta_conflict` error's details.",
+      "items": {
+        "$ref": "#/$defs/MetaPalletConflicts"
+      },
+      "type": "array"
+    },
+    "meta_failed": {
+      "description": "Meta pallets that failed to sync. Never in a successful report.",
+      "items": {
+        "$ref": "#/$defs/MetaPalletFailure"
+      },
+      "type": "array"
+    },
     "meta_merged": {
       "description": "Meta pallets whose diverged history was merged with the remote's.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "meta_replayed": {
+      "description": "Meta pallets (e.g. `@kv`) whose local net change was replayed onto the remote head and\nlifted.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "meta_restamped": {
+      "description": "Cells a replay re-signed under the current key, as `<pallet> <path>`: their stamp was\none of the operator's own older keys.",
       "items": {
         "type": "string"
       },
@@ -1793,7 +1925,15 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "boolean"
     },
     "outcome": {
-      "$ref": "#/$defs/LowerOutcome"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LowerOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What happened to the current pallet; always present in a successful report."
     },
     "pallet": {
       "type": "string"
@@ -1802,12 +1942,258 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "office_moved",
     "pallet",
-    "outcome",
     "head",
     "fetched_objects",
     "fetched_signatures"
   ],
   "title": "LowerReport",
+  "type": "object"
+}
+```
+
+## `kv`
+
+### `Changed`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A key set or removed.",
+  "properties": {
+    "action": {
+      "description": "`set` or `unset`.",
+      "type": "string"
+    },
+    "key": {
+      "type": "string"
+    },
+    "kv_head": {
+      "description": "The head of the kv pallet after the change.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "operator": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    },
+    "unchanged": {
+      "description": "Whether the key already held exactly this value from this key, so nothing was written.",
+      "type": "boolean"
+    },
+    "value": {
+      "description": "The value set; absent for an unset.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "action",
+    "subject",
+    "key",
+    "operator",
+    "unchanged"
+  ],
+  "title": "Changed",
+  "type": "object"
+}
+```
+
+### `EntryView`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One value, with who wrote it.",
+  "properties": {
+    "key": {
+      "type": "string"
+    },
+    "signer": {
+      "description": "The key id the value is stamped with.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subject": {
+      "type": "string"
+    },
+    "unreadable": {
+      "description": "Why the value cannot be read: a newer forklift's schema, or a malformed cell.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "value": {
+      "description": "The text; absent when this forklift cannot read the value (see `unreadable`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "subject",
+    "key"
+  ],
+  "title": "EntryView",
+  "type": "object"
+}
+```
+
+### `KvListing`
+
+```json
+{
+  "$defs": {
+    "EntryView": {
+      "description": "One value, with who wrote it.",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "signer": {
+          "description": "The key id the value is stamped with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subject": {
+          "type": "string"
+        },
+        "unreadable": {
+          "description": "Why the value cannot be read: a newer forklift's schema, or a malformed cell.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "The text; absent when this forklift cannot read the value (see `unreadable`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "subject",
+        "key"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Every value, or a parcel's.",
+  "properties": {
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/EntryView"
+      },
+      "type": "array"
+    },
+    "subject": {
+      "description": "The parcel the listing is scoped to (absent when listing every value).",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "entries"
+  ],
+  "title": "KvListing",
+  "type": "object"
+}
+```
+
+### `KvLog`
+
+```json
+{
+  "$defs": {
+    "ChangeView": {
+      "description": "One change to a key.",
+      "properties": {
+        "operator": {
+          "description": "The operator the parcel records.",
+          "type": "string"
+        },
+        "parcel": {
+          "description": "The parcel that made the change.",
+          "type": "string"
+        },
+        "removed": {
+          "description": "Whether the change removed the value.",
+          "type": "boolean"
+        },
+        "signer": {
+          "description": "The key id that signed it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "description": "When the parcel was stacked (Unix seconds).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "unreadable": {
+          "description": "Why the value after the change cannot be read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "The value after the change; absent for a removal or an unreadable value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "parcel",
+        "operator",
+        "timestamp",
+        "removed"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Every change to a key, newest first.",
+  "properties": {
+    "changes": {
+      "items": {
+        "$ref": "#/$defs/ChangeView"
+      },
+      "type": "array"
+    },
+    "key": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "subject",
+    "key",
+    "changes"
+  ],
+  "title": "KvLog",
   "type": "object"
 }
 ```
