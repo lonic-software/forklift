@@ -276,26 +276,29 @@ pub fn pop_parked() -> Result<(), String> {
     let applied = shift_utils::apply_ops_each(&ops, &removed_dirs, |op| match op {
         FileOp::Write { path, hash, item_type, .. } => batch.stage_file_from_stat(path, hash.clone(), *item_type),
         FileOp::Remove { path } => {
-            let (parent_key, name) = match path.rsplit_once('/') {
-                Some((parent, name)) => (parent, name),
-                None => ("", path.as_str()),
-            };
+            let (parent_key, name) = inventory_utils::split_path_key(path);
 
             batch.update(parent_key, |inventory| { inventory.mark_item_deleted(name); })
         }
     });
 
-    // What was applied before a failure is still staged, as one `update_shard` per file staged
-    // it; either way the parcel stays parked.
+    // The batch publishes whatever was applied before a failure; the parcel stays parked on any
+    // failure, and the error says how far the pop got.
     match (applied, batch.publish()) {
         (Ok(()), Ok(())) => {}
-        (Err(e), Ok(())) => return Err(e),
+        (Err(e), Ok(())) => {
+            return Err(format!(
+                "{}\nThe parked changes applied before this error are in the working directory and \
+                staged. The parcel is still parked.",
+                e
+            ));
+        }
         (applied, Err(publish)) => {
             let first = applied.err().map(|e| format!("{}\n", e)).unwrap_or_default();
 
             return Err(format!(
                 "{}{}\nThe working directory holds the parked changes applied so far, but staging \
-                them failed, so some or all of them are not staged. They are still parked.",
+                them failed, so some or all of them are not staged. The parcel is still parked.",
                 first, publish
             ));
         }
