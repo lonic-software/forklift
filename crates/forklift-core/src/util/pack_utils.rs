@@ -6843,13 +6843,14 @@ mod tests {
     }
 
     /// `compact --all` never copies a delta verbatim once its base is repacked from a different
-    /// copy than the one the delta was encoded against. One pack holds a corrupt base record and a
-    /// target encoded against what that record decodes to; a pack that sorts before it holds a
-    /// good copy of the base. Whether the target reads depends on which copy of the base a read
-    /// meets first; once the base is repacked from the good copy alone, a verbatim copy of the
-    /// target could only ever decode against the good bytes. So the repack must read the target
-    /// rather than copy it. Here that read meets the first-sorted (good) base whatever the caches
-    /// hold, fails, and must fail the run loudly with the old packs left in place.
+    /// copy than the one the delta was encoded against. The pack that sorts first holds a corrupt
+    /// base record and a target encoded against what that record decodes to; a later pack holds a
+    /// good copy of the base. So the target reads before the repack: its read meets the corrupt
+    /// copy first. The repack keeps the base's good copy alone, against which a verbatim copy of
+    /// the target could never decode, so it must read the target rather than copy it. That read
+    /// may meet either copy, depending on what the caches hold, so the run may either fail loudly
+    /// naming the target, with the old packs left in place, or succeed with the target still
+    /// readable. What it must never do is succeed and lose the target.
     ///
     /// Mutation: drop the copied-delta pass at the end of `collect_targets` → the compact succeeds
     /// and the target no longer reads → red.
@@ -6870,11 +6871,11 @@ mod tests {
         let wrong_base = [base.content.as_slice(), b"not what the base holds"].concat();
 
         let pack_folder = temp.join(".forklift/objects/pack");
-        write_raw_pack(&pack_folder, "crafted", &[
+        write_raw_pack(&pack_folder, "a-crafted", &[
             (&base.hash, full_record(&wrong_base)),
             (&target.hash, delta_record(&base.hash, &wrong_base, &target.content)),
         ]);
-        write_raw_pack(&pack_folder, "a-good-base", &[(&base.hash, full_record(&base.content))]);
+        write_raw_pack(&pack_folder, "z-good-base", &[(&base.hash, full_record(&base.content))]);
 
         let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         tree.add_child(TreeItem::new("base.txt".to_string(), base.hash.clone(), DirEntryType::Normal));
@@ -6890,10 +6891,21 @@ mod tests {
         parcel.store().unwrap();
         pallet_utils::set_pallet_head("main", &parcel.hash).unwrap();
 
-        let error = compact(true, false, &Progress::NONE).expect_err("the repack must not copy the target unread");
-        assert!(error.contains(&target.hash), "the failed repack must name the target: {}", error);
-        assert!(pack_folder.join("crafted.pack").exists() && pack_folder.join("a-good-base.pack").exists(),
-            "a failed repack must leave the old packs in place");
+        assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
+            "the fixture's target must read before the repack");
+
+        match compact(true, false, &Progress::NONE) {
+            Ok(_) => {
+                invalidate_cache();
+                assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
+                    "a repack that succeeds must leave the target readable");
+            }
+            Err(error) => {
+                assert!(error.contains(&target.hash), "the failed repack must name the target: {}", error);
+                assert!(pack_folder.join("a-crafted.pack").exists() && pack_folder.join("z-good-base.pack").exists(),
+                    "a failed repack must leave the old packs in place");
+            }
+        }
 
         std::fs::remove_dir_all(&temp).ok();
     }
