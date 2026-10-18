@@ -146,7 +146,7 @@ fn assert_refused(warehouse: &Warehouse, escape: &PathBuf, quoted: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!escape.exists(), "the tree wrote outside the working directory: {}", escape.display());
-    assert!(!output.status.success(), "shift accepted the tree; stderr: {}", stderr);
+    assert!(!output.status.success(), "shift accepted the tree with {}; stderr: {}", quoted, stderr);
     assert!(stderr.contains(quoted), "the refusal must name the entry {}; stderr: {}", quoted, stderr);
 }
 
