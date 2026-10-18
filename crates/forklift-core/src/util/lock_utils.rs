@@ -105,7 +105,7 @@ impl Drop for StoreLock {
 }
 
 /// Where the current warehouse's [`ServeLock`] file lives, held or not.
-pub fn serve_lock_path() -> PathBuf {
+fn serve_lock_path() -> PathBuf {
     absolute(forklift_root().join(FILE_NAME_SERVE_LOCK))
 }
 
@@ -149,11 +149,28 @@ impl ServeLock {
         acquire_lock_file(&path, "warehouse root")?;
         Ok(ServeLock { path })
     }
+
+    /// Release the lock now and say whether its file is gone, where a drop releases silently. For
+    /// a holder that keeps running after letting go: a file it failed to remove refuses that
+    /// warehouse to it and everyone else, and only this result tells that apart from a lock another
+    /// process took the moment it was free. An already-missing file counts as released.
+    pub fn release(mut self) -> Result<(), String> {
+        let path = std::mem::take(&mut self.path);
+
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("Could not remove the lock file \"{}\": {}", path.display(), e)),
+        }
+    }
 }
 
 impl Drop for ServeLock {
     fn drop(&mut self) {
-        release_lock_file(&self.path);
+        // Empty once `release` has taken it.
+        if !self.path.as_os_str().is_empty() {
+            release_lock_file(&self.path);
+        }
     }
 }
 
@@ -714,6 +731,33 @@ mod tests {
 
         drop(first);
         ServeLock::acquire().expect("after the first is dropped the serve lock is free again");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// An explicit release reports a lock file it could not remove, and only that: a missing file
+    /// is released, and a released lock leaves nothing for its drop to remove — not even a lock
+    /// someone else has taken since.
+    #[test]
+    fn a_serve_lock_release_reports_a_file_it_could_not_remove() {
+        let temp = std::env::temp_dir().join(format!("forklift-servelock-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        ServeLock::acquire().unwrap().release().expect("a held lock releases");
+        let taken = ServeLock::acquire().expect("free again after a release");
+        assert!(serve_lock_path().exists());
+
+        let gone = ServeLock { path: serve_lock_path() };
+        std::mem::forget(taken);
+        std::fs::remove_file(serve_lock_path()).unwrap();
+        gone.release().expect("a missing file counts as released");
+
+        // Something that cannot be removed as a file stands where the lock was.
+        std::fs::create_dir(serve_lock_path()).unwrap();
+        let stuck = ServeLock { path: serve_lock_path() };
+        assert!(stuck.release().is_err(), "a lock file that stays must be reported");
 
         std::fs::remove_dir_all(&temp).ok();
     }

@@ -219,23 +219,22 @@ impl WarehouseRegistry {
 /// and to the closure check a ref update must pass. The caller holds the registry mutex, so this
 /// finishes before any request can serve the warehouse again.
 ///
-/// The serve lock is a file its drop removes, best-effort. One left behind would refuse this server
-/// the warehouse from then on, with a 503 naming the lock, so that is logged as the error it is.
+/// The serve lock is a file, released here explicitly: one left behind would refuse this server the
+/// warehouse from then on, so a failed removal is logged as the error it is. Probing for the file
+/// afterwards could not say whose it is — letting go is what lets `gc` or a repack take it.
 fn let_go(handle: Arc<WarehouseHandle>) {
-    let serve_lock = {
+    {
         let _scope = StorageRootScope::enter(&handle.root);
         pack_utils::forget_warehouse();
-        lock_utils::serve_lock_path()
+    }
+
+    // The registry held the only reference; anything else is let go by its last holder's drop.
+    let Ok(mut handle) = Arc::try_unwrap(handle) else {
+        return;
     };
 
-    let had_serve_lock = handle._serve_lock.is_some();
-    drop(handle);
-
-    if had_serve_lock && serve_lock.exists() {
-        tracing::error!(
-            lock = %serve_lock.display(),
-            "a warehouse let go kept its serve lock; it is refused until the file is removed"
-        );
+    if let Some(Err(error)) = handle._serve_lock.take().map(ServeLock::release) {
+        tracing::error!(%error, "a warehouse let go kept its serve lock; it is refused until the file is removed");
     }
 }
 
