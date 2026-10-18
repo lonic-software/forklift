@@ -868,12 +868,16 @@ pub fn path_maybe_changed(parcel_hash: &str, path: &str) -> Result<bool, String>
     // rather than propagating the read error out of a query the caller expects to be total.
     let filter = compute_filter(parcel_hash, record.parents.first().map(String::as_str))
         .unwrap_or(PathFilter::Unknown);
-    let updated = Record {
-        generation: record.generation,
-        parents: record.parents,
-        filter: filter.clone(),
-    };
-    persist_records(&root, &HashMap::from([(parcel_hash.to_string(), updated)]))?;
+    // An uncomputable filter stays unknown, and storing unknown over unknown would only rewrite
+    // the shard on every query of this parcel.
+    if !matches!(filter, PathFilter::Unknown) {
+        let updated = Record {
+            generation: record.generation,
+            parents: record.parents,
+            filter: filter.clone(),
+        };
+        persist_records(&root, &HashMap::from([(parcel_hash.to_string(), updated)]))?;
+    }
 
     Ok(match filter {
         PathFilter::Bloom(bytes) => bloom_contains(&bytes, path),
@@ -900,31 +904,39 @@ const PARALLEL_FILTER_THRESHOLD: usize = 64;
 ///
 /// Purely an accelerator: a caller may ignore its error, because [`path_maybe_changed`] still
 /// computes anything this left missing. A filter whose computation fails (an object absent from
-/// a sparse store) stays unknown, exactly as on the per-query path.
+/// a sparse store) stays unknown and is not stored, exactly as on the per-query path; a parcel
+/// whose record cannot be computed is skipped.
 ///
 /// # Arguments
 /// * `parcels` - The parcels whose filters the caller is about to query, oldest first.
 ///
 /// # Returns
 /// * `Ok(())`      - Every filter that could be computed is stored.
-/// * `Err(String)` - If a record could not be resolved or the cache lock was poisoned.
+/// * `Err(String)` - If the cache lock was poisoned.
 pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
     let root = file_utils::get_path_graph_root();
 
     // Newest first: one `ensure` from the newest parcel records its whole missing ancestry and
-    // persists it once, so every older parcel after it is already a hit.
-    for hash in parcels.iter().rev() {
-        if stored_record(&root, hash)?.is_none() {
-            ensure(&root, hash)?;
-        }
-    }
-
+    // persists it once, so every older parcel after it is already a hit. A parcel whose ancestry
+    // cannot be resolved (an unreadable parent in a partial store) is left to the per-query path
+    // rather than costing every other parcel its batched filter. On a warm graph this is one
+    // lookup per parcel that clones nothing.
     let mut missing: Vec<(String, Record)> = Vec::new();
-    for hash in parcels {
-        if let Some(record) = stored_record(&root, hash)? {
-            if matches!(record.filter, PathFilter::Unknown) {
-                missing.push((hash.clone(), record));
+    for hash in parcels.iter().rev() {
+        let filter_unknown = with_shard(&root, &shard_prefix(hash), |shard| {
+            shard.records.get(hash).map(|record| matches!(record.filter, PathFilter::Unknown))
+        })?;
+        match filter_unknown {
+            Some(false) => continue,
+            Some(true) => {}
+            None => {
+                if ensure(&root, hash).is_err() {
+                    continue;
+                }
             }
+        }
+        if let Some(record) = stored_record(&root, hash)? {
+            missing.push((hash.clone(), record));
         }
     }
 
