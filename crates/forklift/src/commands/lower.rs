@@ -98,7 +98,7 @@ pub async fn handle_command(expect: Option<String>, keep: Vec<String>) -> Result
             return Err(meta_failure_error(&report.meta_failed));
         }
 
-        return Err(meta_conflict_refusal(&report.meta_conflicts));
+        return Err(meta_conflict_refusal(&report.meta_conflicts, &report.pallet, &report.head));
     }
 
     output::emit(&report);
@@ -651,8 +651,9 @@ fn describe_conflicts(wire: &str,
     Ok(MetaPalletConflicts { pallet: wire.to_string(), conflicts })
 }
 
-/// The `meta_conflict` refusal for the pallets that conflicted.
-fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts]) -> String {
+/// The `meta_conflict` refusal for the pallets that conflicted, naming the working pallet that
+/// did lower and its head.
+fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts], pallet: &str, head: &str) -> String {
     let count: usize = conflicts.iter().map(|pallet| pallet.conflicts.len()).sum();
     let pallets: Vec<&str> = conflicts.iter().map(|pallet| pallet.pallet.as_str()).collect();
     let example = conflicts.first()
@@ -675,7 +676,7 @@ fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts]) -> String {
             --keep {}=theirs.",
             example
         ),
-        serde_json::json!({ "pallets": conflicts }),
+        serde_json::json!({ "pallets": conflicts, "lowered": { "pallet": pallet, "head": head } }),
     ).into()
 }
 

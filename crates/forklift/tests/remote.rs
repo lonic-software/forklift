@@ -6253,9 +6253,16 @@ fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
     assert_success(&area.forklift("b", &["lift"]));
     assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "amber"]));
 
-    // The lower still brings the working pallet down, then reports the @kv conflict.
-    let lowered = area.forklift("a", &["lower"]);
+    // The lower still brings the working pallet down, then reports the @kv conflict, naming the
+    // head the working pallet lowered to.
+    let lowered = area.forklift("a", &["--json", "lower"]);
     assert_eq!(lowered.status.code(), Some(24), "{}{}", stdout(&lowered), stderr(&lowered));
     assert_eq!(area.read_file("a/code.txt"), "v2\n", "the working pallet must lower despite @kv");
-    assert!(stdout(&lowered).contains("ours") && stdout(&lowered).contains("theirs"), "{}", stdout(&lowered));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&lowered)).unwrap();
+    assert_eq!(value["error"]["details"]["lowered"]["pallet"], "main");
+    assert_eq!(value["error"]["details"]["lowered"]["head"], parcel_hash(&area, "b", "main"));
+
+    let again = area.forklift("a", &["lower"]);
+    assert_eq!(again.status.code(), Some(24));
+    assert!(stdout(&again).contains("ours") && stdout(&again).contains("theirs"), "{}", stdout(&again));
 }

@@ -392,7 +392,7 @@ shape, `what_changed: "first_contact"` and no `previous`.
 remote's and are lifted. When the same key changed differently here and on the remote, nothing
 is lifted for that pallet and `lower` refuses with `meta_conflict` (exit 24). The working pallet
 still lowers; only the conflicted meta pallets wait. `details` names every conflicted path and
-both sides of it:
+both sides of it, and the working pallet that lowered with its new head:
 
 ```json
 {
@@ -403,7 +403,8 @@ both sides of it:
           "ours":   { "value": "amber", "signer": "<key id>" },
           "theirs": { "value": "red",   "signer": "<key id>" } }
       ] }
-  ]
+  ],
+  "lowered": { "pallet": "main", "head": "<hash>" }
 }
 ```
 
