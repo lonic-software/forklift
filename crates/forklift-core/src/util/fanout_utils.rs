@@ -115,11 +115,12 @@ where
     })
 }
 
-/// The stack a fan-out worker gets: the size `forklift`'s own worker thread runs with, not the
-/// spawned-thread default (2 MiB). Workers load objects, and reconstructing a delta chain
-/// recurses once per link up to the pack reader's depth limit; that limit has to be reached
-/// as an error, not as a stack overflow, which aborts the process.
-const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// The stack every thread that reads objects runs with: fan-out workers, `forklift`'s own worker
+/// thread, and the async runtime threads of `forklift` and `forklift-server` (their
+/// `spawn_blocking` pools included), instead of the spawned-thread default (2 MiB).
+/// Reconstructing a delta chain recurses once per link up to the pack reader's depth limit, and
+/// that limit has to be reached as an error, not as a stack overflow, which aborts the process.
+pub const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Spawn one scoped fan-out worker with [`WORKER_STACK_SIZE`].
 fn worker<'scope, 'env, R: Send + 'scope>(scope: &'scope std::thread::Scope<'scope, 'env>,
@@ -299,6 +300,9 @@ where
                         state.next - 1
                     };
 
+                    // Nothing may run between the claim above and the fill below outside this
+                    // `catch_unwind`: a worker that died holding a claim would leave its slot
+                    // empty while other workers live, and the consumer would wait on it forever.
                     let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let result = load(&items[index]);
                         (size(&result), result)
@@ -655,6 +659,8 @@ mod tests {
 
         // `usize::MAX` reads as "no window": the window's end must not overflow. A budget of two
         // items keeps workers waiting for room, so they test the window again after each take.
+        // (An overflow fails this fast in a debug build; with overflow checks off it wraps and
+        // hangs instead.)
         let result: Result<(), ()> = prefetch_in_order(&items, usize::MAX, 2, |n| *n, |_| 1, |item, loaded| {
             assert_eq!(*item, loaded);
             seen.push(loaded);

@@ -380,7 +380,7 @@ pub fn write_in_order<T: Sync>(items: &[T],
                                blob: impl Fn(&T) -> Option<(&str, DirEntryType)> + Sync,
                                mut write: impl FnMut(&T, Option<Result<Vec<u8>, String>>) -> Result<(), String>)
                                -> Result<(), String> {
-    if items.iter().filter(|item| prefetched(blob(item)).is_some()).count() < PREFETCH_THRESHOLD {
+    if items.iter().filter(|item| prefetched(blob(item)).is_some()).take(PREFETCH_THRESHOLD).count() < PREFETCH_THRESHOLD {
         return items.iter().try_for_each(|item| write(item, None));
     }
 
