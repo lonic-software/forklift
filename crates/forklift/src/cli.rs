@@ -1597,8 +1597,9 @@ impl Command {
 
     /// Check whether the command mutates the warehouse (inventory, refs, objects) and
     /// therefore has to hold the warehouse lock while it runs (see `WarehouseLock`). A command
-    /// that writes the working directory belongs here too: taking a bay's lock clears its
-    /// chunked-file assembly folder, which is safe only while every assembler holds the lock.
+    /// that writes the working directory belongs here too, unless it takes the lock itself, as
+    /// `franchise` does for the warehouse it creates: taking a bay's lock clears its chunked-file
+    /// assembly folder, which is safe only while every assembler holds the lock.
     ///
     /// # Returns
     /// * `true`  - If the command must run under the warehouse lock.
