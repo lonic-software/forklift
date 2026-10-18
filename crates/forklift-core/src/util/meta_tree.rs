@@ -663,7 +663,10 @@ fn apply_level(path: &str,
             .cloned()
             .collect();
 
-        if !deeper.is_empty() {
+        // Unsetting beneath a cell removes nothing, as unsetting any absent path does.
+        let only_unsets = deeper.iter().all(|(_, edit)| matches!(edit, CellEdit::Unset { .. }));
+
+        if !deeper.is_empty() && !(only_unsets && matches!(current, Entry::Blob(_))) {
             let subtree = match &current {
                 Entry::Blob(_) => return Err(format!("{} is a cell, so nothing can be set beneath it.", child_path)),
                 Entry::Tree(hash) => Some(hash.clone()),
@@ -732,6 +735,10 @@ fn read_spine(tree_hash: &str) -> Result<Result<Spine, SpineFault>, String> {
     let tracked = object_utils::load_tree(&tracked)?;
 
     let Some((_, format)) = tracked.get_files().find(|(name, _)| name.as_str() == ENTRY_NAME_FORMAT) else {
+        if subtree_named(&tracked, ENTRY_NAME_FORMAT).is_some() {
+            return Ok(Err(SpineFault::Malformed("its format marker is a subtree, not a blob".to_string())));
+        }
+
         return Ok(Err(SpineFault::NoFormat));
     };
 
@@ -1089,18 +1096,19 @@ pub fn verify_meta_content(pallet: &str,
 }
 
 /// Rule (b): the parcel's signature verifies against its key in the office, and a revoked key
-/// signed it inside the revocation's distrust boundary. Returns the verified key.
+/// signed it inside the revocation's distrust boundary. Returns the verified key. The caller has
+/// already loaded the parcel's body, so only the signature is read here.
 fn verify_meta_signature<'o>(pallet: &str,
                              hash: &str,
                              office: &'o OfficeState,
                              distrust_boundaries: &mut DistrustBoundaryMemo) -> Result<&'o KeyRecord, String> {
-    match audit_utils::classify_parcel_trust(hash, office)? {
+    match audit_utils::classify_signature_trust(hash, office)? {
         SignatureTrust::Verified { key_id } => {
-            Ok(office.find_key(&key_id).expect("classify_parcel_trust found this key"))
+            Ok(office.find_key(&key_id).expect("classify_signature_trust found this key"))
         }
 
         SignatureTrust::SignedRevoked { key_id } => {
-            let key = office.find_key(&key_id).expect("classify_parcel_trust found this key");
+            let key = office.find_key(&key_id).expect("classify_signature_trust found this key");
 
             if distrust_boundaries.vouched(key, hash)? {
                 return Ok(key);
@@ -1231,9 +1239,13 @@ fn walk_entry(path: &str,
 /// remote wrote meanwhile; and every path replayed is one the walk examined. Conflicts refuse
 /// the whole replay unless `keep` resolves each of them:
 ///
-/// - `Theirs` drops every local change at or beneath the path. It is also accepted on a path
-///   only the local side changed — the way to abandon a local edit.
+/// - `Theirs` drops every local change at or beneath the path, so it also resolves every
+///   conflict there. It is accepted on any path with a conflict or a local change at or beneath
+///   it — the way to abandon a local edit, or a whole subtree of them.
 /// - `Ours` must name a conflicted path exactly, and makes the result there ours's whole value.
+///   For a subtree that means re-signing each cell in it that differs from theirs, so one
+///   stamped by another operator refuses (`restamp_for_replay`), as any restore of their cell
+///   would; `Theirs` is always the way out.
 ///
 /// A `keep` naming a path it cannot apply to is refused, so a stale resolution never passes
 /// silently.
@@ -1253,15 +1265,18 @@ pub fn plan_net_changes(base: Option<&str>,
             )));
         }
 
-        let conflicted = walk.conflicts.iter().any(|conflict| conflict.path == *path);
-
         match side {
-            KeepSide::Ours if !conflicted => return Err(ReplayError::Refused(format!(
-                "{} is not in conflict, so there is no remote value to keep ours over.", path
-            ))),
-            KeepSide::Theirs if !conflicted && !local.iter().any(|change| at_or_under(&change.path, path)) => {
+            KeepSide::Ours if !walk.conflicts.iter().any(|conflict| conflict.path == *path) => {
                 return Err(ReplayError::Refused(format!(
-                    "{} was changed by neither side, so there is nothing to resolve.", path
+                    "{} is not in conflict, so there is no remote value to keep ours over.", path
+                )));
+            }
+            KeepSide::Theirs if !walk.conflicts.iter().any(|conflict| at_or_under(&conflict.path, path))
+                && !local.iter().any(|change| at_or_under(&change.path, path)) => {
+                return Err(ReplayError::Refused(format!(
+                    "{} has no local change and no conflict at or beneath it, so there is nothing \
+                    to resolve.",
+                    path
                 )));
             }
             _ => {}
@@ -1269,7 +1284,9 @@ pub fn plan_net_changes(base: Option<&str>,
     }
 
     let unresolved: Vec<MetaConflict> = walk.conflicts.into_iter()
-        .filter(|conflict| !keep.contains_key(&conflict.path))
+        .filter(|conflict| !keep.iter().any(|(path, side)| {
+            *path == conflict.path || (*side == KeepSide::Theirs && at_or_under(&conflict.path, path))
+        }))
         .collect();
 
     if !unresolved.is_empty() {
@@ -1419,31 +1436,37 @@ pub fn replay_meta_pallet(pallet: &str,
 }
 
 /// The newest parcel two linear chains share, or `None` when they share none.
+///
+/// The two chains are walked a parcel at a time, in turn, so heads that forked recently stop at
+/// the fork instead of loading both histories to their roots. What two linear chains share is
+/// one suffix, and each walk enters it at the fork, so the first parcel either walk reaches that
+/// the other has already passed is the fork itself.
 pub fn linear_common_ancestor(a: &str, b: &str) -> Result<Option<String>, String> {
-    let theirs: HashSet<String> = linear_chain(b)?.into_iter().collect();
+    let mut cursors = [Some(a.to_string()), Some(b.to_string())];
+    let mut seen: [HashSet<String>; 2] = [HashSet::new(), HashSet::new()];
 
-    Ok(linear_chain(a)?.into_iter().find(|hash| theirs.contains(hash)))
-}
+    while cursors.iter().any(Option::is_some) {
+        for side in 0..2 {
+            let Some(hash) = cursors[side].take() else { continue };
 
-/// A linear chain from its head to its root, newest first.
-fn linear_chain(head: &str) -> Result<Vec<String>, String> {
-    let mut chain = Vec::new();
-    let mut cursor = Some(head.to_string());
+            if seen[1 - side].contains(&hash) {
+                return Ok(Some(hash));
+            }
 
-    while let Some(hash) = cursor {
-        let parcel = object_utils::load_parcel(&hash)?;
+            let parcel = object_utils::load_parcel(&hash)?;
 
-        if parcel.parents.len() > 1 {
-            return Err(format!(
-                "Parcel {} has {} parents, but a meta pallet is linear.", hash, parcel.parents.len()
-            ));
+            if parcel.parents.len() > 1 {
+                return Err(format!(
+                    "Parcel {} has {} parents, but a meta pallet is linear.", hash, parcel.parents.len()
+                ));
+            }
+
+            cursors[side] = parcel.parents.first().cloned();
+            seen[side].insert(hash);
         }
-
-        cursor = parcel.parents.first().cloned();
-        chain.push(hash);
     }
 
-    Ok(chain)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2092,6 +2115,8 @@ mod tests {
         // Emptied subtrees are pruned, all the way up.
         assert_eq!(apply_edits(root.as_deref(), &[unset("subject/key"), unset("cell")]).unwrap(), None);
         assert_eq!(apply_edits(root.as_deref(), &[unset("missing/key")]).unwrap(), root, "unsetting nothing is nothing");
+        assert_eq!(apply_edits(root.as_deref(), &[unset("cell/below")]).unwrap(), root, "nor is unsetting beneath a cell");
+        assert!(apply_edits(root.as_deref(), &[unset("cell/below"), set("cell/other", &x)]).is_err(), "a set beneath it still refuses");
     }
 
     // --- Reads.
@@ -2136,6 +2161,13 @@ mod tests {
         let tags = forge(&[], &MetaKind::Tags.format_marker(), root.as_deref(), &signer);
         let error = read_meta_state(PALLET, &tags, &TestRules).unwrap_err();
         assert!(error.contains("holds tags metadata"), "{}", error);
+
+        // A marker that is a subtree is a corrupt spine, not an older forklift's.
+        let format_tree = tree(&[("format", t(&tree(&[("x", b(&blob("1")))])))]);
+        let corrupt_tree = tree(&[(".forklift", t(&tree(&[("tracked", t(&format_tree))])))]);
+        let corrupt = stack_signed_parcel(corrupt_tree, Vec::new(), &actor("alice"), "corrupt", &signer).unwrap();
+        let error = read_meta_state(PALLET, &corrupt, &TestRules).unwrap_err();
+        assert!(error.contains("format marker is a subtree") && !error.contains("older forklift"), "{}", error);
 
         // The writer refuses to stack on any of them, too.
         pallet_utils::set_meta_pallet_head(PALLET, &old).unwrap();
@@ -2396,6 +2428,16 @@ mod tests {
         let parcel = forge(&[], &kv(), Some(&object.hash), &alice.signer());
         assert!(verify(&office, None, &parcel).unwrap_err().contains("not a cell"));
 
+        let mut both = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        both.add_child(TreeItem::new("x".to_string(), good.clone(), DirEntryType::Normal));
+        both.add_child(TreeItem::new("x".to_string(), tree(&[("y", b(&good))]), DirEntryType::Tree));
+        let mut object = LooseObjectBuilder::build_tree(&both);
+        object.store().unwrap();
+        let parcel = forge(&[], &kv(), Some(&object.hash), &alice.signer());
+        // The tree decoder itself refuses a name used twice, so the subtree is never shadowed.
+        let error = verify(&office, None, &parcel).unwrap_err();
+        assert!(error.contains("more than one entry named \"x\""), "{}", error);
+
         let canonical = forge(&[], &kv(), cells(&[("x", &good)]).as_deref(), &alice.signer());
         verify(&office, None, &canonical).unwrap();
     }
@@ -2569,12 +2611,62 @@ mod tests {
 
         // Stale or misplaced resolutions are refused, never ignored.
         let stale = refusal(replay(&office, &ours, &theirs, &[("x", KeepSide::Ours), ("w", KeepSide::Theirs)], &alice));
-        assert!(stale.contains("w was changed by neither side"), "{}", stale);
+        assert!(stale.contains("w has no local change and no conflict"), "{}", stale);
 
         let not_conflicted = refusal(replay(&office, &ours, &theirs, &[("x", KeepSide::Ours), ("z", KeepSide::Ours)], &alice));
         assert!(not_conflicted.contains("z is not in conflict"), "{}", not_conflicted);
 
         let overlapping = refusal(replay(&office, &ours, &theirs, &[("x", KeepSide::Ours), ("x/deeper", KeepSide::Theirs)], &alice));
         assert!(overlapping.contains("overlap"), "{}", overlapping);
+    }
+
+    #[test]
+    fn theirs_at_a_subject_resolves_every_conflict_beneath_it() {
+        let _scratch = Scratch::new("replay-keep-subtree");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office(&[&alice.record, &bob.record]);
+        let root = shared_root(&office, &bob);
+
+        let theirs = remote(&root, &bob, &[set("a/x", &cell(bob.id(), "x")), set("a/y", &cell(bob.id(), "y"))]);
+        let ours = write(&office, &alice, &[
+            set("a/x", &cell(alice.id(), "x local")),
+            set("a/y", &cell(alice.id(), "y local")),
+            set("z", &cell(alice.id(), "z")),
+        ]).unwrap().unwrap();
+
+        assert_eq!(conflict_paths(replay(&office, &ours, &theirs, &[], &alice)), vec!["a/x", "a/y"]);
+
+        let kept = replay(&office, &ours, &theirs, &[("a", KeepSide::Theirs)], &alice).unwrap().unwrap();
+        assert_eq!(at(&cells_of(&kept), "a/x"), b(&cell(bob.id(), "x")));
+        assert_eq!(at(&cells_of(&kept), "a/y"), b(&cell(bob.id(), "y")));
+        assert_eq!(at(&cells_of(&kept), "z"), b(&cell(alice.id(), "z")));
+
+        // Ours resolves only the path it names, so it never covers a subject's conflicts.
+        let ours_above = refusal(replay(&office, &ours, &theirs, &[("a", KeepSide::Ours)], &alice));
+        assert!(ours_above.contains("a is not in conflict"), "{}", ours_above);
+    }
+
+    #[test]
+    fn the_common_ancestor_is_the_fork() {
+        let _scratch = Scratch::new("ancestor");
+        let alice = Key::new("alice", 1);
+        let root = forge(&[], &kv(), None, &alice.signer());
+        let mut trunk = root.clone();
+
+        for n in 0..3 {
+            trunk = remote(&trunk, &alice, &[set("t", &cell(alice.id(), &n.to_string()))]);
+        }
+
+        let left = remote(&remote(&trunk, &alice, &[set("l", &cell(alice.id(), "1"))]), &alice, &[set("l", &cell(alice.id(), "2"))]);
+        let right = remote(&trunk, &alice, &[set("r", &cell(alice.id(), "1"))]);
+
+        assert_eq!(linear_common_ancestor(&left, &right).unwrap(), Some(trunk.clone()));
+        assert_eq!(linear_common_ancestor(&right, &left).unwrap(), Some(trunk.clone()));
+        assert_eq!(linear_common_ancestor(&left, &left).unwrap(), Some(left.clone()));
+        assert_eq!(linear_common_ancestor(&left, &trunk).unwrap(), Some(trunk.clone()));
+        assert_eq!(linear_common_ancestor(&root, &left).unwrap(), Some(root.clone()));
+
+        let unrelated = forge(&[], &kv(), cells(&[("u", &cell(alice.id(), "u"))]).as_deref(), &alice.signer());
+        assert_eq!(linear_common_ancestor(&left, &unrelated).unwrap(), None);
     }
 }
