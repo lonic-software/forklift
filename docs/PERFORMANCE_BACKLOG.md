@@ -400,8 +400,8 @@ The ticket asked whether the ancestor walk should be memoized per directory or r
 
 **Measured** on macOS (APFS) with hyperfine, using release builds of af5af44, the parent of the
 FORK-175 merge. FORK-175 did not touch the per-write path checks. Both 40,000-file corpora were
-timed in both orders, because the checked build was the slower one in every pair, and its lead grew
-whenever it ran second. The git.git row was timed once, with the walk first, which is the order that
+timed in both orders. The checked build was the slower one in every pair, and its lead grew whenever
+it ran second. The git.git row was timed once, with the walk first, which is the order that
 showed the smaller gap.
 
 The ancestor walk was A/B'd against a throwaway build that skips the walk alone
