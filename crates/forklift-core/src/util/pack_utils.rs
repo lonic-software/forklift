@@ -1635,9 +1635,9 @@ pub fn invalidate_cache() {
         .remove(&file_utils::get_path_objects_root());
     // Bytes reconstructed against the old mapping may be wrong (a record since rewritten); they
     // are only ever a delta's dictionary, so keeping them is never wrong, but it would make every
-    // read built on them fail its fast attempt until they age out. The whole cache goes, not only
-    // this warehouse's entries: it is only ever a cache of work.
-    unverified_base_cache().clear();
+    // read built on them fail its fast attempt until they age out. Only this warehouse's entries
+    // go (the key's objects-root prefix), so a reload here costs another warehouse nothing.
+    unverified_base_cache().remove_prefixed(&file_utils::read_cache_key(""));
 }
 
 /// The densify-pending marker's filename, in the pack folder. Presence-only — its content is
@@ -2698,11 +2698,15 @@ fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>
 }
 
 /// A delta base for [`Bases::Unverified`]: the verified read cache's copy if it holds one, else
-/// a copy reconstructed earlier by this path, else the first loaded pack record that locates it
-/// and reconstructs (its own bases fetched the same way; a record that fails to decode moves on to
-/// the next pack that locates the hash), kept in [`unverified_base_cache`]. A base no loaded pack
-/// can reconstruct (loose, absent, behind a corrupt bucket, broken everywhere) takes the ordinary
-/// verified read, with all of its fallbacks.
+/// a copy reconstructed earlier by this path, else the first loaded pack record that locates it,
+/// reconstructed (its own bases fetched the same way) and kept in [`unverified_base_cache`]. A
+/// base no loaded pack locates (loose, absent, behind a corrupt bucket) takes the ordinary verified
+/// read, with all of its fallbacks.
+///
+/// A located record that fails to reconstruct fails this attempt outright, with no second copy
+/// tried and no verified read: either would retry the whole chain beneath it at every level (a
+/// second copy per level is exponential in the depth), and the verified redo that
+/// [`resolve_record`] runs on any failure already tries every copy, once.
 ///
 /// These bytes are never handed to a caller: the only consumer is [`reconstruct_record`], as a
 /// delta's dictionary, and the object built from them is hashed before anything returns it.
@@ -2719,8 +2723,7 @@ fn unverified_delta_base(hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Result<Arc<
     let packs = loaded_packs()?;
     for pack in packs.packs.iter() {
         let Some((offset, length)) = pack.locate(hash_bytes).found() else { continue };
-        let Ok(bytes) = reconstruct_record(pack.slice(offset, length)?, hash, Bases::Unverified) else { continue };
-        let bytes = Arc::new(bytes);
+        let bytes = Arc::new(reconstruct_record(pack.slice(offset, length)?, hash, Bases::Unverified)?);
         let weight = bytes.len();
         unverified_base_cache().put(&key, Arc::clone(&bytes), weight);
         return Ok(bytes);
@@ -6840,13 +6843,13 @@ mod tests {
     }
 
     /// `compact --all` never copies a delta verbatim once its base is repacked from a different
-    /// copy than the one the delta was encoded against. Here the only pack holds a corrupt base
-    /// record and a target encoded against what that record decodes to (so the target reads), and
-    /// a good loose copy of the base sits beside it: the base is repacked from the loose copy, and
-    /// a verbatim copy of the target would then decode against the good bytes — lost without the
-    /// repack ever reading it. Reading the base first puts its good copy in the read cache, so the
-    /// repack's read of the target deterministically decodes against it, fails, and must fail
-    /// the run loudly with the old pack left in place.
+    /// copy than the one the delta was encoded against. One pack holds a corrupt base record and a
+    /// target encoded against what that record decodes to; a pack that sorts before it holds a
+    /// good copy of the base. Whether the target reads depends on which copy of the base a read
+    /// meets first; once the base is repacked from the good copy alone, a verbatim copy of the
+    /// target could only ever decode against the good bytes. So the repack must read the target
+    /// rather than copy it. Here that read meets the first-sorted (good) base whatever the caches
+    /// hold, fails, and must fail the run loudly with the old packs left in place.
     ///
     /// Mutation: drop the copied-delta pass at the end of `collect_targets` → the compact succeeds
     /// and the target no longer reads → red.
@@ -6866,11 +6869,12 @@ mod tests {
         let target = LooseObjectBuilder::build_blob(&Blob { content: [body.as_slice(), b"\nv1\nv2\n"].concat() });
         let wrong_base = [base.content.as_slice(), b"not what the base holds"].concat();
 
-        write_raw_pack(&temp.join(".forklift/objects/pack"), "crafted", &[
+        let pack_folder = temp.join(".forklift/objects/pack");
+        write_raw_pack(&pack_folder, "crafted", &[
             (&base.hash, full_record(&wrong_base)),
             (&target.hash, delta_record(&base.hash, &wrong_base, &target.content)),
         ]);
-        store_loose(&base.hash, &base.content);
+        write_raw_pack(&pack_folder, "a-good-base", &[(&base.hash, full_record(&base.content))]);
 
         let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         tree.add_child(TreeItem::new("base.txt".to_string(), base.hash.clone(), DirEntryType::Normal));
@@ -6886,13 +6890,10 @@ mod tests {
         parcel.store().unwrap();
         pallet_utils::set_pallet_head("main", &parcel.hash).unwrap();
 
-        assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
-            "the fixture's target must read before the repack");
-        assert_eq!(file_utils::retrieve_object_by_hash(&base.hash).unwrap(), base.content);
-
         let error = compact(true, false, &Progress::NONE).expect_err("the repack must not copy the target unread");
         assert!(error.contains(&target.hash), "the failed repack must name the target: {}", error);
-        assert!(temp.join(".forklift/objects/pack/crafted.pack").exists(), "a failed repack must leave the old pack in place");
+        assert!(pack_folder.join("crafted.pack").exists() && pack_folder.join("a-good-base.pack").exists(),
+            "a failed repack must leave the old packs in place");
 
         std::fs::remove_dir_all(&temp).ok();
     }
