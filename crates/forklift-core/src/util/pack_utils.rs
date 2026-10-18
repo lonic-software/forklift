@@ -258,7 +258,8 @@ pub struct StoreStatus {
     pub damaged_packs: Vec<PackIndexProblem>,
     /// Pack index files that could not even be parsed (FORK-47, DESIGN.html §3.1.1) — their hash
     /// set is unknown, so they are inert (never gate a read verdict) but worth fixing: move the
-    /// file aside and re-run. Empty on a healthy store.
+    /// file aside and re-run. The exception is an index of another format version, which gates
+    /// every read it might answer (see `quarantine_reason`). Empty on a healthy store.
     pub unenumerable_indexes: Vec<PackIndexProblem>,
 }
 
@@ -1659,7 +1660,8 @@ pub fn densify_pending() -> Result<bool, String> {
 /// bytes and the load's error are kept in `quarantined`, so a
 /// read for a hash it names can still say something honest (`quarantine_reason`) instead of a bare
 /// `Absent`. If the index does not parse either, it goes to `unenumerable` — its hash set is
-/// unknown, so (I4) it must never gate a verdict; it is inert until a future leg surfaces it.
+/// unknown, so (I4) it gates no verdict — unless it is of another format version, which gates
+/// every hash (see [`quarantine_reason`]).
 /// Only a `read_dir` failure on the pack folder itself (not `NotFound`) is still a whole-load
 /// `Err` — an environment failure, not a per-pack one.
 ///
@@ -7318,8 +7320,9 @@ mod tests {
     /// index fails is reported, neither copied from nor deleted, and the objects its sound buckets
     /// hold stay readable; the other packs are repacked as usual.
     ///
-    /// Mutation: make `collect_targets` schedule a pack that fails `records()` for deletion instead
-    /// of reporting it → `unvalidated_packs` is empty (red).
+    /// Mutations: make `collect_targets` schedule a pack that fails `records()` for deletion instead
+    /// of reporting it → `unvalidated_packs` is empty (red). Make a census load a pack that fails
+    /// full validation instead of listing it as damaged → `store_status` fails on it (red).
     #[test]
     fn a_full_repack_leaves_a_pack_whose_index_fails_validation_in_place() {
         use crate::util::file_utils::StoreReadOutcome;

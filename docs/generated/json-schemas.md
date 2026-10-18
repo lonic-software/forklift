@@ -3609,6 +3609,13 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The object-store census. The `Serialize` shape is the public `--json` schema; byte counts\nare exact integers there (the human view renders them in binary units).",
   "properties": {
+    "damaged_packs": {
+      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand an object in a damaged part reads as unverifiable until it is stored again. Empty on a\nhealthy store.",
+      "items": {
+        "$ref": "#/$defs/PackIndexIssue"
+      },
+      "type": "array"
+    },
     "deltas": {
       "description": "Objects stored as deltas across all packs.",
       "format": "uint",
@@ -3693,6 +3700,7 @@ A command not listed here either reports only the generic human-message shape `{
     "maintenance",
     "densify_suggested",
     "quarantined_packs",
+    "damaged_packs",
     "unenumerable_indexes"
   ],
   "title": "StoreReport",

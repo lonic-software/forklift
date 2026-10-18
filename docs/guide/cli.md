@@ -1370,8 +1370,8 @@ it is removed, exactly as it blocks `gc`.
 
 A full repack checks each pack's whole index before copying anything out of it. A pack whose
 index fails that check is **left in place, untouched**, and named in a `Left a pack in place, not
-repacked:` note (`--json`: `unvalidated_packs`, the list of those errors); the objects in its sound
-parts stay readable, and `forklift heal` recovers the rest. Ordinary commands never pay that
+repacked:` note (`--json`: `unvalidated_packs`, the list of those errors). Its sound parts are still
+read; an object in a damaged part reads as unverifiable until it is stored again. Ordinary commands never pay that
 whole-index check: they verify only the slice of an index they actually read.
 
 For the same reason a full repack is **refused while a mutating command is running in another
@@ -1432,22 +1432,26 @@ Object store
 
 `--json` reports `{loose_objects, loose_bytes, packed_objects, pack_files, deltas, pack_bytes,
 total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
-pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_packs, unenumerable_indexes}`
+pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_packs, damaged_packs,
+unenumerable_indexes}`
 — every size an exact byte count. Nothing is written; run `compact` to act on what it reports.
 `densify_suggested` (and, in the human view, a one-line tip) appears once the store was
 bulk-ingested (`import-git` or a franchise's bundle install) and clears once a `compact --all
 --redelta` pass has run (see [`--redelta`](#compact--pack-the-object-store)).
 
-`quarantined_packs` and `unenumerable_indexes` are ordinarily both empty. A pack pair loses its
+`quarantined_packs`, `damaged_packs` and `unenumerable_indexes` are ordinarily all empty. A pack pair loses its
 data file only in unusual circumstances (a file removed by hand, a partial restore); when that
 happens, `store` lists it under `quarantined_packs` — `[{index_path, error}]` — rather than
 failing the census: the objects it named are not lost, only unreachable through that copy, and
-`heal` can refetch them from a configured remote. `store` checks every index in full, so a pack
-whose index is damaged in places is listed there too; ordinary reads keep using its undamaged
-parts, and only objects in a damaged part fail to read. `unenumerable_indexes` — the same `[{index_path,
+`heal` can refetch them from a configured remote. `store` checks every index in full: a pack whose
+index is damaged in places is listed under `damaged_packs` (same shape) and left out of the counts.
+Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable until
+it is stored again. `unenumerable_indexes` — the same `[{index_path,
 error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
 is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
-aside and re-run. In the human view both appear as a `pack problems:` section, only when non-empty.
+aside and re-run. An index written by a build with a different pack format is listed there too,
+naming its version, and every read it might answer fails with that error rather than reporting the
+object missing: re-create the warehouse with this build. In the human view all three appear as a `pack problems:` section, only when non-empty.
 
 ### `heal` — resolve a standing durability taint
 
