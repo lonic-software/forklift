@@ -197,7 +197,7 @@ isn't sampled on macOS, so wall-clock attribution also came from `hyperfine` A/B
 | diff's first blob lookup opened the whole pack set (5 packs, ~500k records) after the walk | ~4.4 of the 7 ms render | **Fixed:** the unstaged walk preloads the pack set on a background thread once a directory reports a change the diff will render (inside its path filter, not untracked), and returns when it lands. A clean, untracked-only or out-of-filter walk never starts it. | diff 18.7 → 15.0 ms dirty; 11.3 → 11.1 ms clean |
 | Serial per-file render in the worktree and staged modes | most of the 8.5 ms by which `diff --staged` exceeds its `--json` form (loose head after the benchmark's commit rows) | **Fixed:** both modes render through `fanout_map` past 8 files, like the pallet diff. Output is byte-identical, and a file that fails to render still prints every file before it, then the error. | diff --staged 17.5 → 12.5 ms, diff 14.7 → 13.4 ms |
 | Verification of every intermediate base in a delta chain | ~20% of the staged render's main thread (blake3), plus zstd ~13% and delta apply ~14% | **Filed: FORK-188.** It needs a design note: bases enter the shared cache. | up to ~2 ms on diff --staged |
-| One task per directory in the unstaged walk (t/ has 1129 files, the root 531) | walk ~7 ms wall for ~28 ms CPU over 6 P-cores | **Filed: FORK-189.** Measure the critical path first. | up to ~2 ms on stocktake and diff |
+| One task per directory in the unstaged walk (t/ has 1129 files, the root 531) | walk ~7 ms wall for ~28 ms CPU over 6 P-cores | **Measured, not done (FORK-189 below):** ranges plus subdirectories-first saved ~0.7 ms median for +43% CPU and a fatter p90. | none |
 | Residual pack-set open: index reads (~24 MB `read_to_end`) plus the linear validation pass (~0.7 ms) | ~4.4 ms per process wherever it can't overlap (e.g. `diff --staged`, whose first act is reading the head parcel) | **Fixed (FORK-118):** index format 3 — a checksummed fanout table; the index is mapped, and a command validates only the buckets it reads. | history -n 1 7.5 → 3.4 ms, diff --staged 7.4 → 3.3 ms |
 | Line interning hasher (`diff::lines`, SipHash) | ~0.2–0.6 ms per 20 files | Not worth a ticket alone. It now runs fanned out, so the wall-clock share is smaller still. | < 0.3 ms |
 
@@ -285,6 +285,33 @@ A/B tests against saved binaries on a quiet machine.
 
 The memory rise does not depend on the window: a window of 32 measured the same. Remaining
 work, a stat-clean worktree read and the other commands' serial loads, is FORK-192.
+
+## FORK-189: splitting the unstaged walk's large directories — measured, not worth doing (2026-10-18)
+
+**Measured** on a v3 git.git warehouse, clean tree, with a throwaway build that timed
+`executor.execute` around the walk, and hyperfine A/Bs against a saved release build of main.
+
+- **The critical path is t/.** Its directory task (1129 files) started ~1.5 ms in and ran
+  5.7–6.3 ms; the walk ended ~50 µs after it. The root (531 files) ran 2.6 ms. Walk median
+  6.62 ms.
+- **Tried:** classifying a directory's files in 128-entry ranges, each its own task, with the
+  last range to finish running the directory's reconcile (removals, missing subdirectories, the
+  shard memo, the pack preload). Holding each `DirEntry` cost ~1 KiB apiece on macOS (+8 MiB, and
+  slower), so ranges hold a name and file type only. Also tried: dispatching subdirectories
+  before classifying any file, so they start earlier.
+
+| clean tree | main | ranges + subdirectories first |
+|---|---|---|
+| walk only (median) | 6.62 ms | 5.70 ms |
+| stocktake (median) | 10.5–10.7 ms | 9.75–9.81 ms |
+| stocktake (p90) | 11.6–12.3 ms | 14.9–16.6 ms |
+| stocktake CPU | 52.6 ms | 75.4 ms (+43%) |
+| diff (median) | 10.4 ms | 9.66–9.84 ms |
+
+Ranges alone (CPU 69 ms) and subdirectories-first alone (CPU 70 ms) each gave no wall-clock
+gain on their own. System time rose from 36 to 57 ms: parallel `lstat` in one directory contends
+in the kernel. A ~0.7 ms median for a fatter tail and ~45% more CPU is not a trade worth making,
+so the walk stays one task per directory.
 
 ---
 
