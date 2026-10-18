@@ -1147,8 +1147,8 @@ impl ShardMutationBatch {
 
             if current_bytes != shard.original_bytes {
                 return Err(format!(
-                    "The inventory of folder \"{}\" changed while it was being updated, so none of \
-                    this command's inventory changes were recorded.",
+                    "The inventory of folder \"{}\" changed while it was being updated, so the \
+                    inventory changes this command still held were not recorded.",
                     load_guard_utils::display_path(&key)
                 ));
             }
