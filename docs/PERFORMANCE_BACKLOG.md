@@ -385,6 +385,66 @@ When nothing can be skipped (every leaf changed, all 20,421 shards read), the de
 read costs ~240 ms against ~225 ms for the one-shot read, inside a ~7 s stack dominated by its
 writes.
 
+## FORK-173: the per-write path checks — measured, not worth memoizing (2026-10-18)
+
+Every materializer write or removal passes `check_working_path`. That function makes two checks:
+
+- **The top-level name.** It refuses a path whose top-level name opens the metadata folder. For a
+  top-level name holding a `~`, `opens_metadata_folder` also asks the volume whether the name
+  resolves to `.forklift`. Only that first component is probed.
+- **The ancestors.** It `lstat`s each existing ancestor, stops at the first missing one, and
+  refuses a symlink.
+
+The ticket asked whether the ancestor walk should be memoized per directory or replaced with
+`openat`.
+
+**Measured** on macOS (APFS) with hyperfine, using release builds of af5af44, the parent of the
+FORK-175 merge. FORK-175 did not touch the per-write path checks. Both 40,000-file corpora were
+timed in both orders. The checked build was the slower one in every pair, and its lead grew whenever
+it ran second. The git.git row was timed once, with the walk first, which is the order that
+showed the smaller gap.
+
+The ancestor walk was A/B'd against a throwaway build that skips the walk alone
+(`&components[..0]`); the top-level check still runs in both builds.
+
+| `shift`, ancestor walk | with the walk | without | cost |
+|---|---|---|---|
+| git.git, `old` → `master` (`old` is git's first parcel, so nearly the whole tree is written) | 400.0 ± 4.7 ms | 393.3 ± 3.8 ms | +1.7% |
+| 40,000 files, six ancestors each (240k `lstat`s), the walk timed first | 4.439 ± 0.031 s | 4.422 ± 0.099 s | +0.4% |
+| the same, the walk timed second | 4.568 ± 0.113 s | 4.333 ± 0.073 s | +5.4% |
+
+Averaged over both orders, the deep corpus pays about 2.9%, or roughly 0.5 µs per `lstat`.
+
+The volume probe was measured on two 40,000-file corpora with 100 top-level directories of 400
+files each: `t~00`…`t~99` against `t_00`…`t_99`. Every write in the first corpus pays a probe.
+
+| full-tree `shift`, volume probe | `t_NN` | `t~NN` | cost |
+|---|---|---|---|
+| `t~NN` timed first | 2.135 ± 0.033 s | 2.191 ± 0.019 s | +2.6% |
+| `t~NN` timed second | 2.131 ± 0.070 s | 2.280 ± 0.099 s | +7.0% |
+
+The two orders put the cost between 1.4 and 3.7 µs per probe; the average is about 4.8%. Which
+writes pay depends on the top-level entry:
+
+- a top-level directory whose name holds a `~` makes every write beneath it pay;
+- a top-level file such as an editor's `README~` pays for its own write only.
+
+**Not measured: Windows.** There, every `lstat` costs more, and the probe compares file ids through
+an opened handle. It is also where 8.3 short names exist.
+
+**Not done.** Projected from the deep corpus, a checkout of 200,000 files six levels deep spends
+about 0.6 s of ~22 s in the walk, about 3%. A memo would save that 3%, but it would add an
+invariant that every write path must keep, and it would not close a race.
+
+The check already leaves a window between the `lstat` and the write. That window covers loading
+the blob, assembling a chunked file, and creating the missing parent directories, which the walk
+never checks. A memo would only widen the window to the whole command. `openat` relative to a
+verified directory handle is what would close it. That rewrites every write sink and is a safety
+change, not a speed one, so it should be filed on its own if it is wanted. The probe's few percent
+falls only on trees whose top-level names hold a `~`.
+
+---
+
 ## Remaining items
 
 ### b. Pack-index validation tax — fixed (FORK-118, 2026-10-18)
