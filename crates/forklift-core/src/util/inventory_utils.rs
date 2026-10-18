@@ -1062,6 +1062,34 @@ impl ShardMutationBatch {
         Ok(())
     }
 
+    /// Stat a file just written for a blob or recipe that is already stored (e.g. one just
+    /// written from a tree or merge), and record it in its parent's shard. Call it right after
+    /// the write — see the type's doc comment.
+    ///
+    /// # Arguments
+    /// * `path`      - The warehouse path of the file.
+    /// * `hash`      - The blob or recipe hash of the file's content.
+    /// * `item_type` - The authoritative entry type (from the tree / merge action), carried through
+    ///   so a chunked entry keeps its `*Chunked` type in the inventory rather than being demoted to
+    ///   a plain type a `stat` would report.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If the entry was recorded in memory.
+    /// * `Err(String)` - If the file's metadata could not be gathered, or its shard read.
+    pub fn stage_file_from_stat(&mut self,
+                                path: &str,
+                                hash: String,
+                                item_type: DirEntryType) -> Result<(), String> {
+        let (parent_key, name) = match path.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
+            Some((parent, name)) => (parent, name),
+            None => ("", path),
+        };
+
+        let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type)?;
+
+        self.update(parent_key, |inventory| inventory.add_item(entry))
+    }
+
     /// Publish every touched shard, then register any key the metadata does not list yet.
     ///
     /// Each shard is re-read first, under `SHARD_MUTATION_LOCK`: if any changed on disk since this
