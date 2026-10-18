@@ -2064,7 +2064,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             meta_tree::check_meta_pallet_name(&bare).map_err(unprocessable)?;
         }
 
-        let converted = if is_meta { meta_tree::converted_rules(&bare) } else { None };
+        let pallet_rules = if is_meta { meta_tree::meta_rules(&bare) } else { None };
 
         // The CAS read-check-write is one critical section. The trust anchor and
         // office state are read here too, once, so transport authorization below and
@@ -2096,10 +2096,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     // Anyone but a reader may transport a meta pallet's history. Content
                     // authorization below differs by meta pallet, not a uniform "signer's
                     // role" check: @office's parcels are checked, per parcel, against the
-                    // signer's role (`verify_office_privileges`); a converted pallet's against
+                    // signer's role (`verify_office_privileges`); a meta pallet's against
                     // its own rules (`verify_meta_content`), which for @tags include an
-                    // admin rule; @haul takes the same `verify_pallet_history` path as an
-                    // ordinary working pallet and gets no role or grant check at all.
+                    // admin rule. No meta pallet gets a pallet grant check.
                     user.role != office_utils::Role::Reader
                 } else {
                     user.may_write_pallet(&bare)
@@ -2219,12 +2218,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     events.push(event);
                 }
             }
-        } else if let Some(rules) = converted {
-            // A converted meta pallet exists only under an office, so a missing anchor or
+        } else if let Some(rules) = pallet_rules {
+            // A meta pallet exists only under an office, so a missing anchor or
             // office refuses here instead of skipping the check. Its content check subsumes
             // the signature audit below: every new parcel must be signed by an office key,
             // stamp only its own cells, and keep the pallet's rules.
-            meta_tree::verify_converted_update(
+            meta_tree::verify_meta_update(
                 &bare,
                 rules,
                 meta_tree::Admission::Admit,
@@ -2235,8 +2234,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             ).map_err(unprocessable)?;
         } else if let Some(anchor) = anchor {
             // A trusted warehouse accepts nothing a local audit would reject. This is the
-            // user-pallet path, and that of a meta pallet still on its own code (the office
-            // and converted pallets took the branches above). The office head is the one
+            // user-pallet path (the office and the meta-tree pallets took the branches above). The office head is the one
             // already read above, not a second lookup.
             let office_head = office_head.ok_or(unprocessable(
                 "Trust is established but the office pallet is missing; lift the \
@@ -4120,7 +4118,7 @@ mod tests {
         // correct on both the passing and the panicking path.
     }
 
-    /// The office fixture's state with an admin token, for the converted-pallet falsifiers.
+    /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
     fn admin_token_state(fixture: &OfficeFixture) -> Arc<AppState> {
         let mut operator_tokens = HashMap::new();
         operator_tokens.insert("tok-alice".to_string(), fixture.admin.identifier.clone());

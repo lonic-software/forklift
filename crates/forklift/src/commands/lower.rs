@@ -8,7 +8,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    audit_utils, config_utils, haul_utils, kv_utils, merge_utils, object_utils,
+    audit_utils, config_utils, kv_utils, merge_utils, object_utils,
     pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
@@ -22,7 +22,7 @@ use crate::output::{self, CommandOutput};
 /// remote its anchor is adopted (a one-way door, exactly like "office enroll"), and the
 /// office pallet fast-forwards so newly admitted operators can be verified locally.
 ///
-/// The meta pallets sync next, each on its own: a converted pallet that diverged has its
+/// The meta pallets sync next, each on its own: a meta pallet that diverged has its
 /// local net change replayed onto the remote head and lifted, unless both sides changed the
 /// same path differently — a conflict, which `keep` resolves path by path. A pallet that
 /// conflicts or fails stops only itself; the working pallet still lowers, and the command
@@ -65,7 +65,6 @@ pub async fn handle_command(expect: Option<String>, keep: Vec<String>) -> Result
         adopted_genesis: trust.adopted_genesis,
         office_moved: trust.office_moved,
         meta_adopted: meta.adopted,
-        meta_merged: meta.merged,
         meta_replayed: meta.replayed,
         meta_restamped: meta.restamped,
         meta_conflicts: meta.conflicts,
@@ -250,10 +249,6 @@ pub(crate) struct LowerReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     meta_adopted: Vec<String>,
 
-    /// Meta pallets whose diverged history was merged with the remote's.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    meta_merged: Vec<String>,
-
     /// Meta pallets (e.g. `@kv`) whose local net change was replayed onto the remote head and
     /// lifted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -300,10 +295,6 @@ impl LowerReport {
 
         for pallet in &self.meta_adopted {
             println!("Updated the {} pallet from the remote.", pallet);
-        }
-
-        for pallet in &self.meta_merged {
-            println!("Merged the remote {} into the local one; \"lift\" to publish it.", pallet);
         }
 
         for pallet in &self.meta_replayed {
@@ -398,7 +389,7 @@ async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<()
 type Keeps = BTreeMap<String, BTreeMap<String, KeepSide>>;
 
 /// Parse `--keep` values (`<pallet>:<path>=ours|theirs`) into cell paths, before anything is
-/// fetched. Only a converted pallet takes resolutions.
+/// fetched. Only a meta pallet takes resolutions.
 fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
     let mut keeps = Keeps::new();
 
@@ -419,7 +410,7 @@ fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
             _ => return Err(malformed()),
         };
 
-        let rules = meta_tree::converted_rules(pallet).ok_or(format!(
+        let rules = meta_tree::meta_rules(pallet).ok_or(format!(
             "\"--keep {}\": @{} takes no resolutions; it is not reconciled path by path.",
             spec, pallet
         ))?;
@@ -438,7 +429,6 @@ fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
 #[derive(Default)]
 struct MetaSync {
     adopted: Vec<String>,
-    merged: Vec<String>,
     replayed: Vec<String>,
     restamped: Vec<String>,
     conflicts: Vec<MetaPalletConflicts>,
@@ -447,9 +437,6 @@ struct MetaSync {
 
 /// How one diverged meta pallet was reconciled.
 enum Reconciled {
-    /// Merged: the local head now holds both sides' changes, and lift publishes it.
-    Merged,
-
     /// Replayed onto the remote head and lifted.
     Replayed,
 
@@ -461,10 +448,9 @@ enum Reconciled {
 }
 
 /// Adopt the remote's non-office meta pallets and reconcile any that diverged, each on its own.
-/// The haul log merges with a conflict-free two-parent join (its entries are independent signed
-/// events). A converted pallet — `@kv`, `@manifest`, `@tags` — replays its local net change onto
-/// the remote head as one parcel and lifts it. Anything else that diverged fails with its pallet
-/// named.
+/// Each one — `@kv`, `@manifest`, `@tags`, `@haul` — replays its local net change onto the
+/// remote head as one parcel and lifts it. A pallet with no rules that diverged fails with its
+/// name.
 async fn sync_meta(client: &RemoteClient,
                    info: &forklift_core::model::remote::WarehouseInfo,
                    keeps: &Keeps) -> MetaSync {
@@ -484,13 +470,12 @@ async fn sync_meta(client: &RemoteClient,
         let wire = pallet_utils::PalletRef::meta(name).to_wire();
         let keep = keeps.get(name).unwrap_or(&no_keeps);
 
-        let reconciled = match meta_tree::converted_rules(name) {
+        let reconciled = match meta_tree::meta_rules(name) {
             Some(rules) => replay(client, info, name, rules, remote_head, keep, &mut sync.restamped).await,
-            None => merge_unconverted(name, remote_head),
+            None => Err(format!("The @{} pallet diverged from the remote and has no rules to replay it.", name)),
         };
 
         match reconciled {
-            Ok(Reconciled::Merged) => sync.merged.push(wire),
             Ok(Reconciled::Replayed) => sync.replayed.push(wire),
             Ok(Reconciled::Adopted) => sync.adopted.push(wire),
             Ok(Reconciled::Conflicts(conflicts)) => sync.conflicts.push(conflicts),
@@ -518,21 +503,7 @@ async fn sync_meta(client: &RemoteClient,
     sync
 }
 
-/// Merge a diverged pallet that is still on its own code.
-fn merge_unconverted(name: &str, remote_head: &str) -> Result<Reconciled, String> {
-    let actor = config_utils::get_operator()?;
-    let (_state, signing_key_id, _actor_id) = office::require_signing_actor(&actor)?;
-
-    if name != haul_utils::HAUL_PALLET_NAME {
-        return Err(format!("The @{} pallet diverged from the remote and has no merge.", name));
-    }
-
-    haul_utils::merge_hauls(remote_head, &actor, "Merged the remote hauls.".to_string(), &signing_key_id)?;
-
-    Ok(Reconciled::Merged)
-}
-
-/// Replay a converted pallet's local net change onto the remote head and lift the result. The
+/// Replay a meta pallet's local net change onto the remote head and lift the result. The
 /// remote's new parcels were verified when they were adopted. The local head moves only once
 /// the remote has accepted the replayed parcel.
 async fn replay(client: &RemoteClient,

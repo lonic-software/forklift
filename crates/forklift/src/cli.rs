@@ -340,11 +340,13 @@ pub enum Command {
     /// Reviewable merge proposals (pull requests) on the @haul meta pallet
     #[command(
         long_about = "Propose merging one pallet into another, with discussion and signed reviews — \
-                      pull requests, in Forklift's vocabulary. A haul is an append-only log of signed events on the \
-                      @haul meta pallet, so authorship — and who approved — is forge-proof and \
-                      carries the operator's identity class (a human's approval is distinguishable \
-                      from an agent's). Reviews are recorded; merging is not gated on them in this \
-                      release. Intra-warehouse (pallet → pallet)."
+                      pull requests, in Forklift's vocabulary. A haul is a set of signed cells on the @haul \
+                      meta pallet — its proposal, its proposed head, its status, one review per \
+                      reviewer and its comments — so authorship, and who approved, is forge-proof \
+                      and carries the operator's identity class (a human's approval is \
+                      distinguishable from an agent's). A review names the head it reviewed, and a \
+                      merged haul stays merged. Reviews are recorded; merging is not gated on them \
+                      in this release. Intra-warehouse (pallet → pallet)."
     )]
     Haul {
         #[command(subcommand)]
@@ -1280,6 +1282,18 @@ pub enum HaulAction {
         id: String,
     },
 
+    /// Propose the source pallet's current head
+    #[command(
+        long_about = "Move an open haul to the source pallet's current head. Only the haul's opener \
+                      moves it; a rewound or rebased source moves the haul with it. Reviews record \
+                      the head they reviewed, so a review of an earlier head stays listed but no \
+                      longer counts as an approval of the haul."
+    )]
+    Update {
+        /// The haul id (or a unique prefix)
+        id: String,
+    },
+
     /// Add a comment
     Comment {
         /// The haul id (or a unique prefix)
@@ -1292,7 +1306,7 @@ pub enum HaulAction {
 
     /// Record a signed review (approve by default)
     #[command(
-        long_about = "Record a signed review of a haul. Approves by default; pass --request-changes \
+        long_about = "Record a signed review of a haul's current head. Approves by default; pass --request-changes \
                       or --comment for the other verdicts. Because the review is signed, the approval \
                       carries your identity class — an agent's approval is distinguishable from a \
                       human's. Requires an enrolled signing key."

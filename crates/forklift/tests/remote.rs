@@ -1225,7 +1225,7 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
 }
 
 #[test]
-fn hauls_sync_across_remotes_and_merge_when_diverged() {
+fn hauls_sync_across_remotes_and_replay_when_diverged() {
     let area = TestArea::new("haul-remote");
     let server = Server::start(&area, None);
 
@@ -1240,11 +1240,14 @@ fn hauls_sync_across_remotes_and_merge_when_diverged() {
     area.write_file("a/feat.txt", "x\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "feat work"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let first_head = pallet_head(&area, "a", "feat");
     assert_success(&area.forklift("a", &["shift", "main"]));
 
-    let opened = area.forklift("a", &["haul", "open", "--target", "main", "--source", "feat", "--title", "Feat", "-m", "review"]);
+    let opened = area.forklift("a", &["--json", "haul", "open", "--target", "main", "--source", "feat", "--title", "Feat", "-m", "review"]);
     assert_success(&opened);
-    let id = stdout(&opened).split_whitespace().nth(2).unwrap().to_string(); // "Opened haul <id> — …"
+    let id = serde_json::from_str::<serde_json::Value>(&stdout(&opened)).unwrap()["data"]["id"]
+        .as_str().unwrap().to_string();
 
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
@@ -1254,25 +1257,90 @@ fn hauls_sync_across_remotes_and_merge_when_diverged() {
     assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
     assert!(stdout(&area.forklift("b", &["haul", "show", &id])).contains("Feat"), "b must see the haul");
 
-    // Diverge: B comments and publishes; A comments on the same base without lowering.
+    // Diverge: B comments and publishes; A comments, and opens a second haul, on the same base
+    // without lowering.
     assert_success(&area.forklift("b", &["haul", "comment", &id, "-m", "from b"]));
     assert_success(&area.forklift("b", &["lift"]));
 
     assert_success(&area.forklift("a", &["haul", "comment", &id, "-m", "from a"]));
+    let second = area.forklift("a", &["--json", "haul", "open", "--target", "main", "--source", "feat", "--title", "Again"]);
+    assert_success(&second);
+    let second = serde_json::from_str::<serde_json::Value>(&stdout(&second)).unwrap()["data"]["id"]
+        .as_str().unwrap().to_string();
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success(), "a diverged @haul lift must be refused");
 
-    // Lowering unions the two event branches (conflict-free), and lifts cleanly.
-    let lowered = area.forklift("a", &["lower"]);
+    // Keeping theirs at a haul A opened locally drops it whole; A's comment, under a different
+    // path from B's, replays onto the remote's and lifts.
+    let lowered = area.forklift("a", &["lower", "--keep", &format!("haul:{}=theirs", second)]);
     assert_success(&lowered);
-    assert!(stdout(&lowered).contains("Merged the remote @haul"), "{}", stdout(&lowered));
-    assert_success(&area.forklift("a", &["lift"]));
+    assert!(stdout(&lowered).contains("Replayed the local @haul"), "{}", stdout(&lowered));
 
-    // Both comments are visible from A; B sees them after lowering; the log audits clean.
     let a_view = stdout(&area.forklift("a", &["haul", "show", &id]));
     assert!(a_view.contains("from a") && a_view.contains("from b"), "{}", a_view);
+    assert!(!area.forklift("a", &["haul", "show", &second]).status.success(), "the kept-theirs haul is gone");
 
+    // A close racing an update is a conflict on the state cell, named and resolvable: B closes
+    // the haul while A moves it to new work.
     assert_success(&area.forklift("b", &["lower"]));
+    assert_success(&area.forklift("b", &["haul", "close", &id]));
+    assert_success(&area.forklift("b", &["lift"]));
+
+    assert_success(&area.forklift("a", &["shift", "feat"]));
+    area.write_file("a/more.txt", "y\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "more feat work"]));
+    assert_success(&area.forklift("a", &["shift", "main"]));
+    assert_success(&area.forklift("a", &["haul", "update", &id]));
+
+    let conflicted = area.forklift("a", &["--json", "lower"]);
+    assert_eq!(conflicted.status.code(), Some(24), "{}", stdout(&conflicted));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&conflicted)).unwrap();
+    let pallets = &value["error"]["details"]["pallets"];
+    assert_eq!(pallets[0]["pallet"], "@haul");
+    assert_eq!(pallets[0]["conflicts"][0]["path"], format!("{}/state", id));
+    assert_eq!(pallets[0]["conflicts"][0]["theirs"]["value"], format!("closed at head {}", first_head));
+
+    assert_success(&area.forklift("a", &["lower", "--keep", &format!("haul:{}/state=theirs", id)]));
+    let show = |side: &str| serde_json::from_str::<serde_json::Value>(&stdout(&area.forklift(side, &["--json", "haul", "show", &id])))
+        .unwrap()["data"].clone();
+    assert_eq!((show("a")["status"].as_str(), show("a")["head"].as_str()), (Some("closed"), Some(first_head.as_str())));
+
+    // A merge racing an update is a conflict on the same cell too, never a merge recorded at a
+    // head it did not merge: B moves the haul to other work and lifts while A merges the head it
+    // has. (B's source is its own `feat`, whose objects A never needs to hold.)
+    assert_success(&area.forklift("b", &["haul", "reopen", &id]));
+    assert_success(&area.forklift("b", &["palletize", "feat"]));
+    area.write_file("b/other.txt", "z\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "other feat work"]));
+    let other_head = pallet_head(&area, "b", "feat");
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    assert_success(&area.forklift("b", &["haul", "update", &id]));
+    assert_success(&area.forklift("b", &["lift"]));
+
+    assert_success(&area.forklift("a", &["haul", "reopen", &id]));
+    assert_success(&area.forklift("a", &["haul", "update", &id]));
+    let a_head = pallet_head(&area, "a", "feat");
+    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    let merge_parcel = show("a")["merge_parcel"].as_str().unwrap().to_string();
+
+    let raced = area.forklift("a", &["--json", "lower"]);
+    assert_eq!(raced.status.code(), Some(24), "{}", stdout(&raced));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&raced)).unwrap();
+    let conflict = &value["error"]["details"]["pallets"][0]["conflicts"][0];
+    assert_eq!(conflict["path"], format!("{}/state", id));
+    assert_eq!(conflict["ours"]["value"], format!("merged as {} at head {}", merge_parcel, a_head));
+    assert_eq!(conflict["theirs"]["value"], format!("open at head {}", other_head));
+
+    // Keeping ours records the merge at the head it merged, over B's move.
+    assert_success(&area.forklift("a", &["lower", "--keep", &format!("haul:{}/state=ours", id)]));
+    let merged = show("a");
+    assert_eq!((merged["status"].as_str(), merged["head"].as_str()), (Some("merged"), Some(a_head.as_str())));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(show("b")["status"], "merged");
+
     assert!(stdout(&area.forklift("b", &["audit", "@haul"])).contains("verified"));
 }
 
@@ -6285,7 +6353,7 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
                "a conflicted lower leaves the local @kv as it was");
 
     // Keeps that cannot apply are refused: a pallet without resolutions, a malformed side.
-    let refused = area.forklift("a", &["lower", "--keep", "haul:main=ours"]);
+    let refused = area.forklift("a", &["lower", "--keep", "office:main=ours"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("takes no resolutions"), "{}", stderr(&refused));
     let refused = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=mine", subject)]);

@@ -1,6 +1,6 @@
 //! Meta pallets as signed state trees.
 //!
-//! A converted meta pallet works the way the office already does: each parcel's tree is the
+//! A meta pallet works the way the office already does: each parcel's tree is the
 //! pallet's complete current state, so reading the state means reading the head parcel's tree
 //! and nothing else. The chain is linear (every parcel has at most one parent), and a write
 //! stacks one signed parcel on the head.
@@ -25,9 +25,9 @@
 //! theirs and names every path both sides changed differently, and [`replay_meta_pallet`]
 //! applies the local side's *net* change since base onto the remote head as one new parcel.
 //!
-//! Enforcement and sync dispatch on [`converted_rules`], a code-level list of converted pallet
-//! names, never on whether a pallet happens to carry a format marker. A pallet not on the list
-//! keeps running on its own code until its conversion adds it.
+//! Enforcement and sync dispatch on [`meta_rules`], a code-level list of meta pallet names,
+//! never on whether a pallet happens to carry a format marker. A name not on the list has no
+//! rules here, so nothing admits, replays or reads it as a meta pallet.
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 use chrono::Utc;
@@ -75,12 +75,14 @@ pub const META_PALLET_NAMES: [&str; 5] = [
     kv_utils::KV_PALLET_NAME,
 ];
 
-/// The rules of a converted meta pallet, or `None` for a pallet still on its own code.
-pub fn converted_rules(name: &str) -> Option<&'static dyn PalletRules> {
+/// The rules of a meta pallet on this substrate, or `None` for the office, which is on its own
+/// code.
+pub fn meta_rules(name: &str) -> Option<&'static dyn PalletRules> {
     match name {
         kv_utils::KV_PALLET_NAME => Some(&kv_utils::KvRules),
         manifest_utils::MANIFEST_PALLET_NAME => Some(&manifest_utils::ManifestRules),
         tag_utils::TAGS_PALLET_NAME => Some(&tag_utils::TagsRules),
+        haul_utils::HAUL_PALLET_NAME => Some(&haul_utils::HaulRules),
         _ => None,
     }
 }
@@ -251,7 +253,7 @@ pub fn parse_cell(bytes: &[u8]) -> Result<CellEnvelope, String> {
     Ok(CellEnvelope { signer: signer.to_string(), schema: schema.to_string(), value })
 }
 
-/// The per-pallet half of the content check, and of reading. Each converted pallet supplies
+/// The per-pallet half of the content check, and of reading. Each meta pallet supplies
 /// one; the substrate never interprets a cell's value itself.
 pub trait PalletRules {
     /// The kind this pallet's format marker must name.
@@ -1299,11 +1301,11 @@ pub fn verify_meta_content(pallet: &str,
     Ok(())
 }
 
-/// The content check for a converted pallet's update on a store that holds the office: the
+/// The content check for a meta pallet's update on a store that holds the office: the
 /// office chain must verify against the anchor, and the pallet's new parcels against that
-/// office. A converted pallet exists only under an office, so a missing anchor or an unborn
+/// office. A meta pallet exists only under an office, so a missing anchor or an unborn
 /// office refuses rather than skipping the check. Returns the verified office.
-pub fn verify_converted_update(pallet: &str,
+pub fn verify_meta_update(pallet: &str,
                                rules: &dyn PalletRules,
                                admission: Admission,
                                anchor: Option<&TrustAnchor>,
@@ -2917,7 +2919,7 @@ mod tests {
         assert_eq!(linear_common_ancestor(&left, &unrelated).unwrap(), None);
     }
 
-    // --- The converted pallets' rules, through the content check that admits their parcels.
+    // --- The meta pallets' rules, through the content check that admits their parcels.
 
     /// An office of these keys, enrolling each key's operator with a role.
     fn office_with_roles(keys: &[(&Key, office_utils::Role)]) -> OfficeState {
@@ -3123,6 +3125,206 @@ mod tests {
         verify_manifest(&office, Some(&head), &rewritten).unwrap();
     }
 
+    /// Store a haul cell of `schema` stamped with `key_id`.
+    fn haul_cell(key_id: &str, schema: &str, value: &Table) -> String {
+        store_blob(&encode_cell(key_id, schema, value)).unwrap()
+    }
+
+    fn haul_parcel(parent: Option<&str>, key: &Key, edits: &[CellEdit]) -> String {
+        let base = parent.and_then(|parent| read_pallet_spine("haul", parent, MetaKind::Haul).unwrap().cells);
+        let cells = apply_edits(base.as_deref(), edits).unwrap();
+        let parents: Vec<&str> = parent.into_iter().collect();
+
+        forge(&parents, &MetaKind::Haul.format_marker(), cells.as_deref(), &key.signer())
+    }
+
+    fn verify_haul(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
+        verify_meta_content("haul", &haul_utils::HaulRules, office, Admission::Admit, old_head, new_head)
+    }
+
+    fn proposal(opener: &str) -> haul_utils::Opened {
+        haul_utils::Opened {
+            source: "feature".to_string(),
+            target: "main".to_string(),
+            title: "Add it".to_string(),
+            description: String::new(),
+            opener: opener.to_string(),
+            opened_at: 100,
+        }
+    }
+
+    /// A `state` cell: `status` at `head`, stamped with `key`.
+    fn state_cell(key: &Key, status: &haul_utils::HaulStatus, head: &str) -> String {
+        haul_cell(key.id(), haul_utils::SCHEMA_STATE, &haul_utils::state_value(status, head))
+    }
+
+    /// The edits that open `opened` as `key`, open at a head.
+    fn open_edits(key: &Key, opened: &haul_utils::Opened) -> Vec<CellEdit> {
+        let dir = haul_utils::haul_dir(&opened.id());
+
+        vec![
+            set(&format!("{}/opened", dir), &haul_cell(key.id(), haul_utils::SCHEMA_OPENED, &haul_utils::opened_value(opened))),
+            set(&format!("{}/state", dir), &state_cell(key, &haul_utils::HaulStatus::Open, &"ab".repeat(32))),
+        ]
+    }
+
+    #[test]
+    fn a_haul_is_opened_once_in_its_openers_name_with_a_state() {
+        use haul_utils::HaulStatus;
+
+        let _scratch = Scratch::new("haul-opened");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office(&[&alice.record, &bob.record]);
+        let opened = proposal("alice");
+        let dir = haul_utils::haul_dir(&opened.id());
+        let state = format!("{}/state", dir);
+
+        let head = haul_parcel(None, &alice, &open_edits(&alice, &opened));
+        verify_haul(&office, None, &head).unwrap();
+
+        // Bob cannot open a haul in Alice's name, even at the id it derives.
+        let forged = haul_parcel(None, &bob, &open_edits(&bob, &opened));
+        let error = verify_haul(&office, None, &forged).unwrap_err();
+        assert!(error.contains("names alice as its opener, but is signed by bob"), "{}", error);
+
+        // A proposal sits at the id it derives, and never without a state.
+        let mut moved = proposal("alice");
+        moved.title = "Something else".to_string();
+        let misplaced = haul_parcel(None, &alice, &[
+            set(&format!("{}/opened", dir), &haul_cell(alice.id(), haul_utils::SCHEMA_OPENED, &haul_utils::opened_value(&moved))),
+            set(&state, &state_cell(&alice, &HaulStatus::Open, &"ab".repeat(32))),
+        ]);
+        assert!(verify_haul(&office, None, &misplaced).unwrap_err().contains("not at the id its content derives"));
+
+        let stateless = haul_parcel(None, &alice, &open_edits(&alice, &opened)[..1]);
+        assert!(verify_haul(&office, None, &stateless).unwrap_err().contains("opened without a state"));
+
+        for born in [HaulStatus::Closed, HaulStatus::Merged("ef".repeat(32))] {
+            let mut edits = open_edits(&alice, &opened);
+            edits[1] = set(&state, &state_cell(&alice, &born, &"ab".repeat(32)));
+            let error = verify_haul(&office, None, &haul_parcel(None, &alice, &edits)).unwrap_err();
+            assert!(error.contains("but a haul is opened open"), "{}", error);
+        }
+
+        // Once opened, the proposal never changes or goes, and the state never goes.
+        let mut retitled = opened.clone();
+        retitled.title = "Renamed".to_string();
+        let rewritten = haul_parcel(Some(&head), &alice, &[
+            set(&format!("{}/opened", dir), &haul_cell(alice.id(), haul_utils::SCHEMA_OPENED, &haul_utils::opened_value(&retitled))),
+        ]);
+        assert!(verify_haul(&office, Some(&head), &rewritten).unwrap_err().contains("never changed or removed"));
+
+        let withdrawn = haul_parcel(Some(&head), &alice, &[unset(&format!("{}/opened", dir)), unset(&state)]);
+        assert!(verify_haul(&office, Some(&head), &withdrawn).unwrap_err().contains("never"));
+
+        let stateless = haul_parcel(Some(&head), &alice, &[unset(&state)]);
+        assert!(verify_haul(&office, Some(&head), &stateless).unwrap_err().contains("never removed"));
+
+        // Only the opener moves the head — to any parcel; anyone may close at the same head.
+        let moved = haul_parcel(Some(&head), &alice, &[set(&state, &state_cell(&alice, &HaulStatus::Open, &"cd".repeat(32)))]);
+        verify_haul(&office, Some(&head), &moved).unwrap();
+
+        let hijacked = haul_parcel(Some(&head), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Open, &"cd".repeat(32)))]);
+        let error = verify_haul(&office, Some(&head), &hijacked).unwrap_err();
+        assert!(error.contains("only the haul's opener, alice, moves it"), "{}", error);
+
+        let closed = haul_parcel(Some(&head), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Closed, &"ab".repeat(32)))]);
+        verify_haul(&office, Some(&head), &closed).unwrap();
+
+        let closed_elsewhere = haul_parcel(Some(&head), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Closed, &"cd".repeat(32)))]);
+        assert!(verify_haul(&office, Some(&head), &closed_elsewhere).unwrap_err().contains("only the haul's opener"));
+
+        // The rules read the state, so a state of a schema this build does not hold is refused
+        // rather than carried: carried, it might read merged where this build cannot tell.
+        let newer = haul_parcel(Some(&head), &alice, &[set(&state, &haul_cell(alice.id(), "haul.state 2", &text("x")))]);
+        assert!(verify_haul(&office, Some(&head), &newer).unwrap_err().contains("holds a haul.state 2 value"));
+
+        // No cell exists in a haul directory without its proposal, nor a cell no rule covers.
+        let other = haul_utils::haul_dir(&proposal("bob").id());
+        let orphan = haul_parcel(Some(&head), &bob, &[
+            set(&format!("{}/state", other), &state_cell(&bob, &HaulStatus::Open, &"cd".repeat(32))),
+        ]);
+        assert!(verify_haul(&office, Some(&head), &orphan).unwrap_err().contains("no proposal"));
+
+        let unknown = haul_parcel(Some(&head), &bob, &[
+            set(&format!("{}/label", dir), &haul_cell(bob.id(), "haul.label 1", &text("x"))),
+        ]);
+        assert!(verify_haul(&office, Some(&head), &unknown).unwrap_err().contains("not a cell this forklift knows"));
+    }
+
+    #[test]
+    fn a_merged_haul_stays_merged_and_reviews_belong_to_their_writers() {
+        use haul_utils::HaulStatus;
+
+        let _scratch = Scratch::new("haul-status");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office(&[&alice.record, &bob.record]);
+        let opened = proposal("alice");
+        let id = opened.id();
+        let dir = haul_utils::haul_dir(&id);
+        let state = format!("{}/state", dir);
+        let at = "ab".repeat(32);
+
+        let head = haul_parcel(None, &alice, &open_edits(&alice, &opened));
+
+        // Closed and reopened freely, by anyone.
+        let closed = haul_parcel(Some(&head), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Closed, &at))]);
+        verify_haul(&office, Some(&head), &closed).unwrap();
+        let reopened = haul_parcel(Some(&closed), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Open, &at))]);
+        verify_haul(&office, Some(&closed), &reopened).unwrap();
+
+        // Merged is final: never reopened, closed, moved or removed, even by the opener.
+        let merged = haul_parcel(Some(&head), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Merged("ef".repeat(32)), &at))]);
+        verify_haul(&office, Some(&head), &merged).unwrap();
+
+        for edit in [
+            set(&state, &state_cell(&alice, &HaulStatus::Open, &at)),
+            set(&state, &state_cell(&alice, &HaulStatus::Closed, &at)),
+            set(&state, &state_cell(&alice, &HaulStatus::Merged("ef".repeat(32)), &"cd".repeat(32))),
+            unset(&state),
+        ] {
+            let undone = haul_parcel(Some(&merged), &alice, &[edit]);
+            let error = verify_haul(&office, Some(&merged), &undone).unwrap_err();
+            assert!(error.contains("a merge is final") || error.contains("never removed"), "{}", error);
+        }
+
+        // A merge records the head it merged: no one but the opener records it at another head.
+        // That is also what refuses a non-opener's merge replayed over the opener's update, and
+        // the refusal says how out: keep theirs, and merge again.
+        let elsewhere = haul_parcel(Some(&head), &bob, &[set(&state, &state_cell(&bob, &HaulStatus::Merged("ef".repeat(32)), &"cd".repeat(32)))]);
+        let error = verify_haul(&office, Some(&head), &elsewhere).unwrap_err();
+        assert!(error.contains("only the haul's opener"), "{}", error);
+        assert!(error.contains(&format!("keeps theirs at {}/state and runs again", id)), "{}", error);
+
+        // A review sits under its writer's directory and names a full head.
+        let review = |key: &Key| haul_cell(key.id(), haul_utils::SCHEMA_REVIEW,
+            &haul_utils::review_value(haul_utils::ReviewVerdict::Approve, "", &at, 1));
+        let review_path = |operator: &str| format!("{}/review/{}", dir, manifest_utils::operator_leaf(operator));
+
+        let own = haul_parcel(Some(&head), &bob, &[set(&review_path("bob"), &review(&bob))]);
+        verify_haul(&office, Some(&head), &own).unwrap();
+
+        let squatted = haul_parcel(Some(&head), &bob, &[set(&review_path("alice"), &review(&bob))]);
+        assert!(verify_haul(&office, Some(&head), &squatted).unwrap_err().contains("another operator's directory"));
+
+        let removed = haul_parcel(Some(&own), &alice, &[unset(&review_path("bob"))]);
+        assert!(verify_haul(&office, Some(&own), &removed).unwrap_err().contains("another operator's directory"));
+
+        // A review of a newer schema is carried.
+        let newer = haul_parcel(Some(&head), &bob, &[set(&review_path("bob"), &haul_cell(bob.id(), "haul.review 2", &text("x")))]);
+        verify_haul(&office, Some(&head), &newer).unwrap();
+
+        // A comment sits at the id its content derives.
+        let comment = haul_utils::comment_value("hi", 5);
+        let path = haul_utils::comment_path(&id, "bob", &comment);
+        let commented = haul_parcel(Some(&head), &bob, &[set(&path, &haul_cell(bob.id(), haul_utils::SCHEMA_COMMENT, &comment))]);
+        verify_haul(&office, Some(&head), &commented).unwrap();
+
+        let elsewhere = haul_utils::comment_path(&id, "bob", &haul_utils::comment_value("bye", 5));
+        let misplaced = haul_parcel(Some(&head), &bob, &[set(&elsewhere, &haul_cell(bob.id(), haul_utils::SCHEMA_COMMENT, &comment))]);
+        assert!(verify_haul(&office, Some(&head), &misplaced).unwrap_err().contains("not at the id its content derives"));
+    }
+
     #[test]
     fn a_tag_or_entry_this_build_cannot_read_is_listed_beside_the_rest() {
         use manifest_utils::{cell_path, ManifestKind};
@@ -3161,5 +3363,27 @@ mod tests {
         assert_eq!(read.unreadable.len(), 1);
         assert_eq!(read.unreadable[0].subject.as_deref(), Some(subject.as_str()));
         assert_eq!(read.unreadable[0].path, newer_path);
+
+        // A haul lists, beside its readable cells, a review of a newer schema and a cell name this
+        // build does not know — the latter forged, since no rule here admits it.
+        let opened = proposal("alice");
+        let id = opened.id();
+        let dir = haul_utils::haul_dir(&id);
+        let mut edits = open_edits(&alice, &opened);
+        edits.push(set(&format!("{}/label", dir), &haul_cell(alice.id(), "haul.label 1", &text("x"))));
+        edits.push(set(&format!("{}/review/{}", dir, manifest_utils::operator_leaf("alice")),
+                       &haul_cell(alice.id(), "haul.review 2", &text("x"))));
+        let forged = haul_parcel(None, &alice, &edits);
+        pallet_utils::set_pallet_head_in(pallet_utils::PalletNamespace::Meta, "haul", &forged).unwrap();
+
+        let haul = haul_utils::find_haul(&id[..8]).unwrap();
+        let mut unreadable: Vec<&str> = haul.unreadable.iter().map(|cell| cell.path.as_str()).collect();
+        unreadable.sort();
+        assert_eq!(unreadable, vec![
+            format!("{}/label", id),
+            format!("{}/review/{}", id, manifest_utils::operator_leaf("alice")),
+        ]);
+        assert!(haul.reviews.is_empty());
+        assert!(haul_utils::read_hauls().unwrap().stray.is_empty(), "a placed cell is the haul's, not stray");
     }
 }

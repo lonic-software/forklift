@@ -175,9 +175,10 @@ not in the repo, not portable, not signed, lost if you change hosts. Forklift pu
 
 - `manifest` — signed post-metadata attached to parcels (notes, approvals, **provenance**),
   one signed cell per entry.
-- `haul` — pull requests as an append-only log of signed events (Opened / Pushed /
-  Comment / Review / Merged / Closed), where **every review is signed**, so an approval
-  is forge-proof and even carries the reviewer's identity class (human vs. agent).
+- `haul` — pull requests as signed cells (the proposal, its head, its status, one review
+  per reviewer, comments), where **every review is signed** and names the head it
+  reviewed, so an approval is forge-proof, never silently carries over to new work, and
+  even carries the reviewer's identity class (human vs. agent).
 
 These sync across remotes like any other object and survive moving hosts. Git has
 nothing equivalent in-repo; the closest is under-used `git notes`.

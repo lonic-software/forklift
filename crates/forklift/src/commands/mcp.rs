@@ -1087,6 +1087,11 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             args.push("show".to_string());
             args.push(require("id")?);
         }
+        "haul_update" => {
+            args.push("haul".to_string());
+            args.push("update".to_string());
+            args.push(require("id")?);
+        }
         "haul_comment" => {
             args.push("haul".to_string());
             args.push("comment".to_string());
@@ -1244,9 +1249,11 @@ fn tool_definitions() -> Value {
             object(json!({ "state": string }), json!([]))),
         tool("haul_show", "Show one merge proposal in full.",
             object(json!({ "id": string }), json!(["id"]))),
+        tool("haul_update", "Move an open merge proposal to its source pallet's current head (reviews of an earlier head stop counting).",
+            object(json!({ "id": string }), json!(["id"]))),
         tool("haul_comment", "Add a comment to a merge proposal.",
             object(json!({ "id": string, "message": string }), json!(["id", "message"]))),
-        tool("haul_review", "Record a signed review of a haul (approves by default; request_changes or comment for the other verdicts). Needs an enrolled key.",
+        tool("haul_review", "Record a signed review of a haul's current head (approves by default; request_changes or comment for the other verdicts). Needs an enrolled key.",
             object(json!({ "id": string, "request_changes": boolean, "comment": boolean, "message": string }), json!(["id"]))),
         tool("haul_merge", "Merge a proposal (consolidate its source into the target).",
             object(json!({ "id": string }), json!(["id"]))),
