@@ -1396,8 +1396,8 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
 /// the record kind and field ("has no ... entry"), and so does a *present* key that is not a
 /// string — but with its own wording ("is present but is not a string"), so a hand-edited
 /// `genesis = 7` is never reported as missing. Same two-arm shape as [`read_integer`], for a
-/// field this record kind always writes. `pub(crate)`: `haul_utils`, `manifest_utils` and
-/// `tag_utils` share this instead of duplicating it as a private per-module closure
+/// field this record kind always writes. `pub(crate)`: `haul_utils` shares this instead of
+/// duplicating it as a private per-module closure
 /// (FORK-81 follow-up: the class sweep this PR's own strictness fix missed).
 pub(crate) fn read_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<String, String> {
     let Some(item) = doc.get(field) else {
@@ -1465,7 +1465,7 @@ pub(crate) fn read_integer(doc: &DocumentMut, field: &str, record_kind: &str) ->
 /// this errors naming the record kind and field. Never conflates "absent" with "present but
 /// the wrong type" the way `doc.get(field).and_then(|item| item.as_str())` collapsing both
 /// cases to `None` would (FORK-81 follow-up: the same lenience `pallets` had). `pub(crate)`:
-/// `haul_utils` and `manifest_utils` share this instead of duplicating the same lenient
+/// `haul_utils` shares this instead of duplicating the same lenient
 /// shape as a private per-module `optional_string` closure.
 pub(crate) fn read_optional_string(doc: &DocumentMut, field: &str, record_kind: &str) -> Result<Option<String>, String> {
     let Some(item) = doc.get(field) else { return Ok(None); };

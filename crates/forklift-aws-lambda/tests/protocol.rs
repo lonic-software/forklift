@@ -93,6 +93,11 @@ impl Area {
     /// Run the CLI in a subdirectory of the area (created first). A fresh key directory
     /// per area keeps signing self-contained.
     fn forklift(&self, dir: &str, args: &[&str]) {
+        self.forklift_stdout(dir, args);
+    }
+
+    /// Run the CLI as [`Area::forklift`] does, and return what it printed.
+    fn forklift_stdout(&self, dir: &str, args: &[&str]) -> String {
         let working = self.path(dir);
         std::fs::create_dir_all(&working).expect("create the working directory");
 
@@ -111,6 +116,8 @@ impl Area {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+
+        String::from_utf8_lossy(&output.stdout).to_string()
     }
 
     fn write_file(&self, relative: &str, content: &str) {
@@ -507,6 +514,61 @@ fn kv_lifts_under_the_office_and_unknown_meta_names_are_refused() {
     head.ref_update("@kv", &RefUpdateRequest { old_head: Some(first), new_head: second.clone() })
         .expect("lift kv again, checked from the head it holds");
     assert_eq!(head.handshake().expect("handshake").pallets.get("@kv"), Some(&second));
+}
+
+/// A `@tags` lift is checked against the office the head holds as it admits it: a tag whose
+/// tagger is an admin there is admitted, and the same tag under an office that has demoted the
+/// tagger since is refused.
+#[test]
+fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
+    let area = Area::new("tags");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+
+    // A second identity in the same warehouse, admitted as an admin, tags a release.
+    let worker = "worker@forklift";
+    area.forklift("wh", &["config", "operator.identifier", worker]);
+    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    let mut admit: Vec<&str> = keygen.lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .collect();
+    admit.extend(["--role", "admin"]);
+    area.forklift("wh", &admit);
+
+    area.forklift("wh", &["config", "operator.identifier", worker]);
+    area.forklift("wh", &["tag", "create", "v1.0", "main"]);
+    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+
+    let before = harvest(&area.path("wh"));
+    let office_wire = format!("@{}", OFFICE_PALLET_NAME);
+    let admitting_office = before.head_of(&office_wire).expect("office head");
+    let tags = before.head_of("@tags").expect("tags head");
+
+    area.forklift("wh", &["office", "role", worker, "writer"]);
+    let after = harvest(&area.path("wh"));
+    let demoting_office = after.head_of(&office_wire).expect("office head");
+
+    let lift = |office: &str| {
+        let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+        upload_all(&head, &after);
+        head.put_trust(&after.trust.clone().expect("trust")).expect("put trust");
+        head.ref_update(&office_wire, &RefUpdateRequest { old_head: None, new_head: office.to_string() })
+            .expect("lift office");
+
+        head.ref_update("@tags", &RefUpdateRequest { old_head: None, new_head: tags.clone() })
+    };
+
+    lift(&admitting_office).expect("a tag from an admin");
+
+    let err = lift(&demoting_office).expect_err("a tag from a tagger the held office demoted");
+    assert_eq!(err.status, Status::Unprocessable);
+    assert!(err.message.contains("not an admin"), "{}", err.message);
 }
 
 /// On a trusted warehouse, a user-pallet lift before the office is lifted is refused: the

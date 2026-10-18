@@ -171,9 +171,10 @@ verify signatures against.
 
 In Git, pull requests, reviews, and approvals live in **GitHub's/GitLab's database** —
 not in the repo, not portable, not signed, lost if you change hosts. Forklift puts them
-*in the warehouse* as signed, append-only objects on dedicated meta-pallets:
+*in the warehouse* as signed objects on dedicated meta-pallets:
 
-- `manifest` — signed post-metadata attached to parcels (notes, approvals, **provenance**).
+- `manifest` — signed post-metadata attached to parcels (notes, approvals, **provenance**),
+  one signed cell per entry.
 - `haul` — pull requests as an append-only log of signed events (Opened / Pushed /
   Comment / Review / Merged / Closed), where **every review is signed**, so an approval
   is forge-proof and even carries the reviewer's identity class (human vs. agent).

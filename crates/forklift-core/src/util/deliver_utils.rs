@@ -18,6 +18,8 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::manifest_utils::{Delivery, ManifestEntry, ManifestKind};
+use crate::util::meta_tree::MetaSigner;
+use crate::util::office_utils::Role;
 use crate::util::{audit_utils, config_utils, manifest_utils, merge_utils, object_utils,
                   office_utils, pallet_utils, sign_utils, stack_utils};
 
@@ -38,7 +40,7 @@ pub struct DeliverOutcome {
     /// How many checkpoint parcels the delivery squashed.
     pub checkpoints: usize,
 
-    /// The manifest parcel that recorded the delivery.
+    /// The manifest head that holds the delivery record.
     pub manifest_head: String,
 }
 
@@ -70,6 +72,16 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         "Deliver records the checkpoint trail as signed post-metadata, so it needs an \
         enrolled key. Establish trust with \"office enroll\" first.".to_string()
     )?;
+
+    // The delivery record is judged against the verified office. A reader may write no pallet,
+    // so is refused before anything is written.
+    let office = audit_utils::verified_local_office()?;
+
+    if office.find_user(&operator.identifier).is_some_and(|user| matches!(user.role, Role::Reader)) {
+        return Err(format!(
+            "\"{}\" is a reader in this office, and a reader cannot deliver.", operator.identifier
+        ));
+    }
 
     let draft_head = pallet_utils::get_pallet_head(&source)?.ok_or(format!(
         "Pallet \"{}\" has nothing stacked yet; there is nothing to deliver.", source
@@ -140,14 +152,16 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     let signature = sign_utils::sign_parcel_hash(&signing_key_id, &object.hash)?;
     sign_utils::store_parcel_signature(&object.hash, &signature)?;
 
-    pallet_utils::set_pallet_head(target, &object.hash)?;
-
     // Record the delivery as signed post-metadata on the clean parcel, referencing the
-    // kept trail so "what the agent tried" stays discoverable.
+    // kept trail so "what the agent tried" stays discoverable. It is recorded before the target
+    // moves, so a refused record leaves the target where it was. The converse — the ref write
+    // failing after the record stood — leaves a record about a parcel no pallet holds, and a
+    // retry records a second squash. That is accepted: a stray record misleads no reader about
+    // a pallet, whereas a moved target with no record would lose the trail's evidence.
     let entry = ManifestEntry {
         subject: object.hash.clone(),
         kind: ManifestKind::Delivery,
-        recorded_at: timestamp.timestamp(),
+        recorded_at: None,
         body: description.unwrap_or_default(),
         provenance: None,
         delivery: Some(Delivery {
@@ -161,7 +175,15 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         "Delivered {} checkpoint(s) from \"{}\" as parcel {}.",
         checkpoints, source, object.hash
     );
-    let manifest_head = manifest_utils::record_entry(&entry, &operator, manifest_description, &signing_key_id)?;
+    let signer = MetaSigner::local(&signing_key_id);
+    let recorded = manifest_utils::record_entry(&entry, &office, &operator, &manifest_description, &signer)?;
+    let manifest_head = match recorded {
+        Some(head) => head,
+        // The record already stood: the head that holds it.
+        None => pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?.unwrap_or_default(),
+    };
+
+    pallet_utils::set_pallet_head(target, &object.hash)?;
 
     // The delivered tree equals the draft's, so switching the current pallet needs no
     // materialization — the working directory already matches.

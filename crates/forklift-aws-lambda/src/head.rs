@@ -716,6 +716,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 meta_tree::verify_converted_update(
                     &bare,
                     rules,
+                    meta_tree::Admission::Admit,
                     anchor.as_ref(),
                     office_head.as_deref(),
                     request.old_head.as_deref(),

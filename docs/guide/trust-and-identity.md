@@ -185,12 +185,16 @@ every meta pallet is exempt from it **at transport** (the set is fixed — `@off
 granted. `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the paragraph below the
 table) is the authoritative statement of that transport rule and of what the content-level
 audit checks on top of it — in short, only `@office` gets a content-level signer-role check
-there (`verify_office_privileges`); `@manifest`, `@haul`, and `@tags` get none, the same
-authenticity-only audit as an ungranted working pallet, and per-pallet grants are checked in
-no audit at all. `@kv` gets a content check instead: it needs the office, and every value must be
-stamped with the key that signed the parcel writing it, so no one can put a value in another
-operator's name — this holds on every head, the serverless one included, and a client checks it
-again when it adopts or lowers `@kv`. A server run with only the shared static token, an `--open` server, or the
+there (`verify_office_privileges`); `@haul` gets none, the same authenticity-only audit as an
+ungranted working pallet, and per-pallet grants are checked in no audit at all. `@kv`,
+`@manifest` and `@tags` get a content check instead: each needs the office, and every value must
+be stamped with the key that signed the parcel writing it, so no one can put a value in another
+operator's name. On top of that, a `@manifest` entry can be changed or removed only by the
+operator who wrote it, and a `@tags` tag can be added only by an admin and never changed or
+removed. This holds on every head, the serverless one included, and a client checks it again
+when it adopts or lowers those pallets — except the admin rule, which a client checks on what it
+writes but not on history a server already admitted, so demoting a past tagger never makes the
+tags they cut unreadable. A server run with only the shared static token, an `--open` server, or the
 AWS serverless head does not resolve a caller to an operator identity at all, so none of them
 run this transport gate — a `reader` who can reach the store directly (or hold that shared
 credential) can sign and push an ordinary pallet's history like anyone else.

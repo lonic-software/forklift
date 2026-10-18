@@ -682,17 +682,20 @@ changing it. Because provenance is signed, paired with an agent-class identity (
 admit --agent --supervisor …`) it answers *"which model produced this change, under whose
 supervision"* forge-proof and offline — the AI-traceability question git cannot. Entries live on the
 `@manifest` meta pallet, so they are forge-proof, portable, and offline-verifiable:
-`forklift audit @manifest` checks them like any signed history, `forklift history @manifest`
-is their audit trail. **Authorship is the signature, not a field you type** — you record
-as yourself, and no one can attribute an entry to another operator without their key.
-Recording needs an enrolled signing key, exactly like an office change — an approval is
-evidence, not an annotation. The subject is any revision (a pallet name or a parcel hash).
+`forklift history @manifest` is their audit trail. **Authorship is the signature, not a
+field you type** — you record as yourself, no one can attribute an entry to another operator
+without their key, and only you can change or remove your own entries. Recording needs an
+enrolled signing key and a writer or admin role — an approval is evidence, not an annotation.
+The subject is any revision (a pallet name or a parcel hash). You hold one approval per parcel
+(approving again replaces it); notes, provenance and deliveries accumulate, and recording the
+same note twice changes nothing. An entry this forklift cannot read (a newer kind, say) is
+listed as `unreadable` rather than hidden or failing the listing.
 
 The manifest **syncs with the office and the working pallets**: `lift` pushes it, `lower`
 and `franchise` pull it (never into the working directory — it is metadata). If two people
-record entries concurrently the manifest diverges, and `lower` **merges it automatically**
-— entries are independent, so the union is always conflict-free; you then `lift` the
-merge. (The office, whose records interdepend, stays linear and is reconciled by hand.)
+record entries concurrently the manifest diverges, and `lower` **replays** your entries onto the
+remote's. Entries from different operators never collide; only two copies of your own approval
+written apart can, and `--keep` settles that (see `kv`).
 
 ### `kv` — custom metadata on parcels
 
@@ -734,12 +737,14 @@ forklift tag show v1.2.0                                  # one tag in full
 ```
 
 A tag is a named, signed pointer at a parcel — a release or a milestone. Like the manifest,
-who cut it is the parcel's **signature**, not a self-declared field, so it is verifiable
-offline against the office chain (`forklift audit @tags`). The release convention:
-a tag is signed by an **admin** key, so creating one requires an admin — an authoritative
-act. Tag names are **immutable** (a name already in use is refused). Tags live on the
-`@tags` meta pallet, reserving no user pallet name; without a revision, `tag create` tags
-the current pallet's head.
+who cut it is its **signature**, not a self-declared field, so it is verifiable offline against
+the office chain. The release convention: a tag is signed by an **admin** key, so creating one
+requires an admin — an authoritative act, which the remote enforces too. Tag names are
+**immutable**: a name already in use is refused, and no one, the remote included, can move or
+delete a tag. Tags live on the `@tags` meta pallet, reserving no user pallet name; without a
+revision, `tag create` tags the current pallet's head. If two admins cut the same name
+concurrently, `lower` reports the conflict: `--keep tags:<name>=theirs` drops your tag, and
+keeping yours is refused, since that would move theirs.
 
 A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
 or was collected because nothing else referenced it (e.g. after an `undo` moved the only
@@ -747,25 +752,20 @@ pallet head off it), the hash still exists in the record but the parcel is gone.
 causes leave the identical local state, so nothing on disk can tell them apart — and a
 sparse or franchised clone can hit the "never fetched" case in perfectly ordinary use
 (cloning `--only` one pallet still adopts every tag, including ones cut on pallets it never
-fetched). A third case reads the same way: `@tags` records sync in wholesale, so a foreign
-or older client's record can carry a subject that is not even a well-formed hash — nothing
-could ever hold that, so it is a definite absence too, just for a different reason.
+fetched).
 
 Rather than refuse over a state that is often entirely healthy, both `tag show` and `tag
 list` probe the subject and **mark**, not fail: `tag show` still renders the tag in full —
 every field it prints comes from the tag record itself, never the subject — and adds a
-`warning:` line naming the parcel, worded for whichever of the two reasons applies; `tag
-list` marks the row with `(subject not in this store)`. Either way the exit code stays `0`.
+`warning:` line naming the parcel; `tag list` marks the row with `(subject not in this store)`. Either way the exit code stays `0`.
 Only a probe that genuinely could not determine presence (an I/O error, never a definite
 answer either way) fails the command, and it names the affected tag when it does.
 
-Every string in a `@tags` record — name, subject, message, tagger — is equally
-unvalidated (nothing checks a synced-in record on the way in; only `tag create` validates
-the name it creates). `tag show`/`tag list` render all of it safely rather than trust it:
-control characters (including ANSI escapes) are neutralized before printing, and a name
-that fails `tag create`'s own naming rules is shown with a `[invalid name] ` marker
-(`list`) or its own `warning:` line (`show`) rather than silently treated as ordinary.
-`--json` output is never touched by any of this — it always carries the raw values.
+A tag's name and subject are checked on every write and every sync, so a tag never carries
+a malformed one. Its message and tagger are another operator's text, so control characters
+(including ANSI escapes) are neutralized before printing; `--json` always carries the raw
+values. A tag this forklift cannot read (a newer schema, say) is listed as `unreadable`, and
+`tag show` of it says why.
 
 ### `haul` — pull requests (reviewable merge proposals)
 
@@ -780,8 +780,8 @@ forklift haul close <id> | reopen <id>
 ```
 
 A **haul** proposes merging one pallet into another, with discussion and reviews — forklift's
-pull request. Like the manifest, it lives on a meta pallet (`@haul`) as an **append-only log
-of signed events** (Opened / Pushed / Comment / Review / Merged / Closed), folded into current
+pull request. Like the manifest, it lives on a meta pallet (`@haul`), here as an **append-only
+log of signed events** (Opened / Pushed / Comment / Review / Merged / Closed), folded into current
 state; it lifts/lowers/franchises with your warehouse and a diverged `@haul` **auto-merges**
 (the union of events). Because every event is signed, authorship — **including who approved** —
 is forge-proof and carries the reviewer's identity class, so a human's approval is
@@ -1180,8 +1180,9 @@ warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-sco
 content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
 
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
-working pallet still lowers. A diverged `@manifest` or `@haul` merges; a diverged `@kv` replays
-your changes onto the remote's, and `--keep` resolves the keys both sides changed (see `kv`).
+working pallet still lowers. A diverged `@haul` merges; a diverged `@kv`, `@manifest` or `@tags`
+replays your changes onto the remote's, and `--keep` resolves the paths both sides changed (see
+`kv`).
 
 ### `expand` — widen a sparse warehouse's fetch scope
 
@@ -1521,9 +1522,7 @@ refusal before ever reaching its own fetch):
   anything only a tag reaches. A tagged parcel may never
   have been fetched (a clone with `--only` still copies every tag) or may have been collected
   after an `undo` moved the history off it, and nothing could bring it back. `heal` names such a
-  tag in a `Note:` line and clears, and likewise names a tag record synced in from elsewhere
-  whose subject is not a well-formed object hash, or notes that the tags could not be read at
-  all. The same goes for a trust boundary naming a head this store
+  tag in a `Note:` line and clears, or notes that the tags could not be read at all. The same goes for a trust boundary naming a head this store
   never fetched. A lost parcel that a pallet's history still needs is reported as below, even if
   a tag also names it.
 - **Something is genuinely gone, and something still needs it** — `heal` reports exactly what,

@@ -79,6 +79,8 @@ pub const META_PALLET_NAMES: [&str; 5] = [
 pub fn converted_rules(name: &str) -> Option<&'static dyn PalletRules> {
     match name {
         kv_utils::KV_PALLET_NAME => Some(&kv_utils::KvRules),
+        manifest_utils::MANIFEST_PALLET_NAME => Some(&manifest_utils::ManifestRules),
+        tag_utils::TAGS_PALLET_NAME => Some(&tag_utils::TagsRules),
         _ => None,
     }
 }
@@ -294,6 +296,19 @@ pub struct CellChange {
     pub after: Option<String>,
 }
 
+/// Why a content check runs, which decides whether rules about the signer's current role apply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Admission {
+    /// New parcels are being admitted to a head: a local write, a replay, or the server moving
+    /// its head. A role rule is checked against the office as it stands now.
+    Admit,
+
+    /// History a server already admitted is being adopted. A role rule is not checked: the
+    /// office may have changed since, and a client does not verify the office's own role rules
+    /// either, so re-checking would only wedge every client behind a since-demoted signer.
+    Audit,
+}
+
 /// Everything a pallet's rules see about one parcel.
 pub struct ParcelChange<'a> {
     /// The parcel's hash.
@@ -313,6 +328,9 @@ pub struct ParcelChange<'a> {
 
     /// Every cell the parcel adds, changes or removes, relative to its parent.
     pub changes: &'a [CellChange],
+
+    /// Why the check runs.
+    pub admission: Admission,
 }
 
 /// One cell as a reader sees it. A bad cell never stops the others from reading.
@@ -878,6 +896,40 @@ fn check_format(pallet: &str, parcel_hash: &str, spine: &Spine, expected: MetaKi
     }
 }
 
+/// Refuse a value table holding any field outside `allowed`.
+pub fn value_fields_only(table: &Table, allowed: &[&str]) -> Result<(), String> {
+    match table.iter().find(|(field, _)| !allowed.contains(field)) {
+        Some((field, _)) => Err(format!("has an unexpected field \"{}\"", field)),
+        None => Ok(()),
+    }
+}
+
+/// A value table's string field, which must be present.
+pub fn value_string(table: &Table, field: &str) -> Result<String, String> {
+    value_optional_string(table, field)?.ok_or(format!("has no {} field", field))
+}
+
+/// A value table's string field, `None` when absent. A present field that is not a string is
+/// an error, never an absence.
+pub fn value_optional_string(table: &Table, field: &str) -> Result<Option<String>, String> {
+    match table.get(field) {
+        Some(Item::Value(item)) => item.as_str()
+            .map(|text| Some(text.to_string()))
+            .ok_or(format!("has a {} field that is not a string", field)),
+        Some(_) => Err(format!("has a {} field that is not a string", field)),
+        None => Ok(None),
+    }
+}
+
+/// A value table's integer field, which must be present.
+pub fn value_integer(table: &Table, field: &str) -> Result<i64, String> {
+    match table.get(field) {
+        Some(Item::Value(item)) => item.as_integer().ok_or(format!("has a {} field that is not an integer", field)),
+        Some(_) => Err(format!("has a {} field that is not an integer", field)),
+        None => Err(format!("has no {} field", field)),
+    }
+}
+
 /// Read the state at a head, tolerantly per cell: an unknown schema or a malformed envelope is
 /// reported as that cell's row and never stops the rest. A missing, unknown or mismatched
 /// format refuses the whole pallet.
@@ -1108,7 +1160,7 @@ pub fn stack_meta_edits(pallet: &str,
     let tree = store_meta_tree(rules.kind().format_marker().as_bytes(), new_cells.as_deref())?;
     let parcel = stack_signed_parcel(tree, head.iter().cloned().collect(), actor, description, signer)?;
 
-    verify_meta_content(pallet, rules, office, head.as_deref(), &parcel)?;
+    verify_meta_content(pallet, rules, office, Admission::Admit, head.as_deref(), &parcel)?;
     pallet_utils::set_meta_pallet_head(pallet, &parcel)?;
 
     Ok(Some(parcel))
@@ -1135,6 +1187,7 @@ pub fn stack_meta_edits(pallet: &str,
 pub fn verify_meta_content(pallet: &str,
                            rules: &dyn PalletRules,
                            office: &OfficeState,
+                           admission: Admission,
                            old_head: Option<&str>,
                            new_head: &str) -> Result<(), String> {
     let mut chain: Vec<(String, Parcel)> = Vec::new();
@@ -1237,6 +1290,7 @@ pub fn verify_meta_content(pallet: &str,
             parent_cells: parent_cells.as_deref(),
             cells: spine.cells.as_deref(),
             changes: &changes,
+            admission,
         }).map_err(|why| format!("Parcel {} on @{} breaks a rule of the pallet: {}", hash, pallet, why))?;
 
         parent_spine = Some(spine);
@@ -1251,6 +1305,7 @@ pub fn verify_meta_content(pallet: &str,
 /// office refuses rather than skipping the check. Returns the verified office.
 pub fn verify_converted_update(pallet: &str,
                                rules: &dyn PalletRules,
+                               admission: Admission,
                                anchor: Option<&TrustAnchor>,
                                office_head: Option<&str>,
                                old_head: Option<&str>,
@@ -1262,7 +1317,7 @@ pub fn verify_converted_update(pallet: &str,
     };
 
     let office = audit_utils::verify_office_chain_memoized(anchor, office_head)?;
-    verify_meta_content(pallet, rules, &office, old_head, new_head)?;
+    verify_meta_content(pallet, rules, &office, admission, old_head, new_head)?;
 
     Ok(office)
 }
@@ -1602,7 +1657,7 @@ pub fn replay_meta_pallet(pallet: &str,
     let tree = store_meta_tree(rules.kind().format_marker().as_bytes(), new_cells.as_deref())?;
     let parcel = stack_signed_parcel(tree, vec![theirs.to_string()], actor, description, signer)?;
 
-    verify_meta_content(pallet, rules, office, Some(theirs), &parcel)?;
+    verify_meta_content(pallet, rules, office, Admission::Admit, Some(theirs), &parcel)?;
 
     Ok(Some(parcel))
 }
@@ -1811,7 +1866,7 @@ mod tests {
     }
 
     fn verify(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content(PALLET, &TestRules, office, old_head, new_head)
+        verify_meta_content(PALLET, &TestRules, office, Admission::Admit, old_head, new_head)
     }
 
     fn write(office: &OfficeState, key: &Key, edits: &[CellEdit]) -> Result<Option<String>, String> {
@@ -2860,5 +2915,251 @@ mod tests {
 
         let unrelated = forge(&[], &kv(), cells(&[("u", &cell(alice.id(), "u"))]).as_deref(), &alice.signer());
         assert_eq!(linear_common_ancestor(&left, &unrelated).unwrap(), None);
+    }
+
+    // --- The converted pallets' rules, through the content check that admits their parcels.
+
+    /// An office of these keys, enrolling each key's operator with a role.
+    fn office_with_roles(keys: &[(&Key, office_utils::Role)]) -> OfficeState {
+        let users = keys.iter().map(|(key, role)| office_utils::UserRecord {
+            identifier: key.record.operator.clone(),
+            enrolled_at: 1,
+            role: *role,
+            pallets: Vec::new(),
+            identity_root: key.record.key_id.clone(),
+            class: office_utils::IdentityClass::Human,
+            supervisor: None,
+        }).collect();
+
+        OfficeState { users, keys: keys.iter().map(|(key, _)| key.record.clone()).collect() }
+    }
+
+    /// Store a `tags.tag 1` cell stamped with `key_id`, pointing at `subject`.
+    fn tag_cell(key_id: &str, subject: &str) -> String {
+        let mut table = Table::new();
+        table.insert("subject", toml_edit::value(subject));
+        table.insert("message", toml_edit::value("release"));
+        table.insert("tagged_at", toml_edit::value(7));
+
+        store_blob(&encode_cell(key_id, tag_utils::TAG_SCHEMA, &table)).unwrap()
+    }
+
+    /// A signed `@tags` parcel on `parents` whose cells are the parent's with `edits` applied.
+    fn tags_parcel(parent: Option<&str>, key: &Key, edits: &[CellEdit]) -> String {
+        let base = parent.and_then(|parent| read_pallet_spine("tags", parent, MetaKind::Tags).unwrap().cells);
+        let cells = apply_edits(base.as_deref(), edits).unwrap();
+        let parents: Vec<&str> = parent.into_iter().collect();
+
+        forge(&parents, &MetaKind::Tags.format_marker(), cells.as_deref(), &key.signer())
+    }
+
+    fn verify_tags(office: &OfficeState,
+                   admission: Admission,
+                   old_head: Option<&str>,
+                   new_head: &str) -> Result<(), String> {
+        verify_meta_content("tags", &tag_utils::TagsRules, office, admission, old_head, new_head)
+    }
+
+    #[test]
+    fn a_tag_is_admitted_from_an_admin_and_audited_from_anyone_the_office_knows() {
+        let _scratch = Scratch::new("tags-admin");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin), (&bob, office_utils::Role::Writer)]);
+        let subject = "ab".repeat(32);
+
+        let by_admin = tags_parcel(None, &alice, &[set("v1.0", &tag_cell(alice.id(), &subject))]);
+        verify_tags(&office, Admission::Admit, None, &by_admin).unwrap();
+
+        let by_writer = tags_parcel(Some(&by_admin), &bob, &[set("v1.1", &tag_cell(bob.id(), &subject))]);
+        let error = verify_tags(&office, Admission::Admit, Some(&by_admin), &by_writer).unwrap_err();
+        assert!(error.contains("v1.1") && error.contains("not an admin"), "{}", error);
+
+        // Admitted history is audited without the role rule: a tagger demoted since is no
+        // reason to refuse what an admit already took.
+        verify_tags(&office, Admission::Audit, Some(&by_admin), &by_writer).unwrap();
+    }
+
+    #[test]
+    fn a_tag_is_never_changed_or_removed_even_by_its_tagger() {
+        let _scratch = Scratch::new("tags-immutable");
+        let alice = Key::new("alice", 1);
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin)]);
+        let (first, second) = ("ab".repeat(32), "cd".repeat(32));
+
+        let head = tags_parcel(None, &alice, &[set("v1.0", &tag_cell(alice.id(), &first))]);
+        verify_tags(&office, Admission::Admit, None, &head).unwrap();
+
+        let added = tags_parcel(Some(&head), &alice, &[set("v2.0", &tag_cell(alice.id(), &second))]);
+        verify_tags(&office, Admission::Admit, Some(&head), &added).unwrap();
+
+        for admission in [Admission::Admit, Admission::Audit] {
+            let moved = tags_parcel(Some(&head), &alice, &[set("v1.0", &tag_cell(alice.id(), &second))]);
+            let error = verify_tags(&office, admission, Some(&head), &moved).unwrap_err();
+            assert!(error.contains("v1.0 already exists"), "{}", error);
+
+            let removed = tags_parcel(Some(&head), &alice, &[unset("v1.0")]);
+            let error = verify_tags(&office, admission, Some(&head), &removed).unwrap_err();
+            assert!(error.contains("v1.0 already exists"), "{}", error);
+        }
+    }
+
+    #[test]
+    fn a_tag_needs_a_valid_name_and_a_strict_value() {
+        let _scratch = Scratch::new("tags-shape");
+        let alice = Key::new("alice", 1);
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin)]);
+
+        let nested = tags_parcel(None, &alice, &[set("rel/v1", &tag_cell(alice.id(), &"ab".repeat(32)))]);
+        assert!(verify_tags(&office, Admission::Audit, None, &nested).unwrap_err().contains("not a valid tag name"));
+
+        let short = tags_parcel(None, &alice, &[set("v1.0", &tag_cell(alice.id(), "abc"))]);
+        assert!(verify_tags(&office, Admission::Audit, None, &short).unwrap_err().contains("full parcel hash"));
+    }
+
+    /// Store a manifest cell of `kind` with only a body, stamped with `key_id`.
+    fn note_cell(key_id: &str, kind: manifest_utils::ManifestKind, body: &str) -> String {
+        let mut table = Table::new();
+        table.insert("body", toml_edit::value(body));
+
+        store_blob(&encode_cell(key_id, kind.schema(), &table)).unwrap()
+    }
+
+    fn note_entry(subject: &str, kind: manifest_utils::ManifestKind, body: &str) -> manifest_utils::ManifestEntry {
+        manifest_utils::ManifestEntry {
+            subject: subject.to_string(),
+            kind,
+            recorded_at: None,
+            body: body.to_string(),
+            provenance: None,
+            delivery: None,
+        }
+    }
+
+    fn manifest_parcel(parent: Option<&str>, key: &Key, edits: &[CellEdit]) -> String {
+        let base = parent.and_then(|parent| read_pallet_spine("manifest", parent, MetaKind::Manifest).unwrap().cells);
+        let cells = apply_edits(base.as_deref(), edits).unwrap();
+        let parents: Vec<&str> = parent.into_iter().collect();
+
+        forge(&parents, &MetaKind::Manifest.format_marker(), cells.as_deref(), &key.signer())
+    }
+
+    fn verify_manifest(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
+        verify_meta_content("manifest", &manifest_utils::ManifestRules, office, Admission::Admit, old_head, new_head)
+    }
+
+    #[test]
+    fn a_manifest_entry_sits_only_where_its_signer_and_content_put_it() {
+        use manifest_utils::{cell_path, operator_leaf, ManifestKind};
+
+        let _scratch = Scratch::new("manifest-paths");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office(&[&alice.record, &bob.record]);
+        let subject = "ab".repeat(32);
+        let approval = note_entry(&subject, ManifestKind::Approval, "");
+        let note = note_entry(&subject, ManifestKind::Note, "lgtm");
+
+        let own = manifest_parcel(None, &alice, &[
+            set(&cell_path("alice", &approval), &note_cell(alice.id(), ManifestKind::Approval, "")),
+            set(&cell_path("alice", &note), &note_cell(alice.id(), ManifestKind::Note, "lgtm")),
+        ]);
+        verify_manifest(&office, None, &own).unwrap();
+        assert!(cell_path("alice", &approval).ends_with(&operator_leaf("alice")));
+
+        // Bob writing into Alice's directory is refused whatever the cell holds — including a
+        // schema this build cannot read, which would otherwise squat the id Alice's note derives.
+        let squatted = store_blob(&encode_cell(bob.id(), "manifest.note 2", &text("lgtm"))).unwrap();
+        for (path, blob) in [
+            (cell_path("alice", &approval), note_cell(bob.id(), ManifestKind::Approval, "")),
+            (cell_path("alice", &note), note_cell(bob.id(), ManifestKind::Note, "lgtm")),
+            (cell_path("alice", &note), squatted),
+        ] {
+            let parcel = manifest_parcel(None, &bob, &[set(&path, &blob)]);
+            let error = verify_manifest(&office, None, &parcel).unwrap_err();
+            assert!(error.contains("another operator's directory"), "{}", error);
+        }
+
+        // In his own directory: an approval is the directory itself, and a note sits at the id
+        // its content derives.
+        let below = format!("{}/{}", cell_path("bob", &approval), "cd".repeat(32));
+        let nested = manifest_parcel(None, &bob, &[set(&below, &note_cell(bob.id(), ManifestKind::Approval, ""))]);
+        let error = verify_manifest(&office, None, &nested).unwrap_err();
+        assert!(error.contains("not at its signer's own path"), "{}", error);
+
+        let other = note_entry(&subject, ManifestKind::Note, "something else");
+        let misplaced = manifest_parcel(None, &bob, &[
+            set(&cell_path("bob", &other), &note_cell(bob.id(), ManifestKind::Note, "lgtm")),
+        ]);
+        let error = verify_manifest(&office, None, &misplaced).unwrap_err();
+        assert!(error.contains("not at the id its content derives"), "{}", error);
+
+        let misfiled = manifest_parcel(None, &bob, &[
+            set(&cell_path("bob", &approval), &note_cell(bob.id(), ManifestKind::Note, "lgtm")),
+        ]);
+        let error = verify_manifest(&office, None, &misfiled).unwrap_err();
+        assert!(error.contains("holds a note entry under the approval directory"), "{}", error);
+    }
+
+    #[test]
+    fn a_manifest_entry_is_changed_or_removed_only_by_its_operator() {
+        use manifest_utils::{cell_path, ManifestKind};
+
+        let _scratch = Scratch::new("manifest-ownership");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office(&[&alice.record, &bob.record]);
+        let approval = note_entry(&"ab".repeat(32), ManifestKind::Approval, "");
+        let path = cell_path("alice", &approval);
+
+        let head = manifest_parcel(None, &alice, &[set(&path, &note_cell(alice.id(), ManifestKind::Approval, ""))]);
+
+        let removed_by_bob = manifest_parcel(Some(&head), &bob, &[unset(&path)]);
+        let error = verify_manifest(&office, Some(&head), &removed_by_bob).unwrap_err();
+        assert!(error.contains("another operator's directory"), "{}", error);
+
+        let withdrawn = manifest_parcel(Some(&head), &alice, &[unset(&path)]);
+        verify_manifest(&office, Some(&head), &withdrawn).unwrap();
+
+        let again = note_cell(alice.id(), ManifestKind::Approval, "again");
+        let rewritten = manifest_parcel(Some(&head), &alice, &[set(&path, &again)]);
+        verify_manifest(&office, Some(&head), &rewritten).unwrap();
+    }
+
+    #[test]
+    fn a_tag_or_entry_this_build_cannot_read_is_listed_beside_the_rest() {
+        use manifest_utils::{cell_path, ManifestKind};
+
+        let _scratch = Scratch::new("unreadable-rows");
+        let alice = Key::new("alice", 1);
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin)]);
+        let subject = "ab".repeat(32);
+        let newer = store_blob(&encode_cell(alice.id(), "tags.tag 2", &text("from a newer forklift"))).unwrap();
+
+        stack_meta_edits("tags", &tag_utils::TagsRules, &office, &[
+            set("v1.0", &tag_cell(alice.id(), &subject)),
+            set("v2.0", &newer),
+        ], &actor("alice"), "tags", &alice.signer()).unwrap().unwrap();
+
+        let read = tag_utils::read_tags().unwrap();
+        assert_eq!(read.tags.iter().map(|tag| tag.tag.name.as_str()).collect::<Vec<_>>(), vec!["v1.0"]);
+        assert_eq!(read.unreadable.len(), 1);
+        assert_eq!(read.unreadable[0].name, "v2.0");
+        assert!(read.unreadable[0].reason.contains("tags.tag 2"), "{}", read.unreadable[0].reason);
+        assert!(tag_utils::find_tag("v2.0").unwrap_err().contains("cannot be read"));
+        assert_eq!(tag_utils::find_tag("v1.0").unwrap().unwrap().tagger, alice.id(), "no office on disk");
+
+        let note = note_entry(&subject, ManifestKind::Note, "lgtm");
+        let newer_path = format!("{}/{}/review/{}", &subject[..2], subject, manifest_utils::operator_leaf("alice"));
+        let newer = store_blob(&encode_cell(alice.id(), "manifest.review 1", &text("a newer kind"))).unwrap();
+
+        stack_meta_edits("manifest", &manifest_utils::ManifestRules, &office, &[
+            set(&cell_path("alice", &note), &note_cell(alice.id(), ManifestKind::Note, "lgtm")),
+            set(&newer_path, &newer),
+        ], &actor("alice"), "manifest", &alice.signer()).unwrap().unwrap();
+
+        let read = manifest_utils::read_manifest().unwrap();
+        assert_eq!(read.entries.len(), 1);
+        assert_eq!(read.entries[0].entry.body, "lgtm");
+        assert_eq!(read.unreadable.len(), 1);
+        assert_eq!(read.unreadable[0].subject.as_deref(), Some(subject.as_str()));
+        assert_eq!(read.unreadable[0].path, newer_path);
     }
 }

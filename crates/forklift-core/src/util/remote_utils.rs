@@ -6061,7 +6061,8 @@ async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str)
         let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
 
         meta_tree::verify_converted_update(
-            name, rules, anchor.as_ref(), office_head.as_deref(), base.as_deref(), remote_head
+            name, rules, meta_tree::Admission::Audit, anchor.as_ref(), office_head.as_deref(), base.as_deref(),
+            remote_head
         ).map_err(|why| format!("The remote @{} was refused: {}", name, why))?;
     }
 

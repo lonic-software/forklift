@@ -24,21 +24,10 @@ write lands inside `.forklift`) stays as defense-in-depth.
 ## The manifest pallet (FORK-9 post-metadata)
 The **manifest** is a second tracked-metadata meta pallet (`@manifest`, at
 `.forklift/meta/manifest`) holding *post-metadata*: signed statements attached to a
-parcel after the fact — approvals, review notes, and (later, §7.2) machine-authorship
-provenance. An entry **references** its subject parcel and never mutates it (the §4.4
-immutability invariant). Because a manifest parcel is signed by a tracked key, it
-verifies through the ordinary pallet-history audit — no office-chain machinery and no
-per-pallet server special-case (`audit @manifest`, `history @manifest`).
-
-Unlike the office (full-state snapshots), the manifest is an **append-only DAG of
-single-entry parcels**, and **authorship is the parcel's signature, not a stored field**.
-Each `manifest note/approve` stacks one parcel carrying one entry, signed by its author;
-the author *is* whoever signed it, so there is nothing to forge — a writer cannot record
-an entry attributed to someone else, because that would require the other operator's key.
-Reading collects every entry *reachable* from the head, which makes merging two diverged
-manifests a plain **two-parent join parcel**: the union of independent records, never a
-conflict. (The office cannot merge this way — its records interdepend — so it stays
-linear; a diverged office is reconciled by hand.)
+parcel after the fact — approvals, review notes, machine-authorship provenance (§7.2) and
+delivery records (§7.3). An entry **references** its subject parcel and never mutates it
+(the §4.4 immutability invariant). It is written in the meta-tree format below; its cells
+are described under [`@manifest`](#manifest).
 
 ## The reserved tree namespace
 Office parcel trees place the records under:
@@ -48,13 +37,6 @@ Office parcel trees place the records under:
 .forklift/tracked/keys/<key-id>.toml
 ```
 
-A manifest parcel carries its single entry in a sibling subtree (the id is
-content-derived); a merge (join) parcel has an empty tree and no entry:
-
-```
-.forklift/tracked/manifest/<entry-id>.toml
-```
-
 The namespace is collision-proof by construction: the `.forklift` folder is the
 warehouse root and is never tracked by `load`, so no user file can ever occupy these
 paths. Trees carrying a top-level `.forklift` entry are refused by every operation that
@@ -62,8 +44,8 @@ materializes or merges trees.
 
 ## The meta-tree format
 `forklift-core`'s `meta_tree` module defines the format the non-office meta pallets move to,
-one pallet per change. `@kv` is written in it; `@manifest`, `@haul` and `@tags` keep the format
-described above until their own change lands. A meta tree is the pallet's whole state, and its chain is linear (a parcel has at most
+one pallet per change. `@kv`, `@manifest` and `@tags` are written in it; `@haul` keeps its own
+format until its change lands. A meta tree is the pallet's whole state, and its chain is linear (a parcel has at most
 one parent), as with the office:
 
 ```
@@ -123,6 +105,73 @@ component of at most 128 bytes; `text` is the only field of the value, UTF-8 of 
 Any operator in the office except a reader may set or unset any cell (the reader rule is
 enforced at transport and by the CLI, not in the content check). Conflicts are resolved per
 `<s>/<key>`, or per `<s>` for `theirs`.
+
+### `@manifest`
+
+Post-metadata about parcels. Every cell sits under the directory of the operator who wrote it.
+
+```
+cells/<s[0..2]>/<s>/approval/<op>         schema "manifest.approval 1"
+cells/<s[0..2]>/<s>/note/<op>/<id>        schema "manifest.note 1"
+cells/<s[0..2]>/<s>/provenance/<op>/<id>  schema "manifest.provenance 1"
+cells/<s[0..2]>/<s>/delivery/<op>/<id>    schema "manifest.delivery 1"
+```
+
+`s` is the full hash of the subject parcel, and `op` the `Blake3` of the writer's operator
+identifier, as office user records are named. An approval is one per operator: the cell `op`
+itself. The other kinds are multi-valued: `id` is the `Blake3` of every field of the entry, each
+length-prefixed. One writer's identical entries therefore collapse into one cell, and the same
+text from two writers never shares a cell. The values, each with exactly these fields:
+
+```toml
+# approval, note
+body = "LGTM"                       # may be empty, e.g. a bare approval
+
+# provenance: which model produced the parcel, with which tool, in which session
+body = "generated the auth module"
+model = "claude-opus-4-8"           # required — the compliance-critical field
+tool = "claude-code"                # optional
+session = "sess-42"                 # optional
+transcript = "b3sum:…"              # optional — a prompt/transcript fingerprint
+recorded_at = 1782205234            # display only; only provenance carries a time
+
+# delivery: the subject is a clean squash of a draft pallet's checkpoint trail (`deliver`)
+body = "add the feature"            # the delivered parcel's message
+source = "draft/feature"            # the draft pallet the trail came from (kept)
+trail_head = "e6ee0a58…"            # the trail tip — `history` on it walks the full trail
+checkpoints = 3                     # how many checkpoints were squashed
+```
+
+There is no author field: the author is the operator whose key the cell is stamped with, so it
+cannot be forged. The pallet rule, checked wherever the content check runs: a parcel may add,
+change or remove cells only under its own signer's `op`, whatever schema they carry, and an
+entry of a known schema only at the path its kind and content derive. A cell of a kind or
+schema this build does not know is listed as unreadable, and a query treats it as possibly
+matching (an unknown, never an absence); its ownership is still enforced. Conflicts are
+resolved at any path from `<s>` down to a cell.
+
+### `@tags`
+
+Signed release labels, one cell per name:
+
+```
+cells/<name>                        schema "tags.tag 1"
+```
+
+```toml
+subject = "0f1877dd…"               # the full hash of the tagged parcel
+message = "first release"           # may be empty
+tagged_at = 1782205234              # display only
+```
+
+A name is one path component of at most 128 bytes. Two rules hold. A parcel that adds a tag
+must be signed by an operator who is an admin in the office it is admitted against: when a
+client writes or replays it, and when a server or the serverless head moves its head. A client
+adopting history a server already admitted does not re-check the role, so a later demotion
+never wedges the history it admitted. And no parcel may change or remove an existing tag, so a
+tag name is immutable everywhere. Two tags created concurrently under one name are a conflict
+at `lower`: keeping `theirs` drops the local tag, and keeping `ours` is refused by the
+immutability rule.
 
 ## Record formats (TOML)
 A user record:
@@ -189,43 +238,6 @@ Retired keys are **retained forever**: they still verify the parcels that were s
 while they were active. The private halves never enter the warehouse; they live in the
 operator's `~/.forklift-keys/<key-id>.key` (mode 0600, `FORKLIFT_KEYS_DIR` overrides
 the location).
-
-A manifest entry (`entry-id` = `Blake3` of the fields below). Note there is no author
-field — the author is the operator whose key signed the parcel, resolved on read, so it
-cannot be forged:
-```toml
-subject = "0f1877dd…"    # the parcel this entry is about (never mutated)
-kind = "approval"        # "approval" | "note" | "provenance"
-recorded_at = 1782205234 # display only — validity comes from the signature, not time
-body = "LGTM"            # the message (may be empty, e.g. a bare approval)
-```
-
-A **provenance** entry (§7.2) adds machine-authorship fields — which model produced the
-parcel, with which tool, in which session. Signed like any entry, so paired with an
-agent-class signer (§7.1) it is forge-proof evidence of *how* a change was made:
-```toml
-subject = "0f1877dd…"
-kind = "provenance"
-recorded_at = 1782205234
-body = "generated the auth module"  # optional summary
-model = "claude-opus-4-8"           # required — the compliance-critical field
-tool = "claude-code"                # optional
-session = "sess-42"                 # optional
-transcript = "b3sum:…"              # optional — a prompt/transcript fingerprint
-```
-
-A **delivery** entry (§7.3) records that the subject parcel is a clean squash of a draft
-pallet's checkpoint trail (`deliver`). The subject is the delivered parcel; the entry
-references the kept trail so it stays discoverable without polluting the target's history:
-```toml
-subject = "f2998944…"    # the delivered (squashed) parcel
-kind = "delivery"
-recorded_at = 1782205234
-body = "add the feature" # the delivered parcel's message
-source = "draft/feature" # the draft pallet the trail came from (kept)
-trail_head = "e6ee0a58…" # the trail tip — `history` on it walks the full trail
-checkpoints = 3          # how many checkpoints were squashed
-```
 
 ## The trust anchor (`.forklift/trust`)
 Trust is established by the first `office enroll`: the genesis office parcel introduces

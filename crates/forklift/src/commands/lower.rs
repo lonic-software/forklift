@@ -3,12 +3,12 @@ use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
-use forklift_core::util::office_utils::{self, OfficeState};
+use forklift_core::util::office_utils::OfficeState;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    audit_utils, config_utils, haul_utils, kv_utils, manifest_utils, merge_utils, object_utils,
+    audit_utils, config_utils, haul_utils, kv_utils, merge_utils, object_utils,
     pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
@@ -420,8 +420,8 @@ fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
         };
 
         let rules = meta_tree::converted_rules(pallet).ok_or(format!(
-            "\"--keep {}\": @{} takes no resolutions; only @{} reconciles path by path.",
-            spec, pallet, kv_utils::KV_PALLET_NAME
+            "\"--keep {}\": @{} takes no resolutions; it is not reconciled path by path.",
+            spec, pallet
         ))?;
 
         let path = rules.resolution_path(spelled).map_err(|why| format!("\"--keep {}\": {}", spec, why))?;
@@ -461,9 +461,10 @@ enum Reconciled {
 }
 
 /// Adopt the remote's non-office meta pallets and reconcile any that diverged, each on its own.
-/// The manifest and the haul log merge with a conflict-free two-parent join (their entries are
-/// independent signed events). A converted pallet replays its local net change onto the remote
-/// head as one parcel and lifts it. Anything else that diverged fails with its pallet named.
+/// The haul log merges with a conflict-free two-parent join (its entries are independent signed
+/// events). A converted pallet — `@kv`, `@manifest`, `@tags` — replays its local net change onto
+/// the remote head as one parcel and lifts it. Anything else that diverged fails with its pallet
+/// named.
 async fn sync_meta(client: &RemoteClient,
                    info: &forklift_core::model::remote::WarehouseInfo,
                    keeps: &Keeps) -> MetaSync {
@@ -522,20 +523,11 @@ fn merge_unconverted(name: &str, remote_head: &str) -> Result<Reconciled, String
     let actor = config_utils::get_operator()?;
     let (_state, signing_key_id, _actor_id) = office::require_signing_actor(&actor)?;
 
-    if name == manifest_utils::MANIFEST_PALLET_NAME {
-        manifest_utils::merge_manifest(
-            remote_head, &actor, "Merged the remote manifest.".to_string(), &signing_key_id
-        )?;
-    } else if name == haul_utils::HAUL_PALLET_NAME {
-        haul_utils::merge_hauls(
-            remote_head, &actor, "Merged the remote hauls.".to_string(), &signing_key_id
-        )?;
-    } else {
-        return Err(format!(
-            "The @{} pallet diverged from the remote and has no automatic merge; resolve it by hand.",
-            name
-        ));
+    if name != haul_utils::HAUL_PALLET_NAME {
+        return Err(format!("The @{} pallet diverged from the remote and has no merge.", name));
     }
+
+    haul_utils::merge_hauls(remote_head, &actor, "Merged the remote hauls.".to_string(), &signing_key_id)?;
 
     Ok(Reconciled::Merged)
 }
@@ -610,14 +602,7 @@ async fn replay(client: &RemoteClient,
 pub(crate) fn verified_signing_office(actor: &Operator) -> Result<(OfficeState, String), String> {
     let (_unverified, signing_key_id, _actor_id) = office::require_signing_actor(actor)?;
 
-    let anchor = office_utils::read_trust_anchor()?
-        .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?;
-    let office_head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
-        .ok_or("The office pallet is unborn; use \"office enroll\" first.".to_string())?;
-
-    let office = audit_utils::verify_office_chain_memoized(&anchor, &office_head)?;
-
-    Ok((office, signing_key_id))
+    Ok((audit_utils::verified_local_office()?, signing_key_id))
 }
 
 fn describe_conflicts(wire: &str,

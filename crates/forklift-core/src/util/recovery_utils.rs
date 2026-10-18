@@ -906,17 +906,12 @@ fn tags_unread_note(error: &str) -> String {
     )
 }
 
-/// Plain-language note for a tag whose subject [`walk_closure_for`] found absent, could not
-/// probe, or never looked up because it is not canonical (FORK-83) — see
-/// [`WalkRoots::tag_subjects`] for why that never blocks clearing.
-/// Both strings come from a `@tags` record, which syncs in unvalidated, so they are sanitized.
+/// Plain-language note for a tag whose subject [`walk_closure_for`] found absent or could not
+/// probe (FORK-83) — see [`WalkRoots::tag_subjects`] for why that never blocks clearing.
 fn never_held_tag_note(name: &str, subject: &str, gap: &TagGap) -> String {
-    let (name, subject) = (crate::error::sanitize(name), crate::error::sanitize(subject));
     let why = match gap {
         TagGap::Absent => "which this store does not hold: it was never fetched here, or was \
             collected after its history was undone".to_string(),
-        TagGap::NotCanonical => "which is not an object hash in canonical form (64 lowercase hex \
-            characters), so heal does not look it up".to_string(),
         TagGap::Unchecked(error) => format!(
             "whose presence could not be checked this run ({})", crate::error::sanitize(error)
         ),
@@ -1317,11 +1312,11 @@ struct WalkRoots {
     /// Every tag as `(name, subject)` — **never walked** (FORK-83). A tag is not a gc root, so
     /// nothing only a tag reaches may hold a taint open, and an absent subject (collected, or
     /// never fetched by a sparse franchise) can never be resolved anyway. These are read only so
-    /// [`walk_closure_for`] can name an absent or non-canonical subject in a note
+    /// [`walk_closure_for`] can name an absent subject in a note
     /// ([`WalkClosureOutcome::never_held_tags`]).
     tag_subjects: Vec<(String, String)>,
-    /// Why the tags could not be read, if they could not (FORK-83). Tags feed notes only, so a
-    /// malformed synced `@tags` record must never abort heal: it leaves `tag_subjects` empty and
+    /// Why the tags could not be read, if they could not (FORK-83). Tags feed notes only, so an
+    /// unreadable `@tags` pallet must never abort heal: it leaves `tag_subjects` empty and
     /// becomes a note. A lost object in the `@tags` history is still reported, because the
     /// `@tags` pallet head is an ordinary root the walk itself descends.
     tags_unread: Option<String>,
@@ -1517,7 +1512,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
 
     // Tags are read for notes only, never walked — see `WalkRoots::tag_subjects`.
     let (tag_subjects, tags_unread) = match tag_utils::read_tags() {
-        Ok(tags) => (tags.into_iter().map(|tag| (tag.tag.name, tag.tag.subject)).collect(), None),
+        Ok(read) => (read.tags.into_iter().map(|tag| (tag.tag.name, tag.tag.subject)).collect(), None),
         Err(error) => (Vec::new(), Some(error)),
     };
 
@@ -1609,7 +1604,7 @@ pub(crate) struct ClosureWalkResult {
     /// their `Ok` path only — see [`never_held_pin_note`].
     pub never_held_pins: BTreeSet<String>,
     /// Every tag `(name, subject, why)` that no genuine root reached and whose subject this run
-    /// found absent, could not probe, or did not look up because it is not canonical — see
+    /// found absent or could not probe — see
     /// [`TagGap`]; a present subject is never listed (FORK-83). Never blocking, folded into notes
     /// on the `Ok` path only — see [`never_held_tag_note`].
     pub never_held_tags: Vec<(String, String, TagGap)>,
@@ -1820,21 +1815,19 @@ fn walk_closure_for(
         .filter(|hash| !visited_parcels.contains(hash) && !referenced.contains(hash))
         .collect();
     // The tag notes (FORK-83). A subject some genuine root reached was already resolved (or
-    // reported) by the drain above and is never noted; a subject in non-canonical form (a synced
-    // `@tags` record is an unvalidated string) is never probed. A failed probe is a note too:
-    // it is diagnostic only, so it must never abort a heal.
+    // reported) by the drain above and is never noted; the content check guarantees every
+    // subject is a full parcel hash. A failed probe is a note too: it is diagnostic only, so it
+    // must never abort a heal.
     let never_held_tags: Vec<(String, String, TagGap)> = roots.tag_subjects.iter()
         .filter_map(|(name, subject)| {
-            let gap = if !object_utils::is_object_hash(subject) {
-                TagGap::NotCanonical
-            } else if visited_parcels.contains(subject) || referenced.contains(subject) {
+            if visited_parcels.contains(subject) || referenced.contains(subject) {
                 return None;
-            } else {
-                match file_utils::raw_object_present(subject) {
-                    Ok(true) => return None,
-                    Ok(false) => TagGap::Absent,
-                    Err(error) => TagGap::Unchecked(error),
-                }
+            }
+
+            let gap = match file_utils::raw_object_present(subject) {
+                Ok(true) => return None,
+                Ok(false) => TagGap::Absent,
+                Err(error) => TagGap::Unchecked(error),
             };
             Some((name.clone(), subject.clone(), gap))
         })
@@ -1857,8 +1850,6 @@ struct WalkClosureOutcome {
 pub(crate) enum TagGap {
     /// A canonical hash this store does not hold: never fetched, or collected.
     Absent,
-    /// Not 64 lowercase hex characters; never looked up.
-    NotCanonical,
     /// The presence probe failed with this error.
     Unchecked(String),
 }
@@ -3976,14 +3967,11 @@ mod tests {
         let tagged = tagged_object.hash.clone();
 
         let absent = "a".repeat(64);
-        let upper = tagged.to_uppercase();
         let roots = WalkRoots {
             parcels: Vec::new(),
             tag_subjects: vec![
                 ("present".to_string(), tagged.clone()),
                 ("v1.0".to_string(), absent.clone()),
-                ("bad".to_string(), "not-hex".to_string()),
-                ("upper".to_string(), upper.clone()),
             ],
             tags_unread: None,
             pin_parcels: Vec::new(),
@@ -4002,8 +3990,6 @@ mod tests {
             outcome.never_held_tags,
             vec![
                 ("v1.0".to_string(), absent.clone(), TagGap::Absent),
-                ("bad".to_string(), "not-hex".to_string(), TagGap::NotCanonical),
-                ("upper".to_string(), upper.clone(), TagGap::NotCanonical),
             ],
         );
 
@@ -4015,9 +4001,8 @@ mod tests {
             "a target only a tag reaches must not be referenced; got {:?}", targeted.referenced
         );
 
-        let note = never_held_tag_note("bad\nname", "\x1b[2Kx", &TagGap::NotCanonical);
-        assert!(note.contains("canonical form"));
-        assert!(!note.chars().any(|c| c.is_control()), "synced strings must be sanitized: {:?}", note);
+        let note = never_held_tag_note("v1.0", &absent, &TagGap::Unchecked("bad \x1b[2K disk".to_string()));
+        assert!(!note.chars().any(|c| c.is_control()), "a probe error must be sanitized: {:?}", note);
         let note = tags_unread_note("bad \x1b[2K record");
         assert!(!note.chars().any(|c| c.is_control()), "a quoted record must be sanitized: {:?}", note);
 
