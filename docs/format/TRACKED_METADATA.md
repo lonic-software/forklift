@@ -108,21 +108,20 @@ enforced at transport and by the CLI, not in the content check). Conflicts are r
 
 ### `@manifest`
 
-Post-metadata about parcels. Every cell belongs to the operator who wrote it.
+Post-metadata about parcels. Every cell sits under the directory of the operator who wrote it.
 
 ```
-cells/<s[0..2]>/<s>/approval/<op>    schema "manifest.approval 1"
-cells/<s[0..2]>/<s>/note/<id>        schema "manifest.note 1"
-cells/<s[0..2]>/<s>/provenance/<id>  schema "manifest.provenance 1"
-cells/<s[0..2]>/<s>/delivery/<id>    schema "manifest.delivery 1"
+cells/<s[0..2]>/<s>/approval/<op>         schema "manifest.approval 1"
+cells/<s[0..2]>/<s>/note/<op>/<id>        schema "manifest.note 1"
+cells/<s[0..2]>/<s>/provenance/<op>/<id>  schema "manifest.provenance 1"
+cells/<s[0..2]>/<s>/delivery/<op>/<id>    schema "manifest.delivery 1"
 ```
 
-`s` is the full hash of the subject parcel. An approval is one per operator: `op` is the
-`Blake3` of the operator identifier, as office user records are named. The other kinds are
-multi-valued: `id` is the `Blake3` of the writer's operator identifier followed by every field
-of the entry, each length-prefixed. One writer's identical entries therefore collapse into one
-cell, and the same text from two writers never shares a cell. The values, each with exactly
-these fields:
+`s` is the full hash of the subject parcel, and `op` the `Blake3` of the writer's operator
+identifier, as office user records are named. An approval is one per operator: the cell `op`
+itself. The other kinds are multi-valued: `id` is the `Blake3` of every field of the entry, each
+length-prefixed. One writer's identical entries therefore collapse into one cell, and the same
+text from two writers never shares a cell. The values, each with exactly these fields:
 
 ```toml
 # approval, note
@@ -144,11 +143,12 @@ checkpoints = 3                     # how many checkpoints were squashed
 ```
 
 There is no author field: the author is the operator whose key the cell is stamped with, so it
-cannot be forged. The pallet rule, checked wherever the content check runs: a cell may be added
-only at the path or id its signer's operator and its content derive, and changed or removed
-only by a parcel whose signer resolves to the same operator as the cell's existing stamp. A
-cell of a kind or schema this build does not know is listed as unreadable; its ownership is
-still enforced. Conflicts are resolved per `<s>/<kind>/<leaf>`, per `<s>/<kind>`, or per `<s>`.
+cannot be forged. The pallet rule, checked wherever the content check runs: a parcel may add,
+change or remove cells only under its own signer's `op`, whatever schema they carry, and an
+entry of a known schema only at the path its kind and content derive. A cell of a kind or
+schema this build does not know is listed as unreadable, and a query treats it as possibly
+matching (an unknown, never an absence); its ownership is still enforced. Conflicts are
+resolved at any path from `<s>` down to a cell.
 
 ### `@tags`
 

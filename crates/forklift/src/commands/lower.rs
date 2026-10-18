@@ -461,9 +461,10 @@ enum Reconciled {
 }
 
 /// Adopt the remote's non-office meta pallets and reconcile any that diverged, each on its own.
-/// The manifest and the haul log merge with a conflict-free two-parent join (their entries are
-/// independent signed events). A converted pallet replays its local net change onto the remote
-/// head as one parcel and lifts it. Anything else that diverged fails with its pallet named.
+/// The haul log merges with a conflict-free two-parent join (its entries are independent signed
+/// events). A converted pallet — `@kv`, `@manifest`, `@tags` — replays its local net change onto
+/// the remote head as one parcel and lifts it. Anything else that diverged fails with its pallet
+/// named.
 async fn sync_meta(client: &RemoteClient,
                    info: &forklift_core::model::remote::WarehouseInfo,
                    keeps: &Keeps) -> MetaSync {

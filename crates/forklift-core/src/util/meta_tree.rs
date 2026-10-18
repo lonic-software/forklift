@@ -3065,23 +3065,35 @@ mod tests {
         verify_manifest(&office, None, &own).unwrap();
         assert!(cell_path("alice", &approval).ends_with(&operator_leaf("alice")));
 
-        // Bob's approval at Alice's path, and Bob's note at the id Alice's would derive.
-        let approval_at_alice = manifest_parcel(None, &bob, &[
-            set(&cell_path("alice", &approval), &note_cell(bob.id(), ManifestKind::Approval, "")),
-        ]);
-        let error = verify_manifest(&office, None, &approval_at_alice).unwrap_err();
+        // Bob writing into Alice's directory is refused whatever the cell holds — including a
+        // schema this build cannot read, which would otherwise squat the id Alice's note derives.
+        let squatted = store_blob(&encode_cell(bob.id(), "manifest.note 2", &text("lgtm"))).unwrap();
+        for (path, blob) in [
+            (cell_path("alice", &approval), note_cell(bob.id(), ManifestKind::Approval, "")),
+            (cell_path("alice", &note), note_cell(bob.id(), ManifestKind::Note, "lgtm")),
+            (cell_path("alice", &note), squatted),
+        ] {
+            let parcel = manifest_parcel(None, &bob, &[set(&path, &blob)]);
+            let error = verify_manifest(&office, None, &parcel).unwrap_err();
+            assert!(error.contains("another operator's directory"), "{}", error);
+        }
+
+        // In his own directory: an approval is the directory itself, and a note sits at the id
+        // its content derives.
+        let below = format!("{}/{}", cell_path("bob", &approval), "cd".repeat(32));
+        let nested = manifest_parcel(None, &bob, &[set(&below, &note_cell(bob.id(), ManifestKind::Approval, ""))]);
+        let error = verify_manifest(&office, None, &nested).unwrap_err();
         assert!(error.contains("not at its signer's own path"), "{}", error);
 
-        let note_at_alice = manifest_parcel(None, &bob, &[
-            set(&cell_path("alice", &note), &note_cell(bob.id(), ManifestKind::Note, "lgtm")),
+        let other = note_entry(&subject, ManifestKind::Note, "something else");
+        let misplaced = manifest_parcel(None, &bob, &[
+            set(&cell_path("bob", &other), &note_cell(bob.id(), ManifestKind::Note, "lgtm")),
         ]);
-        let error = verify_manifest(&office, None, &note_at_alice).unwrap_err();
-        assert!(error.contains("not at the id its signer and content derive"), "{}", error);
+        let error = verify_manifest(&office, None, &misplaced).unwrap_err();
+        assert!(error.contains("not at the id its content derives"), "{}", error);
 
-        // A note's value under the approval directory, at the signer's own approval path.
         let misfiled = manifest_parcel(None, &bob, &[
-            set(&cell_path("bob", &note_entry(&subject, ManifestKind::Approval, "")),
-                &note_cell(bob.id(), ManifestKind::Note, "lgtm")),
+            set(&cell_path("bob", &approval), &note_cell(bob.id(), ManifestKind::Note, "lgtm")),
         ]);
         let error = verify_manifest(&office, None, &misfiled).unwrap_err();
         assert!(error.contains("holds a note entry under the approval directory"), "{}", error);
@@ -3101,7 +3113,7 @@ mod tests {
 
         let removed_by_bob = manifest_parcel(Some(&head), &bob, &[unset(&path)]);
         let error = verify_manifest(&office, Some(&head), &removed_by_bob).unwrap_err();
-        assert!(error.contains("belongs to another operator"), "{}", error);
+        assert!(error.contains("another operator's directory"), "{}", error);
 
         let withdrawn = manifest_parcel(Some(&head), &alice, &[unset(&path)]);
         verify_manifest(&office, Some(&head), &withdrawn).unwrap();
@@ -3135,7 +3147,7 @@ mod tests {
         assert_eq!(tag_utils::find_tag("v1.0").unwrap().unwrap().tagger, alice.id(), "no office on disk");
 
         let note = note_entry(&subject, ManifestKind::Note, "lgtm");
-        let newer_path = format!("{}/{}/review/{}", &subject[..2], subject, "cd".repeat(32));
+        let newer_path = format!("{}/{}/review/{}", &subject[..2], subject, manifest_utils::operator_leaf("alice"));
         let newer = store_blob(&encode_cell(alice.id(), "manifest.review 1", &text("a newer kind"))).unwrap();
 
         stack_meta_edits("manifest", &manifest_utils::ManifestRules, &office, &[

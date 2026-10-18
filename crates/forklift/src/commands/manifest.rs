@@ -90,14 +90,21 @@ fn record(revision: &str, kind: ManifestKind, body: String, provenance: Option<P
 
     let signer = MetaSigner::local(&signing_key_id);
     let head = manifest_utils::record_entry(&entry, &office, &actor, &description, &signer)?;
+    let unchanged = head.is_none();
+
+    // The record already stood: the head that holds it.
+    let manifest_head = match head {
+        Some(head) => Some(head),
+        None => pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?,
+    };
 
     output::emit(&Recorded {
         kind: kind.as_str().to_string(),
         subject,
         operator: actor_id,
         body,
-        unchanged: head.is_none(),
-        manifest_head: head.or(pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?),
+        unchanged,
+        manifest_head,
     });
 
     Ok(())

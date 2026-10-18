@@ -6,10 +6,12 @@
 //! self-declared field, and it is **verifiable offline against the office chain**.
 //!
 //! A tag sits at `cells/<name>` and holds a `tags.tag 1` value: the subject, the message and
-//! when it was tagged. Two rules hold wherever the content check runs: a parcel that adds a tag
-//! must be signed by an Admin of the office as it stands when the parcel is admitted (the
-//! release convention), and no parcel may change or remove an existing tag, so a tag name is
-//! immutable everywhere.
+//! when it was tagged. No parcel may change or remove an existing tag, wherever the content check
+//! runs, so a tag name is immutable everywhere. And a parcel that adds a tag must be signed by an
+//! Admin of the office as it stands when the parcel is admitted (the release convention): when a
+//! client writes or replays it, and when a remote moves its head. A client adopting history the
+//! remote admitted does not re-check the role, so a later demotion never wedges it; that leaves
+//! the role, like every office privilege, as the remote enforces it.
 
 use toml_edit::{value, Table};
 use crate::model::operator::Operator;

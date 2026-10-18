@@ -5,13 +5,13 @@
 //! (§7.3). An entry *references* its subject parcel and never mutates it (the §4.4
 //! immutability invariant).
 //!
-//! Cells sit under `<s[0..2]>/<s>/<kind>/` for subject parcel `s`. An approval is single-valued
-//! per operator and lives at `approval/<op>`, where `op` is the blake3 of the operator
-//! identifier. Every other kind is multi-valued and lives at `<kind>/<id>`, where `id` is
-//! derived from the writer's operator identifier and the entry, so identical entries from one
-//! writer collapse and the same text from two writers never shares a cell. Who wrote an entry is
-//! its cell's signer stamp; the content check keeps that honest, and the pallet rule below lets a
-//! cell be written or removed only by the operator it belongs to.
+//! Cells sit under `<s[0..2]>/<s>/<kind>/<op>` for subject parcel `s` and writer `op`, the
+//! blake3 of the writer's operator identifier. An approval is single-valued per operator and is
+//! the cell `approval/<op>` itself. Every other kind is multi-valued and lives at
+//! `<kind>/<op>/<id>`, where `id` is derived from the entry, so identical entries from one writer
+//! collapse and the same text from two writers never shares a cell. Who wrote an entry is its
+//! cell's signer stamp; the pallet rule below lets a parcel write or remove cells only under its
+//! own signer's `<op>`, whatever schema a cell carries, so no writer can occupy another's path.
 
 use toml_edit::{value, Table};
 use crate::model::operator::Operator;
@@ -194,9 +194,10 @@ pub fn operator_leaf(operator: &str) -> String {
     blake3::hash(operator.as_bytes()).to_hex().to_string()
 }
 
-/// The id of a multi-valued entry written by `operator`: the blake3 of the operator identifier
-/// and every field of the entry, each length-prefixed so no two field lists share an encoding.
-pub fn entry_id(operator: &str, entry: &ManifestEntry) -> String {
+/// The id of a multi-valued entry: the blake3 of every field of the entry, each length-prefixed
+/// so no two field lists share an encoding. The writer is not part of it — the id sits under the
+/// writer's own directory.
+pub fn entry_id(entry: &ManifestEntry) -> String {
     let mut hasher = blake3::Hasher::new();
     let mut field = |bytes: &[u8]| {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -208,7 +209,6 @@ pub fn entry_id(operator: &str, entry: &ManifestEntry) -> String {
         None => "-".to_string(),
     };
 
-    field(operator.as_bytes());
     field(entry.subject.as_bytes());
     field(entry.kind.as_str().as_bytes());
     field(entry.body.as_bytes());
@@ -230,46 +230,51 @@ pub fn entry_id(operator: &str, entry: &ManifestEntry) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// The leaf an entry by `operator` is stored under.
-fn leaf_of(operator: &str, entry: &ManifestEntry) -> String {
-    match entry.kind {
-        ManifestKind::Approval => operator_leaf(operator),
-        _ => entry_id(operator, entry),
-    }
-}
-
 /// The cell path of an entry by `operator`, relative to `cells/`.
 pub fn cell_path(operator: &str, entry: &ManifestEntry) -> String {
-    format!("{}/{}/{}/{}", &entry.subject[..2], entry.subject, entry.kind.as_str(), leaf_of(operator, entry))
+    let (subject, kind) = (&entry.subject, entry.kind.as_str());
+    let owned = format!("{}/{}/{}/{}", &subject[..2], subject, kind, operator_leaf(operator));
+
+    match entry.kind {
+        ManifestKind::Approval => owned,
+        _ => format!("{}/{}", owned, entry_id(entry)),
+    }
 }
 
 /// The parts of a manifest cell path. The kind is kept as spelled, so a newer kind still parses.
 struct CellPath<'a> {
     subject: &'a str,
     kind: &'a str,
-    leaf: &'a str,
+
+    /// The writer's `<op>` component.
+    owner: &'a str,
+
+    /// The entry id, for a multi-valued entry.
+    id: Option<&'a str>,
 }
 
-/// Split a cell path, refusing any path that is not `<s[0..2]>/<s>/<kind>/<leaf>` for a parcel
-/// hash `s` and a 64-hex leaf.
+/// Split a cell path, refusing any path that is not `<s[0..2]>/<s>/<kind>/<op>[/<id>]` for a
+/// parcel hash `s` and 64-hex `op` and `id`.
 fn parse_cell_path(path: &str) -> Result<CellPath<'_>, String> {
     let parts: Vec<&str> = path.split('/').collect();
 
-    let [fan, subject, kind, leaf] = parts.as_slice() else {
-        return Err(format!("{} is not a <subject>/<kind>/<id> cell path", path));
+    let (fan, subject, kind, owner, id) = match parts.as_slice() {
+        [fan, subject, kind, owner] => (*fan, *subject, *kind, *owner, None),
+        [fan, subject, kind, owner, id] => (*fan, *subject, *kind, *owner, Some(*id)),
+        _ => return Err(format!("{} is not a <subject>/<kind>/<writer>[/<id>] cell path", path)),
     };
 
-    if !object_utils::is_object_hash(subject) || *fan != &subject[..2] {
+    if !object_utils::is_object_hash(subject) || fan != &subject[..2] {
         return Err(format!("{} does not sit under the directory of a parcel hash", path));
     }
 
     meta_tree::validate_component(kind)?;
 
-    if !object_utils::is_object_hash(leaf) {
-        return Err(format!("{} does not end in a 64-hex id", path));
+    if !object_utils::is_object_hash(owner) || !id.is_none_or(object_utils::is_object_hash) {
+        return Err(format!("{} does not name its writer and id by 64-hex hashes", path));
     }
 
-    Ok(CellPath { subject, kind, leaf })
+    Ok(CellPath { subject, kind, owner, id })
 }
 
 /// The value table of an entry.
@@ -372,10 +377,9 @@ fn operator_of<'o>(office: &'o OfficeState, key_id: &str) -> Option<&'o str> {
     office.find_key(key_id).map(|key| key.operator.as_str())
 }
 
-/// The pallet rules of `@manifest`: the cell layout, the value shapes, and ownership — every
-/// cell belongs to the operator it was written by. A cell may be added only where that
-/// operator's path or id puts it, and changed or removed only by a parcel signed by the same
-/// operator.
+/// The pallet rules of `@manifest`: the cell layout, the value shapes, and ownership — a parcel
+/// may add, change or remove cells only under its own signer's `<op>` directory, whatever schema
+/// they carry, and a known entry only at the id its content derives.
 pub struct ManifestRules;
 
 impl PalletRules for ManifestRules {
@@ -388,30 +392,24 @@ impl PalletRules for ManifestRules {
     }
 
     fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
-        let operator = change.signer.operator.as_str();
+        let owner = operator_leaf(&change.signer.operator);
 
         for cell in change.changes {
             let path = parse_cell_path(&cell.path)?;
 
-            if let Some(before) = &cell.before {
-                let owner = meta_tree::parse_cell(&object_utils::load_blob(before)?.content)
-                    .ok()
-                    .and_then(|envelope| operator_of(change.office, &envelope.signer).map(str::to_string));
-
-                if owner.as_deref() != Some(operator) {
-                    return Err(format!(
-                        "the entry at {} belongs to another operator, so only they may change or remove it",
-                        cell.path
-                    ));
-                }
+            if path.owner != owner {
+                return Err(format!(
+                    "the cell at {} sits under another operator's directory, so only they may write or remove it",
+                    cell.path
+                ));
             }
 
             let Some(after) = &cell.after else { continue };
             let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
             let kind = ManifestKind::parse(path.kind).ok();
 
-            // An approval's leaf names its operator whatever schema it carries.
-            if kind == Some(ManifestKind::Approval) && path.leaf != operator_leaf(operator) {
+            // An approval is the writer's directory itself, whatever schema it carries.
+            if kind == Some(ManifestKind::Approval) && path.id.is_some() {
                 return Err(format!("the approval at {} is not at its signer's own path", cell.path));
             }
 
@@ -427,15 +425,20 @@ impl PalletRules for ManifestRules {
             let entry = parse_value(path.subject, schema_kind, &envelope.value)
                 .map_err(|why| format!("the value at {} {}", cell.path, why))?;
 
-            if path.leaf != leaf_of(operator, &entry) {
-                return Err(format!("the entry at {} is not at the id its signer and content derive", cell.path));
+            let expected = match schema_kind {
+                ManifestKind::Approval => None,
+                _ => Some(entry_id(&entry)),
+            };
+
+            if path.id != expected.as_deref() {
+                return Err(format!("the entry at {} is not at the id its content derives", cell.path));
             }
         }
 
         Ok(())
     }
 
-    /// `<subject>`, `<subject>/<kind>` or `<subject>/<kind>/<id>`, for a full parcel hash.
+    /// `<subject>` or any path beneath it, for a full parcel hash.
     fn resolution_path(&self, spelled: &str) -> Result<String, String> {
         let subject = spelled.split('/').next().unwrap_or_default();
 
@@ -533,6 +536,11 @@ pub fn read_manifest() -> Result<ManifestRead, String> {
             continue;
         }
 
+        if (kind == ManifestKind::Approval) != parsed.id.is_none() {
+            unreadable(format!("a {} entry at a path its kind does not take", kind.as_str()));
+            continue;
+        }
+
         match parse_value(parsed.subject, kind, &envelope.value) {
             Ok(entry) => read.entries.push(AttributedEntry {
                 entry,
@@ -615,11 +623,11 @@ mod tests {
     fn ids_collapse_one_writers_duplicates_and_separate_two_writers() {
         let note = entry(ManifestKind::Note, "ok");
 
-        assert_eq!(entry_id("alice", &note), entry_id("alice", &note.clone()));
-        assert_ne!(entry_id("alice", &note), entry_id("bob", &note), "the writer salts the id");
-        assert_ne!(entry_id("alice", &note), entry_id("alice", &entry(ManifestKind::Note, "nope")));
-        assert_ne!(entry_id("alice", &note), entry_id("alice", &entry(ManifestKind::Approval, "ok")));
-        assert_ne!(entry_id("alice", &provenance(Some("x"))), entry_id("alice", &provenance(None)));
+        assert_eq!(cell_path("alice", &note), cell_path("alice", &note.clone()));
+        assert_ne!(cell_path("alice", &note), cell_path("bob", &note), "each writer has a directory");
+        assert_ne!(entry_id(&note), entry_id(&entry(ManifestKind::Note, "nope")));
+        assert_ne!(entry_id(&note), entry_id(&entry(ManifestKind::Approval, "ok")));
+        assert_ne!(entry_id(&provenance(Some("x"))), entry_id(&provenance(None)));
 
         // An approval is one per operator, whatever it says.
         let (approve_a, approve_b) = (entry(ManifestKind::Approval, "a"), entry(ManifestKind::Approval, "b"));
@@ -629,15 +637,22 @@ mod tests {
 
     #[test]
     fn a_cell_path_round_trips_and_nothing_else_parses() {
-        let path = cell_path("alice", &entry(ManifestKind::Note, "x"));
-        let parsed = parse_cell_path(&path).unwrap();
+        let note = entry(ManifestKind::Note, "x");
+        let parsed_note = cell_path("alice", &note);
+        let parsed = parse_cell_path(&parsed_note).unwrap();
         assert_eq!((parsed.subject, parsed.kind), (subject().as_str(), "note"));
+        assert_eq!((parsed.owner, parsed.id), (operator_leaf("alice").as_str(), Some(entry_id(&note).as_str())));
 
+        let approval = cell_path("alice", &entry(ManifestKind::Approval, ""));
+        assert_eq!(parse_cell_path(&approval).unwrap().id, None);
+
+        let hex = "e".repeat(64);
         for wrong in [
             format!("ab/{}/note", subject()),
-            format!("cd/{}/note/{}", subject(), "e".repeat(64)),
+            format!("cd/{}/note/{}", subject(), hex),
             format!("ab/{}/note/short", subject()),
-            format!("ab/{}/note/{}/deeper", subject(), "e".repeat(64)),
+            format!("ab/{}/note/{}/short", subject(), hex),
+            format!("ab/{}/note/{}/{}/deeper", subject(), hex, hex),
         ] {
             assert!(parse_cell_path(&wrong).is_err(), "{} must not parse", wrong);
         }

@@ -9,7 +9,8 @@
 //! and `author.class` are. They still carry their own three-valued honesty rule, though:
 //! provenance is *opt-in evidence* (absence is Unknown, never a negation — see
 //! [`evaluate_leaf`]'s A5 note), while a tag is *membership* (absence is a plain False,
-//! except when the whole `@tags` pallet is unreadable).
+//! except when the whole `@tags` pallet is unreadable, or a tag of that name cannot be read).
+//! A tag or manifest entry this build cannot read never reads as an absence.
 //!
 //! The spine of the design is the trust guarantee, and it is an *execution order*, not just a
 //! primitive choice: under verified trust (the default), identity predicates never prune the
@@ -239,6 +240,32 @@ pub struct ProvenanceRecord {
     pub recorded_at: i64,
 }
 
+/// Every readable provenance entry by subject, and which subjects an unreadable entry leaves
+/// incomplete.
+#[derive(Default)]
+struct ProvenanceIndex {
+    records: HashMap<String, Vec<ProvenanceRecord>>,
+
+    /// Subjects with a manifest entry this build cannot read that may be provenance.
+    incomplete: HashSet<String>,
+
+    /// An entry this build cannot read names no subject, so every subject is incomplete.
+    all_incomplete: bool,
+}
+
+impl ProvenanceIndex {
+    fn is_complete_for(&self, hash: &str) -> bool {
+        !self.all_incomplete && !self.incomplete.contains(hash)
+    }
+}
+
+/// Every readable tag by subject, and the names of the tags this build cannot read.
+#[derive(Default)]
+struct TagIndex {
+    by_subject: HashMap<String, Vec<String>>,
+    unreadable: HashSet<String>,
+}
+
 /// The ephemeral, per-query facts Stage 2's non-identity predicates need beyond the parcel
 /// itself. Built once per query invocation (never persisted) because a warehouse's
 /// provenance and tag records are tiny beside the history a query already walks — see
@@ -247,10 +274,10 @@ struct QueryContext {
     /// Subject hash → that subject's provenance entries. `None` when the `@manifest` meta
     /// pallet itself has no head — distinct from `Some(empty-for-this-subject)`, which is
     /// an ordinary parcel the pallet simply says nothing about.
-    provenance: Option<HashMap<String, Vec<ProvenanceRecord>>>,
+    provenance: Option<ProvenanceIndex>,
 
     /// Subject hash → tag names. `None` when the `@tags` meta pallet has no head.
-    tags: Option<HashMap<String, Vec<String>>>,
+    tags: Option<TagIndex>,
 
     /// The warehouse's fetch scope, read once — `touches`'s confirming diff degrades to
     /// `Unknown` (rather than a hard error) only for a path this scope provably never
@@ -289,10 +316,29 @@ impl QueryContext {
         let provenance = pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?
             .is_some()
             .then(|| {
-                let mut index: HashMap<String, Vec<ProvenanceRecord>> = HashMap::new();
-                for attributed in manifest_utils::read_manifest()?.entries {
+                let read = manifest_utils::read_manifest()?;
+                let mut index = ProvenanceIndex::default();
+
+                // An entry this build cannot read may be provenance (or a kind it does not know),
+                // so its subject's provenance is incomplete; one with no subject leaves them all so.
+                for unreadable in read.unreadable {
+                    let kind = unreadable.path.split('/').nth(2).unwrap_or_default();
+
+                    let provenance = manifest_utils::ManifestKind::Provenance;
+
+                    if matches!(manifest_utils::ManifestKind::parse(kind), Ok(known) if known != provenance) {
+                        continue;
+                    }
+
+                    match unreadable.subject {
+                        Some(subject) => { index.incomplete.insert(subject); }
+                        None => index.all_incomplete = true,
+                    }
+                }
+
+                for attributed in read.entries {
                     if let Some(provenance) = attributed.entry.provenance {
-                        index.entry(attributed.entry.subject).or_default().push(ProvenanceRecord {
+                        index.records.entry(attributed.entry.subject).or_default().push(ProvenanceRecord {
                             model: provenance.model,
                             tool: provenance.tool,
                             session: provenance.session,
@@ -307,9 +353,14 @@ impl QueryContext {
         let tags = pallet_utils::get_meta_pallet_head(tag_utils::TAGS_PALLET_NAME)?
             .is_some()
             .then(|| {
-                let mut index: HashMap<String, Vec<String>> = HashMap::new();
-                for attributed in tag_utils::read_tags()?.tags {
-                    index.entry(attributed.tag.subject).or_default().push(attributed.tag.name);
+                let read = tag_utils::read_tags()?;
+                let mut index = TagIndex {
+                    unreadable: read.unreadable.into_iter().map(|tag| tag.name).collect(),
+                    ..TagIndex::default()
+                };
+
+                for attributed in read.tags {
+                    index.by_subject.entry(attributed.tag.subject).or_default().push(attributed.tag.name);
                 }
                 Ok::<_, String>(index)
             })
@@ -329,11 +380,11 @@ impl QueryContext {
     /// pallet has no head" and "the pallet has one, but nothing about this subject" — a
     /// `Leaf::Provenance` test needs only the presence split; the report wants the record).
     fn newest_provenance(&self, hash: &str) -> Option<&ProvenanceRecord> {
-        self.provenance.as_ref()?.get(hash)?.iter().max_by_key(|record| record.recorded_at)
+        self.provenance.as_ref()?.records.get(hash)?.iter().max_by_key(|record| record.recorded_at)
     }
 
     fn tags_of(&self, hash: &str) -> &[String] {
-        self.tags.as_ref().and_then(|index| index.get(hash)).map(Vec::as_slice).unwrap_or(&[])
+        self.tags.as_ref().and_then(|index| index.by_subject.get(hash)).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Record a parcel's tree hash into the memo — called wherever `run_query` already loads
@@ -1261,30 +1312,52 @@ fn evaluate_leaf(
         // A5: provenance is opt-in evidence. No `@manifest` head at all, or no entry for
         // this subject, both read `Unknown` — never `False` — so `not: {provenance.* …}`
         // can never quietly sweep up a parcel that carries no provenance whatsoever.
-        Leaf::Provenance { field, test } => match ctx.provenance.as_ref().and_then(|index| index.get(hash)) {
+        // An entry this build cannot read may be the one that matches, so where one leaves this
+        // subject's provenance incomplete, no match reads `Unknown` rather than a definite answer.
+        Leaf::Provenance { field, test } => match ctx.provenance.as_ref() {
             None => Truth::Unknown,
-            Some(records) => match test {
-                // The aggregate-then-negate convention every other membership leaf in this
-                // file uses: `ne` reads "no entry equals this", not "some entry doesn't" —
-                // the same shape as `SignerOperator`/`RecordedOperator`.
-                ProvenanceTest::Membership { negate, values } => {
-                    let any = records.iter()
-                        .any(|record| values.iter().any(|v| v == provenance_field_value(*field, record)));
-                    Truth::of(any != *negate)
+            Some(index) => match index.records.get(hash) {
+                None => Truth::Unknown,
+                Some(records) => {
+                    // The aggregate-then-negate convention every other membership leaf in this
+                    // file uses: `ne` reads "no entry equals this", not "some entry doesn't" —
+                    // the same shape as `SignerOperator`/`RecordedOperator`.
+                    let (any, negate) = match test {
+                        ProvenanceTest::Membership { negate, values } => (
+                            records.iter()
+                                .any(|record| values.iter().any(|v| v == provenance_field_value(*field, record))),
+                            *negate,
+                        ),
+                        ProvenanceTest::Matches { glob } => (
+                            records.iter().any(|record| glob_match(glob, provenance_field_value(*field, record))),
+                            false,
+                        ),
+                    };
+
+                    if !any && !index.is_complete_for(hash) {
+                        Truth::Unknown
+                    } else {
+                        Truth::of(any != negate)
+                    }
                 }
-                ProvenanceTest::Matches { glob } => Truth::of(
-                    records.iter().any(|record| glob_match(glob, provenance_field_value(*field, record))),
-                ),
             },
         },
 
         // Membership, not evidence: an untagged parcel plainly does not carry the tag
-        // (`False`); only the whole `@tags` pallet being unreadable is `Unknown`.
+        // (`False`). Only the whole `@tags` pallet being unreadable, or a tag of that name this
+        // build cannot read (whose subject it therefore cannot know), is `Unknown`.
         Leaf::Tag { values } => match &ctx.tags {
             None => Truth::Unknown,
             Some(index) => {
-                let tags = index.get(hash).map(Vec::as_slice).unwrap_or(&[]);
-                Truth::of(values.iter().any(|value| tags.contains(value)))
+                let tags = index.by_subject.get(hash).map(Vec::as_slice).unwrap_or(&[]);
+
+                if values.iter().any(|value| tags.contains(value)) {
+                    Truth::True
+                } else if values.iter().any(|value| index.unreadable.contains(value)) {
+                    Truth::Unknown
+                } else {
+                    Truth::False
+                }
             }
         },
 
@@ -1905,5 +1978,56 @@ mod tests {
         // errored above rather than degrade — so a live `Ok` already proves it did not run;
         // this is a second, cheap witness of the same fact.
         assert_eq!(ctx.out_of_scope.get(), 0, "touches must not have run at all");
+    }
+
+    #[test]
+    fn a_tag_or_provenance_entry_that_cannot_be_read_is_unknown_never_an_absence() {
+        let parcel = Parcel { tree_hash: String::new(), parents: Vec::new(), actions: Vec::new(), description: None };
+        let (tagged, other) = ("a".repeat(64), "b".repeat(64));
+
+        let mut tags = TagIndex::default();
+        tags.by_subject.insert(tagged.clone(), vec!["v1.0".to_string()]);
+        tags.unreadable.insert("v2.0".to_string());
+
+        let mut provenance = ProvenanceIndex::default();
+        provenance.records.insert(other.clone(), vec![ProvenanceRecord {
+            model: "m".to_string(), tool: Some("cli".to_string()), session: None, recorded_at: 1,
+        }]);
+
+        let ctx = QueryContext {
+            provenance: Some(provenance),
+            tags: Some(tags),
+            fetch_scope: MaterializationScope::full(),
+            out_of_scope: Cell::new(0),
+            tree_hashes: RefCell::new(HashMap::new()),
+            boundary_memo: RefCell::new(audit_utils::DistrustBoundaryMemo::new()),
+        };
+
+        let truth = |predicate: Value, hash: &str| {
+            evaluate(&parse_value(&predicate).unwrap(), hash, &parcel, &IdentityFacts::Unresolved, &ctx).unwrap()
+        };
+
+        assert!(truth(leaf("tag", "eq", Value::String("v1.0".to_string())), &tagged) == Truth::True);
+        assert!(truth(leaf("tag", "eq", Value::String("v1.0".to_string())), &other) == Truth::False);
+        assert!(truth(leaf("tag", "eq", Value::String("v2.0".to_string())), &other) == Truth::Unknown);
+        let not_v2 = serde_json::json!({"not": leaf("tag", "eq", Value::String("v2.0".to_string()))});
+        assert!(truth(not_v2, &other) == Truth::Unknown);
+
+        let tool = |op: &str, value: &str| leaf("provenance.tool", op, Value::String(value.to_string()));
+        assert!(truth(tool("eq", "other"), &other) == Truth::False);
+        assert!(truth(tool("ne", "other"), &other) == Truth::True);
+
+        // An unreadable entry about the subject leaves every non-match unknown; a match stays.
+        let mut ctx = ctx;
+        ctx.provenance.as_mut().unwrap().incomplete.insert(other.clone());
+        let truth = |predicate: Value, hash: &str| {
+            evaluate(&parse_value(&predicate).unwrap(), hash, &parcel, &IdentityFacts::Unresolved, &ctx).unwrap()
+        };
+
+        assert!(truth(tool("eq", "other"), &other) == Truth::Unknown);
+        assert!(truth(tool("ne", "other"), &other) == Truth::Unknown);
+        assert!(truth(tool("matches", "o*"), &other) == Truth::Unknown);
+        assert!(truth(tool("eq", "cli"), &other) == Truth::True);
+        assert!(truth(tool("ne", "cli"), &other) == Truth::False);
     }
 }

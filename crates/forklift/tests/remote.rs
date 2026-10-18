@@ -1144,7 +1144,7 @@ fn manifest_syncs_across_remotes_and_replays_when_diverged() {
     let b_view = stdout(&area.forklift("b", &["manifest", "show", "main"]));
     assert!(b_view.contains("from a") && b_view.contains("from b"), "{}", b_view);
 
-    // The merged manifest audits clean on both sides.
+    // The replayed manifest audits clean on both sides.
     assert!(stdout(&area.forklift("b", &["audit", "@manifest"])).contains("verified"));
 }
 
@@ -6201,6 +6201,20 @@ fn kv_needs_an_office_and_refuses_readers() {
     let refused = area.forklift("a", &["kv", "unset", "main", "ci"]);
     assert!(!refused.status.success(), "a reader's kv unset must be refused");
     assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "green");
+
+    // Nor may it deliver, which writes a pallet and a manifest entry: the target stays put.
+    assert_success(&area.forklift("a", &["config", "--unset", "operator.identifier"]));
+    assert_success(&area.forklift("a", &["palletize", "draft"]));
+    area.write_file("a/code.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "draft work"]));
+    let main_head = pallet_head(&area, "a", "main");
+
+    assert_success(&area.forklift("a", &["config", "operator.identifier", "reader@forklift"]));
+    let refused = area.forklift("a", &["deliver", "main"]);
+    assert!(!refused.status.success(), "a reader's deliver must be refused");
+    assert!(stderr(&refused).contains("reader cannot deliver"), "{}", stderr(&refused));
+    assert_eq!(pallet_head(&area, "a", "main"), main_head, "the target must not move");
 }
 
 #[test]
