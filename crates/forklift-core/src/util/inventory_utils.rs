@@ -12,7 +12,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils};
+use crate::util::{alias_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
@@ -936,9 +936,14 @@ pub enum ShardOutcome {
 /// * `Err(String)` - Phase A or phase B failed; nothing in `outcomes` may be treated as published.
 fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
                           outcomes: &mut BTreeMap<String, ShardOutcome>) -> Result<(), String> {
+    // By case fold: on a case-insensitive volume `Dir`'s clear lands on the shard `dir` names, and
+    // phase B would publish `dir`'s carried rollup straight back over it. Elsewhere this clears a
+    // rollup that did not need it, which costs one skip.
+    let folded_clear_keys: BTreeSet<String> = clear_keys.iter().map(|key| alias_utils::fold_key(key)).collect();
+
     for (key, outcome) in outcomes.iter_mut() {
         if let ShardOutcome::Carry(inventory, _) = outcome {
-            if clear_keys.contains(key) {
+            if folded_clear_keys.contains(&alias_utils::fold_key(key)) {
                 inventory.set_rollup_hash(None);
             }
         }
@@ -966,6 +971,14 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
     }
 
     phase_b_batch.finish()
+}
+
+/// Split a warehouse path into the key of the shard that lists it and its name in that shard.
+pub fn split_path_key(path: &str) -> (&str, &str) {
+    match path.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
+        Some((parent, name)) => (parent, name),
+        None => ("", path),
+    }
 }
 
 /// One shard a [`ShardMutationBatch`] has touched: the bytes it read on first touch (`None` when
@@ -1014,13 +1027,24 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 ///
 /// Every blob a change makes an entry name must already be durable before `publish`, as
 /// [`publish_shard_outcomes`] requires.
+///
+/// Two keys may name one shard folder: `dir` and `Dir` on a case-insensitive volume, after a
+/// case-only rename. Two in-memory copies of that one file would each be published over the
+/// other, losing one's changes, where one `update_shard` per change read the first change back
+/// through the alias. So a key whose case fold (`alias_utils::fold_key`) matches one already
+/// touched first publishes everything touched so far, and is then read from disk as usual. That
+/// costs one more publish on a volume where the two keys are distinct shards, and nothing else.
+/// If that early publish fails, `update` returns its error and the final `publish` fails too, so
+/// no caller reads the empty batch left behind as everything published.
 pub struct ShardMutationBatch {
     shards: BTreeMap<String, TouchedShard>,
+    folded_keys: BTreeSet<String>,
+    early_publish_failed: bool,
 }
 
 impl ShardMutationBatch {
     pub fn new() -> ShardMutationBatch {
-        ShardMutationBatch { shards: BTreeMap::new() }
+        ShardMutationBatch { shards: BTreeMap::new(), folded_keys: BTreeSet::new(), early_publish_failed: false }
     }
 
     /// Apply `change` to the shard at `key`, reading it first if this batch has not touched it
@@ -1033,10 +1057,20 @@ impl ShardMutationBatch {
     ///
     /// # Returns
     /// * `Ok(())`      - If the change was applied in memory.
-    /// * `Err(String)` - If the shard could not be read or parsed.
+    /// * `Err(String)` - If the shard could not be read or parsed, or the shards touched so far
+    ///                   could not be published before a key that may alias one of them.
     pub fn update(&mut self,
                   key: &str,
                   change: impl FnOnce(&mut Inventory)) -> Result<(), String> {
+        if !self.shards.contains_key(key) && !self.folded_keys.insert(alias_utils::fold_key(key)) {
+            // A key that may alias a shard already touched — see the type's doc comment.
+            if let Err(e) = self.publish_touched() {
+                self.early_publish_failed = true;
+                return Err(e);
+            }
+            self.folded_keys.insert(alias_utils::fold_key(key));
+        }
+
         // After the caller statted what `change` records — see the type's doc comment.
         let verified_at = std::time::SystemTime::now();
 
@@ -1062,6 +1096,31 @@ impl ShardMutationBatch {
         Ok(())
     }
 
+    /// Stat a file just written for a blob or recipe that is already stored (e.g. one just
+    /// written from a tree or merge), and record it in its parent's shard. Call it right after
+    /// the write — see the type's doc comment.
+    ///
+    /// # Arguments
+    /// * `path`      - The warehouse path of the file.
+    /// * `hash`      - The blob or recipe hash of the file's content.
+    /// * `item_type` - The authoritative entry type (from the tree / merge action), carried through
+    ///   so a chunked entry keeps its `*Chunked` type in the inventory rather than being demoted to
+    ///   a plain type a `stat` would report.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If the entry was recorded in memory.
+    /// * `Err(String)` - If the file's metadata could not be gathered, or its shard read.
+    pub fn stage_file_from_stat(&mut self,
+                                path: &str,
+                                hash: String,
+                                item_type: DirEntryType) -> Result<(), String> {
+        let (parent_key, name) = split_path_key(path);
+
+        let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type)?;
+
+        self.update(parent_key, |inventory| inventory.add_item(entry))
+    }
+
     /// Publish every touched shard, then register any key the metadata does not list yet.
     ///
     /// Each shard is re-read first, under `SHARD_MUTATION_LOCK`: if any changed on disk since this
@@ -1072,10 +1131,25 @@ impl ShardMutationBatch {
     ///
     /// # Returns
     /// * `Ok(())`      - Every touched shard is durably published and registered.
-    /// * `Err(String)` - If a shard changed underneath the batch, or the publish failed; no shard
-    ///                   of this batch may then be treated as published.
-    pub fn publish(self) -> Result<(), String> {
-        if self.shards.is_empty() {
+    /// * `Err(String)` - If a shard changed underneath the batch, or the publish failed, here or
+    ///                   in an earlier [`update`](Self::update); no shard of this batch may then
+    ///                   be treated as published.
+    pub fn publish(mut self) -> Result<(), String> {
+        if self.early_publish_failed {
+            return Err("Some of this command's inventory changes were not recorded.".to_string());
+        }
+
+        self.publish_touched()
+    }
+
+    /// [`publish`](Self::publish) every shard touched so far, and forget them: a later
+    /// [`update`](Self::update) reads its shard from disk again.
+    fn publish_touched(&mut self) -> Result<(), String> {
+        self.folded_keys.clear();
+
+        let shards = std::mem::take(&mut self.shards);
+
+        if shards.is_empty() {
             return Ok(());
         }
 
@@ -1084,13 +1158,13 @@ impl ShardMutationBatch {
         let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
         let mut clear_keys: BTreeSet<String> = BTreeSet::new();
 
-        for (key, shard) in self.shards {
+        for (key, shard) in shards {
             let (_, current_bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
 
             if current_bytes != shard.original_bytes {
                 return Err(format!(
-                    "The inventory of folder \"{}\" changed while it was being updated, so none of \
-                    this command's inventory changes were recorded. Run the command again.",
+                    "The inventory of folder \"{}\" changed while it was being updated, so the \
+                    inventory changes this command still held were not recorded.",
                     load_guard_utils::display_path(&key)
                 ));
             }
@@ -3232,6 +3306,89 @@ mod tests {
             assert_eq!(read_rollup(key), None, "a state change must clear the rollup of \"{key}\"");
         }
         assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "an unrelated sibling must keep its rollup");
+    }
+
+    /// A case-only rename of a directory: the old spelling's entry is removed, then the new
+    /// spelling's is written. On a case-insensitive volume both keys name one shard, and the
+    /// second change must see the first; elsewhere they are two shards, each with its own change.
+    #[test]
+    fn a_batch_keeps_both_changes_to_keys_that_differ_only_in_case() {
+        let _scratch = Scratch::new("batch-case-alias");
+
+        let mut setup = ShardMutationBatch::new();
+        setup.update("dir", |inventory| {
+            inventory.add_item(item("a.txt", 1, InventoryItemState::Normal));
+        }).unwrap();
+        setup.publish().unwrap();
+
+        // The volume decides whether the two spellings are one shard folder.
+        let aliased = file_utils::get_inventory_data_path_for_key("Dir").exists();
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("dir", |inventory| { inventory.mark_item_deleted("a.txt"); }).unwrap();
+        batch.update("Dir", |inventory| {
+            inventory.add_item(item("a.txt", 2, InventoryItemState::Normal));
+        }).unwrap();
+        batch.publish().unwrap();
+
+        let state_in = |key: &str| {
+            let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
+            let shard = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+            shard.get_item_by_name("a.txt").map(|item| item.state)
+        };
+
+        if aliased {
+            assert!(state_in("dir") == Some(InventoryItemState::Normal),
+                "the write through the new spelling must not be lost to the removal through the old");
+        } else {
+            assert!(state_in("dir") == Some(InventoryItemState::Deleted), "the old spelling keeps its removal");
+            assert!(state_in("Dir") == Some(InventoryItemState::Normal), "the new spelling keeps its write");
+        }
+        assert!(is_tracked_directory("Dir").unwrap(), "the new spelling is registered either way");
+    }
+
+    #[test]
+    fn a_batch_whose_early_publish_failed_does_not_publish_as_if_complete() {
+        let _scratch = Scratch::new("batch-early-publish-fails");
+        stamped_chain_with_sibling();
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("a", |inventory| {
+            inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
+        }).unwrap();
+
+        // Someone else rewrites the touched shard, so the publish before the aliasing key fails.
+        update_shard("a", |inventory| {
+            inventory.add_item(item("other.txt", 9, InventoryItemState::Normal));
+            Ok(())
+        }).unwrap();
+
+        let error = batch.update("A", |inventory| { inventory.mark_item_deleted("other.txt"); }).unwrap_err();
+        assert!(error.contains("changed while it was being updated"), "unexpected error: {error}");
+
+        assert!(batch.publish().is_err(), "the final publish must not report the dropped shard as published");
+    }
+
+    #[test]
+    fn a_batch_clears_a_carried_rollup_whose_clear_comes_through_another_spelling() {
+        let _scratch = Scratch::new("batch-case-alias-carry");
+        stamped_chain_with_sibling();
+
+        // Only a case-insensitive volume makes the two spellings one shard.
+        if !file_utils::get_inventory_data_path_for_key("A").exists() {
+            return;
+        }
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("a", |inventory| {
+            inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
+        }).unwrap();
+        batch.update("A/b/new", |inventory| {
+            inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
+        }).unwrap();
+        batch.publish().unwrap();
+
+        assert_eq!(read_rollup("a"), None, "a change beneath \"A\" must clear the rollup carried through \"a\"");
     }
 
     #[test]

@@ -884,6 +884,160 @@ fn restore_pays_a_constant_number_of_barriers_regardless_of_restored_file_count(
     assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
 }
 
+/// One `park pop` over 5 directories, each holding `files_per_dir` tracked files that were all
+/// edited and `files_per_dir` more that were removed before the `park`, with
+/// `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the barrier count that run paid.
+fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
+    let area = Area::new(&format!("park-pop-barrier-count-{}", files_per_dir));
+    let warehouse = area.warehouse();
+
+    const DIR_COUNT: usize = 5;
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("v1 {dir} {f}\n")).unwrap();
+            std::fs::write(dir_path.join(format!("gone{f}.txt")), format!("gone {dir} {f}\n")).unwrap();
+        }
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            std::fs::write(dir_path.join(format!("file{f}.txt")), format!("parked {dir} {f}\n")).unwrap();
+            std::fs::remove_file(dir_path.join(format!("gone{f}.txt"))).unwrap();
+        }
+    }
+
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["park"]).status.success());
+
+    // The park put the head back, so the pop below re-applies every edit and every removal.
+    assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file0.txt")).unwrap(), "v1 0 0\n");
+    assert!(warehouse.join("dir0").join("gone0.txt").exists());
+
+    let mut command = area.command(&["park", "pop"]);
+    command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "park pop failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    for dir in 0..DIR_COUNT {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        for f in 0..files_per_dir {
+            assert_eq!(std::fs::read_to_string(dir_path.join(format!("file{f}.txt"))).unwrap(),
+                format!("parked {dir} {f}\n"));
+            assert!(!dir_path.join(format!("gone{f}.txt")).exists());
+        }
+    }
+
+    barrier_count(&output)
+}
+
+/// `park pop` stages every entry it re-applies through one batch, so its barrier count does not
+/// grow with the number of files it writes — before the batch it paid one shard publish per file.
+#[test]
+fn park_pop_pays_a_constant_number_of_barriers_regardless_of_file_count() {
+    let count_1 = park_pop_barrier_count_for(1);
+    let count_10 = park_pop_barrier_count_for(10);
+
+    assert_eq!(count_1, count_10,
+        "park pop's barrier count must not scale with the number of files it writes: {count_1} \
+         for 1 file/directory, {count_10} for 10 files/directory (the same 5 directories either way)");
+    assert!(count_1 > 0, "the counter must observe real barrier work, got {count_1}");
+}
+
+/// A `park pop` whose staging fails after it rewrote the working directory leaves the parcel
+/// parked and says so; the files it wrote stay on disk. The staging is made to fail by making one
+/// shard's folder read-only, so nothing can be published into it.
+#[cfg(unix)]
+#[test]
+fn park_pop_whose_staging_fails_keeps_the_parcel_parked() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("park-pop-publish-fails");
+    let warehouse = area.warehouse();
+
+    for dir in 0..2 {
+        std::fs::create_dir_all(warehouse.join(format!("dir{dir}"))).unwrap();
+        std::fs::write(warehouse.join(format!("dir{dir}")).join("file.txt"), "v1\n").unwrap();
+    }
+
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "operator.name", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "base"]).status.success());
+
+    for dir in 0..2 {
+        std::fs::write(warehouse.join(format!("dir{dir}")).join("file.txt"), "parked\n").unwrap();
+    }
+
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["park"]).status.success());
+    assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file.txt")).unwrap(), "v1\n");
+
+    let shard_folder = find_dir_named(&warehouse.join(".forklift"), "inv_dir0")
+        .expect("dir0 has a shard folder");
+
+    std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root writes through a read-only folder, so the failure cannot be staged; nothing to test.
+    if std::fs::write(shard_folder.join("probe"), "").is_ok() {
+        std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let output = area.run(&["park", "pop"]);
+    std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "park pop must fail when its staging fails");
+    assert!(stderr.contains("The parcel is still parked."), "the failure says the parcel is still parked: {stderr}");
+
+    // The working directory was rewritten before the staging failed.
+    assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file.txt")).unwrap(), "parked\n");
+
+    // ...and the shard that could not be published still lists the head's version, so the
+    // rewritten file shows as an unstaged change.
+    let status = area.run(&["--json", "stocktake"]);
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status_json["data"]["unstaged"].as_array().unwrap().iter()
+            .any(|entry| entry["path"] == "dir0/file.txt" && entry["kind"] == "modified"),
+        "dir0/file.txt is not staged: {status_json}");
+
+    let list = area.run(&["--json", "park", "list"]);
+    assert!(list.status.success());
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list_json["data"]["parked"].as_array().map(Vec::len), Some(1),
+        "the parcel is still parked: {list_json}");
+}
+
+/// The first directory named `name` beneath `root`, searched depth-first.
+#[cfg(unix)]
+fn find_dir_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if entry.file_name() == name {
+            return Some(path);
+        }
+        if let Some(found) = find_dir_named(&path, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// The incomplete-load marker (`load_guard_utils`) must ride a load's own first durable barrier
 /// instead of paying a second, standalone one. For a directory `load`
 /// with real content to publish, that first barrier is the walk's blob-publish batch (Phase 0 —

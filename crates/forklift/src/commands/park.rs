@@ -270,26 +270,39 @@ pub fn pop_parked() -> Result<(), String> {
     // Every removal (and the directories it empties) before every write: across a case-only
     // rename the write would otherwise land on the old name through the alias, and the removal
     // after it would delete it.
-    shift_utils::apply_ops_each(&ops, &removed_dirs, |op| {
-        match op {
-            FileOp::Write { path, hash, item_type, .. } => {
-                inventory_utils::stage_file_entry_from_stat(path, hash.clone(), *item_type)?;
-            }
-            FileOp::Remove { path } => {
-                let (parent_key, name) = match path.rsplit_once('/') {
-                    Some((parent, name)) => (parent, name),
-                    None => ("", path.as_str()),
-                };
+    // Every entry is staged through one batch, each written file statted right after its write.
+    let mut batch = inventory_utils::ShardMutationBatch::new();
 
-                inventory_utils::update_shard(parent_key, |inventory| {
-                    inventory.mark_item_deleted(name);
-                    Ok(())
-                })?;
-            }
+    let applied = shift_utils::apply_ops_each(&ops, &removed_dirs, |op| match op {
+        FileOp::Write { path, hash, item_type, .. } => batch.stage_file_from_stat(path, hash.clone(), *item_type),
+        FileOp::Remove { path } => {
+            let (parent_key, name) = inventory_utils::split_path_key(path);
+
+            batch.update(parent_key, |inventory| { inventory.mark_item_deleted(name); })
         }
+    });
 
-        Ok(())
-    })?;
+    // The batch publishes whatever was applied before a failure; the parcel stays parked on any
+    // failure, and the error says how far the pop got.
+    match (applied, batch.publish()) {
+        (Ok(()), Ok(())) => {}
+        (Err(e), Ok(())) => {
+            return Err(format!(
+                "{}\nThe parked changes applied before this error are in the working directory and \
+                staged. The parcel is still parked.",
+                e
+            ));
+        }
+        (applied, Err(publish)) => {
+            let first = applied.err().map(|e| format!("{}\n", e)).unwrap_or_default();
+
+            return Err(format!(
+                "{}{}\nThe working directory holds the parked changes applied so far, but staging \
+                them failed, so some or all of them are not staged. The parcel is still parked.",
+                first, publish
+            ));
+        }
+    }
 
     parked.pop();
     park_utils::write_parked(&parked)?;

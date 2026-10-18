@@ -571,8 +571,12 @@ itself as well as the findings.
      (982 tracked files, 200 of them dirtied): 18.6 s → 0.55 s (34×), 982 barriers → 1. Each shard is published at the moment of its last change. A caller must stat each file
      right after writing it, then call `update`; writing many files first and statting them
      later would trust an edit made in between.
-   * `park pop` (FORK-195), and `consolidate`/`cherry-pick`'s merge actions (FORK-196), are the
-     remaining slices, one PR each.
+   * **`park pop`: done (FORK-195, slice 2).** Its Write and Remove ops stage through one
+     batch (`ShardMutationBatch::stage_file_from_stat` and `update`), published before the
+     parcel leaves the parked list; the barrier count no longer grows with the file count.
+     Synthetic, 48 files: 694 → 28.8 ms. A publish that fails after the working directory was
+     rewritten leaves the parcel parked and says that some or all of the changes are unstaged.
+   * `consolidate`/`cherry-pick`'s merge actions (FORK-196) are the remaining slice.
 5. **`remove <dir>`'s per-shard loop** — untimed, small, rare; demand-gated. (The
    commit-graph's multi-shard writes, once listed here, pay no barrier at all since
    FORK-162 — see "Best-effort state" below.)
@@ -629,7 +633,7 @@ PR A's `refresh_tracked_entries` rewrite does this implicitly for its blob layer
 shared blob batch across every shard it touches); the shard-content layer itself
 (one `write_shard_mutation`/`save_inventory` call per shard) is unchanged. That shared
 primitive is now `ShardMutationBatch` (FORK-112): it applies every same-shard action to one
-in-memory copy and publishes each shard once. `restore <dir>` uses it; `park pop` and
+in-memory copy and publishes each shard once. `restore <dir>` and `park pop` use it;
 `consolidate`/`cherry-pick` still call `update_shard` per file.
 
 **git.git sanity (PR A, re-verified after review round 2).** A full first-time `load` of
