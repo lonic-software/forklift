@@ -2214,14 +2214,21 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "manifest_head": {
-      "description": "The new head of the manifest pallet.",
-      "type": "string"
+      "description": "The head of the manifest pallet that holds the entry.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "operator": {
       "type": "string"
     },
     "subject": {
       "type": "string"
+    },
+    "unchanged": {
+      "description": "Whether the operator had already recorded exactly this entry, so nothing was written.",
+      "type": "boolean"
     }
   },
   "required": [
@@ -2229,6 +2236,7 @@ A command not listed here either reports only the generic human-message shape `{
     "subject",
     "operator",
     "body",
+    "unchanged",
     "manifest_head"
   ],
   "title": "Recorded",
@@ -2268,8 +2276,12 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "recorded_at": {
+          "description": "When a provenance entry was recorded (Unix seconds); only provenance carries a time.",
           "format": "int64",
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "session": {
           "type": [
@@ -2310,8 +2322,32 @@ A command not listed here either reports only the generic human-message shape `{
         "kind",
         "subject",
         "author",
-        "recorded_at",
         "body"
+      ],
+      "type": "object"
+    },
+    "UnreadableView": {
+      "description": "A manifest cell this forklift cannot read.",
+      "properties": {
+        "path": {
+          "description": "The cell's path in the pallet.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it cannot be read.",
+          "type": "string"
+        },
+        "subject": {
+          "description": "The subject, when the cell's path names one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "reason"
       ],
       "type": "object"
     }
@@ -2331,6 +2367,13 @@ A command not listed here either reports only the generic human-message shape `{
         "string",
         "null"
       ]
+    },
+    "unreadable": {
+      "description": "Entries this forklift cannot read — a newer kind or schema, or a malformed cell. Listed,\nnever dropped.",
+      "items": {
+        "$ref": "#/$defs/UnreadableView"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -4114,18 +4157,18 @@ A command not listed here either reports only the generic human-message shape `{
     "name": {
       "type": "string"
     },
-    "parcel": {
-      "description": "The tag parcel on the @tags meta pallet.",
+    "subject": {
       "type": "string"
     },
-    "subject": {
+    "tags_head": {
+      "description": "The new head of the @tags meta pallet.",
       "type": "string"
     }
   },
   "required": [
     "name",
     "subject",
-    "parcel"
+    "tags_head"
   ],
   "title": "Created",
   "type": "object"
@@ -4147,12 +4190,8 @@ A command not listed here either reports only the generic human-message shape `{
         "name": {
           "type": "string"
         },
-        "name_invalid": {
-          "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
-          "type": "boolean"
-        },
-        "parcel": {
-          "description": "The @tags parcel that introduced the tag.",
+        "signer": {
+          "description": "The key id the tag is signed with.",
           "type": "string"
         },
         "subject": {
@@ -4160,7 +4199,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "subject_absent": {
-          "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
+          "description": "Present and `true` when the subject parcel is not in this store (never fetched, or\ncollected); omitted when the subject is present.",
           "type": "boolean"
         },
         "tagged_at": {
@@ -4168,7 +4207,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "tagger": {
-          "description": "The tagger's pseudonymous operator id (the chain's record).",
+          "description": "The tagger's pseudonymous operator id (the chain's record), or the key id when the\noffice does not know the key.",
           "type": "string"
         },
         "tagger_name": {
@@ -4179,7 +4218,7 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "tagger_role": {
-          "description": "The tagger's role in the office, when known — so a reader can confirm the tag was\ncut by an admin (the release convention).",
+          "description": "The tagger's role in the office, when known.",
           "type": [
             "string",
             "null"
@@ -4190,8 +4229,25 @@ A command not listed here either reports only the generic human-message shape `{
         "name",
         "subject",
         "tagger",
-        "tagged_at",
-        "parcel"
+        "signer",
+        "tagged_at"
+      ],
+      "type": "object"
+    },
+    "UnreadableView": {
+      "description": "A tag this forklift cannot read.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it cannot be read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
       ],
       "type": "object"
     }
@@ -4202,6 +4258,13 @@ A command not listed here either reports only the generic human-message shape `{
     "tags": {
       "items": {
         "$ref": "#/$defs/TagView"
+      },
+      "type": "array"
+    },
+    "unreadable": {
+      "description": "Tags this forklift cannot read — a newer schema, or a malformed cell. Listed, never\ndropped.",
+      "items": {
+        "$ref": "#/$defs/UnreadableView"
       },
       "type": "array"
     }
@@ -4228,12 +4291,8 @@ A command not listed here either reports only the generic human-message shape `{
     "name": {
       "type": "string"
     },
-    "name_invalid": {
-      "description": "Present and `true` when `name` does not meet the naming rules `tag create` enforces\n(letters, digits, `.`, `_`, `-` only); omitted otherwise. `@tags` syncs in wholesale\n(`franchise`/`lower`), and nothing validates a record's `name` on the way in — only\n`tag create` does, for a name of its own choosing — so a foreign or older client's record\ncan carry one this build would never have created itself.",
-      "type": "boolean"
-    },
-    "parcel": {
-      "description": "The @tags parcel that introduced the tag.",
+    "signer": {
+      "description": "The key id the tag is signed with.",
       "type": "string"
     },
     "subject": {
@@ -4241,7 +4300,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "subject_absent": {
-      "description": "Present and `true` when the subject parcel is not in this store (never fetched, collected,\nor recorded with an invalid hash); omitted when the subject is present.",
+      "description": "Present and `true` when the subject parcel is not in this store (never fetched, or\ncollected); omitted when the subject is present.",
       "type": "boolean"
     },
     "tagged_at": {
@@ -4249,7 +4308,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "tagger": {
-      "description": "The tagger's pseudonymous operator id (the chain's record).",
+      "description": "The tagger's pseudonymous operator id (the chain's record), or the key id when the\noffice does not know the key.",
       "type": "string"
     },
     "tagger_name": {
@@ -4260,7 +4319,7 @@ A command not listed here either reports only the generic human-message shape `{
       ]
     },
     "tagger_role": {
-      "description": "The tagger's role in the office, when known — so a reader can confirm the tag was\ncut by an admin (the release convention).",
+      "description": "The tagger's role in the office, when known.",
       "type": [
         "string",
         "null"
@@ -4271,8 +4330,8 @@ A command not listed here either reports only the generic human-message shape `{
     "name",
     "subject",
     "tagger",
-    "tagged_at",
-    "parcel"
+    "signer",
+    "tagged_at"
   ],
   "title": "TagView",
   "type": "object"
