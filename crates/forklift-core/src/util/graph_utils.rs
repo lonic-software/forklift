@@ -569,6 +569,8 @@ fn mark_clean(root: &str, prefix: &str, version: u64) -> Result<(), String> {
 /// an **iterative** post-order DAG walk (no recursion — the parent chain can be tens of
 /// thousands deep). Returns the freshly computed records, already persisted.
 fn ensure(root: &str, hash: &str) -> Result<HashMap<String, Record>, String> {
+    #[cfg(test)]
+    tests::ENSURE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut computed: HashMap<String, Record> = HashMap::new();
     // DFS state per node: `gray` = on the stack (being expanded); a node is "known" once it is
     // in `computed` or already stored. A gray parent encountered while expanding is a cycle.
@@ -919,9 +921,13 @@ pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
     // Newest first: one `ensure` from the newest parcel records its whole missing ancestry and
     // persists it once, so every older parcel after it is already a hit. A parcel whose ancestry
     // cannot be resolved (an unreadable parent in a partial store) is left to the per-query path
-    // rather than costing every other parcel its batched filter. On a warm graph this is one
-    // lookup per parcel that clones nothing.
+    // rather than costing every other parcel its batched filter. After the first such failure no
+    // further `ensure` runs: a failed one persists nothing, so each older parcel would walk most
+    // of the same ancestry again to the same unreadable parent — quadratic in the chain. Records
+    // that already exist are still batched. On a warm graph this is one lookup per parcel that
+    // clones nothing.
     let mut missing: Vec<(String, Record)> = Vec::new();
+    let mut ancestry_unresolvable = false;
     for hash in parcels.iter().rev() {
         let filter_unknown = with_shard(&root, &shard_prefix(hash), |shard| {
             shard.records.get(hash).map(|record| matches!(record.filter, PathFilter::Unknown))
@@ -930,7 +936,11 @@ pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
             Some(false) => continue,
             Some(true) => {}
             None => {
+                if ancestry_unresolvable {
+                    continue;
+                }
                 if ensure(&root, hash).is_err() {
+                    ancestry_unresolvable = true;
                     continue;
                 }
             }
@@ -1402,6 +1412,56 @@ mod tests {
 
         assert!(persisted.is_ok(), "an unreadable shard must not fail the persist: {:?}", persisted);
         assert_eq!(after, original, "an unreadable shard must never be written over");
+    }
+
+    thread_local! {
+        /// How many times [`ensure`] ran on this thread — a test can count the ancestry walks a
+        /// pass made without racing the other tests in the process.
+        pub(super) static ENSURE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn the_filter_pass_walks_an_unresolvable_ancestry_once() {
+        // A merge whose second parent is not in the store: every parcel above it has an ancestry
+        // `ensure` cannot finish, and a failed `ensure` persists nothing. The pass must give up
+        // on records after the first failure, not walk back to the same missing parent once per
+        // parcel — that is quadratic in the chain.
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+
+        let dir = scratch_dir("unresolvable");
+        let _scope = StorageRootScope::enter(&dir);
+        let store = |parents: Vec<String>, tag: &str| -> String {
+            let parcel = Parcel {
+                tree_hash: "0".repeat(64),
+                parents,
+                actions: vec![],
+                description: Some(tag.to_string()),
+            };
+            let mut object = LooseObjectBuilder::build_parcel(&parcel);
+            let hash = object.hash.clone();
+            object.store().unwrap();
+            hash
+        };
+
+        const ABOVE: usize = 50;
+        let root = store(vec![], "root");
+        let merge = store(vec![root.clone(), "f".repeat(64)], "merge");
+        let mut chain = vec![root, merge];
+        for i in 0..ABOVE {
+            let next = store(vec![chain.last().unwrap().clone()], &format!("above {i}"));
+            chain.push(next);
+        }
+
+        ENSURE_CALLS.with(|calls| calls.set(0));
+        let result = ensure_path_filters(&chain[1..]);
+        let walks = ENSURE_CALLS.with(|calls| calls.get());
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_ok(), "an unresolvable ancestry is not an error of the pass: {:?}", result);
+        assert_eq!(walks, 1, "the pass must walk the unresolvable ancestry once, not once per parcel above it");
     }
 
     #[test]
