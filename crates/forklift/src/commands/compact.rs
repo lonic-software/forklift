@@ -97,7 +97,11 @@ impl Compacted {
     /// both render paths.
     fn print_unvalidated_packs_note(&self) {
         for error in &self.unvalidated_packs {
-            println!("Left a pack in place, not repacked: {} Run 'forklift heal' to recover its objects.", error);
+            println!(
+                "Left a pack in place, not repacked: {} Its sound parts are still read; an object in a \
+                damaged part reads as unverifiable until it is stored again.",
+                error
+            );
         }
     }
 

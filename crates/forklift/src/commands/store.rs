@@ -46,6 +46,10 @@ pub(crate) struct StoreReport {
     /// objects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a
     /// healthy store.
     quarantined_packs: Vec<PackIndexIssue>,
+    /// Packs that load but whose index is damaged in places: their sound parts are still read,
+    /// and an object in a damaged part reads as unverifiable until it is stored again. Empty on a
+    /// healthy store.
+    damaged_packs: Vec<PackIndexIssue>,
     /// Pack index files that could not even be parsed — move the file aside and
     /// re-run. Empty on a healthy store.
     unenumerable_indexes: Vec<PackIndexIssue>,
@@ -120,6 +124,10 @@ impl From<StoreStatus> for StoreReport {
                 index_path: p.index_path,
                 error: p.error,
             }).collect(),
+            damaged_packs: status.damaged_packs.into_iter().map(|p| PackIndexIssue {
+                index_path: p.index_path,
+                error: p.error,
+            }).collect(),
             unenumerable_indexes: status.unenumerable_indexes.into_iter().map(|p| PackIndexIssue {
                 index_path: p.index_path,
                 error: p.error,
@@ -174,18 +182,22 @@ impl CommandOutput for StoreReport {
         }
 
         // FORK-47: surfaced unconditionally whenever either list is non-empty — never silent.
-        if !self.quarantined_packs.is_empty() || !self.unenumerable_indexes.is_empty() {
+        if !self.quarantined_packs.is_empty() || !self.damaged_packs.is_empty() || !self.unenumerable_indexes.is_empty() {
             println!();
             println!("  pack problems:");
             for issue in &self.quarantined_packs {
                 println!("    quarantined:   \"{}\" — {}", issue.index_path, issue.error);
             }
+            for issue in &self.damaged_packs {
+                println!("    damaged:       \"{}\" — {}", issue.index_path, issue.error);
+            }
             for issue in &self.unenumerable_indexes {
                 println!("    unenumerable:  \"{}\" — {}", issue.index_path, issue.error);
             }
             println!(
-                "    quarantined objects are recoverable via \"forklift heal\"; an unenumerable \
-                index should be moved aside, then re-run."
+                "    quarantined objects are recoverable via \"forklift heal\"; a damaged pack's \
+                sound parts are still read, and an object in a damaged part reads as unverifiable \
+                until it is stored again; an unenumerable index should be moved aside, then re-run."
             );
         }
     }

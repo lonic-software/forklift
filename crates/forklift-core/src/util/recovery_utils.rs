@@ -424,13 +424,20 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
 /// there is nothing to refetch — only the file itself to move aside.
 fn pack_health_warning_lines() -> Result<Vec<String>, String> {
     let snapshot = pack_utils::pack_health_snapshot()?;
-    let mut lines = Vec::with_capacity(snapshot.quarantined.len() + snapshot.unenumerable.len());
+    let mut lines = Vec::with_capacity(snapshot.quarantined.len() + snapshot.unenumerable.len() + snapshot.damaged.len());
 
     for (index_path, error) in &snapshot.quarantined {
         lines.push(format!(
             "pack index \"{}\" could not be loaded ({}); the objects it names are quarantined — \
             \"forklift heal\" can refetch them from a configured remote, and they will be reported \
             dangling if they are still referenced and none is configured",
+            index_path.to_string_lossy(), error
+        ));
+    }
+    for (index_path, error) in &snapshot.damaged {
+        lines.push(format!(
+            "pack index \"{}\" is damaged ({}); its sound parts are still read, but an object in a \
+            damaged part reads as unverifiable until it is stored again",
             index_path.to_string_lossy(), error
         ));
     }

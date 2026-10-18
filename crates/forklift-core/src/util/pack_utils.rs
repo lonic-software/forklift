@@ -247,11 +247,15 @@ pub struct StoreStatus {
     /// see `mark_densify_pending`. A suggestion only; nothing ever acts on it automatically.
     pub densify_pending: bool,
     /// Pack indexes that parsed but whose paired data file could not be loaded (FORK-47,
-    /// DESIGN.html §3.1.1), or that failed full validation (a corrupt bucket, or records that do
-    /// not tile the data file). The objects they name are quarantined, not lost: a read of one the
-    /// index cannot vouch for classifies an honest `Unverifiable` (never a bare `Absent`), and
-    /// `forklift heal` can still refetch them from a configured remote. Empty on a healthy store.
+    /// DESIGN.html §3.1.1). The objects they name are quarantined, not lost: a read of one
+    /// classifies an honest `Unverifiable` (never a bare `Absent`), and `forklift heal` can still
+    /// refetch them from a configured remote. Empty on a healthy store.
     pub quarantined_packs: Vec<PackIndexProblem>,
+    /// Packs that load but whose index fails full validation (a corrupt bucket, or records that
+    /// do not tile the data file). Reads keep serving their sound buckets; an object in a corrupt
+    /// bucket reads `Unverifiable` until it is stored again. Not counted among `packs`. Empty on a
+    /// healthy store.
+    pub damaged_packs: Vec<PackIndexProblem>,
     /// Pack index files that could not even be parsed (FORK-47, DESIGN.html §3.1.1) — their hash
     /// set is unknown, so they are inert (never gate a read verdict) but worth fixing: move the
     /// file aside and re-run. Empty on a healthy store.
@@ -277,9 +281,9 @@ pub fn store_status() -> Result<StoreStatus, String> {
     // (the index), its delta count (the record kinds), and its on-disk size (data file + index
     // file, both already sized once loaded). `PackSet`'s registry-independent load means a single
     // orphaned or unparseable pack pair never fails this census (FORK-47, DESIGN.html §3.1.1) —
-    // both problem lists are surfaced below instead. The load validates every index in full, so a
-    // pack with a corrupt bucket is listed as quarantined rather than counted.
-    let PackSet { packs: loaded, quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
+    // the problem lists are surfaced below instead. The load validates every index in full, so a
+    // pack with a corrupt bucket is listed as damaged rather than counted.
+    let PackSet { packs: loaded, quarantined, unenumerable, damaged, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
 
     let mut packs = Vec::new();
     for pack in loaded {
@@ -320,6 +324,10 @@ pub fn store_status() -> Result<StoreStatus, String> {
         index_path: u.index_path.to_string_lossy().into_owned(),
         error: u.error,
     }).collect();
+    let damaged_packs = damaged.into_iter().map(|d| PackIndexProblem {
+        index_path: d.index_path.to_string_lossy().into_owned(),
+        error: d.error,
+    }).collect();
 
     Ok(StoreStatus {
         loose_objects,
@@ -335,6 +343,7 @@ pub fn store_status() -> Result<StoreStatus, String> {
         repack_due,
         densify_pending: densify_pending()?,
         quarantined_packs,
+        damaged_packs,
         unenumerable_indexes,
     })
 }
@@ -491,6 +500,23 @@ mod index_format {
 
     /// The fanout bits the writer picks for `count` records: the smallest that brings the average
     /// bucket to [`TARGET_BUCKET_RECORDS`] or below, capped at [`MAX_FANOUT_BITS`].
+    /// The bytes that identify an index: its magic and its version.
+    pub(super) const IDENTITY_LEN: usize = 12;
+
+    /// The version of an index that carries this format's magic but another version, which this
+    /// build refuses by name. `None` for this version, and for anything without the magic.
+    pub(super) fn foreign_version(bytes: &[u8]) -> Option<u32> {
+        if bytes.len() < IDENTITY_LEN || &bytes[0..8] != PACK_INDEX_MAGIC {
+            return None;
+        }
+        Some(read_u32_le(bytes, 8)).filter(|version| *version != PACK_FORMAT_VERSION)
+    }
+
+    /// The error for a bucket of the index at `path` that failed validation.
+    pub(super) fn corrupt_bucket_message(path: &Path, bucket: usize) -> String {
+        format!("Pack index \"{}\" is corrupt (bucket {}).", path.to_string_lossy(), bucket)
+    }
+
     pub(super) const fn fanout_bits_for(count: usize) -> u32 {
         let mut bits = 0;
         while bits < MAX_FANOUT_BITS && count.div_ceil(1 << bits) > TARGET_BUCKET_RECORDS {
@@ -584,16 +610,14 @@ mod index_format {
         pub(super) fn parse(bytes: &[u8], path: &Path) -> Result<Layout, String> {
             let corrupt = || format!("Pack index \"{}\" is corrupt or has an unknown format.", path.to_string_lossy());
 
-            if bytes.len() < HEADER_LEN || &bytes[0..8] != PACK_INDEX_MAGIC {
-                return Err(corrupt());
-            }
-
-            let version = read_u32_le(bytes, 8);
-            if version != PACK_FORMAT_VERSION {
+            if let Some(version) = foreign_version(bytes) {
                 return Err(format!(
                     "Pack index \"{}\" has format version {}, but this build reads only version {}.",
                     path.to_string_lossy(), version, PACK_FORMAT_VERSION
                 ));
+            }
+            if bytes.len() < HEADER_LEN || &bytes[0..8] != PACK_INDEX_MAGIC {
+                return Err(corrupt());
             }
 
             let count = read_u32_le(bytes, 12) as usize;
@@ -945,7 +969,7 @@ impl LoadedPack {
 
     /// The error a reader reports for an index bucket that failed validation.
     fn corrupt_bucket_error(&self, bucket: usize) -> String {
-        format!("Pack index \"{}\" is corrupt (bucket {}).", self.index_path().to_string_lossy(), bucket)
+        index_format::corrupt_bucket_message(&self.index_path(), bucket)
     }
 
     /// Validate the whole index: every bucket, and that the records tile the data body exactly
@@ -1009,9 +1033,23 @@ struct QuarantinedPack {
 struct UnenumerablePack {
     index_path: PathBuf,
     error: String,
+    /// The index carries this format's magic but another version: a store written by another
+    /// build, whose objects this build cannot read. Unlike an unparseable file, it is known to be
+    /// a pack index, so it gates every verdict (see [`quarantine_reason`]): a read it might
+    /// answer fails naming its version instead of reporting the object absent.
+    foreign_version: bool,
     stamp: PairStamp,
     failure: FailureKind,
     attempted_at: Instant,
+}
+
+/// A pack pair that loads but whose index fails full validation (a corrupt bucket, or records that
+/// do not tile the data file). Only a census ([`IndexCheck::Full`]) tells it apart: the registry
+/// loads it and keeps serving its sound buckets, so its objects are neither quarantined nor lost
+/// except those in a corrupt bucket, which read `Unverifiable`. `error` is the validation failure.
+struct DamagedPack {
+    index_path: PathBuf,
+    error: String,
 }
 
 /// What kind of failure left a pair broken, which decides when [`reloaded_if_stale`] retries it.
@@ -1164,16 +1202,20 @@ impl QuarantinedPack {
 /// not even be parsed (unenumerable: its hash set is unknown). Presence and reads treat both as
 /// "as if the file were absent" *except* that a `quarantined`-named hash gets an honest
 /// `Unverifiable` instead of a bare `Absent` at the single gate that produces it (see
-/// `file_utils::read_object_classified`) — `unenumerable` is never consulted there (inert).
+/// `file_utils::read_object_classified`). `unenumerable` is consulted there only for an index of
+/// another format version, which gates every hash; any other unparseable file is inert.
 struct PackSet {
     /// Loaded pairs, sorted by file name (see `load_packs_from_disk`).
     packs: Vec<LoadedPack>,
     /// Index parses; data missing/unmappable/bad. Sorted by index file name for the same
     /// deterministic-error-message reason `packs` is.
     quarantined: Vec<QuarantinedPack>,
-    /// Index itself unreadable or corrupt. Its hash set is unknown, so it can never gate a
-    /// verdict.
+    /// Index itself unreadable or corrupt. Its hash set is unknown, so it gates no verdict
+    /// unless it is of another format version.
     unenumerable: Vec<UnenumerablePack>,
+    /// Pairs that load but fail full validation. Filled only by a census load
+    /// ([`IndexCheck::Full`]); the registry loads these pairs into `packs`.
+    damaged: Vec<DamagedPack>,
     /// The folder as it stood when this set was loaded (see [`reloaded_if_stale`]).
     stamp: FolderStamp,
 }
@@ -1184,6 +1226,7 @@ impl PackSet {
             packs: Vec::new(),
             quarantined: Vec::new(),
             unenumerable: Vec::new(),
+            damaged: Vec::new(),
             stamp: FolderStamp {
                 names: Vec::new(),
                 times: Mutex::new(StampTimes { modified: None, read_at: SystemTime::UNIX_EPOCH }),
@@ -1467,15 +1510,17 @@ fn broken_pair_changed(index_path: &Path,
 /// quarantined index's resident sorted bytes ([`QuarantinedPack::contains`]) — no per-hash parse.
 ///
 /// Consults [`loaded_packs`] (current in every caller today: this is only ever reached right
-/// after a `retrieve_from_packs` miss, which revalidated the set against the pack folder), never
-/// `unenumerable` — an unparseable index's hash set is unknown, so it must never gate a verdict
-/// (I4).
+/// after a `retrieve_from_packs` miss, which revalidated the set against the pack folder). An
+/// unparseable index's hash set is unknown, so it never gates a verdict (I4) — except an index of
+/// another format version ([`UnenumerablePack::foreign_version`]), which is known to be a pack
+/// index this build cannot read: it gates every hash, so a store written by another build fails
+/// its reads by name rather than reading its objects as absent.
 ///
 /// # Returns
-/// * `Ok(Some(message))` - `hash` is named by a quarantined index; `message` is ready to use as
-///   the [`file_utils::StoreReadOutcome::Unverifiable`] payload, naming the index file and its
-///   load error.
-/// * `Ok(None)`          - No quarantined index names `hash`.
+/// * `Ok(Some(message))` - `hash` is named by a quarantined index, or a foreign-version index
+///   may hold it; `message` is ready to use as the [`file_utils::StoreReadOutcome::Unverifiable`]
+///   payload, naming the index file and its error.
+/// * `Ok(None)`          - No quarantined index names `hash`, and no foreign-version index exists.
 /// * `Err(String)`       - The pack registry itself could not be loaded.
 pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
     let Some(hash_bytes) = hash_to_bytes(hash) else {
@@ -1493,6 +1538,14 @@ pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
         }
     }
 
+    // A pack index of another format version may hold any hash, so it can rule none out.
+    if let Some(foreign) = pack_set.unenumerable.iter().find(|pack| pack.foreign_version) {
+        return Ok(Some(format!(
+            "possibly held by pack index \"{}\", which this build cannot read: {}",
+            foreign.index_path.to_string_lossy(), foreign.error
+        )));
+    }
+
     Ok(None)
 }
 
@@ -1501,6 +1554,7 @@ pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
 pub(crate) struct PackHealthSnapshot {
     pub quarantined: Vec<(PathBuf, String)>,
     pub unenumerable: Vec<(PathBuf, String)>,
+    pub damaged: Vec<(PathBuf, String)>,
 }
 
 /// A point-in-time snapshot of the pack registry's two problem lists (FORK-47, DESIGN.html
@@ -1522,11 +1576,12 @@ pub(crate) struct PackHealthSnapshot {
 /// * `Err(String)`            - The pack folder itself could not be enumerated (an environment
 ///                              failure — see [`load_packs_from_disk`]).
 pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
-    let PackSet { quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
+    let PackSet { quarantined, unenumerable, damaged, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
 
     Ok(PackHealthSnapshot {
         quarantined: quarantined.into_iter().map(|q| (q.index_path, q.error)).collect(),
         unenumerable: unenumerable.into_iter().map(|u| (u.index_path, u.error)).collect(),
+        damaged: damaged.into_iter().map(|d| (d.index_path, d.error)).collect(),
     })
 }
 
@@ -1616,6 +1671,7 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
     let mut packs = Vec::new();
     let mut quarantined = Vec::new();
     let mut unenumerable = Vec::new();
+    let mut damaged = Vec::new();
     let mut names = Vec::new();
 
     // Stamp first, list second (see `FolderStamp`).
@@ -1626,7 +1682,7 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let stamp = FolderStamp { names, times: Mutex::new(StampTimes { modified: None, read_at }) };
-            return Ok(PackSet { packs, quarantined, unenumerable, stamp });
+            return Ok(PackSet { packs, quarantined, unenumerable, damaged, stamp });
         }
         Err(error) => return Err(format!(
             "Error while reading the pack folder \"{}\": {}", pack_folder.to_string_lossy(), error
@@ -1649,6 +1705,7 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
             PairOutcome::Loaded(pack) => packs.push(pack),
             PairOutcome::Quarantined(pack) => quarantined.push(pack),
             PairOutcome::Unenumerable(pack) => unenumerable.push(pack),
+            PairOutcome::Damaged(pack) => damaged.push(pack),
         }
     }
 
@@ -1657,10 +1714,11 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
     // lets a test pin the "broken copy enumerated first" case deterministically on every platform.
     packs.sort_by(|a, b| a.data_path.file_name().cmp(&b.data_path.file_name()));
     quarantined.sort_by(|a, b| a.index_path.file_name().cmp(&b.index_path.file_name()));
+    damaged.sort_by(|a, b| a.index_path.file_name().cmp(&b.index_path.file_name()));
     names.sort();
 
     let stamp = FolderStamp { names, times: Mutex::new(StampTimes { modified: Some(modified), read_at }) };
-    Ok(PackSet { packs, quarantined, unenumerable, stamp })
+    Ok(PackSet { packs, quarantined, unenumerable, damaged, stamp })
 }
 
 /// Whether `path` names a pack index or pack data file — the names a [`FolderStamp`] records.
@@ -1689,7 +1747,7 @@ enum IndexCheck {
     /// What the pack registry loads, so a command pays only for the buckets it touches.
     Lazy,
     /// Every bucket and the tiling check ([`LoadedPack::validate_full`]): a pack that fails is
-    /// quarantined. What a census loads, so it reports every corrupt index.
+    /// damaged ([`DamagedPack`]). What a census loads, so it reports every corrupt index.
     Full,
 }
 
@@ -1698,6 +1756,8 @@ enum PairOutcome {
     Loaded(LoadedPack),
     Quarantined(QuarantinedPack),
     Unenumerable(UnenumerablePack),
+    /// Loads, but fails [`LoadedPack::validate_full`]; produced only under [`IndexCheck::Full`].
+    Damaged(DamagedPack),
 }
 
 /// Classify one index entry exactly as the loader does — the single classifier both
@@ -1705,8 +1765,9 @@ enum PairOutcome {
 /// disagree about what a pair is. A `load_pack_pair` failure re-attempts the registry-independent
 /// index parse alone (the same read-and-parse shape [`hashes_in_index_file`] uses, without
 /// touching the data file that just failed): an index that parses is quarantined, one that does
-/// not is unenumerable. Under [`IndexCheck::Full`] a pair that loads but fails
-/// [`LoadedPack::validate_full`] is quarantined too, with that failure as its error.
+/// not is unenumerable. The two checks differ in one outcome only: under [`IndexCheck::Full`] a
+/// pair that loads but fails [`LoadedPack::validate_full`] is damaged, where the registry's
+/// [`IndexCheck::Lazy`] loads it.
 ///
 /// The pair is stamped before it is opened, so a change that lands during the load moves its
 /// files past the stamp.
@@ -1718,9 +1779,9 @@ fn classify_pack_pair(index_path: &Path, check: IndexCheck) -> PairOutcome {
     let pair_failure = match load_pack_pair_classified(&data_path, index_path) {
         Ok(pack) => match check {
             IndexCheck::Lazy => return PairOutcome::Loaded(pack),
-            IndexCheck::Full => match pack.validate_full() {
-                Ok(()) => return PairOutcome::Loaded(pack),
-                Err(message) => PairFailure::fixed(message),
+            IndexCheck::Full => return match pack.validate_full() {
+                Ok(()) => PairOutcome::Loaded(pack),
+                Err(error) => PairOutcome::Damaged(DamagedPack { index_path: index_path.to_path_buf(), error }),
             },
         },
         Err(failure) => failure,
@@ -1739,6 +1800,7 @@ fn classify_pack_pair(index_path: &Path, check: IndexCheck) -> PairOutcome {
             Err(parse_error) => PairOutcome::Unenumerable(UnenumerablePack {
                 index_path: index_path.to_path_buf(),
                 error: parse_error,
+                foreign_version: index_format::foreign_version(&index).is_some(),
                 stamp,
                 failure: FailureKind::Fixed,
                 attempted_at,
@@ -1747,6 +1809,7 @@ fn classify_pack_pair(index_path: &Path, check: IndexCheck) -> PairOutcome {
         Err(read_failure) => PairOutcome::Unenumerable(UnenumerablePack {
             index_path: index_path.to_path_buf(),
             error: format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), read_failure.error),
+            foreign_version: false,
             stamp,
             failure: read_failure.kind,
             attempted_at,
@@ -1808,9 +1871,9 @@ fn load_pack_pair_classified(data_path: &Path, index_path: &Path) -> Result<Load
         message: format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), e),
         kind: FailureKind::Io,
     })?.len();
-    // Too short to hold a header: refuse it here, since mapping an empty file fails on some
+    // Too short to name its version: refuse it here, since mapping an empty file fails on some
     // platforms with an error that would read as an I/O fault rather than a corrupt index.
-    if index_len < 24 {
+    if index_len < index_format::IDENTITY_LEN as u64 {
         return Err(PairFailure::fixed(format!(
             "Pack index \"{}\" is corrupt or has an unknown format.", index_path.to_string_lossy()
         )));
@@ -2605,9 +2668,7 @@ pub(crate) fn hashes_in_index_file(index_path: &Path) -> Result<Vec<String>, Str
         .map_err(|e| format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), e))?;
     let layout = index_format::Layout::parse(&index, index_path)?;
     let index = CheckedIndex::new(index, layout, None);
-    let records = index.all_records().map_err(|bucket| format!(
-        "Pack index \"{}\" is corrupt (bucket {}).", index_path.to_string_lossy(), bucket
-    ))?;
+    let records = index.all_records().map_err(|bucket| index_format::corrupt_bucket_message(index_path, bucket))?;
 
     Ok(records.iter().map(|record| sign_utils::to_hex(record.hash)).collect())
 }
@@ -7206,6 +7267,53 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// A pack index of another format version — a store written by another build — fails every
+    /// read it might answer by name: a hash no readable copy holds reads `Unverifiable` naming the
+    /// version, never `Absent`, while an object stored loose reads `Verified`. Short indexes name
+    /// their version too: a 16-byte version-2 index has no fanout header to be measured against.
+    ///
+    /// Mutation: drop the foreign-version loop from `quarantine_reason` → the never-stored hash
+    /// reads `Absent` (red).
+    #[test]
+    fn a_pack_index_of_another_version_fails_reads_by_name_instead_of_reading_absent() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = std::env::temp_dir().join(format!("forklift-foreign-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let mut old_index = PACK_INDEX_MAGIC.to_vec();
+        old_index.extend_from_slice(&2u32.to_le_bytes());
+        old_index.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(folder.join(format!("{}.{}", "ab".repeat(32), PACK_INDEX_EXTENSION)), &old_index).unwrap();
+        invalidate_cache();
+
+        let never_stored = blake3::hash(b"held only by the old pack, perhaps").to_hex().to_string();
+        match file_utils::read_object_classified(&never_stored).unwrap() {
+            StoreReadOutcome::Unverifiable(message) => assert!(
+                message.contains("format version 2, but this build reads only version 3"), "{}", message
+            ),
+            other => panic!("a read an old-version index might answer must fail by name, got {}", outcome_name(&other)),
+        }
+        assert!(!is_in_packs(&never_stored).unwrap());
+
+        let (content, hex) = (b"stored loose".to_vec(), blake3::hash(b"stored loose").to_hex().to_string());
+        store_loose(&hex, &content);
+        match file_utils::read_object_classified(&hex).unwrap() {
+            StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, content),
+            other => panic!("a readable copy must still read Verified, got {}", outcome_name(&other)),
+        }
+
+        let census = store_status().unwrap();
+        assert_eq!(census.unenumerable_indexes.len(), 1);
+        assert!(census.unenumerable_indexes[0].error.contains("format version 2"), "{}", census.unenumerable_indexes[0].error);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     /// (FORK-118) A full repack validates each pack in full before copying from it. A pack whose
     /// index fails is reported, neither copied from nor deleted, and the objects its sound buckets
     /// hold stay readable; the other packs are repacked as usual.
@@ -7240,6 +7348,13 @@ mod tests {
         let survivor = objects[1].iter().find(|(_, hash, _)| index.bucket_of_hash(hash) != bad_bucket).unwrap();
         corrupt_record_of(&corrupt_pair.index_path, &objects[1][0].1);
         invalidate_cache();
+
+        // The census tells the damaged pack apart: neither quarantined nor counted.
+        let census = store_status().unwrap();
+        assert_eq!(census.damaged_packs.len(), 1, "the corrupt pack must be listed as damaged");
+        assert!(census.damaged_packs[0].error.contains(&format!("bucket {}", bad_bucket)), "{}", census.damaged_packs[0].error);
+        assert!(census.quarantined_packs.is_empty(), "a damaged pack's data file loads, so it is not quarantined");
+        assert_eq!(census.packs.len(), 1, "only the sound pack is counted");
 
         let stats = compact(true, false, &Progress::NONE).unwrap();
 
