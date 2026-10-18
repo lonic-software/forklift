@@ -872,11 +872,12 @@ fn mark_shard_entries_deleted(key: &str) -> Result<bool, String> {
 }
 
 /// One shard's write decision, collected for a single-threaded join point to publish
-/// (`publish_shard_outcomes`) instead of written immediately from whatever decided it. Two
+/// (`publish_shard_outcomes`) instead of written immediately from whatever decided it. Three
 /// producers share this shape: `load`'s parallel walk (`build_inventory`, one task per
-/// directory, joined by `create_inventory_for_directory`) and `park`'s working-directory refresh
-/// (`refresh_tracked_entries`, a single-threaded loop over every tracked shard) — see each
-/// producer's own doc comment for why a decision never touches disk directly.
+/// directory, joined by `create_inventory_for_directory`), `park`'s working-directory refresh
+/// (`refresh_tracked_entries`, a single-threaded loop over every tracked shard), and
+/// [`ShardMutationBatch`] (many edits from one command, such as `restore` of a directory) — see
+/// each producer's own doc comment for why a decision never touches disk directly.
 pub enum ShardOutcome {
     /// Content unchanged from the previous shard (same name/type/hash/state for every entry),
     /// but it still needs rewriting: stat data drifted, or at least one entry had to be
@@ -899,8 +900,8 @@ pub enum ShardOutcome {
 }
 
 /// Publish a batch of [`ShardOutcome`] decisions through the same two-phase ordering `load`'s
-/// join point (`create_inventory_for_directory`) and `park`'s working-directory refresh
-/// (`refresh_tracked_entries`) both need: drop a carried rollup that turns out to be an ancestor
+/// join point (`create_inventory_for_directory`), `park`'s working-directory refresh
+/// (`refresh_tracked_entries`) and [`ShardMutationBatch::publish`] all need: drop a carried rollup that turns out to be an ancestor
 /// of some other real change in the very same batch (step 1, in-memory only — this is what closes
 /// DESIGN.html §5.0 D item 10, finding #1: a decision made *before* a sibling's later-processed
 /// real change is never blindly restamped over the ancestor clear that change requires, because
@@ -914,7 +915,8 @@ pub enum ShardOutcome {
 /// Any blob a published outcome's content might reference must already be durable *before* this
 /// is called — neither phase here stages a blob write; each caller finishes its own blob batch
 /// first (DESIGN.html §5.0 D item 10, finding #7): `create_inventory_for_directory`'s
-/// `context.blob_batch`, `refresh_tracked_entries`'s own local one.
+/// `context.blob_batch`, `refresh_tracked_entries`'s own local one, and for a
+/// [`ShardMutationBatch`] whatever its caller stored before calling `publish`.
 ///
 /// A failure in either phase is folded into the returned `Err` and the *other* phase is skipped
 /// (phase A failing skips phase B entirely, preserving `write_shard_mutation`'s ordering
@@ -1003,7 +1005,9 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 /// not have covered — see [`save_inventory_deferred_with_mtime`]. That holds only while a caller
 /// keeps the order it had with `update_shard`: stat a file right after writing it, then
 /// `update`. Writing many files first and statting them later would record an edit made in
-/// between against the hash the caller wrote, and trust it.
+/// between against the hash the caller wrote, and trust it. The anchor is read from the process
+/// clock, as `load`'s walk and `refresh_tracked_entries` read theirs, where `update_shard`'s
+/// shard gets its mtime from the file system; "never later" assumes the two clocks agree.
 ///
 /// Every blob a change makes an entry name must already be durable before `publish`, as
 /// [`publish_shard_outcomes`] requires.

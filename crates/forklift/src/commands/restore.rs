@@ -188,9 +188,13 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     }
 
     // What was decided before a failure is still published, as one `update_shard` per file
-    // would already have published it — the failure is reported after.
-    batch.publish()?;
-    result?;
+    // would already have published it — the failure is reported after, together with the
+    // publish's own failure if that failed too (which means none of it was staged).
+    match (result, batch.publish()) {
+        (Err(first), Err(publish)) => return Err(format!("{}\n{}", first, publish)),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => return Err(e),
+        (Ok(()), Ok(())) => {}
+    }
 
     if !restored_any {
         return Err(format!(
