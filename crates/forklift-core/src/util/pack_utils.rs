@@ -7089,7 +7089,9 @@ mod tests {
     /// Mutations: make `CheckedIndex::locate` skip `bucket_is_valid` → the corrupted record's
     /// offset is off by one, so its read fails as a decode error rather than naming the bucket,
     /// and the neighbour reads `Verified` (the "bucket" assertions go red). Make `retrieve_from`
-    /// treat `CorruptBucket` as `Missing` → the hashes classify `Absent` (red).
+    /// treat `CorruptBucket` as `Missing` → the hashes classify `Absent` (red). Make `located_in`
+    /// count `CorruptBucket` as present → `is_in_packs` reports the corrupted hash (red), and the
+    /// store would skip writing it.
     #[test]
     fn a_corrupt_index_bucket_makes_only_its_prefix_unverifiable_and_a_new_store_there_reads_back() {
         use crate::util::file_utils::StoreReadOutcome;
@@ -7208,9 +7210,8 @@ mod tests {
     /// index fails is reported, neither copied from nor deleted, and the objects its sound buckets
     /// hold stay readable; the other packs are repacked as usual.
     ///
-    /// Mutation: drop the `pack.records()` check in `collect_targets` (walk the records without
-    /// validating) → the corrupt pack is deleted with the rest and `unvalidated_packs` is empty
-    /// (red).
+    /// Mutation: make `collect_targets` schedule a pack that fails `records()` for deletion instead
+    /// of reporting it → `unvalidated_packs` is empty (red).
     #[test]
     fn a_full_repack_leaves_a_pack_whose_index_fails_validation_in_place() {
         use crate::util::file_utils::StoreReadOutcome;

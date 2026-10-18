@@ -1370,8 +1370,8 @@ mod tests {
     /// so its index is exactly the transport cap — round-trips through a native bundle: the cap
     /// admits it, import validates every bucket and the tiling, and every object lands.
     ///
-    /// Mutation: compute `MAX_TRANSPORT_INDEX_BYTES` for one record fewer → the import refuses the
-    /// index section as over the cap (red).
+    /// Mutation: compute `MAX_TRANSPORT_INDEX_BYTES` for one record fewer → the full pack's index no
+    /// longer equals the cap (red), so the import would refuse it as over the cap.
     #[test]
     fn a_full_rollover_pack_round_trips_through_a_native_bundle() {
         let count = pack_utils::PACK_ROLLOVER_OBJECTS;

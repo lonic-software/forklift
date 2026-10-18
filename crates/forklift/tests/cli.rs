@@ -2733,6 +2733,9 @@ fn index_validation_counts(output: &Output) -> (u64, u64) {
 /// buckets a command reads: `history -n 1` over two packs of hundreds of objects each validates a
 /// handful of buckets and no whole pack. A full repack, which copies every record, validates each
 /// pack it reads in full exactly once.
+///
+/// Mutations: make `CheckedIndex::locate` validate every bucket → 32 buckets (red). Load the pack
+/// registry with `IndexCheck::Full` → two whole-pack validations for `history` (red).
 #[test]
 fn reading_a_pack_validates_only_the_index_buckets_it_touches() {
     let warehouse = TestWarehouse::new("lazy-pack-index");
