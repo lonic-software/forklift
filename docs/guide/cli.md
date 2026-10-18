@@ -1368,6 +1368,12 @@ allowed; the automatic repack simply waits until the root is no longer served. A
 hard-killed leaves its `serve.lock` behind, which blocks repacks (automatic ones silently) until
 it is removed, exactly as it blocks `gc`.
 
+A full repack checks each pack's whole index before copying anything out of it. A pack whose
+index fails that check is **left in place, untouched**, and named in a `Left a pack in place, not
+repacked:` note (`--json`: `unvalidated_packs`, the list of those errors); the objects in its sound
+parts stay readable, and `forklift heal` recovers the rest. Ordinary commands never pay that
+whole-index check: they verify only the slice of an index they actually read.
+
 For the same reason a full repack is **refused while a mutating command is running in another
 bay** of the same warehouse: that command may have just decided to reuse an object the repack
 was about to drop. Run it again once the other command finishes. The opposite case waits
@@ -1436,7 +1442,9 @@ bulk-ingested (`import-git` or a franchise's bundle install) and clears once a `
 data file only in unusual circumstances (a file removed by hand, a partial restore); when that
 happens, `store` lists it under `quarantined_packs` — `[{index_path, error}]` — rather than
 failing the census: the objects it named are not lost, only unreachable through that copy, and
-`heal` can refetch them from a configured remote. `unenumerable_indexes` — the same `[{index_path,
+`heal` can refetch them from a configured remote. `store` checks every index in full, so a pack
+whose index is damaged in places is listed there too; ordinary reads keep using its undamaged
+parts, and only objects in a damaged part fail to read. `unenumerable_indexes` — the same `[{index_path,
 error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
 is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
 aside and re-run. In the human view both appear as a `pack problems:` section, only when non-empty.

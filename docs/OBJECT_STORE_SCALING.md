@@ -178,10 +178,10 @@ opportunistic background runs (the server already has an admin `collect`).
 
 ### Phase 2 — delta compression (shipped)
 
-Packs are now format **version 2**: every data record carries a one-byte kind, so a
-record is either a **full** object (its zstd blob, as before) or a **delta** — the
-object stored as its difference from a similar *base*. Version-1 packs (no kind byte)
-are still read, so upgrading strands nothing.
+Since format version 2, every data record carries a one-byte kind, so a record is
+either a **full** object (its zstd blob) or a **delta** — the object stored as its
+difference from a similar *base*. (Packs are now version 3, which changed only the index;
+see `docs/format/BUNDLE_FORMAT.md`. A reader refuses every other version by name.)
 
 **Reuse, not reinvention.** A delta is exactly the bundle machinery (`delta_utils`):
 zstd with the base object installed as the **dictionary**, never a bespoke diff

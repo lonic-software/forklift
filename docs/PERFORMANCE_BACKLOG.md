@@ -210,8 +210,8 @@ FORK-163 section below, and the rest is FORK-192.
 - FORK-182: the stat refresh stocktake never persists, which made copied warehouses rehash
   everything.
 
-No durability barrier or verification step was removed. The radix sort keeps every check
-`validate_index_records` made; the preload reads the same packs, and a failed preload is dropped
+No durability barrier or verification step was removed. The radix sort kept every check
+the then whole-index validation made (FORK-118 has since replaced that pass with per-bucket checks); the preload reads the same packs, and a failed preload is dropped
 so the first real lookup reports it as before.
 
 **After** (`bin/benchmark --repo git`, fresh work dir, 2026-10-18):

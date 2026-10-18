@@ -538,6 +538,13 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "unvalidated_packs": {
+      "description": "Packs a full repack left exactly as found because their index failed validation: nothing\nwas copied out of them and they were not deleted. Each entry is the validation error, which\nnames the index file. Always empty without `--all`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
@@ -548,7 +555,8 @@ A command not listed here either reports only the generic human-message shape `{
     "deltas",
     "bytes_packed",
     "corrupt_skipped",
-    "over_ceiling_skipped"
+    "over_ceiling_skipped",
+    "unvalidated_packs"
   ],
   "title": "Compacted",
   "type": "object"
