@@ -465,31 +465,24 @@ fn conflict_writes(action: &MergeAction) -> bool {
 ///
 /// Every inventory change goes through one [`inventory_utils::ShardMutationBatch`], published
 /// before this returns, so the caller records its in-progress state only over a published
-/// inventory. What was applied before a failure is still published, and the error says how far
-/// the merge got: the caller has recorded nothing as in progress yet.
+/// inventory. An action that fails leaves the batch unpublished: a half-applied merge staged with
+/// nothing in progress could leave conflict entries staged with no merge to complete or abort. The caller has
+/// recorded nothing as in progress yet, and the error says so.
 pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
     let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    let applied = apply_merge_actions_to(actions, &mut batch, &mut conflict_paths);
-
-    match (applied, batch.publish()) {
-        (Ok(()), Ok(())) => Ok(conflict_paths),
-        (Err(e), Ok(())) => Err(format!(
-            "{}\nThe changes applied before this error are in the working directory and staged. \
-            Nothing was recorded as in progress.",
+    // The batch may already have published some shards early (see its doc comment), so a failure
+    // claims only that some or all of the changes are unstaged.
+    apply_merge_actions_to(actions, &mut batch, &mut conflict_paths)
+        .and_then(|()| batch.publish())
+        .map_err(|e| format!(
+            "{}\nThe working directory holds the changes applied so far, but some or all of them \
+            are not staged. Nothing was recorded as in progress.",
             e
-        )),
-        (applied, Err(publish)) => {
-            let first = applied.err().map(|e| format!("{}\n", e)).unwrap_or_default();
+        ))?;
 
-            Err(format!(
-                "{}{}\nThe working directory holds the changes applied so far, but staging them \
-                failed, so some or all of them are not staged. Nothing was recorded as in progress.",
-                first, publish
-            ))
-        }
-    }
+    Ok(conflict_paths)
 }
 
 /// The body of [`apply_merge_actions`]: every deletion, then every write, staged into `batch`.
@@ -512,8 +505,7 @@ fn apply_merge_actions_to(actions: &[MergeAction],
 }
 
 /// Apply one merge action to the working directory, and stage its inventory change into
-/// `batch`. Shared with `cherry-pick`, which applies a parcel's diff through the same
-/// `MergeAction`s.
+/// `batch`.
 ///
 /// `content` is a `TakeTheirs` blob already loaded by [`shift_utils::write_in_order`]'s
 /// prefetch, or `None` to load it here. A written file is statted right after its write, as the
@@ -558,16 +550,12 @@ fn apply_merge_action(action: &MergeAction,
         MergeAction::Merged { path, content, item_type } => {
             shift_utils::write_working_file(path, content, *item_type, false)?;
 
-            // The merged content is new — store its blob so the next stack can point at it. A
-            // three-way merge only ever runs on plain text files, so a `Merged` result is always
-            // a plain blob, never chunked. Stored durably here, one barrier per blob, rather
-            // than deferred to one write batch finished before the publish: the batch may
-            // publish early (a key that may alias one it touched), and every blob it names
-            // must be durable by then.
+            // The merged content is new — the batch stores its blob so the next stack can point
+            // at it. A three-way merge only ever runs on plain text files, so a `Merged` result
+            // is always a plain blob, never chunked.
             let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
-            object.store()?;
 
-            batch.stage_file_from_stat(path, object.hash, *item_type)
+            batch.stage_file_storing_blob(path, &mut object, *item_type)
         }
 
         MergeAction::Conflict { path, content, entry_hash, item_type } => {

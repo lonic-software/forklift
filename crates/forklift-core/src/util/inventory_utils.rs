@@ -1025,8 +1025,10 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 /// `update_shard`'s shard gets its mtime from the file system; "never later" assumes the two
 /// clocks agree.
 ///
-/// Every blob a change makes an entry name must already be durable before `publish`, as
-/// [`publish_shard_outcomes`] requires.
+/// Every blob a change makes an entry name must be durable before its shard is published, as
+/// [`publish_shard_outcomes`] requires: either stored before the change, or staged through
+/// [`stage_file_storing_blob`](Self::stage_file_storing_blob), whose blobs every publish — the
+/// early one included — makes durable first, in one barrier.
 ///
 /// Two keys may name one shard folder: `dir` and `Dir` on a case-insensitive volume, after a
 /// case-only rename. Two in-memory copies of that one file would each be published over the
@@ -1040,11 +1042,17 @@ pub struct ShardMutationBatch {
     shards: BTreeMap<String, TouchedShard>,
     folded_keys: BTreeSet<String>,
     early_publish_failed: bool,
+    blobs: file_utils::WriteBatch,
 }
 
 impl ShardMutationBatch {
     pub fn new() -> ShardMutationBatch {
-        ShardMutationBatch { shards: BTreeMap::new(), folded_keys: BTreeSet::new(), early_publish_failed: false }
+        ShardMutationBatch {
+            shards: BTreeMap::new(),
+            folded_keys: BTreeSet::new(),
+            early_publish_failed: false,
+            blobs: file_utils::WriteBatch::new(),
+        }
     }
 
     /// Apply `change` to the shard at `key`, reading it first if this batch has not touched it
@@ -1121,6 +1129,33 @@ impl ShardMutationBatch {
         self.update(parent_key, |inventory| inventory.add_item(entry))
     }
 
+    /// Stat a file just written with content not stored yet (e.g. a merge result), record it in
+    /// its parent's shard, and stage its blob into this batch's own write batch — made durable
+    /// before any shard is published, so no published entry names a blob that is not. Call it
+    /// right after the write: the stat comes first, before the blob is compressed.
+    ///
+    /// # Arguments
+    /// * `path`      - The warehouse path of the file.
+    /// * `object`    - The blob of the file's content.
+    /// * `item_type` - The entry type to record.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If the entry was recorded in memory and the blob staged.
+    /// * `Err(String)` - If the file's metadata could not be gathered, the blob staged, or its
+    ///                   shard read.
+    pub fn stage_file_storing_blob(&mut self,
+                                   path: &str,
+                                   object: &mut LooseObject,
+                                   item_type: DirEntryType) -> Result<(), String> {
+        let (parent_key, name) = split_path_key(path);
+
+        let entry = build_inventory_item_from_stat(Path::new(path), name, object.hash.clone(), item_type)?;
+
+        object.store_deferred(&self.blobs)?;
+
+        self.update(parent_key, |inventory| inventory.add_item(entry))
+    }
+
     /// Publish every touched shard, then register any key the metadata does not list yet.
     ///
     /// Each shard is re-read first, under `SHARD_MUTATION_LOCK`: if any changed on disk since this
@@ -1148,6 +1183,9 @@ impl ShardMutationBatch {
         self.folded_keys.clear();
 
         let shards = std::mem::take(&mut self.shards);
+
+        // Every blob a shard below names, durable before any shard is.
+        self.blobs.finish()?;
 
         if shards.is_empty() {
             return Ok(());
