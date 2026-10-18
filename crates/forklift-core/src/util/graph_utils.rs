@@ -910,7 +910,9 @@ const PARALLEL_FILTER_THRESHOLD: usize = 64;
 /// whose record cannot be computed is skipped.
 ///
 /// # Arguments
-/// * `parcels` - The parcels whose filters the caller is about to query, oldest first.
+/// * `parcels` - The parcels whose filters the caller is about to query: a first-parent chain,
+///   oldest first, as `blame` walks it. Any other list is still handled correctly, but less of it
+///   may be batched when an ancestry cannot be resolved.
 ///
 /// # Returns
 /// * `Ok(())`      - Every filter that could be computed is stored.
@@ -918,35 +920,40 @@ const PARALLEL_FILTER_THRESHOLD: usize = 64;
 pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
     let root = file_utils::get_path_graph_root();
 
-    // Newest first: one `ensure` from the newest parcel records its whole missing ancestry and
-    // persists it once, so every older parcel after it is already a hit. A parcel whose ancestry
-    // cannot be resolved (an unreadable parent in a partial store) is left to the per-query path
-    // rather than costing every other parcel its batched filter. After the first such failure no
-    // further `ensure` runs: a failed one persists nothing, so each older parcel would walk most
-    // of the same ancestry again to the same unreadable parent — quadratic in the chain. Records
-    // that already exist are still batched. On a warm graph this is one lookup per parcel that
-    // clones nothing.
-    let mut missing: Vec<(String, Record)> = Vec::new();
-    let mut ancestry_unresolvable = false;
-    for hash in parcels.iter().rev() {
-        let filter_unknown = with_shard(&root, &shard_prefix(hash), |shard| {
-            shard.records.get(hash).map(|record| matches!(record.filter, PathFilter::Unknown))
-        })?;
-        match filter_unknown {
-            Some(false) => continue,
-            Some(true) => {}
-            None => {
-                if ancestry_unresolvable {
-                    continue;
-                }
-                if ensure(&root, hash).is_err() {
-                    ancestry_unresolvable = true;
-                    continue;
+    // Records first. Along a first-parent chain each parcel's ancestry contains every older
+    // parcel's, so one `ensure` from the newest parcel records them all and persists once. When
+    // that ancestry cannot be resolved (an unreadable parent in a partial store), the failed
+    // `ensure` persists nothing; but resolvability only grows toward the root, so a binary search
+    // finds the newest parcel that does resolve in a logarithmic number of walks, and its
+    // `ensure` records everything below it. Retrying from every parcel instead would walk to the
+    // same unreadable parent once per parcel above it — quadratic in the chain. Parcels left
+    // without a record are left to the per-query path. (`ensure` on a recorded parcel is a
+    // single lookup.)
+    if let Some(newest) = parcels.len().checked_sub(1) {
+        if ensure(&root, &parcels[newest]).is_err() {
+            // Invariant: every parcel below `resolved` is recorded; `parcels[unresolved]` fails.
+            let (mut resolved, mut unresolved) = (0, newest);
+            while resolved < unresolved {
+                let mid = resolved + (unresolved - resolved) / 2;
+                if ensure(&root, &parcels[mid]).is_ok() {
+                    resolved = mid + 1;
+                } else {
+                    unresolved = mid;
                 }
             }
         }
-        if let Some(record) = stored_record(&root, hash)? {
-            missing.push((hash.clone(), record));
+    }
+
+    // One lookup per parcel that clones nothing, so a warm graph pays almost nothing here.
+    let mut missing: Vec<(String, Record)> = Vec::new();
+    for hash in parcels {
+        let filter_unknown = with_shard(&root, &shard_prefix(hash), |shard| {
+            shard.records.get(hash).map(|record| matches!(record.filter, PathFilter::Unknown))
+        })?;
+        if filter_unknown == Some(true) {
+            if let Some(record) = stored_record(&root, hash)? {
+                missing.push((hash.clone(), record));
+            }
         }
     }
 
@@ -1421,11 +1428,11 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_pass_walks_an_unresolvable_ancestry_once() {
-        // A merge whose second parent is not in the store: every parcel above it has an ancestry
-        // `ensure` cannot finish, and a failed `ensure` persists nothing. The pass must give up
-        // on records after the first failure, not walk back to the same missing parent once per
-        // parcel — that is quadratic in the chain.
+    fn the_filter_pass_records_below_an_unresolvable_ancestry_in_logarithmic_walks() {
+        // A merge whose second parent is not in the store: every parcel from it up has an
+        // ancestry `ensure` cannot finish, and a failed `ensure` persists nothing. The pass must
+        // not walk back to the same missing parent once per parcel above it (quadratic in the
+        // chain), and it must still record every parcel below the merge, whose ancestry is whole.
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;
         use crate::globals::StorageRootScope;
         use crate::model::parcel::Parcel;
@@ -1445,10 +1452,15 @@ mod tests {
             hash
         };
 
+        const BELOW: usize = 30;
         const ABOVE: usize = 50;
-        let root = store(vec![], "root");
-        let merge = store(vec![root.clone(), "f".repeat(64)], "merge");
-        let mut chain = vec![root, merge];
+        let mut chain = vec![store(vec![], "root")];
+        for i in 0..BELOW {
+            let next = store(vec![chain.last().unwrap().clone()], &format!("below {i}"));
+            chain.push(next);
+        }
+        let merge = store(vec![chain.last().unwrap().clone(), "f".repeat(64)], "merge");
+        chain.push(merge);
         for i in 0..ABOVE {
             let next = store(vec![chain.last().unwrap().clone()], &format!("above {i}"));
             chain.push(next);
@@ -1457,11 +1469,21 @@ mod tests {
         ENSURE_CALLS.with(|calls| calls.set(0));
         let result = ensure_path_filters(&chain[1..]);
         let walks = ENSURE_CALLS.with(|calls| calls.get());
+        let graph_root = file_utils::get_path_graph_root();
+        let recorded: Vec<bool> = chain.iter()
+            .map(|hash| stored_record(&graph_root, hash).unwrap().is_some())
+            .collect();
         drop(_scope);
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(result.is_ok(), "an unresolvable ancestry is not an error of the pass: {:?}", result);
-        assert_eq!(walks, 1, "the pass must walk the unresolvable ancestry once, not once per parcel above it");
+        // One failed walk from the newest parcel, then a binary search over the rest: about
+        // log2(81) more, against one per parcel above the merge if every parcel retried.
+        assert!(walks <= 1 + 8, "the pass must find the resolvable boundary in a logarithmic number of walks; it made {walks}");
+        assert!(recorded[..=BELOW].iter().all(|r| *r),
+            "every parcel below the unreadable merge must be recorded by the pass: {:?}", recorded);
+        assert!(recorded[BELOW + 1..].iter().all(|r| !*r),
+            "sanity: no parcel from the merge up can be recorded: {:?}", recorded);
     }
 
     #[test]
