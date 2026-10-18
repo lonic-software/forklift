@@ -196,7 +196,7 @@ isn't sampled on macOS, so wall-clock attribution also came from `hyperfine` A/B
 | stocktake ran the staged side (head pack open + staged walk) and then the unstaged walk | the staged side's whole wall time | **Fixed:** `tokio::join!` of the two. The unstaged tasks fan out while the command task opens the pack. | stocktake 16.1 → 12.1 ms clean, 17.2 → 11.8 ms staged |
 | diff's first blob lookup opened the whole pack set (5 packs, ~500k records) after the walk | ~4.4 of the 7 ms render | **Fixed:** the unstaged walk preloads the pack set on a background thread once a directory reports a change the diff will render (inside its path filter, not untracked), and returns when it lands. A clean, untracked-only or out-of-filter walk never starts it. | diff 18.7 → 15.0 ms dirty; 11.3 → 11.1 ms clean |
 | Serial per-file render in the worktree and staged modes | most of the 8.5 ms by which `diff --staged` exceeds its `--json` form (loose head after the benchmark's commit rows) | **Fixed:** both modes render through `fanout_map` past 8 files, like the pallet diff. Output is byte-identical, and a file that fails to render still prints every file before it, then the error. | diff --staged 17.5 → 12.5 ms, diff 14.7 → 13.4 ms |
-| Verification of every intermediate base in a delta chain | ~20% of the staged render's main thread (blake3), plus zstd ~13% and delta apply ~14% | **Filed: FORK-188.** It needs a design note: bases enter the shared cache. | up to ~2 ms on diff --staged |
+| Verification of every intermediate base in a delta chain | ~20% of the staged render's main thread (blake3), plus zstd ~13% and delta apply ~14% | **Fixed (FORK-188 below):** a delta chain is reconstructed with unverified bases and only its target is hashed. | diff --staged 15.9 → 12.0 ms |
 | One task per directory in the unstaged walk (t/ has 1129 files, the root 531) | walk ~7 ms wall for ~28 ms CPU over 6 P-cores | **Measured, not done (FORK-189 below):** ranges plus subdirectories-first saved ~0.7 ms median for +43% CPU and a fatter p90. | none |
 | Residual pack-set open: index reads (~24 MB `read_to_end`) plus the linear validation pass (~0.7 ms) | ~4.4 ms per process wherever it can't overlap (e.g. `diff --staged`, whose first act is reading the head parcel) | **Fixed (FORK-118):** index format 3 — a checksummed fanout table; the index is mapped, and a command validates only the buckets it reads. | history -n 1 7.5 → 3.4 ms, diff --staged 7.4 → 3.3 ms |
 | Line interning hasher (`diff::lines`, SipHash) | ~0.2–0.6 ms per 20 files | Not worth a ticket alone. It now runs fanned out, so the wall-clock share is smaller still. | < 0.3 ms |
@@ -285,6 +285,41 @@ A/B tests against saved binaries on a quiet machine.
 
 The memory rise does not depend on the window: a window of 32 measured the same. Remaining
 work, a stat-clean worktree read and the other commands' serial loads, is FORK-192.
+
+## FORK-188: delta chains hash only the object asked for (2026-10-18)
+
+**Measured** on a v3 git.git warehouse with 24 staged files, using hyperfine A/Bs against a saved
+release build of main. A throwaway build that skipped every base's hash check first sized the
+prize at ~4 ms, twice the profile's estimate.
+
+- **Before:** `resolve_record` hashed every object it reconstructed, and a delta's base was
+  fetched through the ordinary verified read. So a chain of depth d paid d + 1 blake3 passes, one
+  over each intermediate base's full bytes.
+- **Fix:** a delta read a caller asked for reconstructs its chain with *unverified* bases and
+  hashes only the result. A base is used only as its delta's dictionary, and no wrong base can
+  yield bytes that hash to the target's address. Bases built this way live in a separate cache,
+  so the read cache still holds only bytes that verified, and a base read directly is still
+  hashed. If the fast attempt fails, the read is redone with every base verified, which is the
+  old read, and its outcome is returned. Errors therefore still name the corrupt object.
+- **Found on the way** (an adversarial review of the design): a read inside a reconstruction
+  forced a full pack-registry reload at every chain level, doubling per level. A corrupt chain
+  root cost 2^depth reloads (1023 at depth 10, pinned by a test). Only the outermost read reloads
+  now. Also, `compact --all` reconstructs a copied delta whose base it repacks from a different
+  copy, so an object that reads only against a corrupt base's stored bytes can't be dropped
+  without ever being read.
+
+| git.git (hyperfine) | before | after |
+|---|---|---|
+| `diff --staged`, 24 files (median) | 15.9 ms | 12.0 ms (−25%) |
+| `diff --staged` CPU | 50.5 ms | 38.2 ms |
+| `blame README.md` (mean) | 361.9 ms | 284.7 ms (−21%) |
+
+Output is byte-identical, and memory is unchanged.
+
+**Where the benchmark stands** (`bin/benchmark --repo git`, fresh work dir, after this change and
+FORK-118): `diff --staged` 8 ms git / 7 ms forklift (0.88x, down from 1.33x after FORK-183);
+status 0.79x; `diff` unstaged 1.25x. The FORK-183 → now drop folds in FORK-118's lazy index; the
+A/B above is the part that is FORK-188's.
 
 ## FORK-189: splitting the unstaged walk's large directories — measured, not worth doing (2026-10-18)
 
