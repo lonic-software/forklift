@@ -320,14 +320,15 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// * `Err(String)` - If there was an error.
 pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String> {
     // The walk skips the metadata folder by its exact name, but a named path is loaded whatever
-    // the rules say, so refuse it here. The test is the one `stack` uses: a spelling some file
-    // system opens as the metadata folder (`.Forklift`, `.forklift.`) is refused too.
+    // the rules say, so refuse it here. Every spelling some file system opens as the metadata
+    // folder (`.Forklift`, `.forklift.`, `FORKLI~1`) is refused, and so is a name this volume
+    // resolves to it.
     let first_component = path.as_key().split('/').next().unwrap_or("");
 
-    if office_utils::is_metadata_folder_name(first_component) {
+    if office_utils::opens_metadata_folder(first_component)? {
         return Err(format!(
-            "Refusing to load \"{}\": {:?} is the warehouse's metadata folder on some file systems, \
-            and it is never tracked.",
+            "Refusing to load \"{}\": {:?} is, on this or some other file system, the warehouse's \
+            metadata folder, and it is never tracked.",
             path.as_key(), first_component
         ));
     }

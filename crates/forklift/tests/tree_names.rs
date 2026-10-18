@@ -26,6 +26,11 @@ struct Warehouse {
 
 impl Warehouse {
     fn new(name: &str) -> Warehouse {
+        Warehouse::new_after(name, |_| {})
+    }
+
+    /// [`Self::new`], running `before_prepare` on the empty working directory first.
+    fn new_after(name: &str, before_prepare: impl FnOnce(&std::path::Path)) -> Warehouse {
         let base = std::env::temp_dir()
             .join(format!("forklift-tree-names-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
@@ -33,6 +38,7 @@ impl Warehouse {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
+        before_prepare(&root);
 
         let warehouse = Warehouse { base, root, home };
         warehouse.run_ok(&["prepare"]);
@@ -140,7 +146,7 @@ fn assert_refused(warehouse: &Warehouse, escape: &PathBuf, quoted: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!escape.exists(), "the tree wrote outside the working directory: {}", escape.display());
-    assert!(!output.status.success(), "shift accepted the tree; stderr: {}", stderr);
+    assert!(!output.status.success(), "shift accepted the tree with {}; stderr: {}", quoted, stderr);
     assert!(stderr.contains(quoted), "the refusal must name the entry {}; stderr: {}", quoted, stderr);
 }
 
@@ -199,6 +205,130 @@ fn a_root_forklift_entry_in_another_case_is_refused() {
     warehouse.craft_pallet(|blob| vec![subtree(".ForkLift", blob)]);
 
     assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), "\".ForkLift\"");
+}
+
+#[test]
+fn a_root_entry_some_file_system_opens_as_the_metadata_folder_is_refused() {
+    // Each is an ordinary name here, but opens `.forklift` somewhere: a data stream of it and an
+    // 8.3 short name on NTFS (listed or hashed), a name holding a code point HFS+ ignores.
+    for (index, name) in [".forklift::$INDEX_ALLOCATION", ".forklift:x", ".fork\u{200C}lift", "\u{FEFF}.forklift",
+        "FORKLI~1", "forkli~4.", ".ForkLift\u{206F} ", "FOCBB9~1", "focbb9~7", "Focbb~10", "foc~1234"].into_iter().enumerate()
+    {
+        let warehouse = Warehouse::new(&format!("metadata-alias-{}", index));
+        warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
+
+        assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), &format!("{:?}", name));
+    }
+}
+
+#[test]
+fn a_root_entry_that_only_resembles_a_metadata_alias_still_shifts() {
+    // The positive twin: names one step from an alias are ordinary on every file system.
+    for (index, name) in ["forkli~5", "forkli~0", "forkli~12", "FORKLIF~1", "forklift", ".forklifts",
+        ".fork-lift", "x:.forklift", "focbb8~1", "focbb9~0", "focbb9~123", "~1", "f~1", "foc~1",
+        "focbb~1"].into_iter().enumerate()
+    {
+        #[cfg(windows)]
+        if name.contains(':') {
+            continue;
+        }
+
+        let warehouse = Warehouse::new(&format!("metadata-near-alias-{}", index));
+        warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
+
+        warehouse.run_ok(&["shift", "evil"]);
+        assert!(warehouse.root.join(name).join("escaped.txt").exists(), "{:?} was not written", name);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_top_level_name_this_volume_resolves_to_the_metadata_folder_is_not_loaded() {
+    // A bay's `.forklift` is a redirect file, so a hard link can give it a second name. A name
+    // holding a `~` (what every 8.3 short name holds) is judged by the volume, not by its
+    // spelling: loading `meta~1` would track the redirect.
+    let warehouse = Warehouse::new("metadata-identity");
+    let bay = warehouse.base.join("bay");
+    warehouse.run_ok(&["bay", "add", "linked", bay.to_str().unwrap()]);
+    assert!(std::fs::symlink_metadata(bay.join(".forklift")).unwrap().is_file(), "the bay has no redirect file");
+    std::fs::hard_link(bay.join(".forklift"), bay.join("meta~1")).unwrap();
+    std::fs::write(bay.join("other~1"), "ordinary\n").unwrap();
+
+    let run = |args: &[&str]| forklift_command()
+        .args(args)
+        .current_dir(&bay)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
+        .output()
+        .unwrap();
+
+    // A parcel naming the alias is refused up front, by that name, before anything trips over the
+    // entry it opens.
+    warehouse.craft_pallet(|blob| vec![subtree("meta~1", blob)]);
+    let shifted = run(&["shift", "evil"]);
+    let stderr = String::from_utf8_lossy(&shifted.stderr);
+    assert!(!shifted.status.success(), "shift accepted the alias; stderr: {}", stderr);
+    assert!(stderr.contains("\"meta~1\", which is the warehouse's metadata"),
+        "the refusal must name the alias as the metadata folder; stderr: {}", stderr);
+
+    let refused = run(&["load", "meta~1"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "the alias was loaded; stderr: {}", stderr);
+    assert!(stderr.contains("metadata folder"), "the refusal must say why; stderr: {}", stderr);
+
+    let accepted = run(&["load", "other~1"]);
+    assert!(accepted.status.success(), "{}", String::from_utf8_lossy(&accepted.stderr));
+
+    // A whole-directory load walks into the alias, since it skips the metadata folder by its exact
+    // name only; stack, which checks every top-level name, refuses it there.
+    let walked = run(&["load", "."]);
+    assert!(walked.status.success(), "{}", String::from_utf8_lossy(&walked.stderr));
+    let stacked = run(&["stack", "alias"]);
+    let stderr = String::from_utf8_lossy(&stacked.stderr);
+    assert!(!stacked.status.success(), "stack accepted the alias; stderr: {}", stderr);
+    assert!(stderr.contains("\"meta~1\": it is"), "the refusal must name the alias; stderr: {}", stderr);
+}
+
+/// The 8.3 short name NTFS gave `path`'s last component, if it gave one.
+#[cfg(windows)]
+fn short_name(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buffer = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated, and `buffer` is writable for the length passed.
+    let length = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    assert!(length > 0 && length < buffer.len(), "GetShortPathNameW failed for {}", path.display());
+
+    let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+    let name = short.file_name()?.to_string_lossy().into_owned();
+    (name != ".forklift").then_some(name)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_hashed_short_name_of_the_metadata_folder_is_refused() {
+    // Four siblings take `FORKLI~1` to `~4` before `.forklift` exists, so NTFS gives it a hashed
+    // short name. The name rule lists the hash git-style; this pins it to what NTFS really gives.
+    let warehouse = Warehouse::new_after("metadata-short-name", |root| {
+        for index in 1..=4 {
+            std::fs::create_dir(root.join(format!("forklift-sibling-{}", index))).unwrap();
+        }
+    });
+    let Some(short) = short_name(&warehouse.root.join(".forklift")) else {
+        assert!(std::env::var_os("CI").is_none(), "this volume gives no 8.3 short names, so the test proves nothing");
+        return;
+    };
+    assert!(!short.to_lowercase().starts_with("forkli~"), "{:?} is not a hashed short name", short);
+    assert!(forklift_core::util::office_utils::is_metadata_folder_name(&short),
+        "NTFS hashed `.forklift` to {:?}, which the name rule does not list", short);
+
+    let loaded = warehouse.run(&["load", &format!("{}/config", short)]);
+    assert!(!loaded.status.success(), "the alias {:?} was loaded", short);
+
+    warehouse.craft_pallet(|blob| vec![subtree(&short, blob)]);
+    assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), &format!("{:?}", short));
 }
 
 /// Whether the warehouse's file system treats names differently by case.

@@ -162,17 +162,18 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
 
     // A top-level name only this file system tells apart from `.forklift` (`.Forklift` on Linux,
     // `.forklift.` anywhere but Windows) would stack fine and then refuse every checkout on a
-    // file system that does not, so refuse it here, where it can still be unloaded.
-    if let Some(name) = root_tree.get_subtrees().chain(root_tree.get_files())
-        .map(|(name, _)| name)
-        .find(|name| office_utils::is_metadata_folder_name(name))
-    {
-        return Err(format!(
-            "Refusing to stack the top-level entry {:?}: some file systems open it as the \
-            warehouse's metadata folder, so no working directory there could check it out. Rename it, \
-            or unload it and add it to .forkliftignore.",
-            name
-        ));
+    // file system that does not, so refuse it here, where it can still be unloaded. A name this
+    // volume resolves to the metadata folder (which a whole-directory load walks into) would stack
+    // the folder's own content.
+    for (name, _) in root_tree.get_subtrees().chain(root_tree.get_files()) {
+        if office_utils::opens_metadata_folder(name)? {
+            return Err(format!(
+                "Refusing to stack the top-level entry {:?}: it is, on this or some other file \
+                system, the warehouse's metadata folder, so no working directory there could check \
+                it out. Rename it, or unload it and add it to .forkliftignore.",
+                name
+            ));
+        }
     }
 
     // The per-key hashes above come straight from the plain (unspliced) inventory tree build,
