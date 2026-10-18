@@ -184,10 +184,10 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
         }
     }
 
-    // What was decided before a failure is still published — the failure is reported after,
-    // together with the publish's own failure if that failed too. A failed publish may have
-    // recorded some, all or none of the batch's entries, though every file restored before it is
-    // already on disk.
+    // What was decided before a failure is still published, unless the failure was a publish
+    // itself — the failure is reported after, together with the publish's own failure if that
+    // failed too. A failed publish may have recorded some, all or none of the batch's entries,
+    // though every file restored before it is already on disk.
     match (result, batch.publish()) {
         (Err(first), Err(publish)) => return Err(format!("{}\n{}", first, publish)),
         (Err(e), Ok(())) | (Ok(()), Err(e)) => return Err(e),
