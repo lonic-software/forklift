@@ -1001,7 +1001,9 @@ forklift park pop         # re-apply the most recent parked changes (staged) and
 `park` saves your staged and unstaged changes to **tracked** files as a parked
 parcel and resets the warehouse to the pallet head (untracked files are left
 alone). `park pop` re-applies the most recent parked changes as a clean re-apply
-— it must be popped onto the head it was parked on, or it reports a conflict.
+— it must be popped onto the head it was parked on, or it reports a conflict. If
+staging the re-applied changes fails, the parcel stays parked, and the error says that the
+working directory already holds the changes.
 
 `park`'s push durably commits the staged inventory into a parked parcel, exactly
 like `stack` commits into a stacked one — so it refuses under the same
