@@ -118,7 +118,7 @@ const PACK_ROLLOVER_BYTES: u64 = 512 * 1024 * 1024;
 /// Roll a pack over once it holds this many objects, so no single index is unbounded (an
 /// index's size — and the RAM to hold it — scales with object *count*, not their bytes; a
 /// pack full of tiny tree objects would otherwise carry a huge index).
-const PACK_ROLLOVER_OBJECTS: usize = 100_000;
+pub(crate) const PACK_ROLLOVER_OBJECTS: usize = 100_000;
 
 /// The largest native-pack data section a transport bundle may declare. A writer rolls after
 /// crossing `PACK_ROLLOVER_BYTES`, so the record that crosses it may itself be one maximal object.
@@ -847,6 +847,12 @@ mod index_format {
         #[cfg(test)]
         pub(super) fn record_byte_position(&self, position: usize) -> usize {
             self.records_start() + position * INDEX_RECORD_LEN
+        }
+
+        /// The bucket `hash` belongs to, so a test can pick hashes inside or outside one.
+        #[cfg(test)]
+        pub(super) fn bucket_of_hash(&self, hash: &[u8]) -> usize {
+            bucket_of(hash, self.layout.bits)
         }
     }
 
@@ -7022,6 +7028,232 @@ mod tests {
 
         // `store` (the read-only census) must not be wedged either.
         assert!(store_status().is_ok(), "store_status must survive an orphaned pack pair");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Read a pack index file off disk as a [`CheckedIndex`] with no data bound — a test's view of
+    /// where records and buckets sit.
+    fn index_on_disk(index_path: &Path) -> CheckedIndex<Vec<u8>> {
+        let bytes = std::fs::read(index_path).unwrap();
+        let layout = index_format::Layout::parse(&bytes, index_path).expect("the test index must parse");
+        CheckedIndex::new(bytes, layout, None)
+    }
+
+    /// Flip one bit of `hash`'s record offset in the index at `index_path`, which fails its
+    /// bucket's crc and nothing else: the header and fanout table still parse.
+    fn corrupt_record_of(index_path: &Path, hash: &[u8; HASH_LEN]) {
+        let index = index_on_disk(index_path);
+        let position = index.all_records().unwrap().iter().position(|record| record.hash == hash.as_slice())
+            .expect("the hash to corrupt must be in the index");
+        let at = index.record_byte_position(position) + HASH_LEN;
+        let mut bytes = std::fs::read(index_path).unwrap();
+        bytes[at] ^= 0x01;
+        std::fs::write(index_path, &bytes).unwrap();
+    }
+
+    /// Contents for `count` distinct objects, with their raw and hex hashes.
+    fn numbered_objects(tag: &str, count: usize) -> Vec<(Vec<u8>, [u8; HASH_LEN], String)> {
+        (0..count).map(|i| {
+            let content = format!("{} object {}", tag, i).into_bytes();
+            let hash = *blake3::hash(&content).as_bytes();
+            (content, hash, sign_utils::to_hex(&hash))
+        }).collect()
+    }
+
+    /// The variant of a read outcome, for a failure message (the outcome carries object bytes).
+    fn outcome_name(outcome: &crate::util::file_utils::StoreReadOutcome) -> String {
+        use crate::util::file_utils::StoreReadOutcome;
+        match outcome {
+            StoreReadOutcome::Verified(_) => "Verified".to_string(),
+            StoreReadOutcome::Unverifiable(message) => format!("Unverifiable({})", message),
+            StoreReadOutcome::Absent => "Absent".to_string(),
+        }
+    }
+
+    /// Content whose hash falls in `bucket` of `index`.
+    fn content_in_bucket(index: &CheckedIndex<Vec<u8>>, bucket: usize, tag: &str) -> (Vec<u8>, String) {
+        (0..).map(|i| format!("{} candidate {}", tag, i).into_bytes())
+            .find(|content| index.bucket_of_hash(blake3::hash(content).as_bytes()) == bucket)
+            .map(|content| { let hash = blake3::hash(&content).to_hex().to_string(); (content, hash) })
+            .unwrap()
+    }
+
+    /// (FORK-118) A corrupt index bucket costs exactly its own prefix. Every hash that falls in
+    /// it — the corrupted record's and its sound neighbours' alike — reads `Unverifiable` naming
+    /// the index and the bucket, is not reported present, and cannot be listed by prefix; a hash
+    /// in any other bucket of the same pack reads `Verified`. Storing an object into that prefix
+    /// afterwards, the corrupted one itself or one the pack never held, reads it back `Verified`:
+    /// the store's own write path is not blocked by the bad bucket.
+    ///
+    /// Mutations: make `CheckedIndex::locate` skip `bucket_is_valid` → the corrupted record's
+    /// offset is off by one, so its read fails as a decode error rather than naming the bucket,
+    /// and the neighbour reads `Verified` (the "bucket" assertions go red). Make `retrieve_from`
+    /// treat `CorruptBucket` as `Missing` → the hashes classify `Absent` (red).
+    #[test]
+    fn a_corrupt_index_bucket_makes_only_its_prefix_unverifiable_and_a_new_store_there_reads_back() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = std::env::temp_dir().join(format!("forklift-corrupt-bucket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        // 200 objects: eight buckets of about 25 records each.
+        let objects = numbered_objects("bucket", 200);
+        let mut builder = TransportPackBuilder::new(&folder).unwrap();
+        for (content, _, hex) in &objects {
+            builder.append_full(hex, content).unwrap();
+        }
+        let artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "test fixture expects exactly one pack pair");
+        let index_path = artifacts[0].index_path.clone();
+        let index_name = index_path.file_name().unwrap().to_str().unwrap().to_string();
+
+        let index = index_on_disk(&index_path);
+        let (bad_content, bad_hash, bad_hex) = objects[0].clone();
+        let bad_bucket = index.bucket_of_hash(&bad_hash);
+        let neighbour = objects.iter().skip(1).find(|(_, hash, _)| index.bucket_of_hash(hash) == bad_bucket)
+            .expect("the fixture must put a second object in the corrupted bucket");
+        let elsewhere = objects.iter().find(|(_, hash, _)| index.bucket_of_hash(hash) != bad_bucket)
+            .expect("the fixture must put an object outside the corrupted bucket");
+
+        corrupt_record_of(&index_path, &bad_hash);
+        invalidate_cache();
+
+        for hex in [&bad_hex, &neighbour.2] {
+            match file_utils::read_object_classified(hex).unwrap() {
+                StoreReadOutcome::Unverifiable(message) => assert!(
+                    message.contains(&index_name) && message.contains(&format!("bucket {}", bad_bucket)),
+                    "the message must name the index and the bucket: {}", message
+                ),
+                StoreReadOutcome::Verified(_) => panic!("a hash in a corrupt bucket must not read Verified"),
+                StoreReadOutcome::Absent => panic!("a hash in a corrupt bucket must not read Absent"),
+            }
+            assert!(!is_in_packs(hex).unwrap(), "a hash in a corrupt bucket must not be reported present");
+        }
+
+        match file_utils::read_object_classified(&elsewhere.2).unwrap() {
+            StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, elsewhere.0),
+            other => panic!("a hash outside the corrupt bucket must read Verified, got {}", outcome_name(&other)),
+        }
+
+        let error = find_hashes_with_prefix(&bad_hex[..8]).expect_err("a corrupt bucket's prefix cannot be listed");
+        assert!(error.contains(&format!("bucket {}", bad_bucket)), "{}", error);
+        assert!(find_hashes_with_prefix(&elsewhere.2[..8]).unwrap().contains(&elsewhere.2));
+
+        // Store the corrupted object again, and one the pack never held, into the bad prefix.
+        let (new_content, new_hex) = content_in_bucket(&index, bad_bucket, "never packed");
+        assert!(object_utils::store_object_bytes(&bad_hex, &bad_content).unwrap(),
+            "a hash only a corrupt bucket names is not present, so storing it must write it");
+        assert!(object_utils::store_object_bytes(&new_hex, &new_content).unwrap());
+        for (hex, content) in [(&bad_hex, &bad_content), (&new_hex, &new_content)] {
+            match file_utils::read_object_classified(hex).unwrap() {
+                StoreReadOutcome::Verified(bytes) => assert_eq!(&bytes, content),
+                other => panic!("an object stored into a corrupt bucket's prefix must read back Verified, got {}", outcome_name(&other)),
+            }
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-118) A quarantined index (its data file gone) with a corrupt bucket: a hash in that
+    /// bucket reads `Unverifiable` even when the index never held it, because the bucket cannot
+    /// rule it out; a never-stored hash in a sound bucket still reads `Absent`, and a stored one
+    /// there `Unverifiable`.
+    ///
+    /// Mutation: make `QuarantinedPack::contains` treat `CorruptBucket` as `Missing` → the
+    /// never-stored hash in the corrupt bucket classifies `Absent` (red).
+    #[test]
+    fn a_quarantined_index_with_a_corrupt_bucket_cannot_rule_out_any_hash_in_it() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = std::env::temp_dir().join(format!("forklift-quarantine-bucket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        let objects = numbered_objects("quarantine", 200);
+        let mut builder = TransportPackBuilder::new(&folder).unwrap();
+        for (content, _, hex) in &objects {
+            builder.append_full(hex, content).unwrap();
+        }
+        let artifacts = builder.finish().unwrap();
+        let index_path = artifacts[0].index_path.clone();
+        std::fs::remove_file(&artifacts[0].data_path).unwrap();
+
+        let index = index_on_disk(&index_path);
+        let bad_bucket = index.bucket_of_hash(&objects[0].1);
+        let sound = objects.iter().find(|(_, hash, _)| index.bucket_of_hash(hash) != bad_bucket).unwrap();
+        let sound_bucket = index.bucket_of_hash(&sound.1);
+        corrupt_record_of(&index_path, &objects[0].1);
+        invalidate_cache();
+
+        let (_, unknown_in_bad) = content_in_bucket(&index, bad_bucket, "unknown bad");
+        let (_, unknown_in_sound) = content_in_bucket(&index, sound_bucket, "unknown sound");
+
+        for hex in [&objects[0].2, &unknown_in_bad, &sound.2] {
+            assert!(matches!(file_utils::read_object_classified(hex).unwrap(), StoreReadOutcome::Unverifiable(_)),
+                "{} must read Unverifiable: the quarantined index names it or cannot rule it out", hex);
+        }
+        assert!(matches!(file_utils::read_object_classified(&unknown_in_sound).unwrap(), StoreReadOutcome::Absent),
+            "a never-stored hash in a sound bucket must still read Absent");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-118) A full repack validates each pack in full before copying from it. A pack whose
+    /// index fails is reported, neither copied from nor deleted, and the objects its sound buckets
+    /// hold stay readable; the other packs are repacked as usual.
+    ///
+    /// Mutation: drop the `pack.records()` check in `collect_targets` (walk the records without
+    /// validating) → the corrupt pack is deleted with the rest and `unvalidated_packs` is empty
+    /// (red).
+    #[test]
+    fn a_full_repack_leaves_a_pack_whose_index_fails_validation_in_place() {
+        use crate::util::file_utils::StoreReadOutcome;
+
+        let temp = std::env::temp_dir().join(format!("forklift-repack-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let folder = pack_folder();
+
+        let mut pairs = Vec::new();
+        let mut objects = Vec::new();
+        for tag in ["repack sound", "repack corrupt"] {
+            let batch = numbered_objects(tag, 200);
+            let mut builder = TransportPackBuilder::new(&folder).unwrap();
+            for (content, _, hex) in &batch {
+                builder.append_full(hex, content).unwrap();
+            }
+            pairs.push(builder.finish().unwrap().remove(0));
+            objects.push(batch);
+        }
+        let (sound_pair, corrupt_pair) = (&pairs[0], &pairs[1]);
+
+        let index = index_on_disk(&corrupt_pair.index_path);
+        let bad_bucket = index.bucket_of_hash(&objects[1][0].1);
+        let survivor = objects[1].iter().find(|(_, hash, _)| index.bucket_of_hash(hash) != bad_bucket).unwrap();
+        corrupt_record_of(&corrupt_pair.index_path, &objects[1][0].1);
+        invalidate_cache();
+
+        let stats = compact(true, false, &Progress::NONE).unwrap();
+
+        assert_eq!(stats.unvalidated_packs.len(), 1, "{:?}", stats.unvalidated_packs);
+        let index_name = corrupt_pair.index_path.file_name().unwrap().to_str().unwrap();
+        assert!(stats.unvalidated_packs[0].contains(index_name), "{:?}", stats.unvalidated_packs);
+        assert!(corrupt_pair.index_path.exists() && corrupt_pair.data_path.exists(),
+            "a pack whose index failed validation must not be deleted");
+        // Nothing is reachable in this fixture, so the sound pack is dropped as garbage — the
+        // repack ran for it as usual.
+        assert!(!sound_pair.index_path.exists(), "the sound pack must be repacked as usual");
+        match file_utils::read_object_classified(&survivor.2).unwrap() {
+            StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, survivor.0),
+            other => panic!("an object in a sound bucket of the kept pack must stay readable, got {}", outcome_name(&other)),
+        }
 
         std::fs::remove_dir_all(&temp).ok();
     }
