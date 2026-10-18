@@ -969,7 +969,7 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
 
 /// One shard a [`ShardMutationBatch`] has touched: the bytes it read on first touch (`None` when
 /// the shard did not exist yet), the effective content those bytes parsed to, the in-memory copy
-/// every later change applies to, and the timestamp it will be published at.
+/// every change applies to, and the timestamp it will be published at — that of its last change.
 struct TouchedShard {
     original_bytes: Option<Vec<u8>>,
     original_content: Option<EffectiveContent>,
@@ -999,15 +999,17 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 /// [`ShardOutcome::Carry`] otherwise — so a pure stat refresh, such as `restore` writing a file
 /// back to the blob it already has staged, keeps every rollup above it.
 ///
-/// Each shard is published at the moment of its first touch, captured before it is read: never
-/// later than the moment one [`update_shard`] per change would have published it, so
+/// Each shard is published at the moment its last [`update`](Self::update) ran: never later than
+/// the moment that change's own [`update_shard`] would have written the shard, so
 /// `is_entry_unchanged`'s `mtime < shard_mtime` trust covers no entry the per-change funnel would
-/// not have covered — see [`save_inventory_deferred_with_mtime`]. That holds only while a caller
-/// keeps the order it had with `update_shard`: stat a file right after writing it, then
-/// `update`. Writing many files first and statting them later would record an edit made in
-/// between against the hash the caller wrote, and trust it. The anchor is read from the process
-/// clock, as `load`'s walk and `refresh_tracked_entries` read theirs, where `update_shard`'s
-/// shard gets its mtime from the file system; "never later" assumes the two clocks agree.
+/// not have covered — see [`save_inventory_deferred_with_mtime`] — and, like that funnel, it
+/// covers a file restored early in the batch once a later change of the same shard is recorded.
+/// That holds only while a caller keeps the order it had with `update_shard`: stat a file right
+/// after writing it, then `update`. Writing many files first and statting them later would record
+/// an edit made in between against the hash the caller wrote, and trust it. The anchor is read
+/// from the process clock, as `load`'s walk and `refresh_tracked_entries` read theirs, where
+/// `update_shard`'s shard gets its mtime from the file system; "never later" assumes the two
+/// clocks agree.
 ///
 /// Every blob a change makes an entry name must already be durable before `publish`, as
 /// [`publish_shard_outcomes`] requires.
@@ -1021,7 +1023,8 @@ impl ShardMutationBatch {
     }
 
     /// Apply `change` to the shard at `key`, reading it first if this batch has not touched it
-    /// yet. A `change` that fails leaves the shard as it was before this call.
+    /// yet, and move the shard's publish timestamp to now. `change` cannot fail: anything that
+    /// can, such as statting the file it records, belongs before this call.
     ///
     /// # Arguments
     /// * `key`    - The warehouse path key of the shard.
@@ -1029,13 +1032,14 @@ impl ShardMutationBatch {
     ///
     /// # Returns
     /// * `Ok(())`      - If the change was applied in memory.
-    /// * `Err(String)` - If the shard could not be read or parsed, or `change` failed.
+    /// * `Err(String)` - If the shard could not be read or parsed.
     pub fn update(&mut self,
                   key: &str,
-                  change: impl FnOnce(&mut Inventory) -> Result<(), String>) -> Result<(), String> {
+                  change: impl FnOnce(&mut Inventory)) -> Result<(), String> {
+        // After the caller statted what `change` records — see the type's doc comment.
+        let verified_at = std::time::SystemTime::now();
+
         if !self.shards.contains_key(key) {
-            // Before the read, and before anything `change` stats — see the type's doc comment.
-            let verified_at = std::time::SystemTime::now();
             let (_, original_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
             let inventory = match &original_bytes {
@@ -1050,11 +1054,9 @@ impl ShardMutationBatch {
         }
 
         let shard = self.shards.get_mut(key).unwrap();
-        let mut candidate = shard.inventory.clone();
 
-        change(&mut candidate)?;
-
-        shard.inventory = candidate;
+        change(&mut shard.inventory);
+        shard.verified_at = verified_at;
 
         Ok(())
     }
@@ -1086,8 +1088,8 @@ impl ShardMutationBatch {
 
             if current_bytes != shard.original_bytes {
                 return Err(format!(
-                    "The inventory of folder \"{}\" changed while it was being updated; nothing was \
-                    written. Run the command again.",
+                    "The inventory of folder \"{}\" changed while it was being updated, so none of \
+                    this command's inventory changes were recorded. Run the command again.",
                     load_guard_utils::display_path(&key)
                 ));
             }
@@ -3091,7 +3093,6 @@ mod tests {
         let mut batch = ShardMutationBatch::new();
         batch.update("a/b", |inventory| {
             inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
-            Ok(())
         }).unwrap();
         batch.publish().unwrap();
 
@@ -3113,7 +3114,6 @@ mod tests {
         let mut batch = ShardMutationBatch::new();
         batch.update("a/b", |inventory| {
             inventory.add_item(item("file.txt", 1, InventoryItemState::FirstParentConflict));
-            Ok(())
         }).unwrap();
         batch.publish().unwrap();
 
@@ -3131,7 +3131,6 @@ mod tests {
         let mut batch = ShardMutationBatch::new();
         batch.update("a/b/new", |inventory| {
             inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
-            Ok(())
         }).unwrap();
         batch.publish().unwrap();
 
@@ -3147,11 +3146,9 @@ mod tests {
         let mut batch = ShardMutationBatch::new();
         batch.update("x", |inventory| {
             inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
-            Ok(())
         }).unwrap();
         batch.update("a/b", |inventory| {
             inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
-            Ok(())
         }).unwrap();
 
         // Someone else rewrites a touched shard before the batch publishes.
@@ -3172,22 +3169,28 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_batch_change_leaves_the_shard_as_it_was() {
-        let _scratch = Scratch::new("batch-failed-change");
+    fn a_batch_publishes_each_shard_at_its_last_change_not_its_first() {
+        let _scratch = Scratch::new("batch-anchor");
         stamped_chain_with_sibling();
 
         let mut batch = ShardMutationBatch::new();
-        let error = batch.update("a/b", |inventory| {
-            inventory.add_item(item("half.txt", 3, InventoryItemState::Normal));
-            Err("stat failed".to_string())
-        }).unwrap_err();
-        assert_eq!(error, "stat failed");
+        batch.update("a/b", |inventory| {
+            inventory.add_item(item("first.txt", 1, InventoryItemState::Normal));
+        }).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let between = std::time::SystemTime::now();
+
+        batch.update("a/b", |inventory| {
+            inventory.add_item(item("second.txt", 2, InventoryItemState::Normal));
+        }).unwrap();
         batch.publish().unwrap();
 
-        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key("a/b").unwrap();
-        let shard = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
-        assert!(shard.get_item_by_name("half.txt").is_none(), "a failed change must not be published");
-        assert_eq!(read_rollup("a").as_deref(), Some("rollup"), "a failed change must clear nothing");
+        let published_mtime = file_utils::get_symlink_metadata_for_path(
+            &file_utils::get_inventory_data_path_for_key("a/b")).unwrap().modified().unwrap();
+        assert!(published_mtime >= between,
+            "a file restored before the shard's last change must be trusted as it is with one \
+            update_shard per change: got {:?}, expected no earlier than {:?}", published_mtime, between);
     }
 
     #[test]

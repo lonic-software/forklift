@@ -8,7 +8,6 @@ use crate::enums::dir_entry_type::DirEntryType;
 /// The inventory contains the full list of objects that have been taken into inventory
 /// (using the `load` command). Changes that have not been loaded yet are not reflected in
 /// the inventory.
-#[derive(Clone)]
 pub struct Inventory {
     items_by_name: BTreeMap<String, Arc<InventoryItem>>,
 

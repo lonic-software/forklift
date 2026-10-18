@@ -478,6 +478,16 @@ fn restore_dot_preserves_every_rollup_and_a_later_stocktake_still_skips() {
         assert!(rollup.is_some(), "\"{key}\" must be stamped after the base stack");
     }
 
+    let stocktake_skips = || {
+        let mut command = warehouse.command(&["stocktake"]);
+        command.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        skip_count(&output)
+    };
+    let skips_before = stocktake_skips();
+    assert!(skips_before >= 1, "a clean stocktake must skip something for this test to pin anything");
+
     warehouse.write_file("a/b/c/file.txt", "deep edited\n");
     warehouse.write_file("sibling/file.txt", "sibling edited\n");
     warehouse.run_ok(&["restore", "."]);
@@ -489,11 +499,8 @@ fn restore_dot_preserves_every_rollup_and_a_later_stocktake_still_skips() {
         assert_eq!(&shard_rollup(&warehouse, key), rollup, "restore must keep the rollup of \"{key}\"");
     }
 
-    let mut command = warehouse.command(&["stocktake"]);
-    command.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
-    let output = command.output().unwrap();
-    assert!(output.status.success());
-    assert!(skip_count(&output) >= 1, "a stocktake after restore must still skip the restored subtrees");
+    assert_eq!(stocktake_skips(), skips_before,
+        "a stocktake after restore must skip exactly what it skipped before the edits");
 }
 
 #[test]

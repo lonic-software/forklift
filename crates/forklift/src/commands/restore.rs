@@ -169,10 +169,7 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
             // later would record an editor's save in between against the staged hash.
             let refreshed = write_restored_file(shard_key, name, &item.hash, item.item_type)
                 .and_then(|()| refreshed_item(shard_key, name, &item.hash, item.item_type))
-                .and_then(|refreshed| batch.update(shard_key, |shard| {
-                    shard.add_item(refreshed);
-                    Ok(())
-                }));
+                .and_then(|refreshed| batch.update(shard_key, |shard| shard.add_item(refreshed)));
 
             if let Err(e) = refreshed {
                 result = Err(e);
@@ -189,7 +186,8 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 
     // What was decided before a failure is still published, as one `update_shard` per file
     // would already have published it — the failure is reported after, together with the
-    // publish's own failure if that failed too (which means none of it was staged).
+    // publish's own failure if that failed too. A failed publish records none of the batch's
+    // entries, though every file restored before it is already on disk.
     match (result, batch.publish()) {
         (Err(first), Err(publish)) => return Err(format!("{}\n{}", first, publish)),
         (Err(e), Ok(())) | (Ok(()), Err(e)) => return Err(e),
