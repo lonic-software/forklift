@@ -48,8 +48,30 @@ fn identity(path: &Path) -> Option<Identity> {
 
 /// Whether `first` and `second` resolve, without following a symlink, to one entry on disk. A path
 /// that does not resolve is the same entry as nothing.
-pub fn same_entry(first: &Path, second: &Path) -> bool {
-    identity(first).is_some_and(|identity_of_first| identity(second) == Some(identity_of_first))
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether the two are one entry.
+/// * `Err(String)` - If a path resolves but cannot be identified: never answered with a guess.
+pub fn same_entry(first: &Path, second: &Path) -> Result<bool, String> {
+    let Some(identity_of_first) = resolved_identity(first)? else {
+        return Ok(false);
+    };
+
+    Ok(resolved_identity(second)? == Some(identity_of_first))
+}
+
+/// [`identity`], telling a path that does not resolve (`None`) from an entry that cannot be
+/// identified (an error).
+fn resolved_identity(path: &Path) -> Result<Option<Identity>, String> {
+    use std::io::ErrorKind;
+
+    match std::fs::symlink_metadata(path) {
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(None),
+        Err(error) => Err(format!("Could not read {:?} to identify it: {}", path, error)),
+        Ok(_) => identity(path)
+            .map(Some)
+            .ok_or_else(|| format!("Could not identify {:?} on its volume.", path)),
+    }
 }
 
 /// The candidate key two names must share before a probe is spent on them: a full case fold
@@ -503,4 +525,35 @@ pub fn refuse_collisions(operation: &str, collisions: &[Collision]) -> Result<()
     }
 
     Err(parts.join("\n"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_entry_that_cannot_be_read_is_an_error_not_a_different_entry() {
+        let root = std::env::temp_dir().join(format!("forklift-same-entry-{}", std::process::id()));
+        let sealed = root.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(root.join("file"), "content\n").unwrap();
+
+        assert!(same_entry(&root.join("file"), &root.join("file")).unwrap());
+        assert!(!same_entry(&root.join("absent"), &root.join("file")).unwrap(), "nothing is no entry");
+        assert!(!same_entry(&root.join("file").join("below"), &root.join("file")).unwrap(),
+            "a path under a file resolves to nothing");
+
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let sealed_read = std::fs::symlink_metadata(sealed.join("inside"));
+        let verdict = same_entry(&sealed.join("inside"), &root.join("file"));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Root reads through a sealed directory, so there is nothing to refuse.
+        if !matches!(sealed_read, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied) {
+            return;
+        }
+        assert!(verdict.is_err(), "an unreadable entry was answered with a guess: {:?}", verdict);
+    }
 }

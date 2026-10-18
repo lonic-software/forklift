@@ -463,10 +463,12 @@ pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
 ///   stream of the folder itself (`.forklift::$INDEX_ALLOCATION`);
 /// * HFS+ skips the code points [`is_hfs_ignorable`] lists, wherever they sit (`.fork\u{200C}lift`);
 /// * NTFS gives the folder an 8.3 short name, `FORKLI~1` (`~2` to `~4` when siblings share the
-///   prefix).
+///   prefix). Past `~4` it hashes the long name instead, into [`HASHED_SHORT_NAME_PREFIX`] and an
+///   ordinal (`FOCBB9~1`), or a shorter cut of that prefix, matched as git's `is_ntfs_dot_generic`
+///   matches `gi7eba~1` for `.gitmodules`.
 ///
-/// Past `~4`, NTFS derives the short name from an undocumented hash, so no name rule can list it;
-/// [`opens_metadata_folder`] asks the volume for a path in the working directory itself.
+/// The hash is undocumented, so [`opens_metadata_folder`] also asks the volume about a path in the
+/// working directory itself.
 pub fn is_metadata_folder_name(name: &str) -> bool {
     let name = name.split(':').next().unwrap_or(name);
     let name: String = name.chars().filter(|c| !is_hfs_ignorable(*c)).collect();
@@ -474,6 +476,26 @@ pub fn is_metadata_folder_name(name: &str) -> bool {
 
     name == TREE_NAME_FORKLIFT
         || name.strip_prefix("forkli~").is_some_and(|ordinal| matches!(ordinal, "1" | "2" | "3" | "4"))
+        || is_hashed_short_name(&name)
+}
+
+/// The six characters NTFS hashes `.forklift` to when it cannot give it `FORKLI~1` to `~4`, as a
+/// Windows volume reported it (`FOCBB9~1`), lowercased.
+const HASHED_SHORT_NAME_PREFIX: &str = "focbb9";
+
+/// Whether the lowercased `name` is a hashed 8.3 short name of `.forklift`: a cut of
+/// [`HASHED_SHORT_NAME_PREFIX`], a `~`, then an ordinal not starting with `0`, eight characters at
+/// most.
+fn is_hashed_short_name(name: &str) -> bool {
+    let Some((prefix, ordinal)) = name.split_once('~') else {
+        return false;
+    };
+
+    name.len() <= 8
+        && !prefix.is_empty()
+        && HASHED_SHORT_NAME_PREFIX.starts_with(prefix)
+        && ordinal.starts_with(|c: char| ('1'..='9').contains(&c))
+        && ordinal.chars().all(|c| c.is_ascii_digit())
 }
 
 /// The code points HFS+ ignores in a file name, so `.fork\u{200C}lift` opens `.forklift` there: the
@@ -485,13 +507,27 @@ fn is_hfs_ignorable(c: char) -> bool {
 /// Whether the top-level working-directory name `name` opens the warehouse's metadata folder here:
 /// by [`is_metadata_folder_name`], or, for a name holding a `~` (the mark of every 8.3 short name,
 /// hashed ones included), because it resolves to the same entry as `.forklift` on this volume.
-/// Relative to the current directory, which is the working directory's root.
-pub fn opens_metadata_folder(name: &str) -> bool {
-    use std::path::Path;
-    use crate::globals::FOLDER_NAME_FORKLIFT_ROOT;
+///
+/// Every check of a top-level name that ends in the working directory (load, stack, every
+/// materializer) asks this one, so they agree on which names are the metadata folder.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether `name` opens the metadata folder.
+/// * `Err(String)` - If the volume could not say: an entry that cannot be identified is never
+///                   taken for a different one.
+pub fn opens_metadata_folder(name: &str) -> Result<bool, String> {
+    use crate::globals::{warehouse_root, FOLDER_NAME_FORKLIFT_ROOT};
 
-    is_metadata_folder_name(name)
-        || (name.contains('~') && alias_utils::same_entry(Path::new(name), Path::new(FOLDER_NAME_FORKLIFT_ROOT)))
+    if is_metadata_folder_name(name) {
+        return Ok(true);
+    }
+    if !name.contains('~') {
+        return Ok(false);
+    }
+
+    let root = warehouse_root();
+
+    alias_utils::same_entry(&root.join(name), &root.join(FOLDER_NAME_FORKLIFT_ROOT))
 }
 
 /// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with
@@ -507,7 +543,12 @@ pub fn opens_metadata_folder(name: &str) -> bool {
 pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
     let found = root.get_subtrees().chain(root.get_files())
         .map(|(name, _)| name)
-        .find(|name| opens_metadata_folder(name));
+        .find_map(|name| match opens_metadata_folder(name) {
+            Ok(true) => Some(Ok(name)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .transpose()?;
 
     match found {
         Some(name) => Err(format!(

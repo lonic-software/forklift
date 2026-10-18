@@ -616,7 +616,7 @@ fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: Dir
 pub fn check_working_path(path: &str) -> Result<(), String> {
     let components: Vec<&str> = path.split('/').collect();
 
-    if components.first().is_some_and(|first| office_utils::opens_metadata_folder(first)) {
+    if office_utils::opens_metadata_folder(components[0])? {
         return Err(format!(
             "Refusing to touch {:?}: it is inside the warehouse's metadata folder.", path
         ));
@@ -655,11 +655,11 @@ pub fn check_working_path(path: &str) -> Result<(), String> {
 
 /// Why Windows would not take `name` as one plain file name, if it would not: a `\` (a path
 /// separator there), a `:` (a drive prefix or an alternate data stream), a trailing dot or space
-/// (dropped, so `.. ` opens `..`), or a reserved device name (`CON`, `NUL`, `COM1`, `COM¹`, …
-/// with or without an extension). Compiled everywhere so it is tested everywhere; enforced on
+/// (dropped, so `.. ` opens `..`), or a reserved device name (`CON`, `CONIN$`, `NUL`, `COM1`,
+/// `COM¹`, … with or without an extension, as git's `is_valid_win32_path` lists them). Compiled everywhere so it is tested everywhere; enforced on
 /// Windows.
 pub fn windows_component_problem(name: &str) -> Option<&'static str> {
-    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    const RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 
     if name.contains('\\') {
         return Some("contains a backslash, a path separator on Windows");
@@ -1048,7 +1048,8 @@ mod tests {
     #[test]
     fn windows_refuses_names_that_are_not_one_plain_file_name() {
         for name in ["a\\b", "C:", "file.txt:stream", "trailing.", "trailing ", "..  ", "CON", "con.txt",
-            "Nul", "aux.tar.gz", "COM1", "lpt9.log", "PRN ", "COM\u{B9}", "lpt\u{B2}.txt", "Com\u{B3}"] {
+            "Nul", "aux.tar.gz", "COM1", "lpt9.log", "PRN ", "COM\u{B9}", "lpt\u{B2}.txt", "Com\u{B3}",
+            "CONIN$", "conout$.txt"] {
             assert!(windows_component_problem(name).is_some(), "{:?} must be refused", name);
         }
     }
@@ -1056,7 +1057,8 @@ mod tests {
     #[test]
     fn windows_accepts_names_that_only_resemble_reserved_ones() {
         for name in ["CONSOLE", "con_", "COM0", "COM10", "LPT", "auxiliary.txt", ".con", "a.CON", "café",
-            "...a", "file.txt", "abé.txt", "a€", "€", "COM\u{2074}", "LPT\u{B9}0", "CO\u{B9}", "COM\u{2070}"] {
+            "...a", "file.txt", "abé.txt", "a€", "€", "COM\u{2074}", "LPT\u{B9}0", "CO\u{B9}", "COM\u{2070}",
+            "CONIN", "conout$x", "CONERR$"] {
             assert_eq!(windows_component_problem(name), None, "{:?} must be accepted", name);
         }
     }

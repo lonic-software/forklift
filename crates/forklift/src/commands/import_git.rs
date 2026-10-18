@@ -920,7 +920,8 @@ fn parse_identity(text: &str) -> Result<(Operator, i64), String> {
 }
 
 /// Refuse `name` as a top-level entry of the root tree `git_hash` if some file system opens it as
-/// `.forklift`, as `stack` does: a parcel carrying it could never be checked out there.
+/// `.forklift`: a parcel carrying it could never be checked out there. The name rule alone, unlike
+/// `stack`, because the tree is git's and no entry of it is on this volume.
 fn refuse_metadata_alias(git_hash: &str, name: &str) -> Result<(), String> {
     if office_utils::is_metadata_folder_name(name) {
         return Err(format!(
