@@ -29,7 +29,7 @@ contention.** Two things decide almost every row:
 | **tree build (stack)** | hot | build+store tree, per dir | bottom-up join (parent waits on children) | `built`/`pending` mutexes | **Already** (`TaskExecutor`) | — |
 | **fetch / franchise / lift / lower** | occasional | GET+store object, per object | parallel within a wave, barrier between waves | `Semaphore(24)`; wave ordering; lift's serial negotiate + signature-upload loop | **Already** (network `JoinSet`) | — |
 | **audit** | occasional | sig read + ed25519 verify, per parcel | office chain sequential; **pallet history independent** | phase-2 per-parcel object reads (loose `.sig` sidecars, parcel bodies) share the object caches — the read ceiling, not the ed25519 CPU | **Done — ~2.4×** (18 cores; read-bound, so sub-linear) | — |
-| **checkout / materialize** (`shift`, `lower`, `restore`, `franchise`, `park`, `bay`) | hot–occasional | `load_blob` + `fs::write`, per changed file | independent per file at forklift's level | **the filesystem serializes the writes** — concurrent create/write/`chmod` of many small files contend on APFS inode/dirent metadata locks | **Tried, reverted — net loss** (~0.87×: 341→391 ms for 8000 files on 18 cores) | — |
+| **checkout / materialize** (`shift`, `lower`, `restore`, `franchise`, `park`, `bay`) | hot–occasional | `load_blob` + `fs::write`, per changed file | independent per file at forklift's level | **the filesystem serializes the writes** — concurrent create/write/`chmod` of many small files contend on APFS inode/dirent metadata locks | **Reads done — 2.4×; parallel writes tried, reverted** (writes: ~0.87×, 341→391 ms for 8000 files). The blob loads now run on workers ahead of the serial, in-order writes (`prefetch_in_order`): full-tree `shift` on git.git 1.20 s → 0.50 s | — |
 | **diff** (cross-revision) | occasional | histogram diff, per changed file | **independent per file** | output must be path-ordered (collect-then-print); blob reads hit the read-cache | **Done — 1.4–5.7×** (18 cores; scales with per-file diff size — compute-bound at the high end) | — |
 | **consolidate / merge** | occasional | 3-way LCS, per *divergent* file | **independent per file** | walk records deferred jobs; end-to-end diluted by the sequential apply-writes + stack | **Done — 6.4× merge / 2.5× end-to-end** (18 cores; compute-bound; only wide merges) | — |
 | **compact** | occasional (auto) | zstd delta-compress, per object | path-deltas independent; window + `PackWriter` sequential | the sliding delta `window` (each object deltas against just-packed neighbours) and the single-file append stay serial | **Done — ~2.1×** (18 cores; **byte-identical output**; read-cache-bound below the CPU ceiling) | — |
@@ -82,6 +82,18 @@ contention.** Two things decide almost every row:
    evidence.) The lesson mirrors `blame`: "embarrassingly parallel" at forklift's level says
    nothing about the shared resource one layer down.
 
+   **The reads were the other half, and they do parallelize (FORK-163).** The revert parallelized
+   load *and* write together, so the filesystem wall hid what the loads cost. On a delta-packed
+   warehouse, reconstructing a blob from its delta chain is real CPU, and the serial loop paid it
+   between writes. `shift_utils::apply_ops_each` (every materializer: `shift`, `park`, `lower`,
+   `franchise`, consolidate's fast-forward) and `consolidate::apply_merge_actions` now load
+   through `fanout_utils::prefetch_in_order`: workers load blobs in a bounded window ahead of a
+   single consumer, which writes them **serially and in input order**, exactly as before. Output,
+   error precedence and the first-failure stop are unchanged; the window (256 items) and a byte
+   budget (64 MiB held) bound memory, and chunked entries still stream. Measured on git.git: a
+   full-tree `shift` 1.20 s → 0.50 s (2.4×), an 83-file `shift` 183 → 151 ms (−18%); peak memory
+   +9%. `restore`'s directory loop still loads serially (FORK-181 rewrites it).
+
 3. **`diff` — done, 1.4–5.7× on 18 cores (`diff_pallets`).** A cross-revision diff is one
    independent unit per changed file: load the two blobs, run the histogram diff, format the block.
    `diff_pallets` now fans those out through the canonical fan-out helper (`fanout_utils::fanout_map`,
@@ -93,9 +105,8 @@ contention.** Two things decide almost every row:
    a quarter changed** (the histogram diff dominates → compute-bound, dodges both the FS wall and
    largely the read ceiling), but only **1.4× on 8000 files with a two-line diff each** (little CPU
    per file → back to the read/print floor). Never a regression, unlike `materialize` — because
-   the work being parallelized is CPU, not filesystem metadata. (The `worktree`/`staged` diff modes
-   were left sequential: they compare against the working tree/inventory and are almost always a
-   handful of files.)
+   the work being parallelized is CPU, not filesystem metadata. The `worktree`/`staged` diff modes
+   fan out the same way since FORK-183.
 
 4. **`consolidate` — done, 6.4× on the merge / 2.5× end-to-end (`compute_merge_actions`).** Same
    shape as `diff`: a file both sides changed since the base is one independent 3-way line merge.
@@ -322,7 +333,7 @@ and recurses a *tree*, where a parent directory's result waits on its children e
 finishing first. `fanout_map` is sync (`std::thread::scope`) and flat — the whole item list is known
 up front and every item is independent of every other. Neither replaces the other; see the doc
 comment on `fanout_map` for the full "when not to use it" list (filesystem-metadata-bound writes —
-the reverted `materialize` lesson above — and sequential-chain operations like compact's delta
+the reverted `materialize` lesson above, whose *reads* go through `prefetch_in_order` instead — and sequential-chain operations like compact's delta
 window or blame's first-parent walk).
 
 ## The cross-cutting lever — the object caches now hold their locks pointer-only (shipped)

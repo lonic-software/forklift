@@ -201,9 +201,8 @@ isn't sampled on macOS, so wall-clock attribution also came from `hyperfine` A/B
 | Residual pack-set open: index reads (~24 MB `read_to_end`) plus the linear validation pass (~0.7 ms) | ~4.4 ms per process wherever it can't overlap (e.g. `diff --staged`, whose first act is reading the head parcel) | **Commented on FORK-118** (lazy or sealed index). | ~3–4 ms on every command that reads an object first |
 | Line interning hasher (`diff::lines`, SipHash) | ~0.2–0.6 ms per 20 files | Not worth a ticket alone. It now runs fanned out, so the wall-clock share is smaller still. | < 0.3 ms |
 
-**FORK-163.** This PR covers that ticket's `diff` sites. The rest of its sweep (other
-commands' serial loads; reading a stat-clean worktree file instead of decompressing the stored
-object) stays open there.
+**FORK-163.** This change covered that ticket's `diff` sites. Its materialize half is the
+FORK-163 section below, and the rest is FORK-192.
 
 **Found on the way:**
 - FORK-187: `import-git` records git's LF blob against the stat of a CRLF-converted working
@@ -260,6 +259,32 @@ The same change fixed a latent dirty-tracking bug. A shard's version was a per-s
 reset to 0 on load, so a shard evicted and reloaded between a persist's snapshot and its
 clean-mark could climb back to the snapshot's number and be marked clean with a record that
 was in no file. Versions now come from one process-wide counter.
+
+## FORK-163: materializers load ahead of their writes (2026-10-18)
+
+**Measured** on the benchmark's git.git warehouse (copy C, delta-packed), with hyperfine
+A/B tests against saved binaries on a quiet machine.
+
+- **Before:** every materializer looped `load_blob` then write, one file at a time. On a packed
+  warehouse, the load reconstructs a delta chain, which is CPU that the loop paid between writes.
+  Parallelizing load and write together was already measured as a loss, because of the
+  filesystem metadata wall (docs/PARALLELIZATION_PLAN.md, item 2).
+- **Fix:** `fanout_utils::prefetch_in_order`. Workers load in a bounded window (256 items, 64 MiB
+  held) ahead of a single consumer, which writes **serially and in input order**. That consumer
+  is `shift_utils::apply_ops_each` (shift, park, lower, franchise, consolidate's fast-forward) or
+  `consolidate::apply_merge_actions` (take-theirs writes). Below 8 writes it stays fully serial.
+  Chunked entries still stream from the store. A load error is reported at that file's turn,
+  after every earlier file has been written, which is the same first failure as the serial loop.
+  A worker panic reaches the caller.
+
+| `shift` on git.git (hyperfine) | before | after |
+|---|---|---|
+| full tree, `old` → `master` | 1.201 s | 0.497 s (2.4x) |
+| 83 changed files, `near` → `master` | 182.9 ms | 150.7 ms (−18%) |
+| peak memory, full tree | 676 MiB | 740 MiB (+9%) |
+
+The memory rise does not depend on the window: a window of 32 measured the same. Remaining
+work, a stat-clean worktree read and the other commands' serial loads, is FORK-192.
 
 ---
 
