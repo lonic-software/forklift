@@ -588,11 +588,12 @@ fails CI if that ever drifts. Tools (arguments in parentheses):
   also rewrite existing packs, dropping unreachable garbage and consolidating.
 - **Branch / merge:** `shift` (pallet), `consolidate` (pallet), `palletize` (name?,
   revision?, all?).
-- **Remote:** `lift`, `lower`.
+- **Remote:** `lift`, `lower` (expect?, keep?).
 - **Review & metadata:** `manifest_note` / `manifest_approve` / `manifest_provenance`
   (model, transcript?, message?) / `manifest_show`, `haul_open` / `haul_list` / `haul_show` /
   `haul_comment` / `haul_review` / `haul_merge` / `haul_close` / `haul_reopen`,
-  `tag_create` / `tag_show` / `tag_list`, `office_list`.
+  `tag_create` / `tag_show` / `tag_list`, `kv_set` (revision, key, value) / `kv_get` / `kv_unset` /
+  `kv_log` (revision, key) / `kv_list` (revision?), `office_list`.
 - **Sandboxing:** `bay_add` (name, path?, scope?), `bay_list`, `bay_remove`
   (name), `scope` — an orchestrator agent opens task-scoped (optionally sparse) sandboxes for
   its sub-agents directly. The scope a bay records is advisory local setup, not the agent's

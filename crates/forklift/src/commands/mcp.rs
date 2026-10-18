@@ -893,6 +893,14 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
                 args.push("--expect".to_string());
                 args.push(genesis);
             }
+            if let Some(keep) = arguments.get("keep").and_then(Value::as_array) {
+                for resolution in keep {
+                    if let Some(resolution) = resolution.as_str() {
+                        args.push("--keep".to_string());
+                        args.push(resolution.to_string());
+                    }
+                }
+            }
         }
         "office_list" => args.push("office".to_string()),
         "bay_add" => {
@@ -1023,6 +1031,26 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             if let Some(message) = string_arg("message") {
                 args.push("--message".to_string());
                 args.push(message);
+            }
+        }
+        "kv_set" => {
+            args.push("kv".to_string());
+            args.push("set".to_string());
+            args.push(require("revision")?);
+            args.push(require("key")?);
+            args.push(require("value")?);
+        }
+        "kv_get" | "kv_unset" | "kv_log" => {
+            args.push("kv".to_string());
+            args.push(name.trim_start_matches("kv_").to_string());
+            args.push(require("revision")?);
+            args.push(require("key")?);
+        }
+        "kv_list" => {
+            args.push("kv".to_string());
+            args.push("list".to_string());
+            if let Some(revision) = string_arg("revision") {
+                args.push(revision);
             }
         }
         "manifest_show" => {
@@ -1160,8 +1188,8 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("lift", "Push the current pallet's new parcels to the configured remote.",
             object(json!({}), json!([]))),
-        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed.",
-            object(json!({ "expect": string }), json!([]))),
+        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged @kv replays the local changes onto the remote's; keys both sides changed refuse with meta_conflict (exit 24, every path and both sides in error.details) until each is resolved with a keep entry \"kv:<subject>/<key>=ours|theirs\".",
+            object(json!({ "expect": string, "keep": { "type": "array", "items": string } }), json!([]))),
         tool("office_list", "List the enrolled operators and their keys.",
             object(json!({}), json!([]))),
         tool("bay_add", "Open a bay: a new working directory bound to this warehouse, checked out to a new pallet named after it (branched from the current head). Pass scope to open a scoped (sparse) bay materializing only those subtree(s) — the tool for an orchestrator to hand a sub-agent a task-scoped sandbox. path defaults to a sibling of the warehouse.",
@@ -1198,6 +1226,16 @@ fn tool_definitions() -> Value {
             object(json!({ "revision": string, "message": string }), json!(["revision"]))),
         tool("manifest_provenance", "Record signed machine-authorship provenance for a parcel: which model produced it (the AI-traceability record). The tool and session are set by the MCP server from this connection — you cannot self-report them; model is your attestation. Needs an enrolled key.",
             object(json!({ "revision": string, "model": string, "transcript": string, "message": string }), json!(["revision", "model"]))),
+        tool("kv_set", "Set a custom-metadata key on a parcel (revision: a pallet name or parcel hash) to a text value, signed as you. Needs an enrolled key and a writer or admin role.",
+            object(json!({ "revision": string, "key": string, "value": string }), json!(["revision", "key", "value"]))),
+        tool("kv_get", "Show a custom-metadata key's value on a parcel, with the key id that wrote it.",
+            object(json!({ "revision": string, "key": string }), json!(["revision", "key"]))),
+        tool("kv_unset", "Remove a custom-metadata key from a parcel. Needs an enrolled key and a writer or admin role.",
+            object(json!({ "revision": string, "key": string }), json!(["revision", "key"]))),
+        tool("kv_list", "List every custom-metadata value, or only a parcel's (revision).",
+            object(json!({ "revision": string }), json!([]))),
+        tool("kv_log", "Every change to a custom-metadata key on a parcel, newest first, with who signed each.",
+            object(json!({ "revision": string, "key": string }), json!(["revision", "key"]))),
         tool("manifest_show", "Show the manifest entries (approvals, notes, provenance) attached to a parcel.",
             object(json!({ "revision": string }), json!(["revision"]))),
         tool("haul_open", "Open a merge proposal (pull request) from a source pallet into a target.",
@@ -1602,6 +1640,20 @@ mod tests {
         "help",        // meta
         "version",     // meta
     ];
+
+    #[test]
+    fn kv_tools_and_lower_keeps_build_their_cli_arguments() {
+        let args = |name: &str, arguments: serde_json::Value| super::build_args(name, &arguments).unwrap();
+
+        assert_eq!(args("kv_set", json!({ "revision": "main", "key": "ci", "value": "green" })),
+                   ["kv", "set", "main", "ci", "green"]);
+        assert_eq!(args("kv_log", json!({ "revision": "main", "key": "ci" })), ["kv", "log", "main", "ci"]);
+        assert_eq!(args("kv_unset", json!({ "revision": "main", "key": "ci" })), ["kv", "unset", "main", "ci"]);
+        assert_eq!(args("kv_list", json!({})), ["kv", "list"]);
+        assert_eq!(args("lower", json!({ "keep": ["kv:a/b=ours", "kv:c=theirs"] })),
+                   ["lower", "--keep", "kv:a/b=ours", "--keep", "kv:c=theirs"]);
+        assert!(super::build_args("kv_get", &json!({ "revision": "main" })).is_err(), "key is required");
+    }
 
     #[test]
     fn every_cli_command_is_an_mcp_tool_or_explicitly_human_only() {
