@@ -60,6 +60,50 @@ warehouse root and is never tracked by `load`, so no user file can ever occupy t
 paths. Trees carrying a top-level `.forklift` entry are refused by every operation that
 materializes or merges trees.
 
+## The meta-tree format (defined; no pallet uses it yet)
+`forklift-core`'s `meta_tree` module defines the format the non-office meta pallets move to,
+one pallet per change. Until a pallet's own change lands, that pallet keeps the format described
+above. A meta tree is the pallet's whole state, and its chain is linear (a parcel has at most
+one parent), as with the office:
+
+```
+.forklift/tracked/format          a blob reading exactly "forklift-meta 1 <kind>"
+.forklift/tracked/cells/<path>    one cell per path (cells/ is omitted when empty)
+```
+
+`<kind>` is `kv`, `manifest`, `haul` or `tags`. Every path component uses only ASCII letters,
+digits, `.`, `_` and `-`, and none may begin with `.` or `-`. Subjects that are hashes fan out
+by their first two hex characters (`cells/ab/<hash>/...`). Each cell is a TOML envelope:
+
+```toml
+signer = "<key id of whoever wrote this value>"
+schema = "kv.text 1"
+[value]
+text = "..."
+```
+
+The envelope has exactly these three fields and no timestamp, so a signer writing a value
+always produces the same bytes. Two writers of the same value produce different cells.
+
+Reads are tolerant per cell. A cell with an unknown schema, or one that does not parse, is
+reported as that cell's row, and the other cells still read. A missing or unknown `format`
+refuses the whole pallet, naming it as written by an older or newer forklift. Writes leave
+every path they do not name byte-for-byte unchanged.
+
+Every parcel must pass `verify_meta_content` against the office. Its signature must verify,
+and inside the distrust boundary if its key is revoked. Every cell it adds or changes relative
+to its parent must be stamped with its own signing key. Its format must stay the parent's.
+Changed envelopes must parse, in a canonical tree with no empty subtrees. The pallet's own
+rules must hold. By induction over the linear chain, every cell at a verified head names the
+key that wrote it.
+
+Diverged heads are not merged. The local net change since the common ancestor is replayed onto
+the remote head as one new parcel, and each replayed cell is re-stamped with the current key.
+That re-stamp is allowed only when the old stamp resolves to the same operator under a key that
+is active or was retired, never one revoked as compromised. Paths that both sides changed
+differently refuse until each is resolved, keeping ours or theirs; keeping theirs at a subject
+resolves every conflict beneath it.
+
 ## Record formats (TOML)
 A user record:
 ```toml
