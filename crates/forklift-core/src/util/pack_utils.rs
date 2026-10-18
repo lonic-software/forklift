@@ -6801,8 +6801,8 @@ mod tests {
     /// Reading the end of a long chain whose root is corrupt reloads the pack registry once, for
     /// the read that was asked for — not at every level of the chain, which doubled per level.
     ///
-    /// Mutation: drop the two `in_reconstruction()` arms in `read_object_classified` → 2^9 − 1
-    /// forced reloads → red.
+    /// Mutation: drop the two `in_reconstruction()` arms in `read_object_classified` → 1023
+    /// (2^10 − 1) forced reloads → red.
     #[test]
     fn a_corrupt_chain_root_costs_one_registry_reload_not_one_per_level() {
         let temp = fresh_root("delta-chain-corrupt-root");

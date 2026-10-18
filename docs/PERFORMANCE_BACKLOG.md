@@ -671,7 +671,9 @@ Finding 5 is demand-gated.
   This is a deliberate integrity guarantee — every object read is re-hashed and
   checked against the address it was fetched by (`object_utils::verify_object_bytes`)
   — that git does not pay for and does not offer. Trading it away for a few percent
-  is not on the table.
+  is not on the table. FORK-188 kept it whole: an intermediate delta base, used only as
+  the dictionary its target is decoded against, is no longer hashed on its own, but every
+  object a caller receives still is, and a base read directly is hashed then.
 - **Sharing zstd dictionaries across parcel frames.** Parcels are intentionally
   stored as independent, full (never delta'd) frames — see `OBJECT_STORE_SCALING.md`'s
   "Parcels are stored full, never delta'd" note, which records that delta-compressing
