@@ -2537,8 +2537,17 @@ fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Re
 /// shadowed by the stale mapping. A persistently broken record therefore reloads at most once per
 /// read.
 pub(crate) fn retrieve_from_packs_reloading(hash: &str) -> Result<PackRetrieval, String> {
+    #[cfg(test)]
+    FORCED_RELOADS.with(|reloads| reloads.set(reloads.get() + 1));
+
     invalidate_cache();
     retrieve_from_packs(hash)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many forced registry reloads ([`retrieve_from_packs_reloading`]) ran on this thread.
+    static FORCED_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A hard ceiling on how deep a delta chain may be followed when reconstructing an object.
@@ -2576,14 +2585,56 @@ impl Drop for DepthGuard {
     }
 }
 
+/// Whether this thread is inside a delta reconstruction — reading a delta's *base*, not an object
+/// a caller asked for. The read path's forced registry reload on a located-but-broken record
+/// (`file_utils::read_object_classified`) is skipped there: the outermost read reloads once and
+/// re-walks the whole chain, whereas a reload at every level of the chain doubles the work per
+/// level (2^depth reloads behind one corrupt chain root).
+pub(crate) fn in_reconstruction() -> bool {
+    RECONSTRUCT_DEPTH.with(|d| d.get()) > 0
+}
+
+/// How [`reconstruct_record`] fetches a delta's base.
+#[derive(Clone, Copy)]
+enum Bases {
+    /// Through the ordinary verified object read — every base is content-verified on its own.
+    Verified,
+    /// Through [`unverified_delta_base`] — intermediate bases are not hashed; only the target is.
+    Unverified,
+}
+
 /// Reconstruct an object's bytes from its data-file record and verify them against `hash`.
 ///
 /// The reconstruction is delegated to [`reconstruct_record`]; this wrapper then enforces the
 /// module's content-addressing guarantee — the reconstructed bytes must hash to `hash`, so a
 /// corrupt full record, a bad delta, or a delta rebuilt against the wrong base fails the read
 /// rather than silently returning wrong bytes (`object_utils::verify_object_bytes`).
+///
+/// A delta read a caller asked for (not a base inside another reconstruction) first reconstructs
+/// its chain with *unverified* bases ([`Bases::Unverified`]) and hashes only the result: a base
+/// is used only as the delta's dictionary, and no wrong base can yield bytes that hash to `hash`.
+/// That skips one hash pass over every intermediate base, ~25% of a packed `diff --staged`.
+/// If that attempt fails in any way, the read is redone with every base verified — exactly the
+/// read this was before — and *its* outcome is returned, so the error for a corrupt chain still
+/// names the object that is actually corrupt, and a base that only verifies through the full read
+/// path (a good loose copy behind a broken pack record) still serves.
+///
+/// What this changes: a target whose delta was encoded against the bytes a corrupt base's record
+/// reconstructs to — only a crafted pack can hold one, since every writer encodes against verified
+/// bases — can now read, because its own bytes verify. Whether it does depends on which copy of
+/// the base this process meets first (a verified copy in the read cache wins), so such an object
+/// is servable but not reliably so. `compact` never copies one verbatim past its base's re-read
+/// (`collect_targets`), so it is never silently dropped either.
 fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
-    let bytes = reconstruct_record(record, hash)?;
+    if record.first() == Some(&RECORD_DELTA) && !in_reconstruction() {
+        if let Ok(bytes) = reconstruct_record(record, hash, Bases::Unverified) {
+            if object_utils::verify_object_bytes(hash, &bytes).is_ok() {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    let bytes = reconstruct_record(record, hash, Bases::Verified)?;
     object_utils::verify_object_bytes(hash, &bytes)?;
     Ok(bytes)
 }
@@ -2593,10 +2644,11 @@ fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
 ///
 /// A record starts with a kind byte: a full record's remainder is the zstd blob; a delta record's remainder is
 /// `base hash (32) || target length (VLQ) || zstd delta`, reconstructed against its base —
-/// which is fetched through the top-level object read, so the base may itself be loose, in
-/// another pack, or itself a delta. The chain is bounded well below `MAX_RECONSTRUCT_DEPTH`,
-/// which guards only against a corrupt pack chaining without end.
-fn reconstruct_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
+/// which `bases` says how to fetch: either through the top-level object read (so the base may be
+/// loose, in another pack, or itself a delta) or through [`unverified_delta_base`]. The chain is
+/// bounded well below `MAX_RECONSTRUCT_DEPTH`, which guards only against a corrupt pack chaining
+/// without end.
+fn reconstruct_record(record: &[u8], hash: &str, bases: Bases) -> Result<Vec<u8>, String> {
     // Trusted bytes: a local pack record is self-written or transport-verified (see
     // `decode_full_transport_record`), and a grandfathered giant must stay readable — bounding
     // this read would make a pre-existing over-ceiling packed object unreadable.
@@ -2626,12 +2678,60 @@ fn reconstruct_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
 
             // Borrow-only: the delta base is only read to reconstruct against, so share the
             // cached `Arc` instead of copying the base out (hot on packed-delta reads and compact).
-            let base = file_utils::retrieve_object_by_hash_shared(&base_hash)?;
+            let base = match bases {
+                Bases::Verified => file_utils::retrieve_object_by_hash_shared(&base_hash)?,
+                Bases::Unverified => unverified_delta_base(&base_hash)?,
+            };
 
             delta_utils::decompress_delta(&base, payload, target_len as usize)
         }
         other => Err(format!("Packed object {} has an unknown record kind {}.", hash, other)),
     }
+}
+
+/// A delta base for [`Bases::Unverified`]: the verified read cache's copy if it holds one, else
+/// a copy reconstructed earlier by this path, else the first loaded pack record that locates it,
+/// reconstructed (its own bases fetched the same way) and kept in [`unverified_base_cache`]. A
+/// base no loaded pack locates (loose, absent, behind a corrupt bucket) takes the ordinary
+/// verified read, with all of its fallbacks.
+///
+/// These bytes are never handed to a caller: the only consumer is [`reconstruct_record`], as a
+/// delta's dictionary, and the object built from them is hashed before anything returns it.
+fn unverified_delta_base(hash: &str) -> Result<Arc<Vec<u8>>, String> {
+    if let Some(bytes) = file_utils::cached_verified_object(hash) {
+        return Ok(bytes);
+    }
+
+    let key = file_utils::read_cache_key(hash);
+    if let Some(bytes) = unverified_base_cache().get(&key) {
+        return Ok(bytes);
+    }
+
+    let Some(hash_bytes) = hash_to_bytes(hash) else {
+        return file_utils::retrieve_object_by_hash_shared(hash);
+    };
+
+    let packs = loaded_packs()?;
+    for pack in packs.packs.iter() {
+        if let Some((offset, length)) = pack.locate(&hash_bytes).found() {
+            let bytes = Arc::new(reconstruct_record(pack.slice(offset, length)?, hash, Bases::Unverified)?);
+            let weight = bytes.len();
+            unverified_base_cache().put(&key, Arc::clone(&bytes), weight);
+            return Ok(bytes);
+        }
+    }
+
+    file_utils::retrieve_object_by_hash_shared(hash)
+}
+
+/// The cache behind [`unverified_delta_base`], kept apart from the verified read cache so that
+/// cache only ever holds bytes that hashed to their key. Keyed by `file_utils::read_cache_key`
+/// (qualified by the warehouse), and smaller than the read cache: an object a walk reads directly
+/// lands there, verified, and is preferred as a base.
+fn unverified_base_cache() -> &'static super::two_gen_cache::TwoGenCache<Vec<u8>> {
+    const BUDGET: usize = 64 * 1024 * 1024;
+    static CACHE: OnceLock<super::two_gen_cache::TwoGenCache<Vec<u8>>> = OnceLock::new();
+    CACHE.get_or_init(|| super::two_gen_cache::TwoGenCache::new(BUDGET, BUDGET / 8))
 }
 
 /// Every packed object hash (hex) that begins with `prefix`. The pack-aware half of
@@ -3590,6 +3690,9 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
     // live hash resolves against the target already selected instead of being skipped outright,
     // so survival is decided by whether the bytes are servable, not by enumeration order.
     let mut seen: HashMap<[u8; HASH_LEN], usize> = HashMap::new();
+    // (target index, base hash) of every delta selected for a verbatim copy — see the pass after
+    // the loop below.
+    let mut copied_deltas: Vec<(usize, [u8; HASH_LEN])> = Vec::new();
 
     // Live loose objects (read from and deleted with their files). Loose-loose duplicates are
     // impossible -- one fan-out path per hash -- so no collision handling is needed here.
@@ -3699,8 +3802,28 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
             // the same one a loose object's file size already stands in for.
             let size = header.raw_len.unwrap_or(length);
 
+            if let (Source::CopyRecord { is_delta: true, .. }, Some(base)) = (&source, header.base) {
+                copied_deltas.push((targets.len(), base));
+            }
+
             seen.insert(hash, targets.len());
             targets.push(PackTarget { hash, size, source });
+        }
+    }
+
+    // A copied delta whose base was demoted to the verified read is reconstructed too. Its record
+    // was encoded against whatever the base's old copy reconstructed to, and a read that does not
+    // verify intermediate bases (`resolve_record`) can serve it even when that copy is corrupt;
+    // once the base is repacked from the copy that verifies, the verbatim delta would decode
+    // against different bytes and the object would be lost without ever having been read. Read
+    // here, it is either re-encoded from bytes that verify or fails the run loudly. One pass is
+    // enough: a reconstructed object's bytes are fixed by its hash, so a delta against *it* still
+    // decodes after the repack.
+    for (index, base) in copied_deltas {
+        let base_reread = seen.get(&base)
+            .is_some_and(|&base_index| matches!(targets[base_index].source, Source::Reconstruct { .. }));
+        if base_reread {
+            targets[index].source = Source::Reconstruct { loose_source: None };
         }
     }
 
@@ -6539,6 +6662,231 @@ mod tests {
         match &result {
             PackRetrieval::Failed(e) => assert!(e.contains("corrupt"), "the error should name the corruption: {}", e),
             other => panic!("a record decompressing to the wrong bytes must fail the read, got {:?}", other),
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A full record of `content`.
+    fn full_record(content: &[u8]) -> Vec<u8> {
+        let mut record = vec![RECORD_FULL];
+        record.extend_from_slice(&zstd::encode_all(content, 0).unwrap());
+        record
+    }
+
+    /// A delta record that decodes to `target` against `base` (whatever hash it names).
+    fn delta_record(base_hash: &str, base: &[u8], target: &[u8]) -> Vec<u8> {
+        let mut record = vec![RECORD_DELTA];
+        record.extend_from_slice(&hash_to_bytes(base_hash).unwrap());
+        record.extend_from_slice(&byte_utils::number_to_vlq_bytes(target.len() as u64));
+        record.extend_from_slice(&delta_utils::compress_delta(base, target).unwrap());
+        record
+    }
+
+    /// Write one pack, `<stem>.pack`/`<stem>.idx`, holding `records` addressed by the given hex
+    /// hashes — whatever the records decode to — and drop the cached registry.
+    fn write_raw_pack(pack_folder: &Path, stem: &str, records: &[(&str, Vec<u8>)]) {
+        let mut data = Vec::new();
+        data.extend_from_slice(PACK_DATA_MAGIC);
+        data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+        let mut index_records = Vec::new();
+        for (hash, record) in records {
+            index_records.push((hash_to_bytes(hash).unwrap(), data.len() as u64, record.len() as u64));
+            data.extend_from_slice(record);
+        }
+        index_records.sort_by(|a, b| a.0.cmp(&b.0));
+        std::fs::create_dir_all(pack_folder).unwrap();
+        std::fs::write(pack_folder.join(format!("{}.pack", stem)), &data).unwrap();
+        std::fs::write(pack_folder.join(format!("{}.idx", stem)), build_index_bytes(&index_records)).unwrap();
+        invalidate_cache();
+    }
+
+    /// Three related contents (c → b → t, each a small edit of the one before), and their hashes.
+    fn chain_contents(tag: &str) -> [(Vec<u8>, String); 3] {
+        let c = [tag.as_bytes(), &deterministic_fill(6000)].concat();
+        let b = [c.as_slice(), b"\nthe second version adds a line\n"].concat();
+        let t = [b.as_slice(), b"\nand the third another\n"].concat();
+        [c, b, t].map(|content| {
+            let hash = blake3::hash(&content).to_hex().to_string();
+            (content, hash)
+        })
+    }
+
+    fn verify_calls() -> usize {
+        object_utils::VERIFY_CALLS.with(|calls| calls.get())
+    }
+
+    /// A cold read of an object at the end of a delta chain hashes only that object, not every
+    /// base on the way; each base still hashes once when it is read directly, and never again.
+    ///
+    /// Mutation: drop `resolve_record`'s unverified attempt → the target's read hashes three
+    /// times (target and both bases) → red.
+    #[test]
+    fn a_cold_delta_chain_read_hashes_only_the_object_asked_for() {
+        let temp = fresh_root("delta-chain-verify-once");
+        let _scope = StorageRootScope::enter(&temp);
+        let [(c, c_hash), (b, b_hash), (t, t_hash)] = chain_contents("verify-once");
+        write_raw_pack(&temp.join(".forklift/objects/pack"), "chain", &[
+            (&c_hash, full_record(&c)),
+            (&b_hash, delta_record(&c_hash, &c, &b)),
+            (&t_hash, delta_record(&b_hash, &b, &t)),
+        ]);
+
+        let before = verify_calls();
+        assert_eq!(file_utils::retrieve_object_by_hash(&t_hash).unwrap(), t);
+        assert_eq!(verify_calls() - before, 1, "a cold chain read hashes the target only");
+
+        let before = verify_calls();
+        assert_eq!(file_utils::retrieve_object_by_hash(&b_hash).unwrap(), b);
+        assert_eq!(file_utils::retrieve_object_by_hash(&b_hash).unwrap(), b);
+        assert_eq!(verify_calls() - before, 1, "a base read directly hashes once, then serves from the cache");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A chain whose middle record decodes to the wrong bytes fails its target's read with the
+    /// error naming the corrupt middle object — the attribution the fully verified read gives —
+    /// and the middle object fails its own read.
+    ///
+    /// Mutation: return the unverified attempt's error instead of redoing the read with every
+    /// base verified → the error names the target, not the corrupt base → red.
+    #[test]
+    fn a_corrupt_intermediate_base_fails_the_read_naming_the_base() {
+        let temp = fresh_root("delta-chain-corrupt-base");
+        let _scope = StorageRootScope::enter(&temp);
+        let [(c, c_hash), (b, b_hash), (t, t_hash)] = chain_contents("corrupt-base");
+        let wrong_b = [b.as_slice(), b"not what b holds"].concat();
+        write_raw_pack(&temp.join(".forklift/objects/pack"), "chain", &[
+            (&c_hash, full_record(&c)),
+            (&b_hash, delta_record(&c_hash, &c, &wrong_b)),
+            (&t_hash, delta_record(&b_hash, &b, &t)),
+        ]);
+
+        let error = file_utils::retrieve_object_by_hash(&t_hash).unwrap_err();
+        assert!(error.contains(&format!("Object {} is corrupt", b_hash)),
+            "the error must name the corrupt base, got: {}", error);
+        let error = file_utils::retrieve_object_by_hash(&b_hash).unwrap_err();
+        assert!(error.contains(&format!("Object {} is corrupt", b_hash)), "got: {}", error);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A target encoded against the bytes a corrupt base's record actually decodes to reads,
+    /// because its own bytes verify — but those base bytes are never served as the base, before
+    /// or after the target's read put them in the unverified base cache.
+    ///
+    /// Mutation: have the direct read take a cached unverified base (look `hash` up in
+    /// `unverified_base_cache` in `retrieve_object_by_hash_shared`) → the base's read returns the
+    /// wrong bytes → red.
+    #[test]
+    fn bytes_reconstructed_for_a_corrupt_base_are_never_served_as_that_base() {
+        let temp = fresh_root("delta-chain-unverified-base");
+        let _scope = StorageRootScope::enter(&temp);
+        let [(c, c_hash), (b, b_hash), (t, t_hash)] = chain_contents("unverified-base");
+        let wrong_b = [b.as_slice(), b"not what b holds"].concat();
+        write_raw_pack(&temp.join(".forklift/objects/pack"), "chain", &[
+            (&c_hash, full_record(&c)),
+            (&b_hash, delta_record(&c_hash, &c, &wrong_b)),
+            (&t_hash, delta_record(&b_hash, &wrong_b, &t)),
+        ]);
+
+        assert_eq!(file_utils::retrieve_object_by_hash(&t_hash).unwrap(), t);
+        let error = file_utils::retrieve_object_by_hash(&b_hash).unwrap_err();
+        assert!(error.contains(&format!("Object {} is corrupt", b_hash)), "got: {}", error);
+        assert!(matches!(retrieve_from_packs(&b_hash).unwrap(), PackRetrieval::Failed(_)));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Reading the end of a long chain whose root is corrupt reloads the pack registry once, for
+    /// the read that was asked for — not at every level of the chain, which doubled per level.
+    ///
+    /// Mutation: drop the two `in_reconstruction()` arms in `read_object_classified` → 2^9 − 1
+    /// forced reloads → red.
+    #[test]
+    fn a_corrupt_chain_root_costs_one_registry_reload_not_one_per_level() {
+        let temp = fresh_root("delta-chain-corrupt-root");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let versions: Vec<Vec<u8>> = (0..10)
+            .map(|i| [deterministic_fill(4000).as_slice(), format!("\nversion {}\n", i).as_bytes()].concat())
+            .collect();
+        let hashes: Vec<String> = versions.iter().map(|v| blake3::hash(v).to_hex().to_string()).collect();
+        let mut records = vec![(hashes[0].as_str(), full_record(b"the root's record holds other bytes"))];
+        for i in 1..versions.len() {
+            records.push((hashes[i].as_str(), delta_record(&hashes[i - 1], &versions[i - 1], &versions[i])));
+        }
+        write_raw_pack(&temp.join(".forklift/objects/pack"), "chain", &records);
+
+        let before = FORCED_RELOADS.with(|reloads| reloads.get());
+        let error = file_utils::retrieve_object_by_hash(hashes.last().unwrap()).unwrap_err();
+        assert!(error.contains(&format!("Object {} is corrupt", hashes[0])), "got: {}", error);
+        assert_eq!(FORCED_RELOADS.with(|reloads| reloads.get()) - before, 1);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// `compact --all` never copies a delta verbatim once its base is repacked from a different
+    /// copy than the one the delta was encoded against. Here the only pack holds a corrupt base
+    /// record and a target encoded against what that record decodes to (so the target reads), and
+    /// a good loose copy of the base sits beside it: the base is repacked from the loose copy.
+    /// A verbatim copy of the target would then decode against the good bytes and be lost. The
+    /// repack must either keep the target readable or fail and leave everything in place.
+    ///
+    /// Mutation: drop the copied-delta pass at the end of `collect_targets` → the compact succeeds
+    /// and the target no longer reads → red.
+    #[test]
+    fn a_repack_never_copies_a_delta_whose_base_it_repacks_from_another_copy() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let temp = fresh_root("delta-copy-reread-base");
+        let _scope = StorageRootScope::enter(&temp);
+
+        let body = deterministic_fill(6000);
+        let base = LooseObjectBuilder::build_blob(&Blob { content: [body.as_slice(), b"\nv1\n"].concat() });
+        let target = LooseObjectBuilder::build_blob(&Blob { content: [body.as_slice(), b"\nv1\nv2\n"].concat() });
+        let wrong_base = [base.content.as_slice(), b"not what the base holds"].concat();
+
+        write_raw_pack(&temp.join(".forklift/objects/pack"), "crafted", &[
+            (&base.hash, full_record(&wrong_base)),
+            (&target.hash, delta_record(&base.hash, &wrong_base, &target.content)),
+        ]);
+        store_loose(&base.hash, &base.content);
+
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree.add_child(TreeItem::new("base.txt".to_string(), base.hash.clone(), DirEntryType::Normal));
+        tree.add_child(TreeItem::new("target.txt".to_string(), target.hash.clone(), DirEntryType::Normal));
+        let mut tree_object = LooseObjectBuilder::build_tree(&tree);
+        tree_object.store().unwrap();
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("crafted".to_string()),
+        });
+        parcel.store().unwrap();
+        pallet_utils::set_pallet_head("main", &parcel.hash).unwrap();
+
+        let read_target = || retrieve_from_packs(&target.hash).unwrap();
+        assert!(matches!(read_target(), PackRetrieval::Verified(_)), "the fixture's target must read before the repack");
+
+        let crafted_pack = temp.join(".forklift/objects/pack/crafted.pack");
+        match compact(true, false, &Progress::NONE) {
+            Ok(_) => {
+                invalidate_cache();
+                match read_target() {
+                    PackRetrieval::Verified(bytes) => assert_eq!(bytes, target.content),
+                    other => panic!("a repack that succeeds must leave the target readable, got {:?}", other),
+                }
+            }
+            Err(error) => {
+                assert!(error.contains(&target.hash), "a failed repack must name the target: {}", error);
+                assert!(crafted_pack.exists(), "a failed repack must leave the old pack in place");
+            }
         }
 
         std::fs::remove_dir_all(&temp).ok();

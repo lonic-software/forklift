@@ -1860,6 +1860,19 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
             // below, distinct from "loose absent or present-but-unverified".
             match read_loose_if_verified(hash) {
                 Ok(Some(bytes)) => return Ok(StoreReadOutcome::Verified(bytes)),
+                // Inside a delta reconstruction (this hash is another object's base), the read
+                // that started the reconstruction does the one forced reload below and re-walks
+                // the whole chain; reloading here as well, at every level, doubles the work per
+                // level — 2^depth reloads behind one corrupt chain root.
+                Ok(None) if crate::util::pack_utils::in_reconstruction() => {
+                    return Ok(StoreReadOutcome::Unverifiable(pack_error));
+                }
+                Err(loose_io) if crate::util::pack_utils::in_reconstruction() => {
+                    return Err(format!(
+                        "the loose store could not be consulted ({}) while deciding a hash \
+                        whose located pack record failed ({})", loose_io, pack_error
+                    ));
+                }
                 Ok(None) => {
                     // Neither the failed pack record nor the loose store served it. One forced
                     // reload closes the window against a stale mapping, so a good copy an external
@@ -2054,6 +2067,13 @@ pub(crate) fn read_cache_key(hash: &str) -> String {
 
 fn read_cache_get(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     read_cache().get(&read_cache_key(hash))
+}
+
+/// The read cache's copy of `hash`, if it holds one — without reading the store on a miss. For
+/// `pack_utils`'s unverified delta-base fetch, which prefers a copy known to verify. Every entry
+/// in this cache hashed to its key before it was put there.
+pub(crate) fn cached_verified_object(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+    read_cache_get(hash)
 }
 
 fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {

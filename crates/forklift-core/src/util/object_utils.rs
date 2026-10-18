@@ -706,6 +706,9 @@ pub fn is_object_hash(text: &str) -> bool {
 /// * `Ok(())`      - If the bytes hash to `hash`.
 /// * `Err(String)` - If they do not (the object store is corrupt).
 pub fn verify_object_bytes(hash: &str, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(test)]
+    VERIFY_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let actual = hash_object_bytes(bytes);
 
     if actual != hash {
@@ -716,6 +719,13 @@ pub fn verify_object_bytes(hash: &str, bytes: &[u8]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`verify_object_bytes`] ran on this thread — for tests that pin how many
+    /// hash passes a read costs.
+    pub(crate) static VERIFY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Validate an object's content address and every import-side size policy without storing it.
