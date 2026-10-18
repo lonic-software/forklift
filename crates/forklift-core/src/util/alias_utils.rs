@@ -46,6 +46,12 @@ fn identity(path: &Path) -> Option<Identity> {
     file_utils::get_full_file_id(path).ok()
 }
 
+/// Whether `first` and `second` resolve, without following a symlink, to one entry on disk. A path
+/// that does not resolve is the same entry as nothing.
+pub fn same_entry(first: &Path, second: &Path) -> bool {
+    identity(first).is_some_and(|identity_of_first| identity(second) == Some(identity_of_first))
+}
+
 /// The candidate key two names must share before a probe is spent on them: a full case fold
 /// (`ß` and `ss`, the Kelvin sign and `k`, `ﬁ` and `fi` all meet) in canonical decomposition (an
 /// NFC and an NFD spelling meet). It proposes pairs; the volume decides them.

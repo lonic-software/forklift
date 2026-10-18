@@ -596,8 +596,9 @@ fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: Dir
 /// goes through here, because the path comes from a tree that may have arrived from a remote.
 ///
 /// Refused:
-/// * a first component that is the warehouse's metadata folder, in any case and with any
-///   trailing dots or spaces (see [`office_utils::ensure_not_metadata_root`]);
+/// * a first component that opens the warehouse's metadata folder: by any spelling some file
+///   system takes for it, or by resolving to it on this volume (see
+///   [`office_utils::opens_metadata_folder`]);
 /// * a parent directory, at any depth, that is a symlink: following it would write or remove
 ///   wherever it points. A file system that ignores case also reaches a symlink `lib` through a
 ///   tree directory `LIB`;
@@ -615,7 +616,7 @@ fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: Dir
 pub fn check_working_path(path: &str) -> Result<(), String> {
     let components: Vec<&str> = path.split('/').collect();
 
-    if components.first().is_some_and(|first| office_utils::is_metadata_folder_name(first)) {
+    if components.first().is_some_and(|first| office_utils::opens_metadata_folder(first)) {
         return Err(format!(
             "Refusing to touch {:?}: it is inside the warehouse's metadata folder.", path
         ));
@@ -654,8 +655,9 @@ pub fn check_working_path(path: &str) -> Result<(), String> {
 
 /// Why Windows would not take `name` as one plain file name, if it would not: a `\` (a path
 /// separator there), a `:` (a drive prefix or an alternate data stream), a trailing dot or space
-/// (dropped, so `.. ` opens `..`), or a reserved device name (`CON`, `NUL`, `COM1`, … with or
-/// without an extension). Compiled everywhere so it is tested everywhere; enforced on Windows.
+/// (dropped, so `.. ` opens `..`), or a reserved device name (`CON`, `NUL`, `COM1`, `COM¹`, …
+/// with or without an extension). Compiled everywhere so it is tested everywhere; enforced on
+/// Windows.
 pub fn windows_component_problem(name: &str) -> Option<&'static str> {
     const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
 
@@ -670,14 +672,14 @@ pub fn windows_component_problem(name: &str) -> Option<&'static str> {
     }
 
     let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
-    // On bytes: a four-byte stem may end in a multi-byte character, which a `str` slice at
-    // byte 3 would split.
+    // On characters: Windows reserves the superscript ports too (`COM¹`, `LPT³`), and those
+    // digits are two bytes each.
     let is_port = |prefix: &str| {
-        let bytes = stem.as_bytes();
-        bytes.len() == 4
-            && bytes[..3].eq_ignore_ascii_case(prefix.as_bytes())
-            && bytes[3].is_ascii_digit()
-            && bytes[3] != b'0'
+        let mut chars = stem.chars();
+        let head: String = chars.by_ref().take(3).collect();
+
+        head.eq_ignore_ascii_case(prefix)
+            && matches!((chars.next(), chars.next()), (Some('1'..='9' | '¹' | '²' | '³'), None))
     };
 
     if RESERVED.iter().any(|reserved| stem.eq_ignore_ascii_case(reserved)) || is_port("COM") || is_port("LPT") {
@@ -1046,7 +1048,7 @@ mod tests {
     #[test]
     fn windows_refuses_names_that_are_not_one_plain_file_name() {
         for name in ["a\\b", "C:", "file.txt:stream", "trailing.", "trailing ", "..  ", "CON", "con.txt",
-            "Nul", "aux.tar.gz", "COM1", "lpt9.log", "PRN "] {
+            "Nul", "aux.tar.gz", "COM1", "lpt9.log", "PRN ", "COM\u{B9}", "lpt\u{B2}.txt", "Com\u{B3}"] {
             assert!(windows_component_problem(name).is_some(), "{:?} must be refused", name);
         }
     }
@@ -1054,7 +1056,7 @@ mod tests {
     #[test]
     fn windows_accepts_names_that_only_resemble_reserved_ones() {
         for name in ["CONSOLE", "con_", "COM0", "COM10", "LPT", "auxiliary.txt", ".con", "a.CON", "café",
-            "...a", "file.txt", "abé.txt", "a€", "€"] {
+            "...a", "file.txt", "abé.txt", "a€", "€", "COM\u{2074}", "LPT\u{B9}0", "CO\u{B9}", "COM\u{2070}"] {
             assert_eq!(windows_component_problem(name), None, "{:?} must be accepted", name);
         }
     }

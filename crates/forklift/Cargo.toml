@@ -38,3 +38,7 @@ blake3 = { workspace = true }
 # The remote tests' mock hook endpoint verifies the signed hook requests with the
 # same MAC helper the server signs them with.
 serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The metadata-alias test asks NTFS for the 8.3 short name it gave `.forklift`.
+windows-sys = { workspace = true }

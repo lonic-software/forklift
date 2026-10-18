@@ -26,6 +26,11 @@ struct Warehouse {
 
 impl Warehouse {
     fn new(name: &str) -> Warehouse {
+        Warehouse::new_after(name, |_| {})
+    }
+
+    /// [`Self::new`], running `before_prepare` on the empty working directory first.
+    fn new_after(name: &str, before_prepare: impl FnOnce(&std::path::Path)) -> Warehouse {
         let base = std::env::temp_dir()
             .join(format!("forklift-tree-names-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
@@ -33,6 +38,7 @@ impl Warehouse {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
+        before_prepare(&root);
 
         let warehouse = Warehouse { base, root, home };
         warehouse.run_ok(&["prepare"]);
@@ -199,6 +205,110 @@ fn a_root_forklift_entry_in_another_case_is_refused() {
     warehouse.craft_pallet(|blob| vec![subtree(".ForkLift", blob)]);
 
     assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), "\".ForkLift\"");
+}
+
+#[test]
+fn a_root_entry_some_file_system_opens_as_the_metadata_folder_is_refused() {
+    // Each is an ordinary name here, but opens `.forklift` somewhere: a data stream of it and an
+    // 8.3 short name on NTFS, a name holding a code point HFS+ ignores.
+    for (index, name) in [".forklift::$INDEX_ALLOCATION", ".forklift:x", ".fork\u{200C}lift", "\u{FEFF}.forklift",
+        "FORKLI~1", "forkli~4.", ".ForkLift\u{206F} "].into_iter().enumerate()
+    {
+        let warehouse = Warehouse::new(&format!("metadata-alias-{}", index));
+        warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
+
+        assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), &format!("{:?}", name));
+    }
+}
+
+#[test]
+fn a_root_entry_that_only_resembles_a_metadata_alias_still_shifts() {
+    // The positive twin: names one step from an alias are ordinary on every file system.
+    for (index, name) in ["forkli~5", "forkli~0", "forkli~12", "FORKLIF~1", "forklift", ".forklifts",
+        ".fork-lift", "x:.forklift"].into_iter().enumerate()
+    {
+        #[cfg(windows)]
+        if name.contains(':') {
+            continue;
+        }
+
+        let warehouse = Warehouse::new(&format!("metadata-near-alias-{}", index));
+        warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
+
+        warehouse.run_ok(&["shift", "evil"]);
+        assert!(warehouse.root.join(name).join("escaped.txt").exists(), "{:?} was not written", name);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_top_level_name_this_volume_resolves_to_the_metadata_folder_is_not_loaded() {
+    // A bay's `.forklift` is a redirect file, so a hard link can give it a second name. A name
+    // holding a `~` (what every 8.3 short name holds) is judged by the volume, not by its
+    // spelling: loading `meta~1` would track the redirect.
+    let warehouse = Warehouse::new("metadata-identity");
+    let bay = warehouse.base.join("bay");
+    warehouse.run_ok(&["bay", "add", "linked", bay.to_str().unwrap()]);
+    assert!(std::fs::symlink_metadata(bay.join(".forklift")).unwrap().is_file(), "the bay has no redirect file");
+    std::fs::hard_link(bay.join(".forklift"), bay.join("meta~1")).unwrap();
+    std::fs::write(bay.join("other~1"), "ordinary\n").unwrap();
+
+    let run = |args: &[&str]| forklift_command()
+        .args(args)
+        .current_dir(&bay)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
+        .output()
+        .unwrap();
+
+    let refused = run(&["load", "meta~1"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "the alias was loaded; stderr: {}", stderr);
+    assert!(stderr.contains("metadata folder"), "the refusal must say why; stderr: {}", stderr);
+
+    let accepted = run(&["load", "other~1"]);
+    assert!(accepted.status.success(), "{}", String::from_utf8_lossy(&accepted.stderr));
+}
+
+/// The 8.3 short name NTFS gave `path`'s last component, if it gave one.
+#[cfg(windows)]
+fn short_name(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buffer = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated, and `buffer` is writable for the length passed.
+    let length = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    assert!(length > 0 && length < buffer.len(), "GetShortPathNameW failed for {}", path.display());
+
+    let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+    let name = short.file_name()?.to_string_lossy().into_owned();
+    (name != ".forklift").then_some(name)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_hashed_short_name_of_the_metadata_folder_is_refused() {
+    // Four siblings take `FORKLI~1` to `~4` before `.forklift` exists, so NTFS gives it a hashed
+    // short name no spelling rule can list; only the volume can say it is the metadata folder.
+    let warehouse = Warehouse::new_after("metadata-short-name", |root| {
+        for index in 1..=4 {
+            std::fs::create_dir(root.join(format!("forklift-sibling-{}", index))).unwrap();
+        }
+    });
+    let Some(short) = short_name(&warehouse.root.join(".forklift")) else {
+        assert!(std::env::var_os("CI").is_none(), "this volume gives no 8.3 short names, so the test proves nothing");
+        return;
+    };
+    assert!(!forklift_core::util::office_utils::is_metadata_folder_name(&short),
+        "{:?} is not a hashed short name, so the test would not reach the volume check", short);
+
+    let loaded = warehouse.run(&["load", &format!("{}/config", short)]);
+    assert!(!loaded.status.success(), "the alias {:?} was loaded", short);
+
+    warehouse.craft_pallet(|blob| vec![subtree(&short, blob)]);
+    assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), &format!("{:?}", short));
 }
 
 /// Whether the warehouse's file system treats names differently by case.

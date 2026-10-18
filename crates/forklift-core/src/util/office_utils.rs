@@ -17,7 +17,7 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
-use crate::util::{file_utils, object_utils, pallet_utils, sign_utils};
+use crate::util::{alias_utils, file_utils, object_utils, pallet_utils, sign_utils};
 
 /// The name of the office meta pallet — the tracked-metadata pallet holding users and
 /// keys. It lives in the meta namespace (`.forklift/meta/office`, not `.forklift/pallets/`),
@@ -453,12 +453,45 @@ pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
     ensure_not_metadata_root(&object_utils::load_tree(root_tree_hash)?)
 }
 
-/// Whether a top-level working-directory name opens the warehouse's metadata folder. The match is
-/// wider than the exact name: a file system that ignores case (macOS, Windows) or drops trailing
-/// dots and spaces (Windows) opens `.forklift` for `.ForkLift` or `.forklift.` too. Case is folded
-/// by Unicode rules, as those file systems fold it, so `.for\u{212A}lift` (KELVIN SIGN) matches.
+/// Whether a top-level working-directory name opens the warehouse's metadata folder on some file
+/// system. The match is wider than the exact name, after git's `verify_path` (`is_ntfs_dotgit`,
+/// `is_hfs_dotgit`):
+/// * a file system that ignores case (macOS, Windows) opens `.forklift` for `.ForkLift`. Case is
+///   folded by Unicode rules, as those file systems fold it, so `.for\u{212A}lift` (KELVIN SIGN)
+///   matches;
+/// * Windows drops trailing dots and spaces (`.forklift.`), and reads what follows a `:` as a data
+///   stream of the folder itself (`.forklift::$INDEX_ALLOCATION`);
+/// * HFS+ skips the code points [`is_hfs_ignorable`] lists, wherever they sit (`.fork\u{200C}lift`);
+/// * NTFS gives the folder an 8.3 short name, `FORKLI~1` (`~2` to `~4` when siblings share the
+///   prefix).
+///
+/// Past `~4`, NTFS derives the short name from an undocumented hash, so no name rule can list it;
+/// [`opens_metadata_folder`] asks the volume for a path in the working directory itself.
 pub fn is_metadata_folder_name(name: &str) -> bool {
-    name.trim_end_matches(['.', ' ']).to_lowercase() == TREE_NAME_FORKLIFT
+    let name = name.split(':').next().unwrap_or(name);
+    let name: String = name.chars().filter(|c| !is_hfs_ignorable(*c)).collect();
+    let name = name.trim_end_matches(['.', ' ']).to_lowercase();
+
+    name == TREE_NAME_FORKLIFT
+        || name.strip_prefix("forkli~").is_some_and(|ordinal| matches!(ordinal, "1" | "2" | "3" | "4"))
+}
+
+/// The code points HFS+ ignores in a file name, so `.fork\u{200C}lift` opens `.forklift` there: the
+/// list git's `is_hfs_dotgit` skips (CVE-2014-9390).
+fn is_hfs_ignorable(c: char) -> bool {
+    matches!(c, '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}')
+}
+
+/// Whether the top-level working-directory name `name` opens the warehouse's metadata folder here:
+/// by [`is_metadata_folder_name`], or, for a name holding a `~` (the mark of every 8.3 short name,
+/// hashed ones included), because it resolves to the same entry as `.forklift` on this volume.
+/// Relative to the current directory, which is the working directory's root.
+pub fn opens_metadata_folder(name: &str) -> bool {
+    use std::path::Path;
+    use crate::globals::FOLDER_NAME_FORKLIFT_ROOT;
+
+    is_metadata_folder_name(name)
+        || (name.contains('~') && alias_utils::same_entry(Path::new(name), Path::new(FOLDER_NAME_FORKLIFT_ROOT)))
 }
 
 /// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with
