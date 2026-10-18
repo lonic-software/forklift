@@ -783,13 +783,13 @@ fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> 
 
 /// Remove every entry of the active bay's assembly folder. Called by
 /// [`WarehouseLock::acquire`](crate::util::lock_utils::WarehouseLock::acquire) once the bay's
-/// lock is held. Every command that assembles into an existing bay holds that bay's lock, so
-/// anything in the folder then was left by an interrupted process and is never read; `bay add`
-/// and `franchise` assemble into a bay they have just created. Should a sweep still remove a temp
-/// in use, that assembly's rename fails loudly rather than placing anything. Best effort: a
-/// leftover that cannot be removed only costs space.
+/// lock is held. Every process that assembles into a bay holds that bay's lock (`bay add` and
+/// `franchise` take the lock of the one they create), so anything in the folder then was left by
+/// an interrupted process and is never read. Best effort: a leftover that cannot be removed only
+/// costs space.
 pub(crate) fn clear_assembly_leftovers() {
-    let Ok(entries) = std::fs::read_dir(crate::globals::bay_root().join(FOLDER_NAME_ASSEMBLY)) else { return };
+    let dir = crate::globals::bay_root().join(FOLDER_NAME_ASSEMBLY);
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
 
     for entry in entries.flatten() {
         let _ = std::fs::remove_file(entry.path());

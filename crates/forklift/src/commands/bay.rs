@@ -5,7 +5,8 @@ use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
 use forklift_core::util::{
-    bay_utils, file_utils, object_utils, pallet_utils, scope_utils, shift_utils, warehouse_utils,
+    bay_utils, file_utils, lock_utils, object_utils, pallet_utils, scope_utils, shift_utils,
+    warehouse_utils,
 };
 use crate::cli::BayAction;
 use crate::output::{self, CommandOutput};
@@ -97,6 +98,10 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     globals::set_bay_context(warehouse_root.join(globals::FOLDER_NAME_FORKLIFT_ROOT), name.to_string());
     std::env::set_current_dir(&bay_dir)
         .map_err(|e| format!("Error while entering the bay \"{}\": {}", bay_dir.to_string_lossy(), e))?;
+
+    // The new bay's own lock, held until it is filled: a command run in the bay meanwhile waits
+    // for it rather than staging against a half-made tree or clearing an assembly in flight.
+    let _bay_lock = lock_utils::WarehouseLock::acquire()?;
 
     pallet_utils::set_current_pallet_name(name)?;
 

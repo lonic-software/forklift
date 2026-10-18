@@ -20,7 +20,9 @@ const FILE_NAME_STORE_ACCESS_LOCK: &str = "store-access.lock";
 /// mutate the inventory, the object store bookkeeping or pallet refs take this lock, so
 /// that e.g. `stack` can never read a staging area that another forklift process is
 /// halfway through rewriting. Read-only commands (`peek`, `stocktake`) do not take it —
-/// at worst they report an in-flight intermediate state.
+/// at worst they report an in-flight intermediate state. Every process that fills a bay's
+/// working directory holds that bay's lock, which is what lets [`WarehouseLock::acquire`] clear
+/// the bay's assembly folder.
 ///
 /// The lock is a lock *file* created with `create_new` (atomic on every platform); it is
 /// removed when the guard is dropped. If the process is killed hard, the file stays
@@ -32,8 +34,9 @@ pub struct WarehouseLock {
 
 impl WarehouseLock {
     /// Acquire the warehouse lock. The current directory must be the warehouse root
-    /// (see `warehouse_utils::enter_warehouse`). Once it is held, leftovers of interrupted
-    /// chunked-file assemblies in the bay are removed.
+    /// (see `warehouse_utils::enter_warehouse`). Once it is held, everything in the bay's
+    /// chunked-file assembly folder is removed as a leftover, so a process takes a bay's lock
+    /// before it assembles anything there.
     ///
     /// # Returns
     /// * `Ok(WarehouseLock)` - The acquired lock (released when dropped).
