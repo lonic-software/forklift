@@ -734,7 +734,7 @@ impl OfficeChainMemo {
     }
 }
 
-/// This warehouse's office, verified against its trust anchor. A converted meta pallet's writes
+/// This warehouse's office, verified against its trust anchor. A meta pallet's writes
 /// are judged against the verified office, never the unverified local read.
 pub fn verified_local_office() -> Result<OfficeState, String> {
     let anchor = office_utils::read_trust_anchor()?

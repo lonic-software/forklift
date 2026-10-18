@@ -508,7 +508,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
     /// checks, and it differs by pallet: for the office pallet, every office-modifying parcel's
     /// *signer* is checked against the office role it held as of that parcel's own signing
-    /// (`verify_office_privileges`); for a converted meta pallet (`meta_tree::converted_rules`),
+    /// (`verify_office_privileges`); for a meta pallet (`meta_tree::meta_rules`),
     /// every new parcel passes `verify_meta_content` against the verified office, and the pallet
     /// is refused outright without one; for any other pallet, a parcel is accepted when it is
     /// either validly signed by a key the office currently tracks and has not revoked, or
@@ -536,7 +536,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             meta_tree::check_meta_pallet_name(&bare).map_err(HeadError::unprocessable)?;
         }
 
-        let converted = if is_meta { meta_tree::converted_rules(&bare) } else { None };
+        let pallet_rules = if is_meta { meta_tree::meta_rules(&bare) } else { None };
 
         // Fail fast on an obviously stale request; the conditional write below is the
         // authoritative gate that also catches a head that moves during the audit.
@@ -614,9 +614,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             materialize(&self.objects, &request.new_head, is_meta, known_complete, &mut mirror)
                 .map_err(HeadError::internal)?;
 
-            // A converted pallet's content check diffs each new parcel against its parent, so
+            // A meta pallet's content check diffs each new parcel against its parent, so
             // the current head's state is read too.
-            if let (Some(_), Some(old_head)) = (converted, &request.old_head) {
+            if let (Some(_), Some(old_head)) = (pallet_rules, &request.old_head) {
                 materialize_state(&self.objects, old_head, &mut mirror).map_err(HeadError::internal)?;
             }
 
@@ -708,12 +708,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             }
 
             // 3. Trust: a trusted warehouse accepts nothing a local audit would reject. A
-            // converted meta pallet exists only under an office, so it is checked even without
+            // meta pallet exists only under an office, so it is checked even without
             // an anchor — and refused for the lack of one. Its content check subsumes the
             // signature audit: every new parcel is signed by an office key, stamps only its own
             // cells, and keeps the pallet's rules.
-            if let Some(rules) = converted {
-                meta_tree::verify_converted_update(
+            if let Some(rules) = pallet_rules {
+                meta_tree::verify_meta_update(
                     &bare,
                     rules,
                     meta_tree::Admission::Admit,

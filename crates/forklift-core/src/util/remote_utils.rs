@@ -5965,7 +5965,7 @@ pub struct MetaAdoptResult {
     pub adopted: Vec<String>,
 
     /// Meta pallets whose local and remote heads diverged, as `(bare name, remote head)`.
-    /// Their remote history has been fetched — and, for a converted pallet, verified from the
+    /// Their remote history has been fetched — and, for a meta pallet, verified from the
     /// two chains' common ancestor — and the caller applies the pallet's sync policy.
     pub diverged: Vec<(String, String)>,
 
@@ -5990,7 +5990,7 @@ enum MetaAdoptStep {
 /// and fast-forward the local ref, without ever materializing into the working directory
 /// (meta pallets are not working content). A pallet present only on the remote is adopted
 /// outright; one that diverged has its remote side fetched and is returned for the caller
-/// to reconcile. A converted pallet's remote parcels pass the content check against the local
+/// to reconcile. A meta pallet's remote parcels pass the content check against the local
 /// office before anything is adopted or reconciled. The office is excluded —
 /// `adopt_remote_trust` handles it, and runs first.
 ///
@@ -6048,7 +6048,7 @@ async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str)
         None => true,
     };
 
-    if let Some(rules) = meta_tree::converted_rules(name) {
+    if let Some(rules) = meta_tree::meta_rules(name) {
         // The verified local base: the local head on a fast-forward, else the newest parcel
         // both chains share (a parcel the local side already verified).
         let base = match (&local, fast_forward) {
@@ -6060,7 +6060,7 @@ async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str)
         let anchor = office_utils::read_trust_anchor()?;
         let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
 
-        meta_tree::verify_converted_update(
+        meta_tree::verify_meta_update(
             name, rules, meta_tree::Admission::Audit, anchor.as_ref(), office_head.as_deref(), base.as_deref(),
             remote_head
         ).map_err(|why| format!("The remote @{} was refused: {}", name, why))?;

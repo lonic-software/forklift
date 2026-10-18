@@ -1,6 +1,6 @@
 //! Meta pallets as signed state trees.
 //!
-//! A converted meta pallet works the way the office already does: each parcel's tree is the
+//! A meta pallet works the way the office already does: each parcel's tree is the
 //! pallet's complete current state, so reading the state means reading the head parcel's tree
 //! and nothing else. The chain is linear (every parcel has at most one parent), and a write
 //! stacks one signed parcel on the head.
@@ -25,9 +25,9 @@
 //! theirs and names every path both sides changed differently, and [`replay_meta_pallet`]
 //! applies the local side's *net* change since base onto the remote head as one new parcel.
 //!
-//! Enforcement and sync dispatch on [`converted_rules`], a code-level list of converted pallet
-//! names, never on whether a pallet happens to carry a format marker. A pallet not on the list
-//! keeps running on its own code until its conversion adds it.
+//! Enforcement and sync dispatch on [`meta_rules`], a code-level list of meta pallet names,
+//! never on whether a pallet happens to carry a format marker. A name not on the list has no
+//! rules here, so nothing admits, replays or reads it as a meta pallet.
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 use chrono::Utc;
@@ -77,7 +77,7 @@ pub const META_PALLET_NAMES: [&str; 5] = [
 
 /// The rules of a meta pallet on this substrate, or `None` for the office, which is on its own
 /// code.
-pub fn converted_rules(name: &str) -> Option<&'static dyn PalletRules> {
+pub fn meta_rules(name: &str) -> Option<&'static dyn PalletRules> {
     match name {
         kv_utils::KV_PALLET_NAME => Some(&kv_utils::KvRules),
         manifest_utils::MANIFEST_PALLET_NAME => Some(&manifest_utils::ManifestRules),
@@ -253,7 +253,7 @@ pub fn parse_cell(bytes: &[u8]) -> Result<CellEnvelope, String> {
     Ok(CellEnvelope { signer: signer.to_string(), schema: schema.to_string(), value })
 }
 
-/// The per-pallet half of the content check, and of reading. Each converted pallet supplies
+/// The per-pallet half of the content check, and of reading. Each meta pallet supplies
 /// one; the substrate never interprets a cell's value itself.
 pub trait PalletRules {
     /// The kind this pallet's format marker must name.
@@ -1301,11 +1301,11 @@ pub fn verify_meta_content(pallet: &str,
     Ok(())
 }
 
-/// The content check for a converted pallet's update on a store that holds the office: the
+/// The content check for a meta pallet's update on a store that holds the office: the
 /// office chain must verify against the anchor, and the pallet's new parcels against that
-/// office. A converted pallet exists only under an office, so a missing anchor or an unborn
+/// office. A meta pallet exists only under an office, so a missing anchor or an unborn
 /// office refuses rather than skipping the check. Returns the verified office.
-pub fn verify_converted_update(pallet: &str,
+pub fn verify_meta_update(pallet: &str,
                                rules: &dyn PalletRules,
                                admission: Admission,
                                anchor: Option<&TrustAnchor>,
@@ -2919,7 +2919,7 @@ mod tests {
         assert_eq!(linear_common_ancestor(&left, &unrelated).unwrap(), None);
     }
 
-    // --- The converted pallets' rules, through the content check that admits their parcels.
+    // --- The meta pallets' rules, through the content check that admits their parcels.
 
     /// An office of these keys, enrolling each key's operator with a role.
     fn office_with_roles(keys: &[(&Key, office_utils::Role)]) -> OfficeState {
@@ -3205,11 +3205,23 @@ mod tests {
         let headless = haul_parcel(Some(&head), &alice, &[unset(&format!("{}/head", dir))]);
         assert!(verify_haul(&office, Some(&head), &headless).unwrap_err().contains("never removed"));
 
-        // Anyone may move the head of an open haul.
-        let moved = haul_parcel(Some(&head), &bob, &[
-            set(&format!("{}/head", dir), &haul_cell(bob.id(), haul_utils::SCHEMA_HEAD, &haul_utils::head_value(&"cd".repeat(32)))),
+        // Only the opener moves the head.
+        let moved = haul_parcel(Some(&head), &alice, &[
+            set(&format!("{}/head", dir), &haul_cell(alice.id(), haul_utils::SCHEMA_HEAD, &haul_utils::head_value(&"cd".repeat(32)))),
         ]);
         verify_haul(&office, Some(&head), &moved).unwrap();
+
+        let hijacked = haul_parcel(Some(&head), &bob, &[
+            set(&format!("{}/head", dir), &haul_cell(bob.id(), haul_utils::SCHEMA_HEAD, &haul_utils::head_value(&"cd".repeat(32)))),
+        ]);
+        let error = verify_haul(&office, Some(&head), &hijacked).unwrap_err();
+        assert!(error.contains("only the haul's opener, alice, moves it"), "{}", error);
+
+        // The cells the rules read hold exactly their own schema.
+        let newer = haul_parcel(Some(&head), &alice, &[
+            set(&format!("{}/head", dir), &haul_cell(alice.id(), "haul.head 2", &text("x"))),
+        ]);
+        assert!(verify_haul(&office, Some(&head), &newer).unwrap_err().contains("holds a haul.head 2 value"));
 
         // No cell exists in a haul directory without its proposal, nor a cell no rule covers.
         let other = haul_utils::haul_dir(&proposal("bob").id());
@@ -3255,11 +3267,16 @@ mod tests {
             assert!(error.contains("a merge is final"), "{}", error);
         }
 
-        // A status this build cannot read might read merged, so it is never changed.
+        // Nor does its head move once it is merged.
+        let advanced = haul_parcel(Some(&merged), &alice, &[
+            set(&format!("{}/head", dir), &haul_cell(alice.id(), haul_utils::SCHEMA_HEAD, &haul_utils::head_value(&"cd".repeat(32)))),
+        ]);
+        assert!(verify_haul(&office, Some(&merged), &advanced).unwrap_err().contains("a merge is final"));
+
+        // The rules read the status, so a status of a schema this build does not hold is refused
+        // rather than carried: carried, it might read merged where this build cannot tell.
         let newer = haul_parcel(Some(&head), &alice, &[set(&status, &haul_cell(alice.id(), "haul.status 2", &text("x")))]);
-        verify_haul(&office, Some(&head), &newer).unwrap();
-        let over = haul_parcel(Some(&newer), &alice, &[set(&status, &status_cell(&alice, &HaulStatus::Open))]);
-        assert!(verify_haul(&office, Some(&newer), &over).unwrap_err().contains("cannot tell whether the haul was merged"));
+        assert!(verify_haul(&office, Some(&head), &newer).unwrap_err().contains("holds a haul.status 2 value"));
 
         // A review sits under its writer's directory and names a full head.
         let review = |key: &Key| haul_cell(key.id(), haul_utils::SCHEMA_REVIEW,

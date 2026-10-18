@@ -289,7 +289,7 @@ fn unauthorized() -> HeadError {
 /// to every other. What actually constrains a push is content-level, run by [`Head::ref_update`]
 /// after authentication has already passed: closure presence (`verify_parcel_closure_with`),
 /// fast-forward-only refs, and — on a trusted warehouse — `verify_office_chain_memoized` +
-/// `verify_office_privileges` for an office-pallet update, `verify_converted_update` for a meta
+/// `verify_office_privileges` for an office-pallet update, `verify_meta_update` for a meta
 /// pallet on the meta-tree format (`@kv`, `@manifest`, `@tags`, `@haul`), or
 /// `verify_office_chain_memoized` + `verify_pallet_history` for a working pallet. The
 /// office and pallet-history checks differ: `verify_office_privileges` checks each

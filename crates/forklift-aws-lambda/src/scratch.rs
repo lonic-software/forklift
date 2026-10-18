@@ -237,7 +237,7 @@ pub fn materialize(
     Ok(())
 }
 
-/// Mirror one parcel's whole tree, blobs included: the state a converted meta pallet's content
+/// Mirror one parcel's whole tree, blobs included: the state a meta pallet's content
 /// check reads at the pallet's current head, whose tree [`materialize`]'s bound leaves out. It
 /// costs the size of the current state, never of the history. An absent parcel is skipped, as
 /// in [`materialize`].

@@ -22,7 +22,7 @@ use crate::output::{self, CommandOutput};
 /// remote its anchor is adopted (a one-way door, exactly like "office enroll"), and the
 /// office pallet fast-forwards so newly admitted operators can be verified locally.
 ///
-/// The meta pallets sync next, each on its own: a converted pallet that diverged has its
+/// The meta pallets sync next, each on its own: a meta pallet that diverged has its
 /// local net change replayed onto the remote head and lifted, unless both sides changed the
 /// same path differently — a conflict, which `keep` resolves path by path. A pallet that
 /// conflicts or fails stops only itself; the working pallet still lowers, and the command
@@ -389,7 +389,7 @@ async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<()
 type Keeps = BTreeMap<String, BTreeMap<String, KeepSide>>;
 
 /// Parse `--keep` values (`<pallet>:<path>=ours|theirs`) into cell paths, before anything is
-/// fetched. Only a converted pallet takes resolutions.
+/// fetched. Only a meta pallet takes resolutions.
 fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
     let mut keeps = Keeps::new();
 
@@ -410,7 +410,7 @@ fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
             _ => return Err(malformed()),
         };
 
-        let rules = meta_tree::converted_rules(pallet).ok_or(format!(
+        let rules = meta_tree::meta_rules(pallet).ok_or(format!(
             "\"--keep {}\": @{} takes no resolutions; it is not reconciled path by path.",
             spec, pallet
         ))?;
@@ -470,7 +470,7 @@ async fn sync_meta(client: &RemoteClient,
         let wire = pallet_utils::PalletRef::meta(name).to_wire();
         let keep = keeps.get(name).unwrap_or(&no_keeps);
 
-        let reconciled = match meta_tree::converted_rules(name) {
+        let reconciled = match meta_tree::meta_rules(name) {
             Some(rules) => replay(client, info, name, rules, remote_head, keep, &mut sync.restamped).await,
             None => Err(format!("The @{} pallet diverged from the remote and has no rules to replay it.", name)),
         };
@@ -503,7 +503,7 @@ async fn sync_meta(client: &RemoteClient,
     sync
 }
 
-/// Replay a converted pallet's local net change onto the remote head and lift the result. The
+/// Replay a meta pallet's local net change onto the remote head and lift the result. The
 /// remote's new parcels were verified when they were adopted. The local head moves only once
 /// the remote has accepted the replayed parcel.
 async fn replay(client: &RemoteClient,

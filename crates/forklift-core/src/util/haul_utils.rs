@@ -448,17 +448,47 @@ fn check_value(name: &CellName, table: &Table) -> Result<(), String> {
     }
 }
 
+/// The status of a haul in a `cells/` tree: `None` when it has none. A status this build cannot
+/// read is an error, since a rule that needs it cannot tell whether it reads merged.
+fn status_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<HaulStatus>, String> {
+    let path = format!("{}/{}", dir, CELL_STATUS);
+
+    match meta_tree::read_cell_in(cells, &path, rules)? {
+        None => Ok(None),
+        Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_STATUS =>
+            parse_status(&envelope.value).map(Some).map_err(|why| format!("the status at {} {}", path, why)),
+        Some(_) => Err(format!(
+            "the status at {} cannot be read by this forklift, so it cannot tell whether the haul \
+            was merged",
+            path
+        )),
+    }
+}
+
+/// The proposal of a haul in a `cells/` tree, or `None` when it has none.
+fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<Opened>, String> {
+    let path = format!("{}/{}", dir, CELL_OPENED);
+
+    match meta_tree::read_cell_in(cells, &path, rules)? {
+        None => Ok(None),
+        Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_OPENED =>
+            parse_opened(&envelope.value).map(Some).map_err(|why| format!("the proposal at {} {}", path, why)),
+        Some(_) => Err(format!("the proposal at {} cannot be read by this forklift", path)),
+    }
+}
+
 /// The pallet rules of `@haul`:
 ///
 /// - `opened` is written once, by its opener, at the id its content derives, together with a
 ///   `head`, and is never changed or removed;
 /// - a haul directory holds no other cell unless its `opened` cell is present;
-/// - `head` is never removed;
-/// - a `status` that reads merged is never changed or removed, and a status this build cannot
-///   read is never changed either, since it might read merged;
+/// - `head` is written only by the opener, never removed, and never moved once the haul is
+///   merged;
+/// - a `status` that reads merged is never changed or removed;
 /// - `review/<op>` and `comment/<op>/…` are written or removed only by the operator `op` names;
-/// - every cell holds its own schema and a strictly valid value, and no cell this build does
-///   not know is written.
+/// - `opened`, `head` and `status` hold exactly their own schema, since the rules read them; a
+///   review or comment of a newer schema is carried; and no cell name this build does not know
+///   is written.
 pub struct HaulRules;
 
 impl PalletRules for HaulRules {
@@ -473,6 +503,10 @@ impl PalletRules for HaulRules {
     fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
         let operator = &change.signer.operator;
         let owner = operator_leaf(operator);
+
+        // Each haul's proposal after the parcel, and its status before it, read once per haul.
+        let mut proposals: BTreeMap<String, Option<Opened>> = BTreeMap::new();
+        let mut statuses: BTreeMap<String, Option<HaulStatus>> = BTreeMap::new();
 
         for cell in change.changes {
             let path = parse_cell_path(&cell.path)?;
@@ -499,43 +533,57 @@ impl PalletRules for HaulRules {
                 _ => {}
             }
 
-            if path.name == CellName::Status {
-                if let Some(before) = &cell.before {
-                    let merged = match meta_tree::read_cell_blob(before, self)? {
-                        CellRead::Readable(envelope) => parse_status(&envelope.value)
-                            .map(|status| matches!(status, HaulStatus::Merged(_)))
-                            .map_err(|why| format!("the status at {} {}", cell.path, why))?,
-                        _ => return Err(format!(
-                            "the status at {} cannot be read by this forklift, so it cannot tell \
-                            whether the haul was merged; upgrade to change it",
-                            cell.path
-                        )),
-                    };
-
-                    if merged {
-                        return Err(format!("the haul {} is merged, and a merge is final", path.haul));
+            if matches!(path.name, CellName::Status | CellName::Head) && cell.before.is_some() {
+                let before = match statuses.get(&dir) {
+                    Some(status) => status.clone(),
+                    None => {
+                        let status = status_in(change.parent_cells, &dir, self)?;
+                        statuses.insert(dir.clone(), status.clone());
+                        status
                     }
+                };
+
+                if let Some(HaulStatus::Merged(_)) = before {
+                    return Err(format!("the haul {} is merged, and a merge is final", path.haul));
                 }
             }
 
             let Some(after) = &cell.after else { continue };
 
-            if meta_tree::read_cell_in(change.cells, &format!("{}/{}", dir, CELL_OPENED), self)?.is_none() {
+            let opened = match proposals.get(&dir) {
+                Some(opened) => opened.clone(),
+                None => {
+                    let opened = opened_in(change.cells, &dir, self)?;
+                    proposals.insert(dir.clone(), opened.clone());
+                    opened
+                }
+            };
+
+            let Some(opened) = opened else {
                 return Err(format!(
                     "the cell at {} belongs to a haul with no proposal; resolve the whole haul \
                     (its id) rather than its proposal alone",
                     cell.path
+                ));
+            };
+
+            // A head written with its proposal is the opener's by the proposal's own rule.
+            if path.name == CellName::Head && cell.before.is_some() && &opened.opener != operator {
+                return Err(format!(
+                    "the head at {} is written by {}, but only the haul's opener, {}, moves it",
+                    cell.path, operator, opened.opener
                 ));
             }
 
             let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
             let Some(schema) = schema_of(&path.name) else { continue };
 
-
             if envelope.schema != schema {
-                // A newer schema at a known cell is carried, except at the proposal, which the
-                // rules must read to check its id and its opener.
-                if self.knows_schema(&envelope.schema) || path.name == CellName::Opened {
+                // A review or comment of a newer schema is carried; the cells the rules read
+                // hold exactly their own.
+                let carried = matches!(path.name, CellName::Review { .. } | CellName::Comment { .. });
+
+                if self.knows_schema(&envelope.schema) || !carried {
                     return Err(format!("the cell at {} holds a {} value", cell.path, envelope.schema));
                 }
 
@@ -546,8 +594,6 @@ impl PalletRules for HaulRules {
 
             match &path.name {
                 CellName::Opened => {
-                    let opened = parse_opened(&envelope.value)?;
-
                     if opened.id() != path.haul {
                         return Err(format!("the proposal at {} is not at the id its content derives", cell.path));
                     }
@@ -624,7 +670,7 @@ fn stack(edits: &[CellEdit],
 }
 
 /// The operator a signing key belongs to.
-fn signing_operator(office: &OfficeState, signer: &MetaSigner) -> Result<String, String> {
+pub fn signing_operator(office: &OfficeState, signer: &MetaSigner) -> Result<String, String> {
     Ok(office.find_key(&signer.key_id)
         .ok_or(format!("The signing key {} is not in the office.", signer.key_id))?
         .operator
@@ -734,7 +780,6 @@ struct HaulCells {
     status: Option<CellRead>,
     reviews: Vec<(String, CellRead)>,
     comments: Vec<(String, CellRead)>,
-    other: Vec<(String, CellRead)>,
 }
 
 /// Read every haul at the local head, attributed through the office (read best-effort, so a
@@ -768,7 +813,10 @@ pub fn read_hauls() -> Result<HaulsRead, String> {
             CellName::Status => cells.status = Some(cell),
             CellName::Review { .. } => cells.reviews.push((path, cell)),
             CellName::Comment { .. } => cells.comments.push((path, cell)),
-            CellName::Other => cells.other.push((path, cell)),
+            CellName::Other => read.stray.push(UnreadableCell {
+                path,
+                reason: "a cell this forklift does not know a haul to hold".to_string(),
+            }),
         }
     }
 
@@ -853,13 +901,6 @@ fn read_haul(id: &str, cells: HaulCells, author: &dyn Fn(&str) -> String) -> Res
             Ok(comment) => haul.comments.push(comment),
             Err(reason) => haul.unreadable.push(UnreadableCell { path: display(path), reason }),
         }
-    }
-
-    for (path, _) in &cells.other {
-        haul.unreadable.push(UnreadableCell {
-            path: display(path),
-            reason: "a cell this forklift does not know".to_string(),
-        });
     }
 
     haul.comments.sort_by_key(|comment| comment.commented_at);

@@ -128,6 +128,22 @@ fn update(id: &str) -> Result<(), String> {
         .ok_or(format!("Pallet \"{}\" has nothing stacked.", haul.opened.source))?;
 
     let (office, actor, signer) = signing()?;
+
+    if haul.opened.opener != haul_utils::signing_operator(&office, &signer)? {
+        return Err(format!(
+            "Haul {} was opened by {}; only its opener updates its head.",
+            haul.id, haul.opened.opener
+        ));
+    }
+
+    if head != haul.head && !merge_utils::is_ancestor(&haul.head, &head)? {
+        return Err(format!(
+            "The head of \"{}\" no longer descends from the haul's head {}; a haul's head only \
+            moves forward.",
+            haul.opened.source, haul.head
+        ));
+    }
+
     let changed = haul_utils::record_head(&haul.id, &head, &office, &actor, &signer)?.is_some();
 
     output::emit(&Updated { id: haul.id, head, changed });
