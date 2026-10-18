@@ -533,7 +533,7 @@ itself as well as the findings.
      `Carry`. `restore .` now pays 1 barrier for 10 or 50 files (it paid 11 and 51), and no
      longer strips the rollups above the files it rewrites, so the next `stocktake` still
      skips them. Synthetic, 48 dirtied files: 721 → 20 ms. git.git, `restore Documentation`
-     (982 tracked files, 200 of them dirtied): 18.6 s → 0.55 s (34×), 982 barriers → 1. Each shard is published at its first touch. A caller must stat each file
+     (982 tracked files, 200 of them dirtied): 18.6 s → 0.55 s (34×), 982 barriers → 1. Each shard is published at the moment of its last change. A caller must stat each file
      right after writing it, then call `update`; writing many files first and statting them
      later would trust an edit made in between.
    * `park pop` (FORK-195), and `consolidate`/`cherry-pick`'s merge actions (FORK-196), are the
