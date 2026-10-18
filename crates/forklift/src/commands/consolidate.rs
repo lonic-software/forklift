@@ -475,7 +475,7 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
 
     // Their blobs load ahead on worker threads while the writes land here, in order.
     shift_utils::write_in_order(&writes, |action| match action {
-        MergeAction::TakeTheirs { hash, item_type, .. } => shift_utils::prefetch_blob(hash, *item_type),
+        MergeAction::TakeTheirs { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
         _ => None,
     }, |action, content| apply_merge_action(action, content, &mut conflict_paths))?;
 

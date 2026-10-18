@@ -333,7 +333,7 @@ pub fn apply_ops_each(ops: &[FileOp],
     let writes: Vec<&FileOp> = ops.iter().filter(|op| matches!(op, FileOp::Write { .. })).collect();
 
     write_in_order(&writes, |op| match op {
-        FileOp::Write { hash, item_type, .. } => prefetch_blob(hash, *item_type),
+        FileOp::Write { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
         FileOp::Remove { .. } => None,
     }, |op, content| {
         if let FileOp::Write { path, hash, item_type, is_new } = op {
@@ -344,45 +344,43 @@ pub fn apply_ops_each(ops: &[FileOp],
     })
 }
 
-/// Below this many writes, a materializer loads each blob itself: the prefetch's threads cost
-/// more than they save on a handful of files.
+/// Below this many blobs to load, a materializer loads each one itself: the prefetch's threads
+/// cost more than they save on a handful of files.
 const PREFETCH_THRESHOLD: usize = 8;
 
 /// How many blobs the prefetch may load ahead of the write that needs the next one.
 const PREFETCH_WINDOW: usize = 256;
 
-/// The bytes of loaded, unwritten blobs at which the prefetch stops loading ahead (each blob is
-/// under the chunk threshold, so it overshoots by at most one blob per worker).
+/// The bytes of loaded, unwritten blobs at which the prefetch stops loading ahead. Loads already
+/// under way finish, so the most held is this plus one blob per worker, and a prefetched blob is
+/// under the chunk threshold (larger ones stream at write time).
 const PREFETCH_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Load a tracked file's blob content ahead of its write, for [`write_tracked_file_from`]. A
-/// chunked entry is streamed at write time instead, so nothing is loaded for it (`None`).
-pub fn prefetch_blob(hash: &str, item_type: DirEntryType) -> Option<Result<Vec<u8>, String>> {
-    if item_type.is_chunked() {
-        return None;
-    }
-
-    Some(object_utils::load_blob(hash).map(|blob| blob.content))
+/// The blob a write loads ahead of time, if any: a chunked entry is streamed at write time
+/// instead, so nothing is loaded for it.
+fn prefetched<'a>(blob: Option<(&'a str, DirEntryType)>) -> Option<&'a str> {
+    blob.filter(|(_, item_type)| !item_type.is_chunked()).map(|(hash, _)| hash)
 }
 
 /// Run a materializer's writes in order on this thread while their blobs load ahead on worker
 /// threads (see [`fanout_utils::prefetch_in_order`]): reconstructing a blob from its delta chain
 /// is CPU work that overlaps, while the file system serializes the writes themselves, so they
-/// stay on one thread. Below [`PREFETCH_THRESHOLD`] writes, each item loads in turn instead.
+/// stay on one thread. Below [`PREFETCH_THRESHOLD`] blobs to load, each write loads its own.
 ///
 /// # Arguments
 /// * `items` - The writes, in the order they must land.
-/// * `load`  - The content to prefetch for one item ([`prefetch_blob`]), or `None`.
-/// * `write` - Applies one item with its prefetched content; the first error stops the run.
+/// * `blob`  - The blob one item writes (its hash and type), or `None` if it writes no stored blob.
+/// * `write` - Applies one item with its prefetched content (`None` if nothing was loaded for it,
+///             e.g. a chunked entry, which streams); the first error stops the run.
 ///
 /// # Returns
 /// * `Ok(())`      - If every write applied.
 /// * `Err(String)` - The first write's error, after every write before it has landed.
 pub fn write_in_order<T: Sync>(items: &[T],
-                               load: impl Fn(&T) -> Option<Result<Vec<u8>, String>> + Sync,
+                               blob: impl Fn(&T) -> Option<(&str, DirEntryType)> + Sync,
                                mut write: impl FnMut(&T, Option<Result<Vec<u8>, String>>) -> Result<(), String>)
                                -> Result<(), String> {
-    if items.len() < PREFETCH_THRESHOLD {
+    if items.iter().filter(|item| prefetched(blob(item)).is_some()).count() < PREFETCH_THRESHOLD {
         return items.iter().try_for_each(|item| write(item, None));
     }
 
@@ -390,7 +388,7 @@ pub fn write_in_order<T: Sync>(items: &[T],
         items,
         PREFETCH_WINDOW,
         PREFETCH_BUDGET_BYTES,
-        load,
+        |item| prefetched(blob(item)).map(|hash| object_utils::load_blob(hash).map(|loaded| loaded.content)),
         |content| match content {
             Some(Ok(bytes)) => bytes.len(),
             _ => 0,

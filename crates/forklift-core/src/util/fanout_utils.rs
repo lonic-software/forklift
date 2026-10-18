@@ -100,11 +100,12 @@ where
                 let scope_root = scope_root.as_deref();
                 let f = &f;
 
-                scope.spawn(move || {
+                worker(scope, move || {
                     let _scope = scope_root.map(StorageRootScope::enter);
 
                     slice.iter().map(f).collect::<Vec<R>>()
                 })
+                .expect("failed to spawn a fan-out worker")
             })
             .collect();
 
@@ -112,6 +113,19 @@ where
             .flat_map(|handle| handle.join().expect("a fan-out worker panicked"))
             .collect()
     })
+}
+
+/// The stack a fan-out worker gets: the size `forklift`'s own worker thread runs with, not the
+/// spawned-thread default (2 MiB). Workers load objects, and reconstructing a delta chain
+/// recurses once per link up to the pack reader's depth limit; that limit has to be reached
+/// as an error, not as a stack overflow, which aborts the process.
+const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Spawn one scoped fan-out worker with [`WORKER_STACK_SIZE`].
+fn worker<'scope, 'env, R: Send + 'scope>(scope: &'scope std::thread::Scope<'scope, 'env>,
+                                          f: impl FnOnce() -> R + Send + 'scope)
+                                          -> std::io::Result<std::thread::ScopedJoinHandle<'scope, R>> {
+    std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn_scoped(scope, f)
 }
 
 /// A loaded item waiting for the consumer: its size in budget units, and the load's outcome
@@ -131,11 +145,14 @@ struct PrefetchState<R> {
     ready: Vec<Option<Loaded<R>>>,
     /// Set when the consumer is done, early or not: workers stop claiming.
     stop: bool,
+    /// How many workers are running. A worker leaves only once it holds no claimed item, so
+    /// when none is left, an empty slot will never fill.
+    live: usize,
 }
 
 struct Prefetch<R> {
     state: std::sync::Mutex<PrefetchState<R>>,
-    /// Signalled when a slot fills (the consumer waits on it).
+    /// Signalled when a slot fills or a worker exits (the consumer waits on it).
     filled: std::sync::Condvar,
     /// Signalled when the consumer takes a slot or stops (workers wait on it).
     taken: std::sync::Condvar,
@@ -149,14 +166,25 @@ impl<R> Prefetch<R> {
     }
 }
 
-/// Stops the workers when the consumer leaves, however it leaves (done, an error, or a panic),
-/// so the scope's join never waits on a worker blocked for room.
+/// Stops the workers when the consumer leaves, however it leaves (done, an error, or a panic,
+/// spawning included), so the scope's join never waits on a worker blocked for room.
 struct StopOnDrop<'a, R>(&'a Prefetch<R>);
 
 impl<R> Drop for StopOnDrop<'_, R> {
     fn drop(&mut self) {
         self.0.lock().stop = true;
         self.0.taken.notify_all();
+    }
+}
+
+/// Counts a worker out when it exits, however it exits, and wakes the consumer so it never
+/// waits on a slot no worker is left to fill.
+struct ExitOnDrop<'a, R>(&'a Prefetch<R>);
+
+impl<R> Drop for ExitOnDrop<'_, R> {
+    fn drop(&mut self) {
+        self.0.lock().live -= 1;
+        self.0.filled.notify_one();
     }
 }
 
@@ -175,8 +203,9 @@ impl<R> Drop for StopOnDrop<'_, R> {
 /// A panic in `load` or `size` is re-raised on the calling thread when the consumer reaches that
 /// item, so every item before it is consumed first, as a serial loop would.
 ///
-/// Below two workers (one item, or one CPU) it runs inline: load, then consume, item by item.
-/// Workers re-enter the caller's storage scope, as [`fanout_map`]'s do.
+/// Below two workers (one item, or one CPU) it runs inline: load, then consume, item by item, as
+/// it does if no worker thread can be spawned. Workers re-enter the caller's storage scope, as
+/// [`fanout_map`]'s do.
 ///
 /// # Arguments
 /// * `items`   - The items, in the order the consumer must see them.
@@ -218,6 +247,7 @@ where
             held: 0,
             ready: (0..items.len()).map(|_| None).collect(),
             stop: false,
+            live: 0,
         }),
         filled: std::sync::Condvar::new(),
         taken: std::sync::Condvar::new(),
@@ -226,13 +256,21 @@ where
     let scope_root = globals::current_scope_root();
 
     std::thread::scope(|scope| {
+        // Before the first spawn: a worker blocked for room must be released however the
+        // consumer leaves, including by a panic out of this function before the loop below.
+        let _stop = StopOnDrop(&shared);
+        let mut spawned = 0;
+
         for _ in 0..workers {
             let shared = &shared;
             let load = &load;
             let size = &size;
             let scope_root = scope_root.as_deref();
 
-            scope.spawn(move || {
+            shared.lock().live += 1;
+
+            let started = worker(scope, move || {
+                let _exit = ExitOnDrop(shared);
                 let _scope = scope_root.map(StorageRootScope::enter);
 
                 loop {
@@ -247,7 +285,7 @@ where
                             // The item the consumer waits for is always claimable. Nothing is held
                             // while it is unclaimed (everything held lies past it), so only a zero
                             // budget needs the second clause.
-                            let in_window = state.next < state.consumed + window;
+                            let in_window = state.next < state.consumed.saturating_add(window);
                             let has_room = state.held < budget || state.next == state.consumed;
 
                             if in_window && has_room {
@@ -277,9 +315,24 @@ where
                     shared.filled.notify_one();
                 }
             });
+
+            match started {
+                Ok(_) => spawned += 1,
+                Err(_) => {
+                    // Out of threads: the workers already running carry the run.
+                    shared.lock().live -= 1;
+                    break;
+                }
+            }
         }
 
-        let _stop = StopOnDrop(&shared);
+        if spawned == 0 {
+            for item in items {
+                consume(item, load(item))?;
+            }
+
+            return Ok(());
+        }
 
         for (index, item) in items.iter().enumerate() {
             let result = {
@@ -290,16 +343,30 @@ where
                         break loaded;
                     }
 
+                    // A worker exits holding no claimed item, so with none left this slot can
+                    // never fill. Only a worker dying outside its load does that.
+                    if state.live == 0 {
+                        drop(state);
+                        panic!("every prefetch worker exited before item {} was loaded", index);
+                    }
+
                     state = shared.filled.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
                 };
 
+                let blocked = state.held >= budget;
                 state.held -= units;
                 state.consumed = index + 1;
 
+                // The take moved the window one item, so one more claim can start, unless it
+                // also took the held size back under the budget, which can release them all.
+                if blocked && state.held < budget {
+                    shared.taken.notify_all();
+                } else {
+                    shared.taken.notify_one();
+                }
+
                 result
             };
-
-            shared.taken.notify_all();
 
             match result {
                 Ok(result) => consume(item, result)?,
@@ -579,5 +646,52 @@ mod tests {
         assert_eq!(mismatches, 0, "every worker must see the caller's entered storage root");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn an_unbounded_window_consumes_every_item() {
+        let items: Vec<usize> = (0..500).collect();
+        let mut seen = Vec::new();
+
+        // `usize::MAX` reads as "no window": the window's end must not overflow.
+        let result: Result<(), ()> = prefetch_in_order(&items, usize::MAX, usize::MAX, |n| *n, |_| 1, |item, loaded| {
+            assert_eq!(*item, loaded);
+            seen.push(loaded);
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen, items);
+    }
+
+    /// Recurses through 16 KiB of stack per level (3 MiB at 192 levels): more than a spawned
+    /// thread's default (2 MiB), as a long delta chain's reconstruction can need. Overflowing
+    /// aborts the test process.
+    fn stack_hungry(depth: usize) -> u8 {
+        let mut frame = [depth as u8; 16 * 1024];
+        std::hint::black_box(&mut frame);
+
+        if depth == 0 { frame[0] } else { stack_hungry(depth - 1).wrapping_add(frame[1]) }
+    }
+
+    #[test]
+    fn fan_out_workers_have_the_stack_of_forklifts_own_thread() {
+        if !has_workers() {
+            return;
+        }
+
+        let items: Vec<usize> = (0..16).collect();
+
+        let mapped = fanout_map(&items, |_| stack_hungry(192));
+        assert_eq!(mapped.len(), items.len());
+
+        let mut consumed = 0;
+        let result: Result<(), ()> = prefetch_in_order(&items, 4, usize::MAX, |_| stack_hungry(192), |_| 1, |_, _| {
+            consumed += 1;
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(consumed, items.len());
     }
 }
