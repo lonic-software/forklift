@@ -104,11 +104,17 @@ impl Drop for StoreLock {
     }
 }
 
+/// Where the current warehouse's [`ServeLock`] file lives, held or not.
+pub fn serve_lock_path() -> PathBuf {
+    absolute(forklift_root().join(FILE_NAME_SERVE_LOCK))
+}
+
 /// An exclusive lock marking a warehouse root as **served by a live server** (or held for the
 /// duration of a serve-exclusive maintenance command).
 ///
 /// The server head acquires it once at startup — for the single served root, or per warehouse in
-/// multi-warehouse mode — and holds it for the whole process lifetime; `gc` acquires it for its
+/// multi-warehouse mode — and holds it while it serves that root: the whole process lifetime for
+/// a single root, until the warehouse is let go as idle in multi-warehouse mode; `gc` acquires it for its
 /// duration, and so does a full repack (`compact --all`, FORK-149), which drops every packed object
 /// outside the live set with no grace period at all. That makes them mutually exclusive on a given
 /// root: neither can sweep a live server's in-flight objects (a lift slower than the grace period —
@@ -139,7 +145,7 @@ impl ServeLock {
         // Lives at `forklift_root` (the shared store root), like the store lock: the server, `gc`
         // and a repack all enter the same storage-root scope, so they agree on the path. Absolute
         // for the same reason as the other locks — the working directory can change before drop.
-        let path = absolute(forklift_root().join(FILE_NAME_SERVE_LOCK));
+        let path = serve_lock_path();
         acquire_lock_file(&path, "warehouse root")?;
         Ok(ServeLock { path })
     }
@@ -607,11 +613,6 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
-    /// The open-file search against a fake kernel: it lands on the largest limit the ceiling
-    /// allows, from below or above the fallback, and never tries a limit at or under the current
-    /// one — including when the current limit is already above the fallback, where a search that
-    /// started from the fallback would run downward.
-    #[cfg(unix)]
     /// One base folder, one server: a second hold on it is refused while the first lives, and
     /// taken once it is dropped. The lock is per open file, so this holds within one process too.
     #[test]
@@ -630,6 +631,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The open-file search against a fake kernel: it lands on the largest limit the ceiling
+    /// allows, from below or above the fallback, and never tries a limit at or under the current
+    /// one — including when the current limit is already above the fallback, where a search that
+    /// started from the fallback would run downward.
+    #[cfg(unix)]
     #[test]
     fn the_open_file_search_finds_the_largest_accepted_limit_and_never_lowers() {
         let search = |current, hard, fallback, ceiling| {

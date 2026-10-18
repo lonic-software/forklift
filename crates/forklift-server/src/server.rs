@@ -209,22 +209,34 @@ impl WarehouseRegistry {
     }
 }
 
-/// Stop serving a warehouse whose handle nothing else holds: drop this process's cached pack set
-/// for it, then the handle with its serve lock and store-access hold.
+/// Stop serving a warehouse whose handle nothing else holds: forget everything this process
+/// caches about its objects, then drop the handle with its serve lock and store-access hold.
 ///
-/// Dropping the pack set is what keeps letting go safe, not just tidy. Once the holds are released
-/// a full repack may delete packed objects, and a cached pack set is trusted on a hit without
-/// looking at the folder again: kept, it would answer "present" for a deleted object to the next
-/// request for this warehouse, both to a client deciding what to upload and to the closure check a
-/// ref update must pass. The caller holds the registry mutex, so this finishes before any request
-/// can serve the warehouse again.
+/// Forgetting the caches is what keeps letting go safe, not just tidy. Once the holds are released
+/// `gc` or a full repack may delete objects, and the pack set, the object cache and the parsed-tree
+/// cache all answer a hit without looking at the disk: kept, they would answer "present" for a
+/// deleted object to the next request for this warehouse, both to a client deciding what to upload
+/// and to the closure check a ref update must pass. The caller holds the registry mutex, so this
+/// finishes before any request can serve the warehouse again.
+///
+/// The serve lock is a file its drop removes, best-effort. One left behind would refuse this server
+/// the warehouse from then on, with a 503 naming the lock, so that is logged as the error it is.
 fn let_go(handle: Arc<WarehouseHandle>) {
-    {
+    let serve_lock = {
         let _scope = StorageRootScope::enter(&handle.root);
-        pack_utils::invalidate_cache();
-    }
+        pack_utils::forget_warehouse();
+        lock_utils::serve_lock_path()
+    };
 
+    let had_serve_lock = handle._serve_lock.is_some();
     drop(handle);
+
+    if had_serve_lock && serve_lock.exists() {
+        tracing::error!(
+            lock = %serve_lock.display(),
+            "a warehouse let go kept its serve lock; it is refused until the file is removed"
+        );
+    }
 }
 
 /// The shared server state.
@@ -1437,8 +1449,6 @@ fn resolve_warehouse(state: &AppState,
         ));
     }
 
-    registry.make_room();
-
     // Acquire this warehouse's serve lock as it is served, and hold it in the registry's handle
     // until the handle is let go. Refuses (503) if a `gc`, full repack or scope-prune is running
     // against this warehouse, or another server already serves it — serving it then would be
@@ -1449,6 +1459,9 @@ fn resolve_warehouse(state: &AppState,
             format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, e),
         ))?
     );
+
+    // Only once it is served: a refused warehouse must not cost a live one its place.
+    registry.make_room();
     registry.insert(id, Arc::clone(&handle));
 
     Ok(handle)
@@ -1461,11 +1474,19 @@ async fn blocking<T: Send + 'static>(
     warehouse: Arc<WarehouseHandle>,
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
-    tokio::task::spawn_blocking(move || {
+    blocking_unscoped(move || {
         let _scope = StorageRootScope::enter(&warehouse.root);
 
         work()
-    })
+    }).await
+}
+
+/// Run blocking work on the blocking pool outside any warehouse's scope — for work on the server's
+/// folders themselves, such as creating a warehouse.
+async fn blocking_unscoped<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
+) -> Result<T, HandlerError> {
+    tokio::task::spawn_blocking(work)
         .await
         .map_err(|e| internal(format!("A storage task failed: {}", e)))?
 }
@@ -1512,7 +1533,7 @@ fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, Handle
         let _scope = StorageRootScope::enter(&staging);
         warehouse_utils::prepare_warehouse().map(|_| ())
     }
-        .and_then(|_| file_utils::sync_dir(&staging));
+        .and_then(|_| sync_tree(&staging));
 
     if let Err(error) = prepared {
         let _ = std::fs::remove_dir_all(&staging);
@@ -1558,6 +1579,36 @@ fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, Handle
     }
 }
 
+/// fsync every file and folder under `dir`, deepest first, so renaming `dir` into place publishes
+/// it whole: a warehouse is never visible after a power loss with part of its preparation missing,
+/// which nothing would repair (a later `PUT` finds it and answers 200). A no-op when fsync is off.
+fn sync_tree(dir: &std::path::Path) -> Result<(), String> {
+    if !file_utils::fsync_enabled() {
+        return Ok(());
+    }
+
+    let failed = |path: &std::path::Path, e: std::io::Error| {
+        format!("Error while syncing \"{}\": {}", path.display(), e)
+    };
+
+    for entry in std::fs::read_dir(dir).map_err(|e| failed(dir, e))? {
+        let entry = entry.map_err(|e| failed(dir, e))?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| failed(&path, e))?;
+
+        if file_type.is_dir() {
+            sync_tree(&path)?;
+        } else if file_type.is_file() {
+            // A write handle: Windows refuses to flush a file opened read-only.
+            std::fs::OpenOptions::new().write(true).open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| failed(&path, e))?;
+        }
+    }
+
+    file_utils::sync_dir(dir)
+}
+
 /// Remove what interrupted warehouse creations left in `base`: the folders [`create_warehouse`]
 /// prepares in, which only a crash between their creation and their rename leaves behind. Runs at
 /// startup under the base-folder lock, when no creation can be in progress. Best-effort: anything
@@ -1573,7 +1624,11 @@ fn sweep_interrupted_creations(base: &std::path::Path) {
         }
 
         let path = entry.path();
-        match std::fs::remove_dir_all(&path) {
+        let removed = match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        match removed {
             Ok(()) => tracing::info!(path = %path.display(), "removed an interrupted warehouse creation"),
             Err(error) => tracing::warn!(
                 path = %path.display(), %error, "could not remove an interrupted warehouse creation"
@@ -1625,10 +1680,7 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
     }
 
     let (base, create_id) = (base.clone(), id.clone());
-    let result = tokio::task::spawn_blocking(move || create_warehouse(&base, &create_id))
-        .await
-        .map_err(|e| internal(format!("A storage task failed: {}", e)))
-        .and_then(|creation| creation);
+    let result = blocking_unscoped(move || create_warehouse(&base, &create_id)).await;
 
     match result {
         Ok(creation) => {
@@ -3751,6 +3803,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A warehouse that cannot be served (here: under `gc`, which holds its serve lock) is refused
+    /// without letting a live one go for it.
+    ///
+    /// Revert: `resolve_warehouse` makes room before serving → the idle `w1` is let go for a
+    /// warehouse that is then refused → red.
+    #[test]
+    fn a_refused_warehouse_costs_no_live_one_its_place() {
+        let base = scratch_dir("cap-refused");
+        let state = capped_state(&base, 1, &["w1", "busy"]);
+        std::fs::write(base.join("busy").join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock"), b"1").unwrap();
+
+        drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
+        let refused = resolve_warehouse(&state, &warehouse_params("busy")).err().expect("refused");
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
+        assert_eq!(live_ids(&state), ["w1"].map(String::from).into());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The idle warehouse let go is the least recently resolved one.
     ///
     /// Revert: `get` stops marking the entry as used → `a` is the oldest insert and is let go
@@ -3815,6 +3887,50 @@ mod tests {
         assert!(!present(&state), "served again, the deleted object must read missing");
 
         drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Letting a warehouse go forgets the objects and trees this process has read from it too: a
+    /// ref update's closure check loads trees through those caches, and both answer a hit without
+    /// looking at the disk.
+    ///
+    /// Revert: `pack_utils::forget_warehouse` stops calling `file_utils::forget_cached_objects`
+    /// (or `object_utils::forget_cached_trees`) → the deleted blob (or tree) still loads → red.
+    #[test]
+    fn a_warehouse_let_go_forgets_the_objects_it_read() {
+        let base = scratch_dir("cap-objects");
+        let state = capped_state(&base, 1, &["w1", "w2"]);
+        let root = base.join("w1");
+        {
+            let _scope = StorageRootScope::enter(&root);
+            warehouse_utils::prepare_warehouse().unwrap();
+        }
+
+        let (blob, tree) = {
+            let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
+            let _scope = StorageRootScope::enter(&handle.root);
+            let bytes = b"an object read while served";
+            let blob = object_utils::hash_object_bytes(bytes);
+            object_utils::store_object_bytes(&blob, bytes).unwrap();
+            let tree = object_utils::empty_tree_hash().unwrap();
+            file_utils::retrieve_object_by_hash(&blob).unwrap();
+            object_utils::load_tree(&tree).unwrap();
+            (blob, tree)
+        };
+
+        // w1 goes idle and is let go; then its objects disappear, as `gc` would make them.
+        drop(resolve_warehouse(&state, &warehouse_params("w2")).unwrap());
+        assert!(!live_ids(&state).contains("w1"));
+        let objects = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects");
+        std::fs::remove_dir_all(&objects).unwrap();
+        std::fs::create_dir(&objects).unwrap();
+
+        let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
+        let _scope = StorageRootScope::enter(&handle.root);
+        assert!(file_utils::retrieve_object_by_hash(&blob).is_err(), "the deleted blob must not load");
+        assert!(object_utils::load_tree(&tree).is_err(), "the deleted tree must not load");
+
+        drop((_scope, handle, state));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3943,6 +4059,7 @@ mod tests {
         std::fs::create_dir_all(base.join(format!("{}w-1-0", CREATING_PREFIX)).join(FOLDER_NAME_FORKLIFT_ROOT))
             .unwrap();
         std::fs::create_dir_all(base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        std::fs::write(base.join(format!("{}stray", CREATING_PREFIX)), b"").unwrap();
         std::fs::write(base.join(lock_utils::FILE_NAME_BASE_SERVE_LOCK), b"").unwrap();
 
         sweep_interrupted_creations(&base);
