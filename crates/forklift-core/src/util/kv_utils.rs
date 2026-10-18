@@ -335,3 +335,66 @@ pub fn log(subject: &str, key: &str) -> Result<Vec<KvChange>, String> {
 fn short(hash: &str) -> &str {
     &hash[..hash.len().min(12)]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subject() -> String {
+        "ab".to_string() + &"c".repeat(62)
+    }
+
+    #[test]
+    fn a_cell_path_round_trips_and_nothing_else_parses() {
+        let path = cell_path(&subject(), "ci");
+        assert_eq!(path, format!("ab/{}/ci", subject()));
+        assert_eq!(parse_cell_path(&path).unwrap(), (subject(), "ci".to_string()));
+
+        for wrong in [
+            format!("{}/ci", subject()),                // no fan
+            format!("cd/{}/ci", subject()),             // the wrong fan
+            format!("ab/{}/ci/deeper", subject()),      // below a key
+            "ab/abc/ci".to_string(),                    // not a parcel hash
+            format!("ab/{}/{}", subject(), "k".repeat(MAX_KEY_BYTES + 1)),
+        ] {
+            assert!(parse_cell_path(&wrong).is_err(), "{} must not parse", wrong);
+        }
+    }
+
+    #[test]
+    fn keys_and_values_are_bounded() {
+        assert!(validate_key(&"k".repeat(MAX_KEY_BYTES)).is_ok());
+        assert!(validate_key(&"k".repeat(MAX_KEY_BYTES + 1)).is_err());
+        assert!(validate_key("a/b").is_err(), "a key is one component");
+        assert!(validate_key("").is_err());
+
+        assert!(validate_value(&"v".repeat(MAX_VALUE_BYTES)).is_ok());
+        assert!(validate_value(&"v".repeat(MAX_VALUE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn a_text_value_reads_back_and_a_malformed_one_says_why() {
+        assert_eq!(text_of(&text_value("multi\nline")).unwrap(), "multi\nline");
+
+        let mut extra = text_value("x");
+        extra.insert("other", value("y"));
+        assert!(text_of(&extra).unwrap_err().contains("unexpected field"));
+
+        let mut not_text = Table::new();
+        not_text.insert(FIELD_TEXT, value(7));
+        assert!(text_of(&not_text).unwrap_err().contains("not a string"));
+
+        assert!(text_of(&Table::new()).unwrap_err().contains("no text field"));
+        assert!(text_of(&text_value(&"v".repeat(MAX_VALUE_BYTES + 1))).is_err());
+    }
+
+    #[test]
+    fn a_resolution_names_a_subject_or_one_of_its_keys() {
+        assert_eq!(KvRules.resolution_path(&subject()).unwrap(), format!("ab/{}", subject()));
+        assert_eq!(KvRules.resolution_path(&format!("{}/ci", subject())).unwrap(), cell_path(&subject(), "ci"));
+        assert!(KvRules.resolution_path("main/ci").is_err(), "a revision is not a subject here");
+        assert!(KvRules.resolution_path(&format!("{}/a/b", subject())).is_err());
+
+        assert_eq!(KvRules.display_path(&cell_path(&subject(), "ci")), format!("{}/ci", subject()));
+    }
+}

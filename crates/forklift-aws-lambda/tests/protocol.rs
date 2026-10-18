@@ -463,6 +463,52 @@ fn trusted_lift_audits_the_office_and_the_pallet() {
     assert!(info.trust.is_some());
 }
 
+/// `@kv` lifts only under a lifted office, through the content check, incrementally from a
+/// head it already holds; a meta pallet name the head does not know is refused outright.
+#[test]
+fn kv_lifts_under_the_office_and_unknown_meta_names_are_refused() {
+    let area = Area::new("kv");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["kv", "set", "main", "ci", "green"]);
+    let first = harvest(&area.path("wh")).head_of("@kv").expect("kv head");
+    area.forklift("wh", &["kv", "set", "main", "review", "done"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let second = harvest.head_of("@kv").expect("kv head");
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest);
+    head.put_trust(&harvest.trust.clone().expect("trust")).expect("put trust");
+
+    // Before the office: there are no keys to check the stamps against.
+    let err = head
+        .ref_update("@kv", &RefUpdateRequest { old_head: None, new_head: first.clone() })
+        .expect_err("kv before the office");
+    assert_eq!(err.status, Status::Unprocessable);
+
+    head.ref_update(&format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
+        old_head: None,
+        new_head: office_head,
+    })
+    .expect("lift office");
+
+    let err = head
+        .ref_update("@foo", &RefUpdateRequest { old_head: None, new_head: first.clone() })
+        .expect_err("an unknown meta pallet");
+    assert_eq!(err.status, Status::Unprocessable);
+
+    head.ref_update("@kv", &RefUpdateRequest { old_head: None, new_head: first.clone() })
+        .expect("lift kv");
+    head.ref_update("@kv", &RefUpdateRequest { old_head: Some(first), new_head: second.clone() })
+        .expect("lift kv again, checked from the head it holds");
+    assert_eq!(head.handshake().expect("handshake").pallets.get("@kv"), Some(&second));
+}
+
 /// On a trusted warehouse, a user-pallet lift before the office is lifted is refused: the
 /// audit has no keys to verify against.
 #[test]
