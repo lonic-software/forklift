@@ -3110,4 +3110,44 @@ mod tests {
         let rewritten = manifest_parcel(Some(&head), &alice, &[set(&path, &again)]);
         verify_manifest(&office, Some(&head), &rewritten).unwrap();
     }
+
+    #[test]
+    fn a_tag_or_entry_this_build_cannot_read_is_listed_beside_the_rest() {
+        use manifest_utils::{cell_path, ManifestKind};
+
+        let _scratch = Scratch::new("unreadable-rows");
+        let alice = Key::new("alice", 1);
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin)]);
+        let subject = "ab".repeat(32);
+        let newer = store_blob(&encode_cell(alice.id(), "tags.tag 2", &text("from a newer forklift"))).unwrap();
+
+        stack_meta_edits("tags", &tag_utils::TagsRules, &office, &[
+            set("v1.0", &tag_cell(alice.id(), &subject)),
+            set("v2.0", &newer),
+        ], &actor("alice"), "tags", &alice.signer()).unwrap().unwrap();
+
+        let read = tag_utils::read_tags().unwrap();
+        assert_eq!(read.tags.iter().map(|tag| tag.tag.name.as_str()).collect::<Vec<_>>(), vec!["v1.0"]);
+        assert_eq!(read.unreadable.len(), 1);
+        assert_eq!(read.unreadable[0].name, "v2.0");
+        assert!(read.unreadable[0].reason.contains("tags.tag 2"), "{}", read.unreadable[0].reason);
+        assert!(tag_utils::find_tag("v2.0").unwrap_err().contains("cannot be read"));
+        assert_eq!(tag_utils::find_tag("v1.0").unwrap().unwrap().tagger, alice.id(), "no office on disk");
+
+        let note = note_entry(&subject, ManifestKind::Note, "lgtm");
+        let newer_path = format!("{}/{}/review/{}", &subject[..2], subject, "cd".repeat(32));
+        let newer = store_blob(&encode_cell(alice.id(), "manifest.review 1", &text("a newer kind"))).unwrap();
+
+        stack_meta_edits("manifest", &manifest_utils::ManifestRules, &office, &[
+            set(&cell_path("alice", &note), &note_cell(alice.id(), ManifestKind::Note, "lgtm")),
+            set(&newer_path, &newer),
+        ], &actor("alice"), "manifest", &alice.signer()).unwrap().unwrap();
+
+        let read = manifest_utils::read_manifest().unwrap();
+        assert_eq!(read.entries.len(), 1);
+        assert_eq!(read.entries[0].entry.body, "lgtm");
+        assert_eq!(read.unreadable.len(), 1);
+        assert_eq!(read.unreadable[0].subject.as_deref(), Some(subject.as_str()));
+        assert_eq!(read.unreadable[0].path, newer_path);
+    }
 }
