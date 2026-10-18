@@ -471,6 +471,64 @@ fn a_leftover_from_an_interrupted_assembly_is_cleared_and_never_reaches_the_work
 }
 
 #[test]
+fn assembly_leftovers_are_cleared_by_any_command_that_takes_the_lock() {
+    // A warehouse that never checks out another chunked file must not keep leftovers forever.
+    // A read-only command does not hold the lock, so it may not clear them: an assembly could
+    // be in flight.
+    let warehouse = Warehouse::new("assemble-sweep");
+    let assembly = warehouse.root.join(".forklift").join("assembly");
+    let plant = || {
+        std::fs::create_dir_all(&assembly).unwrap();
+        std::fs::write(assembly.join("1-0.tmp"), "half an assembly").unwrap();
+        std::fs::write(assembly.join("2-7.tmp"), "another").unwrap();
+    };
+    let left = || -> Vec<String> {
+        std::fs::read_dir(&assembly).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+
+    plant();
+    warehouse.run_ok(&["stocktake"]);
+    assert!(assembly.join("1-0.tmp").exists(), "a command without the lock cleared a leftover");
+
+    for command in [&["load", "."][..], &["heal"][..]] {
+        plant();
+        warehouse.run_ok(command);
+        assert!(left().is_empty(), "`{}` left assembly leftovers: {:?}", command.join(" "), left());
+    }
+}
+
+#[test]
+fn a_bay_clears_its_own_assembly_leftovers_and_no_other() {
+    // The lock and the assembly folder are both the bay's own: taking a bay's lock clears that
+    // bay's folder, and never the one a process holding another bay's lock may be assembling in.
+    let warehouse = Warehouse::new("assemble-sweep-bay");
+    let bay = warehouse.base.join("side");
+    let main_assembly = warehouse.root.join(".forklift").join("assembly");
+    let bay_assembly = warehouse.root.join(".forklift").join("bays").join("side").join("assembly");
+
+    warehouse.run_ok(&["bay", "add", "side", bay.to_str().unwrap()]);
+
+    std::fs::create_dir_all(&main_assembly).unwrap();
+    std::fs::create_dir_all(&bay_assembly).unwrap();
+    std::fs::write(main_assembly.join("1-0.tmp"), "the main tree's").unwrap();
+    std::fs::write(bay_assembly.join("2-0.tmp"), "the bay's").unwrap();
+
+    let output = forklift_command()
+        .args(["load", "."])
+        .current_dir(&bay)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "load in the bay failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    assert!(!bay_assembly.join("2-0.tmp").exists(), "the bay's lock left the bay's leftover");
+    assert!(main_assembly.join("1-0.tmp").exists(), "the bay's lock cleared the main tree's folder");
+}
+
+#[test]
 fn a_chunked_file_with_a_name_near_the_length_limit_checks_out() {
     // The temp name must not grow with the file's name, or a name the file system took when the
     // file was stacked could never be checked out again.

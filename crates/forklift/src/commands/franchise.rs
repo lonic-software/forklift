@@ -8,7 +8,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
-    bundle_utils, config_utils, object_utils, pack_utils, pallet_utils, remote_utils,
+    bundle_utils, config_utils, lock_utils, object_utils, pack_utils, pallet_utils, remote_utils,
     scope_utils, shift_utils, trust_utils, warehouse_utils,
 };
 use crate::output::{self, CommandOutput};
@@ -181,6 +181,10 @@ async fn franchise_into_prepared_target(
     info: WarehouseInfo,
 ) -> Result<(), String> {
     warehouse_utils::prepare_warehouse()?;
+
+    // The new warehouse's lock, held until it is filled: a command run in it meanwhile waits for
+    // it rather than staging against a half-made tree or clearing an assembly in flight.
+    let _lock = lock_utils::WarehouseLock::acquire()?;
 
     config_utils::set_value(config_utils::KEY_REMOTE_URL, url, ConfigScope::Warehouse)?;
 

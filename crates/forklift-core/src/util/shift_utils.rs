@@ -763,28 +763,16 @@ const FOLDER_NAME_ASSEMBLY: &str = "assembly";
 
 /// Create a fresh temp file to assemble a chunked file into, in [`FOLDER_NAME_ASSEMBLY`]. Its name
 /// is unique to this process and attempt and it is created new, so nothing already there is ever
-/// opened (a symlink would be followed). Once per process and folder, leftovers from other
-/// processes are cleared first: every command that materializes holds the warehouse lock, so none
-/// of them is still assembling.
+/// opened (a symlink would be followed). Leftovers of interrupted processes are not cleared here
+/// but by [`clear_assembly_leftovers`], when the bay's lock is taken.
 fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> {
     static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static CLEARED: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = std::sync::Mutex::new(None);
     const MAX_ATTEMPTS: usize = 64;
 
     let dir = crate::globals::bay_root().join(FOLDER_NAME_ASSEMBLY);
     file_utils::create_folder_if_not_exists(&dir)?;
 
     let pid = std::process::id();
-    {
-        let mut cleared = CLEARED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Keyed absolute: a command may change directory mid-run (`bay add`), and the relative
-        // path would then name another folder.
-        let key = std::path::absolute(&dir).unwrap_or_else(|_| dir.clone());
-        if cleared.get_or_insert_with(Default::default).insert(key) {
-            clear_other_assemblies(&dir, pid);
-        }
-    }
-
     let candidates = (0..MAX_ATTEMPTS).map(|_| {
         let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         dir.join(format!("{}-{}.tmp", pid, attempt))
@@ -793,16 +781,18 @@ fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> 
     create_first_new(path, candidates)
 }
 
-/// Remove every entry of the assembly folder that this process did not create. Best effort: a
-/// leftover that cannot be removed only costs space.
-fn clear_other_assemblies(dir: &Path, pid: u32) {
-    let ours = format!("{}-", pid);
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+/// Remove every entry of the active bay's assembly folder. Called by
+/// [`WarehouseLock::acquire`](crate::util::lock_utils::WarehouseLock::acquire) once the bay's
+/// lock is held. Every process that assembles into a bay holds that bay's lock (`bay add` and
+/// `franchise` take the lock of the one they create), so anything in the folder then was left by
+/// an interrupted process and is never read. Best effort: a leftover that cannot be removed only
+/// costs space.
+pub(crate) fn clear_assembly_leftovers() {
+    let dir = crate::globals::bay_root().join(FOLDER_NAME_ASSEMBLY);
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
 
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with(&ours) {
-            let _ = std::fs::remove_file(entry.path());
-        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 
