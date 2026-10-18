@@ -104,9 +104,12 @@ the same substrate.) A pack is two files under `.forklift/objects/pack/`:
 - `<id>.pack` — a 12-byte header then the objects' records concatenated. A full
   record's blob is **byte-identical** to the loose file (same zstd stream), so
   packing a full object re-hashes and re-compresses nothing — it only moves bytes.
-- `<id>.idx` — a header then fixed-width records `(32-byte hash, u64 offset, u64
-  length)` **sorted by hash**, so a lookup is a binary search over the resident
-  index and a single `read` at the offset. `<id>` is the Blake3 of each record's
+- `<id>.idx` — a header, a fanout table, then fixed-width records `(32-byte hash,
+  u64 offset, u64 length)` **sorted by hash**, so a lookup is a binary search in one
+  fanout bucket of the mapped index and a single slice at the offset. Each bucket
+  carries its own crc32 and is validated the first time a read touches it, so a
+  command pays for the buckets it reads, not the whole index (FORK-118; the layout
+  is in [`format/BUNDLE_FORMAT.md`](format/BUNDLE_FORMAT.md)). `<id>` is the Blake3 of each record's
   `(hash, offset, length)` triple — layout-derived, never the record bytes — so a
   repack that reproduces the same layout collides onto the same filename rather
   than piling up a fresh one. (An earlier scheme hashed only the pack's sorted
@@ -352,7 +355,7 @@ either does not do them (single-threaded) or cannot (its graph does not carry th
 | C3 | Memoize the objects *and* graph roots per scope — every object/graph read resolved a root (a bay-context lock + path allocations) for the pack-registry, read-cache, and graph-shard keys | all reads | — | low | **SHIPPED** — per-scope memo, invalidated on scope/bay change; ~5% off blame |
 | — | O(1) graph-shard LRU — the resident-shard cache scanned a `VecDeque` on every access (O(resident), and a `blame` hits it ×10⁴); now an access-clock stamp | blame, graph reads | — | low | **SHIPPED** — found while profiling #4 |
 | C2 | Tighten parcel decode/parse — a parcel carries richer signed-provenance *actions* than a git commit | history, blame | — | med | TODO — partly inherent to what forklift records |
-| 5 | 256-entry first-byte fanout in the `.idx` (narrows each binary search) | all lookups | yes | low | TODO — skipped for now (medium format work, ~1 ms at this scale) |
+| 5 | Fanout in the `.idx` (narrows each binary search) | all lookups | yes | low | **SHIPPED** (FORK-118) — a per-bucket-checksummed fanout, sized to ~32 records a bucket, which also lets a pack open validate only the buckets it reads |
 | 4 | Store the commit **timestamp** in the graph record → order/traverse without decoding parcels | `history -n` | yes (git's graph stores commit date) | low-med | **TRIED & REVERTED** — see below |
 | G | Carry the **subject** in the graph record too, so `--oneline`/`-n` render with *zero* parcel reads | history --oneline/-n | **no — and git declines this on purpose** | med | **SHELVED** — terse already beats git ~2× without it (below) |
 | H | *(beat git differently)* Reachability bitmaps for the transfer axis (clone/fetch/haul enumeration) — git's pack `.bitmap` equivalent | sync at scale | yes | high | TODO — a separate axis; measure a large fetch first |

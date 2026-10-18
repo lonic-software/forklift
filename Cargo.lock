@@ -1237,6 +1237,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "chrono",
+ "crc32fast",
  "ed25519-dalek",
  "flate2",
  "flume",

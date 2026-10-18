@@ -4,9 +4,10 @@
 //! Every object is normally its own zstd-compressed file (`file_utils::write_object_to_file`).
 //! At git.git scale that is ~400k tiny files: each pays filesystem slack, and a whole-history
 //! walk does that many random `open`+`read`s. `compact` sweeps the loose set into a handful of
-//! **packs** — an append-only data file plus a sorted index — so a read is a binary search in a
-//! resident index and one `read` at an offset, and the store is a few large files instead of a
-//! sea of small ones.
+//! **packs** — an append-only data file plus a sorted index — so a read is a binary search in one
+//! fanout bucket of a mapped index and one slice at an offset, and the store is a few large files
+//! instead of a sea of small ones. An index is validated bucket by bucket as reads touch it, so a
+//! command's cost follows the objects it reads, not the size of the store (`index_format`).
 //!
 //! Two invariants keep this safe and aligned with Forklift's philosophy:
 //!
@@ -62,17 +63,12 @@ const PACK_DATA_MAGIC: &[u8; 8] = b"FORKPACK";
 /// Magic + version prefixing a pack index file.
 const PACK_INDEX_MAGIC: &[u8; 8] = b"FORKPIDX";
 
-/// The current pack format version. Version 1 stored each record as a bare zstd blob;
-/// version 2 (phase 2) frames every record with a one-byte kind so a record can be a delta.
-/// Version-1 packs are still read (their records have no kind byte); new packs are written
-/// at the current version. Bump on any further incompatible layout change.
-const PACK_FORMAT_VERSION: u32 = 2;
+/// The pack format version, shared by the data file and the index. Version 3 (FORK-118) added the
+/// index's fanout table; versions 1 and 2 are refused by name, never read (see
+/// [`index_format`]). Bump on any further incompatible layout change.
+const PACK_FORMAT_VERSION: u32 = 3;
 
-/// The first framed pack version — at or above this, a data record starts with a kind byte;
-/// below it (version 1) the record is a bare zstd blob.
-const FIRST_FRAMED_VERSION: u32 = 2;
-
-/// Record kinds in a framed (version ≥ 2) pack.
+/// Record kinds: every data record leads with one of these bytes.
 /// A full object: the kind byte is followed by the object's zstd blob (as a loose file holds).
 const RECORD_FULL: u8 = 0;
 /// A delta: the kind byte is followed by `base hash (32) || target length (VLQ) || zstd delta`.
@@ -109,9 +105,6 @@ const MAX_DELTA_CHAIN: u32 = 50;
 /// The length of a pack data file header: magic (8) + version (4).
 const PACK_DATA_HEADER_LEN: u64 = 12;
 
-/// The length of a pack index header: magic (8) + version (4) + record count (4).
-const INDEX_HEADER_LEN: usize = 16;
-
 /// An object hash is a Blake3 digest: 32 raw bytes (64 hex characters).
 const HASH_LEN: usize = 32;
 
@@ -134,11 +127,10 @@ const PACK_ROLLOVER_OBJECTS: usize = 100_000;
 pub(crate) const MAX_TRANSPORT_PACK_BYTES: u64 =
     PACK_ROLLOVER_BYTES + object_utils::MAX_OBJECT_BYTES as u64 + 2 * 1024 * 1024;
 
-/// The largest native-pack index section a transport bundle may declare. One writer can carry at
-/// most `PACK_ROLLOVER_OBJECTS` records before it rolls; the fixed header and fixed-width records
-/// make the exact upper bound cheap to state and enforce before reading the section.
-pub(crate) const MAX_TRANSPORT_INDEX_BYTES: u64 =
-    (INDEX_HEADER_LEN + PACK_ROLLOVER_OBJECTS * INDEX_RECORD_LEN) as u64;
+/// The largest native-pack index section a transport bundle may declare: the exact length of an
+/// index holding `PACK_ROLLOVER_OBJECTS` records, the most one writer carries before it rolls,
+/// computed by the same function the writer and the reader use.
+pub(crate) const MAX_TRANSPORT_INDEX_BYTES: u64 = index_format::index_len(PACK_ROLLOVER_OBJECTS);
 
 /// Bound the number of native packs in one bundle independently of its byte lengths. Real bundle
 /// builders need one pack per ~512 MiB or 100k objects; 4096 leaves enormous headroom while keeping
@@ -205,7 +197,7 @@ pub struct PackSummary {
     pub id: String,
     /// Objects the pack holds (its index record count).
     pub objects: usize,
-    /// Of `objects`, how many are stored as deltas against a base (0 in a version-1 pack).
+    /// Of `objects`, how many are stored as deltas against a base.
     pub deltas: usize,
     /// On-disk bytes of the pack: its data file plus its index file.
     pub bytes: u64,
@@ -214,9 +206,9 @@ pub struct PackSummary {
 /// One quarantined or unenumerable pack index in a [`StoreStatus`] census (FORK-47,
 /// DESIGN.html §3.1.1) — an operator-facing pairing of the index file's path and why the loader
 /// could not fully trust it. Shared shape for both `StoreStatus::quarantined_packs` (index parsed;
-/// its data file did not load — `error` is `load_pack_pair`'s failure) and
-/// `StoreStatus::unenumerable_indexes` (the index itself did not parse — `error` is
-/// `parse_index_header`'s failure); which list an entry is in is what tells the two apart.
+/// its data file did not load, or the index failed full validation — `error` says which) and
+/// `StoreStatus::unenumerable_indexes` (the index itself did not parse — `error` is the parse
+/// failure); which list an entry is in is what tells the two apart.
 pub struct PackIndexProblem {
     /// The index file's on-disk path.
     pub index_path: String,
@@ -255,8 +247,9 @@ pub struct StoreStatus {
     /// see `mark_densify_pending`. A suggestion only; nothing ever acts on it automatically.
     pub densify_pending: bool,
     /// Pack indexes that parsed but whose paired data file could not be loaded (FORK-47,
-    /// DESIGN.html §3.1.1) — the objects they name are quarantined, not lost: a read for one of
-    /// them classifies an honest `Unverifiable` naming this index (never a bare `Absent`), and
+    /// DESIGN.html §3.1.1), or that failed full validation (a corrupt bucket, or records that do
+    /// not tile the data file). The objects they name are quarantined, not lost: a read of one the
+    /// index cannot vouch for classifies an honest `Unverifiable` (never a bare `Absent`), and
     /// `forklift heal` can still refetch them from a configured remote. Empty on a healthy store.
     pub quarantined_packs: Vec<PackIndexProblem>,
     /// Pack index files that could not even be parsed (FORK-47, DESIGN.html §3.1.1) — their hash
@@ -280,29 +273,21 @@ pub fn store_status() -> Result<StoreStatus, String> {
     let loose_objects = loose.len();
     let loose_bytes: u64 = loose.iter().map(|target| target.size).sum();
 
-    // Packs: reuse the reader (mmaps each data file, holds each index resident). Per pack we
-    // report its object count (the index), its delta count (the framed record kinds), and its
-    // on-disk size (data file + index file, both already sized once loaded). `PackSet`'s
-    // registry-independent load means a single orphaned or unparseable pack pair never fails this
-    // census (FORK-47, DESIGN.html §3.1.1) — both problem lists are surfaced below instead.
-    let PackSet { packs: loaded, quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder())?;
+    // Packs: reuse the reader (maps each data file and index). Per pack we report its object count
+    // (the index), its delta count (the record kinds), and its on-disk size (data file + index
+    // file, both already sized once loaded). `PackSet`'s registry-independent load means a single
+    // orphaned or unparseable pack pair never fails this census (FORK-47, DESIGN.html §3.1.1) —
+    // both problem lists are surfaced below instead. The load validates every index in full, so a
+    // pack with a corrupt bucket is listed as quarantined rather than counted.
+    let PackSet { packs: loaded, quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
 
     let mut packs = Vec::new();
     for pack in loaded {
-        let framed = pack.version >= FIRST_FRAMED_VERSION;
-        let mut deltas = 0;
-
-        if framed {
-            for record in 0..pack.count {
-                let record_offset = INDEX_HEADER_LEN + record * INDEX_RECORD_LEN;
-                let data_offset = read_u64_le(&pack.index, record_offset + HASH_LEN) as usize;
-                // A framed record leads with its kind byte; a delta is `RECORD_DELTA`. An
-                // out-of-bounds offset (corruption) reads as `None` — simply not a delta.
-                if pack.data.get(data_offset) == Some(&RECORD_DELTA) {
-                    deltas += 1;
-                }
-            }
-        }
+        // A record leads with its kind byte; a delta is `RECORD_DELTA`. The full load already
+        // validated every record against the data file's length.
+        let deltas = pack.records()?.iter()
+            .filter(|record| pack.data.get(record.offset as usize) == Some(&RECORD_DELTA))
+            .count();
 
         let id = pack.data_path.file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
@@ -310,9 +295,9 @@ pub fn store_status() -> Result<StoreStatus, String> {
 
         packs.push(PackSummary {
             id,
-            objects: pack.count,
+            objects: pack.index.count(),
             deltas,
-            bytes: pack.data.len() as u64 + pack.index.len() as u64,
+            bytes: pack.data.len() as u64 + pack.index.byte_len() as u64,
         });
     }
 
@@ -448,10 +433,469 @@ pub struct CompactStats {
     /// produce the bytes to pack, and the loose read path stays unbounded so the object stays
     /// fully readable.
     pub over_ceiling_skipped: usize,
+
+    /// Packs a full repack left exactly as found because their index failed full validation (a
+    /// corrupt bucket, or records that do not tile the data file): nothing was copied out of them
+    /// and they were not deleted, so the objects a sound bucket still serves stay readable. Each
+    /// entry is the validation error, which names the index file. Always empty for an incremental
+    /// compaction, which never reads existing packs.
+    pub unvalidated_packs: Vec<String>,
 }
 
-/// A pack loaded for reading: its data file memory-mapped, plus its index bytes held resident
-/// (header + sorted records), binary-searched in place — no per-record allocation.
+/// The pack index format (version 3, FORK-118, DESIGN.html §4.5), and the only code that knows
+/// where a record sits in an index file. Nothing outside this module computes a byte position in
+/// an index: every reader goes through a [`CheckedIndex`](index_format::CheckedIndex), which
+/// validates a bucket of records before it hands any of them out.
+///
+/// The layout, all integers little-endian:
+///
+/// * A 24-byte header: the magic `FORKPIDX`, `u32` version, `u32` record count, `u8` fanout bits
+///   (at most 20), three zero bytes, and a `u32` crc32 over header bytes 0..20 followed by the
+///   whole fanout table.
+/// * The fanout table: one 8-byte entry per bucket, `2^fanout_bits` of them. Bucket `b` holds the
+///   records whose hash's top `fanout_bits` bits equal `b`. Its entry is the `u32` cumulative end
+///   of the bucket (the number of records in buckets `0..=b`) and a `u32` crc32 over the bucket's
+///   record bytes.
+/// * The records, sorted by hash: 32-byte hash, `u64` data offset, `u64` length.
+///
+/// Opening an index checks the header and the fanout table only, under 1% of the file. A bucket's
+/// records are checked the first time something reads them: the crc matches, the hashes are
+/// strictly ascending and all carry the bucket's prefix, and, for an index paired with a data
+/// file, every record is a non-empty range inside that file's body. A bucket that passes proves,
+/// for its prefix, that a hit is in bounds and that a miss is real. Whole-index consumers
+/// validate every bucket first ([`CheckedIndex::all_records`]).
+mod index_format {
+    use std::ops::Range;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    use super::{read_u32_le, read_u64_le, HASH_LEN, INDEX_RECORD_LEN, PACK_DATA_HEADER_LEN,
+                PACK_FORMAT_VERSION, PACK_INDEX_MAGIC};
+
+    /// The fixed header: magic (8), version (4), count (4), fanout bits (1), zero (3), crc (4).
+    const HEADER_LEN: usize = 24;
+
+    /// Where the header's own crc sits; the crc covers the bytes before it.
+    const HEADER_CRC_OFFSET: usize = 20;
+
+    /// One fanout entry: the bucket's cumulative end (4) and its records' crc32 (4).
+    const FANOUT_ENTRY_LEN: usize = 8;
+
+    /// The most fanout bits an index may declare: a 2^20-entry table is 8 MiB, enough for an
+    /// average of 32 records per bucket up to 32M records.
+    const MAX_FANOUT_BITS: u32 = 20;
+
+    /// The writer sizes the table so a bucket averages at most this many records, which keeps a
+    /// lookup's validation to about 1.5 KiB of crc.
+    const TARGET_BUCKET_RECORDS: usize = 32;
+
+    /// The fanout bits the writer picks for `count` records: the smallest that brings the average
+    /// bucket to [`TARGET_BUCKET_RECORDS`] or below, capped at [`MAX_FANOUT_BITS`].
+    pub(super) const fn fanout_bits_for(count: usize) -> u32 {
+        let mut bits = 0;
+        while bits < MAX_FANOUT_BITS && count.div_ceil(1 << bits) > TARGET_BUCKET_RECORDS {
+            bits += 1;
+        }
+        bits
+    }
+
+    /// The exact file length of an index of `count` records with `bits` fanout bits.
+    const fn len_with(count: u64, bits: u32) -> u64 {
+        HEADER_LEN as u64 + FANOUT_ENTRY_LEN as u64 * (1u64 << bits) + INDEX_RECORD_LEN as u64 * count
+    }
+
+    /// The exact file length of the index the writer produces for `count` records.
+    pub(super) const fn index_len(count: usize) -> u64 {
+        len_with(count as u64, fanout_bits_for(count))
+    }
+
+    /// How many index buckets this process has validated (each at most once per loaded index),
+    /// for `FORKLIFT_DEBUG_PACK_COUNTS`.
+    pub(super) static BUCKETS_VALIDATED: AtomicU64 = AtomicU64::new(0);
+
+    /// The bucket a hash belongs to: its top `bits` bits.
+    fn bucket_of(hash: &[u8], bits: u32) -> usize {
+        if bits == 0 {
+            return 0;
+        }
+        let top = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+        (top >> (32 - bits)) as usize
+    }
+
+    /// Build an index over `records`, which must already be sorted by hash.
+    pub(super) fn build(records: &[([u8; HASH_LEN], u64, u64)]) -> Vec<u8> {
+        let bits = fanout_bits_for(records.len());
+        let buckets = 1usize << bits;
+        let mut bytes = Vec::with_capacity(len_with(records.len() as u64, bits) as usize);
+
+        bytes.extend_from_slice(PACK_INDEX_MAGIC);
+        bytes.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        bytes.push(bits as u8);
+        bytes.extend_from_slice(&[0u8; 3]);
+        bytes.extend_from_slice(&[0u8; 4]);
+
+        let fanout_start = bytes.len();
+        bytes.resize(fanout_start + FANOUT_ENTRY_LEN * buckets, 0);
+
+        let mut position = 0;
+        for bucket in 0..buckets {
+            let mut crc = crc32fast::Hasher::new();
+            while position < records.len() && bucket_of(&records[position].0, bits) == bucket {
+                let (hash, offset, length) = &records[position];
+                let mut record = [0u8; INDEX_RECORD_LEN];
+                record[..HASH_LEN].copy_from_slice(hash);
+                record[HASH_LEN..HASH_LEN + 8].copy_from_slice(&offset.to_le_bytes());
+                record[HASH_LEN + 8..].copy_from_slice(&length.to_le_bytes());
+                crc.update(&record);
+                bytes.extend_from_slice(&record);
+                position += 1;
+            }
+
+            let entry = fanout_start + bucket * FANOUT_ENTRY_LEN;
+            bytes[entry..entry + 4].copy_from_slice(&(position as u32).to_le_bytes());
+            bytes[entry + 4..entry + 8].copy_from_slice(&crc.finalize().to_le_bytes());
+        }
+
+        let header_crc = header_crc(&bytes, buckets);
+        bytes[HEADER_CRC_OFFSET..HEADER_LEN].copy_from_slice(&header_crc.to_le_bytes());
+        bytes
+    }
+
+    /// crc32 over header bytes 0..20 and the fanout table.
+    fn header_crc(bytes: &[u8], buckets: usize) -> u32 {
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&bytes[..HEADER_CRC_OFFSET]);
+        crc.update(&bytes[HEADER_LEN..HEADER_LEN + FANOUT_ENTRY_LEN * buckets]);
+        crc.finalize()
+    }
+
+    /// What an index's header and fanout table declare, once both have been checked.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Layout {
+        count: usize,
+        bits: u32,
+    }
+
+    impl Layout {
+        /// Check an index's header and fanout table: the magic, version 3, the fanout bits and
+        /// the zero bytes, the exact file length, the header crc, and that the bucket ends never
+        /// decrease and finish at the record count. Reads no record.
+        pub(super) fn parse(bytes: &[u8], path: &Path) -> Result<Layout, String> {
+            let corrupt = || format!("Pack index \"{}\" is corrupt or has an unknown format.", path.to_string_lossy());
+
+            if bytes.len() < HEADER_LEN || &bytes[0..8] != PACK_INDEX_MAGIC {
+                return Err(corrupt());
+            }
+
+            let version = read_u32_le(bytes, 8);
+            if version != PACK_FORMAT_VERSION {
+                return Err(format!(
+                    "Pack index \"{}\" has format version {}, but this build reads only version {}.",
+                    path.to_string_lossy(), version, PACK_FORMAT_VERSION
+                ));
+            }
+
+            let count = read_u32_le(bytes, 12) as usize;
+            let bits = bytes[16] as u32;
+            if bits > MAX_FANOUT_BITS || bytes[17..20] != [0, 0, 0] {
+                return Err(corrupt());
+            }
+
+            if bytes.len() as u64 != len_with(count as u64, bits) {
+                return Err(corrupt());
+            }
+
+            let buckets = 1usize << bits;
+            if read_u32_le(bytes, HEADER_CRC_OFFSET) != header_crc(bytes, buckets) {
+                return Err(corrupt());
+            }
+
+            let mut previous = 0;
+            for bucket in 0..buckets {
+                let end = read_u32_le(bytes, HEADER_LEN + bucket * FANOUT_ENTRY_LEN) as usize;
+                if end < previous {
+                    return Err(corrupt());
+                }
+                previous = end;
+            }
+            if previous != count {
+                return Err(corrupt());
+            }
+
+            Ok(Layout { count, bits })
+        }
+    }
+
+    /// The answer to "where is this hash in this index?".
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Located {
+        /// The record's `(offset, length)` in the data file; its bucket passed validation.
+        Found(u64, u64),
+        /// The hash's bucket passed validation and does not hold it.
+        Missing,
+        /// The hash's bucket failed validation, so this index cannot say either way.
+        CorruptBucket(usize),
+    }
+
+    impl Located {
+        /// The record's `(offset, length)`, if the hash was found.
+        pub(super) fn found(self) -> Option<(u64, u64)> {
+            match self {
+                Located::Found(offset, length) => Some((offset, length)),
+                Located::Missing | Located::CorruptBucket(_) => None,
+            }
+        }
+    }
+
+    /// One index record.
+    #[derive(Clone, Copy)]
+    pub(super) struct Record<'a> {
+        pub(super) hash: &'a [u8],
+        pub(super) offset: u64,
+        pub(super) length: u64,
+    }
+
+    /// A bucket's verdict, cached per loaded index.
+    const UNCHECKED: u8 = 0;
+    const VALID: u8 = 1;
+    const CORRUPT: u8 = 2;
+
+    /// An index whose header and fanout table have been checked, over bytes it owns (a mapping or
+    /// a buffer), with a verdict cache that validates each bucket at most once.
+    pub(super) struct CheckedIndex<B> {
+        bytes: B,
+        layout: Layout,
+        /// The paired data file's length, which every record must fall inside, or `None` for an
+        /// index read without its data file; then only crc, order and prefix are checked.
+        data_len: Option<u64>,
+        verdicts: Box<[AtomicU8]>,
+    }
+
+    impl<B: AsRef<[u8]>> CheckedIndex<B> {
+        /// Wrap `bytes`, which `layout` was parsed from.
+        pub(super) fn new(bytes: B, layout: Layout, data_len: Option<u64>) -> CheckedIndex<B> {
+            assert_eq!(bytes.as_ref().len() as u64, len_with(layout.count as u64, layout.bits),
+                "an index's layout must come from its own bytes");
+            let verdicts = (0..1usize << layout.bits).map(|_| AtomicU8::new(UNCHECKED)).collect();
+            CheckedIndex { bytes, layout, data_len, verdicts }
+        }
+
+        /// The number of records.
+        pub(super) fn count(&self) -> usize {
+            self.layout.count
+        }
+
+        /// The index file's length in bytes.
+        pub(super) fn byte_len(&self) -> usize {
+            self.bytes.as_ref().len()
+        }
+
+        fn buckets(&self) -> usize {
+            1 << self.layout.bits
+        }
+
+        fn records_start(&self) -> usize {
+            HEADER_LEN + FANOUT_ENTRY_LEN * self.buckets()
+        }
+
+        /// The record positions bucket `bucket` spans, from the checked fanout table.
+        fn bucket_span(&self, bucket: usize) -> Range<usize> {
+            let bytes = self.bytes.as_ref();
+            let end_of = |b: usize| read_u32_le(bytes, HEADER_LEN + b * FANOUT_ENTRY_LEN) as usize;
+            let start = if bucket == 0 { 0 } else { end_of(bucket - 1) };
+            start..end_of(bucket)
+        }
+
+        fn record_at(&self, position: usize) -> Record<'_> {
+            let bytes = self.bytes.as_ref();
+            let start = self.records_start() + position * INDEX_RECORD_LEN;
+            Record {
+                hash: &bytes[start..start + HASH_LEN],
+                offset: read_u64_le(bytes, start + HASH_LEN),
+                length: read_u64_le(bytes, start + HASH_LEN + 8),
+            }
+        }
+
+        /// Whether bucket `bucket` passes validation, computing and caching the verdict on first
+        /// use. Two threads may both compute it; they reach the same answer.
+        fn bucket_is_valid(&self, bucket: usize) -> bool {
+            match self.verdicts[bucket].load(Ordering::Relaxed) {
+                VALID => return true,
+                CORRUPT => return false,
+                _ => {}
+            }
+
+            BUCKETS_VALIDATED.fetch_add(1, Ordering::Relaxed);
+            let valid = self.check_bucket(bucket);
+            self.verdicts[bucket].store(if valid { VALID } else { CORRUPT }, Ordering::Relaxed);
+            valid
+        }
+
+        fn check_bucket(&self, bucket: usize) -> bool {
+            let span = self.bucket_span(bucket);
+            let bytes = self.bytes.as_ref();
+            let start = self.records_start() + span.start * INDEX_RECORD_LEN;
+            let end = self.records_start() + span.end * INDEX_RECORD_LEN;
+
+            let stored_crc = read_u32_le(bytes, HEADER_LEN + bucket * FANOUT_ENTRY_LEN + 4);
+            if crc32fast::hash(&bytes[start..end]) != stored_crc {
+                return false;
+            }
+
+            let mut previous: Option<&[u8]> = None;
+            for position in span {
+                let record = self.record_at(position);
+
+                if previous.is_some_and(|previous| previous >= record.hash) {
+                    return false;
+                }
+                previous = Some(record.hash);
+
+                if bucket_of(record.hash, self.layout.bits) != bucket {
+                    return false;
+                }
+
+                if let Some(data_len) = self.data_len {
+                    let in_bounds = record.offset.checked_add(record.length)
+                        .is_some_and(|end| end <= data_len);
+                    if record.length == 0 || record.offset < PACK_DATA_HEADER_LEN || !in_bounds {
+                        return false;
+                    }
+                }
+            }
+
+            true
+        }
+
+        /// Find `hash`, validating only its bucket.
+        pub(super) fn locate(&self, hash: &[u8; HASH_LEN]) -> Located {
+            let bucket = bucket_of(hash, self.layout.bits);
+            if !self.bucket_is_valid(bucket) {
+                return Located::CorruptBucket(bucket);
+            }
+
+            let span = self.bucket_span(bucket);
+            let (mut low, mut high) = (span.start, span.end);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let record = self.record_at(mid);
+                match record.hash.cmp(hash.as_slice()) {
+                    std::cmp::Ordering::Less => low = mid + 1,
+                    std::cmp::Ordering::Greater => high = mid,
+                    std::cmp::Ordering::Equal => return Located::Found(record.offset, record.length),
+                }
+            }
+
+            Located::Missing
+        }
+
+        /// The buckets that can hold a hash whose hex form starts with `prefix`, or an empty range
+        /// when no hash can (a character that is not lowercase hex, or a prefix longer than a
+        /// hash).
+        fn buckets_for_hex_prefix(&self, prefix: &str) -> Range<usize> {
+            let bits = self.layout.bits;
+            if prefix.len() > HASH_LEN * 2 || !prefix.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+                return 0..0;
+            }
+
+            // The prefix's leading `known` bits, as a number.
+            let mut value = 0usize;
+            let mut known = 0;
+            for c in prefix.bytes() {
+                if known >= bits {
+                    break;
+                }
+                let nibble = (c as char).to_digit(16).expect("checked to be hex above") as usize;
+                value = (value << 4) | nibble;
+                known += 4;
+            }
+            if known > bits {
+                value >>= known - bits;
+                known = bits;
+            }
+
+            let first = value << (bits - known);
+            first..first + (1 << (bits - known))
+        }
+
+        /// The records of every bucket a hash starting with `prefix` could be in, validating each
+        /// of those buckets first. `Err(bucket)` names the first that failed.
+        pub(super) fn records_for_hex_prefix(&self, prefix: &str) -> Result<Vec<Record<'_>>, usize> {
+            let mut records = Vec::new();
+            for bucket in self.buckets_for_hex_prefix(prefix) {
+                if !self.bucket_is_valid(bucket) {
+                    return Err(bucket);
+                }
+                records.extend(self.bucket_span(bucket).map(|position| self.record_at(position)));
+            }
+            Ok(records)
+        }
+
+        /// Validate every bucket, then give access to every record. `Err(bucket)` names the first
+        /// bucket that failed.
+        pub(super) fn all_records(&self) -> Result<AllRecords<'_, B>, usize> {
+            for bucket in 0..self.buckets() {
+                if !self.bucket_is_valid(bucket) {
+                    return Err(bucket);
+                }
+            }
+            Ok(AllRecords { index: self })
+        }
+
+        /// Where record `position` starts in the file, so a test can corrupt it.
+        #[cfg(test)]
+        pub(super) fn record_byte_position(&self, position: usize) -> usize {
+            self.records_start() + position * INDEX_RECORD_LEN
+        }
+    }
+
+    /// Every record of an index all of whose buckets passed validation.
+    pub(super) struct AllRecords<'a, B> {
+        index: &'a CheckedIndex<B>,
+    }
+
+    impl<'a, B: AsRef<[u8]>> AllRecords<'a, B> {
+        pub(super) fn len(&self) -> usize {
+            self.index.count()
+        }
+
+        /// Record `position`, which must be below [`Self::len`].
+        pub(super) fn get(&self, position: usize) -> Record<'a> {
+            assert!(position < self.len(), "record position {} is past the index's {} records", position, self.len());
+            self.index.record_at(position)
+        }
+
+        pub(super) fn iter(&self) -> impl Iterator<Item = Record<'a>> + '_ {
+            (0..self.len()).map(|position| self.get(position))
+        }
+
+        /// Whether the records' ranges cover the data body from its header to `data_len` exactly
+        /// once, with no gap or overlap: the check that makes every byte of a published pack
+        /// accountable to one hash. It needs every record, so only whole-pack consumers run it.
+        pub(super) fn tile(&self, data_len: u64) -> bool {
+            let mut ranges: Vec<(u64, u64)> = self.iter()
+                .map(|record| (record.offset, record.offset.saturating_add(record.length)))
+                .collect();
+            super::sort_ranges_by_start(&mut ranges);
+
+            let mut expected = PACK_DATA_HEADER_LEN;
+            for (start, end) in ranges {
+                if start != expected {
+                    return false;
+                }
+                expected = end;
+            }
+            expected == data_len
+        }
+    }
+}
+
+use index_format::{CheckedIndex, Located};
+
+/// A pack loaded for reading: its data file and its index both memory-mapped. Loading checked the
+/// index's header and fanout table only; a lookup validates just the bucket it reads
+/// ([`CheckedIndex`]), and a whole-pack consumer runs [`LoadedPack::validate_full`] first.
 struct LoadedPack {
     data_path: PathBuf,
     /// The data file mapped into memory for the life of the loaded pack, so a read is a slice
@@ -460,36 +904,66 @@ struct LoadedPack {
     /// immutable once written (write-once, then deleted whole; never truncated) and a `compact`
     /// invalidates the whole registry, so the mapping never goes stale.
     data: memmap2::Mmap,
-    index: Vec<u8>,
-    count: usize,
-    /// The pack's format version — decides whether a data record carries a kind byte.
-    version: u32,
+    /// The index, mapped for the same reason and under the same immutability, with every record
+    /// bounded by `data`'s length.
+    index: CheckedIndex<memmap2::Mmap>,
+    /// [`Self::validate_full`]'s verdict, computed at most once per loaded pack.
+    full: OnceLock<Result<(), String>>,
+}
+
+/// How many packs this process has fully validated ([`LoadedPack::validate_full`]). Printed with
+/// the index bucket count under `FORKLIFT_DEBUG_PACK_COUNTS`, so a test can prove a command
+/// validated only the buckets it read.
+static PACK_FULL_VALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process-wide count of index buckets validated — see [`PACK_FULL_VALIDATIONS`].
+pub fn pack_buckets_validated() -> u64 {
+    index_format::BUCKETS_VALIDATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The process-wide count of packs fully validated — see [`PACK_FULL_VALIDATIONS`].
+pub fn pack_full_validations() -> u64 {
+    PACK_FULL_VALIDATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl LoadedPack {
-    /// The `(offset, length)` of the object with `hash_bytes` in this pack's data file, or
-    /// `None` if this pack does not hold it. Binary search over the sorted index records.
-    fn locate(&self, hash_bytes: &[u8; HASH_LEN]) -> Option<(u64, u64)> {
-        let mut low = 0usize;
-        let mut high = self.count;
+    /// Where `hash_bytes` is in this pack's data file, validating only the index bucket it would
+    /// be in.
+    fn locate(&self, hash_bytes: &[u8; HASH_LEN]) -> Located {
+        self.index.locate(hash_bytes)
+    }
 
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let record = INDEX_HEADER_LEN + mid * INDEX_RECORD_LEN;
-            let record_hash = &self.index[record..record + HASH_LEN];
+    fn index_path(&self) -> PathBuf {
+        self.data_path.with_extension(PACK_INDEX_EXTENSION)
+    }
 
-            match record_hash.cmp(hash_bytes.as_slice()) {
-                std::cmp::Ordering::Less => low = mid + 1,
-                std::cmp::Ordering::Greater => high = mid,
-                std::cmp::Ordering::Equal => {
-                    let offset = read_u64_le(&self.index, record + HASH_LEN);
-                    let length = read_u64_le(&self.index, record + HASH_LEN + 8);
-                    return Some((offset, length));
-                }
+    /// The error a reader reports for an index bucket that failed validation.
+    fn corrupt_bucket_error(&self, bucket: usize) -> String {
+        format!("Pack index \"{}\" is corrupt (bucket {}).", self.index_path().to_string_lossy(), bucket)
+    }
+
+    /// Validate the whole index: every bucket, and that the records tile the data body exactly
+    /// once. Run before anything that reads every record of a pack (a transport import, a
+    /// compaction's copy, a census), so whole-pack work never trusts a record a lookup would have
+    /// refused. Memoized: the second call is free.
+    fn validate_full(&self) -> Result<(), String> {
+        self.full.get_or_init(|| {
+            PACK_FULL_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let records = self.index.all_records().map_err(|bucket| self.corrupt_bucket_error(bucket))?;
+            if !records.tile(self.data.len() as u64) {
+                return Err(format!(
+                    "Pack index \"{}\" is corrupt: its records do not cover the data file exactly once.",
+                    self.index_path().to_string_lossy()
+                ));
             }
-        }
+            Ok(())
+        }).clone()
+    }
 
-        None
+    /// Every record, after [`Self::validate_full`] passes.
+    fn records(&self) -> Result<index_format::AllRecords<'_, memmap2::Mmap>, String> {
+        self.validate_full()?;
+        self.index.all_records().map_err(|bucket| self.corrupt_bucket_error(bucket))
     }
 
     /// A borrowed slice of `length` bytes at `offset` in this pack's mapped data file — no copy,
@@ -507,15 +981,14 @@ impl LoadedPack {
 }
 
 /// A pack index that parsed cleanly but whose data file could not be loaded (missing, unmappable,
-/// or shape-mismatched against the index — see `load_pack_pair`) — an orphaned `.idx`. Its raw
-/// sorted index bytes and record count are kept exactly as [`LoadedPack`] would keep them, so
-/// membership ([`QuarantinedPack::contains`]) is the same binary search over resident bytes, no
-/// per-hash parse. `error` is `load_pack_pair`'s own failure message, reused verbatim in the
+/// or shape-mismatched against the index — see `load_pack_pair`) — an orphaned `.idx`. Its index
+/// bytes are kept resident behind the same per-bucket checks [`LoadedPack`] uses, so membership
+/// ([`QuarantinedPack::contains`]) is a bucket lookup, no per-hash parse. `error` is `load_pack_pair`'s own failure message, reused verbatim in the
 /// `Unverifiable` wording a quarantine-named read produces (`file_utils::read_object_classified`).
 struct QuarantinedPack {
     index_path: PathBuf,
-    index: Vec<u8>,
-    count: usize,
+    /// Read into memory, never mapped: a quarantined index is not trusted to stay unchanged.
+    index: CheckedIndex<Vec<u8>>,
     error: String,
     /// Revalidation state (see [`reloaded_if_stale`]): the pair's files as they stood just before
     /// this load, what kind of failure it was, and when it was attempted.
@@ -667,26 +1140,15 @@ impl StampTimes {
 const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
 
 impl QuarantinedPack {
-    /// Whether this quarantined index names `hash_bytes` — the same sorted binary search
-    /// [`LoadedPack::locate`] runs, but membership-only (there is no data file to resolve an
-    /// offset/length against).
+    /// Whether this quarantined index names `hash_bytes`. There is no data file to bound records
+    /// against, so its buckets are checked for crc, order and prefix only. A bucket that fails
+    /// counts as naming every hash it could hold: the index cannot rule them out, so a read of one
+    /// is `Unverifiable`, never a bare `Absent`.
     fn contains(&self, hash_bytes: &[u8; HASH_LEN]) -> bool {
-        let mut low = 0usize;
-        let mut high = self.count;
-
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let record = INDEX_HEADER_LEN + mid * INDEX_RECORD_LEN;
-            let record_hash = &self.index[record..record + HASH_LEN];
-
-            match record_hash.cmp(hash_bytes.as_slice()) {
-                std::cmp::Ordering::Less => low = mid + 1,
-                std::cmp::Ordering::Greater => high = mid,
-                std::cmp::Ordering::Equal => return true,
-            }
+        match self.index.locate(hash_bytes) {
+            Located::Found(..) | Located::CorruptBucket(_) => true,
+            Located::Missing => false,
         }
-
-        false
     }
 }
 
@@ -805,7 +1267,7 @@ impl PackSetLocation {
                     return;
                 }
 
-                if let Ok(packs) = load_packs_from_disk(&folder) {
+                if let Ok(packs) = load_packs_from_disk(&folder, IndexCheck::Lazy) {
                     registry().lock().expect("the pack registry lock is poisoned")
                         .entry(key)
                         .or_insert_with(|| {
@@ -842,7 +1304,7 @@ impl PackPreload {
 /// older stamp, so the next miss sees the folder past it and reloads again.
 fn reload_packs() -> Result<Arc<PackSet>, String> {
     let key = file_utils::get_path_objects_root();
-    let packs = Arc::new(load_packs_from_disk(&pack_folder())?);
+    let packs = Arc::new(load_packs_from_disk(&pack_folder(), IndexCheck::Lazy)?);
 
     registry().lock().expect("the pack registry lock is poisoned")
         .insert(key, Arc::clone(&packs));
@@ -1054,7 +1516,7 @@ pub(crate) struct PackHealthSnapshot {
 /// * `Err(String)`            - The pack folder itself could not be enumerated (an environment
 ///                              failure — see [`load_packs_from_disk`]).
 pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
-    let PackSet { quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder())?;
+    let PackSet { quarantined, unenumerable, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
 
     Ok(PackHealthSnapshot {
         quarantined: quarantined.into_iter().map(|q| (q.index_path, q.error)).collect(),
@@ -1125,14 +1587,15 @@ pub fn densify_pending() -> Result<bool, String> {
     Ok(pack_folder().join(DENSIFY_MARKER_NAME).exists())
 }
 
-/// Load every pack in `pack_folder` (its index resident, its data file left on disk for
-/// per-object reads). A missing pack folder is simply no packs.
+/// Load every pack in `pack_folder` (its data file and index mapped). A missing pack folder is
+/// simply no packs. `check` decides how much of each index is validated up front: the registry
+/// loads [`IndexCheck::Lazy`], a census [`IndexCheck::Full`].
 ///
 /// A single broken pair no longer fails the whole load (FORK-47, DESIGN.html §3.1.1): a
 /// `load_pack_pair` failure re-attempts the registry-independent index parse alone (the same
-/// read-and-`parse_index_header` shape [`hashes_in_index_file`] uses, without ever touching the
-/// data file that just failed). If the index itself parses, the pair is orphaned rather than
-/// corrupt — its raw sorted bytes and `load_pack_pair`'s error are kept in `quarantined`, so a
+/// read-and-parse shape [`hashes_in_index_file`] uses, without ever touching the data file that
+/// just failed). If the index itself parses, the pair is orphaned rather than corrupt — its index
+/// bytes and the load's error are kept in `quarantined`, so a
 /// read for a hash it names can still say something honest (`quarantine_reason`) instead of a bare
 /// `Absent`. If the index does not parse either, it goes to `unenumerable` — its hash set is
 /// unknown, so (I4) it must never gate a verdict; it is inert until a future leg surfaces it.
@@ -1141,7 +1604,7 @@ pub fn densify_pending() -> Result<bool, String> {
 ///
 /// The returned set carries a [`FolderStamp`] taken before the listing, and each broken entry a
 /// [`PairStamp`] taken before its load, which is what [`reloaded_if_stale`] compares against.
-fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
+fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet, String> {
     PACK_SET_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mut packs = Vec::new();
@@ -1176,7 +1639,7 @@ fn load_packs_from_disk(pack_folder: &Path) -> Result<PackSet, String> {
             continue;
         }
 
-        match classify_pack_pair(&path) {
+        match classify_pack_pair(&path, check) {
             PairOutcome::Loaded(pack) => packs.push(pack),
             PairOutcome::Quarantined(pack) => quarantined.push(pack),
             PairOutcome::Unenumerable(pack) => unenumerable.push(pack),
@@ -1213,6 +1676,17 @@ fn folder_modified(pack_folder: &Path) -> Result<Option<SystemTime>, String> {
     }
 }
 
+/// How much of each index a pack load validates up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexCheck {
+    /// The header and fanout table only; each bucket is validated when a lookup first reads it.
+    /// What the pack registry loads, so a command pays only for the buckets it touches.
+    Lazy,
+    /// Every bucket and the tiling check ([`LoadedPack::validate_full`]): a pack that fails is
+    /// quarantined. What a census loads, so it reports every corrupt index.
+    Full,
+}
+
 /// What the loader makes of one index entry.
 enum PairOutcome {
     Loaded(LoadedPack),
@@ -1223,28 +1697,34 @@ enum PairOutcome {
 /// Classify one index entry exactly as the loader does — the single classifier both
 /// [`load_packs_from_disk`] and [`reloaded_if_stale`]'s retries rest on, so the two cannot
 /// disagree about what a pair is. A `load_pack_pair` failure re-attempts the registry-independent
-/// index parse alone (the same read-and-`parse_index_header` shape [`hashes_in_index_file`] uses,
-/// without touching the data file that just failed): an index that parses is quarantined, one
-/// that does not is unenumerable.
+/// index parse alone (the same read-and-parse shape [`hashes_in_index_file`] uses, without
+/// touching the data file that just failed): an index that parses is quarantined, one that does
+/// not is unenumerable. Under [`IndexCheck::Full`] a pair that loads but fails
+/// [`LoadedPack::validate_full`] is quarantined too, with that failure as its error.
 ///
 /// The pair is stamped before it is opened, so a change that lands during the load moves its
 /// files past the stamp.
-fn classify_pack_pair(index_path: &Path) -> PairOutcome {
+fn classify_pack_pair(index_path: &Path, check: IndexCheck) -> PairOutcome {
     let stamp = pair_stamp(index_path);
     let attempted_at = Instant::now();
     let data_path = index_path.with_extension(PACK_DATA_EXTENSION);
 
     let pair_failure = match load_pack_pair_classified(&data_path, index_path) {
-        Ok(pack) => return PairOutcome::Loaded(pack),
+        Ok(pack) => match check {
+            IndexCheck::Lazy => return PairOutcome::Loaded(pack),
+            IndexCheck::Full => match pack.validate_full() {
+                Ok(()) => return PairOutcome::Loaded(pack),
+                Err(message) => PairFailure::fixed(message),
+            },
+        },
         Err(failure) => failure,
     };
 
     match read_pack_file(index_path) {
-        Ok(index) => match parse_index_header(&index, index_path) {
-            Ok((count, _version)) => PairOutcome::Quarantined(QuarantinedPack {
+        Ok(index) => match index_format::Layout::parse(&index, index_path) {
+            Ok(layout) => PairOutcome::Quarantined(QuarantinedPack {
                 index_path: index_path.to_path_buf(),
-                index,
-                count,
+                index: CheckedIndex::new(index, layout, None),
                 error: pair_failure.message,
                 stamp,
                 failure: pair_failure.kind,
@@ -1311,13 +1791,32 @@ impl PairFailure {
     }
 }
 
-/// [`load_pack_pair`], keeping its failure's [`FailureKind`].
+/// [`load_pack_pair`], keeping its failure's [`FailureKind`]. Checks the index's header and fanout
+/// table and the data file's header; no record is read (see [`IndexCheck`]).
 fn load_pack_pair_classified(data_path: &Path, index_path: &Path) -> Result<LoadedPack, PairFailure> {
-    let index = read_pack_file(index_path).map_err(|failure| PairFailure {
+    let index_file = open_pack_file(index_path).map_err(|failure| PairFailure {
         message: format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), failure.error),
         kind: failure.kind,
     })?;
-    let (count, version) = parse_index_header(&index, index_path).map_err(PairFailure::fixed)?;
+    let index_len = index_file.metadata().map_err(|e| PairFailure {
+        message: format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), e),
+        kind: FailureKind::Io,
+    })?.len();
+    // Too short to hold a header: refuse it here, since mapping an empty file fails on some
+    // platforms with an error that would read as an I/O fault rather than a corrupt index.
+    if index_len < 24 {
+        return Err(PairFailure::fixed(format!(
+            "Pack index \"{}\" is corrupt or has an unknown format.", index_path.to_string_lossy()
+        )));
+    }
+    // SAFETY: as for the data file below: a published index is write-once, and a transport
+    // staging index is closed and never modified again before this mapping is dropped.
+    let index = unsafe { memmap2::Mmap::map(&index_file) }
+        .map_err(|e| PairFailure {
+            message: format!("Error while mapping pack index \"{}\": {}", index_path.to_string_lossy(), e),
+            kind: FailureKind::Io,
+        })?;
+    let layout = index_format::Layout::parse(&index, index_path).map_err(PairFailure::fixed)?;
 
     let file = open_pack_file(data_path).map_err(|failure| PairFailure {
         message: format!("Error while opening pack data \"{}\": {}", data_path.to_string_lossy(), failure.error),
@@ -1338,86 +1837,15 @@ fn load_pack_pair_classified(data_path: &Path, index_path: &Path) -> Result<Load
     }
 
     let data_version = read_u32_le(&data, 8);
-    if data_version != version {
+    if data_version != PACK_FORMAT_VERSION {
         return Err(PairFailure::fixed(format!(
-            "Pack data \"{}\" has format version {}, but its index has version {}.",
-            data_path.to_string_lossy(), data_version, version
+            "Pack data \"{}\" has format version {}, but this build reads only version {}.",
+            data_path.to_string_lossy(), data_version, PACK_FORMAT_VERSION
         )));
     }
 
-    validate_index_records(&index, count, data.len(), index_path).map_err(PairFailure::fixed)?;
-
-    Ok(LoadedPack { data_path: data_path.to_path_buf(), data, index, count, version })
-}
-
-/// Validate a pack index header and return its `(record count, format version)`.
-fn parse_index_header(index: &[u8], path: &Path) -> Result<(usize, u32), String> {
-    let corrupt = || format!("Pack index \"{}\" is corrupt or has an unknown format.", path.to_string_lossy());
-
-    if index.len() < INDEX_HEADER_LEN || &index[0..8] != PACK_INDEX_MAGIC {
-        return Err(corrupt());
-    }
-
-    // A newer version is refused (this build cannot understand it); older ones are read.
-    let version = read_u32_le(index, 8);
-    if version == 0 || version > PACK_FORMAT_VERSION {
-        return Err(format!(
-            "Pack index \"{}\" has format version {}, but this build understands up to {}.",
-            path.to_string_lossy(), version, PACK_FORMAT_VERSION
-        ));
-    }
-
-    let count = read_u32_le(index, 12) as usize;
-
-    if index.len() != INDEX_HEADER_LEN + count * INDEX_RECORD_LEN {
-        return Err(corrupt());
-    }
-
-    Ok((count, version))
-}
-
-/// Validate the index beyond its header: hashes are strictly sorted, record ranges are non-empty
-/// and in bounds, and the offset-sorted records cover the data body exactly once with no hidden
-/// gaps or overlaps. The native writer always has this shape; enforcing it on transport input
-/// makes every byte in a published pack accountable to exactly one hash.
-fn validate_index_records(index: &[u8], count: usize, data_len: usize, path: &Path) -> Result<(), String> {
-    let corrupt = || format!("Pack index \"{}\" is corrupt.", path.to_string_lossy());
-    let mut previous_hash: Option<&[u8]> = None;
-    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(count);
-
-    for position in 0..count {
-        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN;
-        let hash = &index[record..record + HASH_LEN];
-
-        if previous_hash.is_some_and(|previous| previous >= hash) {
-            return Err(corrupt());
-        }
-        previous_hash = Some(hash);
-
-        let offset = read_u64_le(index, record + HASH_LEN);
-        let length = read_u64_le(index, record + HASH_LEN + 8);
-        let end = offset.checked_add(length).ok_or_else(&corrupt)?;
-
-        if length == 0 || offset < PACK_DATA_HEADER_LEN || end > data_len as u64 {
-            return Err(corrupt());
-        }
-        ranges.push((offset, end));
-    }
-
-    sort_ranges_by_start(&mut ranges);
-    let mut expected = PACK_DATA_HEADER_LEN;
-    for (start, end) in ranges {
-        if start != expected {
-            return Err(corrupt());
-        }
-        expected = end;
-    }
-
-    if expected != data_len as u64 {
-        return Err(corrupt());
-    }
-
-    Ok(())
+    let index = CheckedIndex::new(index, layout, Some(data.len() as u64));
+    Ok(LoadedPack { data_path: data_path.to_path_buf(), data, index, full: OnceLock::new() })
 }
 
 /// The bits of a start offset one radix pass of [`sort_ranges_by_start`] consumes.
@@ -1552,6 +1980,11 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         let incoming: Vec<LoadedPack> = staged.iter()
             .map(|pair| load_pack_pair(&pair.data_path, &pair.index_path))
             .collect::<Result<_, _>>()?;
+        // Every byte of an incoming pack is accounted for before any of it is trusted: each index
+        // is validated in full, not bucket by bucket as a local read would.
+        for pack in &incoming {
+            pack.validate_full()?;
+        }
 
         let (hashes, parcels) = verify_incoming_packs(&incoming)?;
         let mut stored_objects = 0;
@@ -1563,6 +1996,9 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                 stored_objects += 1;
             }
         }
+
+        // Each pack's published name, from the index just validated.
+        let pack_ids: Vec<String> = incoming.iter().map(pack_id_of).collect::<Result<_, _>>()?;
 
         // Drop every mmap before renaming the staged files (Windows refuses to rename a mapped
         // file; POSIX permits it, but the portable contract is cheap to preserve).
@@ -1584,10 +2020,7 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         // below taints exactly what it just made visible-but-unproven, not the whole install.
         let mut published_this_run: Vec<PathBuf> = Vec::new();
 
-        for pair in &staged {
-            let index = std::fs::read(&pair.index_path)
-                .map_err(|e| format!("Error while reading a verified bundle pack index: {}", e))?;
-            let pack_id = pack_id_from_index(&index)?;
+        for (pair, pack_id) in staged.iter().zip(&pack_ids) {
             let data_final = folder.join(format!("{}.{}", pack_id, PACK_DATA_EXTENSION));
             let index_final = folder.join(format!("{}.{}", pack_id, PACK_INDEX_EXTENSION));
 
@@ -1688,20 +2121,14 @@ fn sync_file(path: &Path, what: &str) -> Result<(), String> {
 
 /// Derive the native pack filename from the index's sorted `(hash, offset, length)` records — the
 /// same layout identity `PackWriter::finalize` used when the server built it.
-fn pack_id_from_index(index: &[u8]) -> Result<String, String> {
-    let (count, _) = parse_index_header(index, Path::new("<bundle pack index>"))?;
-    let mut records = Vec::with_capacity(count);
-
-    for position in 0..count {
-        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN;
-        let mut hash = [0u8; HASH_LEN];
-        hash.copy_from_slice(&index[record..record + HASH_LEN]);
-        records.push((
-            hash,
-            read_u64_le(index, record + HASH_LEN),
-            read_u64_le(index, record + HASH_LEN + 8),
-        ));
-    }
+fn pack_id_of(pack: &LoadedPack) -> Result<String, String> {
+    let records: Vec<([u8; HASH_LEN], u64, u64)> = pack.records()?.iter()
+        .map(|record| {
+            let mut hash = [0u8; HASH_LEN];
+            hash.copy_from_slice(record.hash);
+            (hash, record.offset, record.length)
+        })
+        .collect();
 
     Ok(compute_pack_id(&records))
 }
@@ -1740,10 +2167,12 @@ fn verify_incoming_packs(packs: &[LoadedPack])
 /// per-object (and per-delta-base) lookups during verification is one binary search across the
 /// whole set instead of one per pack — O(objects × log objects) total rather than
 /// O(objects × packs × log). Entries are indirect `(pack, record)` positions (8 bytes per
-/// object) comparing against the packs' resident index bytes; a hash-keyed map would cost an
+/// object) comparing against the packs' mapped index bytes; a hash-keyed map would cost an
 /// order of magnitude more transient memory on a large clone.
 struct IncomingLocator<'a> {
     packs: &'a [LoadedPack],
+    /// Each pack's records, validated in full.
+    records: Vec<index_format::AllRecords<'a, memmap2::Mmap>>,
     /// `(pack position, record position)`, sorted by the record's hash bytes.
     entries: Vec<(u32, u32)>,
 }
@@ -1752,19 +2181,17 @@ impl<'a> IncomingLocator<'a> {
     /// Build the locator. Sorting also surfaces cross-pack duplicates (adjacent equal hashes),
     /// which are refused: the bundle builder emits every object exactly once.
     fn build(packs: &'a [LoadedPack]) -> Result<IncomingLocator<'a>, String> {
-        let total = packs.iter().map(|pack| pack.count).sum();
+        let records: Vec<_> = packs.iter().map(LoadedPack::records).collect::<Result<_, _>>()?;
+        let total = records.iter().map(|records| records.len()).sum();
         let mut entries: Vec<(u32, u32)> = Vec::with_capacity(total);
 
-        for (pack_position, pack) in packs.iter().enumerate() {
-            for record_position in 0..pack.count {
+        for (pack_position, records) in records.iter().enumerate() {
+            for record_position in 0..records.len() {
                 entries.push((pack_position as u32, record_position as u32));
             }
         }
 
-        let hash_of = |entry: &(u32, u32)| -> &[u8] {
-            let record = INDEX_HEADER_LEN + entry.1 as usize * INDEX_RECORD_LEN;
-            &packs[entry.0 as usize].index[record..record + HASH_LEN]
-        };
+        let hash_of = |entry: &(u32, u32)| -> &[u8] { records[entry.0 as usize].get(entry.1 as usize).hash };
         entries.sort_unstable_by(|a, b| hash_of(a).cmp(hash_of(b)));
 
         for pair in entries.windows(2) {
@@ -1776,12 +2203,11 @@ impl<'a> IncomingLocator<'a> {
             }
         }
 
-        Ok(IncomingLocator { packs, entries })
+        Ok(IncomingLocator { packs, records, entries })
     }
 
     fn hash_of(&self, entry: (u32, u32)) -> &'a [u8] {
-        let record = INDEX_HEADER_LEN + entry.1 as usize * INDEX_RECORD_LEN;
-        &self.packs[entry.0 as usize].index[record..record + HASH_LEN]
+        self.records[entry.0 as usize].get(entry.1 as usize).hash
     }
 
     /// Locate a hash in the incoming set: its pack and the record's `(offset, length)` there.
@@ -1790,14 +2216,9 @@ impl<'a> IncomingLocator<'a> {
             .binary_search_by(|entry| self.hash_of(*entry).cmp(hash))
             .ok()?;
         let (pack_position, record_position) = self.entries[position];
-        let pack = &self.packs[pack_position as usize];
-        let record = INDEX_HEADER_LEN + record_position as usize * INDEX_RECORD_LEN;
+        let record = self.records[pack_position as usize].get(record_position as usize);
 
-        Some((
-            pack,
-            read_u64_le(&pack.index, record + HASH_LEN),
-            read_u64_le(&pack.index, record + HASH_LEN + 8),
-        ))
+        Some((&self.packs[pack_position as usize], record.offset, record.length))
     }
 
     fn contains(&self, hash: &[u8; HASH_LEN]) -> bool {
@@ -1860,10 +2281,6 @@ fn resolve_incoming_object(hash: &[u8; HASH_LEN],
             return file_utils::retrieve_object_by_hash(&hex);
         };
         let record = pack.slice(offset, length)?;
-
-        if pack.version < FIRST_FRAMED_VERSION {
-            return decode_full_transport_record(record, &hex);
-        }
 
         let (&kind, body) = record.split_first()
             .ok_or_else(|| format!("Packed object {} has an empty record.", hex))?;
@@ -1979,20 +2396,27 @@ fn retrieve_from(packs: &PackSet, hash_bytes: &[u8; HASH_LEN], hash: &str) -> Re
     let mut first_error: Option<String> = None;
 
     for pack in packs.packs.iter() {
-        let Some((offset, length)) = pack.locate(hash_bytes) else {
-            continue;
+        let (offset, length) = match pack.locate(hash_bytes) {
+            Located::Found(offset, length) => (offset, length),
+            Located::Missing => continue,
+            // This pack cannot say whether it holds the object. Another pack may still serve it
+            // (a good copy wins); if none does, the read fails rather than reporting it absent.
+            Located::CorruptBucket(bucket) => {
+                if first_error.is_none() {
+                    first_error = Some(pack.corrupt_bucket_error(bucket));
+                }
+                continue;
+            }
         };
 
-        // `offset`/`length` came straight from this pack's own index, which `validate_index_records`
-        // (`pack_utils.rs:648`, run by `load_pack_pair` before a pack ever enters the registry)
-        // already checked tiles every record's range exactly within `[PACK_DATA_HEADER_LEN,
-        // data.len()]` with no gaps or overlaps — the same bound `slice` rechecks. So for any pack
-        // reachable here, `slice` cannot fail on a `locate`d record: this `?` is a defensive
-        // anomaly channel (environment `Err`), never the located-but-broken path the `first_error`
-        // accumulation below exists for.
+        // `offset`/`length` came from a bucket of this pack's index that passed validation
+        // (`index_format`), which bounds every record in it inside `[PACK_DATA_HEADER_LEN,
+        // data.len()]` — the same bound `slice` rechecks. So `slice` cannot fail on a `Found`
+        // record: this `?` is a defensive anomaly channel (environment `Err`), never the
+        // located-but-broken path the `first_error` accumulation exists for.
         let record = pack.slice(offset, length)?;
 
-        match resolve_record(record, pack.version, hash) {
+        match resolve_record(record, hash) {
             Ok(bytes) => return Ok(PackRetrieval::Verified(bytes)),
             Err(e) => {
                 if first_error.is_none() {
@@ -2064,8 +2488,8 @@ impl Drop for DepthGuard {
 /// module's content-addressing guarantee — the reconstructed bytes must hash to `hash`, so a
 /// corrupt full record, a bad delta, or a delta rebuilt against the wrong base fails the read
 /// rather than silently returning wrong bytes (`object_utils::verify_object_bytes`).
-fn resolve_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>, String> {
-    let bytes = reconstruct_record(record, version, hash)?;
+fn resolve_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
+    let bytes = reconstruct_record(record, hash)?;
     object_utils::verify_object_bytes(hash, &bytes)?;
     Ok(bytes)
 }
@@ -2073,23 +2497,18 @@ fn resolve_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>, St
 /// Reconstruct an object's bytes from its data-file record, *without* verifying the result —
 /// its sole caller [`resolve_record`] does that.
 ///
-/// A version-1 record is a bare zstd blob. A version ≥ 2 record starts with a kind byte:
-/// a full record's remainder is the zstd blob; a delta record's remainder is
+/// A record starts with a kind byte: a full record's remainder is the zstd blob; a delta record's remainder is
 /// `base hash (32) || target length (VLQ) || zstd delta`, reconstructed against its base —
 /// which is fetched through the top-level object read, so the base may itself be loose, in
 /// another pack, or itself a delta. The chain is bounded well below `MAX_RECONSTRUCT_DEPTH`,
 /// which guards only against a corrupt pack chaining without end.
-fn reconstruct_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>, String> {
+fn reconstruct_record(record: &[u8], hash: &str) -> Result<Vec<u8>, String> {
     // Trusted bytes: a local pack record is self-written or transport-verified (see
     // `decode_full_transport_record`), and a grandfathered giant must stay readable — bounding
     // this read would make a pre-existing over-ceiling packed object unreadable.
     #[allow(clippy::disallowed_methods)]
     let decode_full = |blob: &[u8]| zstd::stream::decode_all(blob)
         .map_err(|e| format!("Error while decompressing packed object {}: {}", hash, e));
-
-    if version < FIRST_FRAMED_VERSION {
-        return decode_full(record);
-    }
 
     let (&kind, body) = record.split_first()
         .ok_or_else(|| format!("Packed object {} has an empty record.", hash))?;
@@ -2123,29 +2542,30 @@ fn reconstruct_record(record: &[u8], version: u32, hash: &str) -> Result<Vec<u8>
 
 /// Every packed object hash (hex) that begins with `prefix`. The pack-aware half of
 /// resolving a revision given as a hash or hash prefix — without it, a hash reference stops
-/// resolving once its object is packed. A linear scan of the resident indexes; resolution is
-/// interactive and rare, so the simple form is fine.
+/// resolving once its object is packed. Reads only the index buckets a hash with that prefix can
+/// be in, validating each first.
 ///
 /// The cached set is revalidated ([`reloaded_if_stale`]) before every scan, not only when the
 /// scan comes back empty: a prefix that matches one packed hash can still match another in a pack
-/// published since, and answering "unique" from a stale set would resolve it wrongly. Against a
-/// linear scan of every index, the extra `stat` is noise.
+/// published since, and answering "unique" from a stale set would resolve it wrongly.
 ///
 /// # Arguments
-/// * `prefix` - A hex hash or hash prefix.
+/// * `prefix` - A lowercase hex hash or hash prefix; anything else matches nothing.
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - The full hex hashes of packed objects matching the prefix.
-/// * `Err(String)`     - If the packs could not be loaded.
+/// * `Err(String)`     - If the packs could not be loaded, or an index bucket the prefix falls in
+///                       is corrupt, so its matches cannot be listed.
 pub fn find_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
     let cached = loaded_packs()?;
     let packs = reloaded_if_stale(&cached)?.unwrap_or(cached);
     let mut matches = Vec::new();
 
     for pack in packs.packs.iter() {
-        for index in 0..pack.count {
-            let record = INDEX_HEADER_LEN + index * INDEX_RECORD_LEN;
-            let hash = sign_utils::to_hex(&pack.index[record..record + HASH_LEN]);
+        let records = pack.index.records_for_hex_prefix(prefix)
+            .map_err(|bucket| pack.corrupt_bucket_error(bucket))?;
+        for record in records {
+            let hash = sign_utils::to_hex(record.hash);
             if hash.starts_with(prefix) {
                 matches.push(hash);
             }
@@ -2167,10 +2587,9 @@ pub fn find_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
 ///
 /// Deliberately does not call [`load_pack_pair`] (which also maps and validates the *data* file —
 /// exactly the file this is reached because is missing) or go through [`loaded_packs`]'s
-/// registry/cache (which would fail to load the whole pack set over one missing pair). Only the
-/// index header shape is validated ([`parse_index_header`]); [`validate_index_records`]'s
-/// data-length cross-check is skipped since there is no data file to check against — this
-/// function's only job is the hash list, not full structural validation.
+/// registry/cache (which would fail to load the whole pack set over one missing pair). Every
+/// bucket is validated for crc, order and prefix; the data-length bounds are skipped since there
+/// is no data file to check against — this function's only job is the hash list.
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - Every hex hash the index names, in its stored (sorted) order.
@@ -2178,22 +2597,21 @@ pub fn find_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
 pub(crate) fn hashes_in_index_file(index_path: &Path) -> Result<Vec<String>, String> {
     let index = std::fs::read(index_path)
         .map_err(|e| format!("Error while reading pack index \"{}\": {}", index_path.to_string_lossy(), e))?;
-    let (count, _version) = parse_index_header(&index, index_path)?;
+    let layout = index_format::Layout::parse(&index, index_path)?;
+    let index = CheckedIndex::new(index, layout, None);
+    let records = index.all_records().map_err(|bucket| format!(
+        "Pack index \"{}\" is corrupt (bucket {}).", index_path.to_string_lossy(), bucket
+    ))?;
 
-    let mut hashes = Vec::with_capacity(count);
-    for position in 0..count {
-        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN;
-        hashes.push(sign_utils::to_hex(&index[record..record + HASH_LEN]));
-    }
-
-    Ok(hashes)
+    Ok(records.iter().map(|record| sign_utils::to_hex(record.hash)).collect())
 }
 
 /// Whether any pack holds the object with the given hash. The existence fallback for
 /// `file_utils::does_object_exist` when the loose file is absent.
 ///
 /// Answers from **loaded packs only** — a hash named only by a quarantined or unenumerable index
-/// (FORK-47, DESIGN.html §3.1.1) reads `false` here, never `true`. This is the safe polarity: every
+/// (FORK-47, DESIGN.html §3.1.1), or one whose index bucket is corrupt, reads `false` here, never
+/// `true`. This is the safe polarity: every
 /// existing caller of this presence check (push/fetch dedup, prune, the closure walk) must treat
 /// an unservable hash as absent-and-worth-chasing, which is what lets heal *refetch and clear* it
 /// rather than silently skip it — flipping the polarity would make a quarantine-named hash
@@ -2244,7 +2662,7 @@ pub(crate) fn is_in_cached_packs(hash: &str) -> Result<bool, String> {
 }
 
 fn located_in(packs: &PackSet, hash_bytes: &[u8; HASH_LEN]) -> bool {
-    packs.packs.iter().any(|pack| pack.locate(hash_bytes).is_some())
+    packs.packs.iter().any(|pack| matches!(pack.locate(hash_bytes), Located::Found(..)))
 }
 
 /// Where an object to pack comes from, and how to pack it.
@@ -2255,12 +2673,11 @@ enum Source {
     /// never reconstructed or re-deltated, so the original (good) delta is preserved and the
     /// repack stays a byte-copy. `pack_index` indexes the source packs kept mapped for the run
     /// (`collect_targets` returns them), so the record is a zero-copy slice out of that pack's
-    /// mmap — no per-record `open`/`seek`/`read`. `framed` is false for a version-1 (unframed)
-    /// record, which is wrapped in a full-record kind byte on the way into the version-2 pack.
-    /// This is the sole-copy case; when the hash is duplicated, `collect_targets` keeps this
-    /// verbatim path only if every copy's framed bytes are byte-identical, and demotes to
-    /// `Source::Reconstruct` otherwise, so a duplicate is never carried forward unverified.
-    CopyRecord { pack_index: usize, offset: u64, len: u64, framed: bool, is_delta: bool },
+    /// mmap — no per-record `open`/`seek`/`read`. This is the sole-copy case; when the hash is
+    /// duplicated, `collect_targets` keeps this verbatim path only if every copy's bytes are
+    /// byte-identical, and demotes to `Source::Reconstruct` otherwise, so a duplicate is never
+    /// carried forward unverified.
+    CopyRecord { pack_index: usize, offset: u64, len: u64, is_delta: bool },
     /// A packed object whose delta base is being dropped as garbage, or a duplicated hash whose
     /// surviving copy `collect_targets` could not trust verbatim (FORK-55): reconstruct it
     /// (through the exhaustive verified read, `retrieve_object_by_hash`) and re-pack it
@@ -2412,10 +2829,10 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
     // whole reachability phase, which collapses those (~5 per parcel) re-reads to one decode each
     // and is dropped before the parallel batch loop below. `source_packs` are the existing packs,
     // kept mapped for the run so a `CopyRecord` copies its bytes straight from the mmap.
-    let (targets, old_packs, source_packs, depth_packs, path_bases) = {
+    let (targets, old_packs, source_packs, depth_packs, path_bases, unvalidated_packs) = {
         let _parcel_memo = object_utils::ParcelReadMemo::activate();
 
-        let CollectedTargets { targets, old_packs, source_packs } = collect_targets(all, redelta)?;
+        let CollectedTargets { targets, old_packs, source_packs, unvalidated_packs } = collect_targets(all, redelta)?;
 
         // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
         // objects and for the rare object whose base is dropped. A repack that only copies existing
@@ -2459,12 +2876,12 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
         root_targets.extend(chain_targets);
         let targets = root_targets;
 
-        (targets, old_packs, source_packs, depth_packs, path_bases)
+        (targets, old_packs, source_packs, depth_packs, path_bases, unvalidated_packs)
     };
 
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
-        corrupt_skipped: 0, over_ceiling_skipped: 0,
+        corrupt_skipped: 0, over_ceiling_skipped: 0, unvalidated_packs,
     };
     let mut writer: Option<PackWriter> = None;
 
@@ -2613,10 +3030,10 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
 
             // Copy an existing record verbatim — a repack's fast path: the original (good) delta
             // is preserved, nothing is reconstructed or re-deltated. The bytes are a zero-copy
-            // slice out of the source pack's mmap (framed case) rather than a fresh file read.
-            if let Source::CopyRecord { pack_index, offset, len, framed, is_delta } = &target.source {
-                let record = framed_record(&source_packs.packs[*pack_index], *offset, *len, *framed)?;
-                let written = pack.append_raw_record(target.hash, &record)?;
+            // slice out of the source pack's mmap rather than a fresh file read.
+            if let Source::CopyRecord { pack_index, offset, len, is_delta } = &target.source {
+                let record = source_packs.packs[*pack_index].slice(*offset, *len)?;
+                let written = pack.append_raw_record(target.hash, record)?;
                 stats.bytes_packed += written;
                 if *is_delta {
                     stats.deltas += 1;
@@ -3033,6 +3450,9 @@ struct CollectedTargets {
     /// .. }` in `targets` can borrow its record straight from `source_packs.packs[pack_index]`'s
     /// mmap (empty for an incremental `compact`, which has no `CopyRecord` targets).
     source_packs: Arc<PackSet>,
+    /// The validation errors of packs a repack leaves untouched (see
+    /// [`CompactStats::unvalidated_packs`]).
+    unvalidated_packs: Vec<String>,
 }
 
 /// The objects to pack and the old pack files a repack supersedes.
@@ -3068,6 +3488,7 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
             targets: enumerate_loose_objects()?,
             old_packs: Vec::new(),
             source_packs: Arc::new(PackSet::empty()),
+            unvalidated_packs: Vec::new(),
         });
     }
 
@@ -3092,25 +3513,36 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
     // mapped packs are returned to the caller and held for the whole run, so a `CopyRecord` reads
     // its bytes as a zero-copy slice out of the mmap (addressed by `pack_index`), never a fresh
     // per-record file read.
+    //
+    // Each pack's index is validated in full before any record is copied out of it. One that
+    // fails is left exactly as found — not copied from and not deleted — so a repack never
+    // carries forward a record no lookup would have trusted, and never destroys the objects its
+    // sound buckets still serve.
     let packs = loaded_packs()?;
     let mut old_packs = Vec::new();
+    let mut unvalidated_packs = Vec::new();
 
     for (pack_index, pack) in packs.packs.iter().enumerate() {
-        old_packs.push(pack.data_path.clone());
-        old_packs.push(pack.data_path.with_extension(PACK_INDEX_EXTENSION));
+        let records = match pack.records() {
+            Ok(records) => records,
+            Err(error) => {
+                unvalidated_packs.push(error);
+                continue;
+            }
+        };
 
-        for index in 0..pack.count {
-            let record = INDEX_HEADER_LEN + index * INDEX_RECORD_LEN;
+        old_packs.push(pack.data_path.clone());
+        old_packs.push(pack.index_path());
+
+        for record in records.iter() {
             let mut hash = [0u8; HASH_LEN];
-            hash.copy_from_slice(&pack.index[record..record + HASH_LEN]);
+            hash.copy_from_slice(record.hash);
 
             if !live.contains(&sign_utils::to_hex(&hash)) {
                 continue;
             }
 
-            let offset = read_u64_le(&pack.index, record + HASH_LEN);
-            let length = read_u64_le(&pack.index, record + HASH_LEN + 8);
-            let framed = pack.version >= FIRST_FRAMED_VERSION;
+            let (offset, length) = (record.offset, record.length);
 
             // A duplicate of a hash a previous pack (or the loose enumeration above) already
             // selected (FORK-55). The first-enumerated copy no longer wins unconditionally --
@@ -3133,18 +3565,15 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
                         targets[existing_index].source = Source::Reconstruct { loose_source };
                     }
                     // A verbatim copy from an earlier pack was selected first. Byte-identical
-                    // framed records are interchangeable (W6): keep the existing `CopyRecord`
-                    // fast path only when this record matches it exactly; any difference means
-                    // neither copy is trusted over the other, so demote to the verified read.
+                    // records are interchangeable (W6): keep the existing `CopyRecord` fast path
+                    // only when this record matches it exactly; any difference means neither
+                    // copy is trusted over the other, so demote to the verified read.
                     Source::CopyRecord {
-                        pack_index: existing_pack_index, offset: existing_offset,
-                        len: existing_len, framed: existing_framed, ..
+                        pack_index: existing_pack_index, offset: existing_offset, len: existing_len, ..
                     } => {
-                        let existing_record = framed_record(
-                            &packs.packs[*existing_pack_index], *existing_offset, *existing_len, *existing_framed
-                        )?;
-                        let candidate_record = framed_record(pack, offset, length, framed)?;
-                        if existing_record.as_ref() != candidate_record.as_ref() {
+                        let existing_record = packs.packs[*existing_pack_index].slice(*existing_offset, *existing_len)?;
+                        let candidate_record = pack.slice(offset, length)?;
+                        if existing_record != candidate_record {
                             targets[existing_index].source = Source::Reconstruct { loose_source: None };
                         }
                     }
@@ -3159,7 +3588,7 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
             // unrelated to the object's real size, so using it as the largest-first sort key
             // (below) would pair objects by how well they happened to already compress, not by
             // how big they are — scrambling the very order the size-window fallback depends on.
-            let header = read_record_header(pack, offset, length, framed)?;
+            let header = read_record_header(pack, offset, length)?;
 
             // A delta whose base is not itself live cannot be copied (the base is being
             // dropped); reconstruct and re-delta it. Everything else is copied as-is — unless
@@ -3169,7 +3598,7 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
             let source = if redelta || base_dropped {
                 Source::Reconstruct { loose_source: None }
             } else {
-                Source::CopyRecord { pack_index, offset, len: length, framed, is_delta: header.is_delta }
+                Source::CopyRecord { pack_index, offset, len: length, is_delta: header.is_delta }
             };
 
             // A delta's raw target length is free (it is stored in cleartext right after the
@@ -3183,7 +3612,7 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
         }
     }
 
-    Ok(CollectedTargets { targets, old_packs, source_packs: packs })
+    Ok(CollectedTargets { targets, old_packs, source_packs: packs, unvalidated_packs })
 }
 
 /// A record's kind and, for a delta, its base hash and the raw (decompressed) length of the
@@ -3202,12 +3631,8 @@ struct RecordHeader {
 /// Read a record's kind and (for a delta) its base hash and raw target length, without
 /// reconstructing it — just the leading kind byte, the 32-byte base that follows a delta, and
 /// the VLQ length after that (`base hash (32) || target length (VLQ) || zstd delta`, the layout
-/// `PackWriter::append_delta` writes). A version-1 (unframed) record is always a full object.
-fn read_record_header(pack: &LoadedPack, offset: u64, len: u64, framed: bool) -> Result<RecordHeader, String> {
-    if !framed {
-        return Ok(RecordHeader { is_delta: false, base: None, raw_len: None });
-    }
-
+/// `PackWriter::append_delta` writes).
+fn read_record_header(pack: &LoadedPack, offset: u64, len: u64) -> Result<RecordHeader, String> {
     let kind = pack.slice(offset, 1)?[0];
     if kind != RECORD_DELTA {
         return Ok(RecordHeader { is_delta: false, base: None, raw_len: None });
@@ -3220,9 +3645,9 @@ fn read_record_header(pack: &LoadedPack, offset: u64, len: u64, framed: bool) ->
 
     // `record`'s length is the index's declared record length, not a promise it actually holds a
     // base hash: a native writer never emits a delta shorter than this, but a locally loaded pack
-    // is only checked for index-level consistency (`validate_index_records` — offsets/lengths in
-    // bounds, exactly covering the data file, no per-record shape check), not for whether *this*
-    // record's declared length is enough for the kind byte says it is. A transport-imported pack
+    // is only checked for index-level consistency (`index_format` — offsets/lengths in bounds, and
+    // under full validation exactly covering the data file, no per-record shape check), not for
+    // whether *this* record's declared length is enough for what the kind byte says it is. A transport-imported pack
     // is separately re-verified against every hash it claims to hold, but a pack read straight off
     // local disk is not. Bounds-check before indexing, so on-disk corruption fails this compact
     // cleanly instead of panicking on a slice out of range (the fuzz suite's posture: reject, never
@@ -3246,29 +3671,12 @@ fn read_record_header(pack: &LoadedPack, offset: u64, len: u64, framed: bool) ->
     Ok(RecordHeader { is_delta: true, base: Some(base), raw_len: Some(raw_len) })
 }
 
-/// A live record carried verbatim into the new pack, framed for a version-2 pack: a version-2
-/// record is the source pack's mmap slice as-is (it already carries its kind byte); a version-1
-/// record (a bare zstd blob) is wrapped in a `RECORD_FULL` kind byte. Borrows straight from the
-/// source pack's mmap — no `open`/`seek`/`read`, and for the common framed case no copy at all;
-/// the bytes are byte-identical to what a fresh file read produced, so the pack output is unchanged.
-fn framed_record(pack: &LoadedPack, offset: u64, len: u64, framed: bool) -> Result<std::borrow::Cow<'_, [u8]>, String> {
-    let bytes = pack.slice(offset, len)?;
-    if framed {
-        Ok(std::borrow::Cow::Borrowed(bytes))
-    } else {
-        let mut record = Vec::with_capacity(1 + bytes.len());
-        record.push(RECORD_FULL);
-        record.extend_from_slice(bytes);
-        Ok(std::borrow::Cow::Owned(record))
-    }
-}
-
 /// The first pack (if any) among `packs` that holds `hash`, with its record's `(offset, length)`
 /// — the same "which pack, if any" search `retrieve_from_packs`/`is_in_packs` do, factored out
 /// for the depth ledger below, which needs the pack itself (to read the record's header) rather
-/// than its resolved bytes.
+/// than its resolved bytes. A pack whose bucket for `hash` is corrupt is skipped, as a miss.
 fn locate_in_packs<'a>(hash: &[u8; HASH_LEN], packs: &'a [LoadedPack]) -> Option<(&'a LoadedPack, u64, u64)> {
-    packs.iter().find_map(|pack| pack.locate(hash).map(|(offset, length)| (pack, offset, length)))
+    packs.iter().find_map(|pack| pack.locate(hash).found().map(|(offset, length)| (pack, offset, length)))
 }
 
 /// The *true* current reconstruction depth of `hash` — 0 for a full record or a loose file,
@@ -3307,8 +3715,7 @@ fn true_depth(hash: [u8; HASH_LEN], known: &mut HashMap<[u8; HASH_LEN], u32>, pa
             break 0; // Not packed at all: a loose file, always stored full.
         };
 
-        let framed = pack.version >= FIRST_FRAMED_VERSION;
-        let header = read_record_header(pack, offset, length, framed)?;
+        let header = read_record_header(pack, offset, length)?;
 
         if !header.is_delta {
             break 0;
@@ -4159,21 +4566,9 @@ impl StoreIngest {
     }
 }
 
-/// Build the on-disk index bytes: header, then the (already sorted) records.
+/// Build the on-disk index bytes for the (already sorted) records — see [`index_format`].
 fn build_index_bytes(records: &[([u8; HASH_LEN], u64, u64)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(INDEX_HEADER_LEN + records.len() * INDEX_RECORD_LEN);
-
-    bytes.extend_from_slice(PACK_INDEX_MAGIC);
-    bytes.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
-
-    for (hash, offset, length) in records {
-        bytes.extend_from_slice(hash);
-        bytes.extend_from_slice(&offset.to_le_bytes());
-        bytes.extend_from_slice(&length.to_le_bytes());
-    }
-
-    bytes
+    index_format::build(records)
 }
 
 /// A pack's id: the Blake3 over its sorted records — each object hash **and its offset and
@@ -4324,11 +4719,11 @@ mod tests {
         *seed >> 11
     }
 
-    /// An index (header bytes zeroed: `validate_index_records` reads only the records) over
-    /// `count` objects that tile a data body in a shuffled order, with the records in strictly
-    /// increasing hash order, as the native writer lays them out. Lengths vary so that offsets
-    /// need several radix digits. Returns the index and the data length the records tile.
-    fn tiled_index(count: usize) -> (Vec<u8>, Vec<(u64, u64)>, usize) {
+    /// The records of an index over `count` objects that tile a data body in a shuffled order,
+    /// in strictly increasing hash order and spread across the fanout buckets, as the native
+    /// writer lays them out. Lengths vary so that offsets need several radix digits. Returns the
+    /// records and the data length they tile.
+    fn tiled_records(count: usize) -> (Vec<([u8; HASH_LEN], u64, u64)>, usize) {
         let mut seed = 7;
         let mut order: Vec<usize> = (0..count).collect();
         for i in (1..count).rev() {
@@ -4343,23 +4738,25 @@ mod tests {
             offset += lengths[record];
         }
 
-        let mut index = vec![0u8; INDEX_HEADER_LEN];
-        for (position, (offset, length)) in placed.iter().enumerate() {
+        let records = placed.iter().enumerate().map(|(position, (offset, length))| {
             let mut hash = [0u8; HASH_LEN];
-            hash[..8].copy_from_slice(&(position as u64).to_be_bytes());
-            index.extend_from_slice(&hash);
-            index.extend_from_slice(&offset.to_le_bytes());
-            index.extend_from_slice(&length.to_le_bytes());
-        }
+            hash[..8].copy_from_slice(&((position as u64) << 48).to_be_bytes());
+            (hash, *offset, *length)
+        }).collect();
 
-        (index, placed, offset as usize)
+        (records, offset as usize)
     }
 
-    /// Overwrite record `position`'s offset and length in an index built by [`tiled_index`].
-    fn set_record(index: &mut [u8], position: usize, offset: u64, length: u64) {
-        let record = INDEX_HEADER_LEN + position * INDEX_RECORD_LEN + HASH_LEN;
-        index[record..record + 8].copy_from_slice(&offset.to_le_bytes());
-        index[record + 8..record + 16].copy_from_slice(&length.to_le_bytes());
+    /// An index over `records`, checked against a data file of `data_len` bytes.
+    fn checked_index(records: &[([u8; HASH_LEN], u64, u64)], data_len: usize) -> CheckedIndex<Vec<u8>> {
+        let bytes = build_index_bytes(records);
+        let layout = index_format::Layout::parse(&bytes, Path::new("test.idx")).expect("a built index must parse");
+        CheckedIndex::new(bytes, layout, Some(data_len as u64))
+    }
+
+    /// Whether every bucket of the index over `records` validates and its records tile `data_len`.
+    fn tiles(records: &[([u8; HASH_LEN], u64, u64)], data_len: usize) -> bool {
+        checked_index(records, data_len).all_records().is_ok_and(|all| all.tile(data_len as u64))
     }
 
     #[test]
@@ -4392,33 +4789,29 @@ mod tests {
     fn index_validation_accepts_a_shuffled_tiling_and_refuses_a_gap_or_an_overlap() {
         // 5000 records: the radix branch. The records are in hash order and their offsets are a
         // shuffle of the body, so only a correct sort by offset sees the exact tiling.
-        let (index, placed, data_len) = tiled_index(5000);
-        let path = Path::new("test.idx");
-        assert!(validate_index_records(&index, placed.len(), data_len, path).is_ok());
+        let (records, data_len) = tiled_records(5000);
+        assert!(tiles(&records, data_len));
 
         // A record that starts one byte late leaves a gap before it and overlaps its successor.
-        let (record, (offset, length)) = placed.iter().enumerate()
-            .find(|(_, (offset, length))| *length > 1 && offset + length < data_len as u64)
-            .map(|(record, range)| (record, *range)).unwrap();
-        let mut shifted = index.clone();
-        set_record(&mut shifted, record, offset + 1, length);
-        let error = validate_index_records(&shifted, placed.len(), data_len, path).unwrap_err();
-        assert!(error.contains("is corrupt"), "{}", error);
+        let record = records.iter()
+            .position(|(_, offset, length)| *length > 1 && offset + length < data_len as u64).unwrap();
+        let mut shifted = records.clone();
+        shifted[record].1 += 1;
+        assert!(!tiles(&shifted, data_len), "a record shifted one byte must not tile the body");
 
         // A record one byte short leaves a gap after it that no record accounts for.
-        let mut short = index.clone();
-        set_record(&mut short, record, offset, length - 1);
-        let error = validate_index_records(&short, placed.len(), data_len, path).unwrap_err();
-        assert!(error.contains("is corrupt"), "{}", error);
+        let mut short = records.clone();
+        short[record].2 -= 1;
+        assert!(!tiles(&short, data_len), "a record one byte short must not tile the body");
 
         // Two records swapping their offsets but keeping their lengths no longer tile the body when
         // the lengths differ, although the lengths still sum to it.
-        let (a, b) = (0..placed.len()).flat_map(|a| (a + 1..placed.len()).map(move |b| (a, b)))
-            .find(|&(a, b)| placed[a].1 != placed[b].1).unwrap();
-        let mut swapped = index.clone();
-        set_record(&mut swapped, a, placed[b].0, placed[a].1);
-        set_record(&mut swapped, b, placed[a].0, placed[b].1);
-        assert!(validate_index_records(&swapped, placed.len(), data_len, path).is_err());
+        let (a, b) = (0..records.len()).flat_map(|a| (a + 1..records.len()).map(move |b| (a, b)))
+            .find(|&(a, b)| records[a].2 != records[b].2).unwrap();
+        let mut swapped = records.clone();
+        swapped[a].1 = records[b].1;
+        swapped[b].1 = records[a].1;
+        assert!(!tiles(&swapped, data_len), "swapped offsets must not tile the body");
     }
 
     #[test]
@@ -4605,7 +4998,7 @@ mod tests {
         let Some(hash_bytes) = hash_to_bytes(hash) else { return false; };
         let packs = loaded_packs().unwrap();
         for pack in packs.packs.iter() {
-            if let Some((offset, length)) = pack.locate(&hash_bytes) {
+            if let Some((offset, length)) = pack.locate(&hash_bytes).found() {
                 if let Ok(record) = pack.slice(offset, length) {
                     return record.first() == Some(&RECORD_DELTA);
                 }
@@ -5004,7 +5397,7 @@ mod tests {
         // the index.
         let blob_hash_bytes = hash_to_bytes(&blob.hash).unwrap();
         let (blob_offset, blob_len) = loaded_packs().unwrap().packs.iter()
-            .find_map(|pack| pack.locate(&blob_hash_bytes))
+            .find_map(|pack| pack.locate(&blob_hash_bytes).found())
             .expect("the blob must be packed");
 
         let mut data = std::fs::read(&pack_path).unwrap();
@@ -5030,8 +5423,8 @@ mod tests {
     /// FORK-55 pinning test (spike — expected RED on `main`, no fix applied yet). `collect_targets`'s
     /// first-pack-wins dedup (its `!seen.insert(hash)` check) takes whichever pack enumerates first
     /// for a live object present in more than one pack, and that record is copied **verbatim** —
-    /// `Source::CopyRecord`, resolved via `compact`'s own `Source::CopyRecord` arm (`framed_record`
-    /// then `append_raw_record`) — never reconstructed, never hash-checked (see `read_target`'s
+    /// `Source::CopyRecord`, resolved via `compact`'s own `Source::CopyRecord` arm (`slice` then
+    /// `append_raw_record`) — never reconstructed, never hash-checked (see `read_target`'s
     /// `Source::CopyRecord => Err(...)` arm: a `CopyRecord` target is never even routed through the
     /// read/verify path `Source::Loose` and `Source::Reconstruct` both go through). If the winning
     /// copy happens to be a corrupt one and a byte-correct copy exists in a different pack, the
@@ -5051,7 +5444,7 @@ mod tests {
     /// in the live set, so the target is demoted to `Source::Reconstruct`, which *is*
     /// read-verified) and PR #76's exhaustive-verified-read fall-through — passing for the wrong
     /// reason. The duplicate's index tiles are left untouched, so it still loads and validates as
-    /// an ordinary pack (`validate_index_records` never inspects record shape) — modeling honest
+    /// an ordinary pack (index validation never inspects record shape) — modeling honest
     /// bitrot, not an unloadable pack.
     ///
     /// Contract asserted here — deliberately, not just "no crash": this fixture has a verifiable
@@ -5165,7 +5558,7 @@ mod tests {
         let x_hash_bytes = hash_to_bytes(&x_hash).unwrap();
         invalidate_cache();
         let (x_offset, x_len) = loaded_packs().unwrap().packs.iter()
-            .find_map(|pack| pack.locate(&x_hash_bytes))
+            .find_map(|pack| pack.locate(&x_hash_bytes).found())
             .expect("X must be packed");
         let mut dup_bytes = std::fs::read(&dup_data).unwrap();
         let flip_at = x_offset as usize + 1;
@@ -5364,7 +5757,7 @@ mod tests {
     /// copy of X verifies anywhere in the store, and there is no loose X to fall back on.
     ///
     /// Under the fix, `collect_targets`'s pack-loop collision handling compares the two records'
-    /// framed bytes (`framed_record`): they differ, so the duplicate is demoted to
+    /// bytes (`slice`): they differ, so the duplicate is demoted to
     /// `Source::Reconstruct`. `read_target`'s `Reconstruct` arm then reads through the exhaustive
     /// verified read (`retrieve_object_by_hash`), which tries every locating pack and finds
     /// neither copy verifies -- the read errs, `prepare_target` propagates it via `?`, and the
@@ -5446,7 +5839,7 @@ mod tests {
         let x_hash_bytes = hash_to_bytes(&x_hash).unwrap();
         invalidate_cache();
         let (x_offset, x_len) = loaded_packs().unwrap().packs.iter()
-            .find_map(|pack| pack.locate(&x_hash_bytes))
+            .find_map(|pack| pack.locate(&x_hash_bytes).found())
             .expect("X must be packed");
 
         // Corrupt the duplicate at one offset...
@@ -5583,7 +5976,7 @@ mod tests {
         let x_hash_bytes = hash_to_bytes(&x_hash).unwrap();
         invalidate_cache();
         let (x_offset, x_len) = loaded_packs().unwrap().packs.iter()
-            .find_map(|pack| pack.locate(&x_hash_bytes))
+            .find_map(|pack| pack.locate(&x_hash_bytes).found())
             .expect("X must be packed");
 
         // Corrupt pack A itself first...
@@ -5737,7 +6130,7 @@ mod tests {
         // production hook: no test-only escape hatch is added to production code, and the pack
         // produced is byte-for-byte what a real write path emits (magic, version, framing,
         // layout-derived id via `finalize`). The pack loader never validates a pack's stem against
-        // `compute_pack_id` of its own index (`load_pack_pair`/`validate_index_records` check
+        // `compute_pack_id` of its own index (`load_pack_pair` and index validation check
         // only the data/index framing and record layout, never the filename), so no stem surgery
         // is needed either.
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -5957,44 +6350,57 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_pack_is_still_read() {
-        // A version-1 pack (phase 1) stored each record as a bare zstd blob with no kind
-        // byte. The current (framed) reader must still read one, or upgrading would strand
-        // objects packed by an earlier build.
-        let temp = std::env::temp_dir().join(format!("forklift-pack-v1-{}", std::process::id()));
+    fn a_pack_of_any_other_format_version_is_refused_by_name() {
+        // Versions 1 and 2 had no fanout table; a later version may have anything. Neither may be
+        // read as version 3, and neither may be silently ignored: the load names the version it
+        // found, so the operator knows the warehouse needs re-creating rather than repair.
+        let temp = std::env::temp_dir().join(format!("forklift-pack-old-version-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
-        let pack_folder = temp.join(".forklift/objects/pack");
-        std::fs::create_dir_all(&pack_folder).unwrap();
-        let _scope = StorageRootScope::enter(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
 
         let content = vec![9u8; 3000];
-        let hash = blake3::hash(&content).to_hex().to_string();
-        let hash_bytes = hash_to_bytes(&hash).unwrap();
+        let hash_bytes = *blake3::hash(&content).as_bytes();
         let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
 
-        // v1 data: header (magic + version 1) then the bare zstd blob — no kind byte.
         let mut data = Vec::new();
         data.extend_from_slice(PACK_DATA_MAGIC);
-        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
         let offset = data.len() as u64;
+        data.push(RECORD_FULL);
         data.extend_from_slice(&compressed);
+        let length = data.len() as u64 - offset;
 
-        // v1 index: header (magic + version 1 + count) then one (hash, offset, len) record.
-        let mut index = Vec::new();
-        index.extend_from_slice(PACK_INDEX_MAGIC);
-        index.extend_from_slice(&1u32.to_le_bytes());
-        index.extend_from_slice(&1u32.to_le_bytes());
-        index.extend_from_slice(&hash_bytes);
-        index.extend_from_slice(&offset.to_le_bytes());
-        index.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        let data_path = temp.join("p.pack");
+        let index_path = temp.join("p.idx");
+        std::fs::write(&data_path, &data).unwrap();
 
-        std::fs::write(pack_folder.join("legacy.pack"), &data).unwrap();
-        std::fs::write(pack_folder.join("legacy.idx"), &index).unwrap();
-        invalidate_cache();
+        // The current version loads, so the refusals below are about the version alone.
+        std::fs::write(&index_path, build_index_bytes(&[(hash_bytes, offset, length)])).unwrap();
+        load_pack_pair(&data_path, &index_path).expect("a version-3 pair must load");
 
-        // The framed reader reads the unframed v1 record transparently.
-        assert!(is_in_packs(&hash).unwrap());
-        assert_eq!(packs_verified(&hash), content);
+        for version in [1u32, 2, 4] {
+            // An old-layout index: magic, version, count, then the record with no fanout table.
+            let mut index = Vec::new();
+            index.extend_from_slice(PACK_INDEX_MAGIC);
+            index.extend_from_slice(&version.to_le_bytes());
+            index.extend_from_slice(&1u32.to_le_bytes());
+            index.extend_from_slice(&hash_bytes);
+            index.extend_from_slice(&offset.to_le_bytes());
+            index.extend_from_slice(&length.to_le_bytes());
+            std::fs::write(&index_path, &index).unwrap();
+
+            let error = load_pack_pair(&data_path, &index_path).err().expect("another index version must be refused");
+            assert!(error.contains(&format!("format version {}", version)) && error.contains("reads only version 3"),
+                "the refusal must name the version found: {}", error);
+        }
+
+        // A version-3 index over a data file of another version is refused by the data's version.
+        std::fs::write(&index_path, build_index_bytes(&[(hash_bytes, offset, length)])).unwrap();
+        let mut old_data = data.clone();
+        old_data[8..12].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&data_path, &old_data).unwrap();
+        let error = load_pack_pair(&data_path, &index_path).err().expect("another data version must be refused");
+        assert!(error.contains("Pack data") && error.contains("format version 2"), "{}", error);
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -6018,7 +6424,7 @@ mod tests {
         let hash_a_bytes = hash_to_bytes(&hash_a).unwrap();
         let blob_b = zstd::encode_all(content_b.as_slice(), 0).unwrap();
 
-        // Framed (v2) data: header, then one RECORD_FULL whose payload is B's blob.
+        // Data: header, then one RECORD_FULL whose payload is B's blob.
         let mut data = Vec::new();
         data.extend_from_slice(PACK_DATA_MAGIC);
         data.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
@@ -6027,14 +6433,8 @@ mod tests {
         data.extend_from_slice(&blob_b);
         let length = 1 + blob_b.len() as u64;
 
-        // Index: header (magic + version + count), then one (hash A, offset, length) record.
-        let mut index = Vec::new();
-        index.extend_from_slice(PACK_INDEX_MAGIC);
-        index.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
-        index.extend_from_slice(&1u32.to_le_bytes());
-        index.extend_from_slice(&hash_a_bytes);
-        index.extend_from_slice(&offset.to_le_bytes());
-        index.extend_from_slice(&length.to_le_bytes());
+        // Index: one (hash A, offset, length) record.
+        let index = build_index_bytes(&[(hash_a_bytes, offset, length)]);
 
         std::fs::write(pack_folder.join("corrupt.pack"), &data).unwrap();
         std::fs::write(pack_folder.join("corrupt.idx"), &index).unwrap();
@@ -6145,8 +6545,8 @@ mod tests {
 
     #[test]
     fn a_short_delta_record_is_rejected_not_panicked() {
-        // Index-level validation (`validate_index_records`) only checks that offsets/lengths are
-        // in bounds and exactly cover the data file — it has no notion of what a record's *kind*
+        // Index-level validation (`index_format`) only checks that offsets/lengths are in bounds
+        // and exactly cover the data file — it has no notion of what a record's *kind*
         // byte requires, so it happily accepts a record too short to hold a delta's base hash. A
         // native writer never emits one, but a locally loaded pack is not re-verified against
         // that shape (unlike a transport-imported one, checked hash-by-hash on the way in), so a
@@ -6158,7 +6558,7 @@ mod tests {
         std::fs::create_dir_all(&pack_folder).unwrap();
         let _scope = StorageRootScope::enter(&temp);
 
-        // Framed (v2) data: header, then one RECORD_DELTA record with only 2 bytes after the
+        // Data: header, then one RECORD_DELTA record with only 2 bytes after the
         // kind byte — nowhere near the 32-byte base hash the kind promises, let alone a VLQ
         // length after it.
         let mut data = Vec::new();
@@ -6171,13 +6571,7 @@ mod tests {
 
         // Index: header, then one record whose (offset, length) exactly covers the short
         // record above — so index-level validation passes and the pack loads.
-        let mut index = Vec::new();
-        index.extend_from_slice(PACK_INDEX_MAGIC);
-        index.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
-        index.extend_from_slice(&1u32.to_le_bytes());
-        index.extend_from_slice(&[0u8; HASH_LEN]);
-        index.extend_from_slice(&offset.to_le_bytes());
-        index.extend_from_slice(&length.to_le_bytes());
+        let index = build_index_bytes(&[([0u8; HASH_LEN], offset, length)]);
 
         let data_path = pack_folder.join("short-delta.pack");
         let index_path = pack_folder.join("short-delta.idx");
@@ -6185,8 +6579,9 @@ mod tests {
         std::fs::write(&index_path, &index).unwrap();
 
         let pack = load_pack_pair(&data_path, &index_path).expect("index-level validation must accept this pack");
+        pack.validate_full().expect("the record tiles the data file, so full validation must accept it");
 
-        let result = read_record_header(&pack, offset, length, true);
+        let result = read_record_header(&pack, offset, length);
         assert!(result.is_err(), "a delta record too short for a base hash must be rejected, got {:?}", result);
         let message = result.unwrap_err();
         assert!(message.contains("truncated"), "the error should name the truncation: {}", message);
@@ -6238,19 +6633,10 @@ mod tests {
             records.push((*hash, offset, data.len() as u64 - offset));
         }
 
-        // Index: header, then every record sorted by hash (`validate_index_records` requires it).
+        // Index: every record sorted by hash (the index format requires it).
         let mut sorted = records.clone();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut index = Vec::new();
-        index.extend_from_slice(PACK_INDEX_MAGIC);
-        index.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
-        index.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-        for (hash, offset, length) in &sorted {
-            index.extend_from_slice(hash);
-            index.extend_from_slice(&offset.to_le_bytes());
-            index.extend_from_slice(&length.to_le_bytes());
-        }
+        let index = build_index_bytes(&sorted);
 
         let data_path = pack_folder.join("chain.pack");
         let index_path = pack_folder.join("chain.idx");
@@ -6629,7 +7015,7 @@ mod tests {
         }
 
         // The uncached load itself is `Ok`, with B quarantined and A loaded normally.
-        let loaded = load_packs_from_disk(&folder).expect("an orphaned pair must not fail the whole load");
+        let loaded = load_packs_from_disk(&folder, IndexCheck::Lazy).expect("an orphaned pair must not fail the whole load");
         assert_eq!(loaded.packs.len(), 1, "only A's pair loaded cleanly");
         assert_eq!(loaded.quarantined.len(), 1, "B's orphaned index must be quarantined, not dropped");
         assert!(loaded.unenumerable.is_empty(), "B's index parses fine; it is not unenumerable");
@@ -6768,7 +7154,7 @@ mod tests {
         }
 
         // The uncached load places B in `unenumerable`, not `quarantined`, and A still loads.
-        let loaded = load_packs_from_disk(&folder).expect("an unparseable index must not fail the whole load");
+        let loaded = load_packs_from_disk(&folder, IndexCheck::Lazy).expect("an unparseable index must not fail the whole load");
         assert_eq!(loaded.packs.len(), 1, "only A's pair loaded cleanly");
         assert!(loaded.quarantined.is_empty(), "B's index does not parse; it cannot be quarantined");
         assert_eq!(loaded.unenumerable.len(), 1, "B's unparseable index must be recorded as unenumerable");

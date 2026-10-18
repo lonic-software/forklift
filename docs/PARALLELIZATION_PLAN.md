@@ -174,10 +174,10 @@ contention.** Two things decide almost every row:
      often the bytes are fetched from the store.
    - **mmap'd repack copies.** `collect_targets` now returns the `Arc<Vec<LoadedPack>>` it already
      built (renamed `source_packs`), kept alive for the whole `compact` call. Each `CopyRecord`
-     target carries a `pack_index` into that vector instead of a `PathBuf`, and the copy
-     (`framed_record`) is a `Cow::Borrowed` slice straight out of the pack's `Mmap` — zero-copy,
-     zero-syscall — for the common framed (version ≥ 2) case; only the rare unframed (version-1)
-     record still allocates, to prepend the missing kind byte. The **only** thing proven to
+     target carries a `pack_index` into that vector instead of a `PathBuf`, and the copy is a
+     slice straight out of the pack's `Mmap` — zero-copy, zero-syscall. (Version-1 unframed
+     records, which once needed a kind byte prepended, are no longer read at all since FORK-118.)
+     The **only** thing proven to
      matter for the byte-identical-output contract is that the copied bytes are unchanged — a
      borrow of the same bytes a fresh `read_exact` would have produced is trivially
      byte-identical, so this is a pure latency win with no risk to the D5 pack-id/idempotent-repack

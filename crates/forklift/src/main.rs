@@ -109,10 +109,13 @@ async fn async_main() {
     }
 
     // Undocumented, test-only debug hook, same shape again: lets the pack preload tests prove a
-    // `diff` read the pack folder once, and that the read was the preload's.
+    // `diff` read the pack folder once, and that the read was the preload's, and the lazy index tests
+    // prove a command validated only the index buckets it read.
     if std::env::var("FORKLIFT_DEBUG_PACK_COUNTS").is_ok() {
         eprintln!("pack-set-reads: {}", forklift_core::util::pack_utils::pack_set_read_count());
         eprintln!("pack-preloads: {}", forklift_core::util::pack_utils::pack_preload_count());
+        eprintln!("pack-buckets-validated: {}", forklift_core::util::pack_utils::pack_buckets_validated());
+        eprintln!("pack-full-validations: {}", forklift_core::util::pack_utils::pack_full_validations());
     }
 
     // Undocumented, test-only debug hook, same shape again: lets the commit-graph tests prove a
