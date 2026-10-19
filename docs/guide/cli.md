@@ -946,7 +946,8 @@ change. A second delivery of an already-delivered draft is refused.
 The squash replaces the target's tree with the draft's, so `deliver` refuses a target that
 moved after the draft forked from it: those changes would be silently undone. Consolidate the
 target into the draft first, then deliver. A target whose head is an earlier
-delivery of this draft is fine, so a draft can keep working and deliver again.
+delivery of a state the draft has been through is fine, so a draft (or a pallet branched
+from it) can keep working and deliver again.
 
 ### `cherry-pick` — apply one parcel's change onto the current pallet (`cp`)
 

@@ -6128,6 +6128,17 @@ fn a_draft_delivered_once_can_deliver_its_later_work() {
     let history = stdout(&warehouse.run(&["history"]));
     assert!(history.contains("second") && history.contains("first"), "{}", history);
     assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "v3\n");
+
+    // A pallet branched from the draft has been through the delivered state too, so it may
+    // deliver over it although a different pallet recorded the delivery.
+    // Revert: also require the record's source to be the delivering pallet → refused.
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    assert_success(&warehouse.run(&["palletize", "branch"]));
+    warehouse.write_file("code.txt", "v4\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "wip v4"]));
+    assert_success(&warehouse.run(&["deliver", "main", "-m", "third"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "v4\n");
 }
 
 // Revert: accept a target head whose tree equals any trail parcel's, without a delivery record →

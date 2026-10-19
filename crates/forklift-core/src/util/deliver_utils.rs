@@ -119,13 +119,15 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         }
     }
 
-    // The trail: everything reachable from the draft head but not from the target head —
-    // the checkpoints since the two diverged.
     let draft_reachable = audit_utils::collect_reachable(&[draft_head.clone()])?;
 
+    // The squash replaces the target's tree, so the target must hold nothing the draft has not seen.
     if let Some(head) = &target_head {
         ensure_target_covered(target, &source, head, &draft_reachable)?;
     }
+
+    // The trail: everything reachable from the draft head but not from the target head —
+    // the checkpoints since the two diverged.
 
     let target_reachable = match &target_head {
         Some(head) => audit_utils::collect_reachable(&[head.clone()])?,
@@ -215,17 +217,17 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
 /// Refuse unless the target holds nothing the draft has not seen. The delivered parcel replaces
 /// the target's tree with the draft's, so anything else on the target would be silently reverted.
 ///
-/// The target head passes when the draft has reached it, or when it is an earlier delivery of
-/// this draft. That is a squash the draft never descends from, so ancestry alone cannot see it. It
-/// counts only when a delivery record names it with this draft as its source and a trail head
-/// the draft has reached, and its tree is that trail head's. Tree equality alone is not enough: a
-/// target rolled back to an earlier checkpoint's content carries that tree too, and delivering
-/// over it would undo the rollback. What lies beneath an earlier delivery needs no walk, because
-/// that delivery passed this same check when it landed, and the draft has only grown since.
+/// The target head passes when the draft has reached it, or when it is a delivery of a state the
+/// draft has reached. A delivery is a squash no draft descends from, so ancestry alone cannot see
+/// it. It counts only when a delivery record names it with a trail head the draft has reached, and
+/// its tree is that trail head's: the target then holds exactly a state the draft has already
+/// been through, whichever pallet delivered it. Tree equality alone is not enough: a target rolled
+/// back to an earlier checkpoint's content carries that tree too, and delivering over it would
+/// undo the rollback.
 ///
 /// # Arguments
 /// * `target`          - The target pallet's name, for the refusal.
-/// * `source`          - The draft pallet's name.
+/// * `source`          - The draft pallet's name, for the refusal.
 /// * `target_head`     - The target's head.
 /// * `draft_reachable` - Every parcel reachable from the draft head.
 ///
@@ -248,8 +250,7 @@ fn ensure_target_covered(target: &str,
         }
 
         if let Some(delivery) = attributed.entry.delivery {
-            if delivery.source == source
-                && draft_reachable.contains(&delivery.trail_head)
+            if draft_reachable.contains(&delivery.trail_head)
                 && object_utils::load_parcel(&delivery.trail_head)?.tree_hash == target_tree {
                 return Ok(());
             }
