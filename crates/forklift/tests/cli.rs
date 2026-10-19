@@ -2200,10 +2200,10 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
     let warehouse = TestWarehouse::new("large-tree-shards");
     let root = warehouse.root.clone();
 
-    // 24 sibling directories (a level of subtrees to load) holding 100 files in all.
+    // 24 sibling directories (a level of subtrees to load) holding 268 files in all.
     let mut files: Vec<(String, String)> = (0..4).map(|n| (String::new(), format!("r{}.txt", n))).collect();
     for dir in 0..24 {
-        files.extend((0..4).map(|n| (format!("d{:02}", dir), format!("f{}.txt", n))));
+        files.extend((0..11).map(|n| (format!("d{:02}", dir), format!("f{}.txt", n))));
     }
     for (dir, name) in &files {
         let path = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
@@ -2255,6 +2255,72 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
 
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
     assert_every_entry_in_place("shift", None);
+}
+
+/// A scoped bay over a tree large enough for the inventory build to fan out inventories its scope
+/// and nothing else: every in-scope entry in its own shard and proven, so the bay reads clean and
+/// an edit deep inside it reads as the only change; no shard for the out-of-scope sibling's
+/// directories, whose level is never loaded; and no entry for the spine's own files.
+#[test]
+fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
+    let warehouse = TestWarehouse::new("large-tree-scoped");
+
+    // In scope: 20 directories under src/api, 280 files. Out of scope: as many under src/web,
+    // and a file on the spine.
+    for side in ["api", "web"] {
+        for dir in 0..20 {
+            for n in 0..14 {
+                let path = format!("src/{}/d{:02}/f{}.txt", side, dir, n);
+                warehouse.write_file(&path, &format!("{}\n", path));
+            }
+        }
+    }
+    warehouse.write_file("src/spine.txt", "spine\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
+    let changes = |dir: &std::path::Path| -> Vec<(String, String)> {
+        let status = warehouse.run_at(dir, &["--json", "stocktake"]);
+        assert_success(&status);
+        let value = json(&status);
+        assert_eq!(value["data"]["staged_count"], 0, "nothing may be staged: {}", stdout(&status));
+        value["data"]["unstaged"].as_array().into_iter().flatten()
+            .map(|change| (change["kind"].as_str().unwrap().to_string(), change["path"].as_str().unwrap().to_string()))
+            .collect()
+    };
+
+    assert_eq!(changes(&scoped_dir), vec![], "a fresh scoped bay must read clean");
+
+    // A same-size edit is caught by the stat only where the entry is this file's own.
+    std::fs::write(scoped_dir.join("src/api/d13/f9.txt"), "SRC/api/d13/f9.txt\n").unwrap();
+    assert_eq!(changes(&scoped_dir), vec![("modified".to_string(), "src/api/d13/f9.txt".to_string())]);
+
+    // The bay's shards sit where the main tree's would, under the bay's own inventory root.
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    let main_inventory = std::path::PathBuf::from(forklift_core::util::file_utils::get_path_inventory_root());
+    let bay_inventory = warehouse.root.join(".forklift").join("bays").join("scoped").join("inventory");
+    let shard = |key: &str| {
+        let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key);
+        let path = bay_inventory.join(main_path.strip_prefix(&main_inventory).unwrap());
+        std::fs::read(&path).ok()
+            .map(|bytes| forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes).unwrap())
+    };
+    assert!(bay_inventory.is_dir(), "the bay keeps its own inventory");
+
+    for dir in 0..20 {
+        let api = shard(&format!("src/api/d{:02}", dir)).expect("every in-scope directory has a shard");
+        assert_eq!(api.get_items_count(), 14, "src/api/d{:02} must hold its own files", dir);
+        assert!(shard(&format!("src/web/d{:02}", dir)).is_none(), "an out-of-scope directory has no shard");
+    }
+    assert!(shard("src").and_then(|spine| spine.get_item_by_name("spine.txt")).is_none(),
+        "the spine's own file is out of scope");
 }
 
 /// A symlink in git's tree is proven as a link, and stays clean after import.

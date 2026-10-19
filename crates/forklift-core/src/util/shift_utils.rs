@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
@@ -919,7 +918,7 @@ pub enum TreeProvenance {
 ///                                       stamped, or a file read or its metadata gathered.
 pub fn build_inventories_for_tree(root_tree_hash: &str,
                                   provenance: TreeProvenance) -> Result<BTreeMap<String, Inventory>, String> {
-    let root_tree = object_utils::load_tree_shared(root_tree_hash)?;
+    let root_tree = object_utils::load_tree(root_tree_hash)?;
 
     // In a scoped bay only the in-scope subtree(s) are inventoried; the spine is descended but
     // its out-of-scope files and siblings are never loaded or shard-ed. Full scope (a plain bay
@@ -944,15 +943,15 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
         match provenance {
             TreeProvenance::Written(_) => inventory_utils::build_inventory_item_from_stat(
                 path,
-                &file.name,
+                file.name(),
                 file.hash.clone(),
                 file.item_type,
                 anchor,
             ),
             TreeProvenance::Verify => verified_tree_entry(
                 path,
-                &file.name,
-                &inventory_utils::build_stale_inventory_item(&file.name, file.hash.clone(), file.item_type),
+                file.name(),
+                &inventory_utils::build_stale_inventory_item(file.name(), file.hash.clone(), file.item_type),
                 anchor,
             ),
         }
@@ -963,19 +962,33 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
         Ok(())
     };
 
-    if files.len() < RECORD_FANOUT_THRESHOLD {
+    let threshold = match provenance {
+        TreeProvenance::Written(_) => WRITTEN_FANOUT_THRESHOLD,
+        TreeProvenance::Verify => VERIFY_FANOUT_THRESHOLD,
+    };
+
+    if files.len() < threshold {
         let mut gather = gather;
         files.iter().try_for_each(|file| gather(file, record(file)))?;
     } else {
+        // Unbounded window and budget: the records are small and every one is kept, so nothing
+        // needs holding back. Prefetch over `fanout_map` for its dynamic claiming: a verified
+        // file's cost is its size, and contiguous chunks leave a worker holding the large ones
+        // (measured on git.git: 58 ms against 64 ms).
         fanout_utils::prefetch_in_order(&files, usize::MAX, usize::MAX, record, |_| 1, gather)?;
     }
 
     Ok(shards.into_iter().collect())
 }
 
-/// Below this many files, a tree's shards are recorded on the calling thread: the fan-out's
-/// threads cost more than they save on a handful of stats.
-const RECORD_FANOUT_THRESHOLD: usize = 64;
+/// Below this many files, a tree's written files are recorded on the calling thread. Each is a
+/// single stat of a few microseconds, so the fan-out's threads only pay for themselves over a
+/// few hundred.
+const WRITTEN_FANOUT_THRESHOLD: usize = 256;
+
+/// Below this many files, a tree's verified files are recorded on the calling thread. Each is
+/// read and hashed, so the fan-out pays for itself sooner.
+const VERIFY_FANOUT_THRESHOLD: usize = 64;
 
 /// One in-scope file of a tree, waiting to be recorded into its directory's shard.
 struct TreeFile {
@@ -983,12 +996,17 @@ struct TreeFile {
     shard: usize,
     /// Its warehouse path key (also its working path, relative to the working directory).
     key: String,
-    /// Its name within the directory.
-    name: String,
     /// The tree entry's hash.
     hash: String,
     /// The tree entry's kind.
     item_type: DirEntryType,
+}
+
+impl TreeFile {
+    /// Its name within the directory: the key's last component.
+    fn name(&self) -> &str {
+        self.key.rsplit_once('/').map_or(self.key.as_str(), |(_, name)| name)
+    }
 }
 
 /// Record one tree file the command did not write: re-proved against its tree entry under an
@@ -1029,7 +1047,7 @@ fn verified_tree_entry(file_path: &Path,
 /// # Returns
 /// * `Ok(())`      - If every in-scope directory was collected.
 /// * `Err(String)` - If a subtree could not be loaded.
-fn collect_tree_directories(root_tree: Arc<TreeItem>,
+fn collect_tree_directories(root_tree: TreeItem,
                             root_tree_hash: &str,
                             scope: &MaterializationScope,
                             shards: &mut Vec<(String, Inventory)>,
@@ -1040,7 +1058,7 @@ fn collect_tree_directories(root_tree: Arc<TreeItem>,
     let scope_is_full = scope.is_full();
 
     // Each directory of the level: its key, its tree's hash, and the loaded tree.
-    let mut level: Vec<(String, String, Arc<TreeItem>)> = vec![(String::new(), root_tree_hash.to_string(), root_tree)];
+    let mut level: Vec<(String, String, TreeItem)> = vec![(String::new(), root_tree_hash.to_string(), root_tree)];
 
     while !level.is_empty() {
         let mut subtrees: Vec<(String, String)> = Vec::new();
@@ -1061,7 +1079,6 @@ fn collect_tree_directories(root_tree: Arc<TreeItem>,
                 files.push(TreeFile {
                     shard,
                     key: file_key,
-                    name: name.clone(),
                     hash: item.hash.clone(),
                     item_type: item.item_type,
                 });
@@ -1091,9 +1108,10 @@ fn collect_tree_directories(root_tree: Arc<TreeItem>,
             }
         }
 
-        let load = |(_, hash): &(String, String)| object_utils::load_tree_shared(hash);
+        // One-shot loads, kept out of the parsed-tree cache (see `object_utils::load_tree`).
+        let load = |(_, hash): &(String, String)| object_utils::load_tree(hash);
 
-        let loaded: Vec<Result<Arc<TreeItem>, String>> = if subtrees.len() < TREE_LOAD_FANOUT_THRESHOLD {
+        let loaded: Vec<Result<TreeItem, String>> = if subtrees.len() < TREE_LOAD_FANOUT_THRESHOLD {
             subtrees.iter().map(load).collect()
         } else {
             fanout_utils::fanout_map(&subtrees, load)
