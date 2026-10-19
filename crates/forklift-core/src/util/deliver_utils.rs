@@ -53,8 +53,9 @@ pub struct DeliverOutcome {
 ///
 /// # Returns
 /// * `Ok(DeliverOutcome)` - The delivered parcel and trail details.
-/// * `Err(String)`        - If there is nothing to deliver, trust is not established, or
-///                          an object could not be built, stored or signed.
+/// * `Err(String)`        - If there is nothing to deliver, the target holds changes the
+///                          draft has not seen, trust is not established, or an object could
+///                          not be built, stored or signed.
 pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutcome, String> {
     pallet_utils::validate_pallet_name(target)?;
 
@@ -129,6 +130,35 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         .filter(|hash| !target_reachable.contains(hash))
         .collect();
     let checkpoints = trail.len();
+
+    // The delivered parcel replaces the target's tree with the draft's, so the target must hold
+    // nothing the draft has not seen. That holds when the target head is one of the draft's
+    // ancestors, or when it carries the tree of one: a prior delivery of this draft is a squash
+    // the draft never descends from, but its tree is that of the trail head it squashed. Anything
+    // else is work that reached the target after the draft forked, and the squash would silently
+    // revert it.
+    if let Some(head) = &target_head {
+        if !merge_utils::is_ancestor(head, &draft_head)? {
+            let target_tree = object_utils::load_parcel(head)?.tree_hash;
+            let mut seen = false;
+
+            for hash in &trail {
+                if object_utils::load_parcel(hash)?.tree_hash == target_tree {
+                    seen = true;
+                    break;
+                }
+            }
+
+            if !seen {
+                return Err(format!(
+                    "\"{target}\" holds changes \"{source}\" does not have: it moved after \
+                    \"{source}\" forked from it, and delivering would undo them. Consolidate \
+                    \"{target}\" into \"{source}\" first (\"forklift consolidate {target}\"), \
+                    then deliver."
+                ));
+            }
+        }
+    }
 
     // The delivered parcel preserves the trail's authors (the convention for re-apply
     // operations) and records the deliverer as the stacker.
