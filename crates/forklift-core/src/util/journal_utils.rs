@@ -198,7 +198,7 @@ struct JournalContents {
 /// * `Ok(Snapshot)` - The snapshot.
 /// * `Err(String)`  - If the current pallet, consolidation or cherry-pick state could not be read.
 pub fn capture() -> Result<Snapshot, String> {
-    NOT_JOURNALED.store(false, std::sync::atomic::Ordering::SeqCst);
+    not_journaled_marks().remove(&crate::globals::forklift_root());
 
     let position = pallet_utils::read_position()?;
     let heads = position.base
@@ -218,18 +218,25 @@ pub fn capture() -> Result<Snapshot, String> {
     Ok(snapshot)
 }
 
-/// Set by [`not_journaled`]; cleared by [`capture`] and consumed by [`push_if_changed`].
-static NOT_JOURNALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The warehouses whose running command [`not_journaled`] marked, keyed like the write log so
+/// parallel tests in separate warehouses never see each other's mark. Cleared by [`capture`] and
+/// [`discard`], consumed by [`push_if_changed`].
+static NOT_JOURNALED: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+fn not_journaled_marks() -> std::sync::MutexGuard<'static, BTreeSet<PathBuf>> {
+    NOT_JOURNALED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Mark the running command as one [`push_if_changed`] must not journal, though its kind is
 /// journaled: the command itself knows which form it took.
 pub fn not_journaled() {
-    NOT_JOURNALED.store(true, std::sync::atomic::Ordering::SeqCst);
+    not_journaled_marks().insert(crate::globals::forklift_root());
 }
 
 /// Stop recording head writes without journaling them — for an operation that failed, which
 /// [`push_if_changed`] must not journal.
 pub fn discard() {
+    not_journaled_marks().remove(&crate::globals::forklift_root());
     pallet_utils::take_write_log();
 }
 
@@ -251,7 +258,7 @@ pub fn discard() {
 pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
     let writes = pallet_utils::take_write_log();
 
-    if NOT_JOURNALED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if not_journaled_marks().remove(&crate::globals::forklift_root()) {
         return Ok(());
     }
 

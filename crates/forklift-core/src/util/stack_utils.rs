@@ -476,8 +476,11 @@ pub async fn stack_parcel(description: Option<String>,
     // whose files already match the new parcel and nothing in progress, which catching up
     // (`shift <pallet>`) records without touching a file. The other order would leave the base at
     // the new parcel with a merge still recorded on the old one.
-    clean_up_after_stack(&prepared, &stamp_hashes)
-        .map_err(|e| pallet_utils::landed_but(&pallet, &object.hash, &e))?;
+    clean_up_after_stack(&prepared, &stamp_hashes).map_err(|e| format!(
+        "{} If a consolidation or cherry-pick is still recorded, this parcel completed it: abort it \
+        (\"forklift shift {}\" names how) before catching up.",
+        pallet_utils::landed_but(&pallet, &object.hash, &e), pallet
+    ))?;
     pallet_utils::record_landed(&pallet, &object.hash)?;
 
     Ok((object.hash, pallet))
