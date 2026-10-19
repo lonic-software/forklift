@@ -5632,6 +5632,71 @@ fn bays_are_parallel_working_directories_sharing_the_warehouse() {
     assert!(stdout(&warehouse.run(&["bay"])).contains("No bays"));
 }
 
+// FORK-213 spike: two bays current on one pallet. Bay A stacks a change to f; bay B, whose
+// inventory still holds the old f, stacks a change to g. Today B's stack succeeds and its tree turns
+// f back: the assertions marked DEFECT pin that silent revert and invert with the fix.
+#[test]
+fn spike_a_stale_bay_stack_reverts_another_bays_parcel() {
+    let warehouse = TestWarehouse::new("stale-bay-revert");
+    warehouse.write_file("f.txt", "f v1\n");
+    warehouse.write_file("g.txt", "g v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-b");
+    assert_success(&warehouse.run(&["bay", "add", "b", bay_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run_at(&bay_dir, &["shift", "main"]));
+
+    warehouse.write_file("f.txt", "f v2 from A\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "A changes f"]));
+
+    std::fs::write(bay_dir.join("g.txt"), "g v2 from B\n").unwrap();
+    assert_success(&warehouse.run_at(&bay_dir, &["load", "g.txt"]));
+    let stacked = warehouse.run_at(&bay_dir, &["stack", "B changes g"]);
+
+    // DEFECT: the stale bay's stack is accepted...
+    assert_success(&stacked);
+    let f = stdout(&warehouse.run(&["show", "main:f.txt"]));
+    let g = stdout(&warehouse.run(&["show", "main:g.txt"]));
+    assert!(g.contains("g v2 from B"), "{}", g);
+    // DEFECT: ...and main's head has f back at v1, A's parcel silently reverted.
+    assert!(f.contains("f v1") && !f.contains("f v2"), "{}", f);
+}
+
+// FORK-213 spike: a clean bay made stale by another bay's stack cannot shift away, and stocktake
+// reports the other bay's parcel reversed as staged. DEFECT assertions invert with the fix.
+#[test]
+fn spike_a_stale_clean_bay_cannot_shift_away() {
+    let warehouse = TestWarehouse::new("stale-bay-shift");
+    warehouse.write_file("f.txt", "f v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-b");
+    assert_success(&warehouse.run(&["bay", "add", "b", bay_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run_at(&bay_dir, &["shift", "main"]));
+
+    warehouse.write_file("f.txt", "f v2 from A\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "A changes f"]));
+
+    // Bay B touched nothing, yet:
+    let status = warehouse.run_at(&bay_dir, &["stocktake"]);
+    // DEFECT: stocktake reports A's change to f, reversed, as staged in B...
+    assert!(stdout(&status).contains("Staged changes") && stdout(&status).contains("modified:  f.txt"), "{}", stdout(&status));
+    let shifted = warehouse.run_at(&bay_dir, &["shift", "b"]);
+    // DEFECT: ...and the bay cannot shift away.
+    assert!(!shifted.status.success(), "{}", stdout(&shifted));
+    // DEFECT: the refusal calls A's parcel B's local changes, and its first hint, stacking them,
+    // is the silent revert the other spike pins.
+    assert!(stderr(&shifted).contains("local changes that shifting would overwrite. Stack them"), "{}", stderr(&shifted));
+}
+
 #[test]
 fn a_bay_whose_path_file_cannot_be_read_is_neither_listed_blank_nor_half_removed() {
     let warehouse = TestWarehouse::new("bay-unreadable-path");
