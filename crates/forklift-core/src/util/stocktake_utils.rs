@@ -716,8 +716,9 @@ fn detect_unstaged_moves(changes: &mut Vec<Change>) -> Result<(), String> {
                 let inventory = load_shard_or_empty(parent_key)?;
 
                 if let Some(item) = inventory.get_item_by_name(name) {
-                    // Entries with zeroed stat data (fresh from a shift or an unstage)
-                    // have no meaningful inode to match on.
+                    // Entries with zeroed stat data (fresh from a shift, or from an unstage
+                    // of a file that did not provably hold the head's content) have no
+                    // meaningful inode to match on.
                     if item.inode != 0 {
                         removed_by_id.entry((item.device, item.inode)).or_default().push(index);
                         removed_hashes.insert(index, item.hash.clone());

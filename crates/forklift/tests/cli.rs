@@ -2022,6 +2022,78 @@ fn restore_rewrites_a_matching_file_of_another_kind() {
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "the staged mode must come back");
 }
 
+/// `restore --staged` records the stat data of a working file that provably holds the head's
+/// content, so the next comparison trusts the stat cache instead of rehashing; a file that does
+/// not hold it keeps zeroed stat data, so it still shows as modified.
+#[test]
+fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
+    let warehouse = TestWarehouse::new("restore-staged-stat");
+    warehouse.write_file("a.txt", "original a\n");
+    warehouse.write_file("dir/b.txt", "original b\n");
+    warehouse.write_file("dir/c.txt", "original c\n");
+
+    for path in ["a.txt", "dir/b.txt", "dir/c.txt"] {
+        backdate(&warehouse.root.join(path), 3600);
+    }
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "baseline"]));
+
+    let mtime = |path: &str| {
+        file_identity(&warehouse.root.join(path)).0.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    };
+
+    // b: a staged modification still in the working file. c: a staged modification since
+    // reverted by hand, so only its content proves it matches the head.
+    warehouse.write_file("dir/b.txt", "changed b\n");
+    warehouse.write_file("dir/c.txt", "changed c\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    warehouse.write_file("dir/c.txt", "original c\n");
+    backdate(&warehouse.root.join("dir/c.txt"), 7200);
+
+    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime("a.txt"),
+        "a stat-clean file must keep its stat data");
+    assert_eq!(inventory_entry(&warehouse, "dir", "b.txt").content_change_timestamp, 0,
+        "a file that differs from the head must keep zeroed stat data");
+    assert_eq!(inventory_entry(&warehouse, "dir", "c.txt").content_change_timestamp, mtime("dir/c.txt"),
+        "a file whose content matches the head must record its stat data");
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
+    assert!(status.contains("modified:") && status.contains("b.txt") && !status.contains("c.txt"), "status: {}", status);
+
+    // The single-file form records the same way.
+    warehouse.write_file("a.txt", "changed a\n");
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    warehouse.write_file("a.txt", "original a\n");
+    backdate(&warehouse.root.join("a.txt"), 7200);
+    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime("a.txt"),
+        "a file whose content matches the head must record its stat data");
+    // A staged removal is never a witness, even where its entry still proves the untouched
+    // file by stat: the file comes back as a live entry.
+    assert_success(&warehouse.run(&["remove", "a.txt"]));
+    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    let a_entry = inventory_entry(&warehouse, "", "a.txt");
+    assert!(a_entry.state == forklift_core::enums::inventory_item_state::InventoryItemState::Normal,
+        "an unstaged removal must come back as a live entry");
+    assert_eq!(a_entry.content_change_timestamp, mtime("a.txt"), "a file whose content matches the head must record its stat data");
+
+    // Unstaging a file whose entry already matches the head changes no content, so it keeps
+    // the rollups a stack stamped.
+    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert_success(&warehouse.run(&["load", "dir/b.txt"]));
+    assert_success(&warehouse.run(&["stack", "second"]));
+    let rollup = shard_rollup(&warehouse, "");
+    assert!(rollup.is_some(), "the stack must stamp the root's rollup");
+    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_eq!(shard_rollup(&warehouse, ""), rollup, "unstaging an unchanged file must keep the rollups");
+}
+
 #[test]
 fn restore_staged_resets_the_inventory_to_the_head() {
     let warehouse = TestWarehouse::new("restore-staged");
