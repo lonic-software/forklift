@@ -1,7 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::globals::bay_root;
+use crate::util::cherry_pick_utils::{self, CherryPickState};
 use crate::util::merge_utils::{self, ConsolidationState};
 use crate::util::object_utils;
 use crate::util::pallet_utils::{self, PalletRef};
@@ -9,8 +10,8 @@ use crate::util::file_utils;
 
 /// The undo journal (§7.8): an append-only list of operation records kept in the bay, so `undo`
 /// can reverse the last state-changing operation — not just the last `stack`. Content addressing
-/// makes this cheap: a record is just the pallet refs, the current pallet and any in-progress
-/// consolidation on each side of the operation (all tiny); the objects they point at are
+/// makes this cheap: a record is just the current pallet, the pallet refs the operation moved and
+/// any in-progress consolidation or cherry-pick on each side of it (all tiny); the objects they point at are
 /// immutable and already stored. The working directory and inventory are the undo command's
 /// concern, not the journal's.
 const FILE_NAME_JOURNAL: &str = "journal.json";
@@ -31,28 +32,82 @@ pub struct Snapshot {
     /// The bay's current pallet.
     pub current_pallet: String,
 
-    /// Every pallet ref (user and meta), keyed by wire form (`main`, `@office`) → head hash.
+    /// Pallet refs (user and meta), keyed by wire form (`main`, `@office`) → head hash. A
+    /// journaled entry keeps only the refs its operation moved, plus both sides' current pallets;
+    /// a ref the operation left alone needs no restoring.
     pub heads: BTreeMap<String, String>,
 
     /// The bay's consolidation in progress (`their_head`, `their_pallet`), if any.
     pub consolidation: Option<(String, String)>,
+
+    /// The bay's cherry-pick in progress (one whose merge left conflicts), if any.
+    pub cherry_pick: Option<PickInProgress>,
+}
+
+/// A cherry-pick in progress, as journaled: the bay's cherry-pick state file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PickInProgress {
+    /// The parcel being applied.
+    pub source: String,
+
+    /// The description the completing parcel defaults to.
+    pub description: Option<String>,
+}
+
+/// What `undo` gates on: everything about the bay that a journaled operation can change, and
+/// nothing about the refs other bays share.
+#[derive(Debug, PartialEq)]
+struct BayState {
+    current_pallet: String,
+    current_head: Option<String>,
+    consolidation: Option<(String, String)>,
+    cherry_pick: Option<PickInProgress>,
+}
+
+impl BayState {
+    /// The bay as it is now.
+    fn read() -> Result<BayState, String> {
+        let current_pallet = pallet_utils::get_current_pallet_name()?;
+        let current_head = pallet_utils::get_pallet_head(&current_pallet)?;
+
+        Ok(BayState {
+            current_pallet,
+            current_head,
+            consolidation: read_consolidation()?,
+            cherry_pick: read_cherry_pick()?,
+        })
+    }
 }
 
 impl Snapshot {
     /// The head of the current pallet, or `None` while it is unborn.
-    fn current_head(&self) -> Option<&String> {
+    pub fn current_head(&self) -> Option<&String> {
         self.heads.get(&self.current_pallet)
     }
 
-    /// Whether two snapshots agree on everything this bay's `undo` gates on: the current pallet,
-    /// its head and the consolidation in progress. The other refs are deliberately left out: pallet
-    /// refs are shared by every bay of the warehouse, so a stack in another bay moves them without
+    /// The bay state this snapshot records. Pallet refs other than the current one are left out:
+    /// they are shared by every bay of the warehouse, so a stack in another bay moves them without
     /// touching this bay's history.
-    fn same_bay_state(&self, other: &Snapshot) -> bool {
-        self.current_pallet == other.current_pallet
-            && self.current_head() == other.current_head()
-            && self.consolidation == other.consolidation
+    fn bay_state(&self) -> BayState {
+        BayState {
+            current_pallet: self.current_pallet.clone(),
+            current_head: self.current_head().cloned(),
+            consolidation: self.consolidation.clone(),
+            cherry_pick: self.cherry_pick.clone(),
+        }
     }
+}
+
+/// The bay's consolidation in progress, as journaled.
+fn read_consolidation() -> Result<Option<(String, String)>, String> {
+    Ok(merge_utils::read_consolidation_state()?.map(|state| (state.their_head, state.their_pallet)))
+}
+
+/// The bay's cherry-pick in progress, as journaled.
+fn read_cherry_pick() -> Result<Option<PickInProgress>, String> {
+    Ok(cherry_pick_utils::read_state()?
+        .map(|state| PickInProgress { source: state.source, description: state.description }))
 }
 
 /// One journaled operation: the state before it ran, and the state it left behind.
@@ -77,13 +132,7 @@ struct JournalFile<'a> {
     entries: &'a [JournalEntry],
 }
 
-/// The journal file, as read: the version is read on its own first, so an unknown version is
-/// named as such rather than as whatever shape mismatch its entries happen to produce.
-#[derive(Deserialize)]
-struct JournalVersion {
-    version: u64,
-}
-
+/// The journal file, as read (once its version has been checked on its own).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JournalContents {
@@ -96,7 +145,7 @@ struct JournalContents {
 ///
 /// # Returns
 /// * `Ok(Snapshot)` - The snapshot.
-/// * `Err(String)`  - If the refs or consolidation state could not be read.
+/// * `Err(String)`  - If the refs, consolidation or cherry-pick state could not be read.
 pub fn capture() -> Result<Snapshot, String> {
     let current_pallet = pallet_utils::get_current_pallet_name()?;
 
@@ -105,10 +154,12 @@ pub fn capture() -> Result<Snapshot, String> {
         .map(|(reference, head)| (reference.to_wire(), head))
         .collect();
 
-    let consolidation = merge_utils::read_consolidation_state()?
-        .map(|state| (state.their_head, state.their_pallet));
-
-    Ok(Snapshot { current_pallet, heads, consolidation })
+    Ok(Snapshot {
+        current_pallet,
+        heads,
+        consolidation: read_consolidation()?,
+        cherry_pick: read_cherry_pick()?,
+    })
 }
 
 /// Journal `op`, which ran from `before` to the state the bay is in now — but only if it changed
@@ -119,7 +170,7 @@ pub fn capture() -> Result<Snapshot, String> {
 /// # Arguments
 /// * `op`     - The command's journal name.
 /// * `before` - The snapshot captured by [`capture`] before the command ran.
-pub fn push_if_changed(op: &str, before: Snapshot) -> Result<(), String> {
+pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
     // The undo journal reverses an operation by restoring refs, which cannot un-create a
     // pallet's very first parcel (that would need deleting the ref). So an operation starting
     // from an unborn pallet is not journaled.
@@ -127,11 +178,25 @@ pub fn push_if_changed(op: &str, before: Snapshot) -> Result<(), String> {
         return Ok(());
     }
 
-    let after = capture()?;
+    let mut after = capture()?;
 
-    if before.same_bay_state(&after) {
+    if before.bay_state() == after.bay_state() {
         return Ok(());
     }
+
+    // Keep only the refs the operation moved, plus both current pallets (the gate and undo's
+    // report read those). Restoring a ref the operation left alone would be a no-op, and a
+    // warehouse with many pallets would otherwise journal every one of them twice per entry.
+    let kept: BTreeSet<String> = before.heads.keys().chain(after.heads.keys())
+        .filter(|wire| {
+            before.heads.get(*wire) != after.heads.get(*wire)
+                || **wire == before.current_pallet
+                || **wire == after.current_pallet
+        })
+        .cloned()
+        .collect();
+    before.heads.retain(|wire, _| kept.contains(wire));
+    after.heads.retain(|wire, _| kept.contains(wire));
 
     let mut entries = read()?;
     entries.push(JournalEntry { op: op.to_string(), before, after });
@@ -176,7 +241,8 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 }
 
 /// Whether the bay is still exactly where `entry`'s operation left it: the same current pallet,
-/// that pallet at the same head, and the same consolidation in progress. Anything else means an
+/// that pallet at the same head, and the same consolidation and cherry-pick in progress (a
+/// conflicted cherry-pick moves no ref). Anything else means an
 /// operation outside the journal ran since (`palletize` and `deliver` switch the current pallet,
 /// a fast-forward `lower` or a haul merge moves its head), and reversing `entry` now would undo an
 /// older operation than the user's last. Refs other than the current pallet are not compared: they
@@ -189,8 +255,8 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// * `Ok(())`      - The bay matches; the entry may be reversed.
 /// * `Err(String)` - The refusal, naming what differs; or the state could not be read.
 pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
-    let now = capture()?;
-    let after = &entry.after;
+    let now = BayState::read()?;
+    let after = entry.after.bay_state();
 
     if now.current_pallet != after.current_pallet {
         return Err(format!(
@@ -201,7 +267,7 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
         ));
     }
 
-    if now.current_head() != after.current_head() {
+    if now.current_head != after.current_head {
         return Err(format!(
             "Pallet \"{}\" has moved since that operation (\"{}\") — something outside the undo \
             journal advanced it, and undo will not rewind that too. Continue forward instead \
@@ -224,10 +290,24 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
         ));
     }
 
+    if now.cherry_pick != after.cherry_pick {
+        let describe = |pick: &Option<PickInProgress>| match pick {
+            Some(pick) => format!("a cherry-pick of {}", pick.source),
+            None => "no cherry-pick".to_string(),
+        };
+
+        return Err(format!(
+            "The cherry-pick state has changed since that operation (\"{}\"): it left {} in \
+            progress, and {} is in progress now. Undo will not reverse an older operation than \
+            the last one.",
+            entry.op, describe(&after.cherry_pick), describe(&now.cherry_pick)
+        ));
+    }
+
     Ok(())
 }
 
-/// Restore the pallet refs, current pallet and consolidation state an entry recorded before its
+/// Restore the pallet refs, current pallet, consolidation and cherry-pick state an entry recorded before its
 /// operation. The working directory and inventory are left untouched — the `undo` command decides
 /// whether to re-materialize (a soft reset keeps them; reversing a `shift` re-materializes).
 ///
@@ -258,6 +338,15 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
             &ConsolidationState { their_head: their_head.clone(), their_pallet: their_pallet.clone() }
         )?,
         None => merge_utils::clear_consolidation_state()?,
+    }
+
+    // Undoing the stack that completed a conflicted pick puts the pick back in progress, so the
+    // next stack completes it again with the source's authors.
+    match &entry.before.cherry_pick {
+        Some(pick) => cherry_pick_utils::write_state(
+            &CherryPickState { source: pick.source.clone(), description: pick.description.clone() }
+        )?,
+        None => cherry_pick_utils::clear_state()?,
     }
 
     Ok(())
@@ -292,8 +381,16 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
     }
 
     if let Some((their_head, their_pallet)) = &snapshot.consolidation {
-        if !object_utils::is_object_hash(their_head) || their_pallet.is_empty() {
+        if !object_utils::is_object_hash(their_head) {
             return Err("records a malformed consolidation".to_string());
+        }
+
+        pallet_utils::validate_pallet_name(their_pallet).map_err(invalid_name)?;
+    }
+
+    if let Some(pick) = &snapshot.cherry_pick {
+        if !object_utils::is_object_hash(&pick.source) {
+            return Err("records a malformed cherry-pick".to_string());
         }
     }
 
@@ -311,17 +408,23 @@ fn read() -> Result<Vec<JournalEntry>, String> {
         Err(e) => return Err(unreadable(&path, &format!("could not be read ({})", e))),
     };
 
-    let version: JournalVersion = serde_json::from_slice(&bytes)
+    // Parse once; the version is checked on its own first, so an unknown version is named as
+    // such rather than as whatever shape mismatch its entries happen to produce.
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| unreadable(&path, &format!("is not a readable journal ({})", e)))?;
 
-    if version.version != JOURNAL_VERSION {
+    let Some(version) = value.get("version").and_then(serde_json::Value::as_u64) else {
+        return Err(unreadable(&path, "is not a readable journal (it records no format version)"));
+    };
+
+    if version != JOURNAL_VERSION {
         return Err(unreadable(&path, &format!(
             "has format version {}, which this forklift does not understand (it reads version {})",
-            version.version, JOURNAL_VERSION
+            version, JOURNAL_VERSION
         )));
     }
 
-    let contents: JournalContents = serde_json::from_slice(&bytes)
+    let contents: JournalContents = serde_json::from_value(value)
         .map_err(|e| unreadable(&path, &format!("is malformed ({})", e)))?;
 
     for entry in &contents.entries {
@@ -385,7 +488,7 @@ mod tests {
         let mut heads = BTreeMap::new();
         heads.insert(pallet.to_string(), head.to_string());
 
-        Snapshot { current_pallet: pallet.to_string(), heads, consolidation: None }
+        Snapshot { current_pallet: pallet.to_string(), heads, consolidation: None, cherry_pick: None }
     }
 
     /// An entry recording `op` moving `pallet` from `before` to `after`.
@@ -463,6 +566,59 @@ mod tests {
         assert_eq!(popped.after.heads.get("side"), Some(&hash('c')));
         assert_eq!(popped.after.consolidation, Some((hash('d'), "side".to_string())));
         assert!(pop().unwrap().is_none(), "popping removes the entry");
+    }
+
+    #[test]
+    fn push_if_changed_keeps_only_the_refs_the_operation_moved() {
+        let _scratch = Scratch::new("push-prunes");
+
+        pallet_utils::set_pallet_head("main", &hash('a')).unwrap();
+        pallet_utils::set_pallet_head("idle", &hash('e')).unwrap();
+        pallet_utils::set_meta_pallet_head("office", &hash('f')).unwrap();
+        pallet_utils::set_pallet_head("side", &hash('1')).unwrap();
+        let before = capture().unwrap();
+
+        // The operation moves "main" and "side"; "idle" and "@office" stay where they were.
+        pallet_utils::set_pallet_head("main", &hash('b')).unwrap();
+        pallet_utils::set_pallet_head("side", &hash('2')).unwrap();
+        push_if_changed("stack", before).unwrap();
+
+        let popped = pop().unwrap().unwrap();
+        let keys = |heads: &BTreeMap<String, String>| heads.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&popped.before.heads), ["main", "side"]);
+        assert_eq!(keys(&popped.after.heads), ["main", "side"]);
+    }
+
+    #[test]
+    fn push_if_changed_keeps_both_current_pallets_across_a_switch() {
+        let _scratch = Scratch::new("push-prunes-switch");
+
+        pallet_utils::set_pallet_head("main", &hash('a')).unwrap();
+        pallet_utils::set_pallet_head("side", &hash('b')).unwrap();
+        let before = capture().unwrap();
+
+        pallet_utils::set_current_pallet_name("side").unwrap();
+        push_if_changed("shift", before).unwrap();
+
+        let popped = pop().unwrap().unwrap();
+        assert_eq!(popped.before.current_head(), Some(&hash('a')));
+        assert_eq!(popped.after.current_head(), Some(&hash('b')));
+    }
+
+    #[test]
+    fn push_if_changed_records_a_conflicted_cherry_pick() {
+        let _scratch = Scratch::new("push-cherry-pick");
+
+        pallet_utils::set_pallet_head("main", &hash('a')).unwrap();
+        let before = capture().unwrap();
+
+        // A conflicted pick moves no ref; it leaves the pick in progress.
+        cherry_pick_utils::write_state(&CherryPickState { source: hash('c'), description: None }).unwrap();
+        push_if_changed("cherry-pick", before).unwrap();
+
+        let popped = pop().unwrap().expect("a pick left in progress must be journaled");
+        assert_eq!(popped.before.cherry_pick, None);
+        assert_eq!(popped.after.cherry_pick, Some(PickInProgress { source: hash('c'), description: None }));
     }
 
     #[test]
@@ -607,8 +763,17 @@ mod tests {
         bad_head.after.heads.insert("main".to_string(), "not-a-hash".to_string());
         let mut bad_name = entry("stack", "main", &hash('1'), &hash('2'));
         bad_name.before.current_pallet = "../escape".to_string();
+        let mut bad_their = entry("consolidate", "main", &hash('1'), &hash('2'));
+        bad_their.after.consolidation = Some((hash('3'), "../escape".to_string()));
+        let mut bad_pick = entry("stack", "main", &hash('1'), &hash('2'));
+        bad_pick.before.cherry_pick = Some(PickInProgress { source: "nope".to_string(), description: None });
 
-        for (bad, reason) in [(bad_head, "not an object hash"), (bad_name, "names an invalid pallet")] {
+        for (bad, reason) in [
+            (bad_head, "not an object hash"),
+            (bad_name, "names an invalid pallet"),
+            (bad_their, "names an invalid pallet"),
+            (bad_pick, "malformed cherry-pick"),
+        ] {
             let content = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries: &[bad] }).unwrap();
             assert_refused_everywhere(&content, reason);
         }
@@ -688,6 +853,24 @@ mod tests {
         let mut started = entry("consolidate", "main", &hash('2'), &hash('2'));
         started.after.consolidation = Some((hash('5'), "side".to_string()));
         check_undoable(&started).unwrap();
+    }
+
+    #[test]
+    fn check_undoable_refuses_once_a_cherry_pick_was_left_in_progress() {
+        let _scratch = Scratch::new("gate-cherry-pick");
+
+        // The op left no pick in progress; a conflicted cherry-pick has since started one
+        // without moving any ref.
+        pallet_utils::set_pallet_head("main", &hash('2')).unwrap();
+        cherry_pick_utils::write_state(&CherryPickState { source: hash('6'), description: None }).unwrap();
+
+        let error = check_undoable(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap_err();
+        assert!(error.contains("it left no cherry-pick in progress"), "{}", error);
+
+        // And the converse: the op left this pick in progress, and it still is.
+        let mut picked = entry("cherry-pick", "main", &hash('2'), &hash('2'));
+        picked.after.cherry_pick = Some(PickInProgress { source: hash('6'), description: None });
+        check_undoable(&picked).unwrap();
     }
 
     #[test]
@@ -785,6 +968,28 @@ mod tests {
         restore_refs(&entry("stack", "main", &hash('a'), &hash('b'))).unwrap();
 
         assert!(merge_utils::read_consolidation_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_refs_puts_a_completed_cherry_pick_back_in_progress() {
+        let _scratch = Scratch::new("restore-cherry-pick");
+
+        pallet_utils::set_pallet_head("main", &hash('2')).unwrap();
+
+        // The stack that completed the pick consumed its state file.
+        let mut completed = entry("stack", "main", &hash('1'), &hash('2'));
+        completed.before.cherry_pick = Some(PickInProgress { source: hash('c'), description: Some("pick".to_string()) });
+
+        restore_refs(&completed).unwrap();
+
+        let state = cherry_pick_utils::read_state().unwrap().expect("the pick must be in progress again");
+        assert_eq!(state.source, hash('c'));
+        assert_eq!(state.description.as_deref(), Some("pick"));
+
+        // And an entry with no pick before it clears one.
+        pallet_utils::set_pallet_head("main", &hash('2')).unwrap();
+        restore_refs(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap();
+        assert!(cherry_pick_utils::read_state().unwrap().is_none());
     }
 
     #[test]

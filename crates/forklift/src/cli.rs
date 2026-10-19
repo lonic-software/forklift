@@ -949,8 +949,9 @@ pub enum Command {
                       undone changes are staged again and can be re-stacked — e.g. with a \
                       corrected message or author. A shift is reversed by shifting back. Undo \
                       reverses only the user's last operation: if the current pallet has been \
-                      switched (e.g. by palletize or deliver), its head has moved, or the \
-                      consolidation state has changed since the journaled operation, it refuses \
+                      switched (e.g. by palletize or deliver), its head has moved, or a \
+                      consolidation or cherry-pick was started or finished since the journaled \
+                      operation, it refuses \
                       instead of reaching past that. An unreadable journal is reported by name, \
                       never read as empty."
     )]

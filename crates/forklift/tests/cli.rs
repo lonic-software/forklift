@@ -8304,6 +8304,59 @@ fn cherry_pick_conflicts_are_marked_and_completed_by_stacking() {
     assert!(!warehouse.root.join(".forklift/cherry-pick").exists(), "the cherry-pick state must be cleared");
 }
 
+// A conflicted cherry-pick moves no ref but leaves a pick in progress; both it and the stack that
+// completes it are undoable, and undoing the completion puts the pick back in progress so the
+// next stack completes it again.
+#[test]
+fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
+    let warehouse = TestWarehouse::new("undo-cherry-pick-conflict");
+    warehouse.write_file("f.txt", "alpha\nbeta\ngamma\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "feature edits beta"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "main edits beta"]));
+    let main_head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+    let pick_state = warehouse.root.join(".forklift/cherry-pick");
+
+    // Undoing the conflicted pick abandons it: no parcel comes off, the pick is no longer in
+    // progress — and the stack before it is not reached.
+    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    assert_eq!(picked["data"]["outcome"], "conflicts");
+    let undone = json(&warehouse.run(&["--json", "undo"]));
+    assert_eq!(undone["data"]["op"], "cherry-pick");
+    assert!(undone["data"].get("undone").is_none(), "{}", undone);
+    assert!(!pick_state.exists(), "undo must abandon the pick");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), main_head);
+
+    // Pick again, resolve and complete it; undoing the completion puts the pick back in progress.
+    warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    assert_eq!(picked["data"]["outcome"], "conflicts");
+    warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "resolved pick"]));
+    assert!(!pick_state.exists());
+
+    let undone = json(&warehouse.run(&["--json", "undo"]));
+    assert_eq!(undone["data"]["op"], "stack");
+    assert!(pick_state.exists(), "undoing the completing stack must put the pick back in progress");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), main_head);
+
+    assert_success(&warehouse.run(&["stack", "resolved pick again"]));
+    assert!(!pick_state.exists(), "the re-stack completes the pick");
+}
+
 // -------------------------------------------------------------------------------------------
 // Tracked directory <-> file flips: a merge or shift that replaces a tracked directory with a
 // file (or vice versa) must not misread the directory as untracked content, and must apply the

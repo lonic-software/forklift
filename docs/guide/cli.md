@@ -396,9 +396,9 @@ forklift undo
 
 Reverses the **last state-changing operation**, using an undo journal — not just the
 last `stack`. Each `stack`, `consolidate`, `cherry-pick` and `shift` records the state
-before and after it (the pallet refs, current pallet and any in-progress consolidation —
-all tiny, since the objects are content-addressed and already stored), so `undo` can walk
-them back one at a time:
+before and after it (the current pallet, the pallet refs it moved, and any consolidation or
+cherry-pick left in progress — all tiny, since the objects are content-addressed and already
+stored), so `undo` can walk them back one at a time:
 
 - Reversing a **`stack`**, **`consolidate`** or **`cherry-pick`** is a *soft reset*: the head moves back while
   the working directory and inventory are kept, so the undone changes are staged again
@@ -417,7 +417,16 @@ exactly as it is — trust operations such as a key retirement are preserved, ne
 outright when the bay no longer matches what the journaled operation left: the current
 pallet was switched since (`palletize` and `deliver` switch pallets without being
 journaled), the current pallet's head moved (a merged haul, a fast-forwarding `lower`), or a
-consolidation was started or finished. Continue forward instead.
+consolidation or cherry-pick was started or finished. Continue forward instead. Working-tree
+commands in between — `load`, `remove`, `park` — change none of that and do not block it:
+after a `park`, `undo` soft-resets beneath the parked work. `park pop` then re-applies it,
+unless the parked work touches a path the undone parcel changed — it refuses that until the
+undone changes are re-stacked.
+
+Undoing a `consolidate` or `cherry-pick` that stopped at conflicts takes no parcel off the
+pallet; it only abandons the merge in progress, leaving the working directory (markers
+included) as it is. Undoing the `stack` that completed one puts it back in progress, so the
+next `stack` completes it again.
 
 A journal that cannot be read — corrupt, truncated, or written by a forklift with a
 different journal format — makes `undo` fail naming the file, never "nothing to undo".

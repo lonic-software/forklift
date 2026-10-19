@@ -61,9 +61,14 @@ pub async fn handle_command() -> Result<(), String> {
         return Ok(());
     }
 
-    // A soft reset: restore the refs (and any consolidation), keep the working directory. The
-    // gate established that the current pallet is the entry's, at the head the entry left.
-    let undone = pallet_utils::get_pallet_head(&entry.after.current_pallet)?.unwrap_or_default();
+    // A soft reset: restore the refs (and any consolidation or cherry-pick), keep the working
+    // directory. The gate established that the current pallet is the entry's, at the head the
+    // entry left. An operation that moved no head (a consolidate or cherry-pick that stopped at
+    // conflicts) takes no parcel off the pallet; undoing it only abandons what it left in progress.
+    let undone = match entry.after.current_head() {
+        Some(after) if entry.before.heads.get(&entry.after.current_pallet) != Some(after) => after.clone(),
+        _ => String::new(),
+    };
 
     journal_utils::restore_refs(&entry)?;
     journal_utils::pop()?;
@@ -119,6 +124,12 @@ impl CommandOutput for Undone {
         }
 
         println!("Undid {} on pallet \"{}\".", self.op, self.pallet);
+
+        if self.undone.is_empty() {
+            println!("The pallet head is unchanged ({}); the {} is no longer in progress.", self.head, self.op);
+            println!("The working directory is left as it is — resolve or restore it as you see fit.");
+            return;
+        }
 
         if let Some(first_line) = self.description.lines().next() {
             if !first_line.is_empty() {
