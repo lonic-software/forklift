@@ -41,6 +41,8 @@ const CONSOLIDATION_VERSION: u32 = 1;
 
 /// The [`record_utils`] kind and version of the out-of-scope skeleton file.
 const SKELETON_RECORD: &str = "consolidation-skeleton";
+// The undo journal embeds skeletons in this form (`journal_utils::ConsolidationInProgress`):
+// bump `journal_utils::JOURNAL_VERSION` with it, so an old journal is named as another version.
 const SKELETON_VERSION: u32 = 1;
 
 /// How to abort the consolidation whose files live in the bay-local state dir `dir`: remove both
@@ -213,7 +215,7 @@ impl OutOfScopeSkeleton {
     }
 
     /// The bay-local path of the skeleton file.
-    fn path() -> PathBuf {
+    pub(crate) fn path() -> PathBuf {
         bay_root().join(FILE_NAME_SKELETON)
     }
 

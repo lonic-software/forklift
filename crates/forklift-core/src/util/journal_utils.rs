@@ -366,7 +366,8 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
     // `stack` order them, so no window shows a consolidation without its skeleton.
     match &entry.before.consolidation {
         Some(consolidation) => {
-            OutOfScopeSkeleton::from_bytes(consolidation.skeleton.as_bytes(), &path())?.write()?;
+            // Validated when the journal was read; written back as recorded.
+            file_utils::write_file_atomically(&OutOfScopeSkeleton::path(), consolidation.skeleton.as_bytes())?;
             merge_utils::write_consolidation_state(&ConsolidationState {
                 their_head: consolidation.their_head.clone(),
                 their_pallet: consolidation.their_pallet.clone(),
