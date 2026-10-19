@@ -40,8 +40,8 @@ pub async fn handle_command(description: Option<String>) -> Result<(), String> {
 /// The refusal for a stack whose pallet another bay or process moved. With a consolidation or
 /// cherry-pick in progress, its staged output was built on the head it recorded, so stacking it on
 /// the new head would revert the other bay's parcel: the message names the whole way out — abort,
-/// discard the output, delete the files the merge added (which `restore` leaves behind as
-/// untracked) and merge again.
+/// discard the output, delete the files `restore` leaves behind as untracked (the staged paths
+/// the pallet's new head does not hold) and merge again.
 async fn moved_under_merge(moved: RefMoved) -> String {
     let consolidation = merge_utils::read_consolidation_state().ok().flatten();
     let pick = cherry_pick_utils::read_state().ok().flatten();
@@ -62,15 +62,15 @@ async fn moved_under_merge(moved: RefMoved) -> String {
         (None, None) => return moved.to_string(),
     };
 
-    let added = match added_since(&base).await {
-        Ok(added) if added.is_empty() => String::new(),
-        Ok(added) => format!(
-            " delete the files it added, which \"restore\" leaves behind as untracked: {};",
-            added.iter().map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ")
+    let left = match left_untracked(moved.found.as_deref()).await {
+        Ok(left) if left.is_empty() => String::new(),
+        Ok(left) => format!(
+            " delete the files \"restore\" leaves behind as untracked: {};",
+            left.iter().map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ")
         ),
         Err(e) => format!(
-            " delete the files it added, which \"restore\" leaves behind as untracked (they could \
-            not be listed: {});",
+            " delete the files \"restore\" leaves behind as untracked (they could not be \
+            listed: {});",
             e
         ),
     };
@@ -87,16 +87,20 @@ async fn moved_under_merge(moved: RefMoved) -> String {
         moved.found.as_deref().unwrap_or("no head"),
         what,
         abort,
-        added,
+        left,
         again
     )
 }
 
-/// The paths the staged inventory adds over `base`'s tree.
-async fn added_since(base: &str) -> Result<Vec<String>, String> {
-    let tree = object_utils::load_parcel(base)?.tree_hash;
+/// The staged paths `head`'s tree does not hold: once `restore --staged .` resets the inventory
+/// to the pallet's head, these are the files left behind as untracked.
+async fn left_untracked(head: Option<&str>) -> Result<Vec<String>, String> {
+    let tree = match head {
+        Some(head) => Some(object_utils::load_parcel(head)?.tree_hash),
+        None => None,
+    };
 
-    Ok(stocktake_utils::collect_staged_changes(Some(&tree)).await?
+    Ok(stocktake_utils::collect_staged_changes(tree.as_deref()).await?
         .into_iter()
         .filter(|change| matches!(change.kind, ChangeKind::Added | ChangeKind::Moved))
         .map(|change| change.path)
@@ -143,10 +147,14 @@ mod tests {
         let our_tree = test_support::store_tree("a.txt", b"ours\n");
         let our_head = test_support::store_parcel(&our_tree, &[&base]);
         let their_head = test_support::store_parcel(
-            &test_support::store_files(&[("a.txt", b"theirs\n"), ("new.txt", b"new\n")]),
+            &test_support::store_files(&[("a.txt", b"theirs\n"), ("new.txt", b"new\n"), ("both.txt", b"both\n")]),
             &[&base],
         );
-        let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
+        // The other bay's parcel holds one of the files the merge adds: `restore` tracks it again.
+        let elsewhere = test_support::store_parcel(
+            &test_support::store_files(&[("a.txt", b"elsewhere\n"), ("both.txt", b"both\n")]),
+            &[&our_head],
+        );
 
         pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
@@ -165,8 +173,14 @@ mod tests {
         let error = test_support::block_on(handle_command(None))
             .expect_err("completing a merge over a moved pallet must be refused");
         assert!(error.contains("moved") && error.contains("consolidation is kept"), "{}", error);
-        assert!(error.contains("\"new.txt\""), "the files the merge added must be listed: {}", error);
+        assert!(error.contains("\"new.txt\""), "the files restore leaves untracked must be listed: {}", error);
+        assert!(!error.contains("both.txt"), "a file the new head holds is tracked again, never left: {}", error);
         assert!(error.contains("restore --staged"), "{}", error);
+
+        // Completing it from another pallet is refused before it starts.
+        let shifted = test_support::block_on(crate::commands::shift::handle_command("feature"))
+            .expect_err("shifting during a consolidation must be refused");
+        assert!(shifted.contains("consolidation is in progress"), "{}", shifted);
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere),
             "the other bay's parcel must stay the head");

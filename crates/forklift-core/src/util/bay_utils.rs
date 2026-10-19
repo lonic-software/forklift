@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{file_utils, merge_utils, park_utils, record_utils};
+use crate::util::{cherry_pick_utils, file_utils, merge_utils, park_utils, record_utils};
 use crate::util::record_utils::RecordError;
 
 /// The [`record_utils`] kind and version of a bay's `.forklift` redirect file: the warehouse root,
@@ -324,13 +324,20 @@ pub fn collect_bay_scoped_parcel_roots(
 }
 
 /// One bay's own contribution to [`collect_bay_scoped_parcel_roots`] — the single read (parked
-/// parcels, then in-progress-consolidation `their_head`) both [`BayReadPolicy`] variants perform
-/// identically; only what happens to its `Err` differs, in the caller above.
+/// parcels, then an in-progress consolidation's `their_head` and `our_head`, then an in-progress
+/// cherry-pick's `our_head`) both [`BayReadPolicy`] variants perform identically; only what
+/// happens to its `Err` differs, in the caller above. A recorded `our_head` is the completing
+/// parcel's parent, and the pallet may have moved off it since, so it is rooted in its own right.
 fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
     let mut roots = park_utils::read_parked_in(dir)?;
 
     if let Some(consolidation) = merge_utils::read_consolidation_state_in(dir)? {
         roots.push(consolidation.their_head);
+        roots.push(consolidation.our_head);
+    }
+
+    if let Some(pick) = cherry_pick_utils::read_state_in(dir)? {
+        roots.push(pick.our_head);
     }
 
     Ok(roots)
@@ -403,14 +410,22 @@ mod tests {
 
         let parked_hash = "2".repeat(64);
         let consolidation_hash = "3".repeat(64);
+        let (merge_base, pick_base) = ("4".repeat(64), "5".repeat(64));
 
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parked_hash)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
-            their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: "e".repeat(64),
+            their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: merge_base.clone(),
         };
         std::fs::write(bay_b_dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
+
+        let bay_c_dir = bay_state_dir("c");
+        std::fs::create_dir_all(&bay_c_dir).unwrap();
+        let pick = cherry_pick_utils::CherryPickState {
+            source: "6".repeat(64), description: None, our_head: pick_base.clone(),
+        };
+        std::fs::write(bay_c_dir.join("cherry-pick"), serde_json::to_string(&pick).unwrap()).unwrap();
 
         let dirs = all_bay_state_dirs().unwrap();
         let roots = collect_bay_scoped_parcel_roots(&dirs, BayReadPolicy::FailClosed).unwrap().roots;
@@ -419,6 +434,10 @@ mod tests {
             "a non-active bay's parked parcel must be in the shared roots");
         assert!(roots.contains(&consolidation_hash),
             "a non-active bay's consolidation their_head must be in the shared roots");
+        assert!(roots.contains(&merge_base),
+            "a non-active bay's consolidation our_head must be in the shared roots");
+        assert!(roots.contains(&pick_base),
+            "a non-active bay's cherry-pick our_head must be in the shared roots");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::stocktake_utils::ChangeKind;
-use forklift_core::util::{alias_utils, file_utils, inventory_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
+use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
@@ -8,7 +8,7 @@ use crate::output::{self, CommandOutput};
 /// "repopulate on shift" behavior), and make the target the current pallet.
 ///
 /// Shifting refuses to run when there are staged or unstaged changes (they would be
-/// overwritten). Untracked files are tolerated, unless the target wants to write one of
+/// overwritten), or while a consolidation or cherry-pick is in progress. Untracked files are tolerated, unless the target wants to write one of
 /// their paths.
 ///
 /// # Arguments
@@ -59,6 +59,24 @@ impl CommandOutput for Shifted {
 ///                   operation failed.
 pub async fn shift_to(target: &str) -> Result<String, String> {
     pallet_utils::validate_pallet_name(target)?;
+
+    // An in-progress consolidation or cherry-pick is completed on the head it recorded, which
+    // belongs to this pallet: completing it from another one would be refused as a move.
+    if merge_utils::read_consolidation_state()?.is_some() {
+        return Err(format!(
+            "A consolidation is in progress. Complete it (resolve, \"load\", \"stack\") or abort it \
+            ({}) before shifting.",
+            merge_utils::abort_hint_in(&forklift_core::globals::bay_root())
+        ));
+    }
+
+    if cherry_pick_utils::read_state()?.is_some() {
+        return Err(format!(
+            "A cherry-pick is in progress. Resolve its conflicts and \"stack\", or {} to abort it, \
+            before shifting.",
+            cherry_pick_utils::abort_hint()
+        ));
+    }
 
     let Some(target_head) = pallet_utils::get_pallet_head(target)? else {
         return Err(format!(

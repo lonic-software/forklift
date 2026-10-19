@@ -873,8 +873,9 @@ forklift shift main
 Materializes the target pallet's head tree in the working directory, repopulates
 the inventory from it, and makes it the current pallet. Refuses to run when you
 have staged or unstaged changes (they'd be overwritten) — stack, restore, or park
-them first. Untracked files are left alone unless the target needs to write over
-one.
+them first — or while a consolidation or cherry-pick is in progress, which is
+completed on the pallet it started on. Untracked files are left alone unless the
+target needs to write over one.
 
 On a case-insensitive file system (the default on macOS and Windows), two names
 that differ only in case, such as `README` and `readme`, are one file. Every
@@ -1000,8 +1001,8 @@ merge is undone in the working tree and inventory and nothing is left in progres
 the command again is safe. A merge or pick you resolved by hand is stacked on the head it
 started from too, but there a refused `stack` keeps it in progress, since putting the tree back
 would throw your resolutions away. The message says how to redo it on the new head: abort it,
-`restore --staged .` then `restore .`, delete the files the merge added (it lists them), and
-merge again. Do not stack the merge output after aborting — that would revert the other bay's
+`restore --staged .` then `restore .`, delete the files that leaves behind as untracked (it
+lists them), and merge again. Do not stack the merge output after aborting — that would revert the other bay's
 parcel. And `undo` only ever reverses refs your own command moved; a move another bay made in
 the meantime is never undone.
 

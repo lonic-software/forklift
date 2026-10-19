@@ -51,10 +51,11 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     }
 
     if cherry_pick_utils::read_state()?.is_some() {
-        return Err(
-            "A cherry-pick is already in progress. Resolve its conflicts and \"stack\", or remove \
-            \".forklift/cherry-pick\" to abort it.".to_string()
-        );
+        return Err(format!(
+            "A cherry-pick is already in progress. Resolve its conflicts and \"stack\", or {} to \
+            abort it.",
+            cherry_pick_utils::abort_hint()
+        ));
     }
 
     let our_head = pallet_utils::get_pallet_head(&current)?.ok_or(format!(
@@ -228,7 +229,8 @@ impl CommandOutput for CherryPicked {
 
                 println!(
                     "\nResolve the conflicts, \"load\" the resolved files, then \"stack\" to \
-                    complete the cherry-pick (or remove \".forklift/cherry-pick\" to abort it)."
+                    complete the cherry-pick (or {} to abort it).",
+                    cherry_pick_utils::abort_hint()
                 );
             }
         }

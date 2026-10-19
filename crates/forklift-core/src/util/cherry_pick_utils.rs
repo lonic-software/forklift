@@ -15,7 +15,7 @@
 //! mutually exclusive with a consolidation.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::enums::parcel_action_type::ParcelActionType;
 use crate::globals::bay_root;
@@ -62,7 +62,16 @@ pub fn abort_hint() -> String {
 /// * `Ok(None)`                  - If no pick is in progress.
 /// * `Err(String)`               - If the state file exists but is malformed.
 pub fn read_state() -> Result<Option<CherryPickState>, String> {
-    let path = state_path();
+    read_state_in(&bay_root())
+}
+
+/// Read the cherry-pick state of the bay whose state lives in `dir`, if a pick is in progress
+/// there — see [`read_state`].
+///
+/// # Arguments
+/// * `dir` - The bay's state directory.
+pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
+    let path = dir.join(FILE_NAME_CHERRY_PICK);
 
     if !path.exists() {
         return Ok(None);

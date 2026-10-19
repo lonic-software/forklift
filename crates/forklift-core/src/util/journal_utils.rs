@@ -190,19 +190,28 @@ struct JournalContents {
 /// * `Ok(Snapshot)` - The snapshot.
 /// * `Err(String)`  - If the current pallet, consolidation or cherry-pick state could not be read.
 pub fn capture() -> Result<Snapshot, String> {
-    pallet_utils::start_write_log();
-
     let current_pallet = pallet_utils::get_current_pallet_name()?;
     let heads = pallet_utils::get_pallet_head(&current_pallet)?
         .map(|head| BTreeMap::from([(current_pallet.clone(), head)]))
         .unwrap_or_default();
 
-    Ok(Snapshot {
+    let snapshot = Snapshot {
         current_pallet,
         heads,
         consolidation: read_consolidation()?,
         cherry_pick: read_cherry_pick()?,
-    })
+    };
+
+    // Only once the snapshot is whole: a failed capture journals nothing, so it records nothing.
+    pallet_utils::start_write_log();
+
+    Ok(snapshot)
+}
+
+/// Stop recording head writes without journaling them — for an operation that failed, which
+/// [`push_if_changed`] must not journal.
+pub fn discard() {
+    pallet_utils::take_write_log();
 }
 
 /// Journal `op`, which ran from `before` to the state the bay is in now — but only if it changed
@@ -211,8 +220,9 @@ pub fn capture() -> Result<Snapshot, String> {
 /// fail a command that already succeeded. A journal that cannot be read is left untouched.
 ///
 /// The entry's refs are the ones this process wrote since [`capture`], from the write log, which
-/// this stops: each ref's first replaced head before, its last written head after. A ref another
-/// bay or process moved meanwhile is not in the log, so the entry never records — and `undo` never
+/// this stops: each ref's first replaced head before, its last written head after. A ref the
+/// operation created has no before (undo cannot delete a ref), however often it then moved it. A
+/// ref another bay or process moved meanwhile is not in the log, so the entry never records — and `undo` never
 /// reverts — someone else's move. A current pallet the operation did not write is read once, here,
 /// and recorded identically on both sides: the gate reads it, but there is nothing to restore.
 ///
@@ -238,10 +248,14 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
     };
 
     before.heads.clear();
+    let mut seen = BTreeSet::new();
 
     for (wire, old, new) in writes {
-        if let Some(old) = old {
-            before.heads.entry(wire.clone()).or_insert(old);
+        // Only a ref's first write tells what it held before the operation.
+        if seen.insert(wire.clone()) {
+            if let Some(old) = old {
+                before.heads.insert(wire.clone(), old);
+            }
         }
 
         after.heads.insert(wire, new);
@@ -834,6 +848,36 @@ mod tests {
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('a')));
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(hash('2')),
             "the other bay's move must stand");
+    }
+
+    #[test]
+    fn a_ref_the_operation_created_has_no_before_however_often_it_moved() {
+        let _scratch = Scratch::new("journal-created");
+
+        pallet_utils::update_pallet_head("main", None, &hash('a')).unwrap();
+        let before = capture().unwrap();
+
+        pallet_utils::update_pallet_head("main", Some(&hash('a')), &hash('b')).unwrap();
+        pallet_utils::update_pallet_head("fresh", None, &hash('1')).unwrap();
+        pallet_utils::update_pallet_head("fresh", Some(&hash('1')), &hash('2')).unwrap();
+        push_if_changed("haul", before).unwrap();
+
+        let entry = peek().unwrap().expect("the operation moved the current pallet");
+        assert!(!entry.before.heads.contains_key("fresh"),
+            "a created ref must have no before, not its intermediate head: {:?}", entry.before.heads);
+        assert_eq!(entry.after.heads.get("fresh"), Some(&hash('2')));
+    }
+
+    #[test]
+    fn a_failed_capture_records_no_writes() {
+        let _scratch = Scratch::new("journal-capture-fails");
+
+        pallet_utils::update_pallet_head("main", None, &hash('a')).unwrap();
+        std::fs::write(crate::globals::bay_root().join("consolidation"), "not a state").unwrap();
+        assert!(capture().is_err(), "a malformed consolidation state must fail the capture");
+
+        pallet_utils::update_pallet_head("main", Some(&hash('a')), &hash('b')).unwrap();
+        assert!(pallet_utils::take_write_log().is_empty(), "nothing may record for a failed capture");
     }
 
     #[test]
