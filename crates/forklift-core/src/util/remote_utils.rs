@@ -20,6 +20,7 @@ use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
+use crate::util::pallet_utils::RefUpdateError;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::body_utils::{self, BodyReadError, JsonReadError};
@@ -5824,16 +5825,17 @@ pub async fn accept_regenesis(client: &RemoteClient,
 /// acceptance began) with `new_anchor`, then move the office ref from `local_office_head` (also
 /// read up front) to the verified `remote_office_head`.
 ///
-/// If the office did not end up at `remote_office_head` (another bay or process moved it first,
-/// or the write failed), the old anchor is put back, so the anchor and the office never disagree,
-/// but only while the anchor is still the one written here: an anchor another bay installed
-/// meanwhile is its own, and stays. If the office did end up there, another bay accepted the
-/// same re-genesis concurrently (or the write failed after landing), and the acceptance stands.
+/// If another bay moved the office to `remote_office_head` first, it accepted the same re-genesis
+/// concurrently, and the acceptance stands. If the office did not end up there (another bay or
+/// process moved it elsewhere, or the write failed), the old anchor is put back, so the anchor
+/// and the office never disagree, but only while the anchor is still the one written here: an
+/// anchor another bay installed meanwhile is its own, and stays. A write that failed after
+/// landing (not known durable) keeps the new anchor, which matches the office, and still fails.
 ///
 /// # Returns
 /// * `Ok(())`      - The anchor and the office both carry the re-genesis.
-/// * `Err(String)` - The office did not reach the verified head (the anchor is restored as
-///                   above), or the anchor write failed.
+/// * `Err(String)` - The office write was refused or failed (the anchor is restored, or kept,
+///                   as above), or the anchor write failed.
 fn install_regenesis(old_anchor: &office_utils::TrustAnchor,
                      new_anchor: &office_utils::TrustAnchor,
                      local_office_head: Option<&str>,
@@ -5845,20 +5847,25 @@ fn install_regenesis(old_anchor: &office_utils::TrustAnchor,
 
     let error = match pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, local_office_head, remote_office_head) {
         Ok(()) => return Ok(()),
+        Err(RefUpdateError::Moved(moved)) if moved.found.as_deref() == Some(remote_office_head) => return Ok(()),
         Err(error) => error.to_string(),
     };
 
-    if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).ok().flatten().as_deref() == Some(remote_office_head) {
-        return Ok(());
+    match pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME) {
+        Ok(office) if office.as_deref() == Some(remote_office_head) => return Err(error),
+        Ok(_) => {}
+        Err(e) => return Err(format!(
+            "{} The office could not be read back ({}), so the re-genesis trust anchor is left in \
+            place; it may not match the office.",
+            error, e
+        )),
     }
 
-    if office_utils::read_trust_anchor().ok().flatten().as_ref() == Some(new_anchor) {
-        office_utils::restore_trust_anchor(old_anchor).map_err(|e| format!(
-            "{} The previous trust anchor could not be put back either ({}): the anchor is the \
-            re-genesis one while the office is not.",
-            error, e
-        ))?;
-    }
+    office_utils::restore_trust_anchor(new_anchor, old_anchor).map_err(|e| format!(
+        "{} The previous trust anchor could not be put back either ({}): the anchor is the \
+        re-genesis one while the office is not.",
+        error, e
+    ))?;
 
     Err(error)
 }
@@ -6248,13 +6255,42 @@ mod tests {
         let elsewhere = "c".repeat(64);
         let (planted, local_head) = (theirs.clone(), fixture.local_head.clone());
         BEFORE_OFFICE_MOVE.with(|seam| seam.set(Some(Box::new(move || {
-            office_utils::restore_trust_anchor(&planted).unwrap();
+            office_utils::restore_trust_anchor(&office_utils::read_trust_anchor().unwrap().unwrap(), &planted).unwrap();
             pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, Some(&local_head), &elsewhere).unwrap();
         }))));
 
         assert!(fixture.install().is_err());
         assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(theirs),
             "the other bay's anchor must stand, matching the office it moved");
+    }
+
+    #[test]
+    fn putting_back_a_trust_anchor_waits_for_the_ref_lock() {
+        let fixture = Regenesis::new("anchor-lock");
+        office_utils::replace_trust_anchor(&fixture.new).unwrap();
+
+        let held = crate::util::lock_utils::RefLock::acquire().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let writer = {
+            let (root, new, old) = (fixture.root.clone(), fixture.new.clone(), fixture.old.clone());
+            std::thread::spawn(move || {
+                let _scope = crate::globals::StorageRootScope::enter(&root);
+                let result = office_utils::restore_trust_anchor(&new, &old);
+                done_tx.send(()).unwrap();
+                result
+            })
+        };
+
+        // A bounded wait can only err toward passing: a writer that is not blocked finishes well
+        // inside it.
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+            "putting the anchor back must wait while another holder has the ref lock");
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(fixture.new.clone()));
+
+        drop(held);
+        writer.join().unwrap().unwrap();
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(fixture.old.clone()));
     }
 
     #[test]

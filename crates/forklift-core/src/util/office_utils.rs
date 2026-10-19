@@ -917,6 +917,7 @@ fn degraded_office_note(kind: OfficeReadErrorKind, error: &str) -> String {
 /// * `Ok(())`      - If the anchor was written.
 /// * `Err(String)` - If an anchor already exists or the write failed.
 pub fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
+    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
     let path = forklift_root().join(FILE_NAME_TRUST);
 
     if path.exists() {
@@ -939,6 +940,8 @@ pub fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
 /// * `Err(String)` - If no anchor exists, the chain of custody does not match, or the
 ///                   write failed.
 pub fn replace_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
+    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
+
     let Some(existing) = read_trust_anchor()? else {
         return Err(
             "This warehouse has no trust anchor to replace; use \"office enroll\".".to_string()
@@ -961,13 +964,29 @@ pub fn replace_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
 }
 
 /// Put back the anchor that stood before a [`replace_trust_anchor`] in this same process, after
-/// the office move that should have followed it was refused. No chain-of-custody check: the
-/// anchor is the one this warehouse held a moment ago, not a new one.
-pub(crate) fn restore_trust_anchor(previous: &TrustAnchor) -> Result<(), String> {
+/// the office move that should have followed it was refused — but only while the anchor is
+/// still `written`, the one that replace wrote: an anchor another bay installed meanwhile is its
+/// own, and stays. No chain-of-custody check: `previous` is the anchor this warehouse held a
+/// moment ago, not a new one.
+///
+/// The check and the write happen under one hold of the ref lock, which every anchor write
+/// takes, so no other anchor write can land between them.
+///
+/// # Returns
+/// * `Ok(())`      - `previous` is back, or the anchor was no longer `written` (left alone).
+/// * `Err(String)` - The anchor could not be read or written.
+pub(crate) fn restore_trust_anchor(written: &TrustAnchor, previous: &TrustAnchor) -> Result<(), String> {
+    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
+
+    if read_trust_anchor()?.as_ref() != Some(written) {
+        return Ok(());
+    }
+
     write_trust_anchor_file(previous)
 }
 
-/// Serialize an anchor to the trust file (no one-way-door check — callers own that).
+/// Serialize an anchor to the trust file (no one-way-door check — callers own that, and take
+/// the ref lock around it).
 fn write_trust_anchor_file(anchor: &TrustAnchor) -> Result<(), String> {
     let path = forklift_root().join(FILE_NAME_TRUST);
 

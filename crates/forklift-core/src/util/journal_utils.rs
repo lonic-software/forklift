@@ -425,14 +425,24 @@ fn un_restore_current(entry: &JournalEntry, error: String) -> String {
         return error;
     };
 
-    match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head) {
-        Ok(()) | Err(RefUpdateError::Moved(_)) => error,
-        Err(RefUpdateError::Failed(e)) => format!(
-            "{} Pallet \"{}\" could not be put back where the operation left it either ({}): it is \
-            at {}, and undo cannot be retried.",
-            error, current, e, pre_head
-        ),
-    }
+    let e = match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head) {
+        Ok(()) | Err(RefUpdateError::Moved(_)) => return error,
+        Err(RefUpdateError::Failed(e)) => e,
+    };
+
+    // A write can fail after landing (not known durable); what the ref holds now decides.
+    let at = match pallet_utils::get_pallet_head(current) {
+        Ok(head) if head.as_deref() == Some(post_head.as_str()) => return error,
+        Ok(Some(head)) => format!("it is at {}", head),
+        Ok(None) => "it no longer exists".to_string(),
+        Err(read) => format!("it could not be read back either ({})", read),
+    };
+
+    format!(
+        "{} Pallet \"{}\" could not be put back where the operation left it ({}): {}, so a \
+        retried undo will not pass its check.",
+        error, current, e, at
+    )
 }
 
 /// The journal file path (bay-local).
@@ -1214,6 +1224,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let meta = crate::globals::forklift_root().join("meta");
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Permissions do not bind a privileged user (root in a container): no fault, no test.
+        if std::fs::write(meta.join("probe"), b"").is_ok() {
+            std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
 
         let restored = restore_refs(&entry);
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o755)).unwrap();

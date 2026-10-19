@@ -408,19 +408,20 @@ impl BaseServeLock {
     }
 }
 
-/// An exclusive lock on the pallet refs (user and meta) that every bay of a warehouse shares,
-/// held for one read → compare → write of a ref and no longer.
+/// An exclusive lock on the pallet refs (user and meta) and the trust anchor that every bay of a
+/// warehouse shares, held for one read → compare → write of one of them and no longer.
 ///
 /// The bay lock ([`WarehouseLock`]) is bay-local, so it cannot order two bays' ref writes; this
 /// lock lives in the shared forklift root (`forklift_root()/refs.lock`), which is the same file
 /// from every bay. It is a kernel lock on a never-deleted sidecar, like [`StoreAccessLock`], so a
-/// hard-killed holder leaves nothing stale and a writer may wait. A hold spans one ref read and
-/// one durable ref write (its fsyncs included) and nothing else, so the wait is short and is not
-/// announced; a holder stalled inside that write stalls every ref writer with it.
+/// hard-killed holder leaves nothing stale and a writer may wait. A hold spans one ref (or
+/// anchor) read and one durable write of it (its fsyncs included) and nothing else, so the wait
+/// is short and is not announced; a holder stalled inside that write stalls every ref writer.
 ///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
-/// ref compare-and-set and `heal`'s restage of a ref path take it, and neither calls the other.
+/// ref compare-and-set, the trust anchor writes and `heal`'s restage of a ref path take it, and
+/// none of them calls another.
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.
     _file: std::fs::File,
