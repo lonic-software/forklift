@@ -2277,12 +2277,13 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
 /// quarantined index, a corrupt bucket of a loaded one, or an index of another format version
 /// reads `false` from [`does_object_exist`], yet the object's bytes may still be on disk, and its
 /// children may be present in another pack or loose. Reading that `false` as absent would leave
-/// those children unmarked, and the sweep would delete them (FORK-193). So past the presence
-/// shortcut this asks [`read_object_classified`], whose `Absent` is gated against every such
-/// index, and turns its `Unverifiable` into an error.
+/// those children unmarked, and the sweep would delete them (FORK-193). So a miss is an error
+/// whenever any such index might hold the hash ([`pack_utils::sweep_unreadable_reason`]). That
+/// includes an index that does not parse at all, which an ordinary read treats as inert: while
+/// one is in the pack folder, a sweep refuses at the first hash it cannot find.
 ///
 /// # Returns
-/// * `Ok(true)`    - The object is present and servable.
+/// * `Ok(true)`    - The object is present.
 /// * `Ok(false)`   - Neither a pack nor the loose store holds it, and no unreadable index might.
 /// * `Err(String)` - The object may be present but cannot be read, so the walk cannot know what
 ///                   it references; or the store could not be consulted.
@@ -2291,10 +2292,9 @@ pub(crate) fn is_present_for_sweep(hash: &str) -> Result<bool, String> {
         return Ok(true);
     }
 
-    match read_object_classified(hash)? {
-        StoreReadOutcome::Verified(_) => Ok(true),
-        StoreReadOutcome::Absent => Ok(false),
-        StoreReadOutcome::Unverifiable(reason) => Err(format!(
+    match crate::util::pack_utils::sweep_unreadable_reason(hash)? {
+        None => Ok(false),
+        Some(reason) => Err(format!(
             "Object {} may be in the store but cannot be read ({}), so the objects it references \
             cannot be told apart from garbage.",
             hash, reason

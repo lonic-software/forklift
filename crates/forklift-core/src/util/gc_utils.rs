@@ -18,7 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{bay_utils, file_utils, lock_utils, object_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
 // `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
@@ -149,9 +149,9 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 ///
 /// **The office chain is the one root set that must be *loadable*, not merely tolerated-if-
 /// absent.** The tolerance above is about descending into an already-collected root's tree/blob
-/// closure — an ordinary pallet head that itself cannot be read is simply skipped by the
-/// reachability walk below it ([`collect_reachable_for_sweep`] treats an absent head as a gap,
-/// contributing nothing, never an error). Computing the *root set itself* is different:
+/// closure — an ordinary pallet head that is absent is simply skipped by the reachability walk
+/// below it ([`collect_reachable_for_sweep`] treats an absent head as a gap, contributing nothing;
+/// only a head an unreadable pack index might hold is an error, FORK-193). Computing the *root set itself* is different:
 /// every revoked key's `distrust_boundary` pin can only be found by reading the office pallet's
 /// own head parcel, tracked-keys tree and key-record blobs (`office_utils::
 /// collect_trust_pin_roots`), and this call passes it `TrustPinReadPolicy::FailClosed` — an
@@ -321,20 +321,7 @@ fn mark_recipe_chunks_live(recipe_hash: &str, live: &mut HashSet<String>) -> Res
 /// * `Err(String)`         - A present parcel could not be read, or a parcel may be present but
 ///                           cannot be read.
 pub(crate) fn collect_reachable_for_sweep(heads: &[String]) -> Result<HashSet<String>, String> {
-    let mut queue: VecDeque<String> = heads.iter().cloned().collect();
-    let mut reachable: HashSet<String> = HashSet::new();
-
-    while let Some(hash) = queue.pop_front() {
-        if reachable.contains(&hash) || !file_utils::is_present_for_sweep(&hash)? {
-            continue;
-        }
-
-        reachable.insert(hash.clone());
-
-        for parent in object_utils::load_parcel(&hash)?.parents {
-            queue.push_back(parent);
-        }
-    }
+    let (reachable, _gaps) = audit_utils::collect_reachable_noting_gaps(heads, file_utils::is_present_for_sweep)?;
 
     Ok(reachable)
 }

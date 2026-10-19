@@ -1060,13 +1060,32 @@ pub fn collect_reachable(heads: &[String]) -> Result<HashSet<String>, String> {
 pub fn collect_reachable_present_noting_gaps(
     heads: &[String],
 ) -> Result<(HashSet<String>, Vec<String>), String> {
+    collect_reachable_noting_gaps(heads, file_utils::does_object_exist)
+}
+
+/// The parcel walk behind [`collect_reachable_present_noting_gaps`] and
+/// `gc_utils::collect_reachable_for_sweep`, which differ only in what counts as present: a read
+/// may treat an unreadable parcel as a gap, a deleting sweep may not (FORK-193). One walk, so the
+/// two can never drift.
+///
+/// # Arguments
+/// * `heads`      - The starting parcel hashes.
+/// * `is_present` - Whether a parcel is here to read. An error aborts the walk.
+///
+/// # Returns
+/// * `Ok((reachable, gaps))` - As for [`collect_reachable_present_noting_gaps`].
+/// * `Err(String)`           - If `is_present` failed, or a present parcel could not be read.
+pub(crate) fn collect_reachable_noting_gaps(
+    heads: &[String],
+    is_present: impl Fn(&str) -> Result<bool, String>,
+) -> Result<(HashSet<String>, Vec<String>), String> {
     let mut queue: VecDeque<String> = heads.iter().cloned().collect();
     let mut reachable: HashSet<String> = HashSet::new();
     let mut gaps: Vec<String> = Vec::new();
     let mut seen_gaps: HashSet<String> = HashSet::new();
 
     while let Some(hash) = queue.pop_front() {
-        if !file_utils::does_object_exist(&hash)? {
+        if !is_present(&hash)? {
             if seen_gaps.insert(hash.clone()) {
                 gaps.push(hash);
             }
