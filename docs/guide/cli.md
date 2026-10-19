@@ -361,10 +361,13 @@ and add it to `.forkliftignore`. It also
 refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
 named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
-stack again. And it refuses, naming the path and the hash, when the store no longer holds a staged
-file's content (for a large file, its recipe or any of its chunks) — lost after the `load`, say
-to a crash or a manual deletion. A parcel signed over it would pass `audit` and fail only at a
-later `restore`. Load the file again from its working copy, or `restore --staged` it.
+stack again. And it refuses with `staged_content_missing` (exit 25), naming the path and the
+hash, when the store no longer holds the content of a file staged since the head (for a large
+file, its recipe or any of its chunks) — lost after the `load`, say to a crash or a manual
+deletion. A parcel signed over it would pass `audit` and fail only at a later `restore`. Loading
+the file again is not enough while it is unchanged on disk, because `load` then stores nothing:
+run `restore --staged` on it, then `load` it again from its working copy. Files the head already
+holds unchanged are not checked here; their content is `audit`'s and `restore`'s to answer for.
 
 ### Large files
 
@@ -1124,7 +1127,9 @@ working directory already holds the changes.
 `park`'s push durably commits the staged inventory into a parked parcel, exactly
 like `stack` commits into a stacked one — so it refuses under the same
 `incomplete_load` guard (see the note under `load` above) if a previous `load`
-never finished cleanly.
+never finished cleanly, and under the same `staged_content_missing` refusal (exit 25, see
+`stack`) if the store lost a staged file's content. Here it matters more: the push resets the
+working copy, so a parked parcel naming lost content could never be popped back.
 
 ---
 

@@ -110,6 +110,10 @@ pub async fn park_changes() -> Result<(), String> {
     let (partial_root, _tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch, false).await?;
     let partial_root = partial_root.ok_or("There is nothing to park.".to_string())?;
 
+    // Same refusal as `stack`'s, for the same reason, and sharper here: the reset below removes
+    // the working copy, so a parked parcel naming lost content could never be popped back.
+    tree_utils::require_staged_content_present(&partial_root, Some(&head_tree_hash))?;
+
     let root_tree = if scope.is_full() {
         partial_root
     } else {

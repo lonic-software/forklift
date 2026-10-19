@@ -2185,7 +2185,7 @@ const MAX_NAMED_MISSING_CHUNKS: usize = 32;
 /// bounded-concurrency batch of S3 `HEAD`s ([`crate`]-external: `ObjectStore::objects_missing`),
 /// where a probe is a network round trip and a large recipe lists thousands of chunks — the whole
 /// reason the seam is a bulk `&[hash] -> missing` call rather than a per-hash existence check.
-fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, String> {
+pub(crate) fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, String> {
     let mut missing = Vec::new();
 
     for chunk in chunks {
@@ -2220,7 +2220,7 @@ fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, String> {
 /// * `load_recipe_chunks` - Reads the recipe's ordered chunk hashes (local store, or object store).
 /// * `chunks_missing`     - Given a recipe's full chunk-hash list, returns the subset the store
 ///                          lacks (in any order). Non-tolerant: a non-empty result fails the walk.
-fn verify_recipe_chunks_present(
+pub(crate) fn verify_recipe_chunks_present(
     recipe_hash: &str,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,

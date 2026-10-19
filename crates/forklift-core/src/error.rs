@@ -187,6 +187,12 @@ refusal_codes! {
     /// agreed. Nothing is lifted for that pallet; the refusal's details name each path with both
     /// values and their signers, and `lower --keep` resolves them (`meta_tree`).
     MetaConflict => "meta_conflict",
+
+    /// `stack` or `park` found a staged file whose content the object store no longer holds (for a
+    /// chunked file, its recipe or any chunk) — lost after the `load`, to a crash or a manual
+    /// deletion. A parcel naming it would pass `audit` and fail only at a later `restore`, so no
+    /// parcel is made. The remedy is to unstage the path and load it again from its working copy.
+    StagedContentMissing => "staged_content_missing",
 }
 
 impl RefusalCode {

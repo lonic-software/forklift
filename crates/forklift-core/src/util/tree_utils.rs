@@ -10,7 +10,8 @@ use crate::model::tree_item::TreeItem;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{file_utils, inventory_utils, object_utils};
+use crate::error::{CoreError, RefusalCode};
+use crate::util::{audit_utils, file_utils, inventory_utils, object_utils};
 
 /// Build (and store) tree objects from an already-parsed [`inventory_utils::PreparedInventory`]
 /// snapshot, bottom-up: one tree object per inventoried directory, staged into `batch` instead of
@@ -18,8 +19,6 @@ use crate::util::{file_utils, inventory_utils, object_utils};
 ///
 /// * Entries staged for removal (`Deleted`) are excluded — that is how a staged removal
 ///   becomes an actual removal in the next parcel.
-/// * Every other entry's content must be in the store, chunks included, or the build refuses
-///   ([`require_staged_content`]).
 /// * Directories that end up empty (no files, no non-empty subdirectories) are pruned,
 ///   except the warehouse root.
 /// * Ancestor directories that have no shard of their own (e.g. only `src/a` was ever
@@ -213,8 +212,6 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
                     continue;
                 }
 
-                require_staged_content(&key, item)?;
-
                 tree.add_child(TreeItem::new(item.name.clone(), item.hash.clone(), item.item_type));
             }
         }
@@ -288,36 +285,111 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
     }
 }
 
-/// Refuse a staged leaf whose content the store does not hold: for a chunked entry, its recipe
-/// or any chunk the recipe names. Its absence is loss, not a sparse gap — the item was loaded
-/// into this bay, and a sparse bay keeps no shard for what it leaves out — and nothing after the
-/// build can tell the two apart: `audit` accepts a parcel naming an absent object, so only a
-/// later `restore` would fail (FORK-157). A leaf under a subtree the rollup skip injects by hash
-/// is not checked here; the head parcel already names that exact content.
+/// How many paths a [`require_staged_content_present`] refusal names before summarizing the rest
+/// as "and N more"; the count is always exact.
+const MAX_NAMED_LOST_PATHS: usize = 8;
+
+/// Refuse a freshly built tree that names staged content the store does not hold: a changed
+/// file's object, or for a chunked file its recipe or any chunk the recipe names. Called by `stack`
+/// and `park`'s push on the root [`build_tree_from_inventory_deferred`] returned, before anything
+/// is published.
+///
+/// Only what differs from the head is checked, the way `audit_utils::verify_tree_closure` prunes
+/// against its bases: an entry whose hash equals the head's at the same path (a whole subtree
+/// included, and every subtree the rollup skip injected by hash) is not staged work, and its
+/// presence is the head's to answer for, not this bay's. A staged entry that is absent is loss,
+/// not a sparse gap: it was loaded into this bay, and a sparse bay keeps no shard for what it
+/// leaves out. Nothing after the build can tell the two apart (`audit` accepts a parcel naming
+/// an absent object), so only a later `restore` would fail (FORK-157).
+///
+/// The walk reads the built tree in memory (its objects are staged in a batch, unreadable before
+/// the barrier) and loads the head's trees from the store. A head tree that cannot be read
+/// explains nothing, so everything beneath it is checked: more checking, never less.
+///
+/// # Arguments
+/// * `root`           - The built root, as [`build_tree_from_inventory_deferred`] returned it
+///                      (before any scoped splice).
+/// * `head_tree_hash` - The root tree of the parcel the new one stacks on, if any.
 ///
 /// # Returns
-/// * `Ok(())`      - The leaf's content, every chunk included, is present.
-/// * `Err(String)` - It is not, naming the path and the missing hash; or the store could not be
-///                   consulted.
-fn require_staged_content(key: &str, item: &crate::model::inventory::InventoryItem) -> Result<(), String> {
-    let path = if key.is_empty() { item.name.clone() } else { format!("{}/{}", key, item.name) };
-    let missing = |what: String| format!(
-        "\"{}\" is staged, but {} is missing from the store, so no parcel can be built over it. \
-        Nothing was written. Load the file again from its working copy if it is still there, or \
-        unstage it with \"restore --staged\".",
-        path, what
-    );
+/// * `Ok(())`         - Every changed entry's content is present.
+/// * `Err(CoreError)` - A `staged_content_missing` refusal naming each path that lost content;
+///                      or the store could not be consulted.
+pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&str>) -> Result<(), CoreError> {
+    let mut lost = Vec::new();
+    collect_lost_staged_content(root, head_tree_hash, "", &mut lost)?;
 
-    if !file_utils::does_object_exist(&item.hash)? {
-        return Err(missing(format!("its content {}", item.hash)));
+    let Some((first_path, first_reason)) = lost.first() else {
+        return Ok(());
+    };
+
+    let (message, next_step) = if lost.len() == 1 {
+        (
+            format!(
+                "\"{}\" is staged, but {}; no parcel was made, since one naming it could not be \
+                restored.",
+                first_path, first_reason
+            ),
+            format!(
+                "Run \"forklift restore --staged {}\", then \"forklift load {}\" to stage it again \
+                from its working copy.",
+                first_path, first_path
+            ),
+        )
+    } else {
+        let named: Vec<String> = lost.iter().take(MAX_NAMED_LOST_PATHS)
+            .map(|(path, reason)| format!("\"{}\" ({})", path, reason))
+            .collect();
+        let overflow = lost.len() - named.len();
+        let and_more = if overflow > 0 { format!(", and {} more", overflow) } else { String::new() };
+
+        (
+            format!(
+                "{} staged files have content missing from the store: {}{}. No parcel was made, \
+                since one naming them could not be restored.",
+                lost.len(), named.join("; "), and_more
+            ),
+            "Run \"forklift restore --staged <path>\", then \"forklift load <path>\", for each, to \
+            stage it again from its working copy.".to_string(),
+        )
+    };
+
+    Err(CoreError::refusal(RefusalCode::StagedContentMissing, format!("{} {}", message, next_step), next_step))
+}
+
+/// The walk behind [`require_staged_content_present`]: append `(path, reason)` for every file under
+/// `tree` that differs from the head's entry at its path and whose content is not all present.
+fn collect_lost_staged_content(tree: &TreeItem,
+                               head_tree_hash: Option<&str>,
+                               prefix: &str,
+                               lost: &mut Vec<(String, String)>) -> Result<(), String> {
+    if head_tree_hash == Some(tree.hash.as_str()) {
+        return Ok(());
     }
 
-    if item.item_type.is_chunked() {
-        for chunk in object_utils::load_recipe(&item.hash)?.chunks {
-            if !file_utils::does_object_exist(&chunk.hash)? {
-                return Err(missing(format!("chunk {} of its content {}", chunk.hash, item.hash)));
+    let head_tree = head_tree_hash.and_then(|hash| object_utils::load_tree(hash).ok());
+    let head_file = |name: &str| head_tree.as_ref().and_then(|head| head.get_file(name)).map(|file| file.hash.as_str());
+    let head_subtree = |name: &str| head_tree.as_ref().and_then(|head| head.get_subtree(name)).map(|subtree| subtree.hash.as_str());
+    let path_of = |name: &str| if prefix.is_empty() { name.to_string() } else { format!("{}/{}", prefix, name) };
+
+    for (name, file) in tree.get_files() {
+        if head_file(name) == Some(file.hash.as_str()) {
+            continue;
+        }
+
+        if !file_utils::does_object_exist(&file.hash)? {
+            lost.push((path_of(name), format!("its content {} is missing from the store", file.hash)));
+        } else if file.item_type.is_chunked() {
+            if let Err(why) = audit_utils::verify_recipe_chunks_present(
+                &file.hash, &object_utils::recipe_chunk_hashes, &audit_utils::local_chunks_missing,
+            ) {
+                lost.push((path_of(name), format!("its content is incomplete: {}", why)));
             }
         }
+    }
+
+    for (name, subtree) in tree.get_subtrees() {
+        collect_lost_staged_content(subtree, head_subtree(name), &path_of(name), lost)?;
     }
 
     Ok(())

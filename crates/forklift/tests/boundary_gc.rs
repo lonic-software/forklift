@@ -1428,10 +1428,15 @@ fn a_bays_base_survives_collection_after_the_pallet_moved_back() {
 }
 
 /// Load `file` with `content` and return every loose object the load created, sorted. Staged
-/// objects are rooted, so these are exactly the objects the bay's inventory now names.
+/// objects are rooted, so these are exactly the objects the bay's inventory now names. The file's
+/// mtime is moved an hour back first, out of the racily-clean window, so every later `load` (and
+/// `park`'s refresh) proves it unchanged by its stat data alone and stores nothing.
 fn load_and_name_staged(warehouse: &Warehouse, file: &str, content: &[u8]) -> Vec<String> {
     let before = warehouse.loose_objects();
-    std::fs::write(warehouse.root.join(file), content).unwrap();
+    let path = warehouse.root.join(file);
+    std::fs::write(&path, content).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)).unwrap();
     warehouse.run_ok(&["load", "."]);
     warehouse.loose_objects().difference(&before).cloned().collect()
 }
@@ -1449,89 +1454,131 @@ fn chunkable_content() -> Vec<u8> {
 }
 
 /// FORK-157 — a staged object lost by a route gc no longer takes (crash debris, a manual
-/// deletion) must stop `stack`, not end up named by a signed parcel. The staged item was loaded
-/// *here*, so its absence is loss, not a sparse gap; nothing after `stack` can tell the two apart
-/// (`audit` is presence-tolerant). One arm per kind of staged object: a plain blob, a chunked
-/// file's recipe, and one of its chunks. Each arm asserts the refusal names the path and the
-/// missing hash, that the pallet did not move, and that each remedy it names works: loading the
-/// working copy again (blob and chunk arms) and `restore --staged` (recipe arm). Red with the
-/// presence check in
-/// `tree_utils::build_tree_for_inventory_key` removed (every arm stacks), or with only its chunk
-/// walk removed (the chunk arm stacks).
+/// deletion) must stop `stack` and `park`, not end up named by a signed parcel. The staged item was
+/// loaded *here*, so its absence is loss, not a sparse gap; nothing after the build can tell the
+/// two apart (`audit` is presence-tolerant). One arm per kind of staged object (a plain blob, a
+/// chunked file's recipe, one of its chunks), and one for `park`'s push.
+///
+/// Each arm asserts the `staged_content_missing` refusal (exit 25) names the path and the missing
+/// hash and moves nothing; that loading again alone does not clear it (the stat cache proves the
+/// file unchanged and stores nothing, so the fixture really is in the state the named remedy is
+/// for); and that the named remedy, `restore --staged` then `load`, lets the verb through with the
+/// file restorable afterwards.
+///
+/// Red with the `require_staged_content_present` call removed from `stack_parcel` (every stack arm
+/// goes through) or from `park` (the park arm does), and with its chunk check removed (the chunk
+/// arm does).
 #[test]
-fn stack_refuses_a_staged_object_the_store_lost() {
+fn stack_and_park_refuse_a_staged_object_the_store_lost() {
     let mut failures = Vec::new();
 
-    for arm in ["blob", "recipe", "chunk"] {
+    for arm in ["blob", "recipe", "chunk", "park"] {
         let warehouse = Warehouse::new(&format!("lost-staged-{}", arm));
         let first = warehouse.stack("app.txt", "v1\n", "first");
 
-        let (file, staged) = match arm {
-            "blob" => ("wip.txt", load_and_name_staged(&warehouse, "wip.txt", b"work in progress\n")),
-            _ => ("big.bin", load_and_name_staged(&warehouse, "big.bin", &chunkable_content())),
+        let (file, content) = match arm {
+            "recipe" | "chunk" => ("big.bin", chunkable_content()),
+            _ => ("wip.txt", b"work in progress\n".to_vec()),
         };
+        let staged = load_and_name_staged(&warehouse, file, &content);
 
         let missing = match arm {
-            "blob" => staged.first().cloned(),
             "recipe" => staged.iter()
                 .find(|hash| warehouse.scoped(|| forklift_core::util::object_utils::load_recipe(hash).is_ok()))
                 .cloned(),
-            _ => staged.iter()
+            "chunk" => staged.iter()
                 .find(|hash| warehouse.scoped(|| forklift_core::util::object_utils::load_recipe(hash).is_err()))
                 .cloned(),
+            _ => staged.first().cloned(),
         };
         let Some(missing) = missing else {
             failures.push(format!("{}: fixture did not stage the object to lose; load created {:?}", arm, staged));
             continue;
         };
-        if arm == "blob" && staged.len() != 1 || arm != "blob" && staged.len() < 3 {
+        if file == "wip.txt" && staged.len() != 1 || file == "big.bin" && staged.len() < 3 {
             failures.push(format!("{}: unexpected staged objects {:?}", arm, staged));
             continue;
         }
 
         warehouse.delete_object(&missing);
-        let stacked = warehouse.run(&["stack", "second"]);
-        let stderr = String::from_utf8_lossy(&stacked.stderr).to_string();
+        let verb: &[&str] = if arm == "park" { &["park"] } else { &["stack", "second"] };
 
-        if stacked.status.success() {
-            failures.push(format!("{}: stack signed a parcel over the lost {}", arm, missing));
-        } else if !stderr.contains(file) || !stderr.contains(&missing) {
-            failures.push(format!("{}: refusal must name {} and {}; stderr: {}", arm, file, missing, stderr));
+        let refused = warehouse.run(verb);
+        let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+        if refused.status.code() != Some(25) || !stderr.contains(file) || !stderr.contains(&missing) {
+            failures.push(format!(
+                "{}: `{}` must refuse with exit 25 naming {} and {}; got {:?}: {}",
+                arm, verb.join(" "), file, missing, refused.status.code(), stderr
+            ));
         }
         if warehouse.head("main") != first {
             failures.push(format!("{}: the pallet moved past {}", arm, first));
             continue;
         }
+        if std::fs::read(warehouse.root.join(file)).ok().as_deref() != Some(&content[..]) {
+            failures.push(format!("{}: the refused `{}` disturbed the working copy", arm, verb.join(" ")));
+            continue;
+        }
 
-        // Both remedies the refusal names must work. Loading the untouched working copy again
-        // re-stores the lost object, and the stack then goes through; unstaging the file instead
-        // leaves nothing that names the lost object.
-        if arm == "recipe" {
-            let unstaged = warehouse.run(&["restore", "--staged", file]);
-            let again = warehouse.run(&["stack", "second"]);
-            let again_stderr = String::from_utf8_lossy(&again.stderr).to_string();
-            if !unstaged.status.success() || again_stderr.contains(&missing) {
-                failures.push(format!(
-                    "{}: after `restore --staged` the stack must no longer name {}; restore: {} / stack: {}",
-                    arm, missing, String::from_utf8_lossy(&unstaged.stderr), again_stderr
-                ));
-            }
+        // Loading again alone stores nothing: the stat data still proves the file unchanged.
+        warehouse.run_ok(&["load", "."]);
+        if warehouse.run(verb).status.code() != Some(25) {
+            failures.push(format!("{}: a plain reload cleared the loss, so the stat cache never hit", arm));
+        }
+
+        // The remedy the refusal names.
+        let unstaged = warehouse.run(&["restore", "--staged", file]);
+        let reloaded = warehouse.run(&["load", file]);
+        let again = warehouse.run(verb);
+        if !unstaged.status.success() || !reloaded.status.success() || !again.status.success() {
+            failures.push(format!(
+                "{}: `restore --staged` then `load` must let `{}` through; restore: {} / load: {} / {}",
+                arm, verb.join(" "), String::from_utf8_lossy(&unstaged.stderr),
+                String::from_utf8_lossy(&reloaded.stderr), String::from_utf8_lossy(&again.stderr)
+            ));
+            continue;
+        }
+
+        if arm == "park" {
+            warehouse.run_ok(&["park", "pop"]);
         } else {
-            let reloaded = warehouse.run(&["load", "."]);
-            let again = warehouse.run(&["stack", "second"]);
-            if !reloaded.status.success() || !again.status.success() {
-                failures.push(format!(
-                    "{}: loading the working copy again must let the stack through; load: {} / stack: {}",
-                    arm, String::from_utf8_lossy(&reloaded.stderr), String::from_utf8_lossy(&again.stderr)
-                ));
-            } else {
-                std::fs::remove_file(warehouse.root.join(file)).unwrap();
-                if !warehouse.run(&["restore", file]).status.success() {
-                    failures.push(format!("{}: the restacked file must restore", arm));
-                }
-            }
+            std::fs::remove_file(warehouse.root.join(file)).unwrap();
+            warehouse.run_ok(&["restore", file]);
+        }
+        if std::fs::read(warehouse.root.join(file)).ok().as_deref() != Some(&content[..]) {
+            failures.push(format!("{}: the file did not come back after `{}`", arm, verb.join(" ")));
         }
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// FORK-157 — the check covers staged work only. A file the head already holds, unchanged, is not
+/// this bay's to vouch for: losing its object must not block a stack of something else, since
+/// neither remedy could clear it (`restore --staged` resets to the same lost hash). The control:
+/// the same loss on the staged file itself does refuse. Red with the head comparison removed from
+/// `require_staged_content_present` (the head file's loss refuses the stack).
+#[test]
+fn stack_ignores_a_lost_object_the_head_already_names() {
+    let warehouse = Warehouse::new("lost-head-blob");
+    let before = warehouse.loose_objects();
+    warehouse.stack("app.txt", "v1\n", "first");
+    let app_blob = warehouse.scoped(|| {
+        let mut created: Vec<String> = warehouse.loose_objects().difference(&before).cloned().collect();
+        created.retain(|hash| forklift_core::util::object_utils::load_blob(hash).is_ok_and(|blob| blob.content == b"v1\n"));
+        created
+    });
+    assert_eq!(app_blob.len(), 1, "the head's blob for app.txt: {:?}", app_blob);
+
+    let staged = load_and_name_staged(&warehouse, "wip.txt", b"work in progress\n");
+    warehouse.delete_object(&app_blob[0]);
+
+    let stacked = warehouse.run(&["stack", "second"]);
+    assert!(stacked.status.success(), "a lost head-only object blocked the stack: {}", String::from_utf8_lossy(&stacked.stderr));
+
+    // Control: the same loss on staged work refuses.
+    let more = load_and_name_staged(&warehouse, "more.txt", b"more\n");
+    assert_eq!(more.len(), 1, "staged {:?} then {:?}", staged, more);
+    warehouse.delete_object(&more[0]);
+    assert_eq!(warehouse.run(&["stack", "third"]).status.code(), Some(25));
 }

@@ -89,4 +89,14 @@ impl TreeItem {
     pub fn get_files(&self) -> Iter<'_, String, TreeItem> {
         self.file_children.iter()
     }
+
+    /// Get the subtree named `name`, if this tree has one.
+    pub fn get_subtree(&self, name: &str) -> Option<&TreeItem> {
+        self.tree_children.get(name)
+    }
+
+    /// Get the file named `name`, if this tree has one.
+    pub fn get_file(&self, name: &str) -> Option<&TreeItem> {
+        self.file_children.get(name)
+    }
 }

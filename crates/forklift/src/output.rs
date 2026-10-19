@@ -426,6 +426,10 @@ error_codes! {
     /// `{pallets: [{pallet, conflicts: [{path, ours: {value?, signer?}, theirs}]}],
     /// lowered: {pallet, head}}`.
     MetaConflict,
+
+    /// `stack` or `park` found a staged file whose content the object store no longer holds (its
+    /// recipe or a chunk, for a large file), and made no parcel.
+    StagedContentMissing,
 }
 
 impl ErrorCode {
@@ -455,6 +459,7 @@ impl ErrorCode {
             ErrorCode::TrustChanged => RefusalCode::TrustChanged.as_str(),
             ErrorCode::RemoteProtocolViolation => RefusalCode::RemoteProtocolViolation.as_str(),
             ErrorCode::MetaConflict => RefusalCode::MetaConflict.as_str(),
+            ErrorCode::StagedContentMissing => RefusalCode::StagedContentMissing.as_str(),
         }
     }
 
@@ -487,6 +492,7 @@ impl ErrorCode {
             ErrorCode::TrustChanged => 22,
             ErrorCode::RemoteProtocolViolation => 23,
             ErrorCode::MetaConflict => 24,
+            ErrorCode::StagedContentMissing => 25,
         }
     }
 
@@ -543,6 +549,9 @@ impl ErrorCode {
             ErrorCode::MetaConflict =>
                 "A meta pallet changed differently on both sides at the same path; nothing was \
                  lifted for it, and \"lower --keep\" resolves each named path",
+            ErrorCode::StagedContentMissing =>
+                "\"stack\" or \"park\" found a staged file whose content the object store no \
+                 longer holds; no parcel was made",
         }
     }
 
@@ -570,6 +579,7 @@ impl ErrorCode {
             RefusalCode::TrustChanged => ErrorCode::TrustChanged,
             RefusalCode::RemoteProtocolViolation => ErrorCode::RemoteProtocolViolation,
             RefusalCode::MetaConflict => ErrorCode::MetaConflict,
+            RefusalCode::StagedContentMissing => ErrorCode::StagedContentMissing,
         }
     }
 }
@@ -931,6 +941,7 @@ mod tests {
             RefusalCode::CommitPaginationUnsupported,
             RefusalCode::IncompleteLoad,
             RefusalCode::DurabilityTaint,
+            RefusalCode::StagedContentMissing,
         ] {
             // Hostile interpolated text, carried across a String segment (the shim), then classified.
             let framed: String = CoreError::refusal(code, "a\u{1f}path", "a\u{1f}step").into();
@@ -966,6 +977,7 @@ mod tests {
             (RefusalCode::TrustChanged, "trust_changed", 22),
             (RefusalCode::RemoteProtocolViolation, "remote_protocol_violation", 23),
             (RefusalCode::MetaConflict, "meta_conflict", 24),
+            (RefusalCode::StagedContentMissing, "staged_content_missing", 25),
         ];
 
         for (code, code_str, exit) in table {
