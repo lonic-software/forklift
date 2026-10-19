@@ -1085,6 +1085,11 @@ pub(crate) fn collect_reachable_noting_gaps(
     let mut seen_gaps: HashSet<String> = HashSet::new();
 
     while let Some(hash) = queue.pop_front() {
+        // A merge's parents are queued once per child edge: settle a repeat before asking presence.
+        if reachable.contains(&hash) {
+            continue;
+        }
+
         if !is_present(&hash)? {
             if seen_gaps.insert(hash.clone()) {
                 gaps.push(hash);
@@ -1093,9 +1098,7 @@ pub(crate) fn collect_reachable_noting_gaps(
             continue;
         }
 
-        if !reachable.insert(hash.clone()) {
-            continue;
-        }
+        reachable.insert(hash.clone());
 
         for parent in object_utils::load_parcel(&hash)?.parents {
             queue.push_back(parent);

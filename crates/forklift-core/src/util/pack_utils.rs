@@ -1602,7 +1602,8 @@ pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, Stri
     // `quarantine_reason` answered for a foreign-version index, so this one is unparseable.
     if let Some(unparsed) = pack_set.unenumerable.first() {
         return Ok(Some(format!(
-            "possibly held by pack index \"{}\", which could not be parsed: {}",
+            "possibly held by pack index \"{}\", which could not be parsed: {}; restore it, or move \
+            it out of the pack folder if it holds nothing this warehouse needs",
             unparsed.index_path.to_string_lossy(), unparsed.error
         )));
     }
@@ -5050,8 +5051,18 @@ pub(crate) mod tests {
         }
         invalidate_cache();
 
+        // Each kind refuses for its own reason, so an arm cannot pass on another kind's gate.
+        let reason = match how {
+            Unreadable::Quarantined => "whose data file could not be loaded",
+            Unreadable::CorruptBucket => "is corrupt (bucket",
+            Unreadable::ForeignVersion => "which this build cannot read",
+            Unreadable::Unparseable => "which could not be parsed",
+        };
         assert!(!file_utils::does_object_exist(hash).unwrap(), "{:?}: the object must not read present", how);
-        assert!(file_utils::is_present_for_sweep(hash).is_err(), "{:?}: a sweep must not read the object absent", how);
+        match file_utils::is_present_for_sweep(hash) {
+            Err(error) => assert!(error.contains(reason), "{:?}: the refusal must give its own reason: {}", how, error),
+            Ok(present) => panic!("{:?}: a sweep must not read the object absent (read {})", how, present),
+        }
     }
 
     /// Test-only convenience: assert `retrieve_from_packs(hash)` reports `Verified` and return

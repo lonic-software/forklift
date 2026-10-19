@@ -151,16 +151,17 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// absent.** The tolerance above is about descending into an already-collected root's tree/blob
 /// closure — an ordinary pallet head that is absent is simply skipped by the reachability walk
 /// below it ([`collect_reachable_for_sweep`] treats an absent head as a gap, contributing nothing;
-/// only a head an unreadable pack index might hold is an error, FORK-193). Computing the *root set itself* is different:
-/// every revoked key's `distrust_boundary` pin can only be found by reading the office pallet's
-/// own head parcel, tracked-keys tree and key-record blobs (`office_utils::
-/// collect_trust_pin_roots`), and this call passes it `TrustPinReadPolicy::FailClosed` — an
-/// unreadable office record aborts `collect_live_set` outright rather than silently returning a
-/// pin list gc cannot prove complete, because under-counting here means sweeping a hash a signed
-/// revocation still names. `forklift heal`'s own root collection
-/// (`recovery_utils::collect_walk_roots`) needs the opposite call for the same read — see that
-/// function's own doc comment for why a sweep and a non-deleting recovery walk are allowed to
-/// differ here the way they already differ on an unreadable bay (`bay_utils::BayReadPolicy`).
+/// only a head an unreadable pack index might hold is an error, FORK-193). Computing the *root set
+/// itself* is different: every revoked key's `distrust_boundary` pin can only be found by reading
+/// the office pallet's own head parcel, tracked-keys tree and key-record blobs
+/// (`office_utils::collect_trust_pin_roots`), and this call passes it
+/// `TrustPinReadPolicy::FailClosed` — an unreadable office record aborts `collect_live_set`
+/// outright rather than silently returning a pin list gc cannot prove complete, because
+/// under-counting here means sweeping a hash a signed revocation still names. `forklift heal`'s own
+/// root collection (`recovery_utils::collect_walk_roots`) needs the opposite call for the same read
+/// — see that function's own doc comment for why a sweep and a non-deleting recovery walk are
+/// allowed to differ here the way they already differ on an unreadable bay
+/// (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // Pallet heads (both namespaces), bay-scoped parcel roots, trust-pin roots and staged shard
     // leaves: the sources this function shares, hash for hash, with

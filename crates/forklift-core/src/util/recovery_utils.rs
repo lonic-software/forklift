@@ -1387,9 +1387,10 @@ pub(crate) struct GcRootSources {
 /// [`gc_utils::collect_reachable_for_sweep`](crate::util::gc_utils::collect_reachable_for_sweep)
 /// folds every root into one undifferentiated walk — no policy distinction needed there, an absent
 /// root is just a gap either way (one an unreadable pack index might hold fails the walk, whatever
-/// its source), see `collect_live_set`'s own doc comment — so its caller simply drops the [`office_utils::PinAbsencePolicy`] tag and concatenates the
-/// two lists; [`collect_walk_roots`]'s own caller ([`walk_closure_for`]) needs to keep that tag,
-/// to apply the per-entry gap-vs-report rule (see that function's own doc comment).
+/// its source), see `collect_live_set`'s own doc comment — so its caller simply drops the
+/// [`office_utils::PinAbsencePolicy`] tag and concatenates the two lists; [`collect_walk_roots`]'s
+/// own caller ([`walk_closure_for`]) needs to keep that tag, to apply the per-entry gap-vs-report
+/// rule (see that function's own doc comment).
 ///
 /// `bay_policy`/`pin_policy` let each caller keep its own fail-closed/tolerant contract — see
 /// [`bay_utils::BayReadPolicy`] and [`office_utils::TrustPinReadPolicy`] for the full reasoning
