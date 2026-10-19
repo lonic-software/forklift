@@ -321,7 +321,9 @@ forklift restore --staged path   # reset the inventory entry to the pallet head 
 ```
 
 `restore path` overwrites the working file(s) from what's staged — it throws away
-unstaged edits, so use it deliberately. `restore --staged path` leaves the
+unstaged edits, so use it deliberately. A file that already holds the staged content is
+left alone, so its modification time does not change and build tools don't see it as
+edited. `restore --staged path` leaves the
 working directory alone and only un-stages (the inverse of `load`) — the same
 operation as `unload`.
 

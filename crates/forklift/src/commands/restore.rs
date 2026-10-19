@@ -23,9 +23,9 @@ enum HeadEntry {
 }
 
 /// Handle the restore command.
-/// * `restore <path>`          - Rewrite the file (or every tracked file of the directory)
-///                               in the working directory from the inventory, discarding
-///                               unstaged changes.
+/// * `restore <path>`          - Rewrite the file (or every tracked file of the directory
+///                               that differs from its entry) in the working directory from
+///                               the inventory, discarding unstaged changes.
 /// * `restore --staged <path>` - Reset the inventory entries of the path to the pallet
 ///                               head (unstage), leaving the working directory untouched.
 ///
@@ -73,7 +73,8 @@ pub fn handle_unstage(target: &str) -> Result<(), String> {
 }
 
 /// Restore the working directory from the inventory: rewrite the file (or, for a
-/// directory, every tracked, non-`Deleted` file below it) from its staged blob.
+/// directory, every tracked, non-`Deleted` file below it) from its staged blob, leaving a file
+/// that already holds that content untouched (see `restore_entry`).
 ///
 /// # Arguments
 /// * `path` - The path to restore.

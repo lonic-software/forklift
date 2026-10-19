@@ -1871,8 +1871,8 @@ fn restore_discards_unstaged_changes() {
     assert!(stderr(&untracked).contains("not in the inventory"));
 }
 
-/// What rewriting a working file changes and leaving it alone keeps: its mtime, and on unix its
-/// inode (a restore writes a new file and renames it into place).
+/// A working file's mtime and, on unix, inode: a rewrite moves the mtime (and the inode too,
+/// where the write replaces the file); a file left alone keeps both.
 fn file_identity(path: &std::path::Path) -> (std::time::SystemTime, u64) {
     let metadata = std::fs::symlink_metadata(path).unwrap();
 
