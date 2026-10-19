@@ -128,7 +128,6 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
 
     // The trail: everything reachable from the draft head but not from the target head —
     // the checkpoints since the two diverged.
-
     let target_reachable = match &target_head {
         Some(head) => audit_utils::collect_reachable(&[head.clone()])?,
         None => HashSet::new(),
