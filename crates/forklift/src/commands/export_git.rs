@@ -247,9 +247,10 @@ impl<'a> Exporter<'a> {
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Create a fresh temp file to assemble the chunked blob `recipe_hash` into for `git hash-object`,
-/// its name numbered from `counter` as well as by the pid, so no two calls in one process share it. The file is created new, never opened by name: a shared, world-writable temp folder
-/// is no place to follow or truncate a planted symlink. A name already taken, by such a plant or
-/// by a killed earlier process with this one's id, is stepped past.
+/// its name numbered from `counter` as well as by the pid, so no two calls in one process share it.
+/// The file is created new, never opened by name: a shared, world-writable temp folder is no place
+/// to follow or truncate a planted symlink. A name already taken, by such a plant or by a killed
+/// earlier process with this one's id, is stepped past.
 fn create_export_temp(recipe_hash: &str, counter: &std::sync::atomic::AtomicU64)
     -> Result<(std::path::PathBuf, std::fs::File), String> {
     let candidates = file_utils::pid_numbered(counter, |pid, n| {
