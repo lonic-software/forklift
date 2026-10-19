@@ -1539,9 +1539,25 @@ fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, Handle
         return Err(internal(error));
     }
 
+    let conflict = || (
+        StatusCode::CONFLICT,
+        format!(
+            "\"{}\" already exists on this server and is not a warehouse; remove it or choose \
+            another id.",
+            id
+        ),
+    );
+
     // Unix renames over an empty folder and Windows over no folder at all; removing an empty one
     // first (and nothing else: `remove_dir` refuses a folder with anything in it) makes both agree.
     let _ = std::fs::remove_dir(&target);
+
+    // Windows renames over a *file*, replacing it, so anything at the id that is not a folder is
+    // refused here rather than left to the rename, which refuses it only on Unix.
+    if std::fs::symlink_metadata(&target).is_ok_and(|metadata| !metadata.is_dir()) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(conflict());
+    }
 
     match std::fs::rename(&staging, &target) {
         Ok(()) => {
@@ -1559,14 +1575,7 @@ fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, Handle
             if target.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir() {
                 Ok(Creation::Existed)
             } else if std::fs::symlink_metadata(&target).is_ok() {
-                Err((
-                    StatusCode::CONFLICT,
-                    format!(
-                        "\"{}\" already exists on this server and is not a warehouse; remove it \
-                        or choose another id.",
-                        id
-                    ),
-                ))
+                Err(conflict())
             } else {
                 Err(internal(format!(
                     "The warehouse could not be moved into place, so it was not created: {}. \
@@ -4002,6 +4011,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// An empty folder at the id is taken over; a folder with anything in it, or a file, is refused
+    /// and left as it was. The file case is the Windows one: a rename there replaces a file, which
+    /// is how this test failed on Windows before the check ahead of the rename.
     #[test]
     fn an_empty_folder_is_taken_over_and_anything_else_is_refused() {
         let base = scratch_dir("create-existing");
@@ -4018,7 +4030,8 @@ mod tests {
         assert!(!base.join("busy").join(FOLDER_NAME_FORKLIFT_ROOT).exists(), "never adopted");
 
         std::fs::write(base.join("file"), b"not a folder").unwrap();
-        assert_eq!(create_warehouse(&base, "file").unwrap_err().0, StatusCode::CONFLICT);
+        assert_eq!(create_warehouse(&base, "file").err().expect("a file is refused").0, StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(base.join("file")).unwrap(), b"not a folder", "never replaced");
 
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
 
