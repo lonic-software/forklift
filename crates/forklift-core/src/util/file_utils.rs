@@ -2379,6 +2379,38 @@ pub fn get_type_of_dir_entry(metadata: &Metadata) -> DirEntryType {
     }
 }
 
+/// Whether a `stat` on this platform reports a file's executable bit. Windows has none, so
+/// [`is_dir_entry_executable`] says `false` for every file there.
+pub const EXECUTABLE_BIT_IS_OBSERVABLE: bool = cfg!(unix);
+
+/// The kind a tracked file has, given the kind a fresh `stat` reports and the kind its entry
+/// records. Where `stat` cannot see the executable bit, a plain file whose entry is a plain file
+/// keeps the entry's bit: what `stat` says about the bit there is the platform's blind spot, not
+/// a change (git's `core.fileMode=false`). Every other kind is the `stat`'s.
+///
+/// # Arguments
+/// * `stat_kind`  - The kind [`get_type_of_dir_entry`] reports for the file.
+/// * `entry_kind` - The kind the file's entry records (chunked or not).
+///
+/// # Returns
+/// The file's kind as the working directory holds it (never chunked).
+pub fn tracked_kind(stat_kind: DirEntryType, entry_kind: DirEntryType) -> DirEntryType {
+    tracked_kind_when(stat_kind, entry_kind, EXECUTABLE_BIT_IS_OBSERVABLE)
+}
+
+fn tracked_kind_when(stat_kind: DirEntryType,
+                     entry_kind: DirEntryType,
+                     executable_bit_is_observable: bool) -> DirEntryType {
+    let is_plain = |kind: DirEntryType| matches!(kind, DirEntryType::Normal | DirEntryType::Executable);
+    let entry_on_disk = entry_kind.on_disk_kind();
+
+    if !executable_bit_is_observable && is_plain(stat_kind) && is_plain(entry_on_disk) {
+        return entry_on_disk;
+    }
+
+    stat_kind
+}
+
 /// Get the modification timestamp of the metadata of a file.
 /// This always returns `0` on Windows, as Windows does not have an alternative to "ctime".
 ///
@@ -3074,6 +3106,27 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where the bit is observable the stat's kind stands; where it is not, a plain file takes
+    /// its plain entry's kind, in both directions, and nothing else is projected.
+    #[test]
+    fn tracked_kind_projects_only_the_bit_and_only_where_it_is_unobservable() {
+        use DirEntryType::*;
+
+        for stat in [Normal, Executable, SymbolicLink] {
+            for entry in [Normal, Executable, NormalChunked, ExecutableChunked, SymbolicLink] {
+                assert_eq!(tracked_kind_when(stat, entry, true), stat, "observable: {:?} over {:?}", stat, entry);
+            }
+        }
+
+        assert_eq!(tracked_kind_when(Normal, Executable, false), Executable);
+        assert_eq!(tracked_kind_when(Normal, ExecutableChunked, false), Executable);
+        assert_eq!(tracked_kind_when(Executable, Normal, false), Normal);
+        assert_eq!(tracked_kind_when(Executable, NormalChunked, false), Normal);
+        assert_eq!(tracked_kind_when(Normal, Normal, false), Normal);
+        assert_eq!(tracked_kind_when(Normal, SymbolicLink, false), Normal, "a link replaced by a file is a change");
+        assert_eq!(tracked_kind_when(SymbolicLink, Executable, false), SymbolicLink, "a file replaced by a link is a change");
+    }
     use crate::globals::StorageRootScope;
 
     /// The probe source's two promises: an anchor taken before a write is at most that write's

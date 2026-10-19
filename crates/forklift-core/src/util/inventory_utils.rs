@@ -2590,7 +2590,9 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
     // entry may hold a `*Chunked` variant for the same file. Chunking is a storage choice a stat
     // cannot see, so an unchanged giant (stat says `Normal`, inventory says `NormalChunked`) must
     // still hit this fast path and never be re-chunked. A genuine normal↔executable flip is still
-    // caught (their on-disk kinds differ).
+    // caught (their on-disk kinds differ), except where a stat cannot see the bit at all (see
+    // `file_utils::tracked_kind`).
+    let item_type = file_utils::tracked_kind(item_type, existing.item_type);
     if existing.item_type.on_disk_kind() != item_type.on_disk_kind() {
         return false;
     }
@@ -2743,14 +2745,15 @@ pub enum FileVerdict {
     /// The stat cache proves the entry still matches the file — nothing was read or hashed.
     UnchangedByStat,
 
-    /// The stat cache missed, but the content hash matches the entry: the file is
-    /// unchanged. Carries the rebuilt item (same hash, fresh stat data) and, for a small
+    /// The stat cache missed, but the content hash and the on-disk kind match the entry: the
+    /// file is unchanged. Carries the rebuilt item (same hash, fresh stat data) and, for a small
     /// file, the unstored blob object — writers store it anyway (a cheap no-op when present),
     /// which is what makes a re-load heal a blob that went missing from the object store. A
     /// chunked file carries `None` (its chunks/recipe were handled per the ingest mode).
     UnchangedByHash(InventoryItem, Option<LooseObject>),
 
-    /// The content changed. Carries the rebuilt item (new hash, fresh stat data) and, for a
+    /// The content or the kind changed (a chmod alone keeps the hash). Carries the rebuilt
+    /// item (current hash and kind, fresh stat data) and, for a
     /// small file, the unstored blob object, so a writer can store it without reading the file
     /// again — and a read-only caller simply drops it. A chunked file carries `None`.
     Modified(InventoryItem, Option<LooseObject>),
@@ -2791,14 +2794,20 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
                                    name: &str,
                                    mode: IngestMode,
                                    anchor: file_utils::StatAnchor) -> Result<FileVerdict, String> {
+    let item_type = file_utils::tracked_kind(item_type, existing.item_type);
+
     if is_entry_unchanged(existing, metadata, item_type, path) {
         return Ok(FileVerdict::UnchangedByStat);
     }
 
+    // The content alone does not decide it: a file whose bytes match but whose kind flipped (a
+    // chmod) is a change the next stack records, so it is reported as one.
+    let kind_matches = existing.item_type.on_disk_kind() == item_type.on_disk_kind();
+
     if ingest_keeps_representation(existing, metadata, item_type) {
         let (item, object) = build_item_and_object_for_file(path, name, item_type, mode, anchor)?;
 
-        return Ok(if item.hash == existing.hash {
+        return Ok(if item.hash == existing.hash && kind_matches {
             FileVerdict::UnchangedByHash(item, object)
         } else {
             FileVerdict::Modified(item, object)
@@ -2806,7 +2815,11 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
     }
 
     if let Some((item, object)) = reprove_file(existing, item_type, path, name, anchor)? {
-        return Ok(FileVerdict::UnchangedByHash(item, object));
+        return Ok(if kind_matches {
+            FileVerdict::UnchangedByHash(item, object)
+        } else {
+            FileVerdict::Modified(item, object)
+        });
     }
 
     let (item, object) = build_item_and_object_for_file(path, name, item_type, mode, anchor)?;
@@ -3681,6 +3694,51 @@ mod tests {
                                                       DirEntryType::Normal,
                                                       file_utils::StatAnchor::Unproven).unwrap();
         assert_eq!(unproven.content_change_timestamp, UNPROVEN_MTIME);
+    }
+
+    /// A file whose bytes match its entry but whose executable bit does not is a change where a
+    /// stat can see the bit. Where it cannot (Windows), the entry's bit stands: the stat cache
+    /// still hits, and nothing would record the file as plain.
+    #[test]
+    fn a_kind_only_difference_is_a_change_only_where_the_bit_is_observable() {
+        let scratch = Scratch::new("kind-only-change");
+        let file = scratch.root.join("tool.sh");
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let metadata = file_utils::get_symlink_metadata_for_path(&file).unwrap();
+        let stat_kind = file_utils::get_type_of_dir_entry(&metadata);
+        assert_eq!(stat_kind, DirEntryType::Normal);
+        let (hashed, _) = build_item_and_object_for_file(&file, "tool.sh", DirEntryType::Normal,
+                                                         IngestMode::ComputeOnly,
+                                                         file_utils::StatAnchor::Unproven).unwrap();
+        let entry_of = |kind: DirEntryType| build_inventory_item_from_stat(
+            &file, "tool.sh", hashed.hash.clone(), kind, file_utils::StatAnchor::At(u64::MAX)).unwrap();
+        let classify = |entry: &InventoryItem| classify_file_against_entry(
+            entry, &metadata, stat_kind, &file, "tool.sh", IngestMode::ComputeOnly,
+            file_utils::StatAnchor::Unproven).unwrap();
+
+        assert!(matches!(classify(&entry_of(DirEntryType::Normal)), FileVerdict::UnchangedByStat),
+            "a plain entry over the same plain file is unchanged");
+
+        let executable = entry_of(DirEntryType::Executable);
+        match classify(&executable) {
+            FileVerdict::Modified(item, _) if file_utils::EXECUTABLE_BIT_IS_OBSERVABLE => {
+                assert_eq!(item.hash, hashed.hash, "a chmod keeps the hash");
+                assert_eq!(item.item_type, DirEntryType::Normal, "the rebuilt item takes the file's kind");
+            }
+            FileVerdict::UnchangedByStat if !file_utils::EXECUTABLE_BIT_IS_OBSERVABLE => {}
+            other => panic!("unexpected verdict for a kind-only difference: {}", match other {
+                FileVerdict::UnchangedByStat => "unchanged by stat",
+                FileVerdict::UnchangedByHash(..) => "unchanged by hash",
+                FileVerdict::Modified(..) => "modified",
+            }),
+        }
+        assert_eq!(is_entry_unchanged(&executable, &metadata, stat_kind, &file),
+                   !file_utils::EXECUTABLE_BIT_IS_OBSERVABLE);
     }
 
     /// The unproven sentinel never matches a stat, even one whose every other field agrees.

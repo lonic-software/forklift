@@ -165,14 +165,21 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
     }
 
     let blocks = format_blocks(&selected, |change| {
-        let (old_content, new_content) = match (change.kind, &change.moved_from) {
-            (ChangeKind::Removed, _) => (inventory_content(&change.path, &shards)?, DiffSide::empty()),
-            (ChangeKind::Moved, Some(from)) =>
-                (inventory_content(from, &shards)?, worktree_content(&change.path)?),
-            _ => (inventory_content(&change.path, &shards)?, worktree_content(&change.path)?),
+        let staged_path = match (change.kind, &change.moved_from) {
+            (ChangeKind::Moved, Some(from)) => from,
+            _ => &change.path,
         };
+        let (old_content, old_kind) = inventory_content(staged_path, &shards)?;
+        let (new_content, new_kind) = match change.kind {
+            ChangeKind::Removed => (DiffSide::empty(), None),
+            _ => {
+                let (content, kind) = worktree_content(&change.path, old_kind)?;
+                (content, Some(kind))
+            }
+        };
+        let mode = mode_change(Some(old_kind), new_kind);
 
-        Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, verbose))
+        Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, mode, verbose))
     });
 
     print_blocks(blocks)
@@ -232,18 +239,19 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
                               change.path));
         }
 
-        let old_content = match (change.kind, &change.moved_from) {
-            (ChangeKind::Added, _) => DiffSide::empty(),
-            (ChangeKind::Moved, Some(from)) => head_content(head_tree_hash, from)?,
-            _ => head_content(head_tree_hash, &change.path)?,
+        let (old_content, old_kind) = match (change.kind, &change.moved_from) {
+            (ChangeKind::Added, _) => (DiffSide::empty(), None),
+            (ChangeKind::Moved, Some(from)) => with_kind(head_content(head_tree_hash, from)?),
+            _ => with_kind(head_content(head_tree_hash, &change.path)?),
         };
 
-        let new_content = match change.kind {
-            ChangeKind::Removed => DiffSide::empty(),
-            _ => inventory_content(&change.path, &shards)?,
+        let (new_content, new_kind) = match change.kind {
+            ChangeKind::Removed => (DiffSide::empty(), None),
+            _ => with_kind(inventory_content(&change.path, &shards)?),
         };
+        let mode = mode_change(old_kind, new_kind);
 
-        Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, verbose))
+        Ok(format_file_diff(change.kind, &change_label(change), &old_content, &new_content, mode, verbose))
     });
 
     print_blocks(blocks)
@@ -417,7 +425,7 @@ fn diff_block(change: &TreeChange, verbose: bool) -> Result<String, String> {
         None => change.path.clone(),
     };
 
-    Ok(format_file_diff(change.kind, &label, &old_side, &new_side, verbose))
+    Ok(format_file_diff(change.kind, &label, &old_side, &new_side, change.mode, verbose))
 }
 
 /// The reserved token for "the empty tree" as either side of a two-revision `diff`: a root
@@ -468,6 +476,9 @@ struct TreeChange {
     /// Whether either side is a chunked (large binary) file: it is reported as "binary
     /// contents", never assembled or line-diffed (its hash is a recipe, not a blob).
     is_binary: bool,
+
+    /// The old and new on-disk kinds of a file whose kind changed (see [`mode_change`]).
+    mode: Option<(DirEntryType, DirEntryType)>,
 }
 
 /// The §3.2.1 move-detection post-pass over a tree-vs-tree comparison: a removed and an
@@ -566,6 +577,7 @@ fn collect_tree_changes(from: Option<&TreeItem>,
                 new_hash: Some(to_item.hash.clone()),
                 moved_from: None,
                 is_binary: to_item.item_type.is_chunked(),
+                mode: None,
             }),
             Some(from_item)
                 if from_item.hash != to_item.hash
@@ -577,6 +589,7 @@ fn collect_tree_changes(from: Option<&TreeItem>,
                     new_hash: Some(to_item.hash.clone()),
                     moved_from: None,
                     is_binary: from_item.item_type.is_chunked() || to_item.item_type.is_chunked(),
+                    mode: mode_change(Some(from_item.item_type), Some(to_item.item_type)),
                 });
             }
             Some(_) => {}
@@ -596,6 +609,7 @@ fn collect_tree_changes(from: Option<&TreeItem>,
                 new_hash: None,
                 moved_from: None,
                 is_binary: from_item.item_type.is_chunked(),
+                mode: None,
             });
         }
     }
@@ -680,9 +694,9 @@ fn is_within(path: &str, filter: Option<&WarehousePath>) -> bool {
 ///              only when it is missing from this invocation-scoped memo.
 ///
 /// # Returns
-/// * `Ok(Vec<u8>)` - The blob content.
+/// * `Ok((DiffSide, DirEntryType))` - The blob content and the entry's kind.
 /// * `Err(String)` - If the file has no inventory entry or the blob could not be read.
-fn inventory_content(path: &str, shards: &HashMap<String, Arc<Inventory>>) -> Result<DiffSide, String> {
+fn inventory_content(path: &str, shards: &HashMap<String, Arc<Inventory>>) -> Result<(DiffSide, DirEntryType), String> {
     let (parent_key, name) = split_parent(path);
 
     let inventory = match shards.get(parent_key) {
@@ -696,25 +710,26 @@ fn inventory_content(path: &str, shards: &HashMap<String, Arc<Inventory>>) -> Re
 
     // A chunked file's inventory hash is a recipe — never load it as a blob; report binary.
     if item.item_type.is_chunked() {
-        return Ok(DiffSide::Binary);
+        return Ok((DiffSide::Binary, item.item_type));
     }
 
-    Ok(DiffSide::Text(object_utils::load_blob(&item.hash)?.content))
+    Ok((DiffSide::Text(object_utils::load_blob(&item.hash)?.content), item.item_type))
 }
 
 /// Get the working-directory content of a tracked file (a symlink's content is its
 /// target path, matching how symlinks are stored).
 ///
 /// # Arguments
-/// * `path` - The warehouse path of the file.
+/// * `path`       - The warehouse path of the file.
+/// * `entry_kind` - The kind its inventory entry records (see [`file_utils::tracked_kind`]).
 ///
 /// # Returns
-/// * `Ok(Vec<u8>)` - The file content.
+/// * `Ok((DiffSide, DirEntryType))` - The file content and its kind.
 /// * `Err(String)` - If the file could not be read.
-fn worktree_content(path: &str) -> Result<DiffSide, String> {
+fn worktree_content(path: &str, entry_kind: DirEntryType) -> Result<(DiffSide, DirEntryType), String> {
     let fs_path = Path::new(path);
     let metadata = file_utils::get_symlink_metadata_for_path(fs_path)?;
-    let item_type = file_utils::get_type_of_dir_entry(&metadata);
+    let item_type = file_utils::tracked_kind(file_utils::get_type_of_dir_entry(&metadata), entry_kind);
     let name = split_parent(path).1;
 
     // A worktree file at or above the chunk threshold would be tracked chunked (and is too big to
@@ -723,10 +738,10 @@ fn worktree_content(path: &str) -> Result<DiffSide, String> {
     if item_type.is_file()
         && item_type != DirEntryType::SymbolicLink
         && metadata.len() >= chunk_utils::CHUNK_THRESHOLD_BYTES as u64 {
-        return Ok(DiffSide::Binary);
+        return Ok((DiffSide::Binary, item_type));
     }
 
-    Ok(DiffSide::Text(object_utils::get_blob_for_file(name, fs_path, &item_type)?.content))
+    Ok((DiffSide::Text(object_utils::get_blob_for_file(name, fs_path, &item_type)?.content), item_type))
 }
 
 /// Get the pallet-head content of a file: its blob in the head parcel's tree.
@@ -736,9 +751,9 @@ fn worktree_content(path: &str) -> Result<DiffSide, String> {
 /// * `path`           - The warehouse path of the file.
 ///
 /// # Returns
-/// * `Ok(Vec<u8>)` - The blob content.
+/// * `Ok((DiffSide, DirEntryType))` - The blob content and the head entry's kind.
 /// * `Err(String)` - If the file is not in the head tree or the blob could not be read.
-fn head_content(head_tree_hash: Option<&str>, path: &str) -> Result<DiffSide, String> {
+fn head_content(head_tree_hash: Option<&str>, path: &str) -> Result<(DiffSide, DirEntryType), String> {
     let file = match head_tree_hash {
         Some(tree_hash) => object_utils::resolve_tree_file(tree_hash, path)?,
         None => None,
@@ -746,8 +761,8 @@ fn head_content(head_tree_hash: Option<&str>, path: &str) -> Result<DiffSide, St
 
     match file {
         // A chunked head entry's hash is a recipe — report binary without loading it.
-        Some((_, item_type)) if item_type.is_chunked() => Ok(DiffSide::Binary),
-        Some((hash, _)) => Ok(DiffSide::Text(object_utils::load_blob(&hash)?.content)),
+        Some((_, item_type)) if item_type.is_chunked() => Ok((DiffSide::Binary, item_type)),
+        Some((hash, item_type)) => Ok((DiffSide::Text(object_utils::load_blob(&hash)?.content), item_type)),
         None => Err(format!("\"{}\" is not in the pallet head.", path)),
     }
 }
@@ -762,13 +777,25 @@ fn head_content(head_tree_hash: Option<&str>, path: &str) -> Result<DiffSide, St
 /// * `path`    - The warehouse path of the file (already a "old -> new" label if moved).
 /// * `old`     - The old content.
 /// * `new`     - The new content.
+/// * `mode`    - The old and new kinds, when the file's kind changed (see [`mode_change`]).
 /// * `verbose` - Whether to include unchanged lines too.
-fn format_file_diff(kind: ChangeKind, path: &str, old: &DiffSide, new: &DiffSide, verbose: bool) -> String {
+fn format_file_diff(kind: ChangeKind,
+                    path: &str,
+                    old: &DiffSide,
+                    new: &DiffSide,
+                    mode: Option<(DirEntryType, DirEntryType)>,
+                    verbose: bool) -> String {
     use std::fmt::Write;
 
     let mut out = String::new();
 
     let _ = writeln!(out, "\x1b[1m{}: {}\x1b[0m", kind, path);
+
+    // A chmod alone changes no line, so without this its block would be a bare header.
+    if let Some((old_kind, new_kind)) = mode {
+        let _ = writeln!(out, "  (mode: {} -> {})",
+                         old_kind.to_string().to_lowercase(), new_kind.to_string().to_lowercase());
+    }
 
     // A chunked file (or non-text bytes on either side) is reported as binary, never line-diffed.
     if old.is_binary() || new.is_binary() {
@@ -822,6 +849,19 @@ fn format_diff_lines(out: &mut String, diffs: &[Diff]) {
             String::from_utf8_lossy(&diff.line)
         );
     }
+}
+
+/// The old and new on-disk kinds of a file present on both sides whose kind differs (a chmod, or
+/// a file replaced by a symlink); `None` otherwise. Chunking is storage, not a kind.
+fn mode_change(old: Option<DirEntryType>, new: Option<DirEntryType>) -> Option<(DirEntryType, DirEntryType)> {
+    let (old, new) = (old?.on_disk_kind(), new?.on_disk_kind());
+
+    (old != new).then_some((old, new))
+}
+
+/// A present side's content with its kind, for a match arm that also yields an absent side.
+fn with_kind((content, kind): (DiffSide, DirEntryType)) -> (DiffSide, Option<DirEntryType>) {
+    (content, Some(kind))
 }
 
 /// Split a warehouse path into its parent directory key and its file name.

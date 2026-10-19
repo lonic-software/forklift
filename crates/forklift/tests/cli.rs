@@ -1031,6 +1031,38 @@ fn an_edit_to_a_tracked_file_a_rule_covers_stays_visible_and_blocks_shift() {
     assert_eq!(read(&warehouse, "notes.txt"), "local edit\n", "the edit must survive");
 }
 
+/// A chmod alone is a change on every side: stocktake reports it unstaged, then staged once
+/// loaded, diff names the mode on both, the parcel records it, and shift refuses to reset it.
+#[cfg(unix)]
+#[test]
+fn a_mode_only_change_is_reported_staged_and_unstaged_and_blocks_shift() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = warehouse_with_a_diverged_pallet("mode-only-change");
+    let path = warehouse.root.join("notes.txt");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let modified = ("modified".to_string(), "notes.txt".to_string());
+    assert!(changes(&warehouse, "unstaged").contains(&modified), "a chmod must be an unstaged change");
+    let diff = stdout(&warehouse.run(&["diff"]));
+    assert!(diff.contains("modified: notes.txt") && diff.contains("(mode: normal -> executable)"), "{}", diff);
+
+    let shift = warehouse.run(&["shift", "feature"]);
+    assert!(!shift.status.success(), "shift must refuse over the chmod: {}", stdout(&shift));
+    assert_ne!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "the chmod must survive");
+
+    assert_success(&warehouse.run(&["load", "notes.txt"]));
+    assert!(changes(&warehouse, "unstaged").is_empty(), "the loaded chmod must leave nothing unstaged");
+    assert!(changes(&warehouse, "staged").contains(&modified), "a loaded chmod must be a staged change");
+    let staged = stdout(&warehouse.run(&["diff", "--staged"]));
+    assert!(staged.contains("(mode: normal -> executable)"), "{}", staged);
+
+    assert_success(&warehouse.run(&["stack", "chmod"]));
+    assert!(changes(&warehouse, "staged").is_empty());
+    let pallets = stdout(&warehouse.run(&["diff", "feature", "main"]));
+    assert!(pallets.contains("modified: notes.txt") && pallets.contains("(mode: normal -> executable)"), "{}", pallets);
+}
+
 #[test]
 fn loading_the_root_or_a_tracked_folder_a_rule_covers_stages_no_removal() {
     let warehouse = warehouse_with_a_diverged_pallet("ignore-tracked-load");
@@ -2199,7 +2231,7 @@ fn assert_only_the_ignore_file_is_untracked_or_clean(warehouse: &TestWarehouse) 
 }
 
 /// A kind change is never hidden by re-proving an unproven entry: a chmod +x on a large plain
-/// file is recorded by load as a type change, a file replaced by a link to a copy of itself is
+/// file is reported and recorded by load as a type change, a file replaced by a link to a copy of itself is
 /// modified, and a link replaced by a regular file is modified, not an error.
 #[cfg(unix)]
 #[test]
@@ -2225,7 +2257,7 @@ fn re_proving_an_unproven_entry_never_hides_a_kind_change() {
     warehouse.write_file("link", "file.txt");
 
     let changes = unstaged_changes(&warehouse);
-    for path in ["file.txt", "link"] {
+    for path in ["big.bin", "file.txt", "link"] {
         assert!(changes.contains(&("modified".to_string(), path.to_string())), "{} must be modified: {:?}", path, changes);
     }
 
