@@ -2554,6 +2554,17 @@ fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
     closed
 }
 
+/// The kind a file has against its entry, given the kind a fresh `stat` reports (see
+/// [`file_utils::effective_kind`]). Only a live entry lends its executable bit: a file loaded over
+/// an entry staged for removal is a new file, and takes the bit the `stat` reports.
+pub fn effective_kind(existing: &InventoryItem, stat_kind: DirEntryType) -> DirEntryType {
+    if existing.state == InventoryItemState::Deleted {
+        return stat_kind;
+    }
+
+    file_utils::effective_kind(stat_kind, existing.item_type)
+}
+
 /// Check whether a file is unchanged compared to its existing inventory entry, based purely
 /// on file metadata (no file content is read). This is the stat-cache fast path: matching
 /// ctime, mtime, device, inode, type (and size, for non-symlinks) means the stored hash is
@@ -2591,8 +2602,8 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
     // cannot see, so an unchanged giant (stat says `Normal`, inventory says `NormalChunked`) must
     // still hit this fast path and never be re-chunked. A genuine normal↔executable flip is still
     // caught (their on-disk kinds differ), except where a stat cannot see the bit at all (see
-    // `file_utils::tracked_kind`).
-    let item_type = file_utils::tracked_kind(item_type, existing.item_type);
+    // `effective_kind`).
+    let item_type = effective_kind(existing, item_type);
     if existing.item_type.on_disk_kind() != item_type.on_disk_kind() {
         return false;
     }
@@ -2794,7 +2805,7 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
                                    name: &str,
                                    mode: IngestMode,
                                    anchor: file_utils::StatAnchor) -> Result<FileVerdict, String> {
-    let item_type = file_utils::tracked_kind(item_type, existing.item_type);
+    let item_type = effective_kind(existing, item_type);
 
     if is_entry_unchanged(existing, metadata, item_type, path) {
         return Ok(FileVerdict::UnchangedByStat);
@@ -3739,6 +3750,21 @@ mod tests {
         }
         assert_eq!(is_entry_unchanged(&executable, &metadata, stat_kind, &file),
                    !file_utils::EXECUTABLE_BIT_IS_OBSERVABLE);
+    }
+
+    /// Only a live entry lends its executable bit: a file loaded over an entry staged for removal
+    /// is a new file, with the bit its stat reports, wherever that is.
+    #[test]
+    fn an_entry_staged_for_removal_lends_no_executable_bit() {
+        let live = InventoryItem { item_type: DirEntryType::Executable, ..item("run.sh", 1, InventoryItemState::Normal) };
+        let removed = InventoryItem { state: InventoryItemState::Deleted, ..live.clone() };
+
+        assert_eq!(effective_kind(&removed, DirEntryType::Normal), DirEntryType::Normal);
+        assert_eq!(effective_kind(&live, DirEntryType::Normal), if file_utils::EXECUTABLE_BIT_IS_OBSERVABLE {
+            DirEntryType::Normal
+        } else {
+            DirEntryType::Executable
+        });
     }
 
     /// The unproven sentinel never matches a stat, even one whose every other field agrees.

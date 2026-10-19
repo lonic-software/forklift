@@ -425,7 +425,8 @@ fn diff_block(change: &TreeChange, verbose: bool) -> Result<String, String> {
         None => change.path.clone(),
     };
 
-    Ok(format_file_diff(change.kind, &label, &old_side, &new_side, change.mode, verbose))
+    Ok(format_file_diff(change.kind, &label, &old_side, &new_side,
+                       mode_change(change.old_type, change.new_type), verbose))
 }
 
 /// The reserved token for "the empty tree" as either side of a two-revision `diff`: a root
@@ -477,8 +478,10 @@ struct TreeChange {
     /// contents", never assembled or line-diffed (its hash is a recipe, not a blob).
     is_binary: bool,
 
-    /// The old and new on-disk kinds of a file whose kind changed (see [`mode_change`]).
-    mode: Option<(DirEntryType, DirEntryType)>,
+    /// The file's kind on the old side (`None` if it was added).
+    old_type: Option<DirEntryType>,
+    /// The file's kind on the new side (`None` if it was removed).
+    new_type: Option<DirEntryType>,
 }
 
 /// The §3.2.1 move-detection post-pass over a tree-vs-tree comparison: a removed and an
@@ -521,6 +524,7 @@ fn detect_tree_moves(changes: &mut Vec<TreeChange>) {
         changes[added_index].kind = ChangeKind::Moved;
         changes[added_index].moved_from = Some(changes[removed_index].path.clone());
         changes[added_index].old_hash = changes[removed_index].old_hash.clone();
+        changes[added_index].old_type = changes[removed_index].old_type;
         consumed[removed_index] = true;
     }
 
@@ -577,7 +581,8 @@ fn collect_tree_changes(from: Option<&TreeItem>,
                 new_hash: Some(to_item.hash.clone()),
                 moved_from: None,
                 is_binary: to_item.item_type.is_chunked(),
-                mode: None,
+                old_type: None,
+                new_type: Some(to_item.item_type),
             }),
             Some(from_item)
                 if from_item.hash != to_item.hash
@@ -589,7 +594,8 @@ fn collect_tree_changes(from: Option<&TreeItem>,
                     new_hash: Some(to_item.hash.clone()),
                     moved_from: None,
                     is_binary: from_item.item_type.is_chunked() || to_item.item_type.is_chunked(),
-                    mode: mode_change(Some(from_item.item_type), Some(to_item.item_type)),
+                    old_type: Some(from_item.item_type),
+                    new_type: Some(to_item.item_type),
                 });
             }
             Some(_) => {}
@@ -609,7 +615,8 @@ fn collect_tree_changes(from: Option<&TreeItem>,
                 new_hash: None,
                 moved_from: None,
                 is_binary: from_item.item_type.is_chunked(),
-                mode: None,
+                old_type: Some(from_item.item_type),
+                new_type: None,
             });
         }
     }
@@ -721,7 +728,7 @@ fn inventory_content(path: &str, shards: &HashMap<String, Arc<Inventory>>) -> Re
 ///
 /// # Arguments
 /// * `path`       - The warehouse path of the file.
-/// * `entry_kind` - The kind its inventory entry records (see [`file_utils::tracked_kind`]).
+/// * `entry_kind` - The kind its inventory entry records (see [`file_utils::effective_kind`]).
 ///
 /// # Returns
 /// * `Ok((DiffSide, DirEntryType))` - The file content and its kind.
@@ -729,7 +736,7 @@ fn inventory_content(path: &str, shards: &HashMap<String, Arc<Inventory>>) -> Re
 fn worktree_content(path: &str, entry_kind: DirEntryType) -> Result<(DiffSide, DirEntryType), String> {
     let fs_path = Path::new(path);
     let metadata = file_utils::get_symlink_metadata_for_path(fs_path)?;
-    let item_type = file_utils::tracked_kind(file_utils::get_type_of_dir_entry(&metadata), entry_kind);
+    let item_type = file_utils::effective_kind(file_utils::get_type_of_dir_entry(&metadata), entry_kind);
     let name = split_parent(path).1;
 
     // A worktree file at or above the chunk threshold would be tracked chunked (and is too big to

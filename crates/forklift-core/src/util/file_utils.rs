@@ -2386,7 +2386,8 @@ pub const EXECUTABLE_BIT_IS_OBSERVABLE: bool = cfg!(unix);
 /// The kind a tracked file has, given the kind a fresh `stat` reports and the kind its entry
 /// records. Where `stat` cannot see the executable bit, a plain file whose entry is a plain file
 /// keeps the entry's bit: what `stat` says about the bit there is the platform's blind spot, not
-/// a change (git's `core.fileMode=false`). Every other kind is the `stat`'s.
+/// a change (git's `core.fileMode=false`). Every other kind is the `stat`'s. An entry staged for
+/// removal records no bit to keep: see `inventory_utils::effective_kind`.
 ///
 /// # Arguments
 /// * `stat_kind`  - The kind [`get_type_of_dir_entry`] reports for the file.
@@ -2394,11 +2395,11 @@ pub const EXECUTABLE_BIT_IS_OBSERVABLE: bool = cfg!(unix);
 ///
 /// # Returns
 /// The file's kind as the working directory holds it (never chunked).
-pub fn tracked_kind(stat_kind: DirEntryType, entry_kind: DirEntryType) -> DirEntryType {
-    tracked_kind_when(stat_kind, entry_kind, EXECUTABLE_BIT_IS_OBSERVABLE)
+pub fn effective_kind(stat_kind: DirEntryType, entry_kind: DirEntryType) -> DirEntryType {
+    effective_kind_when(stat_kind, entry_kind, EXECUTABLE_BIT_IS_OBSERVABLE)
 }
 
-fn tracked_kind_when(stat_kind: DirEntryType,
+fn effective_kind_when(stat_kind: DirEntryType,
                      entry_kind: DirEntryType,
                      executable_bit_is_observable: bool) -> DirEntryType {
     let is_plain = |kind: DirEntryType| matches!(kind, DirEntryType::Normal | DirEntryType::Executable);
@@ -3110,22 +3111,22 @@ mod tests {
     /// Where the bit is observable the stat's kind stands; where it is not, a plain file takes
     /// its plain entry's kind, in both directions, and nothing else is projected.
     #[test]
-    fn tracked_kind_projects_only_the_bit_and_only_where_it_is_unobservable() {
+    fn effective_kind_projects_only_the_bit_and_only_where_it_is_unobservable() {
         use DirEntryType::*;
 
         for stat in [Normal, Executable, SymbolicLink] {
             for entry in [Normal, Executable, NormalChunked, ExecutableChunked, SymbolicLink] {
-                assert_eq!(tracked_kind_when(stat, entry, true), stat, "observable: {:?} over {:?}", stat, entry);
+                assert_eq!(effective_kind_when(stat, entry, true), stat, "observable: {:?} over {:?}", stat, entry);
             }
         }
 
-        assert_eq!(tracked_kind_when(Normal, Executable, false), Executable);
-        assert_eq!(tracked_kind_when(Normal, ExecutableChunked, false), Executable);
-        assert_eq!(tracked_kind_when(Executable, Normal, false), Normal);
-        assert_eq!(tracked_kind_when(Executable, NormalChunked, false), Normal);
-        assert_eq!(tracked_kind_when(Normal, Normal, false), Normal);
-        assert_eq!(tracked_kind_when(Normal, SymbolicLink, false), Normal, "a link replaced by a file is a change");
-        assert_eq!(tracked_kind_when(SymbolicLink, Executable, false), SymbolicLink, "a file replaced by a link is a change");
+        assert_eq!(effective_kind_when(Normal, Executable, false), Executable);
+        assert_eq!(effective_kind_when(Normal, ExecutableChunked, false), Executable);
+        assert_eq!(effective_kind_when(Executable, Normal, false), Normal);
+        assert_eq!(effective_kind_when(Executable, NormalChunked, false), Normal);
+        assert_eq!(effective_kind_when(Normal, Normal, false), Normal);
+        assert_eq!(effective_kind_when(Normal, SymbolicLink, false), Normal, "a link replaced by a file is a change");
+        assert_eq!(effective_kind_when(SymbolicLink, Executable, false), SymbolicLink, "a file replaced by a link is a change");
     }
     use crate::globals::StorageRootScope;
 

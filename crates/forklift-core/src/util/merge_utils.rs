@@ -721,6 +721,8 @@ struct MergeJob {
 
     /// The base blob hash, or `None` if the file was added on both sides.
     base_hash: Option<String>,
+    /// The base kind, or `None` if the file was added on both sides.
+    base_type: Option<crate::enums::dir_entry_type::DirEntryType>,
     our_hash: String,
     their_hash: String,
     our_type: crate::enums::dir_entry_type::DirEntryType,
@@ -836,14 +838,25 @@ fn resolve_merge_jobs_parallel(jobs: &[(usize, MergeJob)],
     })
 }
 
+/// The kind a three-way merge of two plain files records. The executable bit merges like
+/// content: a side that changed it from the base wins, so a `chmod -x` on one side survives an
+/// edit on the other. With no base kind to compare (an add/add, or a base that was no plain
+/// file), the bit wins from either side.
+fn merged_plain_kind(base: Option<DirEntryType>, ours: DirEntryType, theirs: DirEntryType) -> DirEntryType {
+    match base.map(|kind| kind.on_disk_kind()) {
+        Some(base) if ours == base => theirs,
+        Some(base) if theirs == base => ours,
+        _ if ours == DirEntryType::Executable || theirs == DirEntryType::Executable => DirEntryType::Executable,
+        _ => DirEntryType::Normal,
+    }
+}
+
 /// Load one deferred file's three sides and three-way merge them — the body of the parallel
 /// phase. It reads blobs through the shared, thread-safe object caches and the line merge is
 /// pure CPU, so it is safe to run on many threads at once.
 fn resolve_merge_job(job: &MergeJob,
                      ours_label: &str,
                      theirs_label: &str) -> Result<MergeAction, String> {
-    use crate::enums::dir_entry_type::DirEntryType;
-
     let base_content = match &job.base_hash {
         Some(hash) => object_utils::load_blob(hash)?.content,
         None => Vec::new(),
@@ -865,14 +878,7 @@ fn resolve_merge_job(job: &MergeJob,
         });
     }
 
-    // The executable bit wins from either side (a side that turned the file executable
-    // keeps it executable).
-    let merged_type = if job.our_type == DirEntryType::Executable
-        || job.their_type == DirEntryType::Executable {
-        DirEntryType::Executable
-    } else {
-        DirEntryType::Normal
-    };
+    let merged_type = merged_plain_kind(job.base_type, job.our_type, job.their_type);
 
     let result = merge_file_contents(
         &base_content,
@@ -1041,6 +1047,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
                 pending.push(PendingAction::Merge(MergeJob {
                     path,
                     base_hash: b.map(|(base_hash, _)| base_hash.clone()),
+                    base_type: b.map(|(_, base_type)| *base_type),
                     our_hash: our_hash.clone(),
                     their_hash: their_hash.clone(),
                     our_type: *our_type,
@@ -1176,6 +1183,21 @@ fn split_lines(content: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_executable_bit_merges_like_content() {
+        use DirEntryType::{Executable, Normal, NormalChunked, SymbolicLink};
+
+        assert!(merged_plain_kind(Some(Executable), Normal, Executable) == Normal, "our chmod -x survives");
+        assert!(merged_plain_kind(Some(Executable), Executable, Normal) == Normal, "their chmod -x survives");
+        assert!(merged_plain_kind(Some(Normal), Normal, Executable) == Executable, "their chmod +x survives");
+        assert!(merged_plain_kind(Some(Normal), Executable, Executable) == Executable);
+        assert!(merged_plain_kind(Some(Normal), Normal, Normal) == Normal);
+        assert!(merged_plain_kind(Some(NormalChunked), Normal, Executable) == Executable,
+                "a chunked base compares by its on-disk kind");
+        assert!(merged_plain_kind(None, Normal, Executable) == Executable, "an add/add keeps the bit");
+        assert!(merged_plain_kind(Some(SymbolicLink), Normal, Normal) == Normal);
+    }
 
     /// A micro-benchmark (not run by default) contrasting the generation-number fast path with
     /// the plain object walk on a deep shared history with a recent fork — the realistic shape
