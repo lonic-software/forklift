@@ -2074,6 +2074,15 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
     assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
     assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime("a.txt"),
         "a file whose content matches the head must record its stat data");
+    // Unstaging a file whose entry already matches the head changes no content, so it keeps
+    // the rollups a stack stamped.
+    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert_success(&warehouse.run(&["load", "dir/b.txt"]));
+    assert_success(&warehouse.run(&["stack", "second"]));
+    let rollup = shard_rollup(&warehouse, "");
+    assert!(rollup.is_some(), "the stack must stamp the root's rollup");
+    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_eq!(shard_rollup(&warehouse, ""), rollup, "unstaging an unchanged file must keep the rollups");
 }
 
 #[test]

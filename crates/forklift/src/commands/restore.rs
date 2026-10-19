@@ -475,10 +475,11 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
             let current = read_shard(parent.as_key())?;
             let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref());
 
-            inventory_utils::update_shard(parent.as_key(), |inventory| {
-                inventory.add_item(entry);
-                Ok(())
-            })?;
+            // Through a batch rather than `update_shard`: an entry that already matched the head
+            // changes only its stat data, which keeps the rollups.
+            let mut batch = inventory_utils::ShardMutationBatch::new();
+            batch.update(parent.as_key(), |inventory| inventory.add_item(entry))?;
+            batch.publish()?;
         }
         Some(HeadEntry::Tree { .. }) => unreachable!("directories are handled above"),
         None => {
