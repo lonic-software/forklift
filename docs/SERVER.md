@@ -237,6 +237,9 @@ revocation by more than about a day.
   `<root>/.forklift/serve.lock` and retry. It is also refused while a `forklift` command
   that writes objects runs against the root, which could reuse an unreachable object the
   sweep is about to delete; that lock is a kernel lock, so it never outlives its process.
+  It refuses, deleting nothing, when an object it must read to find what is still live is
+  held only by a damaged or orphaned pack: it names the object rather than treating it as
+  absent and sweeping what that object references.
   A server keeps that lock's file open for every live warehouse, so it raises its own soft
   limit on open files at startup, as far toward the hard limit as the kernel allows. In
   multi-warehouse mode that limit also sets how many warehouses stay live (half of it, at most
