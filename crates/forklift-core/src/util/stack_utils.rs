@@ -463,6 +463,7 @@ pub async fn stack_parcel(description: Option<String>,
 
             if landed {
                 if let Err(cleanup) = clean_up_after_stack(&prepared, &stamp_hashes)
+                    .map_err(|e| cleanup_failed(&pallet, &object.hash, &e))
                     .and_then(|()| pallet_utils::record_landed(&pallet, &object.hash)) {
                     return Err(StackError::Other(format!("{} {}", error, cleanup)));
                 }
@@ -476,14 +477,20 @@ pub async fn stack_parcel(description: Option<String>,
     // whose files already match the new parcel and nothing in progress, which catching up
     // (`shift <pallet>`) records without touching a file. The other order would leave the base at
     // the new parcel with a merge still recorded on the old one.
-    clean_up_after_stack(&prepared, &stamp_hashes).map_err(|e| format!(
-        "{} If a consolidation or cherry-pick is still recorded, this parcel completed it: abort it \
-        (\"forklift shift {}\" names how) before catching up.",
-        pallet_utils::landed_but(&pallet, &object.hash, &e), pallet
-    ))?;
+    clean_up_after_stack(&prepared, &stamp_hashes).map_err(|e| cleanup_failed(&pallet, &object.hash, &e))?;
     pallet_utils::record_landed(&pallet, &object.hash)?;
 
     Ok((object.hash, pallet))
+}
+
+/// The error for a cleanup that failed after `parcel` landed on `pallet`. The position is left at
+/// the old base, so a merge still recorded on it can be aborted and the bay then caught up.
+fn cleanup_failed(pallet: &str, parcel: &str, error: &str) -> String {
+    format!(
+        "{} If a consolidation or cherry-pick is still recorded, this parcel completed it: abort it \
+        (\"forklift shift {}\" names how) before catching up.",
+        pallet_utils::landed_but(pallet, parcel, error), pallet
+    )
 }
 
 /// Clean up what a stacked parcel consumed: see the call in [`stack_parcel`].
