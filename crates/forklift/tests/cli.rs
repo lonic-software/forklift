@@ -6061,6 +6061,123 @@ fn deliver_squashes_a_draft_trail_and_keeps_it_as_post_metadata() {
     assert!(stderr(&again).contains("already delivered"), "{}", stderr(&again));
 }
 
+// Revert: drop deliver's target-coverage check → the delivery lands and other.txt is back to v1.
+#[test]
+fn deliver_onto_a_target_that_moved_after_the_draft_forked_is_refused() {
+    let warehouse = TestWarehouse::new("deliver-moved-target");
+    warehouse.write_file("code.txt", "v1\n");
+    warehouse.write_file("other.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "draft"]));
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "draft work"]));
+
+    // main moves on after the draft forked from it.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("other.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "main work"]));
+    let main_head = stdout(&warehouse.run(&["history", "-n", "1"]));
+
+    // Delivering the draft would squash its tree, which still has other.txt at v1, over main.
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    let refused = warehouse.run(&["deliver", "main", "-m", "stale"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("forklift consolidate main"), "{}", stderr(&refused));
+    assert_eq!(stdout(&warehouse.run(&["history", "main", "-n", "1"])), main_head, "main must not move");
+
+    // Consolidating main into the draft first makes the delivery carry both changes.
+    assert_success(&warehouse.run(&["consolidate", "main"]));
+    assert_success(&warehouse.run(&["deliver", "main", "-m", "both"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "v2\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("other.txt")).unwrap(), "v2\n");
+}
+
+// Revert: accept only a target that is the draft's ancestor (drop the trail-tree arm) → the
+// second delivery is refused.
+#[test]
+fn a_draft_delivered_once_can_deliver_its_later_work() {
+    let warehouse = TestWarehouse::new("deliver-again");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "draft"]));
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "wip v2"]));
+    assert_success(&warehouse.run(&["deliver", "main", "-m", "first"]));
+
+    // The draft keeps going; main holds only the first delivery, whose tree the draft has seen.
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    warehouse.write_file("code.txt", "v3\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "wip v3"]));
+
+    let second = warehouse.run(&["deliver", "main", "-m", "second"]);
+    assert_success(&second);
+    let history = stdout(&warehouse.run(&["history"]));
+    assert!(history.contains("second") && history.contains("first"), "{}", history);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "v3\n");
+
+    // A pallet branched from the draft has been through the delivered state too, so it may
+    // deliver over it although a different pallet recorded the delivery.
+    // Revert: also require the record's source to be the delivering pallet → refused.
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    assert_success(&warehouse.run(&["palletize", "branch"]));
+    warehouse.write_file("code.txt", "v4\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "wip v4"]));
+    assert_success(&warehouse.run(&["deliver", "main", "-m", "third"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "v4\n");
+}
+
+// Revert: accept a target head whose tree equals any trail parcel's, without a delivery record →
+// the rollback is undone.
+#[test]
+fn deliver_over_a_target_rolled_back_to_a_checkpoints_content_is_refused() {
+    let warehouse = TestWarehouse::new("deliver-again-moved");
+    warehouse.write_file("code.txt", "v1\n");
+    warehouse.write_file("other.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "draft"]));
+    for v in ["v2", "v3"] {
+        warehouse.write_file("code.txt", &format!("{}\n", v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("wip {}", v)]));
+    }
+    assert_success(&warehouse.run(&["deliver", "main", "-m", "first"]));
+
+    // main is rolled back to the first checkpoint's content: the same tree as a trail parcel,
+    // but not a delivery.
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "roll back"]));
+
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    warehouse.write_file("code.txt", "v4\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "wip v4"]));
+
+    let refused = warehouse.run(&["deliver", "main", "-m", "over the rollback"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("forklift consolidate main"), "{}", stderr(&refused));
+}
+
 #[test]
 fn regenesis_resets_trust_and_pins_prior_history_as_attested() {
     let warehouse = TestWarehouse::new("regenesis");

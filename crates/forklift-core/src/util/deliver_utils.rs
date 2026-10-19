@@ -53,8 +53,9 @@ pub struct DeliverOutcome {
 ///
 /// # Returns
 /// * `Ok(DeliverOutcome)` - The delivered parcel and trail details.
-/// * `Err(String)`        - If there is nothing to deliver, trust is not established, or
-///                          an object could not be built, stored or signed.
+/// * `Err(String)`        - If there is nothing to deliver, the target holds changes the
+///                          draft has not seen, trust is not established, or an object could
+///                          not be built, stored or signed.
 pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutcome, String> {
     pallet_utils::validate_pallet_name(target)?;
 
@@ -118,9 +119,15 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         }
     }
 
+    let draft_reachable = audit_utils::collect_reachable(&[draft_head.clone()])?;
+
+    // The squash replaces the target's tree, so the target must hold nothing the draft has not seen.
+    if let Some(head) = &target_head {
+        ensure_target_covered(target, &source, head, &draft_reachable)?;
+    }
+
     // The trail: everything reachable from the draft head but not from the target head —
     // the checkpoints since the two diverged.
-    let draft_reachable = audit_utils::collect_reachable(&[draft_head.clone()])?;
     let target_reachable = match &target_head {
         Some(head) => audit_utils::collect_reachable(&[head.clone()])?,
         None => HashSet::new(),
@@ -204,6 +211,56 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         checkpoints,
         manifest_head,
     })
+}
+
+/// Refuse unless the target holds nothing the draft has not seen. The delivered parcel replaces
+/// the target's tree with the draft's, so anything else on the target would be silently reverted.
+///
+/// The target head passes when the draft has reached it, or when it is a delivery of a state the
+/// draft has reached. A delivery is a squash no draft descends from, so ancestry alone cannot see
+/// it. It counts only when a delivery record names it with a trail head the draft has reached, and
+/// its tree is that trail head's: the target then holds exactly a state the draft has already
+/// been through, whichever pallet delivered it. Tree equality alone is not enough: a target rolled
+/// back to an earlier checkpoint's content carries that tree too, and delivering over it would
+/// undo the rollback.
+///
+/// # Arguments
+/// * `target`          - The target pallet's name, for the refusal.
+/// * `source`          - The draft pallet's name, for the refusal.
+/// * `target_head`     - The target's head.
+/// * `draft_reachable` - Every parcel reachable from the draft head.
+///
+/// # Returns
+/// * `Ok(())`      - If the target holds nothing the draft has not seen.
+/// * `Err(String)` - If it does, or a parcel or the manifest could not be read.
+fn ensure_target_covered(target: &str,
+                         source: &str,
+                         target_head: &str,
+                         draft_reachable: &HashSet<String>) -> Result<(), String> {
+    if draft_reachable.contains(target_head) {
+        return Ok(());
+    }
+
+    let target_tree = object_utils::load_parcel(target_head)?.tree_hash;
+
+    for attributed in manifest_utils::read_manifest()?.entries {
+        if attributed.entry.subject != target_head {
+            continue;
+        }
+
+        if let Some(delivery) = attributed.entry.delivery {
+            if draft_reachable.contains(&delivery.trail_head)
+                && object_utils::load_parcel(&delivery.trail_head)?.tree_hash == target_tree {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(format!(
+        "\"{target}\" holds changes \"{source}\" has not seen, and delivering would undo them. \
+        Consolidate \"{target}\" into \"{source}\" first (\"forklift consolidate {target}\"), \
+        then deliver."
+    ))
 }
 
 /// The distinct authors of the trail parcels, in first-seen order (by identifier). Falls

@@ -520,6 +520,7 @@
 <div class="fb">
   <h4><span class="chip done">deliver shipped 2026-07-05</span> 7.3 Draft pallets &amp; <code>deliver</code> — squash with evidence</h4>
   <p>Agents checkpoint constantly (content-addressed dedup + parallel Blake3 make that nearly free); humans want one clean reviewed parcel. <code>deliver</code> consolidates a draft pallet's checkpoint chain into a single signed parcel on the target pallet <em>and retains the full trail</em> as post-metadata referencing the (kept) checkpoint parcels — excluded from normal history views. The human story stays clean; the audit/debugging trail ("what did the agent try, in what order") stays complete. Git forces the choice: squash destroys the trail, keeping it means branch archaeology. Pairs with an auto-checkpoint mode (every load/stack cycle on the draft pallet) so rollback for the agent is one command.</p>
+  <p><b>The target must hold nothing the draft has not seen</b> (FORK-215). The squash replaces the target's tree, so a target that moved after the draft forked would be silently reverted. Delivery therefore requires the target head to be an ancestor of the draft, or a delivery of a state the draft has reached: a parcel a delivery record names, whose trail head the draft has reached and whose tree is that trail head's. Tree equality alone is not enough, because a target rolled back to an earlier checkpoint's content carries that tree too. Anything else is refused with the remedy: consolidate the target into the draft first.</p>
 </div>
 
 <div class="fb">
