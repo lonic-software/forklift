@@ -721,6 +721,8 @@ struct MergeJob {
 
     /// The base blob hash, or `None` if the file was added on both sides.
     base_hash: Option<String>,
+    /// The base kind, or `None` if the file was added on both sides.
+    base_type: Option<crate::enums::dir_entry_type::DirEntryType>,
     our_hash: String,
     their_hash: String,
     our_type: crate::enums::dir_entry_type::DirEntryType,
@@ -836,14 +838,25 @@ fn resolve_merge_jobs_parallel(jobs: &[(usize, MergeJob)],
     })
 }
 
+/// The kind a three-way merge of two plain files records. The executable bit merges like
+/// content: a side that changed it from the base wins, so a `chmod -x` on one side survives an
+/// edit on the other. With no base kind to compare (an add/add, or a base that was no plain
+/// file), the bit wins from either side.
+fn merged_plain_kind(base: Option<DirEntryType>, ours: DirEntryType, theirs: DirEntryType) -> DirEntryType {
+    match base.map(|kind| kind.on_disk_kind()) {
+        Some(base) if ours == base => theirs,
+        Some(base) if theirs == base => ours,
+        _ if ours == DirEntryType::Executable || theirs == DirEntryType::Executable => DirEntryType::Executable,
+        _ => DirEntryType::Normal,
+    }
+}
+
 /// Load one deferred file's three sides and three-way merge them — the body of the parallel
 /// phase. It reads blobs through the shared, thread-safe object caches and the line merge is
 /// pure CPU, so it is safe to run on many threads at once.
 fn resolve_merge_job(job: &MergeJob,
                      ours_label: &str,
                      theirs_label: &str) -> Result<MergeAction, String> {
-    use crate::enums::dir_entry_type::DirEntryType;
-
     let base_content = match &job.base_hash {
         Some(hash) => object_utils::load_blob(hash)?.content,
         None => Vec::new(),
@@ -856,7 +869,8 @@ fn resolve_merge_job(job: &MergeJob,
         && is_mergeable_text(&their_content);
 
     if !all_text {
-        // Binary contents are not line-mergeable; keep ours, in conflict.
+        // Binary contents are not line-mergeable; keep ours, in conflict. Its kind too: nothing
+        // is written, so the entry must record the file as it stands, bit included.
         return Ok(MergeAction::Conflict {
             path: job.path.clone(),
             content: None,
@@ -865,14 +879,7 @@ fn resolve_merge_job(job: &MergeJob,
         });
     }
 
-    // The executable bit wins from either side (a side that turned the file executable
-    // keeps it executable).
-    let merged_type = if job.our_type == DirEntryType::Executable
-        || job.their_type == DirEntryType::Executable {
-        DirEntryType::Executable
-    } else {
-        DirEntryType::Normal
-    };
+    let merged_type = merged_plain_kind(job.base_type, job.our_type, job.their_type);
 
     let result = merge_file_contents(
         &base_content,
@@ -983,6 +990,28 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
             continue;
         }
 
+        // One side changed only the kind (a chmod: the base's content), the other the content:
+        // the content is the other side's, and the bit merges like content. Resolved by hash,
+        // so a chunked, binary or out-of-scope file merges as cleanly as a text one.
+        if let (Some((base_hash, base_type)), Some((our_hash, our_type)), Some((their_hash, their_type))) = (b, o, t) {
+            let plain = |kind: &DirEntryType| matches!(kind.on_disk_kind(), DirEntryType::Normal | DirEntryType::Executable);
+
+            if plain(base_type) && plain(our_type) && plain(their_type) && (our_hash == base_hash || their_hash == base_hash) {
+                let (hash, storage) = if our_hash == base_hash { (their_hash, their_type) } else { (our_hash, our_type) };
+                let kind = merged_plain_kind(Some(*base_type), our_type.on_disk_kind(), their_type.on_disk_kind());
+                let item_type = if storage.is_chunked() { kind.to_chunked() } else { kind };
+
+                if (hash, item_type) != (our_hash, *our_type) {
+                    pending.push(PendingAction::Ready(if out_of_scope {
+                        MergeAction::ResolveOutOfScope { path, resolution: Some((hash.clone(), item_type)) }
+                    } else {
+                        MergeAction::TakeTheirs { path, hash: hash.clone(), item_type, is_new: false }
+                    }));
+                }
+                continue;
+            }
+        }
+
         // Both sides changed the file (relative to the base) in different ways. Out of scope,
         // that is a genuine conflict the bay has no content to reconcile — refuse before any
         // blob load, so no absent out-of-scope object is ever dereferenced.
@@ -1041,6 +1070,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
                 pending.push(PendingAction::Merge(MergeJob {
                     path,
                     base_hash: b.map(|(base_hash, _)| base_hash.clone()),
+                    base_type: b.map(|(_, base_type)| *base_type),
                     our_hash: our_hash.clone(),
                     their_hash: their_hash.clone(),
                     our_type: *our_type,
@@ -1176,6 +1206,21 @@ fn split_lines(content: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_executable_bit_merges_like_content() {
+        use DirEntryType::{Executable, Normal, NormalChunked, SymbolicLink};
+
+        assert!(merged_plain_kind(Some(Executable), Normal, Executable) == Normal, "our chmod -x survives");
+        assert!(merged_plain_kind(Some(Executable), Executable, Normal) == Normal, "their chmod -x survives");
+        assert!(merged_plain_kind(Some(Normal), Normal, Executable) == Executable, "their chmod +x survives");
+        assert!(merged_plain_kind(Some(Normal), Executable, Executable) == Executable);
+        assert!(merged_plain_kind(Some(Normal), Normal, Normal) == Normal);
+        assert!(merged_plain_kind(Some(NormalChunked), Normal, Executable) == Executable,
+                "a chunked base compares by its on-disk kind");
+        assert!(merged_plain_kind(None, Normal, Executable) == Executable, "an add/add keeps the bit");
+        assert!(merged_plain_kind(Some(SymbolicLink), Normal, Normal) == Normal);
+    }
 
     /// A micro-benchmark (not run by default) contrasting the generation-number fast path with
     /// the plain object walk on a deep shared history with a recent fork — the realistic shape

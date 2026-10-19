@@ -249,7 +249,9 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
 
             let change = match (head_entry, is_staged_removal) {
                 (Some(_), true)  => Some(ChangeKind::Removed),
-                (Some(head), false) if head.hash != item.hash => Some(ChangeKind::Modified),
+                // A chmod alone keeps the hash, and the next stack still records it.
+                (Some(head), false) if head.hash != item.hash
+                    || head.item_type.on_disk_kind() != item.item_type.on_disk_kind() => Some(ChangeKind::Modified),
                 (Some(_), false) => None,
                 (None, true)  => None,
                 (None, false) => Some(ChangeKind::Added),

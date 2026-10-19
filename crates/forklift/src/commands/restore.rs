@@ -320,7 +320,7 @@ fn matching_content(file_path: &str, item: &InventoryItem, anchor: file_utils::S
         return None;
     }
 
-    let item_type = file_utils::get_type_of_dir_entry(&metadata);
+    let item_type = inventory_utils::effective_kind(item, file_utils::get_type_of_dir_entry(&metadata));
 
     if item_type.on_disk_kind() != item.item_type.on_disk_kind() {
         return None;

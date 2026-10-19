@@ -1031,6 +1031,117 @@ fn an_edit_to_a_tracked_file_a_rule_covers_stays_visible_and_blocks_shift() {
     assert_eq!(read(&warehouse, "notes.txt"), "local edit\n", "the edit must survive");
 }
 
+/// A chmod alone is a change on every side: stocktake reports it unstaged, then staged once
+/// loaded, diff names the mode on both, the parcel records it, and shift refuses to reset it.
+#[cfg(unix)]
+#[test]
+fn a_mode_only_change_is_reported_staged_and_unstaged_and_blocks_shift() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = warehouse_with_a_diverged_pallet("mode-only-change");
+    let path = warehouse.root.join("notes.txt");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let modified = ("modified".to_string(), "notes.txt".to_string());
+    assert!(changes(&warehouse, "unstaged").contains(&modified), "a chmod must be an unstaged change");
+    let diff = stdout(&warehouse.run(&["diff"]));
+    assert!(diff.contains("modified: notes.txt") && diff.contains("(mode: normal -> executable)"), "{}", diff);
+
+    let shift = warehouse.run(&["shift", "feature"]);
+    assert!(!shift.status.success(), "shift must refuse over the chmod: {}", stdout(&shift));
+    assert_ne!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "the chmod must survive");
+
+    assert_success(&warehouse.run(&["load", "notes.txt"]));
+    assert!(changes(&warehouse, "unstaged").is_empty(), "the loaded chmod must leave nothing unstaged");
+    assert!(changes(&warehouse, "staged").contains(&modified), "a loaded chmod must be a staged change");
+    let staged = stdout(&warehouse.run(&["diff", "--staged"]));
+    assert!(staged.contains("(mode: normal -> executable)"), "{}", staged);
+
+    assert_success(&warehouse.run(&["stack", "chmod"]));
+    assert!(changes(&warehouse, "staged").is_empty());
+    let pallets = stdout(&warehouse.run(&["diff", "feature", "main"]));
+    assert!(pallets.contains("modified: notes.txt") && pallets.contains("(mode: normal -> executable)"), "{}", pallets);
+
+    // Back the other way, folded into a move: the pallet diff keeps the mode of the moved file.
+    assert_success(&warehouse.run(&["palletize", "executable"]));
+    std::fs::rename(&path, warehouse.root.join("moved.txt")).unwrap();
+    std::fs::set_permissions(warehouse.root.join("moved.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged = stdout(&warehouse.run(&["diff", "--staged"]));
+    assert!(staged.contains("notes.txt -> moved.txt") && staged.contains("(mode: executable -> normal)"), "{}", staged);
+    assert_success(&warehouse.run(&["stack", "move and chmod -x"]));
+    let pallets = stdout(&warehouse.run(&["diff", "main", "executable"]));
+    assert!(pallets.contains("notes.txt -> moved.txt") && pallets.contains("(mode: executable -> normal)"), "{}", pallets);
+}
+
+/// The executable bit merges like content: a side that dropped it keeps it dropped over an edit
+/// on the other side.
+#[cfg(unix)]
+#[test]
+fn a_consolidate_keeps_the_side_that_changed_the_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("merge-chmod");
+    let path = warehouse.root.join("run.sh");
+    warehouse.write_file("run.sh", "a\nb\nc\nd\ne\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("run.sh", "a\nb\nc\nd\nE\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs edits"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    warehouse.write_file("run.sh", "A\nb\nc\nd\ne\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "ours edits and drops the bit"]));
+
+    assert_success(&warehouse.run(&["consolidate", "feature"]));
+    assert_eq!(read(&warehouse, "run.sh"), "A\nb\nc\nd\nE\n");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "our chmod -x must survive");
+    assert!(changes(&warehouse, "unstaged").is_empty() && changes(&warehouse, "staged").is_empty(),
+        "the merge must record the file as it left it");
+}
+
+/// A chmod alone on their side merges cleanly with our edit of a binary file, which no line
+/// merge can reconcile: the content is ours, the bit theirs.
+#[cfg(unix)]
+#[test]
+fn a_consolidate_takes_their_chmod_over_our_binary_edit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("merge-chmod-binary");
+    let path = warehouse.root.join("tool.bin");
+    std::fs::write(&path, b"\0base\0").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs drops the bit"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    std::fs::write(&path, b"\0ours\0").unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "ours edits"]));
+
+    let consolidate = warehouse.run(&["consolidate", "feature"]);
+    assert_success(&consolidate);
+    assert_eq!(std::fs::read(&path).unwrap(), b"\0ours\0");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "their chmod -x must survive");
+    assert!(changes(&warehouse, "unstaged").is_empty() && changes(&warehouse, "staged").is_empty(),
+        "the merge must record the file as it left it");
+}
+
 #[test]
 fn loading_the_root_or_a_tracked_folder_a_rule_covers_stages_no_removal() {
     let warehouse = warehouse_with_a_diverged_pallet("ignore-tracked-load");
@@ -2199,7 +2310,7 @@ fn assert_only_the_ignore_file_is_untracked_or_clean(warehouse: &TestWarehouse) 
 }
 
 /// A kind change is never hidden by re-proving an unproven entry: a chmod +x on a large plain
-/// file is recorded by load as a type change, a file replaced by a link to a copy of itself is
+/// file is reported and recorded by load as a type change, a file replaced by a link to a copy of itself is
 /// modified, and a link replaced by a regular file is modified, not an error.
 #[cfg(unix)]
 #[test]
@@ -2225,7 +2336,7 @@ fn re_proving_an_unproven_entry_never_hides_a_kind_change() {
     warehouse.write_file("link", "file.txt");
 
     let changes = unstaged_changes(&warehouse);
-    for path in ["file.txt", "link"] {
+    for path in ["big.bin", "file.txt", "link"] {
         assert!(changes.contains(&("modified".to_string(), path.to_string())), "{} must be modified: {:?}", path, changes);
     }
 
