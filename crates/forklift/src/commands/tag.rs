@@ -45,7 +45,7 @@ fn create(name: &str, revision: Option<String>, message: Option<String>) -> Resu
     let subject = match revision {
         Some(revision) => pallet_utils::resolve_revision(&revision)?,
         None => {
-            let pallet = pallet_utils::get_current_pallet_name()?;
+            let pallet = pallet_utils::read_position()?.pallet;
 
             pallet_utils::get_pallet_head(&pallet)?
                 .ok_or(format!("Pallet \"{}\" has nothing stacked yet; there is nothing to tag.", pallet))?

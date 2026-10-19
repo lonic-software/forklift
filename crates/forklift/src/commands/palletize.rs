@@ -40,7 +40,8 @@ pub async fn handle_command(name: Option<String>, revision: Option<String>, all:
 async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String> {
     pallet_utils::validate_pallet_name(name)?;
 
-    let current = pallet_utils::get_current_pallet_name()?;
+    let position = pallet_utils::read_position()?;
+    let current = position.pallet.clone();
 
     if name == current {
         return Err(format!("\"{}\" is already the current pallet.", name));
@@ -75,17 +76,18 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
             Ok(())
         }
 
-        // The new pallet starts at the same head as the current one — same tree, so only
-        // the refs move. If the current pallet is unborn (nothing stacked yet), the new
-        // pallet is unborn as well: it will be born by the first parcel stacked on it.
+        // The new pallet starts at the parcel this bay's files stand on (the current pallet's
+        // head, unless another bay moved it since) — same tree, so only the refs move. If the
+        // bay stands on nothing (an unborn pallet), the new pallet is unborn as well: it will be
+        // born by the first parcel stacked on it.
         None => {
-            let head = pallet_utils::get_pallet_head(&current)?;
+            let head = position.base.clone();
 
             if let Some(head) = &head {
                 pallet_utils::update_pallet_head(name, None, head)?;
             }
 
-            pallet_utils::set_current_pallet_name(name)?;
+            pallet_utils::write_position(&pallet_utils::BayPosition::new(name, head.clone()))?;
 
             output::emit(&Palletized {
                 pallet: name.to_string(),
@@ -142,7 +144,7 @@ impl CommandOutput for Palletized {
 /// * `Ok(())`      - If the pallets were listed.
 /// * `Err(String)` - If a pallets folder could not be read, or a pallet's ref could not be read.
 fn list_pallets(all: bool) -> Result<(), String> {
-    let current = pallet_utils::get_current_pallet_name()?;
+    let current = pallet_utils::read_position()?.pallet;
     let mut names = pallet_utils::list_pallets()?;
 
     // The current pallet is listed even when unborn (it has no ref file yet) — folded

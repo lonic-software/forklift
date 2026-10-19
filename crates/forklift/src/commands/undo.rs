@@ -76,7 +76,7 @@ pub async fn handle_command() -> Result<(), String> {
     journal_utils::restore_refs(&entry)?;
     journal_utils::pop()?;
 
-    let head = pallet_utils::get_pallet_head(&entry.before.current_pallet)?.unwrap_or_default();
+    let head = pallet_utils::read_position()?.base.unwrap_or_default();
     let description = object_utils::load_parcel(&undone).ok()
         .and_then(|parcel| parcel.description)
         .unwrap_or_default();
@@ -173,27 +173,35 @@ mod tests {
         let _warehouse = Warehouse::storage_only("undo-moved-after-gate");
 
         // "zeta" is current and sorts after "alpha", so a restore that did not take the current
-        // pallet first would reach "alpha" before finding "zeta" moved.
-        pallet_utils::set_current_pallet_name("zeta").unwrap();
-        pallet_utils::update_pallet_head("zeta", None, &hash('1')).unwrap();
+        // pallet first would reach "alpha" before finding "zeta" moved. Zeta's parcels are real,
+        // one on the next, because the undo reads their ancestry when it stops.
+        let tree = test_support::store_tree("a.txt", b"a\n");
+        let one = test_support::store_parcel(&tree, &[]);
+        let two = test_support::store_parcel(&tree, &[&one]);
+        let three = test_support::store_parcel(&tree, &[&two]);
+        pallet_utils::update_pallet_head("zeta", None, &one).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(one.clone()))).unwrap();
         pallet_utils::update_pallet_head("alpha", None, &hash('a')).unwrap();
 
         let before = journal_utils::capture().unwrap();
-        pallet_utils::update_pallet_head("zeta", Some(&hash('1')), &hash('2')).unwrap();
+        pallet_utils::update_pallet_head("zeta", Some(&one), &two).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(two.clone()))).unwrap();
         pallet_utils::update_pallet_head("alpha", Some(&hash('a')), &hash('b')).unwrap();
         journal_utils::push_if_changed("stack", before).unwrap();
 
         // Another bay stacks on "zeta" between the gate and the restore.
-        AFTER_GATE.with(|seam| seam.set(Some(Box::new(|| {
-            pallet_utils::update_pallet_head("zeta", Some(&hash('2')), &hash('3')).unwrap();
+        let (on, moved_to) = (two.clone(), three.clone());
+        AFTER_GATE.with(|seam| seam.set(Some(Box::new(move || {
+            pallet_utils::update_pallet_head("zeta", Some(&on), &moved_to).unwrap();
         }))));
 
         let error = test_support::block_on(handle_command()).expect_err("the undo must be refused");
         assert!(error.contains("has moved since"), "{}", error);
 
-        assert_eq!(pallet_utils::get_pallet_head("zeta").unwrap(), Some(hash('3')), "the other bay's head must stand");
+        assert_eq!(pallet_utils::get_pallet_head("zeta").unwrap(), Some(three), "the other bay's head must stand");
         assert_eq!(pallet_utils::get_pallet_head("alpha").unwrap(), Some(hash('b')), "no other ref may be restored");
-        assert_eq!(pallet_utils::get_current_pallet_name().unwrap(), "zeta");
+        assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("zeta", Some(two)),
+            "the bay still stands where the operation left it");
         assert!(journal_utils::peek().unwrap().is_some(), "a refused undo must keep its entry");
     }
 }

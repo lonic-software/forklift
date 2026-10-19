@@ -582,6 +582,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
+            crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
             Scratch { _scope: scope, root }
         }
@@ -779,6 +780,7 @@ mod tests {
         let parcel = store_parcel(tree_hash, Vec::new());
         let dir = crate::util::bay_utils::bay_state_dir(bay);
         std::fs::create_dir_all(&dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(dir.join("parked"), format!("{}\n", parcel)).unwrap();
     }
 
@@ -860,6 +862,7 @@ mod tests {
 
         let dir = crate::util::bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: theirs.clone(), their_pallet: "feature".to_string(), our_head: "e".repeat(64), our_pallet: "main".to_string(),
         };

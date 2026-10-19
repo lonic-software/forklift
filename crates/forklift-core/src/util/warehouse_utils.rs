@@ -111,9 +111,9 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
         ));
     }
 
-    if pallet_utils::create_current_pallet_file_if_not_exists()? {
+    if pallet_utils::create_position_if_not_exists()? {
         created.push(format!(
-            "Created the pallets folder and the current pallet file (\"{}\").",
+            "Created the pallets folder and the bay position (on pallet \"{}\").",
             pallet_utils::DEFAULT_PALLET_NAME
         ));
     }

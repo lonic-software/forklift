@@ -42,9 +42,11 @@ pub async fn park_changes() -> Result<(), String> {
         return Err("There are unresolved conflicts in the inventory; parking is not possible.".to_string());
     }
 
-    let pallet = pallet_utils::get_current_pallet_name()?;
+    // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
+    let position = pallet_utils::read_position()?;
+    let pallet = position.pallet.clone();
 
-    let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
+    let Some(head) = position.base.clone() else {
         return Err(format!(
             "Pallet \"{}\" has nothing stacked yet; there is no state to park onto.",
             pallet
@@ -210,9 +212,11 @@ pub fn pop_parked() -> Result<(), String> {
 
     let parked_base_tree = object_utils::load_parcel(&parked_base)?.tree_hash;
 
-    let pallet = pallet_utils::get_current_pallet_name()?;
+    // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
+    let position = pallet_utils::read_position()?;
+    let pallet = position.pallet.clone();
 
-    let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
+    let Some(head) = position.base.clone() else {
         return Err(format!(
             "Pallet \"{}\" has nothing stacked yet; there is nothing to un-park onto.",
             pallet

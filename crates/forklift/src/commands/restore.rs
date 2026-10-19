@@ -412,8 +412,9 @@ fn ensure_restorable(file_path: &str) -> Result<(), String> {
 /// * `Err(String)` - If the path exists neither in the inventory nor in the head, and is not a
 ///                   vacuous-heal case.
 fn restore_staged(path: &WarehousePath) -> Result<(), String> {
-    let pallet = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&pallet)?;
+    // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
+    let position = pallet_utils::read_position()?;
+    let head = position.base.clone();
 
     let head_tree_hash = match &head {
         Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),

@@ -52,7 +52,7 @@ fn signing() -> Result<(OfficeState, forklift_core::model::operator::Operator, M
 fn open(target: &str, source: Option<String>, title: &str, description: String) -> Result<(), String> {
     let source = match source {
         Some(name) => name,
-        None => pallet_utils::get_current_pallet_name()?,
+        None => pallet_utils::read_position()?.pallet,
     };
 
     if source == target {
@@ -210,7 +210,8 @@ async fn merge(id: &str) -> Result<(), String> {
     );
 
     // The merge lands on the target pallet, so it must be the current one.
-    let current = pallet_utils::get_current_pallet_name()?;
+    let position = pallet_utils::read_position()?;
+    let current = position.pallet.clone();
     if current != haul.opened.target {
         return Err(format!(
             "Merging lands on the target pallet — shift to \"{}\" first, then \"haul merge\".",
@@ -228,6 +229,10 @@ async fn merge(id: &str) -> Result<(), String> {
         output::emit(&Merged { id: haul.id.clone(), merge_parcel: target_head, already: true });
         return Ok(());
     }
+
+    // The merge is built on the tree this bay holds, and moves the pallet from there; the check
+    // above only read the pallet's history.
+    position.require_current("merged")?;
 
     let target_tree = object_utils::load_parcel(&target_head)?.tree_hash;
 

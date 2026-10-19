@@ -106,8 +106,9 @@ async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
     // narrowed. An ancestor of `prefix` is excluded for the same reason.
     let under = |path: &str| scope_utils::is_at_or_under(path, prefix);
 
-    let pallet = pallet_utils::get_current_pallet_name()?;
-    let head_tree = match pallet_utils::get_pallet_head(&pallet)? {
+    // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
+    let position = pallet_utils::read_position()?;
+    let head_tree = match position.base.clone() {
         Some(head) => Some(object_utils::load_parcel(&head)?.tree_hash),
         None => None,
     };

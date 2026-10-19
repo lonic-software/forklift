@@ -68,8 +68,10 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     let widened = MaterializationScope::from_prefixes(prefixes);
 
     let client = RemoteClient::from_config()?;
-    let pallet = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&pallet)?.ok_or_else(|| format!(
+    // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
+    let position = pallet_utils::read_position()?;
+    let pallet = position.pallet.clone();
+    let head = position.base.clone().ok_or_else(|| format!(
         "Pallet \"{}\" has nothing stacked yet; there is nothing to expand.", pallet
     ))?;
 

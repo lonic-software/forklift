@@ -197,8 +197,9 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
 /// * `Ok(())`      - If the diff completed.
 /// * `Err(String)` - If a shard, blob or tree object could not be read.
 async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<(), String> {
-    let pallet = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&pallet)?;
+    // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
+    let position = pallet_utils::read_position()?;
+    let head = position.base.clone();
 
     let head_tree_hash = match &head {
         Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),

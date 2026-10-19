@@ -332,6 +332,7 @@ pub(crate) mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
+            crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
             Scratch { _scope: scope, root }
         }
@@ -646,6 +647,7 @@ pub(crate) mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parcel)).unwrap();
 
         // Run from the MAIN scope (no active bay) — gc must still see bay "b"'s parked parcel.
@@ -676,6 +678,7 @@ pub(crate) mod tests {
         // Bay "b"'s `parked` file is malformed (not 64 hex chars) — `read_parked_in` errors on it.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
 
         let live_set_result = collect_live_set();
@@ -718,6 +721,7 @@ pub(crate) mod tests {
             .join(file_utils::PREFIX_INVENTORY_FOLDER)
             .join(file_utils::FILE_NAME_INVENTORY_DATA);
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_utils::bay_state_dir(bay), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(&shard_path, InventoryBuilder::build(&inventory)).unwrap();
 
         shard_path

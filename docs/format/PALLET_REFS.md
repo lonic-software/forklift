@@ -38,12 +38,23 @@ Ref files are updated atomically (temp file + rename).
 
 ## The current pallet
 
-The file `.forklift/pallet` holds the name of the current pallet (git counterpart: HEAD)
-— the pallet that `stack` advances — terminated by a single new line byte:
+The file `position` in a bay's state folder (`.forklift/position` for the main tree,
+`.forklift/bays/<name>/position` for a bay) records where that bay stands, as a
+[state record](STATE_RECORD_FORMAT.md) of kind `position`, version 1, with two entries:
 
 ```
+/forklift-position 1\n
 main\n
+9028a15ad613bcd9853a3e780cfe3c78361b56ce95a2430484ba75ade5198cdc\n
 ```
+
+The first entry is the name of the current pallet (git counterpart: HEAD), the pallet that
+`stack` advances. The second is the bay's **base**: the parcel its files and inventory stand
+on, or an empty entry while the pallet is unborn. Refs are shared by every bay, so another bay
+can move the current pallet past the base. Whatever reads the tree this bay holds reads the
+base; whatever reads the pallet's history reads the ref. A bay whose base is not its pallet's
+head is behind: commands that move the pallet refuse there, and `shift <current pallet>`
+catches it up. A missing or header-less file is refused, naming the file.
 
 A current pallet whose ref file does not exist yet is **unborn**: nothing has been
 stacked on it. It is born when the first parcel is stacked. `prepare` sets the current

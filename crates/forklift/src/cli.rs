@@ -791,7 +791,9 @@ pub enum Command {
         aliases = ["checkout", "switch"],
         long_about = "Shift to another pallet: materialize its head parcel in the working \
                       directory and repopulate the inventory from it. Refuses to run while there \
-                      are staged or unstaged changes (untracked files are tolerated)."
+                      are staged or unstaged changes (untracked files are tolerated). Shifting to \
+                      the current pallet catches up with it when another bay or process moved it: \
+                      a clean bay's files move to its head."
     )]
     Shift {
         /// The pallet to shift to

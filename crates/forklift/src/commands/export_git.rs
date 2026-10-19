@@ -79,7 +79,7 @@ pub fn handle_command(path: &str) -> Result<(), String> {
     }
 
     // Check out the current pallet's branch (or the first), materializing a working tree.
-    let current = pallet_utils::get_current_pallet_name().ok()
+    let current = pallet_utils::read_position().ok().map(|position| position.pallet)
         .filter(|name| branches.iter().any(|branch| branch == name))
         .or_else(|| branches.first().cloned());
 

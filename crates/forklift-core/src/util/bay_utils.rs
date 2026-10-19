@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{cherry_pick_utils, file_utils, merge_utils, park_utils, record_utils};
+use crate::util::{cherry_pick_utils, file_utils, merge_utils, pallet_utils, park_utils, record_utils};
 use crate::util::record_utils::RecordError;
 
 /// The [`record_utils`] kind and version of a bay's `.forklift` redirect file: the warehouse root,
@@ -245,7 +245,7 @@ pub enum BayReadPolicy {
 
 /// [`collect_bay_scoped_parcel_roots`]'s result.
 pub struct BayScopeOutcome {
-    /// Every listed dir's parked-parcel hashes plus in-progress-consolidation `their_head`, from
+    /// Every listed dir's base, parked-parcel hashes plus in-progress-consolidation `their_head`, from
     /// every bay this call could actually read.
     pub roots: Vec<String>,
     /// One plain-language note per bay skipped this call because its state could not be read —
@@ -298,10 +298,10 @@ pub struct BayScopeOutcome {
 /// * `policy` - What to do with a bay whose state cannot be read — see [`BayReadPolicy`].
 ///
 /// # Returns
-/// * `Ok(BayScopeOutcome)` - Every readable dir's parked-parcel hashes plus in-progress-
+/// * `Ok(BayScopeOutcome)` - Every readable dir's base, parked-parcel hashes plus in-progress-
 ///                           consolidation `their_head`, in `dirs` order, plus (under `Tolerate`)
 ///                           a note for every bay that had to be skipped.
-/// * `Err(String)`         - Under `FailClosed`, some bay's `parked` or `consolidation` file
+/// * `Err(String)`         - Under `FailClosed`, some bay's `position`, `parked` or `consolidation` file
 ///                           could not be read or was malformed — see above.
 pub fn collect_bay_scoped_parcel_roots(
     dirs: &[PathBuf],
@@ -323,13 +323,17 @@ pub fn collect_bay_scoped_parcel_roots(
     Ok(BayScopeOutcome { roots, degraded })
 }
 
-/// One bay's own contribution to [`collect_bay_scoped_parcel_roots`] — the single read (parked
-/// parcels, then an in-progress consolidation's `their_head` and `our_head`, then an in-progress
-/// cherry-pick's `our_head`) both [`BayReadPolicy`] variants perform identically; only what
-/// happens to its `Err` differs, in the caller above. A recorded `our_head` is the completing
-/// parcel's parent, and the pallet may have moved off it since, so it is rooted in its own right.
+/// One bay's own contribution to [`collect_bay_scoped_parcel_roots`] — the single read (the
+/// bay's base, parked parcels, then an in-progress consolidation's `their_head` and `our_head`,
+/// then an in-progress cherry-pick's `our_head`) both [`BayReadPolicy`] variants perform
+/// identically; only what happens to its `Err` differs, in the caller above. A recorded
+/// `our_head` is the completing parcel's parent, and the pallet may have moved off it since, so
+/// it is rooted in its own right. So is the base: an undo in another bay on the same pallet can
+/// put the ref back behind it, leaving the tree this bay holds reachable from no ref.
 fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
-    let mut roots = park_utils::read_parked_in(dir)?;
+    let mut roots: Vec<String> = pallet_utils::read_position_in(dir)?.base.into_iter().collect();
+
+    roots.append(&mut park_utils::read_parked_in(dir)?);
 
     if let Some(consolidation) = merge_utils::read_consolidation_state_in(dir)? {
         roots.push(consolidation.their_head);
@@ -374,13 +378,10 @@ pub fn remove_bay_state(name: &str) -> Result<(), String> {
         .map_err(|e| format!("Error while removing the bay state \"{}\": {}", state.to_string_lossy(), e))
 }
 
-/// Read a bay's current pallet (its bay-local `pallet` file), for listing from the main
-/// tree. `None` when the bay is unborn or unreadable.
+/// Read a bay's current pallet (from its bay-local position), for listing from the main tree.
+/// `None` when the bay has no position yet or it cannot be read.
 pub fn read_bay_current_pallet(name: &str) -> Option<String> {
-    std::fs::read_to_string(bay_state_dir(name).join("pallet"))
-        .ok()
-        .map(|content| content.trim_end_matches('\n').to_string())
-        .filter(|pallet| !pallet.is_empty())
+    pallet_utils::read_position_in(&bay_state_dir(name)).ok().map(|position| position.pallet)
 }
 
 /// The current bay's local-state folder — a convenience over [`bay_root`].
@@ -407,6 +408,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let parked_hash = "2".repeat(64);
         let consolidation_hash = "3".repeat(64);
@@ -414,6 +416,7 @@ mod tests {
 
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parked_hash)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: merge_base.clone(), our_pallet: "main".to_string(),
@@ -422,6 +425,7 @@ mod tests {
 
         let bay_c_dir = bay_state_dir("c");
         std::fs::create_dir_all(&bay_c_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_c_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let pick = cherry_pick_utils::CherryPickState {
             source: "6".repeat(64), description: None, our_head: pick_base.clone(), our_pallet: "main".to_string(),
         };
@@ -456,9 +460,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
 
         let dirs = all_bay_state_dirs().unwrap();

@@ -60,7 +60,9 @@ pub async fn handle_command() -> Result<(), String> {
             }
         }
 
-        let pallet = pallet_utils::get_current_pallet_name()?;
+        // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
+        let position = pallet_utils::read_position()?;
+        let pallet = position.pallet.clone();
 
         let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
             return Err(format!(
@@ -74,7 +76,7 @@ pub async fn handle_command() -> Result<(), String> {
         // If the remote diverged and the merge is clean, auto-merge and retry rather than
         // stopping. Overlapping changes fall through to the diverged error below.
         if let Some(remote) = &remote_head {
-            if remote != &head && auto_merged < MAX_AUTO_MERGES && try_auto_merge(&client, &pallet, &head, remote, &progress).await? {
+            if remote != &head && auto_merged < MAX_AUTO_MERGES && try_auto_merge(&client, &pallet, position.base.as_deref(), &head, remote, &progress).await? {
                 auto_merged += 1;
                 continue;
             }
@@ -165,6 +167,7 @@ fn ensure_origin_remote() -> Result<(), CoreError> {
 /// reports the diverged error for a true overlap.
 async fn try_auto_merge(client: &RemoteClient,
                         pallet: &str,
+                        base: Option<&str>,
                         head: &str,
                         remote_head: &str,
                         progress: &Progress) -> Result<bool, String> {
@@ -181,6 +184,14 @@ async fn try_auto_merge(client: &RemoteClient,
 
     if !diverged {
         return Ok(false);
+    }
+
+    // The merge materializes into this bay and moves the pallet from the tree it holds, so a bay
+    // another bay or process left behind its pallet is told so instead of attempting it.
+    if base != Some(head) {
+        return Err(pallet_utils::behind_message(
+            pallet, base, Some(head), "lifted: the remote diverged, and only a bay at its pallet's head can merge it in",
+        ));
     }
 
     // Merging materializes into the working directory, so only a clean warehouse qualifies.

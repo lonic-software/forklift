@@ -95,14 +95,14 @@ struct BayState {
 }
 
 impl BayState {
-    /// The bay as it is now.
+    /// The bay as it is now. Its head is the bay's base — the tree it holds — never a fresh read of
+    /// the pallet's ref, which another bay can move without touching this bay.
     fn read() -> Result<BayState, String> {
-        let current_pallet = pallet_utils::get_current_pallet_name()?;
-        let current_head = pallet_utils::get_pallet_head(&current_pallet)?;
+        let position = pallet_utils::read_position()?;
 
         Ok(BayState {
-            current_pallet,
-            current_head,
+            current_pallet: position.pallet,
+            current_head: position.base,
             consolidation: read_consolidation()?,
             cherry_pick: read_cherry_pick()?,
         })
@@ -192,19 +192,19 @@ struct JournalContents {
 /// Capture the bay's state, to journal an operation about to run, and start recording the head
 /// writes this process makes to the warehouse (`pallet_utils`' write log) — [`push_if_changed`]
 /// builds the entry's refs from that record, so the snapshot holds only the bay-local state and
-/// the current pallet's head.
+/// the bay's base, recorded as the current pallet's head.
 ///
 /// # Returns
 /// * `Ok(Snapshot)` - The snapshot.
 /// * `Err(String)`  - If the current pallet, consolidation or cherry-pick state could not be read.
 pub fn capture() -> Result<Snapshot, String> {
-    let current_pallet = pallet_utils::get_current_pallet_name()?;
-    let heads = pallet_utils::get_pallet_head(&current_pallet)?
-        .map(|head| BTreeMap::from([(current_pallet.clone(), head)]))
+    let position = pallet_utils::read_position()?;
+    let heads = position.base
+        .map(|base| BTreeMap::from([(position.pallet.clone(), base)]))
         .unwrap_or_default();
 
     let snapshot = Snapshot {
-        current_pallet,
+        current_pallet: position.pallet,
         heads,
         consolidation: read_consolidation()?,
         cherry_pick: read_cherry_pick()?,
@@ -231,8 +231,8 @@ pub fn discard() {
 /// this stops: each ref's first replaced head before, its last written head after. A ref the
 /// operation created has no before (undo cannot delete a ref), however often it then moved it. A
 /// ref another bay or process moved meanwhile is not in the log, so the entry never records — and `undo` never
-/// reverts — someone else's move. A current pallet the operation did not write is read once, here,
-/// and recorded identically on both sides: the gate reads it, but there is nothing to restore.
+/// reverts — someone else's move. A current pallet the operation did not write is recorded at the
+/// bay's base, not its ref: the gate reads it, but there is nothing to restore.
 ///
 /// # Arguments
 /// * `op`     - The command's journal name.
@@ -247,9 +247,10 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
         return Ok(());
     }
 
-    let current_pallet = pallet_utils::get_current_pallet_name()?;
+    let position = pallet_utils::read_position()?;
+    let before_base = before.current_head().cloned();
     let mut after = Snapshot {
-        current_pallet,
+        current_pallet: position.pallet,
         heads: BTreeMap::new(),
         consolidation: read_consolidation()?,
         cherry_pick: read_cherry_pick()?,
@@ -274,10 +275,16 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
         .cloned()
         .collect();
 
+    // An unwritten current pallet is recorded at the base the bay stood on, on each side it was
+    // current (the other side mirrors it): the gate compares the base, and its ref, which the
+    // operation never wrote, is no part of what undo puts back.
     for pallet in unwritten {
-        if let Some(head) = pallet_utils::get_pallet_head(&pallet)? {
+        let was = (pallet == before.current_pallet).then(|| before_base.clone()).flatten();
+        let is = (pallet == after.current_pallet).then(|| position.base.clone()).flatten();
+
+        if let Some(head) = was.clone().or(is.clone()) {
             before.heads.insert(pallet.clone(), head.clone());
-            after.heads.insert(pallet, head);
+            after.heads.insert(pallet, is.or(was).unwrap_or(head));
         }
     }
 
@@ -328,8 +335,10 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 }
 
 /// Whether the bay is still exactly where `entry`'s operation left it: the same current pallet,
-/// that pallet at the same head, and the same consolidation and cherry-pick in progress (a
-/// conflicted cherry-pick moves no ref). Anything else means an
+/// standing on the same base, and the same consolidation and cherry-pick in progress (a
+/// conflicted cherry-pick moves no ref). Or whether an undo of `entry` stopped halfway, after
+/// writing the bay's earlier position and before putting the refs back (see
+/// [`is_half_undone`]), which a retry resumes. Anything else means an
 /// operation outside the journal ran since (`palletize` and `deliver` switch the current pallet,
 /// a fast-forward `lower` or a haul merge moves its head), and reversing `entry` now would undo an
 /// older operation than the user's last. Refs other than the current pallet are not compared: they
@@ -344,6 +353,10 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     let now = BayState::read()?;
     let after = entry.after.bay_state();
+
+    if now == after || is_half_undone(entry, &now)? {
+        return Ok(());
+    }
 
     if now.current_pallet != after.current_pallet {
         return Err(format!(
@@ -389,6 +402,26 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the bay is where an undo of `entry` that stopped halfway left it: [`restore_refs`]
+/// writes the earlier position before it puts any ref back, so a crash or failure between the two
+/// leaves the position `entry.before` records with the consolidation and cherry-pick still
+/// `entry.after`'s. A ref still at `entry.before`'s head is the other window — the undo finished
+/// and only its journal pop was lost — and is not this state. A `shift` entry is undone by
+/// shifting back, which writes no ref, so it never stops halfway.
+fn is_half_undone(entry: &JournalEntry, now: &BayState) -> Result<bool, String> {
+    let before = entry.before.bay_state();
+
+    if entry.op == "shift"
+        || now.current_pallet != before.current_pallet
+        || now.current_head != before.current_head
+        || now.consolidation != entry.after.consolidation
+        || now.cherry_pick != entry.after.cherry_pick {
+        return Ok(false);
+    }
+
+    Ok(pallet_utils::get_pallet_head(&before.current_pallet)? != before.current_head)
+}
+
 /// The refusal for an undo whose current pallet moved after the operation it would reverse.
 fn current_pallet_moved(pallet: &str, op: &str) -> String {
     format!(
@@ -410,39 +443,46 @@ fn current_pallet_moved(pallet: &str, op: &str) -> String {
 /// restored by a compare-and-set from where the journaled op left it: a ref that has moved since,
 /// that the op did not leave behind, or that no longer exists is left alone.
 ///
-/// The current pallet's ref goes first. If it moved after [`check_undoable`] passed, the undo is
-/// refused with that check's refusal, before any other ref or any bay-local state is touched.
+/// The bay's position goes back first, to the base `entry.before` records — the tree the bay held
+/// before the operation, never a fresh read of the ref. Then the current pallet's ref: if it moved
+/// after [`check_undoable`] passed, the undo is refused with that check's refusal, before any other
+/// ref or any merge state is touched. A ref the operation never wrote (its heads are equal on both
+/// sides) is not put back at all, so a ref another bay moved since cannot refuse it.
+///
+/// When putting the refs back fails, the position is decided by what the current pallet's ref
+/// holds now, never by the kind of error (a write can fail after it landed): at the head the
+/// operation left, or one descending from it, the bay goes back to `entry.after`'s position, whose
+/// tree the soft reset kept; anywhere else the earlier position stays, and its difference to the
+/// files carries every change the undo kept. A crash between the position write and the refs
+/// leaves the half-undone state [`check_undoable`] accepts, and a retry resumes here.
 ///
 /// # Arguments
 /// * `entry` - The entry to reverse.
 pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
     let current = &entry.after.current_pallet;
-    let order = entry.before.heads.keys()
-        .filter(|wire| *wire == current)
-        .chain(entry.before.heads.keys().filter(|wire| *wire != current));
 
-    for wire in order {
-        let Some(post_head) = entry.after.heads.get(wire) else {
-            continue;
+    pallet_utils::write_position(&pallet_utils::BayPosition::new(
+        &entry.before.current_pallet, entry.before.heads.get(&entry.before.current_pallet).cloned(),
+    ))?;
+
+    if let Err(error) = put_back_refs(entry) {
+        // Which base the bay stands on now: the operation's result while the ref still holds it
+        // or a parcel built on it, else the earlier one. An ancestry that cannot be read keeps the
+        // earlier base, whose catch-up parks the operation's change rather than losing it.
+        let operation_left = entry.after.heads.get(current);
+
+        let keeps_operation = match (pallet_utils::get_pallet_head(current), operation_left) {
+            (Ok(Some(head)), Some(left)) => head == *left || merge_utils::is_ancestor(left, &head).unwrap_or(false),
+            _ => false,
         };
 
-        let reference = PalletRef::parse(wire)?;
-        let pre_head = &entry.before.heads[wire];
-
-        match pallet_utils::update_pallet_head_in(reference.namespace, &reference.name, Some(post_head), pre_head) {
-            Ok(()) => {}
-            Err(RefUpdateError::Moved(_)) if wire == current => {
-                return Err(current_pallet_moved(current, &entry.op));
-            }
-            // Another writer moved it after the operation: theirs stands.
-            Err(RefUpdateError::Moved(_)) => {}
-            // The write failed: put the current pallet back where the operation left it, so the
-            // bay still matches the entry and a retried undo passes the gate again.
-            Err(RefUpdateError::Failed(e)) => return Err(un_restore_current(entry, e)),
+        if keeps_operation {
+            pallet_utils::write_position(&pallet_utils::BayPosition::new(current, operation_left.cloned()))
+                .map_err(|e| format!("{} {}", error, e))?;
         }
-    }
 
-    pallet_utils::set_current_pallet_name(&entry.before.current_pallet)?;
+        return Err(error);
+    }
 
     // The skeleton goes down before the state and comes off after it, as `consolidate` and
     // `stack` order them, so no window shows a consolidation without its skeleton.
@@ -475,6 +515,43 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
             }
         )?,
         None => cherry_pick_utils::clear_state()?,
+    }
+
+    Ok(())
+}
+
+/// Put back the refs `entry`'s operation wrote, the current pallet's first: see [`restore_refs`].
+fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
+    let current = &entry.after.current_pallet;
+    let order = entry.before.heads.keys()
+        .filter(|wire| *wire == current)
+        .chain(entry.before.heads.keys().filter(|wire| *wire != current));
+
+    for wire in order {
+        let Some(post_head) = entry.after.heads.get(wire) else {
+            continue;
+        };
+
+        let pre_head = &entry.before.heads[wire];
+
+        // The operation wrote no ref here: there is nothing to put back.
+        if pre_head == post_head {
+            continue;
+        }
+
+        let reference = PalletRef::parse(wire)?;
+
+        match pallet_utils::update_pallet_head_in(reference.namespace, &reference.name, Some(post_head), pre_head) {
+            Ok(()) => {}
+            Err(RefUpdateError::Moved(_)) if wire == current => {
+                return Err(current_pallet_moved(current, &entry.op));
+            }
+            // Another writer moved it after the operation: theirs stands.
+            Err(RefUpdateError::Moved(_)) => {}
+            // The write failed: put the current pallet back where the operation left it, so the
+            // bay still matches the entry and a retried undo passes the gate again.
+            Err(RefUpdateError::Failed(e)) => return Err(un_restore_current(entry, e)),
+        }
     }
 
     Ok(())
@@ -642,6 +719,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
+            crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
             Scratch { root, _scope: scope }
         }
@@ -706,13 +784,13 @@ mod tests {
             assert!(error.contains("Remove it to start a fresh journal"), "{}", error);
         }
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
         ).unwrap();
         let before = capture().unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('b'),
@@ -738,7 +816,7 @@ mod tests {
         // The default pallet has never been stacked to, so `heads` cannot contain it —
         // exactly the "stack onto an unborn pallet" case `push_if_changed` opts out of.
         let before = capture().unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
@@ -752,7 +830,7 @@ mod tests {
     fn push_if_changed_records_both_sides_of_the_operation() {
         let _scratch = Scratch::new("push-real-change");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
@@ -760,12 +838,12 @@ mod tests {
         let before = capture().unwrap();
 
         // The operation itself: the head moves, a consolidation starts and another ref moves.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('b'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('c'),
@@ -787,12 +865,12 @@ mod tests {
     fn push_if_changed_keeps_only_the_refs_the_operation_moved() {
         let _scratch = Scratch::new("push-prunes");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "idle",
             pallet_utils::get_pallet_head("idle").unwrap().as_deref(),
             &hash('e'),
@@ -802,7 +880,7 @@ mod tests {
             pallet_utils::get_meta_pallet_head("office").unwrap().as_deref(),
             &hash('f'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('1'),
@@ -810,12 +888,12 @@ mod tests {
         let before = capture().unwrap();
 
         // The operation moves "main" and "side"; "idle" and "@office" stay where they were.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('b'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('2'),
@@ -830,6 +908,18 @@ mod tests {
 
     /// Move `pallet` to `head` the way another bay or process would: a ref write outside this
     /// process's write log.
+    /// Move `pallet` to `new` as an operation in this bay does: the ref, and this bay's position
+    /// with it when `pallet` is the one it stands on.
+    fn advance(pallet: &str, expected: Option<&str>, new: &str) -> Result<(), pallet_utils::RefUpdateError> {
+        pallet_utils::update_pallet_head(pallet, expected, new)?;
+
+        if pallet_utils::read_position().unwrap().pallet == pallet {
+            pallet_utils::write_position(&pallet_utils::BayPosition::new(pallet, Some(new.to_string()))).unwrap();
+        }
+
+        Ok(())
+    }
+
     fn move_elsewhere(pallet: &str, head: &str) {
         let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, pallet);
         file_utils::write_file_atomically(&path, format!("{}\n", head).as_bytes()).unwrap();
@@ -839,14 +929,14 @@ mod tests {
     fn an_undo_never_reverts_a_ref_another_bay_moved_while_the_operation_ran() {
         let _scratch = Scratch::new("journal-source");
 
-        pallet_utils::update_pallet_head("main", None, &hash('a')).unwrap();
-        pallet_utils::update_pallet_head("side", None, &hash('1')).unwrap();
+        advance("main", None, &hash('a')).unwrap();
+        advance("side", None, &hash('1')).unwrap();
         let before = capture().unwrap();
 
         // The operation moves "main" twice; meanwhile another bay moves "side".
-        pallet_utils::update_pallet_head("main", Some(&hash('a')), &hash('b')).unwrap();
+        advance("main", Some(&hash('a')), &hash('b')).unwrap();
         move_elsewhere("side", &hash('2'));
-        pallet_utils::update_pallet_head("main", Some(&hash('b')), &hash('c')).unwrap();
+        advance("main", Some(&hash('b')), &hash('c')).unwrap();
         push_if_changed("stack", before).unwrap();
 
         let entry = peek().unwrap().expect("the operation moved the current pallet");
@@ -866,12 +956,12 @@ mod tests {
     fn a_ref_the_operation_created_has_no_before_however_often_it_moved() {
         let _scratch = Scratch::new("journal-created");
 
-        pallet_utils::update_pallet_head("main", None, &hash('a')).unwrap();
+        advance("main", None, &hash('a')).unwrap();
         let before = capture().unwrap();
 
-        pallet_utils::update_pallet_head("main", Some(&hash('a')), &hash('b')).unwrap();
-        pallet_utils::update_pallet_head("fresh", None, &hash('1')).unwrap();
-        pallet_utils::update_pallet_head("fresh", Some(&hash('1')), &hash('2')).unwrap();
+        advance("main", Some(&hash('a')), &hash('b')).unwrap();
+        advance("fresh", None, &hash('1')).unwrap();
+        advance("fresh", Some(&hash('1')), &hash('2')).unwrap();
         push_if_changed("haul", before).unwrap();
 
         let entry = peek().unwrap().expect("the operation moved the current pallet");
@@ -884,11 +974,11 @@ mod tests {
     fn a_failed_capture_records_no_writes() {
         let _scratch = Scratch::new("journal-capture-fails");
 
-        pallet_utils::update_pallet_head("main", None, &hash('a')).unwrap();
+        advance("main", None, &hash('a')).unwrap();
         std::fs::write(crate::globals::bay_root().join("consolidation"), "not a state").unwrap();
         assert!(capture().is_err(), "a malformed consolidation state must fail the capture");
 
-        pallet_utils::update_pallet_head("main", Some(&hash('a')), &hash('b')).unwrap();
+        advance("main", Some(&hash('a')), &hash('b')).unwrap();
         assert!(pallet_utils::take_write_log().is_empty(), "nothing may record for a failed capture");
     }
 
@@ -896,7 +986,7 @@ mod tests {
     fn push_if_changed_skips_a_noop_whose_current_pallet_another_bay_moved() {
         let _scratch = Scratch::new("push-moved-elsewhere");
 
-        pallet_utils::update_pallet_head("main", None, &hash('a')).unwrap();
+        advance("main", None, &hash('a')).unwrap();
         let before = capture().unwrap();
 
         // The command writes nothing; another bay stacks on the current pallet meanwhile.
@@ -910,19 +1000,19 @@ mod tests {
     fn push_if_changed_keeps_both_current_pallets_across_a_switch() {
         let _scratch = Scratch::new("push-prunes-switch");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('b'),
         ).unwrap();
         let before = capture().unwrap();
 
-        pallet_utils::set_current_pallet_name("side").unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("side", pallet_utils::get_pallet_head("side").unwrap())).unwrap();
         push_if_changed("shift", before).unwrap();
 
         let popped = pop().unwrap().unwrap();
@@ -934,7 +1024,7 @@ mod tests {
     fn push_if_changed_records_a_conflicted_cherry_pick() {
         let _scratch = Scratch::new("push-cherry-pick");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
@@ -954,19 +1044,19 @@ mod tests {
     fn push_if_changed_records_a_switch_of_the_current_pallet() {
         let _scratch = Scratch::new("push-switch");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('b'),
         ).unwrap();
         let before = capture().unwrap();
 
-        pallet_utils::set_current_pallet_name("side").unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("side", pallet_utils::get_pallet_head("side").unwrap())).unwrap();
         push_if_changed("shift", before).unwrap();
 
         let popped = pop().unwrap().expect("a shift must be journaled");
@@ -978,7 +1068,7 @@ mod tests {
     fn push_if_changed_skips_a_true_noop() {
         let _scratch = Scratch::new("push-noop");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
@@ -995,12 +1085,12 @@ mod tests {
     fn push_if_changed_skips_an_operation_that_moved_only_another_pallet() {
         let _scratch = Scratch::new("push-other-ref");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('a'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('b'),
@@ -1008,7 +1098,7 @@ mod tests {
         let before = capture().unwrap();
 
         // Only a ref other than the current pallet moved (as a stack in another bay would).
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('c'),
@@ -1145,7 +1235,7 @@ mod tests {
     fn check_undoable_passes_while_the_bay_is_where_the_operation_left_it() {
         let _scratch = Scratch::new("gate-pass");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1159,12 +1249,12 @@ mod tests {
         let _scratch = Scratch::new("gate-other-ref");
 
         // The op left "side" at 3; a stack in another bay has since moved it to 4.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "side",
             pallet_utils::get_pallet_head("side").unwrap().as_deref(),
             &hash('4'),
@@ -1182,17 +1272,17 @@ mod tests {
 
         // The op left "main" current at 2; an un-journaled palletize has since switched to
         // "feature" at the same head.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
         ).unwrap();
-        pallet_utils::update_pallet_head(
+        advance(
             "feature",
             pallet_utils::get_pallet_head("feature").unwrap().as_deref(),
             &hash('2'),
         ).unwrap();
-        pallet_utils::set_current_pallet_name("feature").unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("feature", pallet_utils::get_pallet_head("feature").unwrap())).unwrap();
 
         let error = check_undoable(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap_err();
         assert!(error.contains("left pallet \"main\" current, but \"feature\" is current now"), "{}", error);
@@ -1202,7 +1292,7 @@ mod tests {
     fn check_undoable_refuses_once_the_current_pallet_moved() {
         let _scratch = Scratch::new("gate-moved");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('9'),
@@ -1225,7 +1315,7 @@ mod tests {
     fn check_undoable_refuses_once_the_consolidation_state_changed() {
         let _scratch = Scratch::new("gate-consolidation");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1248,7 +1338,7 @@ mod tests {
 
         // The op left no pick in progress; a conflicted cherry-pick has since started one
         // without moving any ref.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1270,7 +1360,7 @@ mod tests {
 
         // Both refs currently sit exactly where the journaled op left them (`after`), so
         // `restore_refs` is free to roll them back to their pre-op values.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1293,7 +1383,7 @@ mod tests {
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('a')));
         assert_eq!(pallet_utils::get_meta_pallet_head("office").unwrap(), Some(hash('b')));
-        assert_eq!(pallet_utils::get_current_pallet_name().unwrap(), "feature");
+        assert_eq!(pallet_utils::read_position().unwrap().pallet, "feature");
 
         let consolidation = merge_utils::read_consolidation_state().unwrap().unwrap();
         assert_eq!(consolidation.their_head, hash('c'));
@@ -1306,7 +1396,7 @@ mod tests {
     fn restore_refs_puts_back_the_recorded_out_of_scope_skeleton() {
         let _scratch = Scratch::new("restore-skeleton");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1328,7 +1418,7 @@ mod tests {
         assert!(OutOfScopeSkeleton::read_required().unwrap() == skeleton, "the recorded skeleton must be restored");
 
         // And an entry with no consolidation before it clears both.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1345,12 +1435,12 @@ mod tests {
         let _scratch = Scratch::new("label-not-a-pallet");
         let label = "not a\npallet/../name";
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
-        pallet_utils::update_pallet_head("main", None, &hash('1')).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
+        advance("main", None, &hash('1')).unwrap();
         start_consolidation(&hash('d'), label);
 
         let before = capture().unwrap();
-        pallet_utils::update_pallet_head("main", Some(&hash('1')), &hash('2')).unwrap();
+        advance("main", Some(&hash('1')), &hash('2')).unwrap();
         merge_utils::clear_consolidation_state().unwrap();
         push_if_changed("stack", before).unwrap();
 
@@ -1363,12 +1453,12 @@ mod tests {
     fn an_undo_whose_later_ref_write_fails_leaves_the_current_pallet_where_the_operation_left_it() {
         let _scratch = Scratch::new("restore-partial-failure");
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
-        pallet_utils::update_pallet_head("main", None, &hash('1')).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
+        advance("main", None, &hash('1')).unwrap();
         pallet_utils::update_meta_pallet_head("kv", None, &hash('a')).unwrap();
 
         let before = capture().unwrap();
-        pallet_utils::update_pallet_head("main", Some(&hash('1')), &hash('2')).unwrap();
+        advance("main", Some(&hash('1')), &hash('2')).unwrap();
         pallet_utils::update_meta_pallet_head("kv", Some(&hash('a')), &hash('b')).unwrap();
         push_if_changed("stack", before).unwrap();
         let entry = peek().unwrap().unwrap();
@@ -1411,14 +1501,14 @@ mod tests {
         let _scratch = Scratch::new("restore-refs-moved");
 
         // "main" sits exactly where the op left it: safe to restore.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
         ).unwrap();
         // "feature" has since moved on to a third value — some un-journaled operation ran
         // between the journaled op and this undo. It must be left exactly where it is.
-        pallet_utils::update_pallet_head(
+        advance(
             "feature",
             pallet_utils::get_pallet_head("feature").unwrap().as_deref(),
             &hash('5'),
@@ -1442,7 +1532,7 @@ mod tests {
     fn restore_refs_never_touches_a_ref_the_operation_did_not_leave_behind() {
         let _scratch = Scratch::new("restore-refs-absent-after");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1468,7 +1558,7 @@ mod tests {
     fn restore_refs_never_resurrects_a_deleted_ref() {
         let _scratch = Scratch::new("restore-refs-deleted");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1492,7 +1582,7 @@ mod tests {
             their_pallet: "stray".to_string(),
             our_head: hash('e'), our_pallet: "main".to_string(),
         }).unwrap();
-        pallet_utils::update_pallet_head("main", None, &hash('b')).unwrap();
+        advance("main", None, &hash('b')).unwrap();
 
         restore_refs(&entry("stack", "main", &hash('a'), &hash('b'))).unwrap();
 
@@ -1503,7 +1593,7 @@ mod tests {
     fn restore_refs_puts_a_completed_cherry_pick_back_in_progress() {
         let _scratch = Scratch::new("restore-cherry-pick");
 
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1521,7 +1611,7 @@ mod tests {
         assert_eq!(state.our_pallet, "side", "the pallet the pick was applied to must come back");
 
         // And an entry with no pick before it clears one.
-        pallet_utils::update_pallet_head(
+        advance(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
@@ -1535,13 +1625,13 @@ mod tests {
         let _scratch = Scratch::new("journal-cap");
 
         for i in 0..(MAX_ENTRIES + 10) {
-            pallet_utils::update_pallet_head(
+            advance(
                 "main",
                 pallet_utils::get_pallet_head("main").unwrap().as_deref(),
                 &format!("{:064x}", i),
             ).unwrap();
             let before = capture().unwrap();
-            pallet_utils::update_pallet_head(
+            advance(
                 "main",
                 pallet_utils::get_pallet_head("main").unwrap().as_deref(),
                 &format!("{:064x}", i + 1),

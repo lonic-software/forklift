@@ -258,7 +258,7 @@ async fn franchise_into_prepared_target(
         // warehouse's mutation began, so reaching this branch means either the remote's own
         // default pallet has nothing stacked yet, or an explicitly named pallet does not exist
         // on an otherwise-fresh remote — both fine starting points, not errors.
-        pallet_utils::set_current_pallet_name(&pallet_name)?;
+        pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, None))?;
 
         // There is no tree to validate --only against (the pallet has nothing stacked on the
         // remote yet); record the requested sparse scope and origin as-is, so a later
@@ -304,7 +304,7 @@ async fn franchise_into_prepared_target(
 
     // A franchise fills a fresh warehouse, so the pallet is unborn here.
     pallet_utils::update_pallet_head(&pallet_name, None, &remote_head)?;
-    pallet_utils::set_current_pallet_name(&pallet_name)?;
+    pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
 
     // A failure here still goes through the caller's ordinary cleanup — the whole target is
     // wiped — even though the warehouse is otherwise complete at this point: every object, the

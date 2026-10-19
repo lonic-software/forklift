@@ -19,9 +19,9 @@ pub(crate) const FOLDER_NAME_META_ROOT: &str = "meta";
 /// (see [`validate_pallet_name`]), so the qualifier is unambiguous.
 pub const META_QUALIFIER: char = '@';
 
-/// The file inside the forklift root that holds the name of the current pallet
-/// (the pallet new parcels are stacked on — git's HEAD equivalent).
-const FILE_NAME_CURRENT_PALLET: &str = "pallet";
+/// The bay-local file that holds the bay's position: its current pallet and the parcel its files
+/// stand on (see [`BayPosition`]).
+pub const FILE_NAME_POSITION: &str = "position";
 
 /// The name of the default pallet (used when a warehouse is prepared).
 pub const DEFAULT_PALLET_NAME: &str = "main";
@@ -116,13 +116,10 @@ pub fn get_pallets_folder() -> PathBuf {
     get_namespace_folder(PalletNamespace::User)
 }
 
-/// Get the path of the current-pallet file.
-///
-/// # Returns
-/// * `PathBuf` - The path of the current-pallet file (relative to the warehouse root).
-fn get_current_pallet_path() -> PathBuf {
-    // The current pallet is bay-local: each bay is checked out to its own pallet.
-    bay_root().join(FILE_NAME_CURRENT_PALLET)
+/// Get the path of the active bay's position file. The position is bay-local: each bay stands on
+/// its own pallet and base.
+fn get_position_path() -> PathBuf {
+    bay_root().join(FILE_NAME_POSITION)
 }
 
 /// Get the path of the ref file of the given pallet, in the given namespace.
@@ -211,58 +208,140 @@ pub fn does_meta_pallet_exist(name: &str) -> bool {
     get_pallet_ref_path(PalletNamespace::Meta, name).is_file()
 }
 
-/// Get the name of the current pallet. Warehouses prepared before pallets existed have no
-/// current-pallet file; they default to the default pallet name.
-///
-/// # Returns
-/// * `Ok(String)`  - The name of the current pallet.
-/// * `Err(String)` - If the current-pallet file exists but could not be read (or holds an
-///                   invalid name).
-pub fn get_current_pallet_name() -> Result<String, String> {
-    let path = get_current_pallet_path();
+/// Where a bay stands: its current pallet, and the base — the parcel its inventory and working
+/// directory were last materialized from or stacked as (`None` while the pallet is unborn). The
+/// pallet's ref is shared by every bay on it and can move under this bay; the base cannot, so
+/// whatever treats "the head" as the tree this bay holds reads the base, and whatever treats it as
+/// the pallet's history reads the ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BayPosition {
+    /// The current pallet (the one new parcels are stacked on — git's HEAD equivalent).
+    pub pallet: String,
 
-    if !path.exists() {
-        return Ok(DEFAULT_PALLET_NAME.to_string());
+    /// The parcel the bay's files stand on, or `None` for an unborn pallet.
+    pub base: Option<String>,
+}
+
+impl BayPosition {
+    /// A position on `pallet`, standing on `base`.
+    pub fn new(pallet: impl Into<String>, base: Option<String>) -> Self {
+        BayPosition { pallet: pallet.into(), base }
     }
 
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Error while reading the current pallet file \"{}\": {}", path.to_string_lossy(), e))?;
-    let name = content.trim_end_matches('\n').to_string();
+    /// The head the pallet's ref holds now, which another bay may have moved past [`Self::base`].
+    pub fn head(&self) -> Result<Option<String>, String> {
+        get_pallet_head(&self.pallet)
+    }
 
-    validate_pallet_name(&name)?;
+    /// Refuse, unless the bay stands on its pallet's head (an unborn pallet and an unborn base
+    /// count as equal). Every command that moves the current pallet asks this first: building on a
+    /// base the pallet has moved past would revert what moved it. The compare-and-set from the
+    /// base, not this check, is what closes the race; the check gives the message, before any
+    /// object is written.
+    ///
+    /// # Arguments
+    /// * `operation` - What is refused, such as "stacked" ("Nothing was <operation>.").
+    pub fn require_current(&self, operation: &str) -> Result<(), String> {
+        let head = self.head()?;
 
-    Ok(name)
+        if head == self.base {
+            return Ok(());
+        }
+
+        Err(behind_message(&self.pallet, self.base.as_deref(), head.as_deref(), operation))
+    }
 }
 
-/// Set the name of the current pallet (atomically).
-///
-/// # Arguments
-/// * `name` - The name of the pallet to make current. Must be a valid pallet name.
-///
-/// # Returns
-/// * `Ok(())`      - If the current pallet was set.
-/// * `Err(String)` - If the name is invalid or the file could not be written.
-pub fn set_current_pallet_name(name: &str) -> Result<(), String> {
-    validate_pallet_name(name)?;
-
-    file_utils::write_file_atomically(&get_current_pallet_path(), format!("{}\n", name).as_bytes())
+/// Why a bay standing on `base` may not move `pallet`, whose head is `head`: see
+/// [`BayPosition::require_current`].
+pub fn behind_message(pallet: &str, base: Option<&str>, head: Option<&str>, operation: &str) -> String {
+    format!(
+        "This bay is behind pallet \"{}\": its files stand on {}, but the pallet is at {}, moved \
+        since by another bay or process. Nothing was {}. Run \"forklift shift {}\" to catch up, \
+        then try again.",
+        pallet,
+        base.map(|base| format!("parcel {}", base)).unwrap_or("no parcel".to_string()),
+        head.map(|head| format!("parcel {}", head)).unwrap_or("no parcel".to_string()),
+        operation,
+        pallet
+    )
 }
 
-/// Create the current-pallet file (pointing at the default pallet) if it does not exist,
-/// along with the pallets folder. Called by `prepare`.
+/// The [`record_utils`] kind and version of a bay's position file: the pallet name, then the base
+/// parcel hash (an empty entry for an unborn pallet).
+const POSITION_RECORD: &str = "position";
+const POSITION_VERSION: u32 = 1;
+
+/// Read the active bay's position.
 ///
 /// # Returns
-/// * `Ok(true)`    - If the current-pallet file was created.
+/// * `Ok(BayPosition)` - Where the bay stands.
+/// * `Err(String)`     - If the position file is missing, unreadable or malformed. There is no
+///                       default: a bay without one was never prepared, and guessing a pallet
+///                       would pair it with no base.
+pub fn read_position() -> Result<BayPosition, String> {
+    read_position_in(&bay_root())
+}
+
+/// Read the position of the bay whose bay-local state dir is `dir` (see [`read_position`]).
+pub fn read_position_in(dir: &Path) -> Result<BayPosition, String> {
+    let path = dir.join(FILE_NAME_POSITION);
+
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("Error while reading the bay position file \"{}\": {}", path.to_string_lossy(), e))?;
+
+    let malformed = |reason: String| format!("The bay position file \"{}\" {}", path.to_string_lossy(), reason);
+
+    let entries = crate::util::record_utils::from_bytes(&bytes, POSITION_RECORD, POSITION_VERSION)
+        .map_err(|e| malformed(e.describe()))?;
+
+    let [pallet, base] = <[String; 2]>::try_from(entries).map_err(|_| malformed("is malformed.".to_string()))?;
+
+    validate_pallet_name(&pallet).map_err(|e| malformed(format!("names an invalid pallet: {}", e)))?;
+
+    let base = match base.as_str() {
+        "" => None,
+        hash if object_utils::is_object_hash(hash) => Some(base),
+        _ => return Err(malformed("is malformed.".to_string())),
+    };
+
+    Ok(BayPosition { pallet, base })
+}
+
+/// Write the active bay's position (atomically: the pallet and the base change together).
+///
+/// # Returns
+/// * `Ok(())`      - If the position was written.
+/// * `Err(String)` - If the pallet name is invalid or the file could not be written.
+pub fn write_position(position: &BayPosition) -> Result<(), String> {
+    write_position_in(&bay_root(), position)
+}
+
+/// [`write_position`] into the bay-local state dir `dir`, whichever bay it belongs to.
+pub fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
+    validate_pallet_name(&position.pallet)?;
+
+    let base = position.base.as_deref().unwrap_or("");
+    let bytes = crate::util::record_utils::to_bytes(POSITION_RECORD, POSITION_VERSION, [position.pallet.as_str(), base]);
+
+    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION), &bytes)
+}
+
+/// Create the active bay's position (the default pallet, unborn) if it has none, along with the
+/// pallets folder. Called by `prepare`.
+///
+/// # Returns
+/// * `Ok(true)`    - If the position file was created.
 /// * `Ok(false)`   - If it already existed.
 /// * `Err(String)` - If an error occurred.
-pub fn create_current_pallet_file_if_not_exists() -> Result<bool, String> {
+pub fn create_position_if_not_exists() -> Result<bool, String> {
     file_utils::create_folder_if_not_exists(&get_pallets_folder())?;
 
-    if get_current_pallet_path().exists() {
+    if get_position_path().exists() {
         return Ok(false);
     }
 
-    set_current_pallet_name(DEFAULT_PALLET_NAME)?;
+    write_position(&BayPosition::new(DEFAULT_PALLET_NAME, None))?;
 
     Ok(true)
 }

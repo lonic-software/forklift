@@ -54,9 +54,11 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     let warehouse_root = std::env::current_dir()
         .map_err(|e| format!("Error while getting the warehouse root: {}", e))?;
 
-    // A bay branches off the current pallet's head, so there must be one.
-    let current = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&current)?.ok_or(format!(
+    // A bay branches off the parcel this bay's files stand on (the current pallet's head, unless
+    // another bay moved it since), so there must be one.
+    let position = pallet_utils::read_position()?;
+    let current = position.pallet.clone();
+    let head = position.base.clone().ok_or(format!(
         "Pallet \"{}\" has nothing stacked yet; stack something before opening a bay.", current
     ))?;
 
@@ -103,7 +105,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // for it rather than staging against a half-made tree or clearing an assembly in flight.
     let _bay_lock = lock_utils::WarehouseLock::acquire()?;
 
-    pallet_utils::set_current_pallet_name(name)?;
+    pallet_utils::write_position(&pallet_utils::BayPosition::new(name, Some(head.clone())))?;
 
     // Record the materialization scope before materializing — the materialize (and every
     // later scope-aware verb in this bay) reads it back through `scope_utils::current_scope`.

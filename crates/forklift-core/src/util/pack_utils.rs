@@ -5740,6 +5740,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         // Minimal reachable history: one blob (the object under test), its tree, one parentless
         // parcel, `main`'s head pointed at it. The blob is the object this fixture corrupts below
@@ -5940,6 +5941,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- loose-vs-pack duplicate\n".to_vec();
         let mut blob = LooseObjectBuilder::build_blob(&Blob { content: original_content });
@@ -6052,6 +6054,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- both-corrupt duplicate fixture\n".to_vec();
         let mut blob = LooseObjectBuilder::build_blob(&Blob { content: original_content });
@@ -6201,6 +6204,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- identical-corrupt duplicate fixture\n".to_vec();
         let mut blob = LooseObjectBuilder::build_blob(&Blob { content: original_content });
@@ -6307,6 +6311,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- clean self-duplicate fixture\n".to_vec();
         let mut blob = LooseObjectBuilder::build_blob(&Blob { content: original_content });
@@ -6413,6 +6418,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let giant = deterministic_fill(object_utils::MAX_OBJECT_BYTES + 1);
         let giant_hash_hex = blake3::hash(&giant).to_hex().to_string();
@@ -6908,6 +6914,7 @@ mod tests {
 
         let temp = fresh_root("delta-copy-reread-base");
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let body = deterministic_fill(6000);
         let base = LooseObjectBuilder::build_blob(&Blob { content: [body.as_slice(), b"\nv1\n"].concat() });
@@ -7244,6 +7251,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         // Two separate incremental packs, so the repack has more than one old pack to supersede.
         let content_a = b"first pack content".to_vec();
@@ -7796,6 +7804,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let folder = pack_folder();
 
         let mut pairs = Vec::new();
@@ -8224,6 +8233,7 @@ mod tests {
     fn a_repack_refuses_while_the_root_is_served_but_incremental_compaction_runs() {
         let temp = fresh_root("repack-serve-lock");
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let content = b"content packed beside a live server".to_vec();
         store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
@@ -8250,6 +8260,7 @@ mod tests {
     fn a_repack_refuses_while_a_writer_holds_the_store_and_keeps_the_object_it_would_drop() {
         let temp = fresh_root("repack-store-access");
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let content = b"unreachable, packed, and found present by another bay's dedup".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();

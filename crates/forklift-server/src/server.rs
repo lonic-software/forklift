@@ -1763,7 +1763,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
 
         Ok(WarehouseInfo {
             protocol: PROTOCOL_VERSION.to_string(),
-            default_pallet: pallet_utils::get_current_pallet_name().map_err(internal)?,
+            default_pallet: pallet_utils::read_position().map_err(internal)?.pallet,
             pallets,
             trust: office_utils::read_trust_anchor()
                 .map_err(internal)?
@@ -4026,7 +4026,7 @@ mod tests {
         assert!(base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT).is_dir());
         {
             let _scope = StorageRootScope::enter(&base.join("w"));
-            assert_eq!(pallet_utils::get_current_pallet_name().unwrap(), pallet_utils::DEFAULT_PALLET_NAME,
+            assert_eq!(pallet_utils::read_position().unwrap().pallet, pallet_utils::DEFAULT_PALLET_NAME,
                        "the warehouse arrives fully prepared");
         }
         assert_eq!(create_warehouse(&base, "w").unwrap(), Creation::Existed);

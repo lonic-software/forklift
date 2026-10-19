@@ -27,6 +27,15 @@ pub enum StackError {
         tree: String,
     },
 
+    /// This bay stands on `base`, but another bay or process moved `pallet` to `head` since;
+    /// nothing was stacked. A merge or pick in progress needs its own way out, so the caller words
+    /// the refusal.
+    Behind {
+        pallet: String,
+        base: Option<String>,
+        head: Option<String>,
+    },
+
     /// Any other failure; nothing was stacked.
     Other(String),
 }
@@ -47,6 +56,9 @@ impl From<StackError> for String {
     fn from(error: StackError) -> Self {
         match error {
             StackError::HeadWrite { error, .. } => error.to_string(),
+            StackError::Behind { pallet, base, head } => {
+                pallet_utils::behind_message(&pallet, base.as_deref(), head.as_deref(), "stacked")
+            },
             StackError::Other(error) => error,
         }
     }
@@ -134,7 +146,8 @@ pub async fn stack_parcel(description: Option<String>,
     // already matches the head (see `inventory_utils::prepare_stack_inventory`), and the scope
     // gates which keys may be skipped at all.
     let scope = scope_utils::current_scope()?;
-    let pallet = pallet_utils::get_current_pallet_name()?;
+    let position = pallet_utils::read_position()?;
+    let pallet = position.pallet.clone();
     let consolidation = merge_utils::read_consolidation_state()?;
 
     // A cherry-pick in progress (§9.1 #8) completes here, single-parent: the picked
@@ -160,15 +173,51 @@ pub async fn stack_parcel(description: Option<String>,
         }
     }
 
-    // The base the parcel stacks on, which the head write below expects the pallet still to be at.
-    // Merge output staged by an earlier command was built on the head recorded when it started,
-    // not on whatever the pallet holds now; stacking it on a head another bay moved would revert
-    // that bay's parcel.
+    // A parcel is built on the tree this bay holds, its base. Stacking it on a pallet another bay
+    // or process moved since would revert their parcel, so a bay behind its pallet is refused
+    // before any object is written; the compare-and-set below closes the race this check leaves.
+    // A caller passing `expected_base` checked this itself before changing anything, and rolls
+    // back on the compare-and-set's `Moved`, which this refusal would bypass.
+    //
+    // Merge output staged by an earlier command was built on the head recorded when it started.
+    // That must be the base too: the parcel's parent and the head the write below expects are
+    // then the same parcel, so a merge started before this bay caught up can never land.
+    if expected_base.is_none() {
+        let head = position.head()?;
+
+        if head != position.base {
+            return Err(StackError::Behind { pallet: pallet.clone(), base: position.base.clone(), head });
+        }
+
+        let started_at = match (&consolidation, &cherry_pick) {
+            (Some(state), _) => Some(("consolidation", &state.our_head)),
+            (None, Some(state)) => Some(("cherry-pick", &state.our_head)),
+            (None, None) => None,
+        };
+
+        if let Some((what, our_head)) = started_at.filter(|(_, our_head)| position.base.as_ref() != Some(*our_head)) {
+            return Err(StackError::Other(format!(
+                "This {} was started on parcel {}, but this bay's files stand on {}. Nothing was \
+                stacked. Abort it, then redo it from where the bay stands.",
+                what, our_head, position.base.as_deref().unwrap_or("no parcel")
+            )));
+        }
+    }
+
+    // The parcel the new one stacks on. Merge output staged by an earlier command was built on the
+    // head recorded when it started, which the check above holds equal to the base.
     let head = match (expected_base, &consolidation, &cherry_pick) {
         (Some(base), _, _) => Some(base.to_string()),
         (None, Some(state), _) => Some(state.our_head.clone()),
         (None, None, Some(state)) => Some(state.our_head.clone()),
-        (None, None, None) => pallet_utils::get_pallet_head(&pallet)?,
+        (None, None, None) => position.base.clone(),
+    };
+
+    // The head the write below expects the pallet still to be at: the base this bay stands on, or
+    // the one a caller passing `expected_base` read before it changed anything.
+    let expected = match expected_base {
+        Some(base) => Some(base.to_string()),
+        None => position.base.clone(),
     };
     let head_root_hash = match &head {
         Some(head_hash) => Some(object_utils::load_parcel(head_hash)?.tree_hash),
@@ -396,9 +445,9 @@ pub async fn stack_parcel(description: Option<String>,
     // yet durable — batching the ref in with the objects it references would trade that
     // guarantee for a few more saved fsyncs, which is not a trade this makes.
     //
-    // It is a compare-and-set against the base this parcel was built on, so a move by another bay
-    // or process since that read is refused rather than silently replaced.
-    match pallet_utils::update_pallet_head(&pallet, head.as_deref(), &object.hash) {
+    // It is a compare-and-set against this bay's base, so a move by another bay or process since
+    // that read is refused rather than silently replaced.
+    match pallet_utils::update_pallet_head(&pallet, expected.as_deref(), &object.hash) {
         Ok(()) => {}
 
         // Another bay already moved the pallet to this very parcel: the move stands.
@@ -412,7 +461,8 @@ pub async fn stack_parcel(description: Option<String>,
                 && pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(object.hash.as_str());
 
             if landed {
-                if let Err(cleanup) = clean_up_after_stack(&prepared, &stamp_hashes) {
+                if let Err(cleanup) = clean_up_after_stack(&prepared, &stamp_hashes)
+                    .and_then(|()| pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet, Some(object.hash.clone())))) {
                     return Err(StackError::Other(format!("{} {}", error, cleanup)));
                 }
             }
@@ -421,7 +471,12 @@ pub async fn stack_parcel(description: Option<String>,
         }
     }
 
+    // The staged state comes off before the position moves: a crash between the two leaves a bay
+    // whose files already match the new parcel and nothing in progress, which catching up
+    // (`shift <pallet>`) records without touching a file. The other order would leave the base at
+    // the new parcel with a merge still recorded on the old one.
     clean_up_after_stack(&prepared, &stamp_hashes)?;
+    pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet, Some(object.hash.clone())))?;
 
     Ok((object.hash, pallet))
 }

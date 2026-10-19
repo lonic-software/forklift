@@ -3611,6 +3611,40 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+### `CaughtUp`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "How a bay caught up with its pallet (see [`catch_up`]).",
+  "properties": {
+    "from": {
+      "description": "The parcel the bay's files stood on before (empty for an unborn pallet).",
+      "type": "string"
+    },
+    "head": {
+      "description": "The pallet's head, which the bay now stands on (empty for an unborn pallet).",
+      "type": "string"
+    },
+    "moved_files": {
+      "description": "Whether the working directory and inventory were moved to the head's tree. False when the\nbay already stood on the head, or its files already matched the head's tree.",
+      "type": "boolean"
+    },
+    "pallet": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "pallet",
+    "from",
+    "head",
+    "moved_files"
+  ],
+  "title": "CaughtUp",
+  "type": "object"
+}
+```
+
 ## `show`
 
 ### `Shown`
@@ -3781,7 +3815,14 @@ A command not listed here either reports only the generic human-message shape `{
       ]
     },
     "head": {
-      "description": "The pallet's head parcel, or `null` when it is unborn.",
+      "description": "The parcel this bay's files stand on, which staged changes are measured against: the\npallet's head unless the pallet moved since; `null` when it is unborn.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "moved_to": {
+      "description": "The pallet's head, when another bay or process moved the pallet past `head` since this\nbay's files were materialized. `shift <pallet>` catches up.",
       "type": [
         "string",
         "null"
@@ -3799,7 +3840,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "staged_count": {
-      "description": "How many changes are staged (inventory vs pallet head).",
+      "description": "How many changes are staged (inventory vs `head`).",
       "format": "uint",
       "minimum": 0,
       "type": "integer"

@@ -33,7 +33,7 @@ pub async fn handle_command(path: &str, revision: Option<String>) -> Result<(), 
     let head = match revision {
         Some(revision) => pallet_utils::resolve_revision(&revision)?,
         None => {
-            let pallet = pallet_utils::get_current_pallet_name()?;
+            let pallet = pallet_utils::read_position()?.pallet;
 
             pallet_utils::get_pallet_head(&pallet)?
                 .ok_or(format!(

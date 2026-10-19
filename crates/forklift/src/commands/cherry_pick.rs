@@ -39,7 +39,8 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
         "Run it from a full bay.",
     )?;
 
-    let current = pallet_utils::get_current_pallet_name()?;
+    let position = pallet_utils::read_position()?;
+    let current = position.pallet.clone();
 
     // A pick materializes into the working directory, so it cannot start on top of an
     // in-progress consolidation or another in-progress pick.
@@ -58,7 +59,10 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
         ));
     }
 
-    let our_head = pallet_utils::get_pallet_head(&current)?.ok_or(format!(
+    // The pick is applied onto the tree this bay holds, and moves the pallet from there.
+    position.require_current("cherry-picked")?;
+
+    let our_head = position.base.clone().ok_or(format!(
         "Pallet \"{}\" has nothing stacked yet; cherry-pick applies a change onto existing history.",
         current
     ))?;
@@ -271,8 +275,8 @@ mod tests {
         let source = test_support::store_parcel(&test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"picked\n")]), &[&base]);
         let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
         // Another bay stacks on "main" after the pick was applied, before its parcel is stacked.

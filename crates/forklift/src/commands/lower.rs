@@ -69,7 +69,7 @@ pub async fn handle_command(expect: Option<String>, keep: Vec<String>) -> Result
         meta_restamped: meta.restamped,
         meta_conflicts: meta.conflicts,
         meta_failed: meta.failed,
-        pallet: pallet_utils::get_current_pallet_name()?,
+        pallet: pallet_utils::read_position()?.pallet,
         outcome: None,
         head: String::new(),
         fetched_objects: 0,
@@ -123,12 +123,17 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     report.head = remote_head.clone();
 
-    let local_head = pallet_utils::get_pallet_head(&pallet)?;
+    let position = pallet_utils::read_position()?;
 
-    if local_head.as_deref() == Some(remote_head.as_str()) {
+    if position.head()?.as_deref() == Some(remote_head.as_str()) {
         report.outcome = Some(LowerOutcome::UpToDate);
         return Ok(());
     }
+
+    // The fast-forward materializes from the tree this bay holds, and moves the pallet from there.
+    position.require_current("lowered")?;
+
+    let local_head = position.base.clone();
 
     // Refuse before fetching anything: a dirty warehouse would be overwritten by the
     // fast-forward, and the operator should resolve that first.
