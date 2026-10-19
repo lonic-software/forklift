@@ -45,6 +45,7 @@ one, the way out. Every writer replaces its file atomically, so a crash never le
 | `inventory/metadata` (bay-local) | `inventory-metadata` | The warehouse path key of every directory with an inventory shard; the root is `./`. |
 | A bay's `.forklift` file | `bay` | The warehouse root, then the bay's name. Its header is how reading one refuses a stray file named `.forklift` instead of misreading it as a bay. |
 | `path` (in a bay's state folder) | `bay-path` | The bay's working directory. |
+| `position` (bay-local) | `position` | The current pallet's name, then the bay's base: the parcel its files stand on, empty while the pallet is unborn. See [pallet refs](PALLET_REFS.md). |
 | `scope` (bay-local), `.forklift/config/fetch-scope` | `scope` | See [the scope file format](SCOPE_FILE_FORMAT.md), which adds an empty-file rule of its own. |
 
 Bay-local files live in the bay's state folder: `.forklift/` for the main tree,

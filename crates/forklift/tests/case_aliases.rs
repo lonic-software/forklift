@@ -239,6 +239,13 @@ fn a_tree_holding_two_spellings_of_one_name_is_refused_or_materialized_whole() {
 fn a_bay_of_a_tree_holding_two_spellings_is_refused_or_materialized_whole() {
     let warehouse = Warehouse::new("bay-pair", &[("app.txt", "app\n")]);
     warehouse.craft("main", "main", &[("app.txt", "app\n"), ("README", "upper\n"), ("readme", "lower\n")]);
+    // A bay branches off the parcel the main tree stands on, so it records the crafted parcel as
+    // its base, as stacking it there would have; its files stay as they are.
+    {
+        let _scope = StorageRootScope::enter(&warehouse.root);
+        let head = pallet_utils::get_pallet_head("main").unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", head)).unwrap();
+    }
 
     let bay = warehouse.base.join("bay");
     let added = warehouse.run(&["bay", "add", "pairs", bay.to_str().unwrap()]);

@@ -124,9 +124,12 @@ impl Warehouse {
     }
 
     fn current_pallet(&self) -> String {
-        std::fs::read_to_string(self.root.join(".forklift").join("pallet"))
+        // The bay position record: a header line, then the pallet name, then the base.
+        std::fs::read_to_string(self.root.join(".forklift").join("position"))
             .unwrap()
-            .trim()
+            .lines()
+            .nth(1)
+            .unwrap()
             .to_string()
     }
 
@@ -1386,4 +1389,40 @@ fn a_full_repack_keeps_staged_content_and_the_next_stack_restores_it() {
         std::fs::read_to_string(warehouse.root.join("wip.txt")).unwrap(),
         "work in progress\n"
     );
+}
+
+/// FORK-213's T4: a bay's base is a gc root. Bay b catches up onto A's parcel N, A undoes that
+/// stack (main back at X), and nothing else names N; b's catch-up back to X still needs N's tree
+/// to diff against. Revert: drop the base from the bay-scoped roots → N is collected and the
+/// catch-up fails.
+#[test]
+fn a_bays_base_survives_collection_after_the_pallet_moved_back() {
+    let warehouse = Warehouse::new("bay-base");
+    let x = warehouse.stack("f.txt", "f v1\n", "first");
+
+    let bay = warehouse.home.join("bay-b");
+    warehouse.run_ok(&["bay", "add", "b", bay.to_str().unwrap()]);
+    let run_in_bay = |args: &[&str]| {
+        forklift_command()
+            .args(args)
+            .current_dir(&bay)
+            .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+            .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
+            .output()
+            .unwrap()
+    };
+    assert!(run_in_bay(&["shift", "main"]).status.success());
+
+    let n = warehouse.stack("f.txt", "f v2\n", "second");
+    let caught_up = run_in_bay(&["shift", "main"]);
+    assert!(caught_up.status.success(), "{}", String::from_utf8_lossy(&caught_up.stderr));
+    warehouse.run_ok(&["undo"]);
+    assert_eq!(warehouse.head("main"), x);
+
+    warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    assert!(warehouse.scoped(|| file_utils::does_object_exist(&n).unwrap()), "gc must keep bay b's base {}", n);
+
+    let back = run_in_bay(&["shift", "main"]);
+    assert!(back.status.success(), "{}", String::from_utf8_lossy(&back.stderr));
+    assert_eq!(std::fs::read_to_string(bay.join("f.txt")).unwrap(), "f v1\n");
 }

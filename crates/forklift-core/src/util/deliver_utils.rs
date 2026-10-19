@@ -58,7 +58,8 @@ pub struct DeliverOutcome {
 pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutcome, String> {
     pallet_utils::validate_pallet_name(target)?;
 
-    let source = pallet_utils::get_current_pallet_name()?;
+    let position = pallet_utils::read_position()?;
+    let source = position.pallet.clone();
 
     if target == source {
         return Err("A pallet cannot be delivered to itself.".to_string());
@@ -83,7 +84,12 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         ));
     }
 
-    let draft_head = pallet_utils::get_pallet_head(&source)?.ok_or(format!(
+    // The delivered parcel carries the tree this bay holds, and the bay ends up on it. A bay behind
+    // its draft pallet would deliver a tree without the draft's latest parcels, so it catches up
+    // first.
+    position.require_current("delivered")?;
+
+    let draft_head = position.base.clone().ok_or(format!(
         "Pallet \"{}\" has nothing stacked yet; there is nothing to deliver.", source
     ))?;
 
@@ -186,8 +192,9 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     pallet_utils::update_pallet_head(target, target_head.as_deref(), &object.hash)?;
 
     // The delivered tree equals the draft's, so switching the current pallet needs no
-    // materialization — the working directory already matches.
-    pallet_utils::set_current_pallet_name(target)?;
+    // materialization — the working directory already matches, and the bay stands on the
+    // delivered parcel.
+    pallet_utils::record_landed(target, &object.hash)?;
 
     Ok(DeliverOutcome {
         delivered: object.hash,

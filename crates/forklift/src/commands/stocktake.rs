@@ -14,8 +14,10 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - If the stocktake completed successfully.
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(summary: bool) -> Result<(), String> {
-    let pallet = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&pallet)?;
+    // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
+    let position = pallet_utils::read_position()?;
+    let pallet = position.pallet.clone();
+    let head = position.base.clone();
 
     let consolidation = merge_utils::read_consolidation_state()?
         .map(|state| state.their_pallet);
@@ -37,9 +39,13 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
     let (unstaged, staged) = tokio::join!(stocktake_utils::collect_unstaged_changes(), staged);
     let (staged, unstaged) = (staged?, unstaged?);
 
+    // Another bay or process may have moved the pallet past the tree this bay holds.
+    let moved_to = position.head()?.filter(|moved| head.as_ref() != Some(moved));
+
     let report = StocktakeReport {
         pallet,
         head,
+        moved_to,
         consolidation_in_progress: consolidation,
         staged_count: staged.len(),
         unstaged_count: unstaged.len(),
@@ -63,14 +69,20 @@ pub(crate) struct StocktakeReport {
     /// The current pallet.
     pallet: String,
 
-    /// The pallet's head parcel, or `null` when it is unborn.
+    /// The parcel this bay's files stand on, which staged changes are measured against: the
+    /// pallet's head unless the pallet moved since; `null` when it is unborn.
     head: Option<String>,
+
+    /// The pallet's head, when another bay or process moved the pallet past `head` since this
+    /// bay's files were materialized. `shift <pallet>` catches up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to: Option<String>,
 
     /// The pallet being consolidated in, when a merge is in progress.
     #[serde(skip_serializing_if = "Option::is_none")]
     consolidation_in_progress: Option<String>,
 
-    /// How many changes are staged (inventory vs pallet head).
+    /// How many changes are staged (inventory vs `head`).
     staged_count: usize,
 
     /// How many changes are unstaged (working directory vs inventory).
@@ -93,6 +105,14 @@ impl CommandOutput for StocktakeReport {
         match &self.head {
             Some(hash) => println!("On pallet \"{}\" (head {})", self.pallet, hash),
             None => println!("On pallet \"{}\" (unborn — nothing stacked yet)", self.pallet),
+        }
+
+        if let Some(moved_to) = &self.moved_to {
+            println!(
+                "The pallet has moved on to parcel {} since this bay's files were materialized; \
+                \"shift {}\" catches up.",
+                moved_to, self.pallet
+            );
         }
 
         if let Some(their_pallet) = &self.consolidation_in_progress {

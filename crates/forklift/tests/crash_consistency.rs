@@ -255,6 +255,13 @@ fn run_kill_spread(
         }
         *prior_head = head_now;
 
+        // A kill between the head write and the position write leaves the bay behind its own
+        // parcel, with files that already match it; catching up records the head, and is a no-op
+        // otherwise. Without it every later stack would be refused as stale.
+        let caught_up = area.run(&["shift", "main"]);
+        assert!(caught_up.status.success(), "catch-up after {commit_tag} kill #{i} failed: {}",
+            String::from_utf8_lossy(&caught_up.stderr));
+
         // 2. Make a fresh change and stage it.
         rewrite_corpus(file, base_line, STACK_CORPUS_LINES, &format!("{commit_tag} {i}"));
         let load = area.run(&["load", "."]);
@@ -327,6 +334,8 @@ fn killing_stack_midway_never_corrupts_the_store() {
     area.clear_stale_lock();
     area.assert_consistent("final");
 
+    let caught_up = area.run(&["shift", "main"]);
+    assert!(caught_up.status.success(), "the final catch-up failed: {}", String::from_utf8_lossy(&caught_up.stderr));
     assert!(area.run(&["load", "."]).status.success());
     let recover = area.run(&["stack", "recover"]);
     let recovered_ok = recover.status.success()

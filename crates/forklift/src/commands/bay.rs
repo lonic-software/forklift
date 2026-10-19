@@ -54,9 +54,11 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     let warehouse_root = std::env::current_dir()
         .map_err(|e| format!("Error while getting the warehouse root: {}", e))?;
 
-    // A bay branches off the current pallet's head, so there must be one.
-    let current = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&current)?.ok_or(format!(
+    // A bay branches off the parcel this bay's files stand on (the current pallet's head, unless
+    // another bay moved it since), so there must be one.
+    let position = pallet_utils::read_position()?;
+    let current = position.pallet.clone();
+    let head = position.base.clone().ok_or(format!(
         "Pallet \"{}\" has nothing stacked yet; stack something before opening a bay.", current
     ))?;
 
@@ -87,6 +89,9 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     std::fs::create_dir_all(&bay_dir)
         .map_err(|e| format!("Error while creating the bay directory \"{}\": {}", bay_dir.to_string_lossy(), e))?;
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
+    // The position goes in first, so a listed bay always has one for collection to root; a bay
+    // interrupted before it is named by collection's refusal until `bay remove` drops it.
+    pallet_utils::write_position_in(&bay_utils::bay_state_dir(name), &pallet_utils::BayPosition::new(name, Some(head.clone())))?;
     // The path file is written before the redirect, so a bay without a path file never wrote
     // one — which is what lets `bay remove` drop such a bay without leaving a redirect behind.
     bay_utils::write_bay_path(name, &bay_dir)?;
@@ -102,8 +107,6 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // The new bay's own lock, held until it is filled: a command run in the bay meanwhile waits
     // for it rather than staging against a half-made tree or clearing an assembly in flight.
     let _bay_lock = lock_utils::WarehouseLock::acquire()?;
-
-    pallet_utils::set_current_pallet_name(name)?;
 
     // Record the materialization scope before materializing — the materialize (and every
     // later scope-aware verb in this bay) reads it back through `scope_utils::current_scope`.

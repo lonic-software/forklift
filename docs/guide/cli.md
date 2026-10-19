@@ -878,6 +878,12 @@ completed on the pallet it started on (`palletize` and `deliver` refuse then too
 and `stack` refuses to complete it on any other pallet). Untracked files are left alone unless the
 target needs to write over one.
 
+`shift` to the pallet you are already on **catches up**: when another bay moved the pallet
+since this bay's files were materialized (`stocktake` says so), it moves the files to the
+pallet's head. With no local changes the files are moved; if they already match the head, only
+the bay's record is updated. With local changes it refuses and names the way through: `park`,
+`shift` again, `park pop`. A catch-up is not journaled, so `undo` never reverses it.
+
 On a case-insensitive file system (the default on macOS and Windows), two names
 that differ only in case, such as `README` and `readme`, are one file. Every
 command that writes the working directory (`shift`, `consolidate`, `cherry-pick`,
@@ -991,6 +997,14 @@ a `.forklift` *file* (a redirect back to the warehouse), and its local state liv
 `.forklift/bays/<name>/`.
 
 Because the refs are shared, two bays can reach for the same pallet — say both are on `main`.
+Each bay records the parcel its files stand on. When another bay stacks on the pallet, this bay
+is **behind**: `stocktake` reports that the pallet moved on, and `stack`, `consolidate`,
+`cherry-pick`, `haul merge`, `lower`, `deliver` and `lift`'s auto-merge refuse, naming both
+parcels, rather than build on the old tree and revert the other bay's work. `shift <pallet>`
+catches up (see `shift`), and shifting to another pallet works as usual. A merge or pick
+started before the pallet moved cannot be completed or caught up past; abort it and redo it
+after catching up.
+
 Each command moves a pallet only from the head it started from: if another bay moved it in
 the meantime, the command is refused with a message naming both heads, and whatever it had
 already written to its own working tree is put back. A head another bay moved is never
@@ -1001,10 +1015,10 @@ that completes on its own is stacked on the head it merged against; if that head
 merge is undone in the working tree and inventory and nothing is left in progress, so running
 the command again is safe. A merge or pick you resolved by hand is stacked on the head it
 started from too, but there a refused `stack` keeps it in progress, since putting the tree back
-would throw your resolutions away. The message says how to redo it on the new head: abort it,
-`restore --staged .` then `restore .`, delete the files that leaves behind as untracked (it
-lists them), and merge again. Do not stack the merge output after aborting — that would revert the other bay's
-parcel. And `undo` only ever reverses refs your own command moved; a move another bay made in
+would throw your resolutions away. To redo it on the new head: abort it, `restore --staged .`
+then `restore .`, delete the files the merge added (they are left untracked), catch up with
+`shift <pallet>`, and merge again. Stacking the merge output instead is refused while the bay is
+behind. And `undo` only ever reverses refs your own command moved; a move another bay made in
 the meantime is never undone.
 
 ### `bay add --scope` — a scoped (sparse) bay

@@ -1837,14 +1837,15 @@ fn shift_switches_pallets_and_materializes_the_target_tree() {
         "only on feature\n"
     );
 
-    // Guards: unknown pallet, and shifting to the pallet already current.
+    // Guards: unknown pallet; shifting to the pallet already current is a catch-up, which has
+    // nothing to do at its head.
     let unknown = warehouse.run(&["shift", "nope"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("No pallet named"));
 
     let same = warehouse.run(&["shift", "feature"]);
-    assert!(!same.status.success());
-    assert!(stderr(&same).contains("Already on"));
+    assert_success(&same);
+    assert!(stdout(&same).contains("Already at the head of pallet \"feature\""), "{}", stdout(&same));
 }
 
 #[test]
@@ -5630,6 +5631,336 @@ fn bays_are_parallel_working_directories_sharing_the_warehouse() {
     assert!(stdout(&warehouse.run(&["bay"])).contains("feature"));
     assert_success(&warehouse.run(&["bay", "remove", "feature"]));
     assert!(stdout(&warehouse.run(&["bay"])).contains("No bays"));
+}
+
+// FORK-213: a bay records the parcel its files stand on (its base) beside its pallet. Two bays
+// current on one pallet: bay A is the main tree, bay B a second bay, both on main. Every test below
+// names the production change whose revert turns it red.
+
+/// A warehouse with f.txt and g.txt stacked on main, and a second bay "b" on main beside the main
+/// tree, both standing on that first parcel.
+fn two_bays_on_main(name: &str) -> (TestWarehouse, std::path::PathBuf) {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("f.txt", "f v1\n");
+    warehouse.write_file("g.txt", "g v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-b");
+    assert_success(&warehouse.run(&["bay", "add", "b", bay_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run_at(&bay_dir, &["shift", "main"]));
+
+    (warehouse, bay_dir)
+}
+
+/// Write `content` to `file` in `dir`, load it and stack it there; the new head of main.
+fn stack_at(warehouse: &TestWarehouse, dir: &std::path::Path, file: &str, content: &str, message: &str) -> String {
+    std::fs::write(dir.join(file), content).unwrap();
+    assert_success(&warehouse.run_at(dir, &["load", file]));
+    assert_success(&warehouse.run_at(dir, &["stack", message]));
+    pallet_head_hash(warehouse, "main")
+}
+
+/// The position file of the main tree (`None`) or of a named bay.
+fn position_path(warehouse: &TestWarehouse, bay: Option<&str>) -> std::path::PathBuf {
+    match bay {
+        None => warehouse.root.join(".forklift").join("position"),
+        Some(bay) => warehouse.root.join(".forklift").join("bays").join(bay).join("position"),
+    }
+}
+
+/// The base a bay's position records (empty for an unborn pallet).
+fn bay_base(warehouse: &TestWarehouse, bay: Option<&str>) -> String {
+    std::fs::read_to_string(position_path(warehouse, bay)).unwrap().lines().nth(2).unwrap().to_string()
+}
+
+/// Write a bay's position by hand, as a crash between two writes would leave it.
+fn write_position(warehouse: &TestWarehouse, bay: Option<&str>, pallet: &str, base: &str) {
+    std::fs::write(position_path(warehouse, bay), format!("/forklift-position 1\n{}\n{}\n", pallet, base)).unwrap();
+}
+
+// T1. Revert: stack's compare-and-set expecting a fresh read of the ref, with the up-front check
+// removed → B's stack succeeds and main's f is back at v1.
+#[test]
+fn a_stale_bays_stack_is_refused_and_catching_up_keeps_the_other_bays_parcel() {
+    let (warehouse, bay) = two_bays_on_main("stale-bay-stack");
+    let initial = pallet_head_hash(&warehouse, "main");
+    let a_head = stack_at(&warehouse, &warehouse.root, "f.txt", "f v2 from A\n", "A changes f");
+
+    std::fs::write(bay.join("g.txt"), "g v2 from B\n").unwrap();
+    assert_success(&warehouse.run_at(&bay, &["load", "g.txt"]));
+    let stacked = warehouse.run_at(&bay, &["stack", "B changes g"]);
+
+    assert!(!stacked.status.success(), "a stale bay's stack must be refused: {}", stdout(&stacked));
+    let refusal = stderr(&stacked);
+    assert!(refusal.contains("behind pallet \"main\"") && refusal.contains(&initial) && refusal.contains(&a_head)
+        && refusal.contains("forklift shift main"), "{}", refusal);
+    assert_eq!(pallet_head_hash(&warehouse, "main"), a_head, "the refusal moved nothing");
+
+    // The way out the catch-up refusal names: park, catch up, pop.
+    let catch_up = warehouse.run_at(&bay, &["shift", "main"]);
+    assert!(!catch_up.status.success() && stderr(&catch_up).contains("park"), "{}", stderr(&catch_up));
+    assert_success(&warehouse.run_at(&bay, &["park"]));
+    assert_success(&warehouse.run_at(&bay, &["shift", "main"]));
+    assert_success(&warehouse.run_at(&bay, &["park", "pop"]));
+    assert_success(&warehouse.run_at(&bay, &["load", "g.txt"]));
+    assert_success(&warehouse.run_at(&bay, &["stack", "B changes g"]));
+
+    assert!(stdout(&warehouse.run(&["show", "main:f.txt"])).contains("f v2 from A"));
+    assert!(stdout(&warehouse.run(&["show", "main:g.txt"])).contains("g v2 from B"));
+}
+
+// T2. Revert: shift's from-tree back to the pallet's ref → `shift b` is refused as dirty.
+#[test]
+fn a_stale_clean_bay_reports_the_moved_pallet_and_can_shift_away() {
+    let (warehouse, bay) = two_bays_on_main("stale-bay-shift");
+    let a_head = stack_at(&warehouse, &warehouse.root, "f.txt", "f v2 from A\n", "A changes f");
+
+    let status = stdout(&warehouse.run_at(&bay, &["stocktake"]));
+    assert!(!status.contains("Staged changes") && status.contains(&format!("moved on to parcel {}", a_head)), "{}", status);
+
+    let shifted = warehouse.run_at(&bay, &["shift", "b"]);
+    assert_success(&shifted);
+
+    // And back: an ordinary shift lands on main's head, A's parcel included.
+    assert_success(&warehouse.run_at(&bay, &["shift", "main"]));
+    assert_eq!(std::fs::read_to_string(bay.join("f.txt")).unwrap(), "f v2 from A\n");
+    assert_eq!(bay_base(&warehouse, Some("b")), a_head);
+}
+
+// T3. Pins deliver's policy refusal only. Revert: drop deliver's currency check → it delivers.
+#[test]
+fn deliver_from_a_bay_behind_its_draft_pallet_is_refused() {
+    let warehouse = TestWarehouse::new("stale-bay-deliver");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    assert_success(&warehouse.run(&["palletize", "draft"]));
+
+    let bay = warehouse.home.join("bay-b");
+    assert_success(&warehouse.run(&["bay", "add", "b", bay.to_str().unwrap()]));
+    assert_success(&warehouse.run_at(&bay, &["shift", "draft"]));
+
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "A drafts v2"]));
+    let main_head = pallet_head_hash(&warehouse, "main");
+
+    let delivered = warehouse.run_at(&bay, &["deliver", "main", "-m", "stale"]);
+    assert!(!delivered.status.success(), "{}", stdout(&delivered));
+    assert!(stderr(&delivered).contains("behind pallet \"draft\""), "{}", stderr(&delivered));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), main_head);
+}
+
+// T5. Stack's crash window between its ref write and its position write: the ref holds B's own
+// parcel, the position the old base, and nothing is in progress. Catch-up records the head and
+// touches no file. Revert: catch-up without its clean-against-head arm → refused.
+#[test]
+fn catching_up_after_an_interrupted_stack_only_records_the_head() {
+    let (warehouse, bay) = two_bays_on_main("stale-bay-crash");
+    let initial = pallet_head_hash(&warehouse, "main");
+    let b_head = stack_at(&warehouse, &bay, "f.txt", "f v2 from B\n", "B changes f");
+    write_position(&warehouse, Some("b"), "main", &initial);
+
+    let before = std::fs::metadata(bay.join("f.txt")).unwrap().modified().unwrap();
+    let caught_up = warehouse.run_at(&bay, &["--json", "shift", "main"]);
+    assert_success(&caught_up);
+    assert_eq!(json(&caught_up)["data"]["moved_files"], false);
+    assert_eq!(json(&caught_up)["data"]["head"], b_head.as_str());
+    assert_eq!(bay_base(&warehouse, Some("b")), b_head);
+    assert_eq!(std::fs::metadata(bay.join("f.txt")).unwrap().modified().unwrap(), before, "no file was touched");
+    assert!(!stdout(&warehouse.run_at(&bay, &["stocktake"])).contains("Staged changes"));
+}
+
+// T6. Revert: restore the missing-file fallback to "main" → the missing case passes.
+#[test]
+fn a_header_less_or_missing_position_is_refused_naming_the_file() {
+    let warehouse = TestWarehouse::new("position-unreadable");
+    assert_success(&warehouse.run(&["prepare"]));
+    let path = position_path(&warehouse, None);
+    let named = std::path::Path::new(".forklift").join("position").to_string_lossy().into_owned();
+
+    std::fs::write(&path, "main\n").unwrap();
+    let headerless = warehouse.run(&["stocktake"]);
+    assert!(!headerless.status.success());
+    assert!(stderr(&headerless).contains(&named) && stderr(&headerless).contains("no format header"),
+        "{}", stderr(&headerless));
+
+    std::fs::remove_file(&path).unwrap();
+    let missing = warehouse.run(&["stocktake"]);
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains(&named), "{}", stderr(&missing));
+}
+
+/// T7's and T8's warehouse: main at Y (f "main v2"), pallet side forked at the first parcel with
+/// f "side", and bay b on main at Y mid-consolidation of side, stopped at the conflict on f.
+fn bay_mid_consolidation(name: &str) -> (TestWarehouse, std::path::PathBuf, String) {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("f.txt", "f v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["palletize", "side"]));
+    stack_at(&warehouse, &warehouse.root, "f.txt", "side\n", "side changes f");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let y = stack_at(&warehouse, &warehouse.root, "f.txt", "main v2\n", "main changes f");
+
+    let bay = warehouse.home.join("bay-b");
+    assert_success(&warehouse.run(&["bay", "add", "b", bay.to_str().unwrap()]));
+    assert_success(&warehouse.run_at(&bay, &["shift", "main"]));
+    let consolidated = warehouse.run_at(&bay, &["consolidate", "side"]);
+    assert_success(&consolidated);
+    assert!(bay_state_file(&warehouse, "b", "consolidation").exists(), "{}", stdout(&consolidated));
+
+    (warehouse, bay, y)
+}
+
+fn bay_state_file(warehouse: &TestWarehouse, bay: &str, file: &str) -> std::path::PathBuf {
+    warehouse.root.join(".forklift").join("bays").join(bay).join(file)
+}
+
+// T7. B resolves its consolidation to the very tree A then stacks, and tries to catch up and stack
+// anyway. Reverts: catch-up without its mid-merge refusal → B catches up (its files match A's
+// head), and stack's our_head-equals-base guard still refuses; that guard alone reverted → B
+// stays behind and is refused as stale; both together → B's merge parcel, built on the old head,
+// lands and drops A's parcel from main.
+#[test]
+fn a_consolidation_started_before_the_pallet_moved_never_lands() {
+    let (warehouse, bay, _) = bay_mid_consolidation("stale-bay-mid-merge");
+    std::fs::write(bay.join("f.txt"), "resolved\n").unwrap();
+    assert_success(&warehouse.run_at(&bay, &["load", "f.txt"]));
+
+    // A stacks the same tree B resolved to, plus nothing else.
+    let a_head = stack_at(&warehouse, &warehouse.root, "f.txt", "resolved\n", "A resolves f the same way");
+
+    let _ = warehouse.run_at(&bay, &["shift", "main"]);
+    let stacked = warehouse.run_at(&bay, &["stack", "B completes the merge"]);
+    assert!(!stacked.status.success(), "{}", stdout(&stacked));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), a_head);
+}
+
+// T7's catch-up half. Revert: catch-up without its mid-merge refusal → it catches up.
+#[test]
+fn catching_up_mid_consolidation_is_refused() {
+    let (warehouse, bay, _) = bay_mid_consolidation("stale-bay-catch-up-mid-merge");
+    std::fs::write(bay.join("f.txt"), "resolved\n").unwrap();
+    assert_success(&warehouse.run_at(&bay, &["load", "f.txt"]));
+    stack_at(&warehouse, &warehouse.root, "f.txt", "resolved\n", "A resolves f the same way");
+
+    let catch_up = warehouse.run_at(&bay, &["shift", "main"]);
+    assert!(!catch_up.status.success() && stderr(&catch_up).contains("consolidation is in progress"), "{}", stderr(&catch_up));
+
+    let stacked = warehouse.run_at(&bay, &["stack", "B completes the merge"]);
+    assert!(stderr(&stacked).contains("consolidation is kept") && stderr(&stacked).contains("forklift shift main"),
+        "{}", stderr(&stacked));
+}
+
+// T8. B's consolidate stops at conflicts, A stacks, B undoes. Reverts: undo putting back refs whose
+// heads are equal → the undo is refused because main moved; undo recording a fresh read of the
+// ref as the base → B's next stack succeeds and reverts A's parcel.
+#[test]
+fn undoing_a_conflicted_consolidate_after_another_bay_stacked_leaves_the_bay_behind() {
+    let (warehouse, bay, y) = bay_mid_consolidation("stale-bay-undo-merge");
+    stack_at(&warehouse, &warehouse.root, "k.txt", "k from A\n", "A adds k");
+
+    let undone = warehouse.run_at(&bay, &["undo"]);
+    assert_success(&undone);
+    assert!(!bay_state_file(&warehouse, "b", "consolidation").exists());
+    assert_eq!(bay_base(&warehouse, Some("b")), y);
+
+    // The conflicted file is still there to resolve; a resolved and loaded stack is refused as
+    // stale rather than landing on A's parcel without it.
+    std::fs::write(bay.join("f.txt"), "resolved\n").unwrap();
+    assert_success(&warehouse.run_at(&bay, &["load", "f.txt"]));
+    let stacked = warehouse.run_at(&bay, &["stack", "B after undo"]);
+    assert!(!stacked.status.success(), "{}", stdout(&stacked));
+    assert!(stderr(&stacked).contains("behind pallet \"main\""), "{}", stderr(&stacked));
+    assert!(stdout(&warehouse.run(&["show", "main:k.txt"])).contains("k from A"));
+}
+
+// T9. Revert: journal the catch-up as a "shift" → undo reports an undone shift and changes nothing.
+#[test]
+fn catching_up_is_not_journaled() {
+    let (warehouse, bay) = two_bays_on_main("stale-bay-catch-up-undo");
+    let a_head = stack_at(&warehouse, &warehouse.root, "f.txt", "f v2 from A\n", "A changes f");
+
+    assert_success(&warehouse.run_at(&bay, &["shift", "main"]));
+    let undone = warehouse.run_at(&bay, &["undo"]);
+    assert!(!stdout(&undone).contains("Undid shift"), "{}", stdout(&undone));
+    assert_eq!(bay_base(&warehouse, Some("b")), a_head);
+    assert_eq!(std::fs::read_to_string(bay.join("f.txt")).unwrap(), "f v2 from A\n");
+}
+
+/// T10's bay b: it stacked X→N (f changed) and then edited g without loading it, and an undo of
+/// that stack was cut short after writing the earlier position {main, X}. Returns X and N.
+fn half_undone_bay(name: &str) -> (TestWarehouse, std::path::PathBuf, String, String) {
+    let (warehouse, bay) = two_bays_on_main(name);
+    let x = pallet_head_hash(&warehouse, "main");
+    let n = stack_at(&warehouse, &bay, "f.txt", "f from N\n", "B's N");
+    std::fs::write(bay.join("g.txt"), "g edited\n").unwrap();
+    write_position(&warehouse, Some("b"), "main", &x);
+
+    (warehouse, bay, x, n)
+}
+
+// T10 (i). Revert: the gate without its half-undone arm → the retry is refused at the gate.
+#[test]
+fn a_half_applied_undo_resumes() {
+    let (warehouse, bay, x, _) = half_undone_bay("half-undo-resume");
+
+    assert_success(&warehouse.run_at(&bay, &["undo"]));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), x);
+    assert_eq!(bay_base(&warehouse, Some("b")), x);
+    assert_eq!(std::fs::read_to_string(bay.join("g.txt")).unwrap(), "g edited\n");
+}
+
+// T10 (ii). Another bay stacked N→M before the retry. Revert: the gate without its half-undone arm
+// → refused at the gate with the position left at X.
+#[test]
+fn a_half_applied_undo_after_another_bay_stacked_on_its_result_keeps_that_result() {
+    let (warehouse, bay, _, n) = half_undone_bay("half-undo-moved");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let m = stack_at(&warehouse, &warehouse.root, "k.txt", "k from M\n", "A's M");
+
+    let undone = warehouse.run_at(&bay, &["undo"]);
+    assert!(!undone.status.success(), "{}", stdout(&undone));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), m);
+    assert_eq!(bay_base(&warehouse, Some("b")), n);
+
+    assert_success(&warehouse.run_at(&bay, &["park"]));
+    assert_success(&warehouse.run_at(&bay, &["shift", "main"]));
+    assert_success(&warehouse.run_at(&bay, &["park", "pop"]));
+    assert_eq!(std::fs::read_to_string(bay.join("g.txt")).unwrap(), "g edited\n");
+    assert_eq!(std::fs::read_to_string(bay.join("k.txt")).unwrap(), "k from M\n");
+    assert_eq!(std::fs::read_to_string(bay.join("f.txt")).unwrap(), "f from N\n");
+}
+
+// T10 (iii). The ref restore landed (main back at X) but the entry was not popped, and another bay
+// then stacked X→M. Revert: write back the operation's position whenever the ref is anywhere but
+// X → the position becomes N, and the park loses N's change.
+#[test]
+fn a_landed_undo_overtaken_by_another_bay_keeps_the_earlier_base() {
+    let (warehouse, bay, x, _) = half_undone_bay("half-undo-landed");
+    std::fs::write(warehouse.root.join(".forklift").join("pallets").join("main"), format!("{}\n", x)).unwrap();
+    let m = stack_at(&warehouse, &warehouse.root, "k.txt", "k from M\n", "A's M");
+
+    let undone = warehouse.run_at(&bay, &["undo"]);
+    assert!(!undone.status.success(), "{}", stdout(&undone));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), m);
+    assert_eq!(bay_base(&warehouse, Some("b")), x);
+
+    assert_success(&warehouse.run_at(&bay, &["park"]));
+    assert_success(&warehouse.run_at(&bay, &["shift", "main"]));
+    assert_success(&warehouse.run_at(&bay, &["park", "pop"]));
+    assert_eq!(std::fs::read_to_string(bay.join("f.txt")).unwrap(), "f from N\n");
+    assert_eq!(std::fs::read_to_string(bay.join("g.txt")).unwrap(), "g edited\n");
+    assert_eq!(std::fs::read_to_string(bay.join("k.txt")).unwrap(), "k from M\n");
 }
 
 #[test]

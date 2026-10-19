@@ -35,7 +35,8 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     // out-of-scope conflict refuses (`out_of_scope_conflict`). In-scope content merges as usual.
     pallet_utils::validate_pallet_name(target)?;
 
-    let current = pallet_utils::get_current_pallet_name()?;
+    let position = pallet_utils::read_position()?;
+    let current = position.pallet.clone();
 
     if target == current {
         return Err("A pallet cannot be consolidated into itself.".to_string());
@@ -56,7 +57,10 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
         );
     }
 
-    let Some(our_head) = pallet_utils::get_pallet_head(&current)? else {
+    // The merge is built on the tree this bay holds, and moves the pallet from there.
+    position.require_current("consolidated")?;
+
+    let Some(our_head) = position.base.clone() else {
         return Err(format!(
             "Pallet \"{}\" has nothing stacked yet; there is nothing to consolidate into.",
             current
@@ -351,7 +355,7 @@ pub(crate) async fn stack_completion(description: Option<String>,
                                      anchor: file_utils::StatAnchor) -> Result<String, String> {
     let (error, pallet, parcel, tree) = match stack_utils::stack_parcel(description, Some(our_head)).await {
         Ok((parcel, _)) => return Ok(parcel),
-        Err(StackError::Other(error)) => return Err(error),
+        Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => return Err(error.into()),
         Err(StackError::HeadWrite { error, pallet, parcel, tree }) => (error, pallet, parcel, tree),
     };
 
@@ -686,8 +690,8 @@ mod tests {
         let their_head = test_support::store_parcel(&their_tree, &[&our_head]);
         let elsewhere = test_support::store_parcel(&test_support::store_tree("file.txt", b"elsewhere\n"), &[&our_head]);
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
@@ -728,8 +732,8 @@ mod tests {
         );
         let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 

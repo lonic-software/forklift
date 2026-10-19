@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::globals::bay_root;
-use forklift_core::util::pallet_utils::{RefMoved, RefUpdateError};
+use forklift_core::util::pallet_utils::RefUpdateError;
 use forklift_core::util::stack_utils::{self, StackError};
 use forklift_core::util::stocktake_utils::{self, ChangeKind};
 use forklift_core::util::{cherry_pick_utils, merge_utils, object_utils};
@@ -27,7 +27,16 @@ pub async fn handle_command(description: Option<String>) -> Result<(), String> {
     let (parcel, pallet) = match stack_utils::stack_parcel(description, None).await {
         Ok(stacked) => stacked,
         Err(StackError::HeadWrite { error: RefUpdateError::Moved(moved), .. }) => {
-            return Err(moved_under_merge(moved).await);
+            let pallet = moved.reference.to_wire();
+
+            return Err(moved_under_merge(&pallet, moved.found.as_deref()).await?.unwrap_or(moved.to_string()));
+        }
+        Err(StackError::Behind { pallet, base, head }) => {
+            if let Some(refusal) = moved_under_merge(&pallet, head.as_deref()).await? {
+                return Err(refusal);
+            }
+
+            return Err(StackError::Behind { pallet, base, head }.into());
         }
         Err(error) => return Err(error.into()),
     };
@@ -37,14 +46,15 @@ pub async fn handle_command(description: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// The refusal for a stack whose pallet another bay or process moved. With a consolidation or
-/// cherry-pick in progress, its staged output was built on the head it recorded, so stacking it on
-/// the new head would revert the other bay's parcel: the message names the whole way out — abort,
-/// discard the output, delete the files `restore` leaves behind as untracked (the staged paths
-/// the pallet's new head does not hold) and merge again.
-async fn moved_under_merge(moved: RefMoved) -> String {
-    let consolidation = merge_utils::read_consolidation_state().ok().flatten();
-    let pick = cherry_pick_utils::read_state().ok().flatten();
+/// The refusal for a stack whose pallet another bay or process moved to `found`, when a
+/// consolidation or cherry-pick is in progress (`None` otherwise). Its staged output was built on
+/// the head it recorded, this bay's base, so stacking it on the new head would revert the other
+/// bay's parcel: the message names the whole way out — abort, discard the output, delete the files
+/// `restore` leaves behind as untracked (the staged paths the base does not hold), catch up and
+/// merge again.
+async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<String>, String> {
+    let consolidation = merge_utils::read_consolidation_state()?;
+    let pick = cherry_pick_utils::read_state()?;
 
     let (what, base, abort, again) = match (consolidation, pick) {
         (Some(state), _) => (
@@ -59,10 +69,10 @@ async fn moved_under_merge(moved: RefMoved) -> String {
             cherry_pick_utils::abort_hint(),
             format!("cherry-pick {} again", state.source),
         ),
-        (None, None) => return moved.to_string(),
+        (None, None) => return Ok(None),
     };
 
-    let left = match left_untracked(moved.found.as_deref()).await {
+    let left = match left_untracked(&base).await {
         Ok(left) if left.is_empty() => String::new(),
         Ok(left) => format!(
             " delete the files \"restore\" leaves behind as untracked: {};",
@@ -75,32 +85,30 @@ async fn moved_under_merge(moved: RefMoved) -> String {
         ),
     };
 
-    format!(
+    Ok(Some(format!(
         "Another bay or process moved pallet \"{}\" since this {} started: it was built on {}, and \
         the pallet is now at {}. Nothing was stacked, and the {} is kept: stacking it on the new \
         head would revert what was stacked there. To redo it on the new head: abort it ({}); \
-        discard its output with \"restore --staged .\" and then \"restore .\";{} then {}. Do not \
-        stack the output after aborting: that too would revert the other parcel.",
-        moved.reference.to_wire(),
+        discard its output with \"restore --staged .\" and then \"restore .\";{} catch up with \
+        \"forklift shift {}\"; then {}.",
+        pallet,
         what,
         base,
-        moved.found.as_deref().unwrap_or("no head"),
+        found.unwrap_or("no head"),
         what,
         abort,
         left,
+        pallet,
         again
-    )
+    )))
 }
 
-/// The staged paths `head`'s tree does not hold: once `restore --staged .` resets the inventory
-/// to the pallet's head, these are the files left behind as untracked.
-async fn left_untracked(head: Option<&str>) -> Result<Vec<String>, String> {
-    let tree = match head {
-        Some(head) => Some(object_utils::load_parcel(head)?.tree_hash),
-        None => None,
-    };
+/// The staged paths `base`'s tree does not hold: once `restore --staged .` resets the inventory
+/// to the parcel this bay stands on, these are the files left behind as untracked.
+async fn left_untracked(base: &str) -> Result<Vec<String>, String> {
+    let tree = object_utils::load_parcel(base)?.tree_hash;
 
-    Ok(stocktake_utils::collect_staged_changes(tree.as_deref()).await?
+    Ok(stocktake_utils::collect_staged_changes(Some(&tree)).await?
         .into_iter()
         .filter(|change| matches!(change.kind, ChangeKind::Added | ChangeKind::Moved))
         .map(|change| change.path)
@@ -139,7 +147,7 @@ mod tests {
     use crate::test_support::{self, Warehouse};
 
     #[test]
-    fn a_stack_completing_a_merge_whose_pallet_moved_is_refused_and_keeps_the_merge() {
+    fn a_stack_completing_a_merge_from_a_bay_behind_its_pallet_is_refused_and_keeps_the_merge() {
         let warehouse = Warehouse::with_working_tree("stack-merge-moved");
         test_support::configure_operator();
 
@@ -156,8 +164,8 @@ mod tests {
             &[&our_head],
         );
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
@@ -170,12 +178,15 @@ mod tests {
         // Another bay stacks on "main" before the merge is completed.
         pallet_utils::update_pallet_head("main", Some(&our_head), &elsewhere).unwrap();
 
+        // The bay is behind "main" now, so the merge is refused before anything is written, with
+        // the way out: abort, discard, delete what restore leaves untracked, catch up, merge again.
         let error = test_support::block_on(handle_command(None))
             .expect_err("completing a merge over a moved pallet must be refused");
-        assert!(error.contains("moved") && error.contains("consolidation is kept"), "{}", error);
-        assert!(error.contains("\"new.txt\""), "the files restore leaves untracked must be listed: {}", error);
-        assert!(!error.contains("both.txt"), "a file the new head holds is tracked again, never left: {}", error);
+        assert!(error.contains("consolidation is kept") && error.contains("forklift shift main"), "{}", error);
+        assert!(error.contains(&our_head) && error.contains(&elsewhere), "{}", error);
         assert!(error.contains("restore --staged"), "{}", error);
+        assert!(error.contains("\"new.txt\"") && error.contains("\"both.txt\""),
+            "the files restore leaves untracked against the base must be listed: {}", error);
 
         // Completing it from another pallet is refused before it starts.
         let shifted = test_support::block_on(crate::commands::shift::handle_command("feature"))
@@ -199,8 +210,8 @@ mod tests {
         let our_head = test_support::store_parcel(&our_tree, &[&base]);
         let their_head = test_support::store_parcel(&test_support::store_tree("a.txt", b"theirs\n"), &[&base]);
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
@@ -216,7 +227,7 @@ mod tests {
 
         // Any other switch to a pallet at the very same head: the merge must not land there.
         pallet_utils::update_pallet_head("side", None, &our_head).unwrap();
-        pallet_utils::set_current_pallet_name("side").unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("side", pallet_utils::get_pallet_head("side").unwrap())).unwrap();
 
         let error = test_support::block_on(handle_command(None))
             .expect_err("completing a merge from another pallet must be refused");
@@ -227,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_completing_a_pick_whose_pallet_moved_is_refused_and_keeps_the_pick() {
+    fn a_stack_completing_a_pick_from_a_bay_behind_its_pallet_is_refused_and_keeps_the_pick() {
         let warehouse = Warehouse::with_working_tree("stack-pick-moved");
         test_support::configure_operator();
 
@@ -240,8 +251,8 @@ mod tests {
         );
         let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
 
-        pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
         // A conflicted pick, resolved and loaded by hand.
@@ -255,7 +266,7 @@ mod tests {
 
         let error = test_support::block_on(handle_command(None))
             .expect_err("completing a pick over a moved pallet must be refused");
-        assert!(error.contains("moved") && error.contains("cherry-pick is kept"), "{}", error);
+        assert!(error.contains("cherry-pick is kept") && error.contains("forklift shift main"), "{}", error);
         assert!(error.contains("\"new.txt\""), "the files the pick added must be listed: {}", error);
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere),

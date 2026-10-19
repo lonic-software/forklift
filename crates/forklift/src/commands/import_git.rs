@@ -134,9 +134,11 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         .map(|(_, pallet)| pallet.clone());
 
     if let Some(pallet) = &current {
-        pallet_utils::set_current_pallet_name(pallet)?;
+        let head = pallet_utils::get_pallet_head(pallet)?;
 
-        if let Some(head) = pallet_utils::get_pallet_head(pallet)? {
+        pallet_utils::write_position(&pallet_utils::BayPosition::new(pallet, head.clone()))?;
+
+        if let Some(head) = head {
             progress.status("Building the inventory");
             let tree = object_utils::load_parcel(&head)?.tree_hash;
             let shards = shift_utils::build_inventories_for_tree(&tree, shift_utils::TreeProvenance::Verify)?;

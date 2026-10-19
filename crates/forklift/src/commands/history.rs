@@ -77,7 +77,7 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
         None => vec![match revision {
             Some(revision) => pallet_utils::resolve_revision(&revision)?,
             None => {
-                let pallet = pallet_utils::get_current_pallet_name()?;
+                let pallet = pallet_utils::read_position()?.pallet;
                 pallet_utils::get_pallet_head(&pallet)?.ok_or_else(|| output::empty_history(format!(
                     "Pallet \"{}\" has nothing stacked yet; there is no history.", pallet
                 )))?

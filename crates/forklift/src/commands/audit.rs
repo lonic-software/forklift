@@ -36,7 +36,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
     // A bare name is a working (user) pallet; `@office` reaches the office meta pallet.
     let pallet_ref = match pallet {
         Some(name) => PalletRef::parse(&name)?,
-        None => PalletRef::user(pallet_utils::get_current_pallet_name()?),
+        None => PalletRef::user(pallet_utils::read_position()?.pallet),
     };
 
     let Some(office_head) = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? else {

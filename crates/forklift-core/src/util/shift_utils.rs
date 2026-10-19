@@ -1188,8 +1188,8 @@ pub fn materialize_tree(from_tree: Option<&str>,
     Ok(())
 }
 
-/// Move `pallet` from `expected` to `new` after `written_tree` (the tree of `new`) was already
-/// materialized, putting the working tree and inventory back at `start_tree` (the tree of
+/// Move `pallet` from `expected` (the bay's base) to `new` after `written_tree` (the tree of `new`)
+/// was already materialized, recording `new` as the bay's base once it stands, and putting the working tree and inventory back at `start_tree` (the tree of
 /// `expected`, or the empty tree for an unborn pallet) if the pallet did not end up at `new` (see
 /// [`settle_head_write`], which decides that).
 pub fn write_head_or_roll_back(pallet: &str,
@@ -1199,7 +1199,7 @@ pub fn write_head_or_roll_back(pallet: &str,
                                start_tree: Option<&str>,
                                anchor: file_utils::StatAnchor) -> Result<(), String> {
     let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new) else {
-        return Ok(());
+        return crate::util::pallet_utils::record_landed(pallet, new);
     };
 
     match settle_head_write(pallet, new, error, written_tree, start_tree, anchor)? {
@@ -1226,8 +1226,8 @@ pub enum HeadWrite {
 
 /// Settle a head write of `pallet` to `new` that returned `error`, after `written_tree` (the tree
 /// of `new`) was already materialized. A failed write can still have landed, so the outcome is
-/// decided by reading the pallet back, never inferred from the error: at `new`, the tree is kept;
-/// anywhere else, the working tree and inventory are put back at `start_tree` (the empty tree for
+/// decided by reading the pallet back, never inferred from the error: at `new`, the tree is kept
+/// and the bay's position records `new` as its base; anywhere else, the working tree and inventory are put back at `start_tree` (the empty tree for
 /// `None`). Runs under the bay lock, so nothing else touched the bay since `written_tree` was
 /// materialized.
 ///
@@ -1244,13 +1244,22 @@ pub fn settle_head_write(pallet: &str,
                          anchor: file_utils::StatAnchor) -> Result<HeadWrite, String> {
     use crate::util::pallet_utils::{self, RefUpdateError};
 
+    // Wherever the tree is kept at `new`, the bay now stands on it.
+    let stands_on_new = || pallet_utils::record_landed(pallet, new);
+
     let error = match error {
-        RefUpdateError::Moved(moved) if moved.found.as_deref() == Some(new) => return Ok(HeadWrite::Stands),
+        RefUpdateError::Moved(moved) if moved.found.as_deref() == Some(new) => {
+            stands_on_new()?;
+            return Ok(HeadWrite::Stands);
+        }
         error => error.to_string(),
     };
 
     match pallet_utils::get_pallet_head(pallet) {
-        Ok(head) if head.as_deref() == Some(new) => return Ok(HeadWrite::Kept(error)),
+        Ok(head) if head.as_deref() == Some(new) => {
+            stands_on_new().map_err(|e| format!("{} {}", error, e))?;
+            return Ok(HeadWrite::Kept(error));
+        }
         Ok(_) => {}
         Err(e) => return Err(format!(
             "{} The pallet could not be read back ({}), so the working tree is left at tree {}; it \

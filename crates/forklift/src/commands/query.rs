@@ -69,7 +69,7 @@ pub async fn handle_command(args: QueryArgs) -> Result<(), String> {
             .map(|revision| pallet_utils::resolve_revision(revision))
             .collect::<Result<_, _>>()?,
         None => {
-            let pallet = pallet_utils::get_current_pallet_name()?;
+            let pallet = pallet_utils::read_position()?.pallet;
             match pallet_utils::get_pallet_head(&pallet)? {
                 Some(head) => vec![head],
                 None => Vec::new(),

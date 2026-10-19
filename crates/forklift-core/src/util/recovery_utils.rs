@@ -2633,6 +2633,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         plant_present_parent_with_absent_subtree_boundary();
 
@@ -3025,6 +3026,7 @@ mod tests {
             .join(file_utils::PREFIX_INVENTORY_FOLDER)
             .join(file_utils::FILE_NAME_INVENTORY_DATA);
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_utils::bay_state_dir("b"), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(&shard_path, bytes).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
@@ -3049,11 +3051,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let target_hash = "e".repeat(64);
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", target_hash)).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
@@ -3084,10 +3088,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         // Bay "b"'s `parked` file is malformed (not 64 hex chars) — `read_parked_in` errors on it.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
 
         let targets: BTreeSet<String> = ["a".repeat(64)].into_iter().collect();
@@ -3116,11 +3122,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let target_hash = "f".repeat(64);
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: target_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: "e".repeat(64), our_pallet: "main".to_string(),
         };
@@ -3429,6 +3437,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         let target_hash = "3".repeat(64);
@@ -3570,6 +3579,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         office_utils::write_trust_anchor(&TrustAnchor {
             genesis: "0".repeat(64),
@@ -3867,6 +3877,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         // A real, intact, otherwise-unreferenced object — directory-driven step 1 must restage it
@@ -3917,6 +3928,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         // A trust boundary naming a head this store never actually fetched — the never-held pin
@@ -4080,6 +4092,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         // A trivial, shared tree for both parcels — its own content does not matter to this
@@ -4172,6 +4185,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         let root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
@@ -4242,6 +4256,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         let mut blob_object = LooseObjectBuilder::build_blob(&Blob { content: b"blob B's content".to_vec() });
@@ -4323,6 +4338,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         // An orphan corrupt object — referenced by nothing at all.
@@ -5139,6 +5155,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         // Candidate A: genuinely absent everywhere, unreferenced by anything — must resolve.
@@ -5534,6 +5551,7 @@ mod tests {
         // this fix are about.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
 
         // A genuinely vanished object recorded as tainted, unrelated to bay "b"'s own state — so
@@ -5611,6 +5629,7 @@ mod tests {
         // corrupt, so that one reference is unreadable along with the rest of the file.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\nnot-a-valid-hash\n", vanished_hash)).unwrap();
 
         let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
@@ -5654,6 +5673,7 @@ mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
+        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
 
         plant_torn_taint(&forklift, &[]);
@@ -5961,6 +5981,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
         // A stray, unparseable index — unrelated to (and incapable of naming) the candidate below.

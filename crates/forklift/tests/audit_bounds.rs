@@ -138,9 +138,12 @@ impl Warehouse {
     }
 
     fn current_pallet(&self) -> String {
-        std::fs::read_to_string(self.root.join(".forklift").join("pallet"))
+        // The bay position record: a header line, then the pallet name, then the base.
+        std::fs::read_to_string(self.root.join(".forklift").join("position"))
             .unwrap()
-            .trim()
+            .lines()
+            .nth(1)
+            .unwrap()
             .to_string()
     }
 
