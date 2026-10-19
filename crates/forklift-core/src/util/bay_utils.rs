@@ -408,7 +408,7 @@ mod tests {
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parked_hash)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
-            their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(),
+            their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: "e".repeat(64),
         };
         std::fs::write(bay_b_dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 

@@ -134,7 +134,7 @@ fn get_current_pallet_path() -> PathBuf {
 ///
 /// # Returns
 /// * `PathBuf` - The path of the pallet's ref file (which may not exist yet).
-fn get_pallet_ref_path(namespace: PalletNamespace, name: &str) -> PathBuf {
+pub(crate) fn get_pallet_ref_path(namespace: PalletNamespace, name: &str) -> PathBuf {
     let mut path = get_namespace_folder(namespace);
 
     for component in name.split('/') {
@@ -479,9 +479,51 @@ pub fn update_pallet_head_in(
         file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    file_utils::write_file_atomically(&path, format!("{}\n", new).as_bytes())?;
+    let written = file_utils::write_file_atomically(&path, format!("{}\n", new).as_bytes());
+
+    // A failed write can still have landed (the rename went through, the directory sync did not);
+    // the log records what the ref now holds, so it is read back rather than inferred.
+    if written.is_ok() || get_pallet_head_in(namespace, name).ok().flatten().as_deref() == Some(new) {
+        log_write(PalletRef { namespace, name: name.to_string() }.to_wire(), found, new);
+    }
+
+    written?;
 
     Ok(())
+}
+
+/// One head write [`update_pallet_head_in`] made: the ref's wire form, the head it replaced
+/// (`None` for a ref it created) and the head it wrote.
+pub type LoggedWrite = (String, Option<String>, String);
+
+/// The write log: the head writes made under each recording warehouse, keyed by its
+/// `forklift_root`. This is how a journaled command learns which refs it moved itself, rather than
+/// diffing snapshots that would also catch what other bays or processes moved meanwhile. Keyed by
+/// root, not per thread, because a command's writes can run on any runtime thread, and so
+/// parallel tests in separate scratch warehouses neither see each other's writes nor switch each
+/// other's recording off.
+static WRITE_LOG: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Vec<LoggedWrite>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn write_log() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<PathBuf, Vec<LoggedWrite>>> {
+    WRITE_LOG.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Start recording this warehouse's head writes, discarding any recorded before.
+pub fn start_write_log() {
+    write_log().insert(forklift_root(), Vec::new());
+}
+
+/// Stop recording this warehouse's head writes and return them, oldest first (empty if it was
+/// not recording).
+pub fn take_write_log() -> Vec<LoggedWrite> {
+    write_log().remove(&forklift_root()).unwrap_or_default()
+}
+
+fn log_write(reference: String, old: Option<String>, new: &str) {
+    if let Some(entries) = write_log().get_mut(&forklift_root()) {
+        entries.push((reference, old, new.to_string()));
+    }
 }
 
 /// List the names of all user pallets that have a ref file, sorted alphabetically.
@@ -599,6 +641,42 @@ mod tests {
 
     fn ref_bytes(name: &str) -> Vec<u8> {
         std::fs::read(get_pallet_ref_path(PalletNamespace::User, name)).unwrap()
+    }
+
+    #[test]
+    fn the_write_log_records_only_its_own_recording_root() {
+        let (root, _scope) = scratch("write-log");
+
+        // Written before recording started: not logged.
+        update_pallet_head("main", None, &hash('a')).unwrap();
+
+        start_write_log();
+        update_pallet_head("main", Some(&hash('a')), &hash('b')).unwrap();
+        update_pallet_head("main", Some(&hash('b')), &hash('c')).unwrap();
+        update_meta_pallet_head("office", None, &hash('d')).unwrap();
+
+        // A refused write moved nothing, so it is not logged.
+        assert!(update_pallet_head("main", Some(&hash('a')), &hash('e')).is_err());
+
+        {
+            // Another warehouse, not recording: its writes go nowhere, and it reads back nothing.
+            let (other, _other_scope) = scratch("write-log-other");
+            update_pallet_head("main", None, &hash('f')).unwrap();
+            assert!(take_write_log().is_empty(), "a root that is not recording must read back nothing");
+            let _ = std::fs::remove_dir_all(&other);
+        }
+
+        assert_eq!(take_write_log(), vec![
+            ("main".to_string(), Some(hash('a')), hash('b')),
+            ("main".to_string(), Some(hash('b')), hash('c')),
+            ("@office".to_string(), None, hash('d')),
+        ]);
+
+        // Taking the log stopped recording.
+        update_pallet_head("main", Some(&hash('c')), &hash('a')).unwrap();
+        assert!(take_write_log().is_empty(), "taking the log must stop recording");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -314,8 +314,8 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
         }
     }
 
-    // Snapshot the pre-operation state for journaled commands (§7.8), so `undo` can
-    // reverse this operation. Best-effort throughout: a journaling problem must never
+    // Snapshot the pre-operation state for journaled commands (§7.8), and record the ref writes
+    // this process makes from here on, so `undo` can reverse this operation. Best-effort throughout: a journaling problem must never
     // block or fail a command. A missed entry costs only undo's reach — undo refuses an
     // older entry once the bay no longer matches it — and an unreadable journal is
     // reported by undo itself.

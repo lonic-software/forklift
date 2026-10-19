@@ -5,9 +5,11 @@ use forklift_core::model::blob::Blob;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    alias_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils,
-    pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
+    alias_utils, cherry_pick_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
+    office_utils, pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
 };
+use forklift_core::util::shift_utils::HeadWrite;
+use forklift_core::util::stack_utils::StackError;
 use crate::output::{self, CommandOutput};
 
 /// Handle the consolidate command (git's "merge"; warehouse workers consolidate loads
@@ -96,7 +98,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     // is one of the recognized self-heals — see `load_guard_utils`'s clearing-scope section — so
     // it must never be blocked); the incomplete-load guard for the genuine-merge path below lives
     // inside `merge_head_into_current` itself, covering every caller (consolidate/haul/lift).
-    match merge_head_into_current(&current, &our_head, &their_head, target, true).await? {
+    match merge_head_into_current(&current, &our_head, &their_head, target, true, anchor).await? {
         MergeStatus::Merged(hash) =>
             output::emit(&ConsolidateReport::merged(&current, target, &hash)),
         MergeStatus::Conflicts(conflicts) =>
@@ -240,8 +242,9 @@ pub(crate) enum MergeStatus {
 ///
 /// When `apply_conflicts` is false and the merge would conflict, **nothing is touched** and
 /// `Conflicts` is returned — so the optimistic path can bail without dirtying the working
-/// directory. Otherwise the merge is applied: a clean one is stacked (`Merged`), a
-/// conflicting one is left in progress for the operator to resolve (`Conflicts`).
+/// directory. Otherwise the merge is applied: a clean one is stacked on `our_head`
+/// (`Merged`, see [`stack_completion`]), a conflicting one is left in progress for the operator
+/// to resolve (`Conflicts`). `anchor` was taken before the caller's cleanliness check.
 ///
 /// # Returns
 /// * `Ok(MergeStatus)` - The outcome.
@@ -250,7 +253,8 @@ pub(crate) async fn merge_head_into_current(current: &str,
                                             our_head: &str,
                                             their_head: &str,
                                             their_label: &str,
-                                            apply_conflicts: bool) -> Result<MergeStatus, String> {
+                                            apply_conflicts: bool,
+                                            anchor: file_utils::StatAnchor) -> Result<MergeStatus, String> {
     // This function writes real merge output into the working inventory and only afterwards
     // records that a consolidation is in progress, before ever reaching `stack_utils::stack_parcel`'s
     // own guard. A `load` that started but never finished cleanly leaves a marker
@@ -314,17 +318,58 @@ pub(crate) async fn merge_head_into_current(current: &str,
     merge_utils::write_consolidation_state(&ConsolidationState {
         their_head: their_head.to_string(),
         their_pallet: their_label.to_string(),
+        our_head: our_head.to_string(),
     })?;
 
     if conflict_paths.is_empty() {
+        #[cfg(test)]
+        tests::BEFORE_MERGE_STACK.with(|seam| seam.take().map(|seam| seam()));
+
         let description = format!("Consolidated \"{}\" into \"{}\".", their_label, current);
-        let (hash, _) = stack_utils::stack_parcel(Some(description)).await?;
+        let hash = stack_completion(Some(description), our_head, &our_tree_hash, anchor).await?;
 
         Ok(MergeStatus::Merged(hash))
     } else {
         conflict_paths.sort();
 
         Ok(MergeStatus::Conflicts(conflict_paths))
+    }
+}
+
+/// Stack a merge or cherry-pick that completes inside the command that applied it, on
+/// `our_head`, the head its output was built on (`our_tree` is that head's tree). Every such
+/// command checked the warehouse clean against `our_head` first (`anchor` was taken before that
+/// check), and applying the merge overwrites no untracked file, so if the pallet did not end up at
+/// the new parcel — another bay or process moved it, or the write failed without landing — the
+/// working tree and inventory are put back at `our_tree` and the consolidation or pick is cleared:
+/// the command changed nothing, and running it again is safe. A write that landed and failed
+/// keeps the parcel, and still fails.
+pub(crate) async fn stack_completion(description: Option<String>,
+                                     our_head: &str,
+                                     our_tree: &str,
+                                     anchor: file_utils::StatAnchor) -> Result<String, String> {
+    let (error, pallet, parcel, tree) = match stack_utils::stack_parcel(description, Some(our_head)).await {
+        Ok((parcel, _)) => return Ok(parcel),
+        Err(StackError::Other(error)) => return Err(error),
+        Err(StackError::HeadWrite { error, pallet, parcel, tree }) => (error, pallet, parcel, tree),
+    };
+
+    match shift_utils::settle_head_write(&pallet, &parcel, error, &tree, Some(our_tree), anchor)? {
+        HeadWrite::Stands => Ok(parcel),
+        HeadWrite::Kept(error) => Err(error),
+        HeadWrite::RolledBack(error) => {
+            // The state comes off before the skeleton, as `stack` orders them, so no window shows
+            // a consolidation without its skeleton.
+            merge_utils::clear_consolidation_state()?;
+            merge_utils::OutOfScopeSkeleton::clear()?;
+            cherry_pick_utils::clear_state()?;
+
+            Err(format!(
+                "{} Nothing was changed: the working tree and inventory are back at the pallet's \
+                previous head, and nothing is left in progress.",
+                error
+            ))
+        }
     }
 }
 
@@ -624,6 +669,10 @@ mod tests {
         /// Runs once just before `fast_forward` writes the pallet's head.
         pub(super) static BEFORE_FAST_FORWARD_WRITE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             std::cell::Cell::new(None);
+
+        /// Runs once just before a clean merge's parcel is stacked.
+        pub(super) static BEFORE_MERGE_STACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            std::cell::Cell::new(None);
     }
 
     #[test]
@@ -662,5 +711,51 @@ mod tests {
         assert!(staged.is_empty() && unstaged.is_empty(),
             "the inventory must be back at our tree: staged {:?}, unstaged {:?}",
             staged.len(), unstaged.len());
+    }
+
+    #[test]
+    fn a_clean_merge_whose_pallet_moved_meanwhile_is_refused_and_rolled_back() {
+        let warehouse = Warehouse::with_working_tree("consolidate-merge-moved");
+        test_support::configure_operator();
+
+        let base = test_support::store_parcel(&test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"base\n")]), &[]);
+        let our_tree = test_support::store_files(&[("a.txt", b"ours\n"), ("b.txt", b"base\n")]);
+        let our_head = test_support::store_parcel(&our_tree, &[&base]);
+        let their_head = test_support::store_parcel(
+            &test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"theirs\n"), ("new.txt", b"new\n")]),
+            &[&base],
+        );
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
+
+        pallet_utils::set_current_pallet_name("main").unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
+        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+
+        // Another bay stacks on "main" after this merge was applied, before its parcel is stacked.
+        let moved_to = elsewhere.clone();
+        BEFORE_MERGE_STACK.with(|seam| seam.set(Some(Box::new(move || {
+            pallet_utils::update_pallet_head("main", Some(&our_head), &moved_to).unwrap();
+        }))));
+
+        let error = test_support::block_on(handle_command("feature"))
+            .expect_err("a merge over a moved pallet must be refused");
+        assert!(error.contains("moved") && error.contains("Nothing was changed"), "{}", error);
+
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere),
+            "the other bay's parcel must stay the head");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"ours\n")
+                && test_support::file_holds(&warehouse.root, "b.txt", b"base\n")
+                && !warehouse.root.join("new.txt").exists(),
+            "the working tree must be back at the head this merge started from");
+
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
+        let unstaged = test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap();
+        assert!(staged.is_empty() && unstaged.is_empty(),
+            "the inventory must be back at our tree: staged {:?}, unstaged {:?}",
+            staged.len(), unstaged.len());
+
+        assert!(merge_utils::read_consolidation_state().unwrap().is_none(), "no consolidation may stay in progress");
+        assert!(merge_utils::OutOfScopeSkeleton::read_required().is_err(), "no skeleton may stay behind");
     }
 }

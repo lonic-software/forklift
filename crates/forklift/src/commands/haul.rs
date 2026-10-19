@@ -3,7 +3,7 @@ use forklift_core::error::sanitize;
 use forklift_core::util::haul_utils::{self, Haul, HaulStatus, ReviewVerdict, UnreadableCell};
 use forklift_core::util::meta_tree::MetaSigner;
 use forklift_core::util::office_utils::{self, OfficeState};
-use forklift_core::util::{config_utils, merge_utils, object_utils, pallet_utils};
+use forklift_core::util::{config_utils, file_utils, merge_utils, object_utils, pallet_utils};
 use crate::cli::HaulAction;
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower;
@@ -230,6 +230,10 @@ async fn merge(id: &str) -> Result<(), String> {
     }
 
     let target_tree = object_utils::load_parcel(&target_head)?.tree_hash;
+
+    // Anchored before the cleanliness check, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+
     if !consolidate::is_warehouse_clean(&target_tree).await? {
         return Err("The working directory has uncommitted changes; commit or restore them before merging.".to_string());
     }
@@ -237,7 +241,7 @@ async fn merge(id: &str) -> Result<(), String> {
     // The "already merged" shortcut above only ever touches the `@haul` meta-pallet, never the
     // working inventory, so it needs no exemption. Past this point the incomplete-load guard
     // lives inside `merge_head_into_current` itself.
-    match consolidate::merge_head_into_current(&current, &target_head, &haul.head, &haul.opened.source, true).await? {
+    match consolidate::merge_head_into_current(&current, &target_head, &haul.head, &haul.opened.source, true, anchor).await? {
         MergeStatus::Merged(parcel) => {
             record(&parcel)?;
             output::emit(&Merged { id: haul.id.clone(), merge_parcel: parcel, already: false });

@@ -186,6 +186,9 @@ async fn try_auto_merge(client: &RemoteClient,
     // Merging materializes into the working directory, so only a clean warehouse qualifies.
     let our_tree = object_utils::load_parcel(head)?.tree_hash;
 
+    // Anchored before the cleanliness check, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+
     if !consolidate::is_warehouse_clean(&our_tree).await? {
         return Ok(false);
     }
@@ -194,7 +197,7 @@ async fn try_auto_merge(client: &RemoteClient,
     // already means a genuine, unresolved divergence (checked above), so every path past this
     // point is the same real merge, and the incomplete-load guard lives inside
     // `merge_head_into_current` itself.
-    match consolidate::merge_head_into_current(pallet, head, remote_head, "remote", false).await? {
+    match consolidate::merge_head_into_current(pallet, head, remote_head, "remote", false, anchor).await? {
         MergeStatus::Merged(_) => Ok(true),
         MergeStatus::Conflicts(_) => Ok(false),
     }

@@ -1,7 +1,7 @@
 use serde::Serialize;
 use forklift_core::util::cherry_pick_utils::{self, CherryPickState};
 use forklift_core::util::{
-    load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils, stack_utils,
+    file_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
 };
 use crate::commands::consolidate;
 use crate::output::{self, CommandOutput};
@@ -79,7 +79,10 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     let our_tree = object_utils::load_parcel(&our_head)?.tree_hash;
 
-    // The pick materializes the merged result, so the warehouse must be clean first.
+    // The pick materializes the merged result, so the warehouse must be clean first. Anchored
+    // before the check, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+
     if !consolidate::is_warehouse_clean(&our_tree).await? {
         return Err(
             "There are local changes that a cherry-pick would overwrite. Stack them, restore \
@@ -127,11 +130,15 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // authors — whether it completes now (clean) or after the user resolves conflicts.
     cherry_pick_utils::write_state(&CherryPickState {
         source: source.clone(),
+        our_head: our_head.clone(),
         description: description.clone(),
     })?;
 
     if conflicts.is_empty() {
-        let (parcel, _) = stack_utils::stack_parcel(description).await?;
+        #[cfg(test)]
+        tests::BEFORE_PICK_STACK.with(|seam| seam.take().map(|seam| seam()));
+
+        let parcel = consolidate::stack_completion(description, &our_head, &our_tree, anchor).await?;
 
         output::emit(&CherryPicked::applied(&source, &current, &parcel));
     } else {
@@ -235,4 +242,53 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<CherryPicked>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forklift_core::util::progress_utils::Progress;
+    use forklift_core::util::{shift_utils, stocktake_utils};
+    use crate::test_support::{self, Warehouse};
+
+    thread_local! {
+        /// Runs once just before a clean pick's parcel is stacked.
+        pub(super) static BEFORE_PICK_STACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            std::cell::Cell::new(None);
+    }
+
+    #[test]
+    fn a_clean_pick_whose_pallet_moved_meanwhile_is_refused_and_rolled_back() {
+        let warehouse = Warehouse::with_working_tree("cherry-pick-moved");
+        test_support::configure_operator();
+
+        let base = test_support::store_parcel(&test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"base\n")]), &[]);
+        let our_tree = test_support::store_files(&[("a.txt", b"ours\n"), ("b.txt", b"base\n")]);
+        let our_head = test_support::store_parcel(&our_tree, &[&base]);
+        let source = test_support::store_parcel(&test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"picked\n")]), &[&base]);
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
+
+        pallet_utils::set_current_pallet_name("main").unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+
+        // Another bay stacks on "main" after the pick was applied, before its parcel is stacked.
+        let moved_to = elsewhere.clone();
+        BEFORE_PICK_STACK.with(|seam| seam.set(Some(Box::new(move || {
+            pallet_utils::update_pallet_head("main", Some(&our_head), &moved_to).unwrap();
+        }))));
+
+        let error = test_support::block_on(handle_command(&source, None))
+            .expect_err("a pick over a moved pallet must be refused");
+        assert!(error.contains("moved") && error.contains("Nothing was changed"), "{}", error);
+
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere),
+            "the other bay's parcel must stay the head");
+        assert!(test_support::file_holds(&warehouse.root, "b.txt", b"base\n"),
+            "the working tree must be back at the head this pick started from");
+
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
+        assert!(staged.is_empty(), "the inventory must be back at our tree: staged {:?}", staged.len());
+        assert!(cherry_pick_utils::read_state().unwrap().is_none(), "no pick may stay in progress");
+    }
 }

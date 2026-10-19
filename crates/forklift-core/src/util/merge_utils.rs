@@ -7,8 +7,8 @@ use crate::util::{fanout_utils, file_utils, graph_utils, lcs, object_utils, reco
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
 /// consolidation is in progress, it holds the head parcel hash of the pallet being
-/// consolidated in (line 1) and that pallet's name (line 2). The next `stack` records the
-/// hash as a second parent and removes the file.
+/// consolidated in (line 1), that pallet's name (line 2) and the head the merge was built on
+/// (line 3). The next `stack` records the first hash as a second parent and removes the file.
 const FILE_NAME_CONSOLIDATION: &str = "consolidation";
 
 /// The maximum number of lines (per side) the line-level merge attempts. Larger files are
@@ -32,12 +32,18 @@ pub struct ConsolidationState {
 
     /// The name of the pallet being consolidated in (informational).
     pub their_pallet: String,
+
+    /// The current pallet's head the merge was built on: the merge parcel's first parent, and
+    /// the head the completing `stack` expects the pallet still to hold.
+    pub our_head: String,
 }
 
 /// The [`record_utils`] kind and version of the consolidation-state file: the other side's head,
-/// then its label, which may be a haul's source and so may hold any character.
+/// then its label, which may be a haul's source and so may hold any character, then our head.
+// The undo journal embeds this state (`journal_utils::ConsolidationInProgress`): bump
+// `journal_utils::JOURNAL_VERSION` with it.
 const CONSOLIDATION_RECORD: &str = "consolidation";
-const CONSOLIDATION_VERSION: u32 = 1;
+const CONSOLIDATION_VERSION: u32 = 2;
 
 /// The [`record_utils`] kind and version of the out-of-scope skeleton file.
 const SKELETON_RECORD: &str = "consolidation-skeleton";
@@ -96,14 +102,14 @@ pub fn read_consolidation_state_in(dir: &Path) -> Result<Option<ConsolidationSta
     let lines = record_utils::from_bytes(&bytes, CONSOLIDATION_RECORD, CONSOLIDATION_VERSION)
         .map_err(|e| malformed(e.describe()))?;
 
-    let [their_head, their_pallet] = <[String; 2]>::try_from(lines)
+    let [their_head, their_pallet, our_head] = <[String; 3]>::try_from(lines)
         .map_err(|_| malformed("is malformed.".to_string()))?;
 
-    if !object_utils::is_object_hash(&their_head) || their_pallet.is_empty() {
+    if !object_utils::is_object_hash(&their_head) || their_pallet.is_empty() || !object_utils::is_object_hash(&our_head) {
         return Err(malformed("is malformed.".to_string()));
     }
 
-    Ok(Some(ConsolidationState { their_head, their_pallet }))
+    Ok(Some(ConsolidationState { their_head, their_pallet, our_head }))
 }
 
 /// Read the consolidation state of the active bay, if a consolidation is in progress.
@@ -130,7 +136,7 @@ pub fn write_consolidation_state(state: &ConsolidationState) -> Result<(), Strin
 
 /// The bytes of the consolidation state file recording `state`.
 pub(crate) fn consolidation_state_bytes(state: &ConsolidationState) -> Vec<u8> {
-    record_utils::to_bytes(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION, [&state.their_head, &state.their_pallet])
+    record_utils::to_bytes(CONSOLIDATION_RECORD, CONSOLIDATION_VERSION, [&state.their_head, &state.their_pallet, &state.our_head])
 }
 
 /// Remove the consolidation state file (a no-op when none exists).
@@ -1532,14 +1538,22 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
 
         for label in HOSTILE_NAMES {
-            let state = ConsolidationState { their_head: "ab".repeat(32), their_pallet: label.to_string() };
+            let state = ConsolidationState {
+                their_head: "ab".repeat(32), their_pallet: label.to_string(), our_head: "cd".repeat(32),
+            };
             write_consolidation_state(&state).unwrap();
 
             let read_back = read_consolidation_state().unwrap().unwrap();
 
             assert_eq!(read_back.their_pallet, label);
             assert_eq!(read_back.their_head, state.their_head);
+            assert_eq!(read_back.our_head, state.our_head);
         }
+
+        // A version-1 state (no base) is refused by its version, never read without one.
+        std::fs::write(get_consolidation_state_path(), record_utils::to_bytes(CONSOLIDATION_RECORD, 1, ["ab".repeat(32), "feature".to_string()])).unwrap();
+        let error = read_consolidation_state().err().expect("a version-1 state file must be refused");
+        assert!(error.contains("does not know") && error.contains("Abort the consolidation"), "{}", error);
 
         std::fs::write(get_consolidation_state_path(), format!("{}\nfeature\n", "ab".repeat(32))).unwrap();
         let error = read_consolidation_state().err().expect("a headerless state file must be refused");
