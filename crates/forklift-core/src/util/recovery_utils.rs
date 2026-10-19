@@ -2664,7 +2664,7 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-i3-targets-before-presence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
 
         let vanished_head_hash = "e".repeat(64);
@@ -5384,7 +5384,7 @@ mod tests {
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-ref-resurrection-overwrite-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
 
@@ -5458,7 +5458,7 @@ mod tests {
         let root = std::env::temp_dir()
             .join(format!("forklift-recovery-utils-ref-resurrection-delete-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
 
