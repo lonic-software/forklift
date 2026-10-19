@@ -15,7 +15,7 @@
 //! mutually exclusive with a consolidation.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::enums::parcel_action_type::ParcelActionType;
 use crate::globals::bay_root;
@@ -23,8 +23,10 @@ use crate::model::operator::Operator;
 use crate::util::{file_utils, object_utils};
 
 /// The name of the cherry-pick-state file (inside the bay root). While a pick is in
-/// progress (its merge left conflicts), it records the source parcel and the intended
-/// description; the next `stack` reads it to complete the pick single-parent and remove it.
+/// progress (its merge left conflicts), it records the source parcel, the intended description,
+/// and the head and pallet the pick was applied to; the next `stack` reads it to complete the pick
+/// single-parent and remove it. A file written before the head and pallet were recorded lacks
+/// those fields and is refused as malformed.
 const FILE_NAME_CHERRY_PICK: &str = "cherry-pick";
 
 /// A cherry-pick in progress: the source parcel being applied, and the description the
@@ -36,11 +38,24 @@ pub struct CherryPickState {
 
     /// The description the completing parcel should carry when the user gives none.
     pub description: Option<String>,
+
+    /// The current pallet's head the pick was applied to: the completing parcel's parent, and the
+    /// head the completing `stack` expects the pallet still to hold.
+    pub our_head: String,
+
+    /// The pallet the pick was applied to, and the only one `stack` completes it on.
+    pub our_pallet: String,
 }
 
 /// Get the path of the cherry-pick-state file (bay-local).
 fn state_path() -> PathBuf {
     bay_root().join(FILE_NAME_CHERRY_PICK)
+}
+
+/// How to abort the cherry-pick in progress in this bay: a phrase such as `remove "<path>"`,
+/// naming the bay's own state file.
+pub fn abort_hint() -> String {
+    format!("remove \"{}\"", state_path().to_string_lossy())
 }
 
 /// Read the cherry-pick state, if a pick is in progress.
@@ -50,7 +65,16 @@ fn state_path() -> PathBuf {
 /// * `Ok(None)`                  - If no pick is in progress.
 /// * `Err(String)`               - If the state file exists but is malformed.
 pub fn read_state() -> Result<Option<CherryPickState>, String> {
-    let path = state_path();
+    read_state_in(&bay_root())
+}
+
+/// Read the cherry-pick state of the bay whose state lives in `dir`, if a pick is in progress
+/// there — see [`read_state`].
+///
+/// # Arguments
+/// * `dir` - The bay's state directory.
+pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
+    let path = dir.join(FILE_NAME_CHERRY_PICK);
 
     if !path.exists() {
         return Ok(None);
@@ -64,9 +88,10 @@ pub fn read_state() -> Result<Option<CherryPickState>, String> {
         path.to_string_lossy()
     ))?;
 
-    let is_valid_hash = object_utils::is_object_hash(&state.source);
+    let is_valid = object_utils::is_object_hash(&state.source) && object_utils::is_object_hash(&state.our_head)
+        && crate::util::pallet_utils::validate_pallet_name(&state.our_pallet).is_ok();
 
-    if !is_valid_hash {
+    if !is_valid {
         return Err(format!(
             "The cherry-pick state file \"{}\" is malformed; remove it to abort the pick.",
             path.to_string_lossy()

@@ -61,15 +61,33 @@ impl Drop for Warehouse {
 
 /// Store a tree holding one file, `name`, with `content`; returns the tree's hash.
 pub(crate) fn store_tree(name: &str, content: &[u8]) -> String {
-    let mut blob = LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() });
-    blob.store().unwrap();
+    store_files(&[(name, content)])
+}
 
+/// Store a flat tree holding `files` (name, content); returns the tree's hash.
+pub(crate) fn store_files(files: &[(&str, &[u8])]) -> String {
     let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-    root.add_child(TreeItem::new(name.to_string(), blob.hash.clone(), DirEntryType::Normal));
+
+    for (name, content) in files {
+        let mut blob = LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() });
+        blob.store().unwrap();
+        root.add_child(TreeItem::new(name.to_string(), blob.hash.clone(), DirEntryType::Normal));
+    }
+
     let mut tree = LooseObjectBuilder::build_tree(&root);
     tree.store().unwrap();
 
     tree.hash
+}
+
+/// Configure an operator in the warehouse's own configuration, so a stack never mints one into
+/// the global configuration of whoever runs the tests.
+pub(crate) fn configure_operator() {
+    use forklift_core::enums::config_scope::ConfigScope;
+    use forklift_core::util::config_utils;
+
+    config_utils::set_value(config_utils::KEY_OPERATOR_IDENTIFIER, "test-operator", ConfigScope::Warehouse).unwrap();
+    config_utils::set_value(config_utils::KEY_OPERATOR_NAME, "Test Operator", ConfigScope::Warehouse).unwrap();
 }
 
 /// Store a parcel of `tree` on `parents`; returns its hash.

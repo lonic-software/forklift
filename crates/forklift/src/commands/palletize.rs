@@ -53,6 +53,9 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
         ));
     }
 
+    // Before the ref is created, so a refusal leaves no half-made pallet behind.
+    shift::refuse_mid_merge("switching to a new pallet")?;
+
     match revision {
         // The new pallet starts at the given revision, which may differ from the current
         // head — a full shift materializes it (and refuses on a dirty warehouse).

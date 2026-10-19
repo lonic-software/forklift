@@ -1190,31 +1190,67 @@ pub fn materialize_tree(from_tree: Option<&str>,
 
 /// Move `pallet` from `expected` to `new` after `written_tree` (the tree of `new`) was already
 /// materialized, putting the working tree and inventory back at `start_tree` (the tree of
-/// `expected`, or the empty tree for an unborn pallet) if the pallet did not end up at `new`:
-/// another bay moved it first, or the write failed. Runs under the bay lock, so nothing else
-/// touched the bay since `written_tree` was materialized.
-///
-/// If another bay already moved the pallet to `new`, the move stands and this is `Ok`. A write
-/// that failed after landing (the pallet is at `new` anyway, not known durable) keeps the tree,
-/// which then matches the pallet, and still fails; so does a pallet that cannot be read back,
-/// whose tree is left alone rather than guessed at. If the rollback itself fails, the error says the working tree holds the
-/// other tree and that the pallet did not move.
+/// `expected`, or the empty tree for an unborn pallet) if the pallet did not end up at `new` (see
+/// [`settle_head_write`], which decides that).
 pub fn write_head_or_roll_back(pallet: &str,
                                expected: Option<&str>,
                                new: &str,
                                written_tree: &str,
                                start_tree: Option<&str>,
                                anchor: file_utils::StatAnchor) -> Result<(), String> {
+    let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new) else {
+        return Ok(());
+    };
+
+    match settle_head_write(pallet, new, error, written_tree, start_tree, anchor)? {
+        HeadWrite::Stands => Ok(()),
+        HeadWrite::Kept(error) | HeadWrite::RolledBack(error) => Err(error),
+    }
+}
+
+/// Where a head write that did not go through cleanly left the bay (see [`settle_head_write`]).
+/// Every variant leaves the working tree and inventory matching the pallet's head.
+#[derive(Debug, PartialEq)]
+pub enum HeadWrite {
+    /// Another bay already moved the pallet to the same head: the move stands, nothing failed.
+    Stands,
+
+    /// The write failed after landing: the pallet is at the new head, though not known durable,
+    /// and the tree (which matches it) is kept. The error to report.
+    Kept(String),
+
+    /// The pallet did not move: the working tree and inventory are back at the start tree. The
+    /// error to report.
+    RolledBack(String),
+}
+
+/// Settle a head write of `pallet` to `new` that returned `error`, after `written_tree` (the tree
+/// of `new`) was already materialized. A failed write can still have landed, so the outcome is
+/// decided by reading the pallet back, never inferred from the error: at `new`, the tree is kept;
+/// anywhere else, the working tree and inventory are put back at `start_tree` (the empty tree for
+/// `None`). Runs under the bay lock, so nothing else touched the bay since `written_tree` was
+/// materialized.
+///
+/// # Returns
+/// * `Ok(HeadWrite)` - The bay matches the pallet's head again; see the variant for what happened.
+/// * `Err(String)`   - The pallet could not be read back (the tree is left alone rather than
+///                     guessed at), or the rollback failed; the error says the working tree may
+///                     not match the pallet's head.
+pub fn settle_head_write(pallet: &str,
+                         new: &str,
+                         error: crate::util::pallet_utils::RefUpdateError,
+                         written_tree: &str,
+                         start_tree: Option<&str>,
+                         anchor: file_utils::StatAnchor) -> Result<HeadWrite, String> {
     use crate::util::pallet_utils::{self, RefUpdateError};
 
-    let error = match pallet_utils::update_pallet_head(pallet, expected, new) {
-        Ok(()) => return Ok(()),
-        Err(RefUpdateError::Moved(moved)) if moved.found.as_deref() == Some(new) => return Ok(()),
-        Err(error) => error.to_string(),
+    let error = match error {
+        RefUpdateError::Moved(moved) if moved.found.as_deref() == Some(new) => return Ok(HeadWrite::Stands),
+        error => error.to_string(),
     };
 
     match pallet_utils::get_pallet_head(pallet) {
-        Ok(head) if head.as_deref() == Some(new) => return Err(error),
+        Ok(head) if head.as_deref() == Some(new) => return Ok(HeadWrite::Kept(error)),
         Ok(_) => {}
         Err(e) => return Err(format!(
             "{} The pallet could not be read back ({}), so the working tree is left at tree {}; it \
@@ -1233,7 +1269,7 @@ pub fn write_head_or_roll_back(pallet: &str,
     });
 
     match rolled_back {
-        Ok(()) => Err(error),
+        Ok(()) => Ok(HeadWrite::RolledBack(error)),
         Err(err) => Err(format!(
             "{} The working tree could not be put back ({}): it holds tree {}, not the pallet's \
             head; shift or restore to bring it back in line.",

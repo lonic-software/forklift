@@ -1,6 +1,7 @@
 use chrono::Utc;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::parcel_action_type::ParcelActionType;
+use crate::globals::bay_root;
 use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
@@ -8,6 +9,48 @@ use crate::util::{
     cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils,
     object_utils, office_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
 };
+use crate::util::pallet_utils::RefUpdateError;
+
+/// Why [`stack_parcel`] failed: its head write did not go through (which a merge or pick
+/// completion has to settle, see `consolidate`'s caller), or anything else.
+#[derive(Debug)]
+pub enum StackError {
+    /// The parcel was built and stored, but the pallet's head write returned `error`: another bay
+    /// or process moved the pallet off the base (`Moved`), or the write failed (`Failed`, which
+    /// may still have landed — the pallet then holds `parcel`, and the staged state it consumed is
+    /// already cleaned up). Nothing else in the bay was touched: the working tree still holds
+    /// `tree`, the stacked parcel's tree.
+    HeadWrite {
+        error: RefUpdateError,
+        pallet: String,
+        parcel: String,
+        tree: String,
+    },
+
+    /// Any other failure; nothing was stacked.
+    Other(String),
+}
+
+impl From<String> for StackError {
+    fn from(error: String) -> Self {
+        StackError::Other(error)
+    }
+}
+
+impl From<crate::error::CoreError> for StackError {
+    fn from(error: crate::error::CoreError) -> Self {
+        StackError::Other(error.into())
+    }
+}
+
+impl From<StackError> for String {
+    fn from(error: StackError) -> Self {
+        match error {
+            StackError::HeadWrite { error, .. } => error.to_string(),
+            StackError::Other(error) => error,
+        }
+    }
+}
 
 /// Resolve the key a parcel must be signed with: `None` while trust is not established,
 /// the operator's local active key afterwards (an error when they have none — signing
@@ -53,14 +96,24 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Option<String>, String
 /// parent and the consolidation state is cleared. Stacking refuses to run while any
 /// inventory entry is in a conflict state.
 ///
+/// The parcel is stacked on a base, and the head write is a compare-and-set against it, so a
+/// pallet another bay or process moved meanwhile is refused rather than overwritten. The base is
+/// `expected_base` when given (a merge or pick completing inside the command that built its tree
+/// passes the head it built on); otherwise the head an in-progress consolidation or cherry-pick
+/// recorded when it started, because that is what the staged merge output was built from;
+/// otherwise the pallet's head as read here.
+///
 /// # Arguments
-/// * `description` - The parcel description.
+/// * `description`   - The parcel description.
+/// * `expected_base` - The head the staged tree was built on, when the caller knows it.
 ///
 /// # Returns
 /// * `Ok((String, String))` - The new parcel's hash and the pallet it was stacked on.
-/// * `Err(String)`          - If there is nothing to stack, the operator identity is not
-///                            configured, conflicts are unresolved, or an operation failed.
-pub async fn stack_parcel(description: Option<String>) -> Result<(String, String), String> {
+/// * `Err(StackError)`      - If there is nothing to stack, the operator identity is not
+///                            configured, conflicts are unresolved, an operation failed, or the
+///                            head write did not go through (`StackError::HeadWrite`).
+pub async fn stack_parcel(description: Option<String>,
+                          expected_base: Option<&str>) -> Result<(String, String), StackError> {
     // The cheapest possible pre-check runs first: a `load` that started but never finished
     // cleanly (crashed mid-walk, or returned an error) leaves a marker behind
     // (`load_guard_utils`), and stacking now could silently commit an incomplete inventory as a
@@ -82,7 +135,41 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // gates which keys may be skipped at all.
     let scope = scope_utils::current_scope()?;
     let pallet = pallet_utils::get_current_pallet_name()?;
-    let head = pallet_utils::get_pallet_head(&pallet)?;
+    let consolidation = merge_utils::read_consolidation_state()?;
+
+    // A cherry-pick in progress (§9.1 #8) completes here, single-parent: the picked
+    // parcel's authors are preserved and this operator is recorded as the stacker.
+    let cherry_pick = cherry_pick_utils::read_state()?;
+
+    // Merge output belongs to the pallet it was started on. A command that switched the current
+    // pallet since (any of them, not only `shift`) must not get it stacked onto another one.
+    if expected_base.is_none() {
+        let started_on = match (&consolidation, &cherry_pick) {
+            (Some(state), _) => Some(("consolidation", &state.our_pallet, merge_utils::abort_hint_in(&bay_root()))),
+            (None, Some(state)) => Some(("cherry-pick", &state.our_pallet, cherry_pick_utils::abort_hint())),
+            (None, None) => None,
+        };
+
+        if let Some((what, started_on, abort)) = started_on.filter(|(_, started_on, _)| **started_on != pallet) {
+            return Err(StackError::Other(format!(
+                "This {} was started on pallet \"{}\", but the current pallet is \"{}\". Nothing was \
+                stacked: its output was built on \"{}\" and belongs there. Abort it ({}), then redo it \
+                on the pallet it is meant for.",
+                what, started_on, pallet, started_on, abort
+            )));
+        }
+    }
+
+    // The base the parcel stacks on, which the head write below expects the pallet still to be at.
+    // Merge output staged by an earlier command was built on the head recorded when it started,
+    // not on whatever the pallet holds now; stacking it on a head another bay moved would revert
+    // that bay's parcel.
+    let head = match (expected_base, &consolidation, &cherry_pick) {
+        (Some(base), _, _) => Some(base.to_string()),
+        (None, Some(state), _) => Some(state.our_head.clone()),
+        (None, None, Some(state)) => Some(state.our_head.clone()),
+        (None, None, None) => pallet_utils::get_pallet_head(&pallet)?,
+    };
     let head_root_hash = match &head {
         Some(head_hash) => Some(object_utils::load_parcel(head_hash)?.tree_hash),
         None => None,
@@ -96,13 +183,11 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     )?);
 
     if inventory_utils::has_conflict_entries_in(&prepared) {
-        return Err(
+        return Err(StackError::Other(
             "There are unresolved conflicts in the inventory. Resolve them, \"load\" the \
             resolved files, and stack again (see \"stocktake\" for the list).".to_string()
-        );
+        ));
     }
-
-    let consolidation = merge_utils::read_consolidation_state()?;
 
     // An orphaned skeleton (left behind when a merge is aborted by removing
     // ".forklift/consolidation" directly, instead of resolving it) is harmless on its own — a
@@ -113,10 +198,6 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     if consolidation.is_none() {
         let _ = merge_utils::OutOfScopeSkeleton::clear();
     }
-
-    // A cherry-pick in progress (§9.1 #8) completes here, single-parent: the picked
-    // parcel's authors are preserved and this operator is recorded as the stacker.
-    let cherry_pick = cherry_pick_utils::read_state()?;
 
     // Every tree object built below is staged into `batch`, not fsynced immediately — one
     // durability barrier for the whole burst instead of a per-object fsync pair (§ perf). The
@@ -167,12 +248,12 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // the folder's own content.
     for (name, _) in root_tree.get_subtrees().chain(root_tree.get_files()) {
         if office_utils::opens_metadata_folder(name)? {
-            return Err(format!(
+            return Err(StackError::Other(format!(
                 "Refusing to stack the top-level entry {:?}: it is, on this or some other file \
                 system, the warehouse's metadata folder, so no working directory there could check \
                 it out. Rename it, or unload it and add it to .forkliftignore.",
                 name
-            ));
+            )));
         }
     }
 
@@ -194,7 +275,9 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     let root_is_empty = root_tree.get_files().len() == 0 && root_tree.get_subtrees().len() == 0;
 
     if head.is_none() && root_is_empty {
-        return Err("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string());
+        return Err(StackError::Other(
+            "There is nothing to stack. Use the \"load\" command to stage changes first.".to_string()
+        ));
     }
 
     if let Some(head_hash) = &head {
@@ -210,16 +293,16 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
             if cherry_pick.is_some() {
                 cherry_pick_utils::clear_state()?;
 
-                return Err(
+                return Err(StackError::Other(
                     "The cherry-pick is empty: applying it changes nothing (the head already \
                     has these changes). Nothing was stacked.".to_string()
-                );
+                ));
             }
 
-            return Err(format!(
+            return Err(StackError::Other(format!(
                 "Nothing to stack: the inventory matches the head of pallet \"{}\".",
                 pallet
-            ));
+            )));
         }
     }
 
@@ -313,10 +396,39 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // yet durable — batching the ref in with the objects it references would trade that
     // guarantee for a few more saved fsyncs, which is not a trade this makes.
     //
-    // It is a compare-and-set against the head this parcel was built on, so a move by another bay
+    // It is a compare-and-set against the base this parcel was built on, so a move by another bay
     // or process since that read is refused rather than silently replaced.
-    pallet_utils::update_pallet_head(&pallet, head.as_deref(), &object.hash)?;
+    match pallet_utils::update_pallet_head(&pallet, head.as_deref(), &object.hash) {
+        Ok(()) => {}
 
+        // Another bay already moved the pallet to this very parcel: the move stands.
+        Err(RefUpdateError::Moved(moved)) if moved.found.as_deref() == Some(object.hash.as_str()) => {}
+
+        Err(error) => {
+            // A failed write can still have landed, so whether the parcel is on the pallet is read
+            // back, never inferred from the error. If it is, the staged state it consumed is
+            // cleaned up exactly as on success, and the failure is still reported.
+            let landed = matches!(error, RefUpdateError::Failed(_))
+                && pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(object.hash.as_str());
+
+            if landed {
+                if let Err(cleanup) = clean_up_after_stack(&prepared, &stamp_hashes) {
+                    return Err(StackError::Other(format!("{} {}", error, cleanup)));
+                }
+            }
+
+            return Err(StackError::HeadWrite { error, pallet, parcel: object.hash, tree: root_tree.hash });
+        }
+    }
+
+    clean_up_after_stack(&prepared, &stamp_hashes)?;
+
+    Ok((object.hash, pallet))
+}
+
+/// Clean up what a stacked parcel consumed: see the call in [`stack_parcel`].
+fn clean_up_after_stack(prepared: &inventory_utils::PreparedInventory,
+                        stamp_hashes: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
     // The parcel consumed the staged removals (and the consolidation or cherry-pick, if any).
     // Reuses the same parsed snapshot the conflict check and tree build already read — nothing
     // between then and here changes a shard's content on disk, only the object store, the ref
@@ -324,10 +436,8 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // it leaves untouched need no scope filtering of their own (unlike `stamp_hashes` above): a
     // skip root's parent is always fully in scope (`prepare_stack_inventory`'s scoped-bay
     // caveat).
-    inventory_utils::cleanup_after_stack_with(&prepared, &stamp_hashes)?;
+    inventory_utils::cleanup_after_stack_with(prepared, stamp_hashes)?;
     merge_utils::clear_consolidation_state()?;
     merge_utils::OutOfScopeSkeleton::clear()?;
-    cherry_pick_utils::clear_state()?;
-
-    Ok((object.hash, pallet))
+    cherry_pick_utils::clear_state()
 }

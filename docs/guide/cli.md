@@ -398,7 +398,9 @@ Reverses the **last state-changing operation**, using an undo journal — not ju
 last `stack`. Each `stack`, `consolidate`, `cherry-pick` and `shift` records the state
 before and after it (the current pallet, the pallet refs it moved, and any consolidation or
 cherry-pick left in progress — all tiny, since the objects are content-addressed and already
-stored), so `undo` can walk them back one at a time:
+stored), so `undo` can walk them back one at a time. Only the refs the command itself wrote are
+recorded: a pallet another bay moved while it ran is never part of the entry, so `undo` never
+reverts it.
 
 - Reversing a **`stack`**, **`consolidate`** or **`cherry-pick`** is a *soft reset*: the head moves back while
   the working directory and inventory are kept, so the undone changes are staged again
@@ -871,8 +873,10 @@ forklift shift main
 Materializes the target pallet's head tree in the working directory, repopulates
 the inventory from it, and makes it the current pallet. Refuses to run when you
 have staged or unstaged changes (they'd be overwritten) — stack, restore, or park
-them first. Untracked files are left alone unless the target needs to write over
-one.
+them first — or while a consolidation or cherry-pick is in progress, which is
+completed on the pallet it started on (`palletize` and `deliver` refuse then too,
+and `stack` refuses to complete it on any other pallet). Untracked files are left alone unless the
+target needs to write over one.
 
 On a case-insensitive file system (the default on macOS and Windows), two names
 that differ only in case, such as `README` and `readme`, are one file. Every
@@ -991,6 +995,17 @@ Each command moves a pallet only from the head it started from: if another bay m
 the meantime, the command is refused with a message naming both heads, and whatever it had
 already written to its own working tree is put back. A head another bay moved is never
 silently overwritten.
+
+That holds for merges too. A `consolidate`, `haul merge`, `lift` auto-merge or `cherry-pick`
+that completes on its own is stacked on the head it merged against; if that head moved, the
+merge is undone in the working tree and inventory and nothing is left in progress, so running
+the command again is safe. A merge or pick you resolved by hand is stacked on the head it
+started from too, but there a refused `stack` keeps it in progress, since putting the tree back
+would throw your resolutions away. The message says how to redo it on the new head: abort it,
+`restore --staged .` then `restore .`, delete the files that leaves behind as untracked (it
+lists them), and merge again. Do not stack the merge output after aborting — that would revert the other bay's
+parcel. And `undo` only ever reverses refs your own command moved; a move another bay made in
+the meantime is never undone.
 
 ### `bay add --scope` — a scoped (sparse) bay
 
