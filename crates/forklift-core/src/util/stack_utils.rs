@@ -1,6 +1,7 @@
 use chrono::Utc;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::parcel_action_type::ParcelActionType;
+use crate::globals::bay_root;
 use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
@@ -139,6 +140,25 @@ pub async fn stack_parcel(description: Option<String>,
     // A cherry-pick in progress (§9.1 #8) completes here, single-parent: the picked
     // parcel's authors are preserved and this operator is recorded as the stacker.
     let cherry_pick = cherry_pick_utils::read_state()?;
+
+    // Merge output belongs to the pallet it was started on. A command that switched the current
+    // pallet since (any of them, not only `shift`) must not get it stacked onto another one.
+    if expected_base.is_none() {
+        let started_on = match (&consolidation, &cherry_pick) {
+            (Some(state), _) => Some(("consolidation", &state.our_pallet, merge_utils::abort_hint_in(&bay_root()))),
+            (None, Some(state)) => Some(("cherry-pick", &state.our_pallet, cherry_pick_utils::abort_hint())),
+            (None, None) => None,
+        };
+
+        if let Some((what, started_on, abort)) = started_on.filter(|(_, started_on, _)| **started_on != pallet) {
+            return Err(StackError::Other(format!(
+                "This {} was started on pallet \"{}\", but the current pallet is \"{}\". Nothing was \
+                stacked: its output was built on \"{}\" and belongs there. Abort it ({}), then redo it \
+                on the pallet it is meant for.",
+                what, started_on, pallet, started_on, abort
+            )));
+        }
+    }
 
     // The base the parcel stacks on, which the head write below expects the pallet still to be at.
     // Merge output staged by an earlier command was built on the head recorded when it started,

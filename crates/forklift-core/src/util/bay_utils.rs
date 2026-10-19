@@ -416,14 +416,14 @@ mod tests {
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parked_hash)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
-            their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: merge_base.clone(),
+            their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: merge_base.clone(), our_pallet: "main".to_string(),
         };
         std::fs::write(bay_b_dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
         let bay_c_dir = bay_state_dir("c");
         std::fs::create_dir_all(&bay_c_dir).unwrap();
         let pick = cherry_pick_utils::CherryPickState {
-            source: "6".repeat(64), description: None, our_head: pick_base.clone(),
+            source: "6".repeat(64), description: None, our_head: pick_base.clone(), our_pallet: "main".to_string(),
         };
         std::fs::write(bay_c_dir.join("cherry-pick"), serde_json::to_string(&pick).unwrap()).unwrap();
 

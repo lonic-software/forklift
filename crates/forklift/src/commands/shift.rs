@@ -8,8 +8,8 @@ use crate::output::{self, CommandOutput};
 /// "repopulate on shift" behavior), and make the target the current pallet.
 ///
 /// Shifting refuses to run when there are staged or unstaged changes (they would be
-/// overwritten), or while a consolidation or cherry-pick is in progress. Untracked files are tolerated, unless the target wants to write one of
-/// their paths.
+/// overwritten), or while a consolidation or cherry-pick is in progress. Untracked files are
+/// tolerated, unless the target wants to write one of their paths.
 ///
 /// # Arguments
 /// * `target` - The name of the pallet to shift to.
@@ -45,6 +45,33 @@ impl CommandOutput for Shifted {
     }
 }
 
+/// Refuse a switch of the current pallet while a consolidation or cherry-pick is in progress: it
+/// is completed on the pallet it started on (`stack` refuses it anywhere else).
+///
+/// # Arguments
+/// * `doing` - The switch, as a gerund for the message (e.g. "shifting").
+pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
+    if merge_utils::read_consolidation_state()?.is_some() {
+        return Err(format!(
+            "A consolidation is in progress. Complete it (resolve, \"load\", \"stack\") or abort it \
+            ({}) before {}.",
+            merge_utils::abort_hint_in(&forklift_core::globals::bay_root()),
+            doing
+        ));
+    }
+
+    if cherry_pick_utils::read_state()?.is_some() {
+        return Err(format!(
+            "A cherry-pick is in progress. Resolve its conflicts and \"stack\", or {} to abort it, \
+            before {}.",
+            cherry_pick_utils::abort_hint(),
+            doing
+        ));
+    }
+
+    Ok(())
+}
+
 /// Shift to the given pallet: clean-check, materialize its head tree, repopulate the
 /// inventory, and make it the current pallet. Also used by `palletize` when a new pallet
 /// is created at a parcel other than the current head.
@@ -60,23 +87,7 @@ impl CommandOutput for Shifted {
 pub async fn shift_to(target: &str) -> Result<String, String> {
     pallet_utils::validate_pallet_name(target)?;
 
-    // An in-progress consolidation or cherry-pick is completed on the head it recorded, which
-    // belongs to this pallet: completing it from another one would be refused as a move.
-    if merge_utils::read_consolidation_state()?.is_some() {
-        return Err(format!(
-            "A consolidation is in progress. Complete it (resolve, \"load\", \"stack\") or abort it \
-            ({}) before shifting.",
-            merge_utils::abort_hint_in(&forklift_core::globals::bay_root())
-        ));
-    }
-
-    if cherry_pick_utils::read_state()?.is_some() {
-        return Err(format!(
-            "A cherry-pick is in progress. Resolve its conflicts and \"stack\", or {} to abort it, \
-            before shifting.",
-            cherry_pick_utils::abort_hint()
-        ));
-    }
+    refuse_mid_merge("shifting")?;
 
     let Some(target_head) = pallet_utils::get_pallet_head(target)? else {
         return Err(format!(

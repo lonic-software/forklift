@@ -42,6 +42,9 @@ pub struct CherryPickState {
     /// The current pallet's head the pick was applied to: the completing parcel's parent, and the
     /// head the completing `stack` expects the pallet still to hold.
     pub our_head: String,
+
+    /// The pallet the pick was applied to, and the only one `stack` completes it on.
+    pub our_pallet: String,
 }
 
 /// Get the path of the cherry-pick-state file (bay-local).
@@ -85,9 +88,10 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
         path.to_string_lossy()
     ))?;
 
-    let is_valid_hash = object_utils::is_object_hash(&state.source) && object_utils::is_object_hash(&state.our_head);
+    let is_valid = object_utils::is_object_hash(&state.source) && object_utils::is_object_hash(&state.our_head)
+        && crate::util::pallet_utils::validate_pallet_name(&state.our_pallet).is_ok();
 
-    if !is_valid_hash {
+    if !is_valid {
         return Err(format!(
             "The cherry-pick state file \"{}\" is malformed; remove it to abort the pick.",
             path.to_string_lossy()

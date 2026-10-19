@@ -190,6 +190,43 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_is_only_stacked_on_the_pallet_it_started_on() {
+        let warehouse = Warehouse::with_working_tree("stack-merge-other-pallet");
+        test_support::configure_operator();
+
+        let base = test_support::store_parcel(&test_support::store_tree("a.txt", b"base\n"), &[]);
+        let our_tree = test_support::store_tree("a.txt", b"ours\n");
+        let our_head = test_support::store_parcel(&our_tree, &[&base]);
+        let their_head = test_support::store_parcel(&test_support::store_tree("a.txt", b"theirs\n"), &[&base]);
+
+        pallet_utils::set_current_pallet_name("main").unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
+        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+
+        test_support::block_on(consolidate::handle_command("feature")).unwrap();
+        std::fs::write(warehouse.root.join("a.txt"), b"resolved\n").unwrap();
+        test_support::block_on(load::handle_command("a.txt")).unwrap();
+
+        // Creating a pallet mid-merge is refused before the pallet exists.
+        let refused = test_support::block_on(crate::commands::palletize::handle_command(Some("side".to_string()), None, false))
+            .expect_err("switching to a new pallet during a consolidation must be refused");
+        assert!(refused.contains("consolidation is in progress"), "{}", refused);
+        assert!(!pallet_utils::does_pallet_exist("side"), "a refused palletize must leave no pallet behind");
+
+        // Any other switch to a pallet at the very same head: the merge must not land there.
+        pallet_utils::update_pallet_head("side", None, &our_head).unwrap();
+        pallet_utils::set_current_pallet_name("side").unwrap();
+
+        let error = test_support::block_on(handle_command(None))
+            .expect_err("completing a merge from another pallet must be refused");
+        assert!(error.contains("started on pallet \"main\"") && error.contains("Nothing was stacked"), "{}", error);
+        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(our_head.clone()), "nothing may land on \"side\"");
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(our_head), "nothing may land on \"main\"");
+        assert!(merge_utils::read_consolidation_state().unwrap().is_some(), "the consolidation must stay in progress");
+    }
+
+    #[test]
     fn a_stack_completing_a_pick_whose_pallet_moved_is_refused_and_keeps_the_pick() {
         let warehouse = Warehouse::with_working_tree("stack-pick-moved");
         test_support::configure_operator();

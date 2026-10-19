@@ -319,6 +319,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
         their_head: their_head.to_string(),
         their_pallet: their_label.to_string(),
         our_head: our_head.to_string(),
+        our_pallet: current.to_string(),
     })?;
 
     if conflict_paths.is_empty() {

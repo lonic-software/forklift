@@ -19,6 +19,9 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If there is nothing to deliver, trust is not established, or an
 ///                   operation failed.
 pub fn handle_command(target: &str, message: Option<String>) -> Result<(), String> {
+    // Delivering makes the target the current pallet.
+    crate::commands::shift::refuse_mid_merge("delivering")?;
+
     let outcome = deliver_utils::deliver(target, message)?;
 
     output::emit(&DeliverReport {

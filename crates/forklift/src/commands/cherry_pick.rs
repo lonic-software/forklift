@@ -132,6 +132,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     cherry_pick_utils::write_state(&CherryPickState {
         source: source.clone(),
         our_head: our_head.clone(),
+        our_pallet: current.clone(),
         description: description.clone(),
     })?;
 

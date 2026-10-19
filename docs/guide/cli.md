@@ -874,7 +874,8 @@ Materializes the target pallet's head tree in the working directory, repopulates
 the inventory from it, and makes it the current pallet. Refuses to run when you
 have staged or unstaged changes (they'd be overwritten) — stack, restore, or park
 them first — or while a consolidation or cherry-pick is in progress, which is
-completed on the pallet it started on. Untracked files are left alone unless the
+completed on the pallet it started on (`palletize` and `deliver` refuse then too,
+and `stack` refuses to complete it on any other pallet). Untracked files are left alone unless the
 target needs to write over one.
 
 On a case-insensitive file system (the default on macOS and Windows), two names

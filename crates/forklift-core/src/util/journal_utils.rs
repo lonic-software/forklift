@@ -60,6 +60,9 @@ pub struct ConsolidationInProgress {
     /// The head the merge was built on: the base its completing parcel stacks on.
     pub our_head: String,
 
+    /// The pallet the merge was started on.
+    pub our_pallet: String,
+
     /// The merge's out-of-scope skeleton, in its on-disk form (empty outside a scoped bay).
     pub skeleton: String,
 }
@@ -73,6 +76,9 @@ pub struct PickInProgress {
 
     /// The head the pick was applied on: the base its completing parcel stacks on.
     pub our_head: String,
+
+    /// The pallet the pick was applied to.
+    pub our_pallet: String,
 
     /// The description the completing parcel defaults to.
     pub description: Option<String>,
@@ -136,6 +142,7 @@ fn read_consolidation() -> Result<Option<ConsolidationInProgress>, String> {
         their_head: state.their_head,
         their_pallet: state.their_pallet,
         our_head: state.our_head,
+        our_pallet: state.our_pallet,
         skeleton,
     }))
 }
@@ -146,6 +153,7 @@ fn read_cherry_pick() -> Result<Option<PickInProgress>, String> {
         .map(|state| PickInProgress {
             source: state.source,
             our_head: state.our_head,
+            our_pallet: state.our_pallet,
             description: state.description,
         }))
 }
@@ -446,6 +454,7 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
                 their_head: consolidation.their_head.clone(),
                 their_pallet: consolidation.their_pallet.clone(),
                 our_head: consolidation.our_head.clone(),
+                our_pallet: consolidation.our_pallet.clone(),
             })?;
         },
         None => {
@@ -461,6 +470,7 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
             &CherryPickState {
                 source: pick.source.clone(),
                 our_head: pick.our_head.clone(),
+                our_pallet: pick.our_pallet.clone(),
                 description: pick.description.clone(),
             }
         )?,
@@ -530,7 +540,8 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
 
     if let Some(consolidation) = &snapshot.consolidation {
         if !object_utils::is_object_hash(&consolidation.their_head)
-            || !object_utils::is_object_hash(&consolidation.our_head) {
+            || !object_utils::is_object_hash(&consolidation.our_head)
+            || pallet_utils::validate_pallet_name(&consolidation.our_pallet).is_err() {
             return Err("records a malformed consolidation".to_string());
         }
 
@@ -547,7 +558,8 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
     }
 
     if let Some(pick) = &snapshot.cherry_pick {
-        if !object_utils::is_object_hash(&pick.source) || !object_utils::is_object_hash(&pick.our_head) {
+        if !object_utils::is_object_hash(&pick.source) || !object_utils::is_object_hash(&pick.our_head)
+            || pallet_utils::validate_pallet_name(&pick.our_pallet).is_err() {
             return Err("records a malformed cherry-pick".to_string());
         }
     }
@@ -646,7 +658,7 @@ mod tests {
         ConsolidationInProgress {
             their_head: head.to_string(),
             their_pallet: pallet.to_string(),
-            our_head: hash('e'),
+            our_head: hash('e'), our_pallet: "main".to_string(),
             skeleton: String::from_utf8(OutOfScopeSkeleton::default().to_bytes()).unwrap(),
         }
     }
@@ -657,7 +669,7 @@ mod tests {
         merge_utils::write_consolidation_state(&ConsolidationState {
             their_head: head.to_string(),
             their_pallet: pallet.to_string(),
-            our_head: hash('e'),
+            our_head: hash('e'), our_pallet: "main".to_string(),
         }).unwrap();
     }
 
@@ -930,12 +942,12 @@ mod tests {
         let before = capture().unwrap();
 
         // A conflicted pick moves no ref; it leaves the pick in progress.
-        cherry_pick_utils::write_state(&CherryPickState { source: hash('c'), our_head: hash('e'), description: None }).unwrap();
+        cherry_pick_utils::write_state(&CherryPickState { source: hash('c'), our_head: hash('e'), our_pallet: "main".to_string(), description: None }).unwrap();
         push_if_changed("cherry-pick", before).unwrap();
 
         let popped = pop().unwrap().expect("a pick left in progress must be journaled");
         assert_eq!(popped.before.cherry_pick, None);
-        assert_eq!(popped.after.cherry_pick, Some(PickInProgress { source: hash('c'), our_head: hash('e'), description: None }));
+        assert_eq!(popped.after.cherry_pick, Some(PickInProgress { source: hash('c'), our_head: hash('e'), our_pallet: "main".to_string(), description: None }));
     }
 
     #[test]
@@ -1113,7 +1125,7 @@ mod tests {
             ..consolidating(&hash('3'), "side")
         });
         let mut bad_pick = entry("stack", "main", &hash('1'), &hash('2'));
-        bad_pick.before.cherry_pick = Some(PickInProgress { source: "nope".to_string(), our_head: hash('e'), description: None });
+        bad_pick.before.cherry_pick = Some(PickInProgress { source: "nope".to_string(), our_head: hash('e'), our_pallet: "main".to_string(), description: None });
         let mut bad_label = entry("consolidate", "main", &hash('1'), &hash('2'));
         bad_label.after.consolidation = Some(consolidating(&hash('3'), ""));
 
@@ -1241,14 +1253,14 @@ mod tests {
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
         ).unwrap();
-        cherry_pick_utils::write_state(&CherryPickState { source: hash('6'), our_head: hash('e'), description: None }).unwrap();
+        cherry_pick_utils::write_state(&CherryPickState { source: hash('6'), our_head: hash('e'), our_pallet: "main".to_string(), description: None }).unwrap();
 
         let error = check_undoable(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap_err();
         assert!(error.contains("it left no cherry-pick in progress"), "{}", error);
 
         // And the converse: the op left this pick in progress, and it still is.
         let mut picked = entry("cherry-pick", "main", &hash('2'), &hash('2'));
-        picked.after.cherry_pick = Some(PickInProgress { source: hash('6'), our_head: hash('e'), description: None });
+        picked.after.cherry_pick = Some(PickInProgress { source: hash('6'), our_head: hash('e'), our_pallet: "main".to_string(), description: None });
         check_undoable(&picked).unwrap();
     }
 
@@ -1385,7 +1397,7 @@ mod tests {
         merge_utils::write_consolidation_state(&ConsolidationState {
             their_head: hash('d'),
             their_pallet: "side".to_string(),
-            our_head: hash('e'),
+            our_head: hash('e'), our_pallet: "main".to_string(),
         }).unwrap();
 
         assert!(capture().is_err(), "a broken merge must not be journaled with an empty skeleton");
@@ -1475,7 +1487,7 @@ mod tests {
         merge_utils::write_consolidation_state(&ConsolidationState {
             their_head: hash('d'),
             their_pallet: "stray".to_string(),
-            our_head: hash('e'),
+            our_head: hash('e'), our_pallet: "main".to_string(),
         }).unwrap();
         pallet_utils::update_pallet_head("main", None, &hash('b')).unwrap();
 
@@ -1496,7 +1508,7 @@ mod tests {
 
         // The stack that completed the pick consumed its state file.
         let mut completed = entry("stack", "main", &hash('1'), &hash('2'));
-        completed.before.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('e'), description: Some("pick".to_string()) });
+        completed.before.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('e'), our_pallet: "main".to_string(), description: Some("pick".to_string()) });
 
         restore_refs(&completed).unwrap();
 
