@@ -104,7 +104,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::forklift_root;
 use crate::util::lock_utils::RefLock;
-use crate::util::{fanout_utils, file_utils, object_utils, pallet_utils, taint_utils};
+use crate::util::{fanout_utils, file_utils, object_utils, office_utils, pallet_utils, taint_utils};
 
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
@@ -188,9 +188,10 @@ pub(crate) enum RestageOutcome {
 pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<RestageOutcome, String> {
     let final_path = root.join(relative_path);
 
-    // A ref's read and rewrite below must not straddle another writer's compare-and-set, or the
-    // rewrite would resurrect the head that write replaced: hold the shared ref lock across both.
-    let _ref_lock = if is_ref_path(relative_path) { Some(RefLock::acquire_in(root)?) } else { None };
+    // A ref's (or the trust anchor's) read and rewrite below must not straddle another writer's
+    // compare-and-set, or the rewrite would resurrect the value that write replaced: hold the
+    // shared ref lock across both.
+    let _ref_lock = if is_ref_lock_guarded(relative_path) { Some(RefLock::acquire_in(root)?) } else { None };
 
     let bytes = match std::fs::read(&final_path) {
         Ok(bytes) => bytes,
@@ -245,9 +246,13 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
     Ok(RestageOutcome::Restaged)
 }
 
-/// Whether `relative_path` (under the forklift root) is a pallet ref: anything under `pallets/`
-/// or `meta/`.
-fn is_ref_path(relative_path: &Path) -> bool {
+/// Whether `relative_path` (under the forklift root) is written only under the ref lock: a pallet
+/// ref (anything under `pallets/` or `meta/`) or the trust anchor.
+fn is_ref_lock_guarded(relative_path: &Path) -> bool {
+    if relative_path == Path::new(office_utils::FILE_NAME_TRUST) {
+        return true;
+    }
+
     matches!(
         relative_path.components().next(),
         Some(std::path::Component::Normal(first))
@@ -1370,34 +1375,37 @@ mod tests {
     }
 
     #[test]
-    fn restaging_a_pallet_ref_waits_for_the_ref_lock() {
-        // A restage reads a ref and rewrites the same bytes; outside the ref lock, a head written
-        // in between would be overwritten with the older value.
+    fn restaging_a_pallet_ref_or_the_trust_anchor_waits_for_the_ref_lock() {
+        // A restage reads a ref (or the anchor) and rewrites the same bytes; outside the ref lock,
+        // a value written in between would be overwritten with the older one.
         let root = scratch("restage-ref-under-lock");
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
 
         std::fs::create_dir_all(forklift.join("pallets")).unwrap();
         std::fs::write(forklift.join("pallets").join("main"), format!("{}\n", "a".repeat(64))).unwrap();
+        std::fs::write(forklift.join(office_utils::FILE_NAME_TRUST), "genesis = \"0\"\n").unwrap();
 
-        let held = crate::util::lock_utils::RefLock::acquire().unwrap();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for path in ["pallets/main", office_utils::FILE_NAME_TRUST] {
+            let held = crate::util::lock_utils::RefLock::acquire().unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
 
-        let restager = {
-            let forklift = forklift.clone();
-            std::thread::spawn(move || {
-                let outcome = restage_object(&forklift, Path::new("pallets/main"));
-                done_tx.send(()).unwrap();
-                outcome
-            })
-        };
+            let restager = {
+                let forklift = forklift.clone();
+                std::thread::spawn(move || {
+                    let outcome = restage_object(&forklift, Path::new(path));
+                    done_tx.send(()).unwrap();
+                    outcome
+                })
+            };
 
-        // A bounded wait can only err toward passing.
-        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
-            "restaging a ref must wait while another holder has the ref lock");
+            // A bounded wait can only err toward passing.
+            assert!(done_rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+                "restaging {} must wait while another holder has the ref lock", path);
 
-        drop(held);
-        assert_eq!(restager.join().unwrap().unwrap(), RestageOutcome::Restaged);
+            drop(held);
+            assert_eq!(restager.join().unwrap().unwrap(), RestageOutcome::Restaged, "{}", path);
+        }
     }
 
     #[test]

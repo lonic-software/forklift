@@ -420,8 +420,8 @@ impl BaseServeLock {
 ///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
-/// ref compare-and-set, the trust anchor writes and `heal`'s restage of a ref path take it, and
-/// none of them calls another.
+/// ref compare-and-set, the trust anchor writes and `heal`'s restage of a ref or the anchor
+/// take it, and none of them calls another.
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.
     _file: std::fs::File,

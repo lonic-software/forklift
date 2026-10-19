@@ -41,7 +41,7 @@ const RECORD_SUFFIX: &str = ".toml";
 
 /// The trust anchor file inside the forklift root. Its presence means signing is
 /// required — a one-way door (nothing ever removes it).
-const FILE_NAME_TRUST: &str = "trust";
+pub(crate) const FILE_NAME_TRUST: &str = "trust";
 
 /// What an operator may do. Recorded in the user's tracked office record, so
 /// privileges are signed, audited metadata like everything else in the office.
