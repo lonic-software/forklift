@@ -94,7 +94,9 @@ contention.** Two things decide almost every row:
    full-tree `shift` 1.20 s → 0.50 s (2.4×), an 83-file `shift` 183 → 151 ms (−18%); peak memory
    +9%. `restore`'s directory loop still runs serially; it writes only the files that differ from
    their entries, but reads in full every file the stat cache cannot vouch for and whose size
-   matches (FORK-181); the rest of its serial cost is FORK-192.
+   matches (FORK-181); `restore --staged` likewise stats each file under the path, and reads
+   in full the ones its current entry cannot settle by stat (FORK-182), on one thread;
+   the rest of both commands' serial cost is FORK-192.
 
 3. **`diff` — done, 1.4–5.7× on 18 cores (`diff_pallets`).** A cross-revision diff is one
    independent unit per changed file: load the two blobs, run the histogram diff, format the block.

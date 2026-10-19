@@ -538,7 +538,7 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 
 /// Whether a directory's inventory shard, just rebuilt wholesale from `tree`, may be trusted to
 /// carry `tree`'s hash as its rollup. Shared by `restore --staged`'s and `shift`'s tree-to-shard
-/// builders (`build_stale_shards`, `shift_utils::build_inventory_for_tree_directory`), which each
+/// builders (`build_unstaged_shards`, `shift_utils::build_inventory_for_tree_directory`), which each
 /// independently rebuild every shard of a subtree straight from a resolved tree and must decide
 /// the same way whether the shard they just wrote is a trustworthy rollup — kept as one function
 /// so the (subtle) rule can never drift between the two copies.

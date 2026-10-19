@@ -2074,6 +2074,18 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
     assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
     assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime("a.txt"),
         "a file whose content matches the head must record its stat data");
+    // A staged removal is never a witness, even where its entry still carries the head's
+    // content: the file comes back as a live entry that its content proves.
+    let a_bytes = std::fs::read(warehouse.root.join("a.txt")).unwrap();
+    assert_success(&warehouse.run(&["remove", "a.txt"]));
+    std::fs::write(warehouse.root.join("a.txt"), &a_bytes).unwrap();
+    backdate(&warehouse.root.join("a.txt"), 10800);
+    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    let a_entry = inventory_entry(&warehouse, "", "a.txt");
+    assert!(a_entry.state == forklift_core::enums::inventory_item_state::InventoryItemState::Normal,
+        "an unstaged removal must come back as a live entry");
+    assert_eq!(a_entry.content_change_timestamp, mtime("a.txt"), "a file whose content matches the head must record its stat data");
+
     // Unstaging a file whose entry already matches the head changes no content, so it keeps
     // the rollups a stack stamped.
     assert_success(&warehouse.run(&["restore", "--staged", "."]));
