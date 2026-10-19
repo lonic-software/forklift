@@ -2203,11 +2203,12 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
 
     // 24 sibling directories (a level of subtrees to load) holding 268 files in all.
     let mut files: Vec<(String, String)> = (0..4).map(|n| (String::new(), format!("r{}.txt", n))).collect();
-    for dir in 0..24 {
+    let dirs = 24;
+    for dir in 0..dirs {
         files.extend((0..11).map(|n| (format!("d{:02}", dir), format!("f{}.txt", n))));
     }
     assert!(files.len() >= shift_utils::WRITTEN_FANOUT_THRESHOLD && files.len() >= shift_utils::VERIFY_FANOUT_THRESHOLD
-        && 24 >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD, "the tree must be large enough to fan out");
+        && dirs >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD, "the tree must be large enough to fan out");
     for (dir, name) in &files {
         let path = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
         warehouse.write_file(&path, &format!("{}\n", path));
@@ -2272,16 +2273,17 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
 
     // In scope: 20 directories under src/api, 280 files. Out of scope: as many under src/web,
     // and a file on the spine.
+    let (dirs, per_dir) = (20, 14);
     for side in ["api", "web"] {
-        for dir in 0..20 {
-            for n in 0..14 {
+        for dir in 0..dirs {
+            for n in 0..per_dir {
                 let path = format!("src/{}/d{:02}/f{}.txt", side, dir, n);
                 warehouse.write_file(&path, &format!("{}\n", path));
             }
         }
     }
     warehouse.write_file("src/spine.txt", "spine\n");
-    assert!(20 * 14 >= shift_utils::WRITTEN_FANOUT_THRESHOLD && 20 >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD,
+    assert!(dirs * per_dir >= shift_utils::WRITTEN_FANOUT_THRESHOLD && dirs >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD,
         "the scope must be large enough to fan out");
 
     assert_success(&warehouse.run(&["prepare"]));
@@ -2305,8 +2307,8 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
 
     assert_eq!(changes(&scoped_dir), vec![], "a fresh scoped bay must read clean");
 
-    // The bay wrote every file after its anchor, so none is proven and stocktake hashes them all:
-    // a same-size edit reads as the only change because every other entry holds its own file.
+    // The bay's entries start unproven (it wrote every file after its anchor): a same-size edit
+    // reads as the only change because every other entry holds its own file's hash.
     std::fs::write(scoped_dir.join("src/api/d13/f9.txt"), "SRC/api/d13/f9.txt\n").unwrap();
     assert_eq!(changes(&scoped_dir), vec![("modified".to_string(), "src/api/d13/f9.txt".to_string())]);
 
@@ -2322,9 +2324,9 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
     };
     assert!(bay_inventory.is_dir(), "the bay keeps its own inventory");
 
-    for dir in 0..20 {
+    for dir in 0..dirs {
         let api = shard(&format!("src/api/d{:02}", dir)).expect("every in-scope directory has a shard");
-        assert_eq!(api.get_items_count(), 14, "src/api/d{:02} must hold its own files", dir);
+        assert_eq!(api.get_items_count(), per_dir, "src/api/d{:02} must hold its own files", dir);
         assert!(shard(&format!("src/web/d{:02}", dir)).is_none(), "an out-of-scope directory has no shard");
     }
     assert!(shard("src").and_then(|spine| spine.get_item_by_name("spine.txt")).is_none(),
