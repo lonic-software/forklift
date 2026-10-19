@@ -6130,6 +6130,43 @@ fn a_draft_delivered_once_can_deliver_its_later_work() {
     assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "v3\n");
 }
 
+// Revert: accept a target head whose tree equals any trail parcel's, without a delivery record →
+// the rollback is undone.
+#[test]
+fn deliver_over_a_target_rolled_back_to_a_checkpoints_content_is_refused() {
+    let warehouse = TestWarehouse::new("deliver-again-moved");
+    warehouse.write_file("code.txt", "v1\n");
+    warehouse.write_file("other.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "draft"]));
+    for v in ["v2", "v3"] {
+        warehouse.write_file("code.txt", &format!("{}\n", v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("wip {}", v)]));
+    }
+    assert_success(&warehouse.run(&["deliver", "main", "-m", "first"]));
+
+    // main is rolled back to the first checkpoint's content: the same tree as a trail parcel,
+    // but not a delivery.
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "roll back"]));
+
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    warehouse.write_file("code.txt", "v4\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "wip v4"]));
+
+    let refused = warehouse.run(&["deliver", "main", "-m", "over the rollback"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("forklift consolidate main"), "{}", stderr(&refused));
+}
+
 #[test]
 fn regenesis_resets_trust_and_pins_prior_history_as_attested() {
     let warehouse = TestWarehouse::new("regenesis");
