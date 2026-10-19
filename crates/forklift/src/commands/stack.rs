@@ -131,7 +131,7 @@ mod tests {
     use super::*;
     use forklift_core::util::{file_utils, pallet_utils, shift_utils};
     use forklift_core::util::progress_utils::Progress;
-    use crate::commands::{consolidate, load};
+    use crate::commands::{cherry_pick, consolidate, load};
     use crate::test_support::{self, Warehouse};
 
     #[test]
@@ -172,6 +172,45 @@ mod tests {
             "the other bay's parcel must stay the head");
         assert_eq!(merge_utils::read_consolidation_state().unwrap().map(|state| state.our_head), Some(our_head),
             "the consolidation must stay in progress");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"resolved\n"), "the resolution must be kept");
+    }
+
+    #[test]
+    fn a_stack_completing_a_pick_whose_pallet_moved_is_refused_and_keeps_the_pick() {
+        let warehouse = Warehouse::with_working_tree("stack-pick-moved");
+        test_support::configure_operator();
+
+        let base = test_support::store_parcel(&test_support::store_tree("a.txt", b"base\n"), &[]);
+        let our_tree = test_support::store_tree("a.txt", b"ours\n");
+        let our_head = test_support::store_parcel(&our_tree, &[&base]);
+        let source = test_support::store_parcel(
+            &test_support::store_files(&[("a.txt", b"theirs\n"), ("new.txt", b"new\n")]),
+            &[&base],
+        );
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
+
+        pallet_utils::set_current_pallet_name("main").unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+
+        // A conflicted pick, resolved and loaded by hand.
+        test_support::block_on(cherry_pick::handle_command(&source, None)).unwrap();
+        assert!(cherry_pick_utils::read_state().unwrap().is_some());
+        std::fs::write(warehouse.root.join("a.txt"), b"resolved\n").unwrap();
+        test_support::block_on(load::handle_command("a.txt")).unwrap();
+
+        // Another bay stacks on "main" before the pick is completed.
+        pallet_utils::update_pallet_head("main", Some(&our_head), &elsewhere).unwrap();
+
+        let error = test_support::block_on(handle_command(None))
+            .expect_err("completing a pick over a moved pallet must be refused");
+        assert!(error.contains("moved") && error.contains("cherry-pick is kept"), "{}", error);
+        assert!(error.contains("\"new.txt\""), "the files the pick added must be listed: {}", error);
+
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere),
+            "the other bay's parcel must stay the head");
+        assert_eq!(cherry_pick_utils::read_state().unwrap().map(|state| state.our_head), Some(our_head),
+            "the pick must stay in progress");
         assert!(test_support::file_holds(&warehouse.root, "a.txt", b"resolved\n"), "the resolution must be kept");
     }
 }
