@@ -286,7 +286,7 @@ format!(
     /// entry per line. A set is `S <type-code> <hash> <path>` (path last, so a path with spaces
     /// survives); a deletion is `D <path>`. The path may hold a line break, which the record
     /// escapes.
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let lines = self.entries.iter().map(|(path, resolution)| match resolution {
             Some((hash, item_type)) => format!("S {} {} {}", item_type.get_code(), hash, path),
             None => format!("D {}", path),
@@ -298,7 +298,7 @@ format!(
     /// Parse the on-disk form produced by [`OutOfScopeSkeleton::to_bytes`].
     ///
     /// `path` is where `bytes` were read from; an error names it, and the way out in its bay.
-    fn from_bytes(bytes: &[u8], path: &Path) -> Result<OutOfScopeSkeleton, String> {
+    pub fn from_bytes(bytes: &[u8], path: &Path) -> Result<OutOfScopeSkeleton, String> {
         let remedy = abort_remedy_in(path.parent().unwrap_or(Path::new("")));
         let lines = record_utils::from_bytes(bytes, SKELETON_RECORD, SKELETON_VERSION).map_err(|e| format!(
             "The consolidation skeleton file \"{}\" {} {}", path.to_string_lossy(), e.describe(), remedy

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::globals::bay_root;
 use crate::util::cherry_pick_utils::{self, CherryPickState};
-use crate::util::merge_utils::{self, ConsolidationState};
+use crate::util::merge_utils::{self, ConsolidationState, OutOfScopeSkeleton};
 use crate::util::object_utils;
 use crate::util::pallet_utils::{self, PalletRef};
 use crate::util::file_utils;
@@ -37,11 +37,28 @@ pub struct Snapshot {
     /// a ref the operation left alone needs no restoring.
     pub heads: BTreeMap<String, String>,
 
-    /// The bay's consolidation in progress (`their_head`, `their_pallet`), if any.
-    pub consolidation: Option<(String, String)>,
+    /// The bay's consolidation in progress, if any.
+    pub consolidation: Option<ConsolidationInProgress>,
 
     /// The bay's cherry-pick in progress (one whose merge left conflicts), if any.
     pub cherry_pick: Option<PickInProgress>,
+}
+
+/// A consolidation in progress, as journaled: the bay's consolidation-state file and the
+/// out-of-scope skeleton beside it. The skeleton travels with the state because the stack that
+/// completes the merge requires both; restoring the state alone would leave a merge that can
+/// never be completed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidationInProgress {
+    /// The head being merged in.
+    pub their_head: String,
+
+    /// The pallet being merged in.
+    pub their_pallet: String,
+
+    /// The merge's out-of-scope skeleton, in its on-disk form (empty outside a scoped bay).
+    pub skeleton: String,
 }
 
 /// A cherry-pick in progress, as journaled: the bay's cherry-pick state file.
@@ -61,7 +78,7 @@ pub struct PickInProgress {
 struct BayState {
     current_pallet: String,
     current_head: Option<String>,
-    consolidation: Option<(String, String)>,
+    consolidation: Option<ConsolidationInProgress>,
     cherry_pick: Option<PickInProgress>,
 }
 
@@ -99,9 +116,21 @@ impl Snapshot {
     }
 }
 
-/// The bay's consolidation in progress, as journaled.
-fn read_consolidation() -> Result<Option<(String, String)>, String> {
-    Ok(merge_utils::read_consolidation_state()?.map(|state| (state.their_head, state.their_pallet)))
+/// The bay's consolidation in progress, as journaled. Its skeleton is required, exactly as the
+/// completing stack requires it: a state without one is a broken merge, never an empty skeleton.
+fn read_consolidation() -> Result<Option<ConsolidationInProgress>, String> {
+    let Some(state) = merge_utils::read_consolidation_state()? else {
+        return Ok(None);
+    };
+
+    let skeleton = String::from_utf8(OutOfScopeSkeleton::read_required()?.to_bytes())
+        .map_err(|_| "The out-of-scope skeleton does not serialize as text.".to_string())?;
+
+    Ok(Some(ConsolidationInProgress {
+        their_head: state.their_head,
+        their_pallet: state.their_pallet,
+        skeleton,
+    }))
 }
 
 /// The bay's cherry-pick in progress, as journaled.
@@ -277,8 +306,8 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     }
 
     if now.consolidation != after.consolidation {
-        let describe = |consolidation: &Option<(String, String)>| match consolidation {
-            Some((_, their_pallet)) => format!("a consolidation of \"{}\"", their_pallet),
+        let describe = |consolidation: &Option<ConsolidationInProgress>| match consolidation {
+            Some(consolidation) => format!("a consolidation of \"{}\"", consolidation.their_pallet),
             None => "no consolidation".to_string(),
         };
 
@@ -333,11 +362,20 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
 
     pallet_utils::set_current_pallet_name(&entry.before.current_pallet)?;
 
+    // The skeleton goes down before the state and comes off after it, as `consolidate` and
+    // `stack` order them, so no window shows a consolidation without its skeleton.
     match &entry.before.consolidation {
-        Some((their_head, their_pallet)) => merge_utils::write_consolidation_state(
-            &ConsolidationState { their_head: their_head.clone(), their_pallet: their_pallet.clone() }
-        )?,
-        None => merge_utils::clear_consolidation_state()?,
+        Some(consolidation) => {
+            OutOfScopeSkeleton::from_bytes(consolidation.skeleton.as_bytes(), &path())?.write()?;
+            merge_utils::write_consolidation_state(&ConsolidationState {
+                their_head: consolidation.their_head.clone(),
+                their_pallet: consolidation.their_pallet.clone(),
+            })?;
+        },
+        None => {
+            merge_utils::clear_consolidation_state()?;
+            OutOfScopeSkeleton::clear()?;
+        },
     }
 
     // Undoing the stack that completed a conflicted pick puts the pick back in progress, so the
@@ -380,12 +418,15 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
         }
     }
 
-    if let Some((their_head, their_pallet)) = &snapshot.consolidation {
-        if !object_utils::is_object_hash(their_head) {
+    if let Some(consolidation) = &snapshot.consolidation {
+        if !object_utils::is_object_hash(&consolidation.their_head) {
             return Err("records a malformed consolidation".to_string());
         }
 
-        pallet_utils::validate_pallet_name(their_pallet).map_err(invalid_name)?;
+        pallet_utils::validate_pallet_name(&consolidation.their_pallet).map_err(invalid_name)?;
+
+        OutOfScopeSkeleton::from_bytes(consolidation.skeleton.as_bytes(), &path())
+            .map_err(|_| "records a malformed out-of-scope skeleton".to_string())?;
     }
 
     if let Some(pick) = &snapshot.cherry_pick {
@@ -413,8 +454,12 @@ fn read() -> Result<Vec<JournalEntry>, String> {
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| unreadable(&path, &format!("is not a readable journal ({})", e)))?;
 
-    let Some(version) = value.get("version").and_then(serde_json::Value::as_u64) else {
-        return Err(unreadable(&path, "is not a readable journal (it records no format version)"));
+    let version = match value.get("version") {
+        Some(version) => version.as_u64().ok_or_else(|| unreadable(&path, &format!(
+            "has an unreadable format version ({}), which this forklift does not understand \
+            (it reads version {})", version, JOURNAL_VERSION
+        )))?,
+        None => return Err(unreadable(&path, "is not a readable journal (it records no format version)")),
     };
 
     if version != JOURNAL_VERSION {
@@ -477,6 +522,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// A consolidation of `pallet` at `head`, with the empty skeleton a full bay writes.
+    fn consolidating(head: &str, pallet: &str) -> ConsolidationInProgress {
+        ConsolidationInProgress {
+            their_head: head.to_string(),
+            their_pallet: pallet.to_string(),
+            skeleton: String::from_utf8(OutOfScopeSkeleton::default().to_bytes()).unwrap(),
+        }
+    }
+
+    /// Start a consolidation in the bay as `consolidate` does: the skeleton, then the state.
+    fn start_consolidation(head: &str, pallet: &str) {
+        OutOfScopeSkeleton::default().write().unwrap();
+        merge_utils::write_consolidation_state(&ConsolidationState {
+            their_head: head.to_string(),
+            their_pallet: pallet.to_string(),
+        }).unwrap();
     }
 
     fn hash(digit: char) -> String {
@@ -552,10 +615,7 @@ mod tests {
         // The operation itself: the head moves, a consolidation starts and another ref moves.
         pallet_utils::set_pallet_head("main", &hash('b')).unwrap();
         pallet_utils::set_pallet_head("side", &hash('c')).unwrap();
-        merge_utils::write_consolidation_state(&ConsolidationState {
-            their_head: hash('d'),
-            their_pallet: "side".to_string(),
-        }).unwrap();
+        start_consolidation(&hash('d'), "side");
         push_if_changed("consolidate", before).unwrap();
 
         let popped = pop().unwrap().expect("a real change must be journaled");
@@ -564,7 +624,7 @@ mod tests {
         assert_eq!(popped.after.current_pallet, "main");
         assert_eq!(popped.after.heads.get("main"), Some(&hash('b')));
         assert_eq!(popped.after.heads.get("side"), Some(&hash('c')));
-        assert_eq!(popped.after.consolidation, Some((hash('d'), "side".to_string())));
+        assert_eq!(popped.after.consolidation, Some(consolidating(&hash('d'), "side")));
         assert!(pop().unwrap().is_none(), "popping removes the entry");
     }
 
@@ -732,6 +792,7 @@ mod tests {
         let _scratch = Scratch::new("version-journal");
 
         assert_refused_everywhere(r#"{"version":2,"entries":[]}"#, "has format version 2");
+        assert_refused_everywhere(r#"{"version":"1","entries":[]}"#, "has an unreadable format version (\"1\")");
     }
 
     #[test]
@@ -764,7 +825,12 @@ mod tests {
         let mut bad_name = entry("stack", "main", &hash('1'), &hash('2'));
         bad_name.before.current_pallet = "../escape".to_string();
         let mut bad_their = entry("consolidate", "main", &hash('1'), &hash('2'));
-        bad_their.after.consolidation = Some((hash('3'), "../escape".to_string()));
+        bad_their.after.consolidation = Some(consolidating(&hash('3'), "../escape"));
+        let mut bad_skeleton = entry("consolidate", "main", &hash('1'), &hash('2'));
+        bad_skeleton.after.consolidation = Some(ConsolidationInProgress {
+            skeleton: "not a skeleton".to_string(),
+            ..consolidating(&hash('3'), "side")
+        });
         let mut bad_pick = entry("stack", "main", &hash('1'), &hash('2'));
         bad_pick.before.cherry_pick = Some(PickInProgress { source: "nope".to_string(), description: None });
 
@@ -772,6 +838,7 @@ mod tests {
             (bad_head, "not an object hash"),
             (bad_name, "names an invalid pallet"),
             (bad_their, "names an invalid pallet"),
+            (bad_skeleton, "malformed out-of-scope skeleton"),
             (bad_pick, "malformed cherry-pick"),
         ] {
             let content = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries: &[bad] }).unwrap();
@@ -840,10 +907,7 @@ mod tests {
         let _scratch = Scratch::new("gate-consolidation");
 
         pallet_utils::set_pallet_head("main", &hash('2')).unwrap();
-        merge_utils::write_consolidation_state(&ConsolidationState {
-            their_head: hash('5'),
-            their_pallet: "side".to_string(),
-        }).unwrap();
+        start_consolidation(&hash('5'), "side");
 
         // The op left no consolidation in progress; one is in progress now.
         let error = check_undoable(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap_err();
@@ -851,7 +915,7 @@ mod tests {
 
         // And the converse: the op left this consolidation in progress, and it still is.
         let mut started = entry("consolidate", "main", &hash('2'), &hash('2'));
-        started.after.consolidation = Some((hash('5'), "side".to_string()));
+        started.after.consolidation = Some(consolidating(&hash('5'), "side"));
         check_undoable(&started).unwrap();
     }
 
@@ -885,7 +949,7 @@ mod tests {
         let mut restored = entry("consolidate", "main", &hash('a'), &hash('2'));
         restored.before.current_pallet = "feature".to_string();
         restored.before.heads.insert("@office".to_string(), hash('b'));
-        restored.before.consolidation = Some((hash('c'), "their-pallet".to_string()));
+        restored.before.consolidation = Some(consolidating(&hash('c'), "their-pallet"));
         restored.after.heads.insert("@office".to_string(), hash('4'));
 
         restore_refs(&restored).unwrap();
@@ -897,6 +961,47 @@ mod tests {
         let consolidation = merge_utils::read_consolidation_state().unwrap().unwrap();
         assert_eq!(consolidation.their_head, hash('c'));
         assert_eq!(consolidation.their_pallet, "their-pallet");
+        assert!(OutOfScopeSkeleton::read_required().is_ok(), "the skeleton must come back with the state");
+    }
+
+    #[test]
+    fn restore_refs_puts_back_the_recorded_out_of_scope_skeleton() {
+        let _scratch = Scratch::new("restore-skeleton");
+
+        pallet_utils::set_pallet_head("main", &hash('2')).unwrap();
+
+        // The stack that completed a scoped merge consumed a non-empty skeleton with the state.
+        let skeleton = OutOfScopeSkeleton::from_actions(&[merge_utils::MergeAction::ResolveOutOfScope {
+            path: "docs/old".to_string(),
+            resolution: None,
+        }]);
+        let mut completed = entry("stack", "main", &hash('1'), &hash('2'));
+        completed.before.consolidation = Some(ConsolidationInProgress {
+            skeleton: String::from_utf8(skeleton.to_bytes()).unwrap(),
+            ..consolidating(&hash('c'), "side")
+        });
+
+        restore_refs(&completed).unwrap();
+
+        assert!(OutOfScopeSkeleton::read_required().unwrap() == skeleton, "the recorded skeleton must be restored");
+
+        // And an entry with no consolidation before it clears both.
+        pallet_utils::set_pallet_head("main", &hash('2')).unwrap();
+        restore_refs(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap();
+        assert!(merge_utils::read_consolidation_state().unwrap().is_none());
+        assert!(OutOfScopeSkeleton::read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn capture_refuses_a_consolidation_without_its_skeleton() {
+        let _scratch = Scratch::new("capture-no-skeleton");
+
+        merge_utils::write_consolidation_state(&ConsolidationState {
+            their_head: hash('d'),
+            their_pallet: "side".to_string(),
+        }).unwrap();
+
+        assert!(capture().is_err(), "a broken merge must not be journaled with an empty skeleton");
     }
 
     #[test]

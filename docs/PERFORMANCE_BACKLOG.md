@@ -685,9 +685,10 @@ qualified.
 * **The undo journal stays durable.** Its push is best-effort by contract and costs about 4 ms
   of a ~47 ms `stack`, but a lost unsynced push leaves the journal *behind* the refs. `undo`
   would then try to reverse an older operation than the user's last. Since FORK-186 the gate
-  compares each entry's recorded after-state (current pallet, its head, consolidation) with the
-  bay. Every journaled operation changes one of those three fields, so a lost push leaves the
-  bay past the surviving entry and `undo` now refuses rather than misreads. Dropping the
+  compares each entry's recorded after-state (current pallet, its head, the consolidation and
+  cherry-pick in progress) with the bay. An operation is journaled only when it changes one of
+  those fields, so a lost push leaves the bay past the surviving entry and `undo` now refuses
+  rather than misreads. Dropping the
   barrier would be defensible on that basis; it is not done here.
 * **Everything else is authoritative.** That covers refs, the current pallet, consolidation and
   cherry-pick state, inventory, markers, scope, signatures, office anchors, bay records,
