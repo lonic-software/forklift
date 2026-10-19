@@ -611,11 +611,12 @@ mod tests {
 
             // Not a number freed here: tests run in parallel, and a concurrent pipe or socket can
             // take a freed number before the check. The soft limit on open files is the lowest
-            // number the kernel will not hand out, and nothing in this binary changes the limit.
+            // number the kernel will not hand out, and nothing changes it while the tests run. An
+            // unlimited soft limit falls back to the largest fd, above every kernel's fd ceiling.
             let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
             // SAFETY: `getrlimit` writes into the `rlimit` it is given and reads nothing else.
             assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
-            let closed = RawFd::try_from(limit.rlim_cur).expect("the open-file limit fits an fd");
+            let closed = RawFd::try_from(limit.rlim_cur).unwrap_or(RawFd::MAX);
 
             // What a concurrent test does between choosing the number and checking it.
             let (_reader, writer) = pipe();
