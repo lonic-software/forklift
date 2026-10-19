@@ -5825,10 +5825,11 @@ fn bay_state_file(warehouse: &TestWarehouse, bay: &str, file: &str) -> std::path
     warehouse.root.join(".forklift").join("bays").join(bay).join(file)
 }
 
-// T7. B resolves its consolidation to the very tree A then stacks. Reverts: catch-up without its
-// mid-merge refusal → the catch-up passes, but stack's our_head-equals-base guard still refuses;
-// that guard alone reverted → still refused at the catch-up; both together → B's merge parcel,
-// built on the old head, drops A's parcel from main.
+// T7. B resolves its consolidation to the very tree A then stacks, and tries to catch up and stack
+// anyway. Reverts: catch-up without its mid-merge refusal → B catches up (its files match A's
+// head), and stack's our_head-equals-base guard still refuses; that guard alone reverted → B
+// stays behind and is refused as stale; both together → B's merge parcel, built on the old head,
+// lands and drops A's parcel from main.
 #[test]
 fn a_consolidation_started_before_the_pallet_moved_never_lands() {
     let (warehouse, bay, _) = bay_mid_consolidation("stale-bay-mid-merge");
@@ -5838,14 +5839,26 @@ fn a_consolidation_started_before_the_pallet_moved_never_lands() {
     // A stacks the same tree B resolved to, plus nothing else.
     let a_head = stack_at(&warehouse, &warehouse.root, "f.txt", "resolved\n", "A resolves f the same way");
 
+    let _ = warehouse.run_at(&bay, &["shift", "main"]);
+    let stacked = warehouse.run_at(&bay, &["stack", "B completes the merge"]);
+    assert!(!stacked.status.success(), "{}", stdout(&stacked));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), a_head);
+}
+
+// T7's catch-up half. Revert: catch-up without its mid-merge refusal → it catches up.
+#[test]
+fn catching_up_mid_consolidation_is_refused() {
+    let (warehouse, bay, _) = bay_mid_consolidation("stale-bay-catch-up-mid-merge");
+    std::fs::write(bay.join("f.txt"), "resolved\n").unwrap();
+    assert_success(&warehouse.run_at(&bay, &["load", "f.txt"]));
+    stack_at(&warehouse, &warehouse.root, "f.txt", "resolved\n", "A resolves f the same way");
+
     let catch_up = warehouse.run_at(&bay, &["shift", "main"]);
     assert!(!catch_up.status.success() && stderr(&catch_up).contains("consolidation is in progress"), "{}", stderr(&catch_up));
 
     let stacked = warehouse.run_at(&bay, &["stack", "B completes the merge"]);
-    assert!(!stacked.status.success(), "{}", stdout(&stacked));
     assert!(stderr(&stacked).contains("consolidation is kept") && stderr(&stacked).contains("forklift shift main"),
         "{}", stderr(&stacked));
-    assert_eq!(pallet_head_hash(&warehouse, "main"), a_head);
 }
 
 // T8. B's consolidate stops at conflicts, A stacks, B undoes. Reverts: undo putting back refs whose
