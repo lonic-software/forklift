@@ -18,6 +18,8 @@ use crate::util::{file_utils, inventory_utils, object_utils};
 ///
 /// * Entries staged for removal (`Deleted`) are excluded — that is how a staged removal
 ///   becomes an actual removal in the next parcel.
+/// * Every other entry's content must be in the store, chunks included, or the build refuses
+///   ([`require_staged_content`]).
 /// * Directories that end up empty (no files, no non-empty subdirectories) are pruned,
 ///   except the warehouse root.
 /// * Ancestor directories that have no shard of their own (e.g. only `src/a` was ever
@@ -211,6 +213,8 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
                     continue;
                 }
 
+                require_staged_content(&key, item)?;
+
                 tree.add_child(TreeItem::new(item.name.clone(), item.hash.clone(), item.item_type));
             }
         }
@@ -282,6 +286,41 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 
         Ok(())
     }
+}
+
+/// Refuse a staged leaf whose content the store does not hold: for a chunked entry, its recipe
+/// or any chunk the recipe names. Its absence is loss, not a sparse gap — the item was loaded
+/// into this bay, and a sparse bay keeps no shard for what it leaves out — and nothing after the
+/// build can tell the two apart: `audit` accepts a parcel naming an absent object, so only a
+/// later `restore` would fail (FORK-157). A leaf under a subtree the rollup skip injects by hash
+/// is not checked here; the head parcel already names that exact content.
+///
+/// # Returns
+/// * `Ok(())`      - The leaf's content, every chunk included, is present.
+/// * `Err(String)` - It is not, naming the path and the missing hash; or the store could not be
+///                   consulted.
+fn require_staged_content(key: &str, item: &crate::model::inventory::InventoryItem) -> Result<(), String> {
+    let path = if key.is_empty() { item.name.clone() } else { format!("{}/{}", key, item.name) };
+    let missing = |what: String| format!(
+        "\"{}\" is staged, but {} is missing from the store, so no parcel can be built over it. \
+        Nothing was written. Load the file again from its working copy if it is still there, or \
+        unstage it with \"restore --staged\".",
+        path, what
+    );
+
+    if !file_utils::does_object_exist(&item.hash)? {
+        return Err(missing(format!("its content {}", item.hash)));
+    }
+
+    if item.item_type.is_chunked() {
+        for chunk in object_utils::load_recipe(&item.hash)?.chunks {
+            if !file_utils::does_object_exist(&chunk.hash)? {
+                return Err(missing(format!("chunk {} of its content {}", chunk.hash, item.hash)));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Splice freshly built in-scope subtree(s) over the current head's spine to produce the

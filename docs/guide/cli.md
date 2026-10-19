@@ -361,7 +361,10 @@ and add it to `.forkliftignore`. It also
 refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
 named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
-stack again.
+stack again. And it refuses, naming the path and the hash, when the store no longer holds a staged
+file's content (for a large file, its recipe or any of its chunks) — lost after the `load`, say
+to a crash or a manual deletion. A parcel signed over it would pass `audit` and fail only at a
+later `restore`. Load the file again from its working copy, or `restore --staged` it.
 
 ### Large files
 
