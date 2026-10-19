@@ -280,17 +280,15 @@ struct TemporaryBundleDirectory {
 
 impl TemporaryBundleDirectory {
     fn new(parent: &Path) -> Result<TemporaryBundleDirectory, String> {
-        // `unique_child` advances its counter on every call, so a leftover directory from a
-        // killed builder with a recycled PID costs a retry, never the build.
-        for _ in 0..16 {
-            let path = unique_child(parent, ".bundle-packs");
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(TemporaryBundleDirectory { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("Error while creating bundle pack staging: {}", e)),
-            }
-        }
-        Err("Error while creating bundle pack staging: no unused staging name.".to_string())
+        // A leftover directory from a killed builder with a recycled PID costs a retry, never the
+        // build.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let candidates = file_utils::pid_numbered(&COUNTER, |pid, n| {
+            parent.join(format!(".bundle-packs-{}-{}", pid, n))
+        });
+        file_utils::create_first_new_folder(candidates)
+            .map(|path| TemporaryBundleDirectory { path })
+            .map_err(|e| format!("Error while creating bundle pack staging: {}", e))
     }
 }
 

@@ -1504,6 +1504,10 @@ enum Creation {
 /// with a dot, which no warehouse id may, so a half-prepared warehouse is never served.
 const CREATING_PREFIX: &str = ".creating-";
 
+/// Numbers [`create_warehouse`]'s staging folders, which are unique per creation, not just per
+/// process.
+static NEXT_CREATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Make the warehouse `id` in `base`, or find it already made. The warehouse is prepared in a
 /// folder of its own and renamed into place, so it appears complete or not at all, and the rename
 /// decides which of several racing calls made it: exactly one sees [`Creation::Created`].
@@ -1513,19 +1517,23 @@ const CREATING_PREFIX: &str = ".creating-";
 ///
 /// Blocking: call it from blocking code.
 fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, HandlerError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_CREATION: AtomicU64 = AtomicU64::new(0);
+    create_warehouse_numbered(base, id, &NEXT_CREATION)
+}
 
+/// [`create_warehouse`] drawing its staging names from `counter`.
+fn create_warehouse_numbered(base: &std::path::Path, id: &str,
+                             counter: &std::sync::atomic::AtomicU64) -> Result<Creation, HandlerError> {
     let target = base.join(id);
     if target.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir() {
         return Ok(Creation::Existed);
     }
 
-    let staging = base.join(format!(
-        "{}{}-{}-{}",
-        CREATING_PREFIX, id, std::process::id(), NEXT_CREATION.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir(&staging)
+    // A name taken by a killed earlier process with this one's id, which the startup sweep could
+    // not remove, is stepped past rather than failing every creation of `id`.
+    let candidates = file_utils::pid_numbered(counter, |pid, n| base.join(format!(
+        "{}{}-{}-{}", CREATING_PREFIX, id, pid, n
+    )));
+    let staging = file_utils::create_first_new_folder(candidates)
         .map_err(|e| internal(format!("Error while creating the warehouse folder: {}", e)))?;
 
     let prepared = {
@@ -4034,6 +4042,33 @@ mod tests {
         assert_eq!(std::fs::read(base.join("file")).unwrap(), b"not a folder", "never replaced");
 
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A killed earlier process with this one's id can leave its staging folder at the very name
+    /// the next creation draws, when the startup sweep could not remove it. The creation steps
+    /// past it, and the litter is neither adopted nor touched.
+    #[test]
+    fn a_dead_process_s_staging_folder_at_the_next_name_is_stepped_past() {
+        let base = scratch_dir("create-litter");
+        // A counter of the test's own: other tests drawing from the shared one would move the
+        // next name past the litter, and the test would pass without stepping past anything.
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let litter: Vec<_> = (0..8)
+            .map(|n| base.join(format!("{}w-{}-{}", CREATING_PREFIX, std::process::id(), n)))
+            .collect();
+        for folder in &litter {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::write(folder.join("left.txt"), b"litter").unwrap();
+        }
+
+        assert_eq!(create_warehouse_numbered(&base, "w", &counter).unwrap(), Creation::Created);
+        assert!(base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT).is_dir());
+        assert!(!base.join("w").join("left.txt").exists(), "the litter was adopted");
+        for folder in &litter {
+            assert_eq!(std::fs::read(folder.join("left.txt")).unwrap(), b"litter", "litter is left as it was");
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

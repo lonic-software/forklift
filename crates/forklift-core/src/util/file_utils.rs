@@ -609,6 +609,54 @@ fn create_fresh_temp(file_path: &Path,
     }
 }
 
+/// Create a new file at the first of `candidates` that is not taken, opened for writing. A taken
+/// name is skipped, never opened: opening it would follow a symlink, or truncate a file someone
+/// else owns. A pid-numbered name is taken by litter when a process that had this one's id was
+/// killed before it cleaned up (Windows reuses ids quickly). Any error but `AlreadyExists` returns
+/// at once; running out of candidates returns `AlreadyExists`. On Windows a *folder* at a candidate
+/// is refused as access denied, so it returns rather than being skipped: no caller draws file and
+/// folder names from one sequence.
+pub fn create_first_new_file(candidates: impl IntoIterator<Item = PathBuf>) -> std::io::Result<(PathBuf, std::fs::File)> {
+    first_new(candidates, |path| std::fs::OpenOptions::new().write(true).create_new(true).open(path))
+}
+
+/// [`create_first_new_file`] for a folder: create a new, empty folder at the first of
+/// `candidates` that is not taken, so nothing a dead process left in a taken one is ever adopted.
+pub fn create_first_new_folder(candidates: impl IntoIterator<Item = PathBuf>) -> std::io::Result<PathBuf> {
+    first_new(candidates, |path| std::fs::create_dir(path)).map(|(path, ())| path)
+}
+
+/// How many names [`pid_numbered`] offers: enough to step past any litter a few killed processes
+/// with this one's id could leave, few enough that a folder filled with it fails rather than spins.
+pub const PID_NUMBERED_TRIES: u64 = 64;
+
+/// The names a temp file or folder is created at, numbered for this process: `name(pid, n)` for
+/// this process's id and the next [`PID_NUMBERED_TRIES`] numbers drawn from `counter`. A site keeps
+/// its own `counter`, so no two calls in one process draw the same name.
+pub fn pid_numbered<'a>(counter: &'a std::sync::atomic::AtomicU64,
+                        name: impl Fn(u32, u64) -> PathBuf + 'a) -> impl Iterator<Item = PathBuf> + 'a {
+    let pid = std::process::id();
+    (0..PID_NUMBERED_TRIES).map(move |_| name(pid, counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+}
+
+fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
+                create: impl Fn(&Path) -> std::io::Result<T>) -> std::io::Result<(PathBuf, T)> {
+    let mut last = None;
+    for path in candidates {
+        match create(&path) {
+            Ok(created) => return Ok((path, created)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(path),
+            Err(e) => return Err(e),
+        }
+    }
+
+    let reason = match last {
+        Some(last) => format!("every name tried is already taken, the last \"{}\"", last.display()),
+        None => "there was no name to try".to_string(),
+    };
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, reason))
+}
+
 /// Write a file atomically: the content is written to a temporary file in the same folder first,
 /// fsynced, then renamed into place, and finally the parent directory is fsynced. A crash mid-write
 /// can therefore never leave a truncated file at the final path — the file either has its old
@@ -3459,6 +3507,48 @@ mod tests {
         let mut asked = 0;
         let result = create_fresh_temp(&target, |_| { asked += 1; Ok(missing.clone()) });
         assert!(result.is_err() && asked == 1, "a missing folder must fail at once, asked {} times", asked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_first_new_steps_past_taken_names_and_stops_on_any_other_failure() {
+        let dir = std::env::temp_dir().join(format!("forklift-first-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = |stem: &str| -> Vec<PathBuf> { (0..3).map(|n| dir.join(format!("{}-{}", stem, n))).collect() };
+
+        // Files: taken names are skipped and left as they were.
+        let files = names("file");
+        std::fs::write(&files[0], b"litter").unwrap();
+        std::fs::write(&files[1], b"more litter").unwrap();
+        let (created, _file) = create_first_new_file(files.clone()).expect("taken names must be stepped past");
+        assert_eq!(created, files[2]);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"litter");
+        assert_eq!(std::fs::read(&files[1]).unwrap(), b"more litter");
+
+        // Folders: a taken folder with content is never adopted, and the content stays.
+        let folders = names("folder");
+        std::fs::create_dir(&folders[0]).unwrap();
+        std::fs::write(folders[0].join("left.txt"), b"litter").unwrap();
+        std::fs::write(&folders[1], b"litter").unwrap();
+        assert_eq!(create_first_new_folder(folders.clone()).unwrap(), folders[2]);
+        assert!(std::fs::read_dir(&folders[2]).unwrap().next().is_none(), "the folder made is new and empty");
+        assert_eq!(std::fs::read(folders[0].join("left.txt")).unwrap(), b"litter");
+
+        // Every name taken: AlreadyExists, after trying each, naming the last one tried.
+        let exhausted = create_first_new_folder(folders.clone()).unwrap_err();
+        assert_eq!(exhausted.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(exhausted.to_string().contains(&folders.last().unwrap().display().to_string()), "{}", exhausted);
+        let nothing = create_first_new_folder(std::iter::empty()).unwrap_err();
+        assert_eq!(nothing.to_string(), "there was no name to try");
+
+        // Any other failure returns at once, without trying the names after it.
+        let mut tried = 0;
+        let missing = dir.join("absent").join("x");
+        let candidates = std::iter::repeat_with(|| { tried += 1; missing.clone() }).take(5);
+        assert_eq!(create_first_new_file(candidates).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(tried, 1, "a failure other than a taken name must not be retried");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -828,18 +828,11 @@ fn copy_into_place(assembled: &Path, fs_path: &Path, path: &str, item_type: DirE
     placed
 }
 
-/// Create the first of `candidates` that does not exist yet, skipping (never opening) any that
-/// does: opening it would follow a symlink, or truncate a file someone else owns.
+/// Create the first of `candidates` that does not exist yet (see
+/// [`file_utils::create_first_new_file`]), for the file at `path`.
 fn create_first_new(path: &str, candidates: impl Iterator<Item = PathBuf>) -> Result<(PathBuf, std::fs::File), String> {
-    for temp_path in candidates {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("Error while creating a temp file for \"{}\": {}", path, e)),
-        }
-    }
-
-    Err(format!("Error while creating a temp file for \"{}\": every name tried already exists.", path))
+    file_utils::create_first_new_file(candidates)
+        .map_err(|e| format!("Error while creating a temp file for \"{}\": {}", path, e))
 }
 
 /// Set a materialized file's mode: executable (`0o755`) for an executable (chunked or plain)
