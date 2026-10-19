@@ -2196,6 +2196,7 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
 fn a_large_tree_lands_every_entry_in_its_own_shard() {
     use forklift_core::enums::dir_entry_type::DirEntryType;
     use forklift_core::model::inventory::UNPROVEN_MTIME;
+    use forklift_core::util::shift_utils;
 
     let warehouse = TestWarehouse::new("large-tree-shards");
     let root = warehouse.root.clone();
@@ -2205,6 +2206,8 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
     for dir in 0..24 {
         files.extend((0..11).map(|n| (format!("d{:02}", dir), format!("f{}.txt", n))));
     }
+    assert!(files.len() >= shift_utils::WRITTEN_FANOUT_THRESHOLD && files.len() >= shift_utils::VERIFY_FANOUT_THRESHOLD
+        && 24 >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD, "the tree must be large enough to fan out");
     for (dir, name) in &files {
         let path = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
         warehouse.write_file(&path, &format!("{}\n", path));
@@ -2263,6 +2266,8 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
 /// directories, whose level is never loaded; and no entry for the spine's own files.
 #[test]
 fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
+    use forklift_core::util::shift_utils;
+
     let warehouse = TestWarehouse::new("large-tree-scoped");
 
     // In scope: 20 directories under src/api, 280 files. Out of scope: as many under src/web,
@@ -2276,6 +2281,8 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
         }
     }
     warehouse.write_file("src/spine.txt", "spine\n");
+    assert!(20 * 14 >= shift_utils::WRITTEN_FANOUT_THRESHOLD && 20 >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD,
+        "the scope must be large enough to fan out");
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
@@ -2298,7 +2305,8 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
 
     assert_eq!(changes(&scoped_dir), vec![], "a fresh scoped bay must read clean");
 
-    // A same-size edit is caught by the stat only where the entry is this file's own.
+    // The bay wrote every file after its anchor, so none is proven and stocktake hashes them all:
+    // a same-size edit reads as the only change because every other entry holds its own file.
     std::fs::write(scoped_dir.join("src/api/d13/f9.txt"), "SRC/api/d13/f9.txt\n").unwrap();
     assert_eq!(changes(&scoped_dir), vec![("modified".to_string(), "src/api/d13/f9.txt".to_string())]);
 

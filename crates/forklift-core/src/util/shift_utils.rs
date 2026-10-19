@@ -984,11 +984,11 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
 /// Below this many files, a tree's written files are recorded on the calling thread. Each is a
 /// single stat of a few microseconds, so the fan-out's threads only pay for themselves over a
 /// few hundred.
-const WRITTEN_FANOUT_THRESHOLD: usize = 256;
+pub const WRITTEN_FANOUT_THRESHOLD: usize = 256;
 
 /// Below this many files, a tree's verified files are recorded on the calling thread. Each is
 /// read and hashed, so the fan-out pays for itself sooner.
-const VERIFY_FANOUT_THRESHOLD: usize = 64;
+pub const VERIFY_FANOUT_THRESHOLD: usize = 64;
 
 /// One in-scope file of a tree, waiting to be recorded into its directory's shard.
 struct TreeFile {
@@ -1128,7 +1128,7 @@ fn collect_tree_directories(root_tree: TreeItem,
 
 /// Below this many subtrees in a level, they are loaded on the calling thread: the fan-out's
 /// threads cost more than they save on a handful of tree loads.
-const TREE_LOAD_FANOUT_THRESHOLD: usize = 16;
+pub const TREE_LOAD_FANOUT_THRESHOLD: usize = 16;
 
 /// Join a directory key and an entry name into the entry's warehouse path.
 fn join_key(key: &str, name: &str) -> String {
