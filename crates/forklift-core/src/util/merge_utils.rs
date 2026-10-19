@@ -868,17 +868,18 @@ fn resolve_merge_job(job: &MergeJob,
         && is_mergeable_text(&our_content)
         && is_mergeable_text(&their_content);
 
-    let merged_type = merged_plain_kind(job.base_type, job.our_type, job.their_type);
-
     if !all_text {
-        // Binary contents are not line-mergeable; keep ours, in conflict.
+        // Binary contents are not line-mergeable; keep ours, in conflict. Its kind too: nothing
+        // is written, so the entry must record the file as it stands, bit included.
         return Ok(MergeAction::Conflict {
             path: job.path.clone(),
             content: None,
             entry_hash: job.our_hash.clone(),
-            item_type: merged_type,
+            item_type: job.our_type,
         });
     }
+
+    let merged_type = merged_plain_kind(job.base_type, job.our_type, job.their_type);
 
     let result = merge_file_contents(
         &base_content,
