@@ -23,9 +23,9 @@ enum HeadEntry {
 }
 
 /// Handle the restore command.
-/// * `restore <path>`          - Rewrite the file (or every tracked file of the directory)
-///                               in the working directory from the inventory, discarding
-///                               unstaged changes.
+/// * `restore <path>`          - Rewrite the file (or every tracked file of the directory
+///                               that differs from its entry) in the working directory from
+///                               the inventory, discarding unstaged changes.
 /// * `restore --staged <path>` - Reset the inventory entries of the path to the pallet
 ///                               head (unstage), leaving the working directory untouched.
 ///
@@ -73,7 +73,8 @@ pub fn handle_unstage(target: &str) -> Result<(), String> {
 }
 
 /// Restore the working directory from the inventory: rewrite the file (or, for a
-/// directory, every tracked, non-`Deleted` file below it) from its staged blob.
+/// directory, every tracked, non-`Deleted` file below it) from its staged blob, leaving a file
+/// that already holds that content untouched (see `restore_entry`).
 ///
 /// # Arguments
 /// * `path` - The path to restore.
@@ -103,10 +104,8 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
     let (parent, file_name) = path.split_parent()?;
 
-    let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(parent.as_key())?;
-    let inventory = match shard_bytes {
-        Some(bytes) => forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)?,
-        None => return Err(format!("\"{}\" is not in the inventory.", path.as_key())),
+    let Some((inventory, shard_mtime)) = read_shard(parent.as_key())? else {
+        return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
     };
 
     let Some(item) = inventory.get_item_by_name(&file_name) else {
@@ -121,9 +120,23 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
         ));
     }
 
-    restore_file_and_refresh_entry(parent.as_key(), &item.name, &item.hash, item.item_type)?;
+    // Through a batch rather than `update_shard`: recording only stat data keeps the rollups.
+    let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    output::message(format!("Restored \"{}\" from the inventory.", path.as_key()));
+    let message = match restore_entry(parent.as_key(), &item, shard_mtime)? {
+        Restored::Untouched => format!("\"{}\" already matches the inventory.", path.as_key()),
+        Restored::Restatted(refreshed) => {
+            batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
+            format!("\"{}\" already matches the inventory.", path.as_key())
+        }
+        Restored::Rewritten(refreshed) => {
+            batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
+            format!("Restored \"{}\" from the inventory.", path.as_key())
+        }
+    };
+
+    batch.publish()?;
+    output::message(message);
 
     Ok(())
 }
@@ -142,6 +155,7 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 
     let mut restored_any = false;
     let mut restored_count = 0usize;
+    let mut matched_count = 0usize;
     let mut batch = inventory_utils::ShardMutationBatch::new();
     let mut result: Result<(), String> = Ok(());
 
@@ -154,29 +168,39 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 
         restored_any = true;
 
-        let inventory = match read_shard(shard_key) {
-            Ok(Some(inventory)) => inventory,
+        let (inventory, shard_mtime) = match read_shard(shard_key) {
+            Ok(Some(shard)) => shard,
             Ok(None) => continue,
             Err(e) => { result = Err(e); break; }
         };
 
-        for (name, item) in inventory.get_items() {
+        for (_, item) in inventory.get_items() {
             if item.state == InventoryItemState::Deleted {
                 continue;
             }
 
-            // Stat right after the write, as one `update_shard` per file did: a file statted
-            // later would record an editor's save in between against the staged hash.
-            let refreshed = write_restored_file(shard_key, name, &item.hash, item.item_type)
-                .and_then(|()| refreshed_item(shard_key, name, &item.hash, item.item_type))
-                .and_then(|refreshed| batch.update(shard_key, |shard| shard.add_item(refreshed)));
+            // Recorded right after `restore_entry` statted the file: the batch anchors the shard's
+            // publish time at its last update (see `ShardMutationBatch`'s doc comment), so a file
+            // statted earlier would record an editor's save in between against the staged hash.
+            let recorded = restore_entry(shard_key, item, shard_mtime).and_then(|restored| match restored {
+                Restored::Untouched => {
+                    matched_count += 1;
+                    Ok(())
+                }
+                Restored::Restatted(refreshed) => {
+                    matched_count += 1;
+                    batch.update(shard_key, |shard| shard.add_item(refreshed))
+                }
+                Restored::Rewritten(refreshed) => {
+                    restored_count += 1;
+                    batch.update(shard_key, |shard| shard.add_item(refreshed))
+                }
+            });
 
-            if let Err(e) = refreshed {
+            if let Err(e) = recorded {
                 result = Err(e);
                 break;
             }
-
-            restored_count += 1;
         }
 
         if result.is_err() {
@@ -201,48 +225,138 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
         ));
     }
 
-    output::message(format!("Restored {} file(s) from the inventory.", restored_count));
+    if matched_count == 0 {
+        output::message(format!("Restored {} file(s) from the inventory.", restored_count));
+    } else {
+        output::message(format!(
+            "Restored {} file(s) from the inventory; {} already matched it.",
+            restored_count, matched_count
+        ));
+    }
 
     Ok(())
 }
 
-/// The parsed shard at `key`, or `None` when it has no shard file.
-fn read_shard(key: &str) -> Result<Option<Inventory>, String> {
-    let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+/// The parsed shard at `key` with the shard file's modification timestamp (what
+/// `is_entry_unchanged` trusts its entries against), or `None` when it has no shard file.
+fn read_shard(key: &str) -> Result<Option<(Inventory, u64)>, String> {
+    let (shard_path, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
     let Some(bytes) = shard_bytes else {
         return Ok(None);
     };
 
+    let shard_mtime = file_utils::get_shard_mtime_or_zero(&shard_path);
+
     forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
-        .map(Some)
+        .map(|inventory| Some((inventory, shard_mtime)))
         .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))
 }
 
-/// Write one tracked file from its blob and refresh its inventory entry with the new
-/// stat data (so the warehouse reports clean afterwards without rehashing).
+/// What restoring one tracked entry did.
+enum Restored {
+    /// The file already held the staged content and the stat cache proved it: nothing was
+    /// written, and the entry needs no change.
+    Untouched,
+
+    /// The file already held the staged content, but only its hash proved it: nothing was
+    /// written, and the entry is to be recorded with the file's fresh stat data, so the next
+    /// comparison trusts the stat cache again.
+    Restatted(InventoryItem),
+
+    /// The file was written from its blob; the entry is to be recorded with its new stat data.
+    Rewritten(InventoryItem),
+}
+
+/// Restore one tracked, non-`Deleted` entry: write its file from the staged blob unless the
+/// file already holds that content, so a file that matches keeps its mtime and inode (build
+/// tools that watch mtimes see nothing changed). The caller records the returned entry.
+///
+/// Only a `Normal` entry is ever left unwritten: restoring a conflict entry writes it and
+/// records it as `Normal`, which is what resolves the conflict. A file of another on-disk kind
+/// (a symlink for a file, an executable for a plain file) is written even when its bytes hash
+/// the same.
 ///
 /// # Arguments
-/// * `parent_key` - The warehouse path key of the file's directory.
-/// * `name`       - The name of the file.
-/// * `hash`       - The blob hash of the staged content.
-/// * `item_type`  - The type of the entry.
+/// * `parent_key`  - The warehouse path key of the entry's directory.
+/// * `item`        - The inventory entry.
+/// * `shard_mtime` - The modification timestamp of the shard the entry came from.
 ///
 /// # Returns
-/// * `Ok(())`      - If the file was restored.
-/// * `Err(String)` - If a write failed.
-fn restore_file_and_refresh_entry(parent_key: &str,
-                                  name: &str,
-                                  hash: &str,
-                                  item_type: DirEntryType) -> Result<(), String> {
-    write_restored_file(parent_key, name, hash, item_type)?;
+/// * `Ok(Restored)` - What was done.
+/// * `Err(String)`  - If the path was refused or a write failed.
+fn restore_entry(parent_key: &str, item: &InventoryItem, shard_mtime: u64) -> Result<Restored, String> {
+    let file_path = tracked_path(parent_key, &item.name);
 
-    let refreshed = refreshed_item(parent_key, name, hash, item_type)?;
+    ensure_restorable(&file_path)?;
 
-    inventory_utils::update_shard(parent_key, |inventory| {
-        inventory.add_item(refreshed);
-        Ok(())
-    })
+    if item.state == InventoryItemState::Normal {
+        if let Some(restored) = matching_content(&file_path, item, shard_mtime) {
+            return Ok(restored);
+        }
+    }
+
+    shift_utils::write_tracked_file(&file_path, &item.hash, item.item_type, false)?;
+
+    // Stat right after the write: a file statted later would record an editor's save in
+    // between against the staged hash.
+    let refreshed = inventory_utils::build_inventory_item_from_stat(
+        std::path::Path::new(&file_path),
+        &item.name,
+        item.hash.clone(),
+        item.item_type,
+    )?;
+
+    Ok(Restored::Rewritten(refreshed))
+}
+
+/// `Untouched` or `Restatted` when the file at `file_path` already holds `item`'s content as a
+/// file of the same kind, `None` when it does not or cannot be compared (it is then written).
+/// The stat data a `Restatted` entry carries was read before the file's content, and is only
+/// recorded when its mtime predates a clock second read before that stat: an edit in the same
+/// second as the stat, after the content was read, keeps the mtime, and the shard is published
+/// later than the stat, so its racily-clean guard alone would trust the stale hash. Such a file
+/// is left `Untouched` and its entry as it was.
+fn matching_content(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> Option<Restored> {
+    let path = std::path::Path::new(file_path);
+    let statted_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let metadata = file_utils::get_symlink_metadata_for_path(path).ok()?;
+
+    if metadata.is_dir() {
+        return None;
+    }
+
+    let item_type = file_utils::get_type_of_dir_entry(&metadata);
+
+    if item_type.on_disk_kind() != item.item_type.on_disk_kind() {
+        return None;
+    }
+
+    // A size that differs settles it without reading the file. Not for a symlink, whose stored
+    // size is not comparable, nor for an entry with zeroed stat data, which records no size.
+    if item_type != DirEntryType::SymbolicLink && item.inode != 0 && metadata.len() != item.file_size {
+        return None;
+    }
+
+    let verdict = inventory_utils::classify_file_against_entry(
+        item, &metadata, item_type, path, &item.name, shard_mtime, object_utils::IngestMode::ComputeOnly
+    ).ok()?;
+
+    match verdict {
+        inventory_utils::FileVerdict::UnchangedByStat => Some(Restored::Untouched),
+        // Only the stat data may change here, never the entry's type.
+        inventory_utils::FileVerdict::UnchangedByHash(refreshed, _) if refreshed.item_type == item.item_type => {
+            if refreshed.content_change_timestamp < statted_after {
+                Some(Restored::Restatted(refreshed))
+            } else {
+                Some(Restored::Untouched)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The warehouse path of the file `name` in the directory `parent_key`.
@@ -254,61 +368,37 @@ fn tracked_path(parent_key: &str, name: &str) -> String {
     }
 }
 
-/// Write one tracked file from its blob, refusing a path that would overwrite another file
-/// through an alias or that needs a directory where a file is. The inventory is not touched.
+/// Refuse a path whose write would overwrite another file through an alias, or that needs a
+/// directory where a file is.
 ///
 /// # Arguments
-/// * `parent_key` - The warehouse path key of the file's directory.
-/// * `name`       - The name of the file.
-/// * `hash`       - The blob hash of the staged content.
-/// * `item_type`  - The type of the entry.
+/// * `file_path` - The warehouse path of the tracked file.
 ///
 /// # Returns
-/// * `Ok(())`      - If the file was written.
-/// * `Err(String)` - If the path was refused or the write failed.
-fn write_restored_file(parent_key: &str,
-                       name: &str,
-                       hash: &str,
-                       item_type: DirEntryType) -> Result<(), String> {
-    let file_path = tracked_path(parent_key, name);
-
+/// * `Ok(())`      - If the path may be written.
+/// * `Err(String)` - If the path was refused.
+fn ensure_restorable(file_path: &str) -> Result<(), String> {
     // The inventory can hold two spellings of one file on a case-insensitive volume (a
     // case-only directory rename staged under the new name while the old one stays): writing
     // the one that is not on disk would overwrite the other through the alias. A file where the
     // path needs a directory is refused too, rather than failing inside the write.
-    match alias_utils::AliasCheck::new().occupancy(&file_path)? {
+    match alias_utils::AliasCheck::new().occupancy(file_path)? {
         alias_utils::Occupancy::Alias { occupant, .. } | alias_utils::Occupancy::Unidentified { component: occupant } => {
-            return Err(format!(
+            Err(format!(
                 "Cannot restore \"{}\": on this file system it names the same file as \"{}\", which \
                 restoring would overwrite. Stage the one you mean to keep (load or unload the other) \
                 first.",
                 file_path, occupant
-            ));
+            ))
         }
         alias_utils::Occupancy::NonDirectory { occupant } => {
-            return Err(format!(
+            Err(format!(
                 "Cannot restore \"{}\": \"{}\" is not a directory. Move it aside first.",
                 file_path, occupant
-            ));
+            ))
         }
-        alias_utils::Occupancy::Vacant | alias_utils::Occupancy::Listed => {}
+        alias_utils::Occupancy::Vacant | alias_utils::Occupancy::Listed => Ok(()),
     }
-
-    shift_utils::write_tracked_file(&file_path, hash, item_type, false)
-}
-
-/// The inventory entry of a file `write_restored_file` just wrote: its staged hash, with the
-/// file's new stat data.
-fn refreshed_item(parent_key: &str,
-                  name: &str,
-                  hash: &str,
-                  item_type: DirEntryType) -> Result<InventoryItem, String> {
-    inventory_utils::build_inventory_item_from_stat(
-        std::path::Path::new(&tracked_path(parent_key, name)),
-        name,
-        hash.to_string(),
-        item_type,
-    )
 }
 
 /// Reset the inventory entries of the given path to the pallet head (unstage). The

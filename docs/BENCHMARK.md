@@ -211,12 +211,10 @@ These matter. A benchmark that hides them is a sales pitch, not a measurement.
   commit); with the shell-timer fallback it is a mean over a handful of runs, not a
   distribution. Either way it is one machine on one day — quote the hardware with the
   number. For a distribution, run the commands under `hyperfine` yourself (see §5).
-- **Forklift's timings depend on inventory state.** `forklift restore` of a directory
-  currently rewrites every tracked file under it, which clears the inventory's cached
-  subtree hashes, and `restore --staged` leaves entries whose stat data is re-read on
-  every later `stocktake`. Either makes later `status`/`diff`/`stack` timings slower
-  than on a fresh import, which is why the harness never resets with them. If you run
-  the steps by hand, time on a freshly imported copy.
+- **Forklift's timings depend on inventory state.** `restore --staged` leaves entries
+  whose stat data is re-read on every later `stocktake`, so later `status`/`diff` timings
+  are slower than on a fresh import. If you run the steps by hand, time on a freshly
+  imported copy.
 - **Durability differs by default.** Every `forklift stack` is durable when it
   returns: on macOS it ends with a device-cache flush (`F_FULLFSYNC`). git's defaults
   are weaker there: git-config(1) documents `core.fsyncMethod`'s macOS default as

@@ -459,9 +459,7 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
         // The shard's own modification time is needed for the stat-cache comparison
         // (see `inventory_utils::is_entry_unchanged`).
         let (shard_path, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
-        let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
-            .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m).ok())
-            .unwrap_or(0);
+        let shard_mtime = file_utils::get_shard_mtime_or_zero(&shard_path);
 
         let inventory = match shard_bytes {
             Some(bytes) => parser::inventory::inventory_parser::parse_inventory(&bytes)

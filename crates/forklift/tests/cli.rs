@@ -1871,6 +1871,157 @@ fn restore_discards_unstaged_changes() {
     assert!(stderr(&untracked).contains("not in the inventory"));
 }
 
+/// A working file's mtime and, on unix, inode: a rewrite moves the mtime (and the inode too,
+/// where the write replaces the file); a file left alone keeps both.
+fn file_identity(path: &std::path::Path) -> (std::time::SystemTime, u64) {
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+    #[cfg(not(unix))]
+    let inode = 0;
+
+    (metadata.modified().unwrap(), inode)
+}
+
+/// Move a file's mtime `seconds` into the past, leaving its content alone.
+fn backdate(path: &std::path::Path, seconds: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
+}
+
+/// The rollup hash of the shard `key`, read straight off disk.
+fn shard_rollup(warehouse: &TestWarehouse, key: &str) -> Option<String> {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+
+    let (_, bytes) = forklift_core::util::file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
+    let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+
+    inventory.get_rollup_hash().cloned()
+}
+
+/// The inventory entry of `name` in the shard `key`, read straight off disk.
+fn inventory_entry(warehouse: &TestWarehouse, key: &str, name: &str) -> forklift_core::model::inventory::InventoryItem {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+
+    let (_, bytes) = forklift_core::util::file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
+    let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+
+    inventory.get_item_by_name(name).unwrap().as_ref().clone()
+}
+
+#[test]
+fn restore_leaves_files_that_already_match_untouched() {
+    let warehouse = TestWarehouse::new("restore-skip");
+    warehouse.write_file("a.txt", "original a\n");
+    warehouse.write_file("dir/b.txt", "original b\n");
+    warehouse.write_file("dir/c.txt", "original c\n");
+
+    // Older than the shards `load` writes, so the stat cache trusts every entry.
+    for path in ["a.txt", "dir/b.txt", "dir/c.txt"] {
+        backdate(&warehouse.root.join(path), 3600);
+    }
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "baseline"]));
+
+    let a_before = file_identity(&warehouse.root.join("a.txt"));
+    let c_before = file_identity(&warehouse.root.join("dir/c.txt"));
+
+    // Only the modified file is written; the stat-clean ones keep their mtime and inode.
+    warehouse.write_file("dir/b.txt", "scribbled over\n");
+    let restored = stdout(&warehouse.run(&["restore", "."]));
+    assert!(restored.contains("Restored 1 file(s) from the inventory; 2 already matched it."), "{}", restored);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dir/b.txt")).unwrap(), "original b\n");
+    assert_eq!(file_identity(&warehouse.root.join("a.txt")), a_before, "a stat-clean file must not be rewritten");
+    assert_eq!(file_identity(&warehouse.root.join("dir/c.txt")), c_before, "a stat-clean file must not be rewritten");
+
+    let single = stdout(&warehouse.run(&["restore", "a.txt"]));
+    assert!(single.contains("\"a.txt\" already matches the inventory."), "{}", single);
+    assert_eq!(file_identity(&warehouse.root.join("a.txt")), a_before, "a stat-clean file must not be rewritten");
+
+    // A stat miss over the same content (a touch) is settled by hash: the file is still not
+    // written, and its entry takes the file's new stat data so the next comparison trusts it.
+    backdate(&warehouse.root.join("dir/c.txt"), 7200);
+    let c_touched = file_identity(&warehouse.root.join("dir/c.txt"));
+    let touched_secs = c_touched.0.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert_ne!(inventory_entry(&warehouse, "dir", "c.txt").content_change_timestamp, touched_secs);
+
+    let rollup = shard_rollup(&warehouse, "");
+    assert!(rollup.is_some(), "the stack must stamp the root's rollup");
+
+    let restored = stdout(&warehouse.run(&["restore", "dir"]));
+    assert!(restored.contains("Restored 0 file(s) from the inventory; 2 already matched it."), "{}", restored);
+    assert_eq!(file_identity(&warehouse.root.join("dir/c.txt")), c_touched, "a matching file must not be rewritten");
+    assert_eq!(inventory_entry(&warehouse, "dir", "c.txt").content_change_timestamp, touched_secs,
+        "the hash-matched entry must record the file's fresh stat data");
+
+    // The single-file form records a touched file the same way, and neither form clears a
+    // rollup, since no content changed.
+    backdate(&warehouse.root.join("a.txt"), 7200);
+    let a_touched = file_identity(&warehouse.root.join("a.txt")).0.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let single = stdout(&warehouse.run(&["restore", "a.txt"]));
+    assert!(single.contains("\"a.txt\" already matches the inventory."), "{}", single);
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, a_touched,
+        "the hash-matched entry must record the file's fresh stat data");
+    assert_eq!(shard_rollup(&warehouse, ""), rollup, "a stat-only restore must keep the rollups");
+
+    let status = stdout(&warehouse.run(&["stocktake"]));
+    assert!(status.contains("The working directory matches the inventory"), "must be clean: {}", status);
+}
+
+/// A matching file whose mtime is not older than the restore's own stat could still be edited
+/// in that second without its mtime moving, so its fresh stat data is not recorded: the entry
+/// stays as it was, to be settled by hash again later.
+#[test]
+fn restore_does_not_record_a_racily_matching_file() {
+    let warehouse = TestWarehouse::new("restore-skip-racy");
+    warehouse.write_file("a.txt", "original a\n");
+    backdate(&warehouse.root.join("a.txt"), 3600);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "baseline"]));
+
+    // A future mtime stands in for "edited in the same second as the stat".
+    let path = warehouse.root.join("a.txt");
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)).unwrap();
+    drop(file);
+    let before = inventory_entry(&warehouse, "", "a.txt").content_change_timestamp;
+
+    let restored = stdout(&warehouse.run(&["restore", "."]));
+    assert!(restored.contains("Restored 0 file(s) from the inventory; 1 already matched it."), "{}", restored);
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, before,
+        "a racily matching file's stat data must not be recorded");
+}
+
+/// A file whose bytes match but whose kind does not (an executable bit set by hand) is still
+/// written, so restore puts the staged mode back.
+#[cfg(unix)]
+#[test]
+fn restore_rewrites_a_matching_file_of_another_kind() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("restore-skip-kind");
+    warehouse.write_file("run.sh", "echo hi\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "baseline"]));
+
+    let path = warehouse.root.join("run.sh");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let restored = stdout(&warehouse.run(&["restore", "run.sh"]));
+    assert!(restored.contains("Restored \"run.sh\" from the inventory."), "{}", restored);
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "the staged mode must come back");
+}
+
 #[test]
 fn restore_staged_resets_the_inventory_to_the_head() {
     let warehouse = TestWarehouse::new("restore-staged");

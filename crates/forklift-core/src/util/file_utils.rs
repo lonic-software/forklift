@@ -2479,6 +2479,21 @@ pub fn get_content_modification_timestamp_for_file(file_metadata: &Metadata) -> 
         ).map(|time| time.as_secs())
 }
 
+/// The modification time of the inventory shard at `shard_path`, in seconds, for the stat cache's
+/// racily-clean guard (see `inventory_utils::is_entry_unchanged`). An unreadable time is 0, which
+/// trusts no entry, so every file is compared by content.
+///
+/// # Arguments
+/// * `shard_path` - The path of the shard file.
+///
+/// # Returns
+/// * `u64` - The shard's mtime, or 0.
+pub fn get_shard_mtime_or_zero(shard_path: &Path) -> u64 {
+    get_symlink_metadata_for_path(shard_path).ok()
+        .and_then(|metadata| get_content_modification_timestamp_for_file(&metadata).ok())
+        .unwrap_or(0)
+}
+
 /// Get the (device, inode) identity of a directory entry, without following a symlink.
 ///
 /// On unix the pair comes straight from `metadata`, which must be the entry's `symlink_metadata`:
