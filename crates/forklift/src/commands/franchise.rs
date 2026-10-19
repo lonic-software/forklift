@@ -302,7 +302,8 @@ async fn franchise_into_prepared_target(
         config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, url, ConfigScope::Warehouse)?;
     }
 
-    pallet_utils::set_pallet_head(&pallet_name, &remote_head)?;
+    // A franchise fills a fresh warehouse, so the pallet is unborn here.
+    pallet_utils::update_pallet_head(&pallet_name, None, &remote_head)?;
     pallet_utils::set_current_pallet_name(&pallet_name)?;
 
     // A failure here still goes through the caller's ordinary cleanup — the whole target is

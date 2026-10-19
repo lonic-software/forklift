@@ -395,7 +395,11 @@ pub(crate) mod tests {
         };
         let mut object = LooseObjectBuilder::build_parcel(&parcel);
         object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &object.hash,
+        ).unwrap();
         object.hash
     }
 
@@ -787,8 +791,10 @@ pub(crate) mod tests {
         }).unwrap();
 
         let never_stored_office_head = "f".repeat(64);
-        pallet_utils::set_meta_pallet_head(
-            crate::util::office_utils::OFFICE_PALLET_NAME, &never_stored_office_head
+        pallet_utils::update_meta_pallet_head(
+            crate::util::office_utils::OFFICE_PALLET_NAME,
+            pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
+            &never_stored_office_head,
         ).unwrap();
 
         let result = collect_live_set();
@@ -885,8 +891,10 @@ pub(crate) mod tests {
             prior_genesis: None,
             adopts: None,
         }).unwrap();
-        pallet_utils::set_meta_pallet_head(
-            crate::util::office_utils::OFFICE_PALLET_NAME, &office_parcel_object.hash
+        pallet_utils::update_meta_pallet_head(
+            crate::util::office_utils::OFFICE_PALLET_NAME,
+            pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
+            &office_parcel_object.hash,
         ).unwrap();
 
         // Sanity: the malformed user record really would abort the FULL office-state reader.

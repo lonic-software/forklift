@@ -171,7 +171,10 @@ async fn lower_working_pallet(client: &RemoteClient,
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
 
     shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress)?;
-    pallet_utils::set_pallet_head(&pallet, remote_head)?;
+
+    // A compare-and-set against the head this lower started from; the working tree goes back to
+    // where it was if the pallet did not move (another bay moved it first, or the write failed).
+    shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &remote_tree, local_tree.as_deref(), anchor)?;
 
     report.outcome = Some(LowerOutcome::Lowered);
 
@@ -534,7 +537,7 @@ async fn replay(client: &RemoteClient,
     let parcel = match replayed {
         Ok(Some(parcel)) => parcel,
         Ok(None) => {
-            pallet_utils::set_meta_pallet_head(name, remote_head)?;
+            pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head)?;
             return Ok(Reconciled::Adopted);
         }
         Err(ReplayError::Conflicts(conflicts)) => {
@@ -565,7 +568,7 @@ async fn replay(client: &RemoteClient,
     }
 
     remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), info.chunking, &Progress::NONE).await?;
-    pallet_utils::set_meta_pallet_head(name, &parcel)?;
+    pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel)?;
     restamped.extend(resigned);
 
     Ok(Reconciled::Replayed)
@@ -574,7 +577,7 @@ async fn replay(client: &RemoteClient,
 /// The office, verified against the anchor, and the operator's signing key in it. A converted
 /// pallet's writes are judged against the verified office, never the unverified local read.
 pub(crate) fn verified_signing_office(actor: &Operator) -> Result<(OfficeState, String), String> {
-    let (_unverified, signing_key_id, _actor_id) = office::require_signing_actor(actor)?;
+    let (_unverified, _office_head, signing_key_id, _actor_id) = office::require_signing_actor(actor)?;
 
     Ok((audit_utils::verified_local_office()?, signing_key_id))
 }

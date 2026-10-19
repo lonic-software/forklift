@@ -223,7 +223,7 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
         }
     }
 
-    let mut parents: Vec<String> = head.into_iter().collect();
+    let mut parents: Vec<String> = head.iter().cloned().collect();
 
     // A consolidation adds the consolidated head as a second parent; a cherry-pick does
     // not — it re-applies a diff as a single-parent parcel (no merge, no rewrite).
@@ -296,7 +296,7 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     // fewer device flushes than fsyncing each individually. This must complete (return `Ok`)
     // before anything below is allowed to reference what it just published — the signature
     // sidecar and the pallet head are both written only from this point on, deliberately kept
-    // out of this same batch (see the crash-ordering note on `set_pallet_head` below).
+    // out of this same batch (see the crash-ordering note on the ref write below).
     batch.finish()?;
 
     if let Some(key_id) = &signing_key_id {
@@ -304,15 +304,18 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
         sign_utils::store_parcel_signature(&object.hash, &signature)?;
     }
 
-    // Deliberately its own separate atomic write (unbatched, exactly as every other caller of
-    // `set_pallet_head`), not folded into `batch` above: `WriteBatch::finish` offers no
+    // Deliberately its own separate atomic write (unbatched, exactly as every other ref write),
+    // not folded into `batch` above: `WriteBatch::finish` offers no
     // atomicity *across* its entries, only that each one individually is never visible before
     // its bytes are durable (see its doc comment). Sequencing the ref write as a distinct step
     // that only starts after `batch.finish()` has already returned `Ok` is what guarantees the
     // head can never become visible pointing at a parcel (or any tree beneath it) that is not
     // yet durable — batching the ref in with the objects it references would trade that
     // guarantee for a few more saved fsyncs, which is not a trade this makes.
-    pallet_utils::set_pallet_head(&pallet, &object.hash)?;
+    //
+    // It is a compare-and-set against the head this parcel was built on, so a move by another bay
+    // or process since that read is refused rather than silently replaced.
+    pallet_utils::update_pallet_head(&pallet, head.as_deref(), &object.hash)?;
 
     // The parcel consumed the staged removals (and the consolidation or cherry-pick, if any).
     // Reuses the same parsed snapshot the conflict check and tree build already read — nothing

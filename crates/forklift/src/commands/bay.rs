@@ -81,7 +81,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     bay_utils::check_bay_paths_recordable(&warehouse_root, &bay_dir)?;
 
     // The bay's pallet, at the current head (a shared ref).
-    pallet_utils::set_pallet_head(name, &head)?;
+    pallet_utils::update_pallet_head(name, None, &head)?;
 
     // The bay's working directory + its local state folder + the redirect back here.
     std::fs::create_dir_all(&bay_dir)

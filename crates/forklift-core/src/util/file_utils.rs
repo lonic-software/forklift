@@ -1343,7 +1343,7 @@ fn discard_staged_temps(pending: &[(PathBuf, PathBuf)]) {
 /// `finish`'s `# Returns` for the breakdown. In every case no record is kept of which entries
 /// these are, so the caller must treat the whole batch as unpublished regardless.
 /// `stack_utils::stack_parcel` relies on the `Ok`-gating: it never
-/// batches the pallet-head ref write itself, and only calls `set_pallet_head` after the batch
+/// batches the pallet-head ref write itself, and only calls `update_pallet_head` after the batch
 /// covering every object the parcel references has already finished successfully.
 pub struct WriteBatch {
     state: std::sync::Mutex<WriteBatchState>,
@@ -5510,7 +5510,11 @@ mod tests {
             };
             let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
             parcel_object.store().unwrap();
-            crate::util::pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+            crate::util::pallet_utils::update_pallet_head(
+                "main",
+                crate::util::pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+                &parcel_object.hash,
+            ).unwrap();
             crate::util::pack_utils::compact(false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
 
             let start = Instant::now();

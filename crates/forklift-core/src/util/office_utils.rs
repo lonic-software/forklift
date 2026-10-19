@@ -41,7 +41,7 @@ const RECORD_SUFFIX: &str = ".toml";
 
 /// The trust anchor file inside the forklift root. Its presence means signing is
 /// required — a one-way door (nothing ever removes it).
-const FILE_NAME_TRUST: &str = "trust";
+pub(crate) const FILE_NAME_TRUST: &str = "trust";
 
 /// What an operator may do. Recorded in the user's tracked office record, so
 /// privileges are signed, audited metadata like everything else in the office.
@@ -415,6 +415,7 @@ pub fn endorse_key(public_key_hex: &str,
 }
 
 /// The trust anchor: the genesis office parcel that established signing.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TrustAnchor {
     /// The hash of the genesis office parcel.
     pub genesis: String,
@@ -916,6 +917,7 @@ fn degraded_office_note(kind: OfficeReadErrorKind, error: &str) -> String {
 /// * `Ok(())`      - If the anchor was written.
 /// * `Err(String)` - If an anchor already exists or the write failed.
 pub fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
+    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
     let path = forklift_root().join(FILE_NAME_TRUST);
 
     if path.exists() {
@@ -938,6 +940,8 @@ pub fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
 /// * `Err(String)` - If no anchor exists, the chain of custody does not match, or the
 ///                   write failed.
 pub fn replace_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
+    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
+
     let Some(existing) = read_trust_anchor()? else {
         return Err(
             "This warehouse has no trust anchor to replace; use \"office enroll\".".to_string()
@@ -959,7 +963,30 @@ pub fn replace_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
     write_trust_anchor_file(anchor)
 }
 
-/// Serialize an anchor to the trust file (no one-way-door check — callers own that).
+/// Put back the anchor that stood before a [`replace_trust_anchor`] in this same process, after
+/// the office move that should have followed it was refused — but only while the anchor is
+/// still `written`, the one that replace wrote: an anchor another bay installed meanwhile is its
+/// own, and stays. No chain-of-custody check: `previous` is the anchor this warehouse held a
+/// moment ago, not a new one.
+///
+/// The check and the write happen under one hold of the ref lock, which every anchor write
+/// takes, so no other anchor write can land between them.
+///
+/// # Returns
+/// * `Ok(())`      - `previous` is back, or the anchor was no longer `written` (left alone).
+/// * `Err(String)` - The anchor could not be read or written.
+pub(crate) fn restore_trust_anchor(written: &TrustAnchor, previous: &TrustAnchor) -> Result<(), String> {
+    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
+
+    if read_trust_anchor()?.as_ref() != Some(written) {
+        return Ok(());
+    }
+
+    write_trust_anchor_file(previous)
+}
+
+/// Serialize an anchor to the trust file (no one-way-door check — callers own that, and take
+/// the ref lock around it).
 fn write_trust_anchor_file(anchor: &TrustAnchor) -> Result<(), String> {
     let path = forklift_root().join(FILE_NAME_TRUST);
 
@@ -993,11 +1020,22 @@ fn write_trust_anchor_file(anchor: &TrustAnchor) -> Result<(), String> {
 /// * `Ok(OfficeState)` - The state.
 /// * `Err(String)`     - If an object or record could not be read.
 pub fn read_office_state() -> Result<OfficeState, String> {
+    Ok(read_office_state_and_head()?.0)
+}
+
+/// Read the full office state and the office head it was read from, for a caller that stacks a
+/// changed state: the head is the base its office parcel must extend (see
+/// [`stack_office_parcel`]). An unborn office pallet yields an empty state and no head.
+///
+/// # Returns
+/// * `Ok((OfficeState, Option<String>))` - The state, and the head it was read from.
+/// * `Err(String)`                       - If an object or record could not be read.
+pub fn read_office_state_and_head() -> Result<(OfficeState, Option<String>), String> {
     let Some(head) = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)? else {
-        return Ok(OfficeState { users: Vec::new(), keys: Vec::new() });
+        return Ok((OfficeState { users: Vec::new(), keys: Vec::new() }, None));
     };
 
-    read_office_state_of(&head)
+    Ok((read_office_state_of(&head)?, Some(head)))
 }
 
 /// Read the office state as recorded by a specific office parcel.
@@ -1050,42 +1088,47 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
 /// * `actor`          - The operator performing the change.
 /// * `description`    - The parcel description (the audit line).
 /// * `signing_key_id` - The key to sign with (its private half must be local).
+/// * `base`           - The office head `state` was read from (`None`: the office is unborn). It
+///                      is the new parcel's parent, and the office ref moves only while it still
+///                      holds it.
 ///
 /// # Returns
 /// * `Ok(String)`  - The hash of the new office parcel.
-/// * `Err(String)` - If an object could not be built, stored or signed.
+/// * `Err(String)` - If an object could not be built, stored or signed, or the office moved
+///                   since `base` was read.
 pub fn stack_office_parcel(state: &OfficeState,
                            actor: &Operator,
                            description: String,
-                           signing_key_id: &str) -> Result<String, String> {
-    let parents: Vec<String> = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?
-        .into_iter()
-        .collect();
+                           signing_key_id: &str,
+                           base: Option<&str>) -> Result<String, String> {
+    let parents: Vec<String> = base.map(str::to_string).into_iter().collect();
 
-    stack_office_parcel_with_parents(state, actor, description, signing_key_id, parents)
+    stack_office_parcel_with_parents(state, actor, description, signing_key_id, parents, base)
 }
 
 /// Stack a parentless office genesis parcel: the root of a fresh office chain. Used by
-/// enrollment (implicitly, via the unborn office pallet) and by re-genesis (§8.7),
-/// where the office head exists but the new chain must not descend from it — the old
-/// chain is pinned by the anchor's `adopts`, not extended.
+/// re-genesis (§8.7), where the office head exists but the new chain must not descend from it —
+/// the old chain is pinned by the anchor's `adopts`, not extended. `old_head` is the office head
+/// the caller read: the ref is replaced only while it still holds it.
 pub fn stack_office_genesis(state: &OfficeState,
                             actor: &Operator,
                             description: String,
-                            signing_key_id: &str) -> Result<String, String> {
-    stack_office_parcel_with_parents(state, actor, description, signing_key_id, Vec::new())
+                            signing_key_id: &str,
+                            old_head: Option<&str>) -> Result<String, String> {
+    stack_office_parcel_with_parents(state, actor, description, signing_key_id, Vec::new(), old_head)
 }
 
 /// The shared body: build the record trees, stack the parcel with the given parents,
-/// sign it and advance the office head.
+/// sign it and move the office head from `expected` to it.
 fn stack_office_parcel_with_parents(state: &OfficeState,
                                     actor: &Operator,
                                     description: String,
                                     signing_key_id: &str,
-                                    parents: Vec<String>) -> Result<String, String> {
+                                    parents: Vec<String>,
+                                    expected: Option<&str>) -> Result<String, String> {
     let hash = build_and_sign_office_parcel(state, actor, description, signing_key_id, parents)?;
 
-    pallet_utils::set_meta_pallet_head(OFFICE_PALLET_NAME, &hash)?;
+    pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, expected, &hash)?;
 
     Ok(hash)
 }

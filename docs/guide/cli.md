@@ -986,6 +986,12 @@ all operate on the bay's pallet against the shared object store. The bay's direc
 a `.forklift` *file* (a redirect back to the warehouse), and its local state lives under
 `.forklift/bays/<name>/`.
 
+Because the refs are shared, two bays can reach for the same pallet — say both are on `main`.
+Each command moves a pallet only from the head it started from: if another bay moved it in
+the meantime, the command is refused with a message naming both heads, and whatever it had
+already written to its own working tree is put back. A head another bay moved is never
+silently overwritten.
+
 ### `bay add --scope` — a scoped (sparse) bay
 
 ```sh

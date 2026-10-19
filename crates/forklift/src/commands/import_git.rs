@@ -121,7 +121,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
             "Branch \"{}\" points at a commit that was not imported.", branch
         ))?;
 
-        pallet_utils::set_pallet_head(&pallet, &head)?;
+        pallet_utils::update_pallet_head(&pallet, None, &head)?;
         imported.push((branch.clone(), pallet));
     }
 

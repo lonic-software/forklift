@@ -41,6 +41,9 @@ pub async fn handle_command() -> Result<(), String> {
     // untouched, unless the bay is still exactly where the entry's operation left it.
     journal_utils::check_undoable(&entry)?;
 
+    #[cfg(test)]
+    tests::AFTER_GATE.with(|seam| seam.take().map(|seam| seam()));
+
     if entry.op == "shift" {
         // Move back to the pallet that was current before the shift, re-materializing it.
         // `shift_to` refuses up front (a dirty workdir, a missing target pallet, …) without
@@ -149,4 +152,48 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<Undone>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{self, Warehouse};
+
+    thread_local! {
+        /// Runs once just after undo's gate passed, before anything is restored.
+        pub(super) static AFTER_GATE: std::cell::Cell<Option<Box<dyn FnOnce()>>> = std::cell::Cell::new(None);
+    }
+
+    fn hash(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    #[test]
+    fn an_undo_whose_current_pallet_moved_after_the_gate_is_refused_and_touches_nothing() {
+        let _warehouse = Warehouse::storage_only("undo-moved-after-gate");
+
+        // "zeta" is current and sorts after "alpha", so a restore that did not take the current
+        // pallet first would reach "alpha" before finding "zeta" moved.
+        pallet_utils::set_current_pallet_name("zeta").unwrap();
+        pallet_utils::update_pallet_head("zeta", None, &hash('1')).unwrap();
+        pallet_utils::update_pallet_head("alpha", None, &hash('a')).unwrap();
+
+        let before = journal_utils::capture().unwrap();
+        pallet_utils::update_pallet_head("zeta", Some(&hash('1')), &hash('2')).unwrap();
+        pallet_utils::update_pallet_head("alpha", Some(&hash('a')), &hash('b')).unwrap();
+        journal_utils::push_if_changed("stack", before).unwrap();
+
+        // Another bay stacks on "zeta" between the gate and the restore.
+        AFTER_GATE.with(|seam| seam.set(Some(Box::new(|| {
+            pallet_utils::update_pallet_head("zeta", Some(&hash('2')), &hash('3')).unwrap();
+        }))));
+
+        let error = test_support::block_on(handle_command()).expect_err("the undo must be refused");
+        assert!(error.contains("has moved since"), "{}", error);
+
+        assert_eq!(pallet_utils::get_pallet_head("zeta").unwrap(), Some(hash('3')), "the other bay's head must stand");
+        assert_eq!(pallet_utils::get_pallet_head("alpha").unwrap(), Some(hash('b')), "no other ref may be restored");
+        assert_eq!(pallet_utils::get_current_pallet_name().unwrap(), "zeta");
+        assert!(journal_utils::peek().unwrap().is_some(), "a refused undo must keep its entry");
+    }
 }

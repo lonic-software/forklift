@@ -84,7 +84,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     office_utils::ensure_not_metadata_tree(&their_tree_hash)?;
 
     if merge_utils::is_ancestor(&our_head, &their_head)? {
-        let head = fast_forward(&current, &target, &our_tree_hash, &their_head, &their_tree_hash, anchor)?;
+        let head = fast_forward(&current, &target, &our_head, &our_tree_hash, &their_head, &their_tree_hash, anchor)?;
 
         output::emit(&ConsolidateReport::fast_forward(&current, target, &head));
 
@@ -339,6 +339,7 @@ pub(crate) async fn is_warehouse_clean(our_tree_hash: &str) -> Result<bool, Stri
 /// repopulate the inventory, exactly like a shift — but moving the current pallet's ref.
 fn fast_forward(current: &str,
                 target: &str,
+                our_head: &str,
                 our_tree_hash: &str,
                 their_head: &str,
                 their_tree_hash: &str,
@@ -355,7 +356,12 @@ fn fast_forward(current: &str,
     let shards = shift_utils::build_inventories_for_tree(their_tree_hash, shift_utils::TreeProvenance::Written(anchor))?;
     inventory_utils::replace_all_inventories(&shards)?;
 
-    pallet_utils::set_pallet_head(current, their_head)?;
+    #[cfg(test)]
+    tests::BEFORE_FAST_FORWARD_WRITE.with(|seam| seam.take().map(|seam| seam()));
+
+    // A compare-and-set against the head this consolidation started from; the bay's work above
+    // is undone if the pallet did not move (another bay moved it first, or the write failed).
+    shift_utils::write_head_or_roll_back(current, Some(our_head), their_head, their_tree_hash, Some(our_tree_hash), anchor)?;
 
     Ok(their_head.to_string())
 }
@@ -606,4 +612,55 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<ConsolidateReport>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{self, Warehouse};
+    use forklift_core::util::progress_utils::Progress;
+
+    thread_local! {
+        /// Runs once just before `fast_forward` writes the pallet's head.
+        pub(super) static BEFORE_FAST_FORWARD_WRITE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            std::cell::Cell::new(None);
+    }
+
+    #[test]
+    fn a_fast_forward_whose_pallet_moved_meanwhile_is_refused_and_rolled_back() {
+        let warehouse = Warehouse::with_working_tree("consolidate-ff-moved");
+
+        let our_tree = test_support::store_tree("file.txt", b"ours\n");
+        let our_head = test_support::store_parcel(&our_tree, &[]);
+        let their_tree = test_support::store_tree("file.txt", b"theirs\n");
+        let their_head = test_support::store_parcel(&their_tree, &[&our_head]);
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("file.txt", b"elsewhere\n"), &[&our_head]);
+
+        pallet_utils::set_current_pallet_name("main").unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
+        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+
+        // Another bay stacks on "main" while this consolidation is between its tree write and
+        // its ref write.
+        let moved_to = elsewhere.clone();
+        BEFORE_FAST_FORWARD_WRITE.with(|seam| seam.set(Some(Box::new(move || {
+            pallet_utils::update_pallet_head("main", Some(&our_head), &moved_to).unwrap();
+        }))));
+
+        let error = test_support::block_on(handle_command("feature"))
+            .expect_err("a fast-forward over a moved pallet must be refused");
+        assert!(error.contains("moved"), "{}", error);
+
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere),
+            "the other bay's head must stand");
+        assert!(test_support::file_holds(&warehouse.root, "file.txt", b"ours\n"),
+            "the working tree must be back at the head this consolidation started from");
+
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
+        let unstaged = test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap();
+        assert!(staged.is_empty() && unstaged.is_empty(),
+            "the inventory must be back at our tree: staged {:?}, unstaged {:?}",
+            staged.len(), unstaged.len());
+    }
 }

@@ -1188,9 +1188,86 @@ pub fn materialize_tree(from_tree: Option<&str>,
     Ok(())
 }
 
+/// Move `pallet` from `expected` to `new` after `written_tree` (the tree of `new`) was already
+/// materialized, putting the working tree and inventory back at `start_tree` (the tree of
+/// `expected`, or the empty tree for an unborn pallet) if the pallet did not end up at `new`:
+/// another bay moved it first, or the write failed. Runs under the bay lock, so nothing else
+/// touched the bay since `written_tree` was materialized.
+///
+/// If another bay already moved the pallet to `new`, the move stands and this is `Ok`. A write
+/// that failed after landing (the pallet is at `new` anyway, not known durable) keeps the tree,
+/// which then matches the pallet, and still fails; so does a pallet that cannot be read back,
+/// whose tree is left alone rather than guessed at. If the rollback itself fails, the error says the working tree holds the
+/// other tree and that the pallet did not move.
+pub fn write_head_or_roll_back(pallet: &str,
+                               expected: Option<&str>,
+                               new: &str,
+                               written_tree: &str,
+                               start_tree: Option<&str>,
+                               anchor: file_utils::StatAnchor) -> Result<(), String> {
+    use crate::util::pallet_utils::{self, RefUpdateError};
+
+    let error = match pallet_utils::update_pallet_head(pallet, expected, new) {
+        Ok(()) => return Ok(()),
+        Err(RefUpdateError::Moved(moved)) if moved.found.as_deref() == Some(new) => return Ok(()),
+        Err(error) => error.to_string(),
+    };
+
+    match pallet_utils::get_pallet_head(pallet) {
+        Ok(head) if head.as_deref() == Some(new) => return Err(error),
+        Ok(_) => {}
+        Err(e) => return Err(format!(
+            "{} The pallet could not be read back ({}), so the working tree is left at tree {}; it \
+            may not match the pallet's head — shift or restore to bring it back in line.",
+            error, e, written_tree
+        )),
+    }
+
+    let start = match start_tree {
+        Some(tree) => Ok(tree.to_string()),
+        None => crate::util::object_utils::empty_tree_hash(),
+    };
+
+    let rolled_back = start.and_then(|start| {
+        materialize_tree(Some(written_tree), &start, "Rolling back", anchor, &Progress::NONE)
+    });
+
+    match rolled_back {
+        Ok(()) => Err(error),
+        Err(err) => Err(format!(
+            "{} The working tree could not be put back ({}): it holds tree {}, not the pallet's \
+            head; shift or restore to bring it back in line.",
+            error, err, written_tree
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_head_write_another_bay_already_made_stands_and_touches_no_tree() {
+        let root = std::env::temp_dir().join(format!("forklift-shift-same-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+
+        let (start, new) = ("a".repeat(64), "b".repeat(64));
+        crate::util::pallet_utils::update_pallet_head("main", None, &start).unwrap();
+
+        // Another bay makes the very same move first.
+        crate::util::pallet_utils::update_pallet_head("main", Some(&start), &new).unwrap();
+
+        // The trees name no stored objects: a rollback would fail loudly, so Ok proves none ran.
+        write_head_or_roll_back("main", Some(&start), &new, &"c".repeat(64), Some(&"d".repeat(64)),
+                                file_utils::StatAnchor::Unproven)
+            .expect("a move another bay already made must stand");
+        assert_eq!(crate::util::pallet_utils::get_pallet_head("main").unwrap(), Some(new));
+
+        drop(scope);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn windows_refuses_names_that_are_not_one_plain_file_name() {
