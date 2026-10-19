@@ -4946,9 +4946,52 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    /// How [`pack_as_unreadable`] makes an object's only pack unreadable.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum Unreadable {
+        /// The index survives, its data file is gone.
+        Quarantined,
+        /// The index's bucket holding the object fails validation.
+        CorruptBucket,
+    }
+
+    /// Move the loose object `hash` into a pack of its own (deleting the loose file), so a
+    /// test can place one object in a pack and the objects around it elsewhere.
+    pub(crate) fn pack_alone(hash: &str) -> TransportPackArtifact {
+        let raw = file_utils::retrieve_object_by_hash(hash).unwrap();
+        let mut builder = TransportPackBuilder::new(&pack_folder()).unwrap();
+        builder.append_full(hash, &raw).unwrap();
+        let mut artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "one object must make exactly one pack pair");
+
+        let (folder, file_name) = file_utils::get_path_for_object(hash).unwrap();
+        std::fs::remove_file(Path::new(&folder).join(file_name)).unwrap();
+        invalidate_cache();
+
+        artifacts.remove(0)
+    }
+
+    /// Leave the loose object `hash` held only by a pack index this store cannot serve it from,
+    /// and assert that it reads neither present nor absent.
+    pub(crate) fn pack_as_unreadable(hash: &str, how: Unreadable) {
+        let artifact = pack_alone(hash);
+
+        match how {
+            Unreadable::Quarantined => std::fs::remove_file(&artifact.data_path).unwrap(),
+            Unreadable::CorruptBucket => corrupt_record_of(&artifact.index_path, &hash_to_bytes(hash).unwrap()),
+        }
+        invalidate_cache();
+
+        assert!(!file_utils::does_object_exist(hash).unwrap(), "{:?}: the object must not read present", how);
+        assert!(
+            matches!(file_utils::read_object_classified(hash).unwrap(), file_utils::StoreReadOutcome::Unverifiable(_)),
+            "{:?}: the object must read Unverifiable", how
+        );
+    }
 
     /// Test-only convenience: assert `retrieve_from_packs(hash)` reports `Verified` and return
     /// its bytes, so a byte-comparison assertion at the call site stays a single line as it was

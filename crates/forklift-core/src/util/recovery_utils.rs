@@ -1384,7 +1384,7 @@ pub(crate) struct GcRootSources {
 ///
 /// `pin_parcels` is returned separately from `parcels` (never merged) because the two callers need
 /// different things from it: gc's own
-/// [`audit_utils::collect_reachable_present`](crate::util::audit_utils::collect_reachable_present)
+/// [`gc_utils::collect_reachable_for_sweep`](crate::util::gc_utils::collect_reachable_for_sweep)
 /// folds every root into one undifferentiated presence-tolerant walk — no policy distinction
 /// needed there, an absent root is just a gap either way, see `collect_live_set`'s own doc comment
 /// — so its caller simply drops the [`office_utils::PinAbsencePolicy`] tag and concatenates the
@@ -1770,7 +1770,7 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// either*, this walk cannot tell "never held" apart from "held once, then lost to corruption in
 /// an otherwise-full store" — both read as raw-absent here, and the gap rule tolerates both the
 /// same way. `audit`'s own trust-boundary resolution already lives with exactly this ambiguity for
-/// gc's live set (`audit_utils::collect_reachable_present`'s own doc comment: "a trust boundary
+/// gc's live set (`gc_utils::collect_reachable_for_sweep`'s own doc comment: "a trust boundary
 /// may name heads this warehouse never had"); giving heal's own remainder a narrower verdict
 /// specific to that case is a distinct piece of work, not this one. What this fix *does* surface
 /// (F6, same round): every hash this walk can positively confirm falls into that residual case —

@@ -172,7 +172,7 @@ thread_local! {
 /// because a whole-history walk reads each parcel about once, so caching them is pure churn.
 /// `compact --all`'s reachability phase is the one exception: it reads the *same* parcel set
 /// several times over — the live-set walk (`gc_utils::collect_live_set` →
-/// `collect_reachable_present`, then again per parcel for its `tree_hash`) and, when new deltas
+/// `collect_reachable_for_sweep`, then again per parcel for its `tree_hash`) and, when new deltas
 /// must be built, the path-base walk (`compute_path_bases` → `collect_reachable`,
 /// `topo_order_oldest_first`, then again per parcel for its `tree_hash`). Measured on a
 /// 401-parcel synthetic warehouse: 2005 logical parcel reads when both walks run (garbage or

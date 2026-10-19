@@ -18,7 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils};
+use crate::util::{bay_utils, file_utils, lock_utils, object_utils};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
 // `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
@@ -150,8 +150,8 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// **The office chain is the one root set that must be *loadable*, not merely tolerated-if-
 /// absent.** The tolerance above is about descending into an already-collected root's tree/blob
 /// closure — an ordinary pallet head that itself cannot be read is simply skipped by the
-/// reachability walk below it (`audit_utils::collect_reachable_present` treats an absent head as
-/// a gap, contributing nothing, never an error). Computing the *root set itself* is different:
+/// reachability walk below it ([`collect_reachable_for_sweep`] treats an absent head as a gap,
+/// contributing nothing, never an error). Computing the *root set itself* is different:
 /// every revoked key's `distrust_boundary` pin can only be found by reading the office pallet's
 /// own head parcel, tracked-keys tree and key-record blobs (`office_utils::
 /// collect_trust_pin_roots`), and this call passes it `TrustPinReadPolicy::FailClosed` — an
@@ -168,7 +168,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // cannot drift apart (see that function's doc comment, and `collect_walk_roots`' for the
     // superset invariant this list must stay a subset of). GC does
     // not need the pin/ordinary distinction `collect_walk_roots` cares about (an absent root, pin
-    // or ordinary, is just a gap to `audit_utils::collect_reachable_present` below — see this
+    // or ordinary, is just a gap to `collect_reachable_for_sweep` below — see this
     // function's own doc comment), so both lists are flattened into one plain `roots` bag.
     //
     // `FailClosed` for both policies, unconditionally — this feeds a sweep that deletes objects,
@@ -185,7 +185,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     let mut roots: Vec<String> = sources.parcels;
     roots.extend(sources.pin_parcels.into_iter().map(|(hash, _policy)| hash));
 
-    let parcels = audit_utils::collect_reachable_present(&roots)?;
+    let parcels = collect_reachable_for_sweep(&roots)?;
 
     let mut live: HashSet<String> = HashSet::new();
     let mut tree_queue: VecDeque<String> = VecDeque::new();
@@ -218,10 +218,10 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
         // Its hash was inserted into `live` on the line above, *before* this check, so the seal
         // is never collected; we simply cannot descend into bytes we do not hold. The tolerance
         // is presence-based only: gc cannot tell a deliberately-unfetched object apart from one
-        // genuinely lost to corruption — both read as absent here — and does not try to. `audit`
-        // is what re-proves integrity (it re-hashes the trees it holds and flags an object that
-        // should be present but is not); gc's job is to free provably-unreachable garbage without
-        // ever touching a live hash, and it stays correct whichever kind of absence this is.
+        // whose file was lost — both are absent — and does not try to. `audit` is what re-proves
+        // integrity (it re-hashes the trees it holds and flags an object that should be present
+        // but is not); gc's job is to free provably-unreachable garbage without ever touching a
+        // live hash, and it stays correct whichever kind of absence this is.
         //
         // The store invariant that makes skipping the descent safe: if a subtree object is
         // absent, nothing beneath it is present here either (a warehouse never holds a child
@@ -231,7 +231,10 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
         // is ever left unmarked in a way that matters, because nothing beneath it exists locally
         // to mark. A present-but-corrupt object is the other case: it *is* present, so the load
         // below runs and fails, and `collect_garbage` deletes nothing on that error (safe, loud).
-        // This is the same presence tolerance `collect_reachable_present` already applies to
+        // An object only an unreadable pack index might hold is that case too, not absence: its
+        // bytes may still be on disk with its children elsewhere, so the invariant does not cover
+        // it, and `is_present_for_sweep` fails the walk on it instead of answering absent
+        // (FORK-193). This is the same presence rule `collect_reachable_for_sweep` applies to
         // parcels above, extended one level down to the tree closure.
         //
         // This invariant is steady-state, not instantaneous: an in-flight or interrupted fetch
@@ -240,7 +243,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
         // live — but `collect_garbage`'s mtime grace period is what makes that safe: a young
         // orphan is kept while the fetch might still resume and complete it, and only one
         // abandoned past the grace period ages into legitimate, re-fetchable garbage.
-        if !file_utils::does_object_exist(&tree_hash)? {
+        if !file_utils::is_present_for_sweep(&tree_hash)? {
             continue;
         }
 
@@ -280,6 +283,8 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
 /// already-live hash is never collected. A **present** recipe is loaded (which re-hashes it on the
 /// content-addressed read, so a corrupt one fails here and `collect_garbage` then deletes nothing
 /// — safe and loud) and each chunk hash is marked live, tolerating an absent chunk with no read.
+/// A recipe only an unreadable pack index might hold is an error, never absent
+/// ([`file_utils::is_present_for_sweep`]).
 ///
 /// # Arguments
 /// * `recipe_hash` - The hash of the recipe (a chunked file's tree-entry hash).
@@ -287,9 +292,10 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - The chunks were marked (or the recipe was absent and tolerated).
-/// * `Err(String)` - If a present recipe could not be loaded (corrupt/unreadable).
+/// * `Err(String)` - If a present recipe could not be loaded (corrupt/unreadable), or the
+///                   recipe may be present but cannot be read.
 fn mark_recipe_chunks_live(recipe_hash: &str, live: &mut HashSet<String>) -> Result<(), String> {
-    if !file_utils::does_object_exist(recipe_hash)? {
+    if !file_utils::is_present_for_sweep(recipe_hash)? {
         return Ok(());
     }
 
@@ -302,6 +308,37 @@ fn mark_recipe_chunks_live(recipe_hash: &str, live: &mut HashSet<String>) -> Res
     Ok(())
 }
 
+/// Every parcel reachable from `heads` (the heads included) that this store holds, for a sweep
+/// that deletes what the walk does not reach (`gc`, `compact --all`, scope prune).
+///
+/// A head or ancestor that is absent contributes nothing: a trust boundary may name heads this
+/// warehouse never had (enrollment includes the remote's heads). A parcel only an unreadable
+/// pack index might hold is not absent: its tree may be present, so the walk fails rather than
+/// leave that tree unmarked ([`file_utils::is_present_for_sweep`], FORK-193).
+///
+/// # Returns
+/// * `Ok(HashSet<String>)` - The reachable parcels this store holds.
+/// * `Err(String)`         - A present parcel could not be read, or a parcel may be present but
+///                           cannot be read.
+pub(crate) fn collect_reachable_for_sweep(heads: &[String]) -> Result<HashSet<String>, String> {
+    let mut queue: VecDeque<String> = heads.iter().cloned().collect();
+    let mut reachable: HashSet<String> = HashSet::new();
+
+    while let Some(hash) = queue.pop_front() {
+        if reachable.contains(&hash) || !file_utils::is_present_for_sweep(&hash)? {
+            continue;
+        }
+
+        reachable.insert(hash.clone());
+
+        for parent in object_utils::load_parcel(&hash)?.parents {
+            queue.push_back(parent);
+        }
+    }
+
+    Ok(reachable)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -311,6 +348,7 @@ pub(crate) mod tests {
     use crate::model::blob::Blob;
     use crate::model::parcel::Parcel;
     use crate::model::tree_item::TreeItem;
+    use crate::util::pack_utils::tests::{pack_alone, pack_as_unreadable, Unreadable};
     use std::path::{Path, PathBuf};
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for its
@@ -964,5 +1002,83 @@ pub(crate) mod tests {
         let stats = collect_garbage(3600).expect("gc must tolerate an unrecognized loose file");
         assert!(stray_temp.exists(), "a recently stranded temp must survive gc within the grace period");
         assert_eq!(stats.kept_recent, 1);
+    }
+
+    /// FORK-193: an object only an unreadable pack index holds is not absent. Its bytes may still
+    /// be on disk and its children elsewhere, so a sweep that skipped its descent would delete
+    /// them. Run for both kinds of unreadable index: a quarantined one (data file gone) and a
+    /// corrupt bucket of a loaded one.
+    fn assert_gc_refuses(how: Unreadable, unreadable: &str, child: &str) {
+        let error = collect_garbage(0).err()
+            .unwrap_or_else(|| panic!("{:?}: gc must refuse past an unreadable object", how));
+        assert!(error.contains(unreadable) && error.contains("cannot be read"),
+            "{:?}: the error must name the unreadable object: {}", how, error);
+        assert!(loose_path(child).exists(), "{:?}: the unreadable object's child must survive gc", how);
+    }
+
+    /// Mutation: in `collect_live_set`'s tree descent, ask `does_object_exist` instead of
+    /// `is_present_for_sweep` → the walk skips the tree, gc succeeds and deletes its blob (red).
+    #[test]
+    fn gc_refuses_and_keeps_the_children_of_a_tree_only_an_unreadable_index_holds() {
+        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+            let _scratch = Scratch::new("gc-unreadable-tree");
+            let f = build_fixture();
+            pack_as_unreadable(&f.web_tree, how);
+
+            assert_gc_refuses(how, &f.web_tree, &f.web_blob);
+        }
+    }
+
+    /// Mutation: in `mark_recipe_chunks_live`, ask `does_object_exist` → the recipe's chunk is
+    /// deleted (red).
+    #[test]
+    fn gc_refuses_and_keeps_the_chunks_of_a_recipe_only_an_unreadable_index_holds() {
+        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+            let _scratch = Scratch::new("gc-unreadable-recipe");
+            let chunk = store_chunk(b"chunk under an unreadable recipe");
+            let recipe = store_recipe(&[(chunk.clone(), 32)]);
+            let root_tree = store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]);
+            store_root_parcel(&root_tree);
+            pack_as_unreadable(&recipe, how);
+
+            assert_gc_refuses(how, &recipe, &chunk);
+        }
+    }
+
+    /// Mutation: in `collect_reachable_for_sweep`, ask `does_object_exist` → the head parcel reads
+    /// absent, and its tree is deleted (red).
+    #[test]
+    fn gc_refuses_and_keeps_the_tree_of_a_parcel_only_an_unreadable_index_holds() {
+        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+            let _scratch = Scratch::new("gc-unreadable-parcel");
+            let f = build_fixture();
+            pack_as_unreadable(&f.parcel, how);
+
+            assert_gc_refuses(how, &f.parcel, &f.root_tree);
+        }
+    }
+
+    /// The same hazard through `compact --all`, whose repack drops every packed object the live
+    /// set does not reach and then deletes the packs it superseded. The child sits in a valid pack
+    /// of its own here, so a skipped descent would lose it with that pack.
+    ///
+    /// Mutation: as for the tree test above → compact succeeds and the child's pack is deleted
+    /// without the child being copied anywhere (red).
+    #[test]
+    fn compact_all_refuses_and_keeps_the_pack_holding_the_child_of_an_unreadable_tree() {
+        use crate::util::pack_utils;
+
+        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+            let _scratch = Scratch::new("compact-unreadable-tree");
+            let f = build_fixture();
+            let child_pack = pack_alone(&f.web_blob);
+            pack_as_unreadable(&f.web_tree, how);
+
+            let error = pack_utils::compact(true, false, &crate::util::progress_utils::Progress::NONE).err()
+                .unwrap_or_else(|| panic!("{:?}: compact --all must refuse past an unreadable tree", how));
+            assert!(error.contains(&f.web_tree), "{:?}: the error must name the unreadable tree: {}", how, error);
+            assert!(child_pack.data_path.exists(), "{:?}: the child's pack must survive", how);
+            assert!(file_utils::does_object_exist(&f.web_blob).unwrap(), "{:?}: the child must stay present", how);
+        }
     }
 }

@@ -2269,6 +2269,39 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
     crate::util::pack_utils::is_in_packs(hash)
 }
 
+/// [`does_object_exist`] for the liveness walk of a sweep that deletes (`gc`, `compact --all`,
+/// scope prune): `false` only when the hash is genuinely absent.
+///
+/// A walk that stops descending at an absent object relies on a store invariant: nothing beneath
+/// an absent object is present. A hash that only an unreadable index might hold breaks it. A
+/// quarantined index, a corrupt bucket of a loaded one, or an index of another format version
+/// reads `false` from [`does_object_exist`], yet the object's bytes may still be on disk, and its
+/// children may be present in another pack or loose. Reading that `false` as absent would leave
+/// those children unmarked, and the sweep would delete them (FORK-193). So past the presence
+/// shortcut this asks [`read_object_classified`], whose `Absent` is gated against every such
+/// index, and turns its `Unverifiable` into an error.
+///
+/// # Returns
+/// * `Ok(true)`    - The object is present and servable.
+/// * `Ok(false)`   - Neither a pack nor the loose store holds it, and no unreadable index might.
+/// * `Err(String)` - The object may be present but cannot be read, so the walk cannot know what
+///                   it references; or the store could not be consulted.
+pub(crate) fn is_present_for_sweep(hash: &str) -> Result<bool, String> {
+    if does_object_exist(hash)? {
+        return Ok(true);
+    }
+
+    match read_object_classified(hash)? {
+        StoreReadOutcome::Verified(_) => Ok(true),
+        StoreReadOutcome::Absent => Ok(false),
+        StoreReadOutcome::Unverifiable(reason) => Err(format!(
+            "Object {} may be in the store but cannot be read ({}), so the objects it references \
+            cannot be told apart from garbage.",
+            hash, reason
+        )),
+    }
+}
+
 /// Whether the loose fan-out path for `hash` has a dentry (no content check).
 fn loose_dentry_exists(hash: &str) -> Result<bool, String> {
     let (path, file_name) = get_path_for_object(hash)?;
