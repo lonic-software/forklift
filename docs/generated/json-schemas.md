@@ -4460,7 +4460,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "op": {
-      "description": "The operation that was reversed (`stack`, `consolidate`, `shift`).",
+      "description": "The operation that was reversed (`stack`, `consolidate`, `cherry-pick`, `shift`).",
       "type": "string"
     },
     "pallet": {

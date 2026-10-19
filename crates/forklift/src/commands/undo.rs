@@ -1,52 +1,57 @@
 use serde::Serialize;
 use forklift_core::error::sanitize;
-use forklift_core::util::journal_utils::{self, JournalEntry};
+use forklift_core::util::journal_utils;
 use forklift_core::util::{object_utils, pallet_utils};
 use crate::commands::shift;
 use crate::output::{self, CommandOutput};
 
 /// Handle the undo command (§7.8): reverse the last state-changing operation, using the
-/// undo journal. `undo` now spans `stack`, `consolidate` and `shift` — not just the last
-/// stack — because each of those snapshots its pre-operation state before it runs.
+/// undo journal. `undo` spans `stack`, `consolidate`, `cherry-pick` and `shift` — not just the
+/// last stack — because each of those journals the state on both sides of it.
 ///
-/// * Reversing a `stack` or `consolidate` is a **soft reset**: the pallet head moves back
-///   while the working directory and inventory are kept, so the undone changes end up
-///   staged again (this is how a merge is reversed too — no longer refused).
+/// * Reversing a `stack`, `consolidate` or `cherry-pick` is a **soft reset**: the pallet head
+///   moves back while the working directory and inventory are kept, so the undone changes end
+///   up staged again (this is how a merge is reversed too).
 /// * Reversing a `shift` moves back to the previous pallet, re-materializing its tree
 ///   (it refuses if the working directory is dirty, exactly like a forward `shift`).
 ///
-/// When the journal is empty (e.g. a stack made before this feature), it falls back to the
-/// classic behavior: soft-reset the current pallet's head to its first parent.
+/// An empty journal means there is nothing to undo. An entry is reversed only while the bay is
+/// still where its operation left it (`journal_utils::check_undoable`); otherwise an operation
+/// outside the journal ran since, and reversing the entry would undo an older operation than
+/// the user's last.
 ///
 /// The journal entry is only ever consumed (`journal_utils::pop`) once its undo has fully
-/// succeeded — `peek` looks at it first. A refused or failed undo (the target has moved, or
-/// a later step errors) must leave the journal exactly as it found it, so a retried `undo`
-/// sees the same entry rather than skipping straight past it.
+/// succeeded — `peek` looks at it first. A refused or failed undo must leave the journal exactly
+/// as it found it, so a retried `undo` sees the same entry rather than skipping straight past it.
 ///
 /// # Returns
 /// * `Ok(())`      - If an operation was undone.
-/// * `Err(String)` - If there is nothing to undo, or the reversal failed.
+/// * `Err(String)` - If there is nothing to undo, the journal cannot be read, the bay has moved
+///                   past the last entry, or the reversal failed.
 pub async fn handle_command() -> Result<(), String> {
-    match journal_utils::peek()? {
-        Some(entry) => undo_from_journal(entry).await,
-        None => undo_last_stack(),
-    }
-}
+    let Some(entry) = journal_utils::peek()? else {
+        return Err(
+            "There is nothing to undo: the undo journal is empty. Only stack, consolidate, \
+            cherry-pick and shift are journaled, and a pallet's first parcel cannot be undone."
+                .to_string()
+        );
+    };
 
-/// Reverse the operation described by a journal entry (not yet popped — see
-/// `handle_command`).
-async fn undo_from_journal(entry: JournalEntry) -> Result<(), String> {
+    // Gate before mutating anything, for every kind of entry: refuse, leaving the journal
+    // untouched, unless the bay is still exactly where the entry's operation left it.
+    journal_utils::check_undoable(&entry)?;
+
     if entry.op == "shift" {
         // Move back to the pallet that was current before the shift, re-materializing it.
         // `shift_to` refuses up front (a dirty workdir, a missing target pallet, …) without
         // touching anything, so the entry is only popped once it has actually succeeded.
-        let left = pallet_utils::get_current_pallet_name().unwrap_or_default();
-        let head = shift::shift_to(&entry.current_pallet).await?;
+        let left = entry.after.current_pallet.clone();
+        let head = shift::shift_to(&entry.before.current_pallet).await?;
         journal_utils::pop()?;
 
         output::emit(&Undone {
             op: entry.op,
-            pallet: entry.current_pallet,
+            pallet: entry.before.current_pallet,
             left,
             undone: String::new(),
             head,
@@ -56,36 +61,21 @@ async fn undo_from_journal(entry: JournalEntry) -> Result<(), String> {
         return Ok(());
     }
 
-    // Gate before mutating anything: if the entry's own pallet has moved since the op ran,
-    // something outside the undo journal advanced it (an un-journaled command, or a fast
-    // forward), and restoring around that would either be a silent no-op (the ref itself
-    // stays put, `restore_refs` already leaves a moved ref alone) or — for a `consolidate`
-    // entry — resurrect a stale in-progress-merge record against a head that has moved on.
-    // Refuse outright instead of guessing; the journal entry stays untouched.
-    if journal_utils::current_pallet_moved_since(&entry)? {
-        return Err(format!(
-            "Pallet \"{}\" has moved since that operation — something outside the undo \
-            journal advanced it, and undo will not rewind that too. Continue forward \
-            instead (e.g. re-stack).",
-            entry.current_pallet
-        ));
-    }
-
-    // A soft reset: restore the refs (and any consolidation), keep the working directory.
-    let pallet = pallet_utils::get_current_pallet_name()?;
-    let undone = pallet_utils::get_pallet_head(&pallet)?.unwrap_or_default();
+    // A soft reset: restore the refs (and any consolidation), keep the working directory. The
+    // gate established that the current pallet is the entry's, at the head the entry left.
+    let undone = pallet_utils::get_pallet_head(&entry.after.current_pallet)?.unwrap_or_default();
 
     journal_utils::restore_refs(&entry)?;
     journal_utils::pop()?;
 
-    let head = pallet_utils::get_pallet_head(&entry.current_pallet)?.unwrap_or_default();
+    let head = pallet_utils::get_pallet_head(&entry.before.current_pallet)?.unwrap_or_default();
     let description = object_utils::load_parcel(&undone).ok()
         .and_then(|parcel| parcel.description)
         .unwrap_or_default();
 
     output::emit(&Undone {
         op: entry.op,
-        pallet: entry.current_pallet,
+        pallet: entry.before.current_pallet,
         left: String::new(),
         undone,
         head,
@@ -95,46 +85,11 @@ async fn undo_from_journal(entry: JournalEntry) -> Result<(), String> {
     Ok(())
 }
 
-/// The classic behavior, used when the journal is empty: soft-reset the current pallet's
-/// head to its first parent (a merge is reversed the same way).
-fn undo_last_stack() -> Result<(), String> {
-    let pallet = pallet_utils::get_current_pallet_name()?;
-
-    let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
-        return Err(format!(
-            "Pallet \"{}\" has nothing stacked yet; there is nothing to undo.",
-            pallet
-        ));
-    };
-
-    let parcel = object_utils::load_parcel(&head)?;
-
-    let Some(parent) = parcel.parents.first() else {
-        return Err(format!(
-            "The head of \"{}\" is its first parcel (no parent); there is nothing to undo.",
-            pallet
-        ));
-    };
-
-    pallet_utils::set_pallet_head(&pallet, parent)?;
-
-    output::emit(&Undone {
-        op: "stack".to_string(),
-        pallet,
-        left: String::new(),
-        undone: head,
-        head: parent.clone(),
-        description: parcel.description.unwrap_or_default(),
-    });
-
-    Ok(())
-}
-
 /// The result of an undo.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct Undone {
-    /// The operation that was reversed (`stack`, `consolidate`, `shift`).
+    /// The operation that was reversed (`stack`, `consolidate`, `cherry-pick`, `shift`).
     op: String,
 
     /// The pallet that is current after the undo.

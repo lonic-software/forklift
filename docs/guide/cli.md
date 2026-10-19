@@ -395,26 +395,34 @@ forklift undo
 ```
 
 Reverses the **last state-changing operation**, using an undo journal — not just the
-last `stack`. Each `stack`, `consolidate` and `shift` snapshots its pre-operation state
-(the pallet refs, current pallet and any in-progress consolidation — all tiny, since the
-objects are content-addressed and already stored), so `undo` can walk them back one at a
-time:
+last `stack`. Each `stack`, `consolidate`, `cherry-pick` and `shift` records the state
+before and after it (the pallet refs, current pallet and any in-progress consolidation —
+all tiny, since the objects are content-addressed and already stored), so `undo` can walk
+them back one at a time:
 
-- Reversing a **`stack`** or **`consolidate`** is a *soft reset*: the head moves back while
+- Reversing a **`stack`**, **`consolidate`** or **`cherry-pick`** is a *soft reset*: the head moves back while
   the working directory and inventory are kept, so the undone changes are staged again
   (like git's `reset --soft HEAD~1`). This is how a **merge is reversed** too — merge
   parcels are no longer refused.
 - Reversing a **`shift`** moves back to the previous pallet and re-materializes its tree (it
   refuses on a dirty working directory, just like a forward `shift`).
 
-Re-`stack` to redo (e.g. with a corrected message). When the journal is empty (a stack made
-before this feature), `undo` falls back to soft-resetting the current pallet's head to its
-first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`remove`/`unload`)
+Re-`stack` to redo (e.g. with a corrected message). An empty journal means there is nothing
+to undo. Undoing a pallet's *very first* parcel, pure-staging (`load`/`remove`/`unload`)
 and trust/remote commands are out of scope; `park` is reversed with `park pop`. Anything that
 happened between the journaled operation and the `undo` but was never journaled itself stays
 exactly as it is — trust operations such as a key retirement are preserved, never rolled back.
-If the pallet itself has moved since (something outside the journal advanced it), `undo`
-refuses outright rather than guessing at a partial reversal.
+
+`undo` reverses only your *last* operation, never an older one behind it. It refuses
+outright when the bay no longer matches what the journaled operation left: the current
+pallet was switched since (`palletize` and `deliver` switch pallets without being
+journaled), the current pallet's head moved (a merged haul, a fast-forwarding `lower`), or a
+consolidation was started or finished. Continue forward instead.
+
+A journal that cannot be read — corrupt, truncated, or written by a forklift with a
+different journal format — makes `undo` fail naming the file, never "nothing to undo".
+Remove the file to start a fresh journal; the undo history is lost, nothing else. Other
+commands keep working meanwhile and leave the file alone.
 
 ### `peek` — inspect an object (`pk`)
 
@@ -1768,7 +1776,7 @@ what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `s
 | `stocktake` | `st` | Show staged and unstaged changes |
 | `diff` | `d` | Show line-by-line changes |
 | `stack` | `s` | Record the inventory as a new parcel |
-| `undo` | | Soft-reset the last stack |
+| `undo` | | Reverse the last stack, consolidate, cherry-pick or shift |
 | `peek` | `pk` | Inspect an object or inventory |
 | `show` | | Print a file's content at a revision (`<revision>:<path>`) |
 | `history` | `hi` | Walk the parcel graph |

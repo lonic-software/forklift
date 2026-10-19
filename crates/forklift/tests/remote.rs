@@ -3142,17 +3142,11 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     // fixture is unchanged; only the assertions invert.
     //
     // Construction note (a deviation from the original sketch, which tried to manufacture
-    // this with `undo`): un-stacking a side-pallet parcel with `undo` *after* retiring past
-    // it does not work, because `undo`'s journal snapshots and restores *every* pallet ref,
-    // meta pallets included (`journal_utils::JournalEntry::heads`) — reversing the stack
-    // would also silently revert the office pallet's own ref, un-retiring the key right
-    // back to active. That's a real wrinkle in `undo` (out of scope for this predicate
-    // work: it never expected a meta-pallet mutation to land *between* the operation being
-    // undone and the undo itself). A pallet that is simply never lifted sidesteps it
-    // entirely — and is arguably the more realistic shape besides, since `office retire`
-    // snapshots *every* current pallet head regardless of what's ever reached the remote:
-    // a purely local, never-pushed pallet's head lands in a distrust boundary exactly the
-    // same as a published one's.
+    // this by un-stacking a side-pallet parcel with `undo` *after* retiring past it): a
+    // pallet that is simply never lifted is simpler, and arguably the more realistic shape
+    // besides, since `office retire` snapshots *every* current pallet head regardless of
+    // what's ever reached the remote: a purely local, never-pushed pallet's head lands in a
+    // distrust boundary exactly the same as a published one's.
     //
     // So: a second local-only pallet ("side") supplies the boundary head that a plain
     // (non-sparse) franchise of `main` alone will never even hear about, let alone fetch —

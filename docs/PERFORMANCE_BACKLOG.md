@@ -684,10 +684,11 @@ qualified.
   rather than pruning at them, so a lost ancestor shard behind a surviving head is rebuilt.
 * **The undo journal stays durable.** Its push is best-effort by contract and costs about 4 ms
   of a ~47 ms `stack`, but a lost unsynced push leaves the journal *behind* the refs. `undo`
-  would then quietly reverse an older operation than the user's last. Undo's existing gate only
-  refuses when the surviving entry's own pallet has moved, so a lost op on another pallet, or a
-  surviving shift entry, slips past it. A full after-state gate cannot close that soundly,
-  because un-journaled `palletize` and `deliver` move the current pallet between journaled ops. The saving does not pay for the misread.
+  would then try to reverse an older operation than the user's last. Since FORK-186 the gate
+  compares each entry's recorded after-state (current pallet, its head, consolidation) with the
+  bay. Every journaled operation changes one of those three fields, so a lost push leaves the
+  bay past the surviving entry and `undo` now refuses rather than misreads. Dropping the
+  barrier would be defensible on that basis; it is not done here.
 * **Everything else is authoritative.** That covers refs, the current pallet, consolidation and
   cherry-pick state, inventory, markers, scope, signatures, office anchors, bay records,
   config, the parked-parcel list and loose objects. The store side is covered by the no-go list above.

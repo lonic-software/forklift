@@ -7796,6 +7796,144 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     assert_success(&warehouse.run(&["undo"]));
 }
 
+// `palletize` is not journaled, so after it the newest journal entry is an older operation.
+// Reversing that entry would undo something other than the user's last operation: the gate
+// refuses because the current pallet is no longer the one the entry left current.
+#[test]
+fn undo_refuses_to_reach_past_a_palletize() {
+    let warehouse = TestWarehouse::new("undo-past-palletize");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    warehouse.write_file("b.txt", "two\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "second"]));
+
+    // Un-journaled: a new pallet at the same head, made current.
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    let main_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("left pallet \"main\" current, but \"feature\" is current now"),
+        "{}", stderr(&refused)
+    );
+
+    let main_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+    assert_eq!(main_before, main_after, "a refused undo must not move main");
+    assert!(stdout(&warehouse.run(&["palletize"])).contains("* feature"), "a refused undo must not switch pallets");
+}
+
+// The same for `deliver`, which moves its target and makes it current: the newest entry is the
+// draft's last checkpoint, and reversing it would rewind the draft and switch back onto it.
+#[test]
+fn undo_refuses_to_reach_past_a_deliver() {
+    let warehouse = TestWarehouse::new("undo-past-deliver");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "draft/feature"]));
+    for v in ["v2", "v3"] {
+        warehouse.write_file("code.txt", &format!("{}\n", v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("wip {}", v)]));
+    }
+    assert_success(&warehouse.run(&["deliver", "main", "-m", "add the feature"]));
+
+    let draft_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/draft/feature")).unwrap();
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("left pallet \"draft/feature\" current, but \"main\" is current now"),
+        "{}", stderr(&refused)
+    );
+
+    let draft_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/draft/feature")).unwrap();
+    assert_eq!(draft_before, draft_after, "a refused undo must not rewind the draft");
+    assert!(stdout(&warehouse.run(&["palletize"])).contains("* main"), "a refused undo must not switch pallets");
+}
+
+// A shift entry passes through the same gate: after `shift main` and an un-journaled
+// `palletize other`, undo must not shift back to "side" — the user's last operation was the
+// palletize, not the shift.
+#[test]
+fn undo_refuses_to_reverse_a_shift_past_a_palletize() {
+    let warehouse = TestWarehouse::new("undo-shift-past-palletize");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+
+    warehouse.write_file("base.txt", "base\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["palletize", "side"]));
+    warehouse.write_file("side.txt", "side\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "side work"]));
+
+    // Journaled: side → main. Un-journaled after it: a new pallet at main's head, made current.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["palletize", "other"]));
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("left pallet \"main\" current, but \"other\" is current now"),
+        "{}", stderr(&refused)
+    );
+    assert!(stdout(&warehouse.run(&["palletize"])).contains("* other"), "a refused undo must not shift");
+    assert!(!warehouse.root.join("side.txt").exists(), "a refused undo must not materialize \"side\"");
+}
+
+// A journal that cannot be read is named, never read as empty ("nothing to undo"). A command
+// that succeeds still succeeds — journaling is best-effort — and leaves the file for the user.
+#[test]
+fn undo_refuses_a_corrupt_journal_by_name() {
+    let warehouse = TestWarehouse::new("undo-corrupt-journal");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    warehouse.write_file("b.txt", "two\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "second"]));
+
+    let journal = warehouse.root.join(".forklift/journal.json");
+    assert!(journal.is_file(), "the second stack must have been journaled");
+    std::fs::write(&journal, "{\"version\":1,\"entr").unwrap();
+    let main_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    let message = stderr(&refused);
+    assert!(message.contains("journal.json") && message.contains("Remove it to start a fresh journal"), "{}", message);
+    assert!(!message.contains("nothing to undo"), "{}", message);
+    let main_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+    assert_eq!(main_before, main_after, "a refused undo must not move main");
+
+    warehouse.write_file("c.txt", "three\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "third"]));
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), "{\"version\":1,\"entr", "a refused journal is never rewritten");
+
+    // The remedy the message names works.
+    std::fs::remove_file(&journal).unwrap();
+    warehouse.write_file("d.txt", "four\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "fourth"]));
+    assert_success(&warehouse.run(&["undo"]));
+}
+
 #[test]
 fn config_unset_removes_a_value() {
     let warehouse = TestWarehouse::new("config-unset");

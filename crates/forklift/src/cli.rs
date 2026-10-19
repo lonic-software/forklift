@@ -940,14 +940,19 @@ pub enum Command {
         action: Option<TagAction>,
     },
 
-    /// Undo the last stack on the current pallet (soft — keeps your changes)
+    /// Undo the last stack, consolidate, cherry-pick or shift (soft — keeps your changes)
     #[command(
-        long_about = "Undo the last \"stack\" on the current pallet: move the pallet head back to \
-                      the previous parcel, keeping the working directory and the inventory as they \
-                      are (like git's \"reset --soft HEAD~1\"). The undone parcel's changes are \
-                      staged again, so you can re-stack them — e.g. with a corrected message or \
-                      author — or adjust them first. The parcel is not deleted, only taken off the \
-                      pallet. Merge parcels (completed consolidations) are not undone yet."
+        long_about = "Undo the last journaled operation: a \"stack\", \"consolidate\", \
+                      \"cherry-pick\" or \"shift\". A stack, consolidate or cherry-pick is \
+                      reversed softly: the pallet head moves back while the working directory and \
+                      the inventory stay as they are (like git's \"reset --soft HEAD~1\"), so the \
+                      undone changes are staged again and can be re-stacked — e.g. with a \
+                      corrected message or author. A shift is reversed by shifting back. Undo \
+                      reverses only the user's last operation: if the current pallet has been \
+                      switched (e.g. by palletize or deliver), its head has moved, or the \
+                      consolidation state has changed since the journaled operation, it refuses \
+                      instead of reaching past that. An unreadable journal is reported by name, \
+                      never read as empty."
     )]
     Undo,
 

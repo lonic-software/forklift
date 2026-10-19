@@ -314,9 +314,11 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
 
     // Snapshot the pre-operation state for journaled commands (§7.8), so `undo` can
     // reverse this operation. Best-effort throughout: a journaling problem must never
-    // block or fail a command — undo simply falls back to its classic behavior.
+    // block or fail a command. A missed entry costs only undo's reach — undo refuses an
+    // older entry once the bay no longer matches it — and an unreadable journal is
+    // reported by undo itself.
     let journal_pre = cli.command.journal_op()
-        .and_then(|op| forklift_core::util::journal_utils::capture(op).ok());
+        .and_then(|op| forklift_core::util::journal_utils::capture().ok().map(|pre| (op, pre)));
 
     // A mutating command adds loose objects; captured before `dispatch` consumes `cli`.
     let auto_maintenance = cli.command.triggers_auto_maintenance();
@@ -324,8 +326,8 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     let result = dispatch(cli).await;
 
     if result.is_ok() {
-        if let Some(pre) = journal_pre {
-            let _ = forklift_core::util::journal_utils::push_if_changed(pre);
+        if let Some((op, pre)) = journal_pre {
+            let _ = forklift_core::util::journal_utils::push_if_changed(op, pre);
         }
     }
 
