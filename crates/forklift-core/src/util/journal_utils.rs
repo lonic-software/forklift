@@ -1284,7 +1284,9 @@ mod tests {
         let mut restored = entry("consolidate", "main", &hash('a'), &hash('2'));
         restored.before.current_pallet = "feature".to_string();
         restored.before.heads.insert("@office".to_string(), hash('b'));
-        restored.before.consolidation = Some(consolidating(&hash('c'), "their-pallet"));
+        let mut journaled = consolidating(&hash('c'), "their-pallet");
+        journaled.our_pallet = "feature".to_string();
+        restored.before.consolidation = Some(journaled);
         restored.after.heads.insert("@office".to_string(), hash('4'));
 
         restore_refs(&restored).unwrap();
@@ -1296,6 +1298,7 @@ mod tests {
         let consolidation = merge_utils::read_consolidation_state().unwrap().unwrap();
         assert_eq!(consolidation.their_head, hash('c'));
         assert_eq!(consolidation.their_pallet, "their-pallet");
+        assert_eq!(consolidation.our_pallet, "feature", "the pallet the merge started on must come back");
         assert!(OutOfScopeSkeleton::read_required().is_ok(), "the skeleton must come back with the state");
     }
 
@@ -1508,13 +1511,14 @@ mod tests {
 
         // The stack that completed the pick consumed its state file.
         let mut completed = entry("stack", "main", &hash('1'), &hash('2'));
-        completed.before.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('e'), our_pallet: "main".to_string(), description: Some("pick".to_string()) });
+        completed.before.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('e'), our_pallet: "side".to_string(), description: Some("pick".to_string()) });
 
         restore_refs(&completed).unwrap();
 
         let state = cherry_pick_utils::read_state().unwrap().expect("the pick must be in progress again");
         assert_eq!(state.source, hash('c'));
         assert_eq!(state.description.as_deref(), Some("pick"));
+        assert_eq!(state.our_pallet, "side", "the pallet the pick was applied to must come back");
 
         // And an entry with no pick before it clears one.
         pallet_utils::update_pallet_head(
