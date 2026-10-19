@@ -1035,24 +1035,11 @@ pub fn collect_reachable(heads: &[String]) -> Result<HashSet<String>, String> {
     Ok(reachable)
 }
 
-/// Collect every *locally present* parcel reachable from the given heads (the heads
-/// included). A head that does not exist here contributes nothing: a trust boundary
-/// may name heads this warehouse never had (enrollment includes the remote's heads),
-/// and any locally present pre-trust parcel is reachable from a local head anyway.
-///
-/// # Arguments
-/// * `heads` - The starting parcel hashes.
-///
-/// # Returns
-/// * `Ok(HashSet<String>)` - The reachable, locally present parcel hashes.
-/// * `Err(String)`         - If a present parcel could not be read.
-pub fn collect_reachable_present(heads: &[String]) -> Result<HashSet<String>, String> {
-    Ok(collect_reachable_present_noting_gaps(heads)?.0)
-}
-
-/// [`collect_reachable_present`], but also reporting every reference the walk found absent —
-/// a head itself, or a parent edge pointing at an object this store doesn't have — in the
-/// order the walk first met them.
+/// Collect every *locally present* parcel reachable from the given heads (the heads included),
+/// and report every reference the walk found absent — a head itself, or a parent edge pointing
+/// at an object this store doesn't have — in the order the walk first met them. A head that
+/// does not exist here contributes nothing: a trust boundary may name heads this warehouse never
+/// had (enrollment includes the remote's heads).
 ///
 /// A head-only presence pre-scan is not enough to know whether a walk's answer is complete:
 /// every one of a key's boundary heads can be present while the walk still runs into a gap
@@ -1067,12 +1054,30 @@ pub fn collect_reachable_present(heads: &[String]) -> Result<HashSet<String>, St
 /// * `heads` - The starting parcel hashes.
 ///
 /// # Returns
-/// * `Ok((reachable, gaps))` - `reachable` is the present, reachable set (as
-///   [`collect_reachable_present`]); `gaps` is every absent hash the walk actually referenced,
-///   deduplicated, first-encountered order.
+/// * `Ok((reachable, gaps))` - `reachable` is the present, reachable set; `gaps` is every
+///   absent hash the walk actually referenced, deduplicated, first-encountered order.
 /// * `Err(String)`           - If a present parcel could not be read.
 pub fn collect_reachable_present_noting_gaps(
     heads: &[String],
+) -> Result<(HashSet<String>, Vec<String>), String> {
+    collect_reachable_noting_gaps(heads, file_utils::does_object_exist)
+}
+
+/// The parcel walk behind [`collect_reachable_present_noting_gaps`] and
+/// `gc_utils::collect_reachable_for_sweep`, which differ only in what counts as present: a read
+/// may treat an unreadable parcel as a gap, a deleting sweep may not (FORK-193). One walk, so the
+/// two can never drift.
+///
+/// # Arguments
+/// * `heads`      - The starting parcel hashes.
+/// * `is_present` - Whether a parcel is here to read. An error aborts the walk.
+///
+/// # Returns
+/// * `Ok((reachable, gaps))` - As for [`collect_reachable_present_noting_gaps`].
+/// * `Err(String)`           - If `is_present` failed, or a present parcel could not be read.
+pub(crate) fn collect_reachable_noting_gaps(
+    heads: &[String],
+    is_present: impl Fn(&str) -> Result<bool, String>,
 ) -> Result<(HashSet<String>, Vec<String>), String> {
     let mut queue: VecDeque<String> = heads.iter().cloned().collect();
     let mut reachable: HashSet<String> = HashSet::new();
@@ -1080,7 +1085,12 @@ pub fn collect_reachable_present_noting_gaps(
     let mut seen_gaps: HashSet<String> = HashSet::new();
 
     while let Some(hash) = queue.pop_front() {
-        if !file_utils::does_object_exist(&hash)? {
+        // A merge's parents are queued once per child edge: settle a repeat before asking presence.
+        if reachable.contains(&hash) {
+            continue;
+        }
+
+        if !is_present(&hash)? {
             if seen_gaps.insert(hash.clone()) {
                 gaps.push(hash);
             }
@@ -1088,9 +1098,7 @@ pub fn collect_reachable_present_noting_gaps(
             continue;
         }
 
-        if !reachable.insert(hash.clone()) {
-            continue;
-        }
+        reachable.insert(hash.clone());
 
         for parent in object_utils::load_parcel(&hash)?.parents {
             queue.push_back(parent);
@@ -1101,7 +1109,7 @@ pub fn collect_reachable_present_noting_gaps(
 }
 
 /// Per-revoked-key memo of a distrust boundary's vouched parcel set: the reachability walk
-/// ([`collect_reachable_present`]) runs at most once per distinct key, not once per parcel
+/// ([`collect_reachable_present_noting_gaps`]) runs at most once per distinct key, not once per parcel
 /// that key signed. Shared between `audit`'s phase-3 resolution (below) and the query
 /// engine's `signer.boundary` predicate (`query_utils::QueryContext`) — the walk-and-
 /// membership arithmetic must never drift between the two.

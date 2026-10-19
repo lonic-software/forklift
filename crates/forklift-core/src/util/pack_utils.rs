@@ -1568,6 +1568,49 @@ pub(crate) fn quarantine_reason(hash: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Why the liveness walk of a sweep that deletes cannot read a presence miss on `hash` as absent
+/// (FORK-193). Asked only after `file_utils::does_object_exist` missed, which revalidated the
+/// cached pack set against the pack folder, so this answers from that set with no I/O of its own.
+///
+/// Stricter than [`quarantine_reason`], which gates the verdict of an ordinary read: on top of a
+/// quarantined or foreign-version index, a corrupt bucket of a loaded pack may hold the hash, and
+/// so may an index that could not be parsed at all. A read may treat such an index as inert (I4),
+/// since the worst a missed copy costs it is an honest `Absent`. A sweep may not: what the hash
+/// references would be deleted.
+///
+/// # Returns
+/// * `Ok(Some(reason))` - Some pack index may hold `hash` but cannot serve it; `reason` names it.
+/// * `Ok(None)`         - No pack index could hold `hash` unseen.
+/// * `Err(String)`      - The pack registry itself could not be loaded.
+pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, String> {
+    if let Some(reason) = quarantine_reason(hash)? {
+        return Ok(Some(reason));
+    }
+
+    let Some(hash_bytes) = hash_to_bytes(hash) else {
+        return Ok(None);
+    };
+
+    let pack_set = loaded_packs()?;
+
+    for pack in pack_set.packs.iter() {
+        if let Located::CorruptBucket(bucket) = pack.locate(&hash_bytes) {
+            return Ok(Some(pack.corrupt_bucket_error(bucket)));
+        }
+    }
+
+    // `quarantine_reason` answered for a foreign-version index, so this one is unparseable.
+    if let Some(unparsed) = pack_set.unenumerable.first() {
+        return Ok(Some(format!(
+            "possibly held by pack index \"{}\", which could not be parsed: {}; restore it, or move \
+            it out of the pack folder if it holds nothing this warehouse needs",
+            unparsed.index_path.to_string_lossy(), unparsed.error
+        )));
+    }
+
+    Ok(None)
+}
+
 /// [`pack_health_snapshot`]'s result: every quarantined index's `(path, load error)` and every
 /// unenumerable index's `(path, parse error)`, as of one uncached load.
 pub(crate) struct PackHealthSnapshot {
@@ -4946,9 +4989,81 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    /// How [`pack_as_unreadable`] makes an object's only pack unreadable.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum Unreadable {
+        /// The index survives, its data file is gone.
+        Quarantined,
+        /// The index's bucket holding the object fails validation.
+        CorruptBucket,
+        /// The index carries another format version.
+        ForeignVersion,
+        /// The index does not parse at all, so its hash set is unknown.
+        Unparseable,
+    }
+
+    /// Move the loose object `hash` into a pack of its own (deleting the loose file), so a
+    /// test can place one object in a pack and the objects around it elsewhere.
+    pub(crate) fn pack_alone(hash: &str) -> TransportPackArtifact {
+        let raw = file_utils::retrieve_object_by_hash(hash).unwrap();
+        let mut builder = TransportPackBuilder::new(&pack_folder()).unwrap();
+        builder.append_full(hash, &raw).unwrap();
+        let mut artifacts = builder.finish().unwrap();
+        assert_eq!(artifacts.len(), 1, "one object must make exactly one pack pair");
+
+        let (folder, file_name) = file_utils::get_path_for_object(hash).unwrap();
+        std::fs::remove_file(Path::new(&folder).join(file_name)).unwrap();
+        invalidate_cache();
+
+        artifacts.remove(0)
+    }
+
+    /// Run `case` once per [`Unreadable`] kind and fail with every arm's failure together, so a red
+    /// run reports each arm rather than stopping at the first.
+    pub(crate) fn for_each_unreadable(case: impl Fn(Unreadable) -> Option<String>) {
+        let all = [Unreadable::Quarantined, Unreadable::CorruptBucket, Unreadable::ForeignVersion, Unreadable::Unparseable];
+        let failures: Vec<String> = all
+            .into_iter()
+            .filter_map(case)
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Leave the loose object `hash` held only by a pack index this store cannot serve it from,
+    /// and assert that it reads not present, yet not absent to a sweep.
+    pub(crate) fn pack_as_unreadable(hash: &str, how: Unreadable) {
+        let artifact = pack_alone(hash);
+        let rewrite_header = |offset: usize, bytes: &[u8]| {
+            let mut index = std::fs::read(&artifact.index_path).unwrap();
+            index[offset..offset + bytes.len()].copy_from_slice(bytes);
+            std::fs::write(&artifact.index_path, index).unwrap();
+        };
+
+        match how {
+            Unreadable::Quarantined => std::fs::remove_file(&artifact.data_path).unwrap(),
+            Unreadable::CorruptBucket => corrupt_record_of(&artifact.index_path, &hash_to_bytes(hash).unwrap()),
+            Unreadable::ForeignVersion => rewrite_header(8, &(PACK_FORMAT_VERSION + 1).to_le_bytes()),
+            Unreadable::Unparseable => rewrite_header(0, b"NOTAPACK"),
+        }
+        invalidate_cache();
+
+        // Each kind refuses for its own reason, so an arm cannot pass on another kind's gate.
+        let reason = match how {
+            Unreadable::Quarantined => "whose data file could not be loaded",
+            Unreadable::CorruptBucket => "is corrupt (bucket",
+            Unreadable::ForeignVersion => "which this build cannot read",
+            Unreadable::Unparseable => "which could not be parsed",
+        };
+        assert!(!file_utils::does_object_exist(hash).unwrap(), "{:?}: the object must not read present", how);
+        match file_utils::is_present_for_sweep(hash) {
+            Err(error) => assert!(error.contains(reason), "{:?}: the refusal must give its own reason: {}", how, error),
+            Ok(present) => panic!("{:?}: a sweep must not read the object absent (read {})", how, present),
+        }
+    }
 
     /// Test-only convenience: assert `retrieve_from_packs(hash)` reports `Verified` and return
     /// its bytes, so a byte-comparison assertion at the call site stays a single line as it was

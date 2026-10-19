@@ -118,7 +118,7 @@ impl MatchTrust {
 /// exactly when [`IdentityResolution::trust`] is `SignedRevoked`. `Vouched` means the parcel
 /// is part of the history the revoker vouched for at revocation time (the same reachability
 /// test `audit` runs to accept a revoked-key signature at all — see
-/// [`audit_utils::collect_reachable_present`]); `Suspect` means it sits outside that boundary
+/// [`audit_utils::collect_reachable_present_noting_gaps`]); `Suspect` means it sits outside that boundary
 /// — a forged backdate, or the key's holder kept signing after the revocation. `audit` hard-
 /// errors on a suspect parcel; a read-only query was only asked to read the history, so it
 /// cannot refuse it — it labels the parcel loudly instead.

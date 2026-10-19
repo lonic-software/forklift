@@ -1495,6 +1495,14 @@ repacked:` note (`--json`: `unvalidated_packs`, the list of those errors). Its s
 read; an object in a damaged part reads as unverifiable until it is stored again. Ordinary commands never pay that
 whole-index check: they verify only the slice of an index they actually read.
 
+Telling garbage from live content means reading every parcel, tree and large-file recipe still
+in use. If one of those is missing but a broken pack might hold it (a damaged part of a pack, a
+pack whose data file is missing, or a pack index that cannot be read at all), the full repack
+**refuses and deletes nothing**, naming the object: what it refers to cannot be told apart from
+garbage. `scope-prune` and `forklift-server gc` refuse the same way. `forklift store` lists the
+pack under `quarantined_packs`, `damaged_packs`, `unenumerable_indexes` or
+`foreign_version_indexes`; once the pack is restored or moved aside, the sweep can run.
+
 For the same reason a full repack is **refused while a mutating command is running in another
 bay** of the same warehouse: that command may have just decided to reuse an object the repack
 was about to drop. Run it again once the other command finishes. The opposite case waits

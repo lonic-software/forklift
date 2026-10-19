@@ -47,7 +47,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::util::pallet_utils::PalletNamespace;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 use crate::util::{
-    audit_utils, bay_utils, file_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
+    bay_utils, file_utils, gc_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
     tree_utils,
 };
 use crate::util::lock_utils::StoreAccessExclusive;
@@ -172,8 +172,8 @@ fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
         }
     }
 
-    let user: Vec<String> = audit_utils::collect_reachable_present(&user_roots)?.into_iter().collect();
-    let meta: Vec<String> = audit_utils::collect_reachable_present(&meta_roots)?.into_iter().collect();
+    let user: Vec<String> = gc_utils::collect_reachable_for_sweep(&user_roots)?.into_iter().collect();
+    let meta: Vec<String> = gc_utils::collect_reachable_for_sweep(&meta_roots)?.into_iter().collect();
 
     Ok((user, meta))
 }
@@ -210,7 +210,7 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String]) -> Result<Local
     let mut roots: Vec<String> = sources.parcels.into_iter().filter(|p| !known.contains(p)).collect();
     roots.extend(sources.pin_parcels.into_iter().map(|(p, _)| p).filter(|p| !known.contains(p)));
 
-    let parcels: Vec<String> = audit_utils::collect_reachable_present(&roots)?
+    let parcels: Vec<String> = gc_utils::collect_reachable_for_sweep(&roots)?
         .into_iter()
         .filter(|p| !known.contains(p))
         .collect();
@@ -336,7 +336,9 @@ fn collect_retained(
 /// Presence-tolerant, unlike [`collect_retained`]: a local parcel made in a narrower checkout,
 /// or a pinned historical parcel, may seal subtrees this warehouse never fetched, and a staged
 /// recipe may already be gone (FORK-157). An absent object has nothing left to keep and is not
-/// a prune target either, so skipping it is the same rule gc's live set applies.
+/// a prune target either, so skipping it is the same rule gc's live set applies, including its
+/// exception: an object only an unreadable pack index might hold fails the plan instead
+/// ([`file_utils::is_present_for_sweep`]), since its children may be targets (FORK-193).
 ///
 /// # Arguments
 /// * `local`      - The non-head roots from [`local_roots`].
@@ -365,7 +367,7 @@ fn retain_local_closure(
     }
 
     while let Some((tree_hash, path)) = frontier.pop_front() {
-        if !seen.insert((tree_hash.clone(), path.clone())) || !file_utils::does_object_exist(&tree_hash)? {
+        if !seen.insert((tree_hash.clone(), path.clone())) || !file_utils::is_present_for_sweep(&tree_hash)? {
             continue;
         }
 
@@ -401,9 +403,10 @@ fn retain_local_closure(
     Ok(())
 }
 
-/// [`retain_recipe_chunks`] for a recipe that may be absent, which retains nothing.
+/// [`retain_recipe_chunks`] for a recipe that may be absent, which retains nothing. A recipe only
+/// an unreadable pack index might hold is an error, as in [`retain_local_closure`].
 fn retain_present_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Result<(), String> {
-    if !file_utils::does_object_exist(recipe_hash)? {
+    if !file_utils::is_present_for_sweep(recipe_hash)? {
         return Ok(());
     }
 
@@ -441,6 +444,11 @@ fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Re
 /// descent is simply skipped, never an error — which is sound only because objects are always
 /// *freed* in the same child-before-parent order this function produces, so an absent node
 /// proves its whole subtree is already gone, not merely that this one object is.
+///
+/// Presence here is the plain [`file_utils::does_object_exist`], not the fail-closed sweep form
+/// the retained walks use. An object only an unreadable pack index might hold reads absent, so
+/// what lies beneath it is not targeted: this walk only decides what may be freed, and missing a
+/// target frees less, never more.
 fn collect_prune_targets(
     user_parcels: &[String],
     pruned_prefixes: &[String],
@@ -557,6 +565,7 @@ mod tests {
     use crate::model::blob::Blob;
     use crate::model::parcel::Parcel;
     use crate::model::tree_item::TreeItem;
+    use crate::util::pack_utils::tests::{for_each_unreadable, pack_as_unreadable, Unreadable};
     use std::path::PathBuf;
 
     /// Exclusive store access at the active storage root, as the scope-prune handler holds it.
@@ -775,13 +784,14 @@ mod tests {
         assert_eq!(plan.retained_shared, 1);
     }
 
-    /// Park `tree_hash` as bay `bay`'s only parked parcel, by path.
-    fn plant_parked(bay: &str, tree_hash: &str) {
+    /// Park `tree_hash` as bay `bay`'s only parked parcel, by path. Returns the parcel's hash.
+    fn plant_parked(bay: &str, tree_hash: &str) -> String {
         let parcel = store_parcel(tree_hash, Vec::new());
         let dir = crate::util::bay_utils::bay_state_dir(bay);
         std::fs::create_dir_all(&dir).unwrap();
         crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(dir.join("parked"), format!("{}\n", parcel)).unwrap();
+        parcel
     }
 
     /// The root tree `src/<dir>/<file>` holding `blob`.
@@ -1233,5 +1243,81 @@ mod tests {
             "the resumed prune finished freeing the chunked file");
         object_utils::load_tree(&src_tree).expect("the spine still loads: src/web is sealed by hash");
         assert!(loose_exists(&api_blob), "in-scope content is untouched");
+    }
+
+    /// FORK-193: the retained walks are a sweep's liveness walk. An object only an unreadable pack
+    /// index holds is not absent, and what it references may be all that keeps a target, so the
+    /// plan must fail rather than skip it. Each test runs for both kinds of unreadable index.
+    /// Returns what went wrong, if anything; freeing `kept` is checked first, since it is the harm
+    /// the refusal exists to prevent.
+    fn plan_outcome(how: Unreadable, unreadable: &str, kept: &str) -> Option<String> {
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+
+        match plan_prune(&["src/web".to_string()], &post_prune, &store_access()) {
+            Ok(plan) if plan.to_free.contains(&kept.to_string()) => {
+                Some(format!("{:?}: the plan frees {}, which the unreadable object references", how, kept))
+            }
+            Ok(_) => Some(format!("{:?}: the prune plan must refuse past an unreadable object", how)),
+            Err(error) if !(error.contains(unreadable) && error.contains("cannot be read")) => {
+                Some(format!("{:?}: the error must name the unreadable object: {}", how, error))
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// A parked `src/api/y.txt` holds the pruned blob's bytes, under a tree only an unreadable
+    /// index holds. Mutation: in `retain_local_closure`, ask `does_object_exist` → the plan frees
+    /// the blob (red).
+    #[test]
+    fn plan_prune_refuses_past_a_parked_tree_only_an_unreadable_index_holds() {
+        for_each_unreadable(|how| {
+            let _scratch = Scratch::new("parked-unreadable-tree");
+            let f = build_fixture();
+            let leaf = store_tree(&[("y.txt", &f.web_blob, DirEntryType::Normal)]);
+            let src = store_tree(&[("api", &leaf, DirEntryType::Tree)]);
+            plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
+            pack_as_unreadable(&leaf, how);
+
+            plan_outcome(how, &leaf, &f.web_blob)
+        });
+    }
+
+    /// A staged chunked file's recipe shares a chunk with the pruned file's recipe, and only an
+    /// unreadable index holds the staged recipe. Mutation: in `retain_present_recipe_chunks`, ask
+    /// `does_object_exist` → the plan frees the shared chunk (red).
+    #[test]
+    fn plan_prune_refuses_past_a_staged_recipe_only_an_unreadable_index_holds() {
+        for_each_unreadable(|how| {
+            let _scratch = Scratch::new("staged-unreadable-recipe");
+            let shared = store_chunk(b"a chunk both recipes name");
+            let other = store_chunk(b"a chunk only the pruned recipe names");
+            let pruned_recipe = store_recipe(&[(shared.clone(), 25), (other.clone(), 36)]);
+            let staged_recipe = store_recipe(&[(shared.clone(), 25)]);
+
+            let web = store_tree(&[("big.bin", &pruned_recipe, DirEntryType::NormalChunked)]);
+            let src = store_tree(&[("web", &web, DirEntryType::Tree)]);
+            let parcel = store_parcel(&store_tree(&[("src", &src, DirEntryType::Tree)]), Vec::new());
+            pallet_utils::update_pallet_head("main", None, &parcel).unwrap();
+
+            crate::util::gc_utils::tests::plant_staged_shard("b", &[("big.bin", &staged_recipe, DirEntryType::NormalChunked)]);
+            pack_as_unreadable(&staged_recipe, how);
+
+            plan_outcome(how, &staged_recipe, &shared)
+        });
+    }
+
+    /// A parked parcel whose tree holds the pruned blob in scope is itself only in an unreadable
+    /// index. Mutation: in `collect_reachable_for_sweep`, ask `does_object_exist` → the parked
+    /// parcel reads absent and the plan frees the blob (red).
+    #[test]
+    fn plan_prune_refuses_past_a_parked_parcel_only_an_unreadable_index_holds() {
+        for_each_unreadable(|how| {
+            let _scratch = Scratch::new("parked-unreadable-parcel");
+            let f = build_fixture();
+            let parked = plant_parked("b", &src_tree_with("api", "y.txt", &f.web_blob));
+            pack_as_unreadable(&parked, how);
+
+            plan_outcome(how, &parked, &f.web_blob)
+        });
     }
 }
