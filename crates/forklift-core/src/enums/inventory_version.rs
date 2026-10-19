@@ -3,6 +3,7 @@ use crate::model::inventory::Inventory;
 
 const CODE_VERSION_2024_09_04: u64 = 1;
 const CODE_VERSION_2026_07_15: u64 = 2;
+const CODE_VERSION_2026_10_19: u64 = 3;
 
 /// Versions of the inventory object format.
 pub enum InventoryVersion {
@@ -12,6 +13,11 @@ pub enum InventoryVersion {
     /// Adds an optional per-shard rollup hash to the header (DESIGN.html §5.0 D item 8): the
     /// hash `stack` would build for this directory's entire staged subtree, when known.
     V2026_07_15,
+
+    /// Same bytes as `V2026_07_15`, but every entry proves itself: its stat was taken against an
+    /// anchor read before it, or recorded as unproven. Older versions' entries were trusted
+    /// against the shard file's mtime, so they parse with every entry unproven.
+    V2026_10_19,
 }
 
 impl InventoryVersion {
@@ -23,6 +29,7 @@ impl InventoryVersion {
         match self {
             InventoryVersion::V2024_09_04 => CODE_VERSION_2024_09_04,
             InventoryVersion::V2026_07_15 => CODE_VERSION_2026_07_15,
+            InventoryVersion::V2026_10_19 => CODE_VERSION_2026_10_19,
         }
     }
 
@@ -38,6 +45,7 @@ impl InventoryVersion {
         match code {
             CODE_VERSION_2024_09_04 => Ok(InventoryVersion::V2024_09_04),
             CODE_VERSION_2026_07_15 => Ok(InventoryVersion::V2026_07_15),
+            CODE_VERSION_2026_10_19 => Ok(InventoryVersion::V2026_10_19),
             _ => Err(format!("Inventory version code {} not found.", code)),
         }
     }
@@ -50,6 +58,7 @@ impl InventoryVersion {
         let builder_fn = match self {
             InventoryVersion::V2024_09_04 => builder::inventory::version::v2024_09_04::build,
             InventoryVersion::V2026_07_15 => builder::inventory::version::v2026_07_15::build,
+            InventoryVersion::V2026_10_19 => builder::inventory::version::v2026_10_19::build,
         };
 
         move |inventory| builder_fn(inventory)
@@ -63,6 +72,7 @@ impl InventoryVersion {
         let parser_fn = match self {
             InventoryVersion::V2024_09_04 => parser::inventory::version::v2024_09_04::parse,
             InventoryVersion::V2026_07_15 => parser::inventory::version::v2026_07_15::parse,
+            InventoryVersion::V2026_10_19 => parser::inventory::version::v2026_10_19::parse,
         };
 
         move |offset, content| parser_fn(offset, content)
@@ -77,6 +87,7 @@ impl InventoryVersion {
         let builder_fn = match self {
             InventoryVersion::V2024_09_04 => builder::inventory::version::v2024_09_04::build_header,
             InventoryVersion::V2026_07_15 => builder::inventory::version::v2026_07_15::build_header,
+            InventoryVersion::V2026_10_19 => builder::inventory::version::v2026_10_19::build_header,
         };
 
         move |inventory| builder_fn(inventory)
@@ -92,6 +103,7 @@ impl InventoryVersion {
         let parser_fn = match self {
             InventoryVersion::V2024_09_04 => parser::inventory::version::v2024_09_04::parse_header,
             InventoryVersion::V2026_07_15 => parser::inventory::version::v2026_07_15::parse_header,
+            InventoryVersion::V2026_10_19 => parser::inventory::version::v2026_10_19::parse_header,
         };
 
         move |offset, content| parser_fn(offset, content)
@@ -102,6 +114,6 @@ impl InventoryVersion {
     /// # Returns
     /// * `InventoryVersion` - The latest inventory version.
     pub fn latest() -> InventoryVersion {
-        InventoryVersion::V2026_07_15
+        InventoryVersion::V2026_10_19
     }
 }

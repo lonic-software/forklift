@@ -369,16 +369,16 @@ fn reloading_stages_deleted_directories_and_files_for_removal() {
     assert!(stdout(&sibling).contains("other.txt"), "unrelated inventories must survive");
 }
 
-// Timestamps have second granularity, so the fast path only trusts entries strictly older
-// than their shard ("racily clean" protection). The file must be backdated to make the test
-// deterministic; `touch -t` keeps this unix-only.
+// Timestamps have second granularity, so an entry is only trusted when its file's mtime is two
+// whole seconds older than the clock read before its stat. The file must be backdated to make
+// the test deterministic; `touch -t` keeps this unix-only.
 #[cfg(unix)]
 #[test]
 fn unchanged_files_are_not_rehashed_on_reload() {
     let warehouse = TestWarehouse::new("statcache");
     warehouse.write_file("src/stable.txt", "stable content\n");
 
-    // Backdate the file so its mtime is strictly older than the shard about to be written.
+    // Backdate the file so the load's stat proves its entry.
     let touch = Command::new("touch")
         .args(["-t", "202601010000"])
         .arg(warehouse.root.join("src/stable.txt"))
@@ -405,8 +405,8 @@ fn unchanged_files_are_not_rehashed_on_reload() {
     assert_success(&warehouse.run(&["load", "src"]));
     assert!(!object_path.exists(), "unchanged file must be reused via the stat cache, not rehashed");
 
-    // Rewriting the file (same content, fresh timestamps) must take the full path again:
-    // its mtime is now >= the shard's, so racily-clean protection forces a rehash.
+    // Rewriting the file (same content, fresh timestamps) must take the full path again: its
+    // fresh mtime proves nothing, so the entry records it as unproven and the reload rehashes.
     warehouse.write_file("src/stable.txt", "stable content\n");
     assert_success(&warehouse.run(&["load", "src"]));
     assert!(object_path.exists(), "a touched file must be rehashed and its blob re-stored");
@@ -1917,7 +1917,7 @@ fn restore_leaves_files_that_already_match_untouched() {
     warehouse.write_file("dir/b.txt", "original b\n");
     warehouse.write_file("dir/c.txt", "original c\n");
 
-    // Older than the shards `load` writes, so the stat cache trusts every entry.
+    // Old enough for `load`'s stat to prove every entry, so the stat cache trusts them.
     for path in ["a.txt", "dir/b.txt", "dir/c.txt"] {
         backdate(&warehouse.root.join(path), 3600);
     }
@@ -1972,11 +1972,11 @@ fn restore_leaves_files_that_already_match_untouched() {
     assert!(status.contains("The working directory matches the inventory"), "must be clean: {}", status);
 }
 
-/// A matching file whose mtime is not older than the restore's own stat could still be edited
-/// in that second without its mtime moving, so its fresh stat data is not recorded: the entry
-/// stays as it was, to be settled by hash again later.
+/// A matching file whose mtime is not two whole seconds older than the restore's own clock read
+/// could still be edited in that second without its mtime moving, so its entry is recorded as
+/// unproven, to be settled by hash again later.
 #[test]
-fn restore_does_not_record_a_racily_matching_file() {
+fn restore_records_a_racily_matching_file_as_unproven() {
     let warehouse = TestWarehouse::new("restore-skip-racy");
     warehouse.write_file("a.txt", "original a\n");
     backdate(&warehouse.root.join("a.txt"), 3600);
@@ -1991,12 +1991,247 @@ fn restore_does_not_record_a_racily_matching_file() {
     let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)).unwrap();
     drop(file);
-    let before = inventory_entry(&warehouse, "", "a.txt").content_change_timestamp;
 
     let restored = stdout(&warehouse.run(&["restore", "."]));
     assert!(restored.contains("Restored 0 file(s) from the inventory; 1 already matched it."), "{}", restored);
-    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, before,
-        "a racily matching file's stat data must not be recorded");
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp,
+        forklift_core::model::inventory::UNPROVEN_MTIME,
+        "a racily matching file's stat data must not be trusted");
+}
+
+/// Run git in `root` with a fixed identity.
+fn git_in(root: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.com")
+        .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@example.com")
+        .output()
+        .expect("git must be installed to run this test");
+    assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+}
+
+/// A deterministic, incompressible-ish file of `len` bytes, at or above the chunk threshold
+/// when `len` is.
+fn write_pseudo_random_file(path: &std::path::Path, len: usize) {
+    let mut content = Vec::with_capacity(len + 8);
+    let mut state = 0x9E37_79B9u64;
+    while content.len() < len {
+        state = state.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(1);
+        content.extend_from_slice(&state.to_le_bytes());
+    }
+    content.truncate(len);
+    std::fs::write(path, content).unwrap();
+}
+
+/// The unstaged changes `stocktake` reports, as `(kind, path)` pairs (none when it omits them).
+fn unstaged_changes(warehouse: &TestWarehouse) -> Vec<(String, String)> {
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    status["data"]["unstaged"].as_array().into_iter().flatten()
+        .map(|change| (change["kind"].as_str().unwrap().to_string(), change["path"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+/// `import-git` builds its inventory from git's tree over a working tree it never wrote, so it
+/// proves each file against the tree before trusting its stat: an uncommitted edit that keeps the
+/// file's size is still reported, and a large file git stores as one plain blob, which a fresh
+/// ingest would chunk, is not mistaken for a change.
+#[test]
+fn import_git_proves_the_working_tree_against_the_imported_tree() {
+    let warehouse = TestWarehouse::new("import-git-proves");
+    let root = warehouse.root.clone();
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file("small.txt", "hello\n");
+    warehouse.write_file("edited.txt", "aaaa\n");
+    write_pseudo_random_file(&root.join("big.bin"), 9 * 1024 * 1024);
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+
+    // An uncommitted edit of the same size, old enough by import time for its stat to prove it.
+    warehouse.write_file("edited.txt", "bbbb\n");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+
+    let modified = ("modified".to_string(), "edited.txt".to_string());
+    let untracked_ignore = ("untracked".to_string(), ".forkliftignore".to_string());
+    assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore.clone(), modified],
+        "the same-size edit must be reported, and nothing else");
+
+    // The large plain file stays clean through a load, and loading it stages nothing.
+    assert_success(&warehouse.run(&["load", "big.bin"]));
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(status["data"]["staged_count"], 0, "an unedited file must stage nothing: {}", status);
+    assert_eq!(inventory_entry(&warehouse, "", "big.bin").item_type,
+        forklift_core::enums::dir_entry_type::DirEntryType::Normal, "its storage must not change");
+
+    // Nor does park's refresh stage anything for it.
+    warehouse.write_file("edited.txt", "aaaa\n");
+    let park = warehouse.run(&["park"]);
+    assert!(!park.status.success(), "park must find nothing to park");
+    assert!(stderr(&park).contains("the warehouse matches the pallet head"), "{}", stderr(&park));
+    assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
+}
+
+/// A symlink in git's tree is proven as a link, and stays clean after import.
+#[cfg(unix)]
+#[test]
+fn import_git_proves_an_unedited_symlink() {
+    let warehouse = TestWarehouse::new("import-git-symlink");
+    let root = warehouse.root.clone();
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file("target.txt", "hello\n");
+    std::os::unix::fs::symlink("target.txt", root.join("link")).unwrap();
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_only_the_ignore_file_is_untracked(&warehouse);
+}
+
+/// An entry `shift` records for a file it just wrote proves nothing, so an edit in that same
+/// second (same size, same mtime and ctime seconds) is still reported after a sibling's load
+/// republishes the shard a second later.
+#[test]
+fn an_edit_in_the_second_of_a_shift_survives_a_sibling_load() {
+    for attempt in 0..5 {
+        let warehouse = TestWarehouse::new(&format!("shift-same-second-{}", attempt));
+        warehouse.write_file("a.txt", "one\n");
+        warehouse.write_file("b.txt", "bee\n");
+        assert_success(&warehouse.run(&["prepare"]));
+        configure_operator(&warehouse);
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", "base"]));
+        assert_success(&warehouse.run(&["palletize", "feature"]));
+        warehouse.write_file("a.txt", "two\n");
+        assert_success(&warehouse.run(&["load", "a.txt"]));
+        assert_success(&warehouse.run(&["stack", "second"]));
+
+        assert_success(&warehouse.run(&["shift", "main"]));
+        let path = warehouse.root.join("a.txt");
+        let seconds = |metadata: &std::fs::Metadata| {
+            #[cfg(unix)]
+            let ctime = std::os::unix::fs::MetadataExt::ctime(metadata) as u64;
+            #[cfg(not(unix))]
+            let ctime = 0;
+            let mtime = metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            (mtime, ctime)
+        };
+        let written = seconds(&std::fs::metadata(&path).unwrap());
+        std::fs::write(&path, "six\n").unwrap();
+        if seconds(&std::fs::metadata(&path).unwrap()) != written {
+            continue;
+        }
+
+        // The sibling's load lands in a later second, so a shard-mtime anchor would trust a.txt.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        warehouse.write_file("b.txt", "bus\n");
+        assert_success(&warehouse.run(&["load", "b.txt"]));
+
+        assert!(unstaged_changes(&warehouse).contains(&("modified".to_string(), "a.txt".to_string())),
+            "an edit in the shift's second must still be reported: {:?}", unstaged_changes(&warehouse));
+        return;
+    }
+    panic!("no attempt edited a.txt within the second shift wrote it");
+}
+
+/// A shard written before entries proved themselves (format v2) parses with every entry
+/// unproven, and the next directory load rewrites it as v3 with real stat data.
+#[test]
+fn a_load_rewrites_a_v2_shard_with_proven_entries() {
+    let warehouse = TestWarehouse::new("v2-shard-rewrite");
+    warehouse.write_file("a.txt", "one\n");
+    backdate(&warehouse.root.join("a.txt"), 3600);
+    assert_success(&warehouse.run(&["prepare"]));
+    assert_success(&warehouse.run(&["load", "."]));
+
+    let shard = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        forklift_core::util::file_utils::get_inventory_data_path_for_key("")
+    };
+    let mut bytes = std::fs::read(&shard).unwrap();
+    assert_eq!(bytes[0], 3, "sanity: a fresh shard is v3");
+    bytes[0] = 2;
+    std::fs::write(&shard, bytes).unwrap();
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp,
+        forklift_core::model::inventory::UNPROVEN_MTIME, "a v2 entry must parse unproven");
+    assert_only_the_ignore_file_is_untracked_or_clean(&warehouse);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_eq!(std::fs::read(&shard).unwrap()[0], 3, "the load must rewrite the shard as v3");
+    let mtime = file_identity(&warehouse.root.join("a.txt")).0
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime);
+}
+
+fn assert_only_the_ignore_file_is_untracked_or_clean(warehouse: &TestWarehouse) {
+    let changes = unstaged_changes(warehouse);
+    assert!(changes.iter().all(|(kind, path)| kind == "untracked" && path == ".forkliftignore"), "{:?}", changes);
+}
+
+/// A kind change is never hidden by re-proving an unproven entry: a chmod +x on a large plain
+/// file is recorded by load as a type change, a file replaced by a link to a copy of itself is
+/// modified, and a link replaced by a regular file is modified, not an error.
+#[cfg(unix)]
+#[test]
+fn re_proving_an_unproven_entry_never_hides_a_kind_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("reprove-kind-change");
+    let root = warehouse.root.clone();
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    write_pseudo_random_file(&root.join("big.bin"), 9 * 1024 * 1024);
+    warehouse.write_file("file.txt", "content\n");
+    std::os::unix::fs::symlink("file.txt", root.join("link")).unwrap();
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+
+    std::fs::set_permissions(root.join("big.bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(root.join("file.txt"), root.join("copy.txt")).unwrap();
+    std::os::unix::fs::symlink("copy.txt", root.join("file.txt")).unwrap();
+    std::fs::remove_file(root.join("link")).unwrap();
+    warehouse.write_file("link", "file.txt");
+
+    let changes = unstaged_changes(&warehouse);
+    for path in ["file.txt", "link"] {
+        assert!(changes.contains(&("modified".to_string(), path.to_string())), "{} must be modified: {:?}", path, changes);
+    }
+
+    // The kind is recorded in the entry's own storage: still one plain blob, now executable.
+    assert_success(&warehouse.run(&["load", "big.bin"]));
+    assert_eq!(inventory_entry(&warehouse, "", "big.bin").item_type,
+        forklift_core::enums::dir_entry_type::DirEntryType::Executable, "the chmod must be recorded");
+}
+
+/// The clock probe lives under the shared metadata root, so a bay, whose `.forklift` is a
+/// redirect file, stamps the warehouse's probe rather than failing on its own.
+#[test]
+fn a_bay_stamps_the_shared_clock_probe() {
+    let warehouse = TestWarehouse::new("bay-clock-probe");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-clock");
+    assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
+    let probe = warehouse.root.join(".forklift").join(forklift_core::util::file_utils::FILE_NAME_CLOCK_PROBE);
+    let _ = std::fs::remove_file(&probe);
+
+    std::fs::write(bay_dir.join("code.txt"), "v2\n").unwrap();
+    assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
+    assert!(probe.is_file(), "the bay's load must stamp the shared probe");
+    assert!(bay_dir.join(".forklift").is_file(), "the bay's redirect must stay a file");
 }
 
 /// A file whose bytes match but whose kind does not (an executable bit set by hand) is still
@@ -2024,7 +2259,7 @@ fn restore_rewrites_a_matching_file_of_another_kind() {
 
 /// `restore --staged` records the stat data of a working file that provably holds the head's
 /// content, so the next comparison trusts the stat cache instead of rehashing; a file that does
-/// not hold it keeps zeroed stat data, so it still shows as modified.
+/// not hold it keeps stale, unproven stat data, so it still shows as modified.
 #[test]
 fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
     let warehouse = TestWarehouse::new("restore-staged-stat");
@@ -2057,8 +2292,9 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
 
     assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime("a.txt"),
         "a stat-clean file must keep its stat data");
-    assert_eq!(inventory_entry(&warehouse, "dir", "b.txt").content_change_timestamp, 0,
-        "a file that differs from the head must keep zeroed stat data");
+    assert_eq!(inventory_entry(&warehouse, "dir", "b.txt").content_change_timestamp,
+        forklift_core::model::inventory::UNPROVEN_MTIME,
+        "a file that differs from the head must keep unproven stat data");
     assert_eq!(inventory_entry(&warehouse, "dir", "c.txt").content_change_timestamp, mtime("dir/c.txt"),
         "a file whose content matches the head must record its stat data");
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
-use crate::model::inventory::Inventory;
+use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
@@ -882,17 +882,34 @@ pub fn remove_empty_directories(removed_dirs: &[String]) {
     }
 }
 
-/// Build the inventory shards for the given tree: one shard per directory, entries built
-/// from the (just materialized) files' metadata — nothing is read or hashed.
+/// Where the working files a tree's shards are built over came from — what makes each tree
+/// entry's hash true of its file, which an entry recorded from a stat presumes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TreeProvenance {
+    /// The caller just wrote every file from the tree, so the tree's hashes are true of them:
+    /// only their metadata is gathered, nothing is read or hashed.
+    Written,
+
+    /// The files were never written or hashed by this command (`import-git` over an existing
+    /// checkout): each is re-proved against its tree entry, in that entry's representation. A file
+    /// that does not hold its tree entry's content (an uncommitted edit, a missing file) is
+    /// recorded with the tree's hash and an unproven stat, so it reads as an unstaged change.
+    Verify,
+}
+
+/// Build the inventory shards for the given tree: one shard per directory, its entries built
+/// from the files' metadata, under the given provenance.
 ///
 /// # Arguments
 /// * `root_tree_hash` - The hash of the root tree to build shards for.
+/// * `provenance`     - What makes the tree's hashes true of the working files.
 ///
 /// # Returns
 /// * `Ok(BTreeMap<String, Inventory>)` - Warehouse path key → inventory.
-/// * `Err(String)`                     - If a tree object could not be loaded or a file's
-///                                       metadata could not be gathered.
-pub fn build_inventories_for_tree(root_tree_hash: &str) -> Result<BTreeMap<String, Inventory>, String> {
+/// * `Err(String)`                     - If a tree object could not be loaded, the clock probe
+///                                       stamped, or a file read or its metadata gathered.
+pub fn build_inventories_for_tree(root_tree_hash: &str,
+                                  provenance: TreeProvenance) -> Result<BTreeMap<String, Inventory>, String> {
     let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
     let root_tree = object_utils::load_tree(root_tree_hash)?;
 
@@ -901,9 +918,38 @@ pub fn build_inventories_for_tree(root_tree_hash: &str) -> Result<BTreeMap<Strin
     // or the main tree) inventories the whole tree exactly as before.
     let scope = scope_utils::current_scope()?;
 
-    build_inventory_for_tree_directory(&root_tree, "", root_tree_hash, &mut shards, &scope)?;
+    // Written files are anchored once, after every write and before any stat. Verified files are
+    // each anchored just before their own stat, inside the walk.
+    let written_anchor = match provenance {
+        TreeProvenance::Written => Some(file_utils::take_stat_anchor()?),
+        TreeProvenance::Verify => None,
+    };
+
+    build_inventory_for_tree_directory(&root_tree, "", root_tree_hash, &mut shards, &scope, written_anchor)?;
 
     Ok(shards)
+}
+
+/// Record one tree file the command did not write: re-proved against its tree entry under an
+/// anchor taken before its stat, or else recorded with the tree's hash and an unproven stat.
+fn verified_tree_entry(file_path: &Path,
+                       name: &str,
+                       tree_entry: &InventoryItem) -> Result<InventoryItem, String> {
+    let anchor = file_utils::take_stat_anchor()?;
+
+    let Ok(metadata) = file_utils::get_symlink_metadata_for_path(file_path) else {
+        return Ok(tree_entry.clone());
+    };
+    let item_type = file_utils::get_type_of_dir_entry(&metadata);
+
+    if !item_type.is_file() {
+        return Ok(tree_entry.clone());
+    }
+
+    match inventory_utils::reprove_file(tree_entry, item_type, file_path, name, anchor)? {
+        Some((item, _)) => Ok(item),
+        None => Ok(tree_entry.clone()),
+    }
 }
 
 /// Build the inventory shard for one directory of a tree (recursively), stamping each shard's
@@ -923,7 +969,8 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
                                       key: &str,
                                       tree_hash: &str,
                                       shards: &mut BTreeMap<String, Inventory>,
-                                      scope: &MaterializationScope) -> Result<(), String> {
+                                      scope: &MaterializationScope,
+                                      written_anchor: Option<file_utils::StatAnchor>) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
     // everything in scope, so on the hot, common full-bay path the classify calls below are
     // pure overhead — short-circuit them away entirely (`diff_directory` does the same).
@@ -943,12 +990,22 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
 
         let file_path = PathBuf::from(file_key);
 
-        inventory.add_item(inventory_utils::build_inventory_item_from_stat(
-            &file_path,
-            name,
-            item.hash.clone(),
-            item.item_type,
-        )?);
+        let entry = match written_anchor {
+            Some(anchor) => inventory_utils::build_inventory_item_from_stat(
+                &file_path,
+                name,
+                item.hash.clone(),
+                item.item_type,
+                anchor,
+            )?,
+            None => verified_tree_entry(
+                &file_path,
+                name,
+                &inventory_utils::build_stale_inventory_item(name, item.hash.clone(), item.item_type),
+            )?,
+        };
+
+        inventory.add_item(entry);
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when its content
@@ -970,7 +1027,7 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
         }
 
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, &subtree.hash, shards, scope)?;
+        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, &subtree.hash, shards, scope, written_anchor)?;
     }
 
     Ok(())
@@ -1024,7 +1081,7 @@ pub fn materialize_tree(from_tree: Option<&str>,
 
     progress.status("Rebuilding the inventory");
 
-    let shards = build_inventories_for_tree(to_tree)?;
+    let shards = build_inventories_for_tree(to_tree, TreeProvenance::Written)?;
 
     crate::util::inventory_utils::replace_all_inventories(&shards)?;
 

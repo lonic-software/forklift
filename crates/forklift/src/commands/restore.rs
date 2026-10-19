@@ -104,7 +104,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
     let (parent, file_name) = path.split_parent()?;
 
-    let Some((inventory, shard_mtime)) = read_shard(parent.as_key())? else {
+    let Some(inventory) = read_shard(parent.as_key())? else {
         return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
     };
 
@@ -123,7 +123,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
     // Through a batch rather than `update_shard`: recording only stat data keeps the rollups.
     let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    let message = match restore_entry(parent.as_key(), &item, shard_mtime)? {
+    let message = match restore_entry(parent.as_key(), &item)? {
         Restored::Untouched => format!("\"{}\" already matches the inventory.", path.as_key()),
         Restored::Restatted(refreshed) => {
             batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
@@ -168,7 +168,7 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
 
         restored_any = true;
 
-        let (inventory, shard_mtime) = match read_shard(shard_key) {
+        let inventory = match read_shard(shard_key) {
             Ok(Some(shard)) => shard,
             Ok(None) => continue,
             Err(e) => { result = Err(e); break; }
@@ -179,10 +179,7 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
                 continue;
             }
 
-            // Recorded right after `restore_entry` statted the file: the batch anchors the shard's
-            // publish time at its last update (see `ShardMutationBatch`'s doc comment), so a file
-            // statted earlier would record an editor's save in between against the staged hash.
-            let recorded = restore_entry(shard_key, item, shard_mtime).and_then(|restored| match restored {
+            let recorded = restore_entry(shard_key, item).and_then(|restored| match restored {
                 Restored::Untouched => {
                     matched_count += 1;
                     Ok(())
@@ -237,19 +234,16 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The parsed shard at `key` with the shard file's modification timestamp (what
-/// `is_entry_unchanged` trusts its entries against), or `None` when it has no shard file.
-fn read_shard(key: &str) -> Result<Option<(Inventory, u64)>, String> {
-    let (shard_path, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+/// The parsed shard at `key`, or `None` when it has no shard file.
+fn read_shard(key: &str) -> Result<Option<Inventory>, String> {
+    let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
     let Some(bytes) = shard_bytes else {
         return Ok(None);
     };
 
-    let shard_mtime = file_utils::get_shard_mtime_or_zero(&shard_path);
-
     forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
-        .map(|inventory| Some((inventory, shard_mtime)))
+        .map(Some)
         .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))
 }
 
@@ -278,33 +272,37 @@ enum Restored {
 /// the same.
 ///
 /// # Arguments
-/// * `parent_key`  - The warehouse path key of the entry's directory.
-/// * `item`        - The inventory entry.
-/// * `shard_mtime` - The modification timestamp of the shard the entry came from.
+/// * `parent_key` - The warehouse path key of the entry's directory.
+/// * `item`       - The inventory entry.
 ///
 /// # Returns
 /// * `Ok(Restored)` - What was done.
-/// * `Err(String)`  - If the path was refused or a write failed.
-fn restore_entry(parent_key: &str, item: &InventoryItem, shard_mtime: u64) -> Result<Restored, String> {
+/// * `Err(String)`  - If the path was refused, the clock probe could not be stamped, or a write
+///                    failed.
+fn restore_entry(parent_key: &str, item: &InventoryItem) -> Result<Restored, String> {
     let file_path = tracked_path(parent_key, &item.name);
 
     ensure_restorable(&file_path)?;
 
     if item.state == InventoryItemState::Normal {
-        if let Some(restored) = matching_content(&file_path, item, shard_mtime) {
+        let anchor = file_utils::take_stat_anchor()?;
+
+        if let Some(restored) = matching_content(&file_path, item, anchor) {
             return Ok(restored);
         }
     }
 
     shift_utils::write_tracked_file(&file_path, &item.hash, item.item_type, false)?;
 
-    // Stat right after the write: a file statted later would record an editor's save in
-    // between against the staged hash.
+    // Anchored and statted right after the write: a file statted later would record an editor's
+    // save in between against the staged hash.
+    let anchor = file_utils::take_stat_anchor()?;
     let refreshed = inventory_utils::build_inventory_item_from_stat(
         std::path::Path::new(&file_path),
         &item.name,
         item.hash.clone(),
         item.item_type,
+        anchor,
     )?;
 
     Ok(Restored::Rewritten(refreshed))
@@ -312,17 +310,10 @@ fn restore_entry(parent_key: &str, item: &InventoryItem, shard_mtime: u64) -> Re
 
 /// `Untouched` or `Restatted` when the file at `file_path` already holds `item`'s content as a
 /// file of the same kind, `None` when it does not or cannot be compared (it is then written).
-/// The stat data a `Restatted` entry carries was read before the file's content, and is only
-/// recorded when its mtime predates a clock second read before that stat: an edit in the same
-/// second as the stat, after the content was read, keeps the mtime, and the shard is published
-/// later than the stat, so its racily-clean guard alone would trust the stale hash. Such a file
-/// is left `Untouched` and its entry as it was.
-fn matching_content(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> Option<Restored> {
+/// A `Restatted` entry carries stat data proven against `anchor`, taken before this stat, so an
+/// edit made after the anchor leaves it unproven and the next comparison rehashes the file.
+fn matching_content(file_path: &str, item: &InventoryItem, anchor: file_utils::StatAnchor) -> Option<Restored> {
     let path = std::path::Path::new(file_path);
-    let statted_after = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
     let metadata = file_utils::get_symlink_metadata_for_path(path).ok()?;
 
     if metadata.is_dir() {
@@ -342,18 +333,14 @@ fn matching_content(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> 
     }
 
     let verdict = inventory_utils::classify_file_against_entry(
-        item, &metadata, item_type, path, &item.name, shard_mtime, object_utils::IngestMode::ComputeOnly
+        item, &metadata, item_type, path, &item.name, object_utils::IngestMode::ComputeOnly, anchor
     ).ok()?;
 
     match verdict {
         inventory_utils::FileVerdict::UnchangedByStat => Some(Restored::Untouched),
         // Only the stat data may change here, never the entry's type.
         inventory_utils::FileVerdict::UnchangedByHash(refreshed, _) if refreshed.item_type == item.item_type => {
-            if refreshed.content_change_timestamp < statted_after {
-                Some(Restored::Restatted(refreshed))
-            } else {
-                Some(Restored::Untouched)
-            }
+            Some(Restored::Restatted(refreshed))
         }
         _ => None,
     }
@@ -474,7 +461,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
         Some(HeadEntry::File { hash, item_type }) => {
             // As in `build_unstaged_shards`, an unreadable shard only costs the shortcut.
             let current = read_shard(parent.as_key()).unwrap_or(None);
-            let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref());
+            let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref())?;
 
             // Through a batch rather than `update_shard`: an entry that already matched the head
             // changes only its stat data, which keeps the rollups.
@@ -634,7 +621,7 @@ fn build_unstaged_shards(tree: &TreeItem,
             }
         }
 
-        inventory.add_item(unstaged_entry(key, name, item.hash.clone(), item.item_type, current.as_ref()));
+        inventory.add_item(unstaged_entry(key, name, item.hash.clone(), item.item_type, current.as_ref())?);
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when the reset here
@@ -674,43 +661,43 @@ fn build_unstaged_shards(tree: &TreeItem,
 /// * `name`       - The name of the file.
 /// * `hash`       - The head's blob hash for the file.
 /// * `item_type`  - The head's type for the file.
-/// * `current`    - The directory's shard before the reset, with its mtime, if it has one.
+/// * `current`    - The directory's shard before the reset, if it has one.
 ///
 /// # Returns
-/// * `InventoryItem` - The entry to record.
+/// * `Ok(InventoryItem)` - The entry to record.
+/// * `Err(String)`       - If the clock probe could not be stamped.
 fn unstaged_entry(parent_key: &str,
                   name: &str,
                   hash: String,
                   item_type: DirEntryType,
-                  current: Option<&(Inventory, u64)>) -> InventoryItem {
+                  current: Option<&Inventory>) -> Result<InventoryItem, String> {
     let stale = inventory_utils::build_stale_inventory_item(name, hash, item_type);
 
     let file_path = tracked_path(parent_key, name);
     let current_entry = current
-        .and_then(|(inventory, shard_mtime)| inventory.get_item_by_name(name).map(|item| (item, *shard_mtime)))
-        .filter(|(item, _)| item.state == InventoryItemState::Normal);
+        .and_then(|inventory| inventory.get_item_by_name(name))
+        .filter(|item| item.state == InventoryItemState::Normal);
+
+    // Before the stats below, so a restatted entry proves itself against it.
+    let anchor = file_utils::take_stat_anchor()?;
 
     // The current entry is a cheaper witness than the content: for the head's own content and
     // type it can prove a match, and for any other content it can prove a difference.
-    let (witness, shard_mtime) = match current_entry {
-        Some((item, shard_mtime)) if item.hash == stale.hash && item.item_type == stale.item_type => {
-            (item.as_ref().clone(), shard_mtime)
-        }
-        Some((item, shard_mtime)) if item.hash != stale.hash && proven_by_stat(&file_path, &item, shard_mtime) => {
-            return stale;
-        }
-        _ => (stale.clone(), 0),
+    let witness = match current_entry {
+        Some(item) if item.hash == stale.hash && item.item_type == stale.item_type => item.as_ref().clone(),
+        Some(item) if item.hash != stale.hash && proven_by_stat(&file_path, &item) => return Ok(stale),
+        _ => stale.clone(),
     };
 
-    match matching_content(&file_path, &witness, shard_mtime) {
+    Ok(match matching_content(&file_path, &witness, anchor) {
         Some(Restored::Restatted(refreshed)) => refreshed,
         Some(Restored::Untouched) => witness,
         _ => stale,
-    }
+    })
 }
 
 /// Whether the stat cache proves the file at `file_path` still holds `item`'s content.
-fn proven_by_stat(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> bool {
+fn proven_by_stat(file_path: &str, item: &InventoryItem) -> bool {
     let path = std::path::Path::new(file_path);
 
     let Ok(metadata) = file_utils::get_symlink_metadata_for_path(path) else {
@@ -718,7 +705,7 @@ fn proven_by_stat(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> bo
     };
 
     !metadata.is_dir() && inventory_utils::is_entry_unchanged(
-        item, &metadata, file_utils::get_type_of_dir_entry(&metadata), path, shard_mtime
+        item, &metadata, file_utils::get_type_of_dir_entry(&metadata), path
     )
 }
 

@@ -384,8 +384,8 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 /// build directly on whatever the (possibly interrupted) load left behind: `stack` it, with no
 /// healing re-load first. This is deliberate, not an oversight — a healing re-load could mask
 /// exactly the bug this test exists to catch, since the stat-cache fast path
-/// (`is_entry_unchanged`) trusts an already-published shard's mtime without re-verifying its
-/// entries, so a second `load .` would not necessarily re-touch (or heal) a shard a first,
+/// (`is_entry_unchanged`) trusts an already-published shard's proven entries without re-reading
+/// their files, so a second `load .` would not necessarily re-touch (or heal) a shard a first,
 /// interrupted `load .` already made durable and visible. `stack` itself never verifies a blob's
 /// existence (it only carries hashes forward into tree entries), so the sharp check is deferred
 /// to a final `export-git` after the whole spread (DESIGN.html §5.0 D item 10, finding #1) —

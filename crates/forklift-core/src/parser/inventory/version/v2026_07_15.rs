@@ -4,7 +4,8 @@ use crate::util::byte_utils;
 
 /// Parse an inventory object's content with version `V2026_07_15`: byte-identical per-item
 /// encoding to `V2024_09_04` — the rollup hash added by this version lives in the header, not
-/// the content, so the item body is reused rather than duplicated.
+/// the content, so the item body is reused rather than duplicated. Like `V2024_09_04`, its
+/// entries predate per-entry proof and are all parsed as unproven.
 ///
 /// # Arguments
 /// * `offset`  - The offset to start parsing at. This should be the byte *after* the inventory
@@ -16,7 +17,7 @@ use crate::util::byte_utils;
 ///   attaches it from the parsed header).
 /// * `Err(String)`   - The error message.
 pub fn parse(offset: usize, content: &[u8]) -> Result<Inventory, String> {
-    super::v2024_09_04::parse(offset, content)
+    super::v2024_09_04::parse_items(offset, content, true)
 }
 
 /// Parse the inventory header's extra bytes for version `V2026_07_15`: a presence flag (VLQ

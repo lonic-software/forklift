@@ -601,7 +601,9 @@ itself as well as the findings.
      integration test manufactures a measurable gap by deciding 1,000 shards and checking the
      first-decided one's published mtime: unfixed, it landed **~41 ms** after the call started
      (≈ the time to decide all 1,000 shards, i.e. "now" at pass-2 time); fixed, **~0.2 ms**
-     (≈ the time to decide just that one shard).
+     (≈ the time to decide just that one shard). *Superseded by FORK-208 (2026-10-19): entries
+     now carry their own proof against a clock-probe anchor, the shard's mtime is no longer an
+     anchor, and every shard publishes with "now".*
    * **Round 2, finding #5 (park's read-phase parallelism, CONFIRMED).** `park` traded a parallel
      per-directory shard read (its pre-PR-A tree build read+parsed each shard from inside its own
      `TaskExecutor` task) for a single serial `prepare_stack_inventory()` pass — an N-core-to-1-core

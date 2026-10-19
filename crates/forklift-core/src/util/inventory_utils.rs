@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::builder::inventory::InventoryBuilder;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::enums::dir_entry_type::DirEntryType;
-use crate::model::inventory::{Inventory, InventoryItem};
+use crate::model::inventory::{Inventory, InventoryItem, UNPROVEN_MTIME};
 use crate::model::object::loose_object::LooseObject;
 use crate::model::task::inventory_builder::inventory_builder_context::InventoryBuilderContext;
 use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuilderTask;
@@ -60,19 +60,6 @@ fn ancestor_keys_root_first(key: &str) -> Vec<String> {
 /// [`file_utils::WriteBatch::finish`] once, instead of paying a full atomic-write barrier per
 /// shard — see [`clear_ancestors_batched`].
 ///
-/// The staged write preserves the shard's *current* mtime (via
-/// [`file_utils::WriteBatch::stage_with_mtime`], set on the temp file before it is ever
-/// renamed — no post-`finish` fix-up, and so no crash window where a durable, renamed shard
-/// briefly carries the wrong mtime). This matters because a rollup clear is invisible
-/// *content*-wise to every other reader (it only ever removes a value nothing outside the
-/// rollup machinery consults), but a shard's own mtime is not: `load`'s "racily clean"
-/// stat-cache fast path (`is_entry_unchanged`) treats a shard's mtime as proof that its entries
-/// were verified against the file system no earlier than that moment. A rollup-only rewrite
-/// verifies nothing — so if it were allowed to advance the shard's mtime, a file edited just
-/// before the clear could satisfy `mtime < shard_mtime` on a stale cached hash and be wrongly
-/// reported unchanged. Preserving the mtime keeps the clear invisible to the stat cache too,
-/// exactly as if only the rollup field had changed in place.
-///
 /// # Returns
 /// * `Ok(())`      - The clear was staged (or there was nothing to clear).
 /// * `Err(String)` - If the shard could not be read, parsed, or staged.
@@ -90,26 +77,10 @@ fn stage_rollup_clear(key: &str, batch: &file_utils::WriteBatch) -> Result<(), S
         return Ok(());
     }
 
-    // Captured before the rewrite below is even staged — this is the mtime the temp file
-    // (and, after the barrier, the renamed final file) will carry instead of "now".
-    let original_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
-        .and_then(|m| m.modified().ok());
-
     inventory.set_rollup_hash(None);
     let bytes = ensure_inventory_folder_and_build(&inventory, &shard_path)?;
 
-    match original_mtime {
-        Some(mtime) => batch.stage_with_mtime(&shard_path, &bytes, mtime),
-        // No mtime could be determined (the shard's metadata is unreadable, however that
-        // happened) — this is not cosmetic: staging a plain write here would carry "now" as the
-        // published mtime, which is exactly the racily-clean widening this function exists to
-        // avoid (see the doc comment above). With no real mtime to preserve, the safe direction
-        // is the most conservative one — an epoch mtime collapses this shard's stat-cache trust
-        // entirely, so every one of its entries gets re-verified against the file system on the
-        // next load, instead of possibly being trusted on the strength of a timestamp that never
-        // actually verified anything.
-        None => batch.stage_with_mtime(&shard_path, &bytes, std::time::SystemTime::UNIX_EPOCH),
-    }
+    batch.stage(&shard_path, &bytes)
 }
 
 /// Clear the rollup hash of every existing ancestor shard of `key`, from the root down to (but
@@ -651,11 +622,6 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         let dirty_paths = context.dirty_inventory_paths.lock().await;
 
         for dirty_key in dirty_paths.iter() {
-            // Captured right when this pass starts reading this shard — the same "no later than
-            // any verification actually performed" anchor `build_inventory`'s own tasks use (see
-            // `ShardOutcome`'s doc comment); here, "verification" is this read itself.
-            let verified_at = std::time::SystemTime::now();
-
             let bytes_opt = match file_utils::retrieve_inventory_or_none_by_key(dirty_key) {
                 Ok((_, bytes_opt)) => bytes_opt,
                 Err(e) => { result = Err(Some(e)); break; }
@@ -682,7 +648,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
             if inventory.mark_all_items_deleted() {
                 clear_keys.extend(ancestor_keys_root_first(dirty_key));
                 inventory.set_rollup_hash(None);
-                outcomes.insert(dirty_key.clone(), ShardOutcome::Changed(inventory, verified_at));
+                outcomes.insert(dirty_key.clone(), ShardOutcome::Changed(inventory));
             }
         }
     }
@@ -886,19 +852,13 @@ pub enum ShardOutcome {
     /// re-verified (read and rehashed) even though it ended up matching. Carries the previous
     /// rollup forward — the join point drops it back to `None` instead if this key turns out to
     /// be an ancestor of some other real change in the same batch.
-    ///
-    /// The `SystemTime` is the shard's *published* mtime — see the join point's publish step for
-    /// why it is not simply "now".
-    Carry(Inventory, std::time::SystemTime),
+    Carry(Inventory),
 
     /// Effective content changed (a brand-new shard, an entry added or removed, or any entry's
     /// name/type/hash/state differs from before) — or every non-`Deleted` item was just staged
     /// for removal (`load`'s post-walk dirty-path pass, or a file gone from disk during a
     /// refresh). Always published with rollup `None`.
-    ///
-    /// The `SystemTime` is the shard's *published* mtime — see the join point's publish step for
-    /// why it is not simply "now".
-    Changed(Inventory, std::time::SystemTime),
+    Changed(Inventory),
 }
 
 /// Publish a batch of [`ShardOutcome`] decisions through the same two-phase ordering `load`'s
@@ -943,7 +903,7 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
     let folded_clear_keys: BTreeSet<String> = clear_keys.iter().map(|key| alias_utils::fold_key(key)).collect();
 
     for (key, outcome) in outcomes.iter_mut() {
-        if let ShardOutcome::Carry(inventory, _) = outcome {
+        if let ShardOutcome::Carry(inventory) = outcome {
             if folded_clear_keys.contains(&alias_utils::fold_key(key)) {
                 inventory.set_rollup_hash(None);
             }
@@ -961,14 +921,9 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
     let phase_b_batch = file_utils::WriteBatch::new();
 
     for (key, outcome) in outcomes.iter() {
-        let (inventory, verified_at) = match outcome {
-            ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
-                (inventory, *verified_at),
-        };
+        let (ShardOutcome::Carry(inventory) | ShardOutcome::Changed(inventory)) = outcome;
 
-        save_inventory_deferred_with_mtime(
-            inventory, &file_utils::get_inventory_data_path_for_key(key), &phase_b_batch, verified_at,
-        )?;
+        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(key), &phase_b_batch)?;
     }
 
     phase_b_batch.finish()
@@ -983,13 +938,12 @@ pub fn split_path_key(path: &str) -> (&str, &str) {
 }
 
 /// One shard a [`ShardMutationBatch`] has touched: the bytes it read on first touch (`None` when
-/// the shard did not exist yet), the effective content those bytes parsed to, the in-memory copy
-/// every change applies to, and the timestamp it will be published at — that of its last change.
+/// the shard did not exist yet), the effective content those bytes parsed to, and the in-memory
+/// copy every change applies to.
 struct TouchedShard {
     original_bytes: Option<Vec<u8>>,
     original_content: Option<EffectiveContent>,
     inventory: Inventory,
-    verified_at: std::time::SystemTime,
 }
 
 /// A shard's effective content: every entry's name, hash, type and state — exactly what a
@@ -1014,17 +968,11 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 /// [`ShardOutcome::Carry`] otherwise — so a pure stat refresh, such as `restore` writing a file
 /// back to the blob it already has staged, keeps every rollup above it.
 ///
-/// Each shard is published at the moment its last [`update`](Self::update) ran: never later than
-/// the moment that change's own [`update_shard`] would have written the shard, so
-/// `is_entry_unchanged`'s `mtime < shard_mtime` trust covers no entry the per-change funnel would
-/// not have covered — see [`save_inventory_deferred_with_mtime`] — and, like that funnel, it
-/// covers a file restored early in the batch once a later change of the same shard is recorded.
-/// That holds only while a caller keeps the order it had with `update_shard`: stat a file right
-/// after writing it, then `update`. Writing many files first and statting them later would record
-/// an edit made in between against the hash the caller wrote, and trust it. The anchor is read
-/// from the process clock, as `load`'s walk and `refresh_tracked_entries` read theirs, where
-/// `update_shard`'s shard gets its mtime from the file system; "never later" assumes the two
-/// clocks agree.
+/// An entry the batch records from a stat proves itself (see [`file_utils::StatAnchor`]): the
+/// staging methods take their anchor after the caller's write and before the stat, so an edit
+/// after the anchor is recorded as unproven. A caller must stat a file right after writing it:
+/// writing many files first and staging them later would record an edit made in between against
+/// the hash the caller wrote, and an edit older than the anchor would be trusted.
 ///
 /// Every blob a change makes an entry name must be durable before its shard is published, as
 /// [`publish_shard_outcomes`] requires: either stored before the change, or staged through
@@ -1057,8 +1005,8 @@ impl ShardMutationBatch {
     }
 
     /// Apply `change` to the shard at `key`, reading it first if this batch has not touched it
-    /// yet, and move the shard's publish timestamp to now. `change` cannot fail: anything that
-    /// can, such as statting the file it records, belongs before this call.
+    /// yet. `change` cannot fail: anything that can, such as statting the file it records,
+    /// belongs before this call.
     ///
     /// # Arguments
     /// * `key`    - The warehouse path key of the shard.
@@ -1080,9 +1028,6 @@ impl ShardMutationBatch {
             self.folded_keys.insert(alias_utils::fold_key(key));
         }
 
-        // After the caller statted what `change` records — see the type's doc comment.
-        let verified_at = std::time::SystemTime::now();
-
         if !self.shards.contains_key(key) {
             let (_, original_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
@@ -1094,20 +1039,19 @@ impl ShardMutationBatch {
 
             let original_content = original_bytes.as_ref().map(|_| effective_content(&inventory));
 
-            self.shards.insert(key.to_string(), TouchedShard { original_bytes, original_content, inventory, verified_at });
+            self.shards.insert(key.to_string(), TouchedShard { original_bytes, original_content, inventory });
         }
 
         let shard = self.shards.get_mut(key).unwrap();
 
         change(&mut shard.inventory);
-        shard.verified_at = verified_at;
 
         Ok(())
     }
 
     /// Stat a file just written for a blob or recipe that is already stored (e.g. one just
     /// written from a tree or merge), and record it in its parent's shard. Call it right after
-    /// the write — see the type's doc comment.
+    /// the write: the anchor is taken here, before the stat — see the type's doc comment.
     ///
     /// # Arguments
     /// * `path`      - The warehouse path of the file.
@@ -1118,14 +1062,16 @@ impl ShardMutationBatch {
     ///
     /// # Returns
     /// * `Ok(())`      - If the entry was recorded in memory.
-    /// * `Err(String)` - If the file's metadata could not be gathered, or its shard read.
+    /// * `Err(String)` - If the clock probe could not be stamped, the file's metadata gathered, or
+    ///                   its shard read.
     pub fn stage_file_from_stat(&mut self,
                                 path: &str,
                                 hash: String,
                                 item_type: DirEntryType) -> Result<(), String> {
         let (parent_key, name) = split_path_key(path);
 
-        let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type)?;
+        let anchor = file_utils::take_stat_anchor()?;
+        let entry = build_inventory_item_from_stat(Path::new(path), name, hash, item_type, anchor)?;
 
         self.update(parent_key, |inventory| inventory.add_item(entry))
     }
@@ -1133,7 +1079,7 @@ impl ShardMutationBatch {
     /// Stat a file just written with content not stored yet (e.g. a merge result), record it in
     /// its parent's shard, and stage its blob into this batch's own write batch — made durable
     /// before any shard is published, so no published entry names a blob that is not. Call it
-    /// right after the write: the stat comes first, before the blob is compressed.
+    /// right after the write: the anchor and the stat come first, before the blob is compressed.
     ///
     /// # Arguments
     /// * `path`      - The warehouse path of the file.
@@ -1142,15 +1088,16 @@ impl ShardMutationBatch {
     ///
     /// # Returns
     /// * `Ok(())`      - If the entry was recorded in memory and the blob staged.
-    /// * `Err(String)` - If the file's metadata could not be gathered, the blob staged, or its
-    ///                   shard read.
+    /// * `Err(String)` - If the clock probe could not be stamped, the file's metadata gathered,
+    ///                   the blob staged, or its shard read.
     pub fn stage_file_storing_blob(&mut self,
                                    path: &str,
                                    object: &mut LooseObject,
                                    item_type: DirEntryType) -> Result<(), String> {
         let (parent_key, name) = split_path_key(path);
 
-        let entry = build_inventory_item_from_stat(Path::new(path), name, object.hash.clone(), item_type)?;
+        let anchor = file_utils::take_stat_anchor()?;
+        let entry = build_inventory_item_from_stat(Path::new(path), name, object.hash.clone(), item_type, anchor)?;
 
         object.store_deferred(&self.blobs)?;
 
@@ -1211,11 +1158,11 @@ impl ShardMutationBatch {
             let mut inventory = shard.inventory;
 
             if shard.original_content.as_ref() == Some(&effective_content(&inventory)) {
-                outcomes.insert(key, ShardOutcome::Carry(inventory, shard.verified_at));
+                outcomes.insert(key, ShardOutcome::Carry(inventory));
             } else {
                 inventory.set_rollup_hash(None);
                 clear_keys.extend(ancestor_keys_root_first(&key));
-                outcomes.insert(key, ShardOutcome::Changed(inventory, shard.verified_at));
+                outcomes.insert(key, ShardOutcome::Changed(inventory));
             }
         }
 
@@ -1293,13 +1240,9 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                    registered: Arc<BTreeSet<String>>,
                    parent_coverage: file_utils::Coverage) -> impl Future<Output = Result<(), String>> + Send {
     async move {
-        // Captured before this task reads, stats or hashes anything below — the timestamp this
-        // directory's published shard will carry as its mtime (see the join point's publish
-        // step). Deliberately the task's *start*, not its end or the join point's later publish
-        // time: it must be no later than any verification (a stat, a rehash) this task actually
-        // performs, so a file edited after that verification but before the join point publishes
-        // is never mistaken, on a future load, for one that was already accounted for.
-        let verified_at = std::time::SystemTime::now();
+        // Taken before this task stats anything below, so every entry it records from a stat
+        // proves itself against it (see `file_utils::StatAnchor`).
+        let anchor = file_utils::take_stat_anchor()?;
 
         let directory = file_utils::read_directory(&path.to_fs_path())?;
 
@@ -1321,11 +1264,10 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // It is also what says which files are tracked, which the ignore rules depend on, so an
         // unreadable or unparsable shard fails the load instead of being rebuilt from scratch:
         // a rebuild would silently drop every tracked file a rule covers.
-        // The shard's own modification time is needed to reject "racily clean" entries
-        // (see `is_entry_unchanged`). Its rollup (if any) is captured here too, at task start —
-        // the tentative "carry forward" value if this directory's content turns out unchanged.
+        // Its rollup (if any) is captured here too, at task start — the tentative "carry
+        // forward" value if this directory's content turns out unchanged.
         let existing_inventory = match file_utils::retrieve_inventory_or_none_by_key(path.as_key())? {
-            (shard_path, Some(bytes)) => {
+            (_, Some(bytes)) => {
                 let folder = if path.is_root() { "." } else { path.as_key() };
                 // Quoted for the shell the user is likely in: POSIX single quotes, or double quotes
                 // on Windows (where a path cannot contain one, and cmd.exe ignores single quotes).
@@ -1341,12 +1283,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                     loaded by name.",
                     folder, e.trim_end_matches('.'), quoted
                 );
-                let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path)
-                    .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m))
-                    .map_err(unreadable)?;
-                let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes).map_err(unreadable)?;
-
-                Some((inventory, shard_mtime))
+                Some(parser::inventory::inventory_parser::parse_inventory(&bytes).map_err(unreadable)?)
             }
             (_, None) => None,
         };
@@ -1369,7 +1306,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             // An entry the rules hide is left out of the rebuilt shard either way: a tracked
             // entry of the other type under its name is then staged as removed.
             let verdict = rule_verdict(
-                &ignore_rules, coverage, existing_inventory.as_ref().map(|(inv, _)| inv),
+                &ignore_rules, coverage, existing_inventory.as_ref(),
                 &entry, &name, entry_path.as_key(), &registered,
             )?;
 
@@ -1382,15 +1319,12 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
             if item_type.is_file() {
                 let existing_entry = existing_inventory.as_ref()
-                    .and_then(|(inv, shard_mtime)| {
-                        inv.get_item_by_name(&name).map(|item| (item, *shard_mtime))
-                    });
+                    .and_then(|inv| inv.get_item_by_name(&name));
 
                 let index_item = match existing_entry {
-                    Some((item, shard_mtime)) => {
+                    Some(item) => {
                         let verdict = classify_file_against_entry(
-                            &item, &metadata, item_type, &entry.path(), &name, shard_mtime,
-                            IngestMode::Store,
+                            &item, &metadata, item_type, &entry.path(), &name, IngestMode::Store, anchor,
                         )?;
 
                         match verdict {
@@ -1426,7 +1360,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                     }
                     None => {
                         any_entry_rebuilt = true;
-                        build_inventory_item_from_file_deferred(&entry.path(), name.as_str(), item_type, &context.blob_batch)?
+                        build_inventory_item_from_file_deferred(&entry.path(), name.as_str(), item_type, &context.blob_batch, anchor)?
                     }
                 };
 
@@ -1449,30 +1383,28 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // removals — this is the "present only in the shard → Deleted" half of the
         // per-directory merge-join. A real content change (a state flip to `Deleted`), caught
         // the same way as any other by `inventory_content_matches` below.
-        if let Some((old_inventory, _)) = existing_inventory.as_ref() {
+        if let Some(old_inventory) = existing_inventory.as_ref() {
             carry_over_missing_entries_as_deleted(old_inventory, &mut inventory);
         }
 
         let key = path.as_key().to_string();
 
         let is_carry = existing_inventory.as_ref()
-            .is_some_and(|(old_inventory, _)| inventory_content_matches(&inventory, old_inventory));
+            .is_some_and(|old_inventory| inventory_content_matches(&inventory, old_inventory));
 
         if is_carry {
             // Case (a): every entry hit the pure stat-cache fast path and the entry set is
             // unchanged — literally nothing here differs from what is already on disk (not even
-            // stat data). Write nothing at all: the old shard's mtime (and rollup) stay exactly
-            // as they were, so the "racily clean" stat-cache guard on this directory's *parent*
-            // stays exactly as conservative as it already was.
+            // stat data). Write nothing at all.
             if any_entry_rebuilt {
                 // Case (b): content unchanged, but at least one entry was re-verified (or stat
                 // data drifted). Tentatively carry the rollup this task read at start — the join
                 // point drops it if this key is also an ancestor of some other real change.
                 let carried_rollup = existing_inventory.as_ref()
-                    .and_then(|(old_inventory, _)| old_inventory.get_rollup_hash().cloned());
+                    .and_then(|old_inventory| old_inventory.get_rollup_hash().cloned());
                 inventory.set_rollup_hash(carried_rollup);
 
-                context.outcomes.lock().await.insert(key, ShardOutcome::Carry(inventory, verified_at));
+                context.outcomes.lock().await.insert(key, ShardOutcome::Carry(inventory));
             }
         } else {
             // Case (c): effective content changed (or this is a brand-new shard). Always
@@ -1480,7 +1412,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             inventory.set_rollup_hash(None);
 
             context.clear_keys.lock().await.extend(ancestor_keys_root_first(&key));
-            context.outcomes.lock().await.insert(key, ShardOutcome::Changed(inventory, verified_at));
+            context.outcomes.lock().await.insert(key, ShardOutcome::Changed(inventory));
         }
 
         // Registered only once this directory's content is decided: registration is what makes
@@ -1506,6 +1438,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 ///   (chunking is a storage choice), so the tree's `NormalChunked`/`ExecutableChunked` must be
 ///   carried through here or the next stack would emit a wrong (plain) tree entry over a recipe
 ///   hash. For a plain file this equals what `stat` reports; for a symlink it is `SymbolicLink`.
+/// * `anchor`    - Taken before this stat, and after whatever made `hash` true of the file (see
+///   [`file_utils::StatAnchor`]). An mtime it does not prove is recorded as unproven.
 ///
 /// # Returns
 /// * `Ok(InventoryItem)` - The inventory item.
@@ -1513,10 +1447,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 pub fn build_inventory_item_from_stat(path: &Path,
                                       name: &str,
                                       hash: String,
-                                      item_type: DirEntryType) -> Result<InventoryItem, String> {
+                                      item_type: DirEntryType,
+                                      anchor: file_utils::StatAnchor) -> Result<InventoryItem, String> {
     let metadata = file_utils::get_symlink_metadata_for_path(path)?;
 
-    let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
+    let mtime = anchor.record(file_utils::get_content_modification_timestamp_for_file(&metadata)?);
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
     let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
@@ -1637,14 +1572,12 @@ fn directory_has_no_untracked_content(key: &str,
 ///   sibling's real content change requires — `publish_shard_outcomes`'s step 1 drops a carried
 ///   rollup for any key that ends up in `clear_keys`, computed from every decision in this whole
 ///   batch, not just the ones already processed when a given shard was decided.
-/// * **Finding #6.** Each decision's `verified_at` is captured at that decision's *start* — before
-///   it reads, stats or rehashes anything — and carried through to publish as that shard's mtime
-///   (`save_inventory_deferred_with_mtime`, inside `publish_shard_outcomes`), never "now" at
-///   publish time. `is_entry_unchanged`'s "racily clean" guard trusts a cached entry only when its
-///   mtime predates the shard's own mtime; publishing with "now" (the moment every shard in this
-///   whole refresh has finished being decided, which can be well after this one was) would let a
-///   file edited in that gap satisfy the guard on a stale cached hash and be silently missed on
-///   every future load, park or stack.
+///
+/// Each decision takes its stat anchor at its start, before it stats anything, so every entry it
+/// rebuilds proves itself (see [`file_utils::StatAnchor`]); when the shard is later published
+/// makes no difference to what its entries are trusted for. A file whose stat missed is
+/// re-proved in its entry's representation first (see [`reprove_file`]), so an unchanged file
+/// keeps its storage and is never restaged as a change of storage alone.
 ///
 /// Every rebuilt file's blob is staged into its own batch, finished on its own — durable —
 /// strictly before `publish_shard_outcomes` stages any shard content (DESIGN.html §5.0 D item 10,
@@ -1692,21 +1625,17 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     for entry in &metadata {
         let key = metadata_entry_to_key(entry);
 
-        // Captured before this decision reads, stats or rehashes anything below — see the
-        // function's own doc comment (finding #6) for why this, and not the moment every shard in
-        // this refresh has been decided, is the timestamp this shard's published content carries.
-        let verified_at = std::time::SystemTime::now();
-
         // `Ok(Some((inventory, content_changed)))` when this shard needs rewriting; `Ok(None)`
         // when nothing about it changed at all.
         let decision = (|| -> Result<Option<(Inventory, bool)>, String> {
-            let (shard_path, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+            // Before this decision stats anything below — see the function's own doc comment.
+            let anchor = file_utils::take_stat_anchor()?;
+
+            let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
             let Some(bytes) = bytes_opt else {
                 return Ok(None);
             };
-
-            let shard_mtime = file_utils::get_shard_mtime_or_zero(&shard_path);
 
             let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
                 .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
@@ -1741,14 +1670,23 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
 
                 let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
-                if is_entry_unchanged(&item, &metadata, item_type, &file_path, shard_mtime) {
+                if is_entry_unchanged(&item, &metadata, item_type, &file_path) {
                     continue;
                 }
 
                 // The entry is rebuilt even when only the stat data went stale (same
-                // content), so the refreshed shard keeps the fast path warm. Staged, not stored
-                // immediately — see the batch comment above.
-                let rebuilt = build_inventory_item_from_file_deferred(&file_path, &name, item_type, &blob_batch)?;
+                // content), so the refreshed shard keeps the fast path warm. Blobs are staged,
+                // not stored immediately — see the batch comment above. Staging an unchanged
+                // file's blob too heals one that went missing from the store, as `load` does.
+                let rebuilt = match reprove_file(&item, item_type, &file_path, &name, anchor)? {
+                    Some((reproved, object)) => {
+                        if let Some(mut object) = object {
+                            object.store_deferred(&blob_batch)?;
+                        }
+                        reproved
+                    }
+                    None => build_inventory_item_from_file_deferred(&file_path, &name, item_type, &blob_batch, anchor)?,
+                };
                 changed = true;
 
                 if rebuilt.hash != item.hash || rebuilt.item_type != item.item_type || rebuilt.state != item.state {
@@ -1768,14 +1706,14 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
                 // `load`'s walk uses for the same reason (see its own doc comment).
                 inventory.set_rollup_hash(None);
                 clear_keys.extend(ancestor_keys_root_first(key));
-                outcomes.insert(key.to_string(), ShardOutcome::Changed(inventory, verified_at));
+                outcomes.insert(key.to_string(), ShardOutcome::Changed(inventory));
             }
             Ok(Some((inventory, false))) => {
                 // Only stat data went stale: carry the rollup forward tentatively —
                 // `publish_shard_outcomes` drops it if this key also turns out to be an ancestor
                 // of some other shard's real change decided elsewhere in this same pass (finding
                 // #1 — see the function's own doc comment).
-                outcomes.insert(key.to_string(), ShardOutcome::Carry(inventory, verified_at));
+                outcomes.insert(key.to_string(), ShardOutcome::Carry(inventory));
             }
             Ok(None) => {}
             // Matches the old loop's own behavior: a shard's failure stops the walk right there
@@ -2180,7 +2118,8 @@ pub fn list_conflict_paths() -> Result<Vec<String>, String> {
 }
 
 /// Build a "stale" inventory item: the hash and type are known (e.g. from a head tree),
-/// but the stat fields are zeroed on purpose, so the stat cache can never trust the entry
+/// but the stat fields are zeroed and its mtime is [`UNPROVEN_MTIME`] on purpose, so the stat
+/// cache can never trust the entry
 /// — the next comparison against the working directory always rehashes the file. Used by
 /// `restore --staged`, where the file on disk may not match the recorded hash.
 ///
@@ -2194,7 +2133,7 @@ pub fn list_conflict_paths() -> Result<Vec<String>, String> {
 pub fn build_stale_inventory_item(name: &str, hash: String, item_type: DirEntryType) -> InventoryItem {
     InventoryItem {
         metadata_change_timestamp: 0,
-        content_change_timestamp: 0,
+        content_change_timestamp: UNPROVEN_MTIME,
         device: 0,
         inode: 0,
         item_type,
@@ -2457,20 +2396,7 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
 
             let shard_path = file_utils::get_inventory_data_path_for_key(key);
 
-            // Neither case rewritten here re-verifies a single entry against the file system —
-            // the stamp comes from `stack`'s own just-finished tree build, and a Deleted-drop
-            // just copies `prepared`'s already-parsed entries — so this write is exactly the
-            // "rewrite that verifies nothing" hazard `load`'s join point was fixed against (see
-            // `ShardOutcome`'s doc comment): publishing it with "now" would let a file edited
-            // between this shard's last real verification and this cleanup satisfy
-            // `is_entry_unchanged`'s `mtime < shard_mtime` on a now-stale cached hash, forever.
-            // The shard's own current mtime is captured and carried through unchanged instead —
-            // exactly like `stage_rollup_clear`'s rollup-only rewrite, and for the same reason.
-            let original_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-            save_inventory_deferred_with_mtime(&rebuilt, &shard_path, &batch, original_mtime)?;
+            save_inventory_deferred(&rebuilt, &shard_path, &batch)?;
         }
     }
 
@@ -2639,16 +2565,17 @@ fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
 /// an inode mismatch therefore just means "changed" (rehash), never "different file".
 ///
 /// "Racily clean" protection: timestamps have second granularity, so a file modified in the
-/// same second the shard was written could keep identical mtime/ctime/size and slip past the
-/// stat check. Entries are therefore only trusted when their mtime is *strictly older* than
-/// the shard itself — anything as new as the shard (or newer, e.g. clock skew) is rehashed.
+/// same second it was statted could keep identical mtime/ctime/size and slip past the stat
+/// check. Each entry carries its own proof: its stat was taken against an anchor, and one the
+/// anchor could not prove was recorded as [`UNPROVEN_MTIME`], which no file's mtime equals (see
+/// [`file_utils::StatAnchor`]). Nothing about the shard the entry is read from is consulted, so
+/// no later write of that shard can make an unproven entry trusted.
 ///
 /// # Arguments
-/// * `existing`    - The inventory entry from the previous load.
-/// * `metadata`    - The current (symlink) metadata of the file.
-/// * `item_type`   - The current type of the directory entry.
-/// * `path`        - The path of the file.
-/// * `shard_mtime` - The modification timestamp of the inventory shard the entry came from.
+/// * `existing`  - The inventory entry from the previous load.
+/// * `metadata`  - The current (symlink) metadata of the file.
+/// * `item_type` - The current type of the directory entry.
+/// * `path`      - The path of the file.
 ///
 /// # Returns
 /// * `true`  - If the file is unchanged and the existing entry can be reused.
@@ -2656,8 +2583,7 @@ fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
 pub fn is_entry_unchanged(existing: &InventoryItem,
                       metadata: &std::fs::Metadata,
                       item_type: DirEntryType,
-                      path: &Path,
-                      shard_mtime: u64) -> bool {
+                      path: &Path) -> bool {
     // Compare the on-disk kind, not the chunked storage decision: `item_type` is derived from a
     // fresh `stat` and can only ever be `Normal`/`Executable`/`SymbolicLink`, while the inventory
     // entry may hold a `*Chunked` variant for the same file. Chunking is a storage choice a stat
@@ -2682,7 +2608,7 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
     let size_matches = item_type == DirEntryType::SymbolicLink
         || existing.file_size == metadata.len();
 
-    mtime < shard_mtime
+    existing.content_change_timestamp != UNPROVEN_MTIME
         && existing.content_change_timestamp == mtime
         && existing.metadata_change_timestamp == ctime
         && existing.device == device
@@ -2697,16 +2623,18 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
 /// * `path`      - The path of the file.
 /// * `name`      - The name of the file.
 /// * `item_type` - The type of the directory entry.
+/// * `anchor`    - Taken before the file's stat (see [`file_utils::StatAnchor`]).
 ///
 /// # Returns
 /// * `Ok(InventoryItem)` - The inventory item for the file.
 /// * `Err(String)`       - The error message if the inventory item could not be created.
 pub fn build_inventory_item_from_file(path: &Path,
                                       name: &str,
-                                      item_type: DirEntryType) -> Result<InventoryItem, String> {
+                                      item_type: DirEntryType,
+                                      anchor: file_utils::StatAnchor) -> Result<InventoryItem, String> {
     // A first-time `load` of a file: persist its objects. A small file returns its blob for us to
     // store; a chunked file already stored its chunks and recipe during ingest (`None`).
-    let (item, object) = build_item_and_object_for_file(path, name, item_type, IngestMode::Store)?;
+    let (item, object) = build_item_and_object_for_file(path, name, item_type, IngestMode::Store, anchor)?;
 
     if let Some(mut object) = object {
         object.store()?;
@@ -2726,6 +2654,7 @@ pub fn build_inventory_item_from_file(path: &Path,
 /// * `name`      - The name of the file.
 /// * `item_type` - The type of the directory entry.
 /// * `batch`     - Where the file's blob (if any) is staged.
+/// * `anchor`    - Taken before the file's stat (see [`file_utils::StatAnchor`]).
 ///
 /// # Returns
 /// * `Ok(InventoryItem)` - The inventory item for the file. Its blob, if any, is staged but not
@@ -2736,8 +2665,9 @@ pub fn build_inventory_item_from_file(path: &Path,
 pub fn build_inventory_item_from_file_deferred(path: &Path,
                                                name: &str,
                                                item_type: DirEntryType,
-                                               batch: &file_utils::WriteBatch) -> Result<InventoryItem, String> {
-    let (item, object) = build_item_and_object_for_file(path, name, item_type, IngestMode::Store)?;
+                                               batch: &file_utils::WriteBatch,
+                                               anchor: file_utils::StatAnchor) -> Result<InventoryItem, String> {
+    let (item, object) = build_item_and_object_for_file(path, name, item_type, IngestMode::Store, anchor)?;
 
     if let Some(mut object) = object {
         object.store_deferred(batch)?;
@@ -2761,6 +2691,9 @@ pub fn build_inventory_item_from_file_deferred(path: &Path,
 /// * `name`      - The name of the file.
 /// * `item_type` - The type of the directory entry (a `*Chunked` upgrade is decided here).
 /// * `mode`      - Whether to persist a chunked file's objects or only compute their hashes.
+/// * `anchor`    - Taken before this stat (see [`file_utils::StatAnchor`]). The stat precedes the
+///   read, so the hash is of content at least as new as the stat; an mtime the anchor does not
+///   prove is recorded as unproven.
 ///
 /// # Returns
 /// * `Ok((InventoryItem, Option<LooseObject>))` - The item, and the unstored blob for a small
@@ -2769,11 +2702,12 @@ pub fn build_inventory_item_from_file_deferred(path: &Path,
 fn build_item_and_object_for_file(path: &Path,
                                   name: &str,
                                   item_type: DirEntryType,
-                                  mode: IngestMode)
+                                  mode: IngestMode,
+                                  anchor: file_utils::StatAnchor)
                                   -> Result<(InventoryItem, Option<LooseObject>), String> {
     let metadata = file_utils::get_symlink_metadata_for_path(path)?;
 
-    let mtime = file_utils::get_content_modification_timestamp_for_file(&metadata)?;
+    let mtime = anchor.record(file_utils::get_content_modification_timestamp_for_file(&metadata)?);
     let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
     let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
@@ -2823,17 +2757,20 @@ pub enum FileVerdict {
 
 /// Classify one on-disk file against its existing inventory entry: the stat-cache fast
 /// path first (see `is_entry_unchanged`, including the racily-clean protection), then a
-/// read-and-hash comparison. Nothing is written to the object store or the inventory.
+/// read-and-hash comparison in the entry's own representation (see [`reprove_file`]). Nothing
+/// is written to the object store or the inventory.
 ///
 /// # Arguments
-/// * `existing`    - The inventory entry the file is compared against.
-/// * `metadata`    - The current (symlink) metadata of the file.
-/// * `item_type`   - The current type of the directory entry (the filesystem-visible kind).
-/// * `path`        - The path of the file.
-/// * `name`        - The name of the file.
-/// * `shard_mtime` - The modification timestamp of the shard the entry came from.
-/// * `mode`        - Whether a re-chunked giant's objects are stored (`load`) or only hashed
+/// * `existing`  - The inventory entry the file is compared against.
+/// * `metadata`  - The current (symlink) metadata of the file.
+/// * `item_type` - The current type of the directory entry (the filesystem-visible kind).
+/// * `path`      - The path of the file.
+/// * `name`      - The name of the file.
+/// * `mode`      - Whether a re-chunked giant's objects are stored (`load`) or only hashed
 ///   (read-only stocktake/diff).
+/// * `anchor`    - Taken before `metadata`'s stat, for the rebuilt item (see
+///   [`file_utils::StatAnchor`]). A read-only caller whose items are never persisted passes
+///   `StatAnchor::Unproven`.
 ///
 /// # Returns
 /// * `Ok(FileVerdict)` - The verdict.
@@ -2843,23 +2780,70 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
                                    item_type: DirEntryType,
                                    path: &Path,
                                    name: &str,
-                                   shard_mtime: u64,
-                                   mode: IngestMode) -> Result<FileVerdict, String> {
-    if is_entry_unchanged(existing, metadata, item_type, path, shard_mtime) {
+                                   mode: IngestMode,
+                                   anchor: file_utils::StatAnchor) -> Result<FileVerdict, String> {
+    if is_entry_unchanged(existing, metadata, item_type, path) {
         return Ok(FileVerdict::UnchangedByStat);
     }
 
-    let (item, object) = build_item_and_object_for_file(path, name, item_type, mode)?;
-
-    if item.hash == existing.hash {
-        Ok(FileVerdict::UnchangedByHash(item, object))
-    } else {
-        Ok(FileVerdict::Modified(item, object))
+    if let Some((item, object)) = reprove_file(existing, item_type, path, name, anchor)? {
+        return Ok(FileVerdict::UnchangedByHash(item, object));
     }
+
+    let (item, object) = build_item_and_object_for_file(path, name, item_type, mode, anchor)?;
+
+    Ok(FileVerdict::Modified(item, object))
+}
+
+/// Re-prove a file whose stat missed against its existing entry, by hashing it in the entry's
+/// representation (see [`object_utils::hash_file_as_entry`]). Every caller that decides by hash
+/// whether a file still holds an entry's content goes through here.
+///
+/// On a match the rebuilt item keeps the entry's hash and storage (chunked or not), takes the
+/// file's current kind, so an executable-bit flip is still recorded, and records a fresh stat
+/// under `anchor`. That stat is taken after the hash; any edit since the anchor leaves an mtime
+/// the anchor does not prove, so the entry is then recorded as unproven.
+///
+/// # Arguments
+/// * `existing`  - The inventory entry the file is compared against.
+/// * `item_type` - The file's current on-disk kind.
+/// * `path`      - The path of the file.
+/// * `name`      - The name of the file.
+/// * `anchor`    - Taken before the caller's stat of the file.
+///
+/// # Returns
+/// * `Ok(Some((InventoryItem, Option<LooseObject>)))` - The file still holds the entry's content:
+///   the rebuilt item, and for a small plain file its blob, so a writer heals a blob that went
+///   missing from the store.
+/// * `Ok(None)`    - It does not (or it changed between a symlink and a file).
+/// * `Err(String)` - If the file could not be read or stat'ed.
+pub fn reprove_file(existing: &InventoryItem,
+                    item_type: DirEntryType,
+                    path: &Path,
+                    name: &str,
+                    anchor: file_utils::StatAnchor)
+                    -> Result<Option<(InventoryItem, Option<LooseObject>)>, String> {
+    let Some(hashed) = object_utils::hash_file_as_entry(name, path, existing.item_type, item_type)? else {
+        return Ok(None);
+    };
+
+    if hashed.hash != existing.hash {
+        return Ok(None);
+    }
+
+    let stored_type = if existing.item_type.is_chunked() { item_type.to_chunked() } else { item_type };
+    let mut item = build_inventory_item_from_stat(path, name, hashed.hash, stored_type, anchor)?;
+    item.file_size = hashed.file_size;
+    let object = hashed.blob;
+
+    Ok(Some((item, object)))
 }
 
 /// Add a single file to its corresponding inventory file.
-/// If the file is already in the inventory, its entry is updated.
+/// If the file is already in the inventory, it is classified against its entry the way the
+/// directory walk does (see [`classify_file_against_entry`]), so a file that still holds the
+/// entry's content keeps the entry's hash and storage, and a large file stored as one plain blob
+/// is not re-chunked into a staged change of storage alone.
 ///
 /// # Arguments
 /// * `path` - The path of the file.
@@ -2873,13 +2857,32 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
     let (_, mut inventory) = retrieve_inventory_or_empty(&parent)?;
 
     let fs_path = path.to_fs_path();
+    let anchor = file_utils::take_stat_anchor()?;
     let file_metadata = file_utils::get_symlink_metadata_for_path(&fs_path)?;
 
-    let item = build_inventory_item_from_file(
-        &fs_path,
-        &file_name,
-        file_utils::get_type_of_dir_entry(&file_metadata)
-    )?;
+    let item_type = file_utils::get_type_of_dir_entry(&file_metadata);
+    let existing = inventory.get_item_by_name(&file_name).map(|item| item.as_ref().clone());
+
+    let item = match existing {
+        Some(existing) => {
+            let verdict = classify_file_against_entry(
+                &existing, &file_metadata, item_type, &fs_path, &file_name, IngestMode::Store, anchor,
+            )?;
+
+            match verdict {
+                // Loading stages the current state, so a file staged for removal comes back.
+                FileVerdict::UnchangedByStat => InventoryItem { state: InventoryItemState::Normal, ..existing },
+                // Storing on the unchanged-by-hash path too heals a blob missing from the store.
+                FileVerdict::UnchangedByHash(fresh, object) | FileVerdict::Modified(fresh, object) => {
+                    if let Some(mut object) = object {
+                        object.store()?;
+                    }
+                    fresh
+                }
+            }
+        }
+        None => build_inventory_item_from_file(&fs_path, &file_name, item_type, anchor)?,
+    };
 
     inventory.add_item(item);
 
@@ -2995,29 +2998,6 @@ fn save_inventory_deferred(inventory: &Inventory,
     batch.stage(inventory_path, &bytes)
 }
 
-/// Like [`save_inventory_deferred`], but publishes with an explicit mtime instead of "now" — see
-/// [`file_utils::WriteBatch::stage_with_mtime`]. Every caller uses this for the same reason: the
-/// rewrite being published does not itself verify anything against the file system, so it must
-/// not be allowed to advance a shard's mtime — doing so would overstate `is_entry_unchanged`'s
-/// proof that this shard's entries were checked against the file system no earlier than that
-/// moment, and a file edited between the shard's real last verification and this publish would
-/// then satisfy `mtime < shard_mtime` on a now-stale cached hash and be silently missed forever.
-///
-/// * `load`'s join point (`create_inventory_for_directory`) publishes each [`ShardOutcome`] with
-///   the timestamp captured when it was actually verified, not the (potentially much later)
-///   moment the whole walk finishes and publishes.
-/// * `cleanup_after_stack_with`'s post-stack rewrite (a rollup stamp, or a `Deleted`-entry drop)
-///   publishes with the shard's own pre-rewrite mtime — neither rewrite re-verifies a single
-///   entry, so "now" would be just as wrong there.
-fn save_inventory_deferred_with_mtime(inventory: &Inventory,
-                                      inventory_path: &Path,
-                                      batch: &file_utils::WriteBatch,
-                                      mtime: std::time::SystemTime) -> Result<(), String> {
-    let bytes = ensure_inventory_folder_and_build(inventory, inventory_path)?;
-
-    batch.stage_with_mtime(inventory_path, &bytes, mtime)
-}
-
 /// The shared prelude of [`save_inventory`] and [`save_inventory_deferred`]: make sure the
 /// shard's parent folder exists, and serialize its bytes.
 fn ensure_inventory_folder_and_build(inventory: &Inventory, inventory_path: &Path) -> Result<Vec<u8>, String> {
@@ -3119,11 +3099,12 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", &link).unwrap();
 
         let recorded = build_inventory_item_from_stat(&link, "link", "hash".to_string(),
-                                                      DirEntryType::SymbolicLink).unwrap();
+                                                      DirEntryType::SymbolicLink,
+                                                      file_utils::StatAnchor::At(u64::MAX)).unwrap();
         let link_metadata = std::fs::symlink_metadata(&link).unwrap();
         assert_eq!(recorded.inode, std::os::unix::fs::MetadataExt::ino(&link_metadata));
 
-        assert!(is_entry_unchanged(&recorded, &link_metadata, DirEntryType::SymbolicLink, &link, u64::MAX),
+        assert!(is_entry_unchanged(&recorded, &link_metadata, DirEntryType::SymbolicLink, &link),
             "a symlink recorded from its own stat must hit the stat cache");
     }
 
@@ -3598,67 +3579,91 @@ mod tests {
         assert!(!inventory_content_matches(&a, &c), "a real hash change must count as a content change");
     }
 
-    #[test]
-    fn a_published_shard_carries_its_outcome_verified_at_mtime_not_now() {
-        // `load`'s join point publishes every `ShardOutcome` with the timestamp captured when it
-        // was verified, not "now" (the join point's own, potentially much later, publish time —
-        // see `ShardOutcome`'s doc comment for the staleness hazard that closes). Pin that the
-        // publish path (`save_inventory_deferred_with_mtime`) actually honours the outcome's own
-        // timestamp field, using a deliberately old anchor so a stray `SystemTime::now()`
-        // anywhere in the path would be caught immediately.
-        let _scratch = Scratch::new("publish-mtime-anchor");
-
-        let anchor = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
-            .unwrap();
-        let outcome = ShardOutcome::Changed(Inventory::new(), anchor);
-
-        let (inventory, verified_at) = match &outcome {
-            ShardOutcome::Carry(inventory, verified_at) | ShardOutcome::Changed(inventory, verified_at) =>
-                (inventory, *verified_at),
-        };
-
-        let batch = file_utils::WriteBatch::new();
-        let path = file_utils::get_inventory_data_path_for_key("some/key");
-        save_inventory_deferred_with_mtime(inventory, &path, &batch, verified_at).unwrap();
-        batch.finish().unwrap();
-
-        let published_mtime = file_utils::get_symlink_metadata_for_path(&path).unwrap()
-            .modified().unwrap();
-
-        // Filesystem mtime resolution can be coarser than `SystemTime`'s own precision (whole
-        // seconds on some filesystems), so compare within a small tolerance rather than
-        // bit-for-bit — the anchor is an hour old, so any real bug (publishing with "now")
-        // would miss by nearly an hour, nowhere near this tolerance.
-        let diff = published_mtime.duration_since(anchor).unwrap_or_else(|e| e.duration());
-        assert!(diff < std::time::Duration::from_secs(2),
-            "a published shard's mtime must equal its ShardOutcome's verified_at timestamp, not \
-            \"now\": got {:?}, expected {:?} (diff {:?})", published_mtime, anchor, diff);
-    }
-
     /// Set a file's modification time directly, through an open write handle — never a
-    /// reopen-by-path (the project's Windows fsync convention; see `WriteBatch::stage_with_mtime`).
+    /// reopen-by-path (the project's Windows fsync convention).
     fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(mtime).unwrap();
     }
 
+    /// Read the root shard's `a.txt` entry back from disk and ask the stat cache whether it
+    /// trusts it against the file as it is now.
+    fn root_entry_is_trusted(file: &Path) -> bool {
+        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key("").unwrap();
+        let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+        let entry = inventory.get_item_by_name("a.txt").unwrap().clone();
+        let metadata = file_utils::get_symlink_metadata_for_path(file).unwrap();
+        is_entry_unchanged(&entry, &metadata, DirEntryType::Normal, file)
+    }
+
+    /// An entry recorded within the same second as its file's write proves nothing, and no later
+    /// republish of its shard (a sibling's stage, a rollup stamp) can make it trusted: the proof
+    /// lives in the entry, not in the shard's own mtime.
     #[test]
-    fn cleanup_after_stack_does_not_advance_a_stamped_shard_s_mtime() {
-        // Regression (multi-agent review of PR #59, finding 1): `cleanup_after_stack_with`'s
-        // rollup-stamp rewrite never re-verifies a single entry against the file system (the
-        // entries come straight from the already-parsed `PreparedInventory` snapshot) — exactly
-        // the "rewrite that verifies nothing" hazard the join-point redesign was already fixed
-        // against for `load` itself. Publishing this rewrite with "now" would widen the
-        // racily-clean trust window the same way; the shard's own current mtime must survive it.
-        let _scratch = Scratch::new("cleanup-mtime-stamp");
+    fn a_racy_entry_stays_untrusted_after_a_sibling_republishes_its_shard() {
+        let scratch = Scratch::new("racy-entry-republish");
+        let file = scratch.root.join("a.txt");
+        std::fs::write(&file, "two").unwrap();
+
+        // The hash is of earlier content, edited within the same second: a racy entry.
+        let anchor = file_utils::take_stat_anchor().unwrap();
+        let entry = build_inventory_item_from_stat(&file, "a.txt", "hash-of-one".to_string(),
+                                                   DirEntryType::Normal, anchor).unwrap();
+        assert_eq!(entry.content_change_timestamp, UNPROVEN_MTIME,
+            "a stat taken in the same second as the write must record the unproven sentinel");
+        update_shard("", |inventory| { inventory.add_item(entry); Ok(()) }).unwrap();
+        assert!(!root_entry_is_trusted(&file), "a racy entry must not be trusted");
+
+        update_shard("", |inventory| { inventory.add_item(item("b.txt", 9, InventoryItemState::Normal)); Ok(()) }).unwrap();
+        assert!(!root_entry_is_trusted(&file), "a sibling's republish must not make the racy entry trusted");
+    }
+
+    /// The trust rule's boundary, under an injected anchor: an mtime two whole seconds before the
+    /// anchor is proven, one second before or later is not.
+    #[test]
+    fn an_entry_is_proven_only_two_whole_seconds_before_its_anchor() {
+        let scratch = Scratch::new("anchor-boundary");
+        let file = scratch.root.join("a.txt");
+        std::fs::write(&file, "content").unwrap();
+        set_mtime(&file, std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        let mtime = file_utils::get_content_modification_timestamp_for_file(
+            &file_utils::get_symlink_metadata_for_path(&file).unwrap()).unwrap();
+        assert_eq!(mtime, 1_000_000);
+
+        let recorded = |anchor: u64| build_inventory_item_from_stat(
+            &file, "a.txt", "hash".to_string(), DirEntryType::Normal,
+            file_utils::StatAnchor::At(anchor)).unwrap().content_change_timestamp;
+        assert_eq!(recorded(mtime + 2), mtime, "two whole seconds before the anchor is proven");
+        assert_eq!(recorded(mtime + 1), UNPROVEN_MTIME, "one second before the anchor is not proven");
+        assert_eq!(recorded(mtime), UNPROVEN_MTIME, "the anchor's own second is not proven");
+        assert_eq!(recorded(0), UNPROVEN_MTIME);
+        let unproven = build_inventory_item_from_stat(&file, "a.txt", "hash".to_string(),
+                                                      DirEntryType::Normal,
+                                                      file_utils::StatAnchor::Unproven).unwrap();
+        assert_eq!(unproven.content_change_timestamp, UNPROVEN_MTIME);
+    }
+
+    /// The unproven sentinel never matches a stat, even one whose every other field agrees.
+    #[test]
+    fn an_unproven_entry_never_reads_unchanged() {
+        let scratch = Scratch::new("sentinel-never-matches");
+        let file = scratch.root.join("a.txt");
+        std::fs::write(&file, "content").unwrap();
+        let metadata = file_utils::get_symlink_metadata_for_path(&file).unwrap();
+        let mut entry = build_inventory_item_from_stat(&file, "a.txt", "hash".to_string(),
+                                                       DirEntryType::Normal,
+                                                       file_utils::StatAnchor::At(u64::MAX)).unwrap();
+        assert!(is_entry_unchanged(&entry, &metadata, DirEntryType::Normal, &file));
+        entry.content_change_timestamp = UNPROVEN_MTIME;
+        assert!(!is_entry_unchanged(&entry, &metadata, DirEntryType::Normal, &file),
+            "the unproven sentinel must never read unchanged");
+    }
+
+    #[test]
+    fn cleanup_after_stack_stamps_a_stale_rollup() {
+        let _scratch = Scratch::new("cleanup-stamp");
 
         write_stamped_shard("", Some("stale-rollup"));
-        let shard_path = file_utils::get_inventory_data_path_for_key("");
-
-        let old_mtime = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(3600)).unwrap();
-        set_mtime(&shard_path, old_mtime);
 
         let mut metadata: BTreeSet<String> = BTreeSet::new();
         metadata.insert(key_to_metadata_entry(""));
@@ -3672,35 +3677,17 @@ mod tests {
 
         cleanup_after_stack_with(&prepared, &stamp_hashes).unwrap();
 
-        // The stamp itself must still take effect — this test is about the mtime, not about
-        // whether the rewrite happens at all.
         assert_eq!(read_rollup(""), Some("fresh-rollup".to_string()));
-
-        let published_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).unwrap()
-            .modified().unwrap();
-        let diff = published_mtime.duration_since(old_mtime).unwrap_or_else(|e| e.duration());
-        assert!(diff < std::time::Duration::from_secs(2),
-            "a rollup stamp verifies nothing, so it must not advance the shard's mtime: got {:?}, \
-            expected close to {:?} (diff {:?})", published_mtime, old_mtime, diff);
     }
 
     #[test]
-    fn cleanup_after_stack_does_not_advance_mtime_when_dropping_deleted_entries() {
-        // The other rewrite `cleanup_after_stack_with` performs — dropping now-consumed
-        // `Deleted` entries — is exactly as unverified as the stamp above (same regression,
-        // same fix): the survivors are copied straight out of `PreparedInventory`, nothing here
-        // is re-checked against the file system either.
-        let _scratch = Scratch::new("cleanup-mtime-deleted-drop");
+    fn cleanup_after_stack_drops_consumed_deleted_entries() {
+        let _scratch = Scratch::new("cleanup-deleted-drop");
 
         let mut inventory = Inventory::new();
         inventory.add_item(item("kept.txt", 1, InventoryItemState::Normal));
         inventory.add_item(item("removed.txt", 2, InventoryItemState::Deleted));
         save_inventory(&inventory, &file_utils::get_inventory_data_path_for_key("")).unwrap();
-
-        let shard_path = file_utils::get_inventory_data_path_for_key("");
-        let old_mtime = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(3600)).unwrap();
-        set_mtime(&shard_path, old_mtime);
 
         let mut metadata: BTreeSet<String> = BTreeSet::new();
         metadata.insert(key_to_metadata_entry(""));
@@ -3719,13 +3706,6 @@ mod tests {
         let rebuilt = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
         assert!(rebuilt.get_item_by_name("kept.txt").is_some(), "a surviving entry must be kept");
         assert!(rebuilt.get_item_by_name("removed.txt").is_none(), "the Deleted entry must be dropped");
-
-        let published_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).unwrap()
-            .modified().unwrap();
-        let diff = published_mtime.duration_since(old_mtime).unwrap_or_else(|e| e.duration());
-        assert!(diff < std::time::Duration::from_secs(2),
-            "dropping a Deleted entry verifies nothing either, so it must not advance the shard's \
-            mtime: got {:?}, expected close to {:?} (diff {:?})", published_mtime, old_mtime, diff);
     }
 
     #[test]

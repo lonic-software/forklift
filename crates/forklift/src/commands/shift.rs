@@ -97,7 +97,7 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
     // Repopulate the staging area from the target tree ("repopulate on shift"): entries
     // carry the just-materialized files' stat data and the hashes from the tree, so the
     // whole warehouse is "clean" without reading a single file back.
-    let shards = shift_utils::build_inventories_for_tree(&target_tree_hash)?;
+    let shards = shift_utils::build_inventories_for_tree(&target_tree_hash, shift_utils::TreeProvenance::Written)?;
     inventory_utils::replace_all_inventories(&shards)?;
 
     pallet_utils::set_current_pallet_name(target)?;

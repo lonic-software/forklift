@@ -456,10 +456,7 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
             std::path::PathBuf::from(&key)
         };
 
-        // The shard's own modification time is needed for the stat-cache comparison
-        // (see `inventory_utils::is_entry_unchanged`).
-        let (shard_path, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
-        let shard_mtime = file_utils::get_shard_mtime_or_zero(&shard_path);
+        let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
 
         let inventory = match shard_bytes {
             Some(bytes) => parser::inventory::inventory_parser::parse_inventory(&bytes)
@@ -514,10 +511,11 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                         // The shared classifier `load` also uses: stat cache first, hash
                         // on a miss. `ComputeOnly` keeps this read-only — nothing is written
                         // to the object store, not even a re-chunked giant's chunks (the blob
-                        // object of a modified small file is likewise dropped here).
+                        // object of a modified small file is likewise dropped here). Its items
+                        // are never persisted, so it takes no anchor and never stamps the probe.
                         let verdict = inventory_utils::classify_file_against_entry(
-                            &item, &metadata, item_type, &entry.path(), &name, shard_mtime,
-                            object_utils::IngestMode::ComputeOnly,
+                            &item, &metadata, item_type, &entry.path(), &name,
+                            object_utils::IngestMode::ComputeOnly, file_utils::StatAnchor::Unproven,
                         )?;
 
                         if let inventory_utils::FileVerdict::Modified(..) = verdict {

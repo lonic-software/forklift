@@ -348,7 +348,7 @@ fn fast_forward(current: &str,
 
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
-    let shards = shift_utils::build_inventories_for_tree(their_tree_hash)?;
+    let shards = shift_utils::build_inventories_for_tree(their_tree_hash, shift_utils::TreeProvenance::Written)?;
     inventory_utils::replace_all_inventories(&shards)?;
 
     pallet_utils::set_pallet_head(current, their_head)?;
