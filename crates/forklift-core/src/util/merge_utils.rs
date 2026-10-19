@@ -7,8 +7,9 @@ use crate::util::{fanout_utils, file_utils, graph_utils, lcs, object_utils, pall
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
 /// consolidation is in progress, it holds the head parcel hash of the pallet being
-/// consolidated in (line 1), that pallet's name (line 2) and the head the merge was built on
-/// (line 3). The next `stack` records the first hash as a second parent and removes the file.
+/// consolidated in (line 1), that pallet's name (line 2), the head the merge was built on
+/// (line 3) and the pallet it was started on (line 4). The next `stack` records the first hash as
+/// a second parent and removes the file.
 const FILE_NAME_CONSOLIDATION: &str = "consolidation";
 
 /// The maximum number of lines (per side) the line-level merge attempts. Larger files are

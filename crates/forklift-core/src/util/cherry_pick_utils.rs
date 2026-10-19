@@ -23,10 +23,10 @@ use crate::model::operator::Operator;
 use crate::util::{file_utils, object_utils};
 
 /// The name of the cherry-pick-state file (inside the bay root). While a pick is in
-/// progress (its merge left conflicts), it records the source parcel, the intended description
-/// and the head the pick was applied to; the next `stack` reads it to complete the pick
-/// single-parent and remove it. A file written before the head was recorded lacks that field and
-/// is refused as malformed.
+/// progress (its merge left conflicts), it records the source parcel, the intended description,
+/// and the head and pallet the pick was applied to; the next `stack` reads it to complete the pick
+/// single-parent and remove it. A file written before the head and pallet were recorded lacks
+/// those fields and is refused as malformed.
 const FILE_NAME_CHERRY_PICK: &str = "cherry-pick";
 
 /// A cherry-pick in progress: the source parcel being applied, and the description the
