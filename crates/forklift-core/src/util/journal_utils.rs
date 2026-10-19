@@ -5,7 +5,7 @@ use crate::globals::bay_root;
 use crate::util::cherry_pick_utils::{self, CherryPickState};
 use crate::util::merge_utils::{self, ConsolidationState, OutOfScopeSkeleton};
 use crate::util::object_utils;
-use crate::util::pallet_utils::{self, PalletRef, RefUpdateError};
+use crate::util::pallet_utils::{self, PalletNamespace, PalletRef, RefUpdateError};
 use crate::util::file_utils;
 
 /// The undo journal (§7.8): an append-only list of operation records kept in the bay, so `undo`
@@ -378,7 +378,9 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
             }
             // Another writer moved it after the operation: theirs stands.
             Err(RefUpdateError::Moved(_)) => {}
-            Err(RefUpdateError::Failed(e)) => return Err(e),
+            // The write failed: put the current pallet back where the operation left it, so the
+            // bay still matches the entry and a retried undo passes the gate again.
+            Err(RefUpdateError::Failed(e)) => return Err(un_restore_current(entry, e)),
         }
     }
 
@@ -411,6 +413,26 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// After a ref write failed partway through [`restore_refs`], move the current pallet's ref back
+/// from its restored head to the one the operation left (if it was restored), and return the
+/// error to report. Other refs restored before the failure stay restored: a retried undo finds
+/// them moved off the operation's heads and leaves them alone.
+fn un_restore_current(entry: &JournalEntry, error: String) -> String {
+    let current = &entry.after.current_pallet;
+    let (Some(pre_head), Some(post_head)) = (entry.before.heads.get(current), entry.after.heads.get(current)) else {
+        return error;
+    };
+
+    match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head) {
+        Ok(()) | Err(RefUpdateError::Moved(_)) => error,
+        Err(RefUpdateError::Failed(e)) => format!(
+            "{} Pallet \"{}\" could not be put back where the operation left it either ({}): it is \
+            at {}, and undo cannot be retried.",
+            error, current, e, pre_head
+        ),
+    }
 }
 
 /// The journal file path (bay-local).
@@ -448,7 +470,11 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
 
         // `their_pallet` is the merge's label, not a ref: a haul merge labels it with the haul's
         // recorded source and lift with "remote", and the consolidation state round-trips any
-        // label. Nothing resolves it, so any string is well-formed here.
+        // label. Nothing resolves it, so any non-empty string is well-formed here (the
+        // consolidation state refuses an empty one).
+        if consolidation.their_pallet.is_empty() {
+            return Err("records a consolidation with no label".to_string());
+        }
 
         OutOfScopeSkeleton::from_bytes(consolidation.skeleton.as_bytes(), &path())
             .map_err(|_| "records a malformed out-of-scope skeleton".to_string())?;
@@ -940,12 +966,15 @@ mod tests {
         });
         let mut bad_pick = entry("stack", "main", &hash('1'), &hash('2'));
         bad_pick.before.cherry_pick = Some(PickInProgress { source: "nope".to_string(), description: None });
+        let mut bad_label = entry("consolidate", "main", &hash('1'), &hash('2'));
+        bad_label.after.consolidation = Some(consolidating(&hash('3'), ""));
 
         for (bad, reason) in [
             (bad_head, "not an object hash"),
             (bad_name, "names an invalid pallet"),
             (bad_skeleton, "malformed out-of-scope skeleton"),
             (bad_pick, "malformed cherry-pick"),
+            (bad_label, "consolidation with no label"),
         ] {
             let content = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries: &[bad] }).unwrap();
             assert_refused_everywhere(&content, reason);
@@ -1164,6 +1193,35 @@ mod tests {
 
         let entry = peek().expect("the journal must stay readable").unwrap();
         assert_eq!(entry.before.consolidation.unwrap().their_pallet, label);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undo_whose_later_ref_write_fails_leaves_the_current_pallet_where_the_operation_left_it() {
+        let _scratch = Scratch::new("restore-partial-failure");
+
+        pallet_utils::set_current_pallet_name("main").unwrap();
+        pallet_utils::update_pallet_head("main", None, &hash('1')).unwrap();
+        pallet_utils::update_meta_pallet_head("kv", None, &hash('a')).unwrap();
+
+        let before = capture().unwrap();
+        pallet_utils::update_pallet_head("main", Some(&hash('1')), &hash('2')).unwrap();
+        pallet_utils::update_meta_pallet_head("kv", Some(&hash('a')), &hash('b')).unwrap();
+        push_if_changed("stack", before).unwrap();
+        let entry = peek().unwrap().unwrap();
+
+        // "@kv" reads, but can no longer be written: its folder is read-only now.
+        use std::os::unix::fs::PermissionsExt;
+        let meta = crate::globals::forklift_root().join("meta");
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let restored = restore_refs(&entry);
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(restored.is_err(), "the \"@kv\" write must fail");
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('2')),
+            "the current pallet must be back where the operation left it");
+        check_undoable(&entry).expect("a retried undo must still pass the gate");
     }
 
     #[test]

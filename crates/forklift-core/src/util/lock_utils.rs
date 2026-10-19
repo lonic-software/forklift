@@ -414,8 +414,9 @@ impl BaseServeLock {
 /// The bay lock ([`WarehouseLock`]) is bay-local, so it cannot order two bays' ref writes; this
 /// lock lives in the shared forklift root (`forklift_root()/refs.lock`), which is the same file
 /// from every bay. It is a kernel lock on a never-deleted sidecar, like [`StoreAccessLock`], so a
-/// hard-killed holder leaves nothing stale and a writer may wait. A hold lasts microseconds, so
-/// the wait is not announced.
+/// hard-killed holder leaves nothing stale and a writer may wait. A hold spans one ref read and
+/// one durable ref write (its fsyncs included) and nothing else, so the wait is short and is not
+/// announced; a holder stalled inside that write stalls every ref writer with it.
 ///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the

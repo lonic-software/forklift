@@ -4,7 +4,6 @@ use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
 use forklift_core::util::office_utils::OfficeState;
-use forklift_core::util::pallet_utils::RefUpdateError;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
@@ -173,15 +172,9 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress)?;
 
-    // A compare-and-set against the head this lower started from; if another bay moved the
-    // pallet meanwhile, the working tree goes back to where it was.
-    match pallet_utils::update_pallet_head(&pallet, local_head.as_deref(), remote_head) {
-        Ok(()) => {}
-        Err(RefUpdateError::Moved(moved)) => {
-            return Err(shift_utils::roll_back_materialized(&moved, &remote_tree, local_tree.as_deref(), anchor));
-        }
-        Err(RefUpdateError::Failed(err)) => return Err(err),
-    }
+    // A compare-and-set against the head this lower started from; the working tree goes back to
+    // where it was if the pallet did not move (another bay moved it first, or the write failed).
+    shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &remote_tree, local_tree.as_deref(), anchor)?;
 
     report.outcome = Some(LowerOutcome::Lowered);
 

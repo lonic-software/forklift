@@ -28,7 +28,6 @@ use crate::util::{
     bundle_utils, config_utils, file_utils, merge_utils, meta_tree, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils, trust_utils,
 };
-use crate::util::pallet_utils::RefUpdateError;
 
 /// How many object transfers run concurrently.
 pub const CONCURRENT_TRANSFERS: usize = 24;
@@ -5821,40 +5820,47 @@ pub async fn accept_regenesis(client: &RemoteClient,
     Ok(Some((local, new_anchor)))
 }
 
-/// The local half of accepting a re-genesis: replace the trust anchor `old_anchor` with
-/// `new_anchor`, then move the office ref from `local_office_head` (read before the acceptance
-/// began) to the verified `remote_office_head`.
+/// Install an accepted re-genesis: replace the trust anchor `old_anchor` (read before the
+/// acceptance began) with `new_anchor`, then move the office ref from `local_office_head` (also
+/// read up front) to the verified `remote_office_head`.
 ///
-/// When the office ref moved meanwhile, the move is refused. The old anchor is then written back,
-/// unless the office already holds `remote_office_head`: that means another bay accepted the same
-/// re-genesis concurrently, and its anchor is the one just written, so restoring the old one would
-/// set the anchor and the office against each other.
+/// If the office did not end up at `remote_office_head` (another bay or process moved it first,
+/// or the write failed), the old anchor is put back, so the anchor and the office never disagree,
+/// but only while the anchor is still the one written here: an anchor another bay installed
+/// meanwhile is its own, and stays. If the office did end up there, another bay accepted the
+/// same re-genesis concurrently (or the write failed after landing), and the acceptance stands.
 ///
 /// # Returns
-/// * `Ok(())`      - The anchor was replaced and the office moved.
-/// * `Err(String)` - The office moved meanwhile (the anchor is restored as above), or a write
-///                   failed.
+/// * `Ok(())`      - The anchor and the office both carry the re-genesis.
+/// * `Err(String)` - The office did not reach the verified head (the anchor is restored as
+///                   above), or the anchor write failed.
 fn install_regenesis(old_anchor: &office_utils::TrustAnchor,
                      new_anchor: &office_utils::TrustAnchor,
                      local_office_head: Option<&str>,
                      remote_office_head: &str) -> Result<(), String> {
     office_utils::replace_trust_anchor(new_anchor)?;
 
-    match pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, local_office_head, remote_office_head) {
-        Ok(()) => Ok(()),
-        Err(RefUpdateError::Moved(moved)) => {
-            if moved.found.as_deref() != Some(remote_office_head) {
-                office_utils::restore_trust_anchor(old_anchor).map_err(|e| format!(
-                    "{} The previous trust anchor could not be put back either ({}): the anchor \
-                    is the re-genesis one while the office is not.",
-                    moved, e
-                ))?;
-            }
+    #[cfg(test)]
+    tests::BEFORE_OFFICE_MOVE.with(|seam| seam.take().map(|seam| seam()));
 
-            Err(moved.to_string())
-        }
-        Err(RefUpdateError::Failed(e)) => Err(e),
+    let error = match pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, local_office_head, remote_office_head) {
+        Ok(()) => return Ok(()),
+        Err(error) => error.to_string(),
+    };
+
+    if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).ok().flatten().as_deref() == Some(remote_office_head) {
+        return Ok(());
     }
+
+    if office_utils::read_trust_anchor().ok().flatten().as_ref() == Some(new_anchor) {
+        office_utils::restore_trust_anchor(old_anchor).map_err(|e| format!(
+            "{} The previous trust anchor could not be put back either ({}): the anchor is the \
+            re-genesis one while the office is not.",
+            error, e
+        ))?;
+    }
+
+    Err(error)
 }
 
 /// Push the local trust state (lift direction): establish the anchor on the remote when
@@ -6221,10 +6227,34 @@ mod tests {
         let fixture = Regenesis::new("moved-to-verified");
         fixture.move_office(&fixture.remote_head);
 
-        assert!(fixture.install().is_err());
+        fixture.install().expect("the acceptance stands: the office carries the re-genesis");
 
         assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(fixture.new.clone()));
         assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.remote_head.clone()));
+    }
+
+    thread_local! {
+        /// Runs once between `install_regenesis`'s anchor write and its office move.
+        pub(super) static BEFORE_OFFICE_MOVE: std::cell::Cell<Option<Box<dyn FnOnce()>>> = std::cell::Cell::new(None);
+    }
+
+    #[test]
+    fn a_failed_regenesis_never_puts_back_over_an_anchor_another_bay_installed() {
+        let fixture = Regenesis::new("other-anchor");
+
+        // Another bay's own re-genesis lands, anchor and office, between this acceptance's anchor
+        // write and its office move.
+        let theirs = office_utils::TrustAnchor { genesis: "3".repeat(64), ..fixture.new.clone() };
+        let elsewhere = "c".repeat(64);
+        let (planted, local_head) = (theirs.clone(), fixture.local_head.clone());
+        BEFORE_OFFICE_MOVE.with(|seam| seam.set(Some(Box::new(move || {
+            office_utils::restore_trust_anchor(&planted).unwrap();
+            pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, Some(&local_head), &elsewhere).unwrap();
+        }))));
+
+        assert!(fixture.install().is_err());
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(theirs),
+            "the other bay's anchor must stand, matching the office it moved");
     }
 
     #[test]

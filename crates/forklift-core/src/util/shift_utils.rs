@@ -1188,15 +1188,30 @@ pub fn materialize_tree(from_tree: Option<&str>,
     Ok(())
 }
 
-/// Undo a materialization whose ref write was refused: put the working tree and the inventory
-/// back at `start_tree` (the tree of the head the command started from, or the empty tree for an
-/// unborn pallet) and return the error to report. Runs under the bay lock, so nothing else
-/// touched the bay since `written_tree` was materialized. If the rollback itself fails, the
-/// error says the working tree holds the other tree and that the pallet did not move.
-pub fn roll_back_materialized(moved: &crate::util::pallet_utils::RefMoved,
-                              written_tree: &str,
-                              start_tree: Option<&str>,
-                              anchor: file_utils::StatAnchor) -> String {
+/// Move `pallet` from `expected` to `new` after `written_tree` (the tree of `new`) was already
+/// materialized, putting the working tree and inventory back at `start_tree` (the tree of
+/// `expected`, or the empty tree for an unborn pallet) if the pallet did not end up at `new`:
+/// another bay moved it first, or the write failed. Runs under the bay lock, so nothing else
+/// touched the bay since `written_tree` was materialized.
+///
+/// A write that failed after landing (the pallet is at `new` anyway) keeps the tree, which then
+/// matches the pallet. If the rollback itself fails, the error says the working tree holds the
+/// other tree and that the pallet did not move.
+pub fn write_head_or_roll_back(pallet: &str,
+                               expected: Option<&str>,
+                               new: &str,
+                               written_tree: &str,
+                               start_tree: Option<&str>,
+                               anchor: file_utils::StatAnchor) -> Result<(), String> {
+    let error = match crate::util::pallet_utils::update_pallet_head(pallet, expected, new) {
+        Ok(()) => return Ok(()),
+        Err(error) => error.to_string(),
+    };
+
+    if crate::util::pallet_utils::get_pallet_head(pallet).ok().flatten().as_deref() == Some(new) {
+        return Err(error);
+    }
+
     let start = match start_tree {
         Some(tree) => Ok(tree.to_string()),
         None => crate::util::object_utils::empty_tree_hash(),
@@ -1207,12 +1222,12 @@ pub fn roll_back_materialized(moved: &crate::util::pallet_utils::RefMoved,
     });
 
     match rolled_back {
-        Ok(()) => moved.to_string(),
-        Err(err) => format!(
+        Ok(()) => Err(error),
+        Err(err) => Err(format!(
             "{} The working tree could not be put back ({}): it holds tree {}, not the pallet's \
             head; shift or restore to bring it back in line.",
-            moved, err, written_tree
-        ),
+            error, err, written_tree
+        )),
     }
 }
 

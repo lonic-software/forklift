@@ -3,7 +3,6 @@ use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::blob::Blob;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
-use forklift_core::util::pallet_utils::RefUpdateError;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils,
@@ -360,15 +359,11 @@ fn fast_forward(current: &str,
     #[cfg(test)]
     tests::BEFORE_FAST_FORWARD_WRITE.with(|seam| seam.take().map(|seam| seam()));
 
-    // The bay's work above is undone if another bay moved the pallet meanwhile: the write is a
-    // compare-and-set against the head this consolidation started from.
-    match pallet_utils::update_pallet_head(current, Some(our_head), their_head) {
-        Ok(()) => Ok(their_head.to_string()),
-        Err(RefUpdateError::Moved(moved)) => {
-            Err(shift_utils::roll_back_materialized(&moved, their_tree_hash, Some(our_tree_hash), anchor))
-        }
-        Err(RefUpdateError::Failed(err)) => Err(err),
-    }
+    // A compare-and-set against the head this consolidation started from; the bay's work above
+    // is undone if the pallet did not move (another bay moved it first, or the write failed).
+    shift_utils::write_head_or_roll_back(current, Some(our_head), their_head, their_tree_hash, Some(our_tree_hash), anchor)?;
+
+    Ok(their_head.to_string())
 }
 
 /// Ensure there are no staged or unstaged changes (untracked files are allowed).
@@ -639,7 +634,7 @@ mod tests {
         let our_head = test_support::store_parcel(&our_tree, &[]);
         let their_tree = test_support::store_tree("file.txt", b"theirs\n");
         let their_head = test_support::store_parcel(&their_tree, &[&our_head]);
-        let elsewhere = test_support::store_parcel(&their_tree, &[&our_head]);
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("file.txt", b"elsewhere\n"), &[&our_head]);
 
         pallet_utils::set_current_pallet_name("main").unwrap();
         pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
