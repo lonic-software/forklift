@@ -4975,6 +4975,16 @@ pub(crate) mod tests {
         artifacts.remove(0)
     }
 
+    /// Run `case` once per [`Unreadable`] kind and fail with every arm's failure together, so a red
+    /// run reports both arms rather than stopping at the first.
+    pub(crate) fn for_each_unreadable(case: impl Fn(Unreadable) -> Option<String>) {
+        let failures: Vec<String> = [Unreadable::Quarantined, Unreadable::CorruptBucket]
+            .into_iter()
+            .filter_map(case)
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Leave the loose object `hash` held only by a pack index this store cannot serve it from,
     /// and assert that it reads neither present nor absent.
     pub(crate) fn pack_as_unreadable(hash: &str, how: Unreadable) {

@@ -565,7 +565,7 @@ mod tests {
     use crate::model::blob::Blob;
     use crate::model::parcel::Parcel;
     use crate::model::tree_item::TreeItem;
-    use crate::util::pack_utils::tests::{pack_as_unreadable, Unreadable};
+    use crate::util::pack_utils::tests::{for_each_unreadable, pack_as_unreadable, Unreadable};
     use std::path::PathBuf;
 
     /// Exclusive store access at the active storage root, as the scope-prune handler holds it.
@@ -1246,14 +1246,23 @@ mod tests {
     }
 
     /// FORK-193: the retained walks are a sweep's liveness walk. An object only an unreadable pack
-    /// index holds is not absent, and what it references may be the only thing keeping a target,
-    /// so the plan must fail rather than skip it. Run for both kinds of unreadable index.
-    fn assert_plan_refuses(how: Unreadable, unreadable: &str) {
+    /// index holds is not absent, and what it references may be all that keeps a target, so the
+    /// plan must fail rather than skip it. Each test runs for both kinds of unreadable index.
+    /// Returns what went wrong, if anything; freeing `kept` is checked first, since it is the harm
+    /// the refusal exists to prevent.
+    fn plan_outcome(how: Unreadable, unreadable: &str, kept: &str) -> Option<String> {
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let error = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).err()
-            .unwrap_or_else(|| panic!("{:?}: the prune plan must refuse past an unreadable object", how));
-        assert!(error.contains(unreadable) && error.contains("cannot be read"),
-            "{:?}: the error must name the unreadable object: {}", how, error);
+
+        match plan_prune(&["src/web".to_string()], &post_prune, &store_access()) {
+            Ok(plan) if plan.to_free.contains(&kept.to_string()) => {
+                Some(format!("{:?}: the plan frees {}, which the unreadable object references", how, kept))
+            }
+            Ok(_) => Some(format!("{:?}: the prune plan must refuse past an unreadable object", how)),
+            Err(error) if !(error.contains(unreadable) && error.contains("cannot be read")) => {
+                Some(format!("{:?}: the error must name the unreadable object: {}", how, error))
+            }
+            Err(_) => None,
+        }
     }
 
     /// A parked `src/api/y.txt` holds the pruned blob's bytes, under a tree only an unreadable
@@ -1261,7 +1270,7 @@ mod tests {
     /// the blob (red).
     #[test]
     fn plan_prune_refuses_past_a_parked_tree_only_an_unreadable_index_holds() {
-        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+        for_each_unreadable(|how| {
             let _scratch = Scratch::new("parked-unreadable-tree");
             let f = build_fixture();
             let leaf = store_tree(&[("y.txt", &f.web_blob, DirEntryType::Normal)]);
@@ -1269,8 +1278,8 @@ mod tests {
             plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
             pack_as_unreadable(&leaf, how);
 
-            assert_plan_refuses(how, &leaf);
-        }
+            plan_outcome(how, &leaf, &f.web_blob)
+        });
     }
 
     /// A staged chunked file's recipe shares a chunk with the pruned file's recipe, and only an
@@ -1278,7 +1287,7 @@ mod tests {
     /// `does_object_exist` → the plan frees the shared chunk (red).
     #[test]
     fn plan_prune_refuses_past_a_staged_recipe_only_an_unreadable_index_holds() {
-        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+        for_each_unreadable(|how| {
             let _scratch = Scratch::new("staged-unreadable-recipe");
             let shared = store_chunk(b"a chunk both recipes name");
             let other = store_chunk(b"a chunk only the pruned recipe names");
@@ -1293,8 +1302,8 @@ mod tests {
             crate::util::gc_utils::tests::plant_staged_shard("b", &[("big.bin", &staged_recipe, DirEntryType::NormalChunked)]);
             pack_as_unreadable(&staged_recipe, how);
 
-            assert_plan_refuses(how, &staged_recipe);
-        }
+            plan_outcome(how, &staged_recipe, &shared)
+        });
     }
 
     /// A parked parcel whose tree holds the pruned blob in scope is itself only in an unreadable
@@ -1302,13 +1311,13 @@ mod tests {
     /// parcel reads absent and the plan frees the blob (red).
     #[test]
     fn plan_prune_refuses_past_a_parked_parcel_only_an_unreadable_index_holds() {
-        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+        for_each_unreadable(|how| {
             let _scratch = Scratch::new("parked-unreadable-parcel");
             let f = build_fixture();
             let parked = plant_parked("b", &src_tree_with("api", "y.txt", &f.web_blob));
             pack_as_unreadable(&parked, how);
 
-            assert_plan_refuses(how, &parked);
-        }
+            plan_outcome(how, &parked, &f.web_blob)
+        });
     }
 }

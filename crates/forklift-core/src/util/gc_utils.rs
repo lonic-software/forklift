@@ -348,7 +348,7 @@ pub(crate) mod tests {
     use crate::model::blob::Blob;
     use crate::model::parcel::Parcel;
     use crate::model::tree_item::TreeItem;
-    use crate::util::pack_utils::tests::{pack_alone, pack_as_unreadable, Unreadable};
+    use crate::util::pack_utils::tests::{for_each_unreadable, pack_alone, pack_as_unreadable, Unreadable};
     use std::path::{Path, PathBuf};
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for its
@@ -1006,34 +1006,43 @@ pub(crate) mod tests {
 
     /// FORK-193: an object only an unreadable pack index holds is not absent. Its bytes may still
     /// be on disk and its children elsewhere, so a sweep that skipped its descent would delete
-    /// them. Run for both kinds of unreadable index: a quarantined one (data file gone) and a
-    /// corrupt bucket of a loaded one.
-    fn assert_gc_refuses(how: Unreadable, unreadable: &str, child: &str) {
-        let error = collect_garbage(0).err()
-            .unwrap_or_else(|| panic!("{:?}: gc must refuse past an unreadable object", how));
-        assert!(error.contains(unreadable) && error.contains("cannot be read"),
-            "{:?}: the error must name the unreadable object: {}", how, error);
-        assert!(loose_path(child).exists(), "{:?}: the unreadable object's child must survive gc", how);
+    /// them. Each test runs for both kinds of unreadable index: a quarantined one (data file gone)
+    /// and a corrupt bucket of a loaded one. Returns what went wrong, if anything; the child's
+    /// survival is checked first, since its loss is the harm the refusal exists to prevent.
+    fn gc_outcome(how: Unreadable, unreadable: &str, child: &str) -> Option<String> {
+        let result = collect_garbage(0);
+
+        if !loose_path(child).exists() {
+            return Some(format!("{:?}: gc deleted {}, which the unreadable object references", how, child));
+        }
+
+        match result {
+            Ok(_) => Some(format!("{:?}: gc must refuse past an unreadable object", how)),
+            Err(error) if !(error.contains(unreadable) && error.contains("cannot be read")) => {
+                Some(format!("{:?}: the error must name the unreadable object: {}", how, error))
+            }
+            Err(_) => None,
+        }
     }
 
     /// Mutation: in `collect_live_set`'s tree descent, ask `does_object_exist` instead of
-    /// `is_present_for_sweep` → the walk skips the tree, gc succeeds and deletes its blob (red).
+    /// `is_present_for_sweep` → the walk skips the tree, and gc deletes its blob (red).
     #[test]
     fn gc_refuses_and_keeps_the_children_of_a_tree_only_an_unreadable_index_holds() {
-        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+        for_each_unreadable(|how| {
             let _scratch = Scratch::new("gc-unreadable-tree");
             let f = build_fixture();
             pack_as_unreadable(&f.web_tree, how);
 
-            assert_gc_refuses(how, &f.web_tree, &f.web_blob);
-        }
+            gc_outcome(how, &f.web_tree, &f.web_blob)
+        });
     }
 
-    /// Mutation: in `mark_recipe_chunks_live`, ask `does_object_exist` → the recipe's chunk is
-    /// deleted (red).
+    /// Mutation: in `mark_recipe_chunks_live`, ask `does_object_exist` → gc deletes the recipe's
+    /// chunk (red).
     #[test]
     fn gc_refuses_and_keeps_the_chunks_of_a_recipe_only_an_unreadable_index_holds() {
-        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+        for_each_unreadable(|how| {
             let _scratch = Scratch::new("gc-unreadable-recipe");
             let chunk = store_chunk(b"chunk under an unreadable recipe");
             let recipe = store_recipe(&[(chunk.clone(), 32)]);
@@ -1041,44 +1050,55 @@ pub(crate) mod tests {
             store_root_parcel(&root_tree);
             pack_as_unreadable(&recipe, how);
 
-            assert_gc_refuses(how, &recipe, &chunk);
-        }
+            gc_outcome(how, &recipe, &chunk)
+        });
     }
 
     /// Mutation: in `collect_reachable_for_sweep`, ask `does_object_exist` → the head parcel reads
-    /// absent, and its tree is deleted (red).
+    /// absent, and gc deletes its tree (red).
     #[test]
     fn gc_refuses_and_keeps_the_tree_of_a_parcel_only_an_unreadable_index_holds() {
-        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+        for_each_unreadable(|how| {
             let _scratch = Scratch::new("gc-unreadable-parcel");
             let f = build_fixture();
             pack_as_unreadable(&f.parcel, how);
 
-            assert_gc_refuses(how, &f.parcel, &f.root_tree);
-        }
+            gc_outcome(how, &f.parcel, &f.root_tree)
+        });
     }
 
     /// The same hazard through `compact --all`, whose repack drops every packed object the live
     /// set does not reach and then deletes the packs it superseded. The child sits in a valid pack
     /// of its own here, so a skipped descent would lose it with that pack.
     ///
-    /// Mutation: as for the tree test above → compact succeeds and the child's pack is deleted
-    /// without the child being copied anywhere (red).
+    /// Mutation: as for the tree test above → compact deletes the child's pack without copying
+    /// the child anywhere (red).
     #[test]
     fn compact_all_refuses_and_keeps_the_pack_holding_the_child_of_an_unreadable_tree() {
         use crate::util::pack_utils;
 
-        for how in [Unreadable::Quarantined, Unreadable::CorruptBucket] {
+        for_each_unreadable(|how| {
             let _scratch = Scratch::new("compact-unreadable-tree");
             let f = build_fixture();
             let child_pack = pack_alone(&f.web_blob);
             pack_as_unreadable(&f.web_tree, how);
 
-            let error = pack_utils::compact(true, false, &crate::util::progress_utils::Progress::NONE).err()
-                .unwrap_or_else(|| panic!("{:?}: compact --all must refuse past an unreadable tree", how));
-            assert!(error.contains(&f.web_tree), "{:?}: the error must name the unreadable tree: {}", how, error);
-            assert!(child_pack.data_path.exists(), "{:?}: the child's pack must survive", how);
-            assert!(file_utils::does_object_exist(&f.web_blob).unwrap(), "{:?}: the child must stay present", how);
-        }
+            let result = pack_utils::compact(true, false, &crate::util::progress_utils::Progress::NONE);
+
+            if !file_utils::does_object_exist(&f.web_blob).unwrap() {
+                return Some(format!("{:?}: compact --all lost {}, a child of the unreadable tree", how, f.web_blob));
+            }
+            if !child_pack.data_path.exists() {
+                return Some(format!("{:?}: the child's pack must survive", how));
+            }
+
+            match result {
+                Ok(_) => Some(format!("{:?}: compact --all must refuse past an unreadable tree", how)),
+                Err(error) if !error.contains(&f.web_tree) => {
+                    Some(format!("{:?}: the error must name the unreadable tree: {}", how, error))
+                }
+                Err(_) => None,
+            }
+        });
     }
 }
