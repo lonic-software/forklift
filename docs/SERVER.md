@@ -63,7 +63,26 @@ lift:
 curl -X PUT -H "Authorization: Bearer <admin-secret>" http://…/warehouses/<id>
 ```
 
-Creation requires the static token; an open server refuses it (`403`).
+Creation requires the static token; an open server refuses it (`403`). It answers `201` when it
+created the warehouse and `200` when the warehouse already existed. Of several PUTs racing for the
+same new id, exactly one gets the `201` (and emits `warehouse_created`). A warehouse appears fully
+prepared or not at all: it is prepared in a hidden `.creating-…` folder and renamed into place. An
+empty folder at `<id>` is taken over. Anything else at `<id>` that is not a warehouse is refused
+with `409`. Leftover `.creating-…` folders from a crash are removed at the next startup.
+
+One server serves a base folder at a time. A second server on the same folder is refused at
+startup; the lock is a kernel lock on `<base>/.forklift-server.lock`, so a crashed server leaves
+nothing stale behind.
+
+A live warehouse holds its serve lock and one open file. The server keeps at most half its
+open-file limit (and never more than 1024) live. When it needs to serve one more, it first lets go
+of the least recently used warehouse that no request is using. It never refuses a request
+because of that cap: when every live warehouse is busy, it serves the new one over the cap. A
+warehouse that was let go is served again on its next request. Below the cap nothing is let go.
+While a warehouse is not live, `gc`, a full repack and scope-prune can run on it. A lift whose
+objects were deleted between its requests is refused at the ref update (`422`) and can be
+retried; nothing is ever left pointing at a deleted object. The auto-rebuild lift count
+(`rebuild_after_lifts`) starts again from zero when a warehouse is let go.
 
 ## Authentication
 
@@ -218,11 +237,12 @@ revocation by more than about a day.
   `<root>/.forklift/serve.lock` and retry. It is also refused while a `forklift` command
   that writes objects runs against the root, which could reuse an unreachable object the
   sweep is about to delete; that lock is a kernel lock, so it never outlives its process.
-  A server keeps that lock's file open for every warehouse it serves, so it raises its own soft
+  A server keeps that lock's file open for every live warehouse, so it raises its own soft
   limit on open files at startup, as far toward the hard limit as the kernel allows. In
-  multi-warehouse mode a served warehouse stays open until the server stops, so that limit also
-  bounds how many distinct warehouses one server process can serve; raise the hard limit
-  (`ulimit -Hn`, systemd `LimitNOFILE`) to match the fleet.
+  multi-warehouse mode that limit also sets how many warehouses stay live (half of it, at most
+  1024; see "Serving many warehouses"). A warehouse no request is using may then be let go, and
+  `gc` runs on it while it is not live. Raise the hard limit (`ulimit -Hn`, systemd
+  `LimitNOFILE`) if many warehouses are busy at once.
 - **Repack:** `forklift compact --all` against a served root is refused for the same reason
   as `gc` — it drops unreachable packed objects with no grace period at all — so it also
   belongs in the maintenance window. Plain `forklift compact` (incremental) never drops an

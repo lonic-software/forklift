@@ -14,6 +14,10 @@ const FILE_NAME_SERVE_LOCK: &str = "serve.lock";
 /// The name of the store-access lock sidecar (inside the forklift root folder). Never deleted.
 const FILE_NAME_STORE_ACCESS_LOCK: &str = "store-access.lock";
 
+/// The name of the base-folder lock sidecar of a multi-warehouse server (inside the base folder).
+/// Never deleted. It starts with a dot, which no warehouse id may, so it is never served as one.
+pub const FILE_NAME_BASE_SERVE_LOCK: &str = ".forklift-server.lock";
+
 /// An exclusive lock on the warehouse, held for the duration of a mutating command.
 ///
 /// This is the staging-area atomicity story (see the design document): commands that
@@ -100,11 +104,17 @@ impl Drop for StoreLock {
     }
 }
 
+/// Where the current warehouse's [`ServeLock`] file lives, held or not.
+fn serve_lock_path() -> PathBuf {
+    absolute(forklift_root().join(FILE_NAME_SERVE_LOCK))
+}
+
 /// An exclusive lock marking a warehouse root as **served by a live server** (or held for the
 /// duration of a serve-exclusive maintenance command).
 ///
 /// The server head acquires it once at startup — for the single served root, or per warehouse in
-/// multi-warehouse mode — and holds it for the whole process lifetime; `gc` acquires it for its
+/// multi-warehouse mode — and holds it while it serves that root: the whole process lifetime for
+/// a single root, until the warehouse is let go as idle in multi-warehouse mode; `gc` acquires it for its
 /// duration, and so does a full repack (`compact --all`, FORK-149), which drops every packed object
 /// outside the live set with no grace period at all. That makes them mutually exclusive on a given
 /// root: neither can sweep a live server's in-flight objects (a lift slower than the grace period —
@@ -135,15 +145,32 @@ impl ServeLock {
         // Lives at `forklift_root` (the shared store root), like the store lock: the server, `gc`
         // and a repack all enter the same storage-root scope, so they agree on the path. Absolute
         // for the same reason as the other locks — the working directory can change before drop.
-        let path = absolute(forklift_root().join(FILE_NAME_SERVE_LOCK));
+        let path = serve_lock_path();
         acquire_lock_file(&path, "warehouse root")?;
         Ok(ServeLock { path })
+    }
+
+    /// Release the lock now and say whether its file is gone, where a drop releases silently. For
+    /// a holder that keeps running after letting go: a file it failed to remove refuses that
+    /// warehouse to it and everyone else, and only this result tells that apart from a lock another
+    /// process took the moment it was free. An already-missing file counts as released.
+    pub fn release(mut self) -> Result<(), String> {
+        let path = std::mem::take(&mut self.path);
+
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("Could not remove the lock file \"{}\": {}", path.display(), e)),
+        }
     }
 }
 
 impl Drop for ServeLock {
     fn drop(&mut self) {
-        release_lock_file(&self.path);
+        // Empty once `release` has taken it.
+        if !self.path.as_os_str().is_empty() {
+            release_lock_file(&self.path);
+        }
     }
 }
 
@@ -166,7 +193,8 @@ impl Drop for ServeLock {
 ///   `scope-prune`, which host deleters (a process's own shared hold refuses its own exclusive
 ///   try). Taken right after the bay lock, so the order is always bay lock first and no cycle is
 ///   possible; released before auto-maintenance, which may repack.
-/// * **shared, try** — a server, for every warehouse it serves, for the handle's lifetime; and
+/// * **shared, try** — a server, for every warehouse it serves, for as long as it keeps that
+///   warehouse live; and
 ///   incremental compaction (explicit or automatic), which moves loose objects into a pack and
 ///   deletes the loose copies, so it must not interleave with a deleter's loose deletions.
 /// * **exclusive, try** — the deleters, at the deleter itself so no caller can forget it.
@@ -273,13 +301,17 @@ const MACOS_OPEN_MAX: libc::rlim_t = 10240;
 /// `kern.maxfilesperproc`, trying `OPEN_MAX` first when it is above the current limit); never
 /// lowers the limit. Best-effort: a limit that cannot be read or raised is left as it is. A no-op
 /// off Unix, which has no such per-process soft limit.
-pub fn raise_open_file_limit() {
+///
+/// # Returns
+/// The soft limit in force afterwards, or `None` when there is none to read (off Unix, or
+/// `getrlimit` failed).
+pub fn raise_open_file_limit() -> Option<u64> {
     #[cfg(unix)]
     {
         let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: `getrlimit` writes into the `rlimit` it is given and reads nothing else.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-            return;
+            return None;
         }
 
         let hard = limit.rlim_max;
@@ -288,12 +320,15 @@ pub fn raise_open_file_limit() {
         #[cfg(not(target_os = "macos"))]
         let fallback = None;
 
-        largest_accepted_limit(limit.rlim_cur, hard, fallback, |target| {
+        let reached = largest_accepted_limit(limit.rlim_cur, hard, fallback, |target| {
             let raised = libc::rlimit { rlim_cur: target, rlim_max: hard };
             // SAFETY: `setrlimit` only reads the `rlimit` it is given.
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 }
         });
+        Some(u64::from(reached))
     }
+    #[cfg(not(unix))]
+    None
 }
 
 /// The search behind [`raise_open_file_limit`], apart from the kernel so it can be tested against
@@ -332,6 +367,41 @@ fn largest_accepted_limit(current: libc::rlim_t,
     }
 
     accepted
+}
+
+/// The lock a multi-warehouse server holds on its base folder for as long as it runs, so one base
+/// folder is served by at most one server process. Per-warehouse serve locks cannot give that: a
+/// second server on the same base would only collide warehouse by warehouse, and the work a server
+/// does in the base folder itself (warehouse creation, and sweeping what an interrupted creation
+/// left behind) assumes no other server is doing it at the same time.
+///
+/// A *kernel* lock (`File::try_lock`) on a sidecar that is never deleted, like
+/// [`StoreAccessLock`], so a hard-killed server leaves nothing stale that would refuse its restart.
+pub struct BaseServeLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+impl BaseServeLock {
+    /// Take the lock on `base` without waiting.
+    ///
+    /// # Returns
+    /// * `Ok(BaseServeLock)` - The lock (released when dropped).
+    /// * `Err(String)`       - Another server holds it, or the sidecar could not be opened or
+    ///                         locked.
+    pub fn try_acquire(base: &Path) -> Result<BaseServeLock, String> {
+        let path = absolute(base.join(FILE_NAME_BASE_SERVE_LOCK));
+        let file = open_lock_sidecar(&path)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(BaseServeLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "Another forklift server is already serving the warehouses folder \"{}\".",
+                base.to_string_lossy()
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
+    }
 }
 
 /// Open (creating if needed) the store-access sidecar at the current storage root, at an absolute
@@ -560,6 +630,24 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// One base folder, one server: a second hold on it is refused while the first lives, and
+    /// taken once it is dropped. The lock is per open file, so this holds within one process too.
+    #[test]
+    fn a_base_folder_serve_lock_admits_one_holder() {
+        let base = std::env::temp_dir().join(format!("forklift-base-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let first = BaseServeLock::try_acquire(&base).unwrap();
+        let refused = BaseServeLock::try_acquire(&base).err().expect("a second holder is refused");
+        assert!(refused.contains("Another forklift server"), "{}", refused);
+
+        drop(first);
+        let _again = BaseServeLock::try_acquire(&base).expect("released with its holder");
+
+        drop(_again);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The open-file search against a fake kernel: it lands on the largest limit the ceiling
     /// allows, from below or above the fallback, and never tries a limit at or under the current
     /// one — including when the current limit is already above the fallback, where a search that
@@ -643,6 +731,33 @@ mod tests {
 
         drop(first);
         ServeLock::acquire().expect("after the first is dropped the serve lock is free again");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// An explicit release reports a lock file it could not remove, and only that: a missing file
+    /// is released, and a released lock leaves nothing for its drop to remove — not even a lock
+    /// someone else has taken since.
+    #[test]
+    fn a_serve_lock_release_reports_a_file_it_could_not_remove() {
+        let temp = std::env::temp_dir().join(format!("forklift-servelock-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        ServeLock::acquire().unwrap().release().expect("a held lock releases");
+        let taken = ServeLock::acquire().expect("free again after a release");
+        assert!(serve_lock_path().exists());
+
+        let gone = ServeLock { path: serve_lock_path() };
+        std::mem::forget(taken);
+        std::fs::remove_file(serve_lock_path()).unwrap();
+        gone.release().expect("a missing file counts as released");
+
+        // Something that cannot be removed as a file stands where the lock was.
+        std::fs::create_dir(serve_lock_path()).unwrap();
+        let stuck = ServeLock { path: serve_lock_path() };
+        assert!(stuck.release().is_err(), "a lock file that stays must be reported");
 
         std::fs::remove_dir_all(&temp).ok();
     }

@@ -1640,6 +1640,22 @@ pub fn invalidate_cache() {
     unverified_base_cache().remove_prefixed(&file_utils::read_cache_key(""));
 }
 
+/// Forget everything this process holds about the current warehouse's objects: its pack set
+/// and reload lock, and its entries in the verified read cache, the parsed-tree cache and the
+/// unverified-base cache. For a server letting a warehouse go: once it is not live another
+/// process may delete objects from it (gc, a full repack), and every one of those caches answers
+/// a hit without looking at the disk, so a kept entry would report a deleted object as present —
+/// to a client deciding what to upload, and to the closure check of a ref update. Only this
+/// warehouse's entries go, so the next one served pays nothing for it.
+pub fn forget_warehouse() {
+    invalidate_cache();
+    RELOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock()
+        .expect("the pack reload lock map is poisoned")
+        .remove(&file_utils::get_path_objects_root());
+    file_utils::forget_cached_objects();
+    object_utils::forget_cached_trees();
+}
+
 /// The densify-pending marker's filename, in the pack folder. Presence-only — its content is
 /// just a human-readable note, never parsed — set after a bulk ingest (`StoreIngest::finish`,
 /// `import_transport_packs`) publishes at least one pack, and cleared after a successful

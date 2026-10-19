@@ -311,6 +311,12 @@ fn tree_parse_cache_get(hash: &str) -> Option<std::sync::Arc<TreeItem>> {
     tree_parse_cache().get(&file_utils::read_cache_key(hash))
 }
 
+/// Drop the current warehouse's entries from the parsed-tree cache (see
+/// `pack_utils::forget_warehouse`).
+pub(crate) fn forget_cached_trees() {
+    tree_parse_cache().remove_prefixed(&file_utils::read_cache_key(""));
+}
+
 fn tree_parse_cache_put(hash: &str, tree: std::sync::Arc<TreeItem>, weight: usize) {
     tree_parse_cache().put(&file_utils::read_cache_key(hash), tree, weight);
 }

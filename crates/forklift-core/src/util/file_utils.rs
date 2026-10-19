@@ -2082,6 +2082,11 @@ pub(crate) fn read_cache_get(hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     read_cache().get(&read_cache_key(hash))
 }
 
+/// Drop the current warehouse's entries from the read cache (see `pack_utils::forget_warehouse`).
+pub(crate) fn forget_cached_objects() {
+    read_cache().remove_prefixed(&read_cache_key(""));
+}
+
 fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {
     // Weighed by its own length; store the caller's `Arc` directly — the fetched allocation is
     // shared, never re-copied.
