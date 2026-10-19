@@ -313,10 +313,17 @@ fn restore_entry(parent_key: &str, item: &InventoryItem, shard_mtime: u64) -> Re
 
 /// `Untouched` or `Restatted` when the file at `file_path` already holds `item`'s content as a
 /// file of the same kind, `None` when it does not or cannot be compared (it is then written).
-/// The stat data a `Restatted` entry carries was read before the file's content, so an edit
-/// racing the comparison is never recorded against the staged hash.
+/// The stat data a `Restatted` entry carries was read before the file's content, and is only
+/// recorded when its mtime predates a clock second read before that stat: an edit in the same
+/// second as the stat, after the content was read, keeps the mtime, and the shard is published
+/// later than the stat, so its racily-clean guard alone would trust the stale hash. Such a file
+/// is left `Untouched` and its entry as it was.
 fn matching_content(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> Option<Restored> {
     let path = std::path::Path::new(file_path);
+    let statted_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     let metadata = file_utils::get_symlink_metadata_for_path(path).ok()?;
 
     if metadata.is_dir() {
@@ -337,7 +344,11 @@ fn matching_content(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> 
         inventory_utils::FileVerdict::UnchangedByStat => Some(Restored::Untouched),
         // Only the stat data may change here, never the entry's type.
         inventory_utils::FileVerdict::UnchangedByHash(refreshed, _) if refreshed.item_type == item.item_type => {
-            Some(Restored::Restatted(refreshed))
+            if refreshed.content_change_timestamp < statted_after {
+                Some(Restored::Restatted(refreshed))
+            } else {
+                Some(Restored::Untouched)
+            }
         }
         _ => None,
     }
