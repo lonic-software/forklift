@@ -2558,11 +2558,17 @@ fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
 /// [`file_utils::effective_kind`]). Only a live entry lends its executable bit: a file loaded over
 /// an entry staged for removal is a new file, and takes the bit the `stat` reports.
 pub fn effective_kind(existing: &InventoryItem, stat_kind: DirEntryType) -> DirEntryType {
+    effective_kind_when(existing, stat_kind, file_utils::EXECUTABLE_BIT_IS_OBSERVABLE)
+}
+
+fn effective_kind_when(existing: &InventoryItem,
+                       stat_kind: DirEntryType,
+                       executable_bit_is_observable: bool) -> DirEntryType {
     if existing.state == InventoryItemState::Deleted {
         return stat_kind;
     }
 
-    file_utils::effective_kind(stat_kind, existing.item_type)
+    file_utils::effective_kind_when(stat_kind, existing.item_type, executable_bit_is_observable)
 }
 
 /// Check whether a file is unchanged compared to its existing inventory entry, based purely
@@ -3759,12 +3765,11 @@ mod tests {
         let live = InventoryItem { item_type: DirEntryType::Executable, ..item("run.sh", 1, InventoryItemState::Normal) };
         let removed = InventoryItem { state: InventoryItemState::Deleted, ..live.clone() };
 
-        assert_eq!(effective_kind(&removed, DirEntryType::Normal), DirEntryType::Normal);
-        assert_eq!(effective_kind(&live, DirEntryType::Normal), if file_utils::EXECUTABLE_BIT_IS_OBSERVABLE {
-            DirEntryType::Normal
-        } else {
-            DirEntryType::Executable
-        });
+        for observable in [true, false] {
+            assert_eq!(effective_kind_when(&removed, DirEntryType::Normal, observable), DirEntryType::Normal);
+        }
+        assert_eq!(effective_kind_when(&live, DirEntryType::Normal, false), DirEntryType::Executable);
+        assert_eq!(effective_kind_when(&live, DirEntryType::Normal, true), DirEntryType::Normal);
     }
 
     /// The unproven sentinel never matches a stat, even one whose every other field agrees.

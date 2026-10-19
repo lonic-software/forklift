@@ -2399,7 +2399,7 @@ pub fn effective_kind(stat_kind: DirEntryType, entry_kind: DirEntryType) -> DirE
     effective_kind_when(stat_kind, entry_kind, EXECUTABLE_BIT_IS_OBSERVABLE)
 }
 
-fn effective_kind_when(stat_kind: DirEntryType,
+pub(crate) fn effective_kind_when(stat_kind: DirEntryType,
                      entry_kind: DirEntryType,
                      executable_bit_is_observable: bool) -> DirEntryType {
     let is_plain = |kind: DirEntryType| matches!(kind, DirEntryType::Normal | DirEntryType::Executable);
