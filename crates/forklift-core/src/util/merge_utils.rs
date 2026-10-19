@@ -868,17 +868,17 @@ fn resolve_merge_job(job: &MergeJob,
         && is_mergeable_text(&our_content)
         && is_mergeable_text(&their_content);
 
+    let merged_type = merged_plain_kind(job.base_type, job.our_type, job.their_type);
+
     if !all_text {
         // Binary contents are not line-mergeable; keep ours, in conflict.
         return Ok(MergeAction::Conflict {
             path: job.path.clone(),
             content: None,
             entry_hash: job.our_hash.clone(),
-            item_type: job.our_type,
+            item_type: merged_type,
         });
     }
-
-    let merged_type = merged_plain_kind(job.base_type, job.our_type, job.their_type);
 
     let result = merge_file_contents(
         &base_content,
@@ -987,6 +987,28 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
                 (false, None) => pending.push(PendingAction::Ready(MergeAction::Delete { path })),
             }
             continue;
+        }
+
+        // One side changed only the kind (a chmod: the base's content), the other the content:
+        // the content is the other side's, and the bit merges like content. Resolved by hash,
+        // so a chunked, binary or out-of-scope file merges as cleanly as a text one.
+        if let (Some((base_hash, base_type)), Some((our_hash, our_type)), Some((their_hash, their_type))) = (b, o, t) {
+            let plain = |kind: &DirEntryType| matches!(kind.on_disk_kind(), DirEntryType::Normal | DirEntryType::Executable);
+
+            if plain(base_type) && plain(our_type) && plain(their_type) && (our_hash == base_hash || their_hash == base_hash) {
+                let (hash, storage) = if our_hash == base_hash { (their_hash, their_type) } else { (our_hash, our_type) };
+                let kind = merged_plain_kind(Some(*base_type), our_type.on_disk_kind(), their_type.on_disk_kind());
+                let item_type = if storage.is_chunked() { kind.to_chunked() } else { kind };
+
+                if (hash, item_type) != (our_hash, *our_type) {
+                    pending.push(PendingAction::Ready(if out_of_scope {
+                        MergeAction::ResolveOutOfScope { path, resolution: Some((hash.clone(), item_type)) }
+                    } else {
+                        MergeAction::TakeTheirs { path, hash: hash.clone(), item_type, is_new: false }
+                    }));
+                }
+                continue;
+            }
         }
 
         // Both sides changed the file (relative to the base) in different ways. Out of scope,

@@ -289,8 +289,7 @@ A change of kind is a change even when the bytes are the same: a `chmod +x` (or
 `-x`) on a tracked file, or a file replaced by a symlink, reports as `modified` on
 both sides, and `shift` refuses to reset it like any other edit. On Windows, where
 the file system has no executable bit, a tracked file keeps the bit its entry
-records; `load` never clears it there. A file loaded over a staged removal is a new
-file there, and starts without the bit.
+records; `load` never clears it there, not even over a staged removal.
 
 ### `diff` — line-by-line changes (`d`)
 
@@ -889,9 +888,9 @@ Merges another pallet's head into the current pallet:
   files with diff3 markers, the entries enter a conflict state, and the
   consolidation stays in progress until you resolve, `load`, and `stack`.
 
-The executable bit merges like content: when both sides edited a file, the side that
-changed its bit from the common ancestor wins, so a `chmod -x` survives an edit on the
-other side.
+The executable bit merges like content: the side that changed a file's bit from the
+common ancestor wins, so a `chmod -x` on one side survives an edit on the other, for
+binary and large files too.
 
 Requires a clean warehouse before it starts.
 

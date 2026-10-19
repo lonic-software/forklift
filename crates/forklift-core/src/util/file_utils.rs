@@ -2386,8 +2386,7 @@ pub const EXECUTABLE_BIT_IS_OBSERVABLE: bool = cfg!(unix);
 /// The kind a tracked file has, given the kind a fresh `stat` reports and the kind its entry
 /// records. Where `stat` cannot see the executable bit, a plain file whose entry is a plain file
 /// keeps the entry's bit: what `stat` says about the bit there is the platform's blind spot, not
-/// a change (git's `core.fileMode=false`). Every other kind is the `stat`'s. An entry staged for
-/// removal records no bit to keep: see `inventory_utils::effective_kind`.
+/// a change (git's `core.fileMode=false`). Every other kind is the `stat`'s.
 ///
 /// # Arguments
 /// * `stat_kind`  - The kind [`get_type_of_dir_entry`] reports for the file.
@@ -2399,7 +2398,7 @@ pub fn effective_kind(stat_kind: DirEntryType, entry_kind: DirEntryType) -> DirE
     effective_kind_when(stat_kind, entry_kind, EXECUTABLE_BIT_IS_OBSERVABLE)
 }
 
-pub(crate) fn effective_kind_when(stat_kind: DirEntryType,
+fn effective_kind_when(stat_kind: DirEntryType,
                      entry_kind: DirEntryType,
                      executable_bit_is_observable: bool) -> DirEntryType {
     let is_plain = |kind: DirEntryType| matches!(kind, DirEntryType::Normal | DirEntryType::Executable);

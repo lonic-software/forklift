@@ -2555,20 +2555,10 @@ fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
 }
 
 /// The kind a file has against its entry, given the kind a fresh `stat` reports (see
-/// [`file_utils::effective_kind`]). Only a live entry lends its executable bit: a file loaded over
-/// an entry staged for removal is a new file, and takes the bit the `stat` reports.
+/// [`file_utils::effective_kind`]). The bit belongs to the path until a removal is stacked: an
+/// entry staged for removal lends it too, so `remove` then `load` of the same file round-trips.
 pub fn effective_kind(existing: &InventoryItem, stat_kind: DirEntryType) -> DirEntryType {
-    effective_kind_when(existing, stat_kind, file_utils::EXECUTABLE_BIT_IS_OBSERVABLE)
-}
-
-fn effective_kind_when(existing: &InventoryItem,
-                       stat_kind: DirEntryType,
-                       executable_bit_is_observable: bool) -> DirEntryType {
-    if existing.state == InventoryItemState::Deleted {
-        return stat_kind;
-    }
-
-    file_utils::effective_kind_when(stat_kind, existing.item_type, executable_bit_is_observable)
+    file_utils::effective_kind(stat_kind, existing.item_type)
 }
 
 /// Check whether a file is unchanged compared to its existing inventory entry, based purely
@@ -3758,18 +3748,16 @@ mod tests {
                    !file_utils::EXECUTABLE_BIT_IS_OBSERVABLE);
     }
 
-    /// Only a live entry lends its executable bit: a file loaded over an entry staged for removal
-    /// is a new file, with the bit its stat reports, wherever that is.
+    /// The bit belongs to the path until a removal is stacked: an entry staged for removal lends
+    /// it like a live one, so `remove` then `load` of the same file round-trips everywhere.
     #[test]
-    fn an_entry_staged_for_removal_lends_no_executable_bit() {
+    fn an_entry_staged_for_removal_lends_its_bit_like_a_live_one() {
         let live = InventoryItem { item_type: DirEntryType::Executable, ..item("run.sh", 1, InventoryItemState::Normal) };
         let removed = InventoryItem { state: InventoryItemState::Deleted, ..live.clone() };
 
-        for observable in [true, false] {
-            assert_eq!(effective_kind_when(&removed, DirEntryType::Normal, observable), DirEntryType::Normal);
+        for stat_kind in [DirEntryType::Normal, DirEntryType::Executable, DirEntryType::SymbolicLink] {
+            assert_eq!(effective_kind(&removed, stat_kind), effective_kind(&live, stat_kind));
         }
-        assert_eq!(effective_kind_when(&live, DirEntryType::Normal, false), DirEntryType::Executable);
-        assert_eq!(effective_kind_when(&live, DirEntryType::Normal, true), DirEntryType::Normal);
     }
 
     /// The unproven sentinel never matches a stat, even one whose every other field agrees.

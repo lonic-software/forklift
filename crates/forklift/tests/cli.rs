@@ -1108,6 +1108,40 @@ fn a_consolidate_keeps_the_side_that_changed_the_executable_bit() {
         "the merge must record the file as it left it");
 }
 
+/// A chmod alone on their side merges cleanly with our edit of a binary file, which no line
+/// merge can reconcile: the content is ours, the bit theirs.
+#[cfg(unix)]
+#[test]
+fn a_consolidate_takes_their_chmod_over_our_binary_edit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("merge-chmod-binary");
+    let path = warehouse.root.join("tool.bin");
+    std::fs::write(&path, b"\0base\0").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "theirs drops the bit"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    std::fs::write(&path, b"\0ours\0").unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "ours edits"]));
+
+    let consolidate = warehouse.run(&["consolidate", "feature"]);
+    assert_success(&consolidate);
+    assert_eq!(std::fs::read(&path).unwrap(), b"\0ours\0");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "their chmod -x must survive");
+    assert!(changes(&warehouse, "unstaged").is_empty() && changes(&warehouse, "staged").is_empty(),
+        "the merge must record the file as it left it");
+}
+
 #[test]
 fn loading_the_root_or_a_tracked_folder_a_rule_covers_stages_no_removal() {
     let warehouse = warehouse_with_a_diverged_pallet("ignore-tracked-load");
