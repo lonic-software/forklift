@@ -1307,6 +1307,135 @@ pub fn ingest_file(file_name: &str,
     })
 }
 
+/// Hash an on-disk file the way an inventory entry of type `entry_type` records it, to re-prove
+/// that the file still holds that entry's content after its stat missed. This is the only place a
+/// file's content is compared with an entry's by hash, so every re-prover agrees with every other.
+///
+/// The representation comes from the entry, not from the file's size: a symlink entry hashes its
+/// link target, a `*Chunked` entry its recipe, and any other entry a plain blob of the whole file,
+/// at any size. Size-based chunking (see [`ingest_file`]) must not decide this, since an entry
+/// can hold a plain blob of any size (`import-git` stores every git blob plain), and comparing a
+/// recipe hash with it would report an unchanged file as modified.
+///
+/// A file that became a symlink, or a symlink that became a file, never matches: a link's
+/// content and a file's content are different things, so neither can prove the other.
+///
+/// Nothing is written to the object store.
+///
+/// # Arguments
+/// * `file_name`    - The name of the file (for error messages).
+/// * `entry_path`   - The path to the file.
+/// * `entry_type`   - The type the entry records.
+/// * `current_type` - The file's current on-disk kind, from a fresh stat.
+///
+/// # Returns
+/// * `Ok(Some(HashedAsEntry))` - The file's hash in the entry's representation.
+/// * `Ok(None)`                - The file cannot hold the entry's content: it changed between a
+///   symlink and a file, or its length changed while it was read.
+/// * `Err(String)`             - If the file could not be read.
+pub fn hash_file_as_entry(file_name: &str,
+                          entry_path: &Path,
+                          entry_type: DirEntryType,
+                          current_type: DirEntryType) -> Result<Option<HashedAsEntry>, String> {
+    let entry_is_link = entry_type == DirEntryType::SymbolicLink;
+    if entry_is_link != (current_type == DirEntryType::SymbolicLink) {
+        return Ok(None);
+    }
+
+    if entry_is_link {
+        let blob = get_blob_for_file(file_name, entry_path, &entry_type)?;
+        let file_size = blob.content.len() as u64;
+        let object = LooseObjectBuilder::build_blob(&blob);
+
+        return Ok(Some(HashedAsEntry { hash: object.hash.clone(), file_size, blob: Some(object) }));
+    }
+
+    if entry_type.is_chunked() {
+        // Below the threshold this yields a blob hash, which can never equal a recipe's: the
+        // file shrank, so its content changed.
+        let ingested = ingest_file(file_name, entry_path, current_type.on_disk_kind(), IngestMode::ComputeOnly)?;
+
+        return Ok(Some(HashedAsEntry { hash: ingested.hash, file_size: ingested.file_size, blob: None }));
+    }
+
+    hash_file_as_plain_blob(file_name, entry_path)
+}
+
+/// A file's hash in an entry's representation (see [`hash_file_as_entry`]).
+pub struct HashedAsEntry {
+    /// The hash.
+    pub hash: String,
+
+    /// The size an entry records for this content: a symlink's target length, a file's length.
+    pub file_size: u64,
+
+    /// The built-but-unstored blob, when the file was read whole to hash it (a symlink, or a plain
+    /// file below the chunk threshold), so a writer can heal a blob missing from the store. `None`
+    /// for a chunked entry or a streamed large plain file.
+    pub blob: Option<crate::model::object::loose_object::LooseObject>,
+}
+
+/// The hash a plain blob of the whole file has. A file below the chunk threshold is read whole
+/// and its blob built, exactly as [`ingest_file`] does; a larger one is streamed, so memory stays
+/// bounded, into the same hash [`LooseObjectBuilder::build_blob`] would give its bytes.
+///
+/// # Returns
+/// * `Ok(Some(HashedAsEntry))` - The hash.
+/// * `Ok(None)`                - The file's length changed while it was read, so no consistent
+///   content was seen and nothing can be proven.
+/// * `Err(String)`             - If the file could not be read.
+fn hash_file_as_plain_blob(file_name: &str, entry_path: &Path) -> Result<Option<HashedAsEntry>, String> {
+    let failed = |e: std::io::Error| format!("Error while reading file \"{}\": {}", file_name, e);
+    let mut file = std::fs::File::open(entry_path).map_err(failed)?;
+    let length = file.metadata().map_err(failed)?.len();
+
+    if length < chunk_utils::CHUNK_THRESHOLD_BYTES as u64 {
+        let mut content = Vec::with_capacity(length as usize);
+        file.read_to_end(&mut content).map_err(failed)?;
+        if content.len() as u64 != length {
+            return Ok(None);
+        }
+
+        let object = LooseObjectBuilder::build_blob(&Blob { content });
+
+        return Ok(Some(HashedAsEntry { hash: object.hash.clone(), file_size: length, blob: Some(object) }));
+    }
+
+    // The blob object's bytes: the loose-object header over the blob content, which is the blob
+    // version followed by the raw file bytes. See `LooseObjectBuilder::build_blob`.
+    let blob_version = byte_utils::number_to_vlq_bytes(
+        crate::enums::object::blob_version::BlobVersion::latest().get_code()
+    );
+    let mut header: Vec<u8> = Vec::new();
+    header.extend(byte_utils::number_to_vlq_bytes(
+        crate::enums::object::loose_object_version::LooseObjectVersion::latest().get_code()
+    ));
+    header.extend(byte_utils::number_to_vlq_bytes(ObjectType::Blob.get_code()));
+    header.extend(byte_utils::number_to_vlq_bytes(blob_version.len() as u64 + length));
+    push_null(&mut header);
+    header.extend(blob_version);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&header);
+
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut read_total = 0u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(failed)?;
+        if read == 0 {
+            break;
+        }
+        read_total += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+
+    if read_total != length {
+        return Ok(None);
+    }
+
+    Ok(Some(HashedAsEntry { hash: hasher.finalize().to_hex().to_string(), file_size: length, blob: None }))
+}
+
 /// Hash (and, in `Store` mode, store) a batch of chunks in parallel, appending their
 /// `(hash, size)` to `recipe_chunks` in the batch's order. The batch is drained.
 fn flush_chunk_batch(batch: &mut Vec<Vec<u8>>,
@@ -1513,6 +1642,77 @@ mod tests {
         let mut assembled = Vec::new();
         assemble_chunked_file(&ingested.hash, &mut assembled).unwrap();
         assert_eq!(assembled, big, "assembled bytes are identical to the ingested file");
+    }
+
+    /// A deterministic, incompressible-ish file of exactly `len` bytes.
+    fn pseudo_random_file(path: &Path, len: usize) -> Vec<u8> {
+        let mut content = Vec::with_capacity(len + 8);
+        let mut state = 0x9E37_79B9u64;
+        while content.len() < len {
+            state = state.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(1);
+            content.extend_from_slice(&state.to_le_bytes());
+        }
+        content.truncate(len);
+        std::fs::write(path, &content).unwrap();
+        content
+    }
+
+    /// A plain entry is re-proved as a plain blob at any size: the streamed hash of a file at or
+    /// above the chunk threshold is exactly the hash `build_blob` gives its bytes, so an entry
+    /// `import-git` stored plain matches its unedited file.
+    #[test]
+    fn a_large_plain_entry_rehashes_to_the_blob_hash_build_blob_gives() {
+        let scratch = Scratch::new("hash-as-plain");
+        let path = scratch.root.join("big.bin");
+        let content = pseudo_random_file(&path, chunk_utils::CHUNK_THRESHOLD_BYTES + 12_345);
+
+        let expected = LooseObjectBuilder::build_blob(&Blob { content: content.clone() }).hash;
+        let hashed = hash_file_as_entry("big.bin", &path, DirEntryType::Normal, DirEntryType::Normal)
+            .unwrap().unwrap();
+        assert_eq!(hashed.hash, expected, "a streamed plain blob must hash as build_blob does");
+        assert_eq!(hashed.file_size, content.len() as u64);
+        assert!(hashed.blob.is_none(), "a streamed blob is not built");
+
+        let small = scratch.root.join("small.bin");
+        let small_content = pseudo_random_file(&small, 1000);
+        let hashed = hash_file_as_entry("small.bin", &small, DirEntryType::Executable, DirEntryType::Normal)
+            .unwrap().unwrap();
+        assert_eq!(hashed.hash, LooseObjectBuilder::build_blob(&Blob { content: small_content }).hash);
+        assert!(hashed.blob.is_some(), "a small blob is built so a writer can heal it");
+    }
+
+    /// A chunked entry is re-proved as a recipe, which is what ingesting the same file gives.
+    #[test]
+    fn a_chunked_entry_rehashes_to_its_recipe() {
+        let scratch = Scratch::new("hash-as-chunked");
+        let path = scratch.root.join("big.bin");
+        pseudo_random_file(&path, chunk_utils::CHUNK_THRESHOLD_BYTES);
+
+        let ingested = ingest_file("big.bin", &path, DirEntryType::Normal, IngestMode::ComputeOnly).unwrap();
+        assert_eq!(ingested.item_type, DirEntryType::NormalChunked);
+        let hashed = hash_file_as_entry("big.bin", &path, DirEntryType::ExecutableChunked, DirEntryType::Executable)
+            .unwrap().unwrap();
+        assert_eq!(hashed.hash, ingested.hash);
+    }
+
+    /// A file never proves a symlink entry, and a symlink never proves a file entry, even where
+    /// the link's target string equals the file's bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_and_a_file_never_prove_each_other() {
+        let scratch = Scratch::new("hash-as-flip");
+        let file = scratch.root.join("file");
+        std::fs::write(&file, "target").unwrap();
+        let link = scratch.root.join("link");
+        std::os::unix::fs::symlink("target", &link).unwrap();
+
+        assert!(hash_file_as_entry("link", &link, DirEntryType::Normal, DirEntryType::SymbolicLink).unwrap().is_none());
+        assert!(hash_file_as_entry("file", &file, DirEntryType::SymbolicLink, DirEntryType::Normal).unwrap().is_none());
+
+        let as_link = hash_file_as_entry("link", &link, DirEntryType::SymbolicLink, DirEntryType::SymbolicLink)
+            .unwrap().unwrap();
+        let as_file = hash_file_as_entry("file", &file, DirEntryType::Normal, DirEntryType::Normal).unwrap().unwrap();
+        assert_eq!(as_link.hash, as_file.hash, "sanity: the link target and the file hold the same bytes");
     }
 
     #[test]

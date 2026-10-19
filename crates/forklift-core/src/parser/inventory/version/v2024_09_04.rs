@@ -1,7 +1,7 @@
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::globals;
-use crate::model::inventory::{Inventory, InventoryItem};
+use crate::model::inventory::{Inventory, InventoryItem, UNPROVEN_MTIME};
 use crate::util::byte_utils;
 
 /// Parse an inventory object from the given inventory file bytes (version `v2024_09_04`).
@@ -11,16 +11,40 @@ use crate::util::byte_utils;
 /// the inventory header.
 /// * `content` - The bytes of the inventory file.
 ///
+/// Its entries carry no proof of their own, so every one is parsed as unproven (see
+/// [`parse_items`]).
+///
 /// # Returns
 /// * `Ok(Inventory)` - The parsed inventory.
 /// * `Err(String)`   - The error message.
 pub fn parse(offset: usize, content: &[u8]) -> Result<Inventory, String> {
+    parse_items(offset, content, true)
+}
+
+/// Parse the per-item content shared by every inventory version so far.
+///
+/// # Arguments
+/// * `offset`  - The offset to start parsing at (the byte *after* the inventory header).
+/// * `content` - The bytes of the inventory file.
+/// * `unproven` - Whether the shard's version predates entries that prove themselves (versions
+///   before `V2026_10_19`). Such an entry's stat was trusted against the shard file's own
+///   mtime, an anchor this parser no longer has, so its `content_change_timestamp` is replaced
+///   with [`UNPROVEN_MTIME`] and the file is hashed until a directory load re-proves it.
+///
+/// # Returns
+/// * `Ok(Inventory)` - The parsed inventory.
+/// * `Err(String)`   - The error message.
+pub fn parse_items(offset: usize, content: &[u8], unproven: bool) -> Result<Inventory, String> {
     let mut cursor = offset;
     let mut inventory = Inventory::new();
 
     while cursor < content.len() {
-        let (item, bytes_read) = parse_item(cursor, content)?;
+        let (mut item, bytes_read) = parse_item(cursor, content)?;
         cursor += bytes_read;
+
+        if unproven {
+            item.content_change_timestamp = UNPROVEN_MTIME;
+        }
 
         inventory.add_item(item);
     }

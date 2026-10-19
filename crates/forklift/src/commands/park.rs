@@ -55,7 +55,10 @@ pub async fn park_changes() -> Result<(), String> {
 
     // Stage the whole work in progress: modified tracked files are rehashed, deleted
     // tracked files become staged removals. Untracked files stay untracked. Its own blob
-    // stores are already batched internally (DESIGN.html §5.0 D item 10, finding #3).
+    // stores are already batched internally (DESIGN.html §5.0 D item 10, finding #3). The
+    // rebuild below anchors before it, so a file edited after the refresh is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+
     inventory_utils::refresh_tracked_entries()?;
 
     // In a scoped (sparse) bay the dock only materializes the in-scope subtree(s); splice it
@@ -180,7 +183,7 @@ pub async fn park_changes() -> Result<(), String> {
     // Reset the working directory and the inventory to the pallet head.
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
-    let shards = shift_utils::build_inventories_for_tree(&head_tree_hash)?;
+    let shards = shift_utils::build_inventories_for_tree(&head_tree_hash, shift_utils::TreeProvenance::Written(anchor))?;
     inventory_utils::replace_all_inventories(&shards)?;
 
     output::message(format!(

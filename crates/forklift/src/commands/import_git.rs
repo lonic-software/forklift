@@ -139,7 +139,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         if let Some(head) = pallet_utils::get_pallet_head(pallet)? {
             progress.status("Building the inventory");
             let tree = object_utils::load_parcel(&head)?.tree_hash;
-            let shards = shift_utils::build_inventories_for_tree(&tree)?;
+            let shards = shift_utils::build_inventories_for_tree(&tree, shift_utils::TreeProvenance::Verify)?;
             inventory_utils::replace_all_inventories(&shards)?;
         }
     }

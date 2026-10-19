@@ -8,8 +8,8 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
-    bundle_utils, config_utils, lock_utils, object_utils, pack_utils, pallet_utils, remote_utils,
-    scope_utils, shift_utils, trust_utils, warehouse_utils,
+    bundle_utils, config_utils, file_utils, lock_utils, object_utils, pack_utils, pallet_utils,
+    remote_utils, scope_utils, shift_utils, trust_utils, warehouse_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -319,7 +319,7 @@ async fn franchise_into_prepared_target(
     // own, to justify a franchise failure having two different recovery contracts depending on
     // which step failed. The error is at least pointed at `--only` below, so a retry that hits
     // the same offending path again has a way past it that doesn't require a different target.
-    shift_utils::materialize_tree(None, &tree_hash, "Franchising", &Progress::NONE).map_err(|e| error::append_to_message(
+    shift_utils::materialize_tree(None, &tree_hash, "Franchising", file_utils::take_stat_anchor()?, &Progress::NONE).map_err(|e| error::append_to_message(
         e,
         "(the signed history was already fetched and verified; only checking out the working \
         tree failed. A retry re-fetches from scratch rather than resuming — if the same path \

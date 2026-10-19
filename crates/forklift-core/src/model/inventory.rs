@@ -142,6 +142,12 @@ impl Inventory {
     }
 }
 
+/// The `content_change_timestamp` of an entry whose stat does not prove its content: one taken
+/// too close to its anchor to rule out a same-second edit, an entry with no stat at all, or one
+/// read from a shard format that predates per-entry proof. No whole-second mtime reaches it, so
+/// such an entry never matches a stat and the file is always hashed.
+pub const UNPROVEN_MTIME: u64 = u64::MAX;
+
 /// An item (i.e. file) in the inventory.
 /// It contains metadata about a file that has been taken into inventory.
 /// This metadata can be used to detect changes in the actual file.

@@ -8,7 +8,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    audit_utils, config_utils, kv_utils, merge_utils, object_utils,
+    audit_utils, config_utils, file_utils, kv_utils, merge_utils, object_utils,
     pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
@@ -137,6 +137,9 @@ async fn lower_working_pallet(client: &RemoteClient,
         None => None,
     };
 
+    // Anchored before the cleanliness check, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+
     ensure_warehouse_is_clean(local_tree.as_deref()).await?;
 
     // Path-pruned in a sparse warehouse (out-of-scope content stays sealed), whole in a full one
@@ -167,7 +170,7 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
 
-    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", progress)?;
+    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress)?;
     pallet_utils::set_pallet_head(&pallet, remote_head)?;
 
     report.outcome = Some(LowerOutcome::Lowered);

@@ -706,8 +706,7 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
     // A real content change inside the directory that sorts before "./" in metadata order...
     warehouse.write_file("(marketing)/page.tsx", "page v2 -- a real edit\n");
     // ...and a same-*content* rewrite of a root-level file: its shard entry is rebuilt (the
-    // rewrite advances its mtime past the shard's own, so the stat-cache fast path cannot trust
-    // it), but the rebuilt hash matches the old one exactly, so this is "changed" without being
+    // rewrite moves its mtime, so the stat-cache fast path cannot trust it), but the rebuilt hash matches the old one exactly, so this is "changed" without being
     // "content_changed" — the exact combination that hit the buggy `save_inventory` path
     // (as opposed to the ancestor-clearing `write_shard_mutation` path) for the root shard.
     warehouse.write_file("README.md", "readme v1\n");
@@ -730,16 +729,6 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
     // restamped root rollup that happened to equal head.
     assert_eq!(warehouse.head_tree_hash("main"), head_before);
 }
-
-// A PR #61 review finding (#6) on `refresh_tracked_entries` — a shard rewritten only because its
-// stat data drifted (no real content change) used to publish with the wall clock's value *when
-// the whole refresh finished deciding every tracked shard*, not the instant this particular shard
-// was actually verified — is covered by
-// `crates/forklift-core/tests/refresh_tracked_entries_verified_at.rs`, not here: `park`'s own
-// reset-to-head step (`inventory_utils::replace_all_inventories`) unconditionally rewrites every
-// shard right after `refresh_tracked_entries` returns, so a shard's mtime observed after a full
-// `park` command reflects that later, unrelated rewrite — not what this refresh itself published.
-// That dedicated test calls `refresh_tracked_entries` directly instead.
 
 /// `stack` reads no shard beneath a subtree whose rollup matches the head: a shard there that
 /// would not even parse goes unnoticed with the skip on, and fails the stack with it off. The

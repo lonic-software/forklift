@@ -5,8 +5,8 @@ use forklift_core::model::blob::Blob;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    alias_utils, inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
-    scope_utils, shift_utils, stack_utils, stocktake_utils,
+    alias_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils,
+    pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -67,6 +67,9 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     let our_tree_hash = object_utils::load_parcel(&our_head)?.tree_hash;
 
+    // Anchored before the cleanliness check, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+
     ensure_warehouse_is_clean(&our_tree_hash).await?;
 
     if merge_utils::is_ancestor(&their_head, &our_head)? {
@@ -81,7 +84,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     office_utils::ensure_not_metadata_tree(&their_tree_hash)?;
 
     if merge_utils::is_ancestor(&our_head, &their_head)? {
-        let head = fast_forward(&current, &target, &our_tree_hash, &their_head, &their_tree_hash)?;
+        let head = fast_forward(&current, &target, &our_tree_hash, &their_head, &their_tree_hash, anchor)?;
 
         output::emit(&ConsolidateReport::fast_forward(&current, target, &head));
 
@@ -338,7 +341,8 @@ fn fast_forward(current: &str,
                 target: &str,
                 our_tree_hash: &str,
                 their_head: &str,
-                their_tree_hash: &str) -> Result<String, String> {
+                their_tree_hash: &str,
+                anchor: file_utils::StatAnchor) -> Result<String, String> {
     let (ops, removed_dirs) = shift_utils::diff_trees(Some(our_tree_hash), their_tree_hash)?;
 
     alias_utils::refuse_collisions(
@@ -348,7 +352,7 @@ fn fast_forward(current: &str,
 
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
-    let shards = shift_utils::build_inventories_for_tree(their_tree_hash)?;
+    let shards = shift_utils::build_inventories_for_tree(their_tree_hash, shift_utils::TreeProvenance::Written(anchor))?;
     inventory_utils::replace_all_inventories(&shards)?;
 
     pallet_utils::set_pallet_head(current, their_head)?;

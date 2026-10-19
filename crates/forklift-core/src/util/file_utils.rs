@@ -1315,7 +1315,7 @@ struct WriteBatchState {
 
     /// Final paths that won their [`WriteBatch::reserve_final_path`] call but have not (yet, or
     /// ever) been staged — exactly the leak set [`WriteBatch::finish`] refuses to publish
-    /// through. A winning reservation inserts here; `stage`/`stage_with_mtime` removes here (a
+    /// through. A winning reservation inserts here; `stage` removes here (a
     /// no-op if the path was never reserved — i.e. staged directly, without going through
     /// `reserve_final_path` first). Maintained incrementally rather than recomputed from
     /// `final_paths` and `pending` on every `finish` call, so a successful finish — the common
@@ -1344,7 +1344,7 @@ impl WriteBatch {
     /// [`discard_staged_temps`] nor `Drop`'s would ever see it to clean it up — and, unlike a
     /// stranded temp inside an object fan-out folder (which `gc`'s reachability sweep eventually
     /// reclaims regardless, see [`BulkStoreSession::finish`]'s doc comment), a temp staged into
-    /// some other directory (an inventory folder, via [`stage_with_mtime`](Self::stage_with_mtime))
+    /// some other directory (an inventory folder, via [`stage`](Self::stage))
     /// has no *dedicated* sweeper of its own — it survives until whatever incidentally clears that
     /// directory wholesale (e.g. `inventory_utils::replace_subtree_inventories`'s `remove_dir_all`
     /// of the whole staging folder), not on any schedule this crate guarantees.
@@ -1357,59 +1357,6 @@ impl WriteBatch {
         if let Err(e) = create_and_write_file(&temp_path, content) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(e);
-        }
-
-        let mut state = self.state.lock().expect("write batch lock poisoned");
-        state.final_paths.insert(file_path.to_path_buf());
-        state.reserved_not_staged.remove(file_path);
-        state.pending.push((temp_path, file_path.to_path_buf()));
-
-        Ok(())
-    }
-
-    /// Like [`stage`](Self::stage), but sets the staged temp file's modification time to
-    /// `mtime` — through the same write handle the content was just written with, never a
-    /// reopen-by-path (the project's Windows fsync convention applies here too: a fresh
-    /// `File::open` on Windows can fail to observe the write that just happened without an
-    /// intervening flush) — before it is queued for the barrier.
-    ///
-    /// This exists for a rewrite that must be invisible, timing-wise, to a later mtime-based
-    /// staleness check (`inventory_utils`'s rollup-clear maintenance: see
-    /// `stage_rollup_clear`'s doc comment). Setting the mtime on the *temp* file, before the
-    /// barrier's fsync and rename, means the final path never has an observable window where its
-    /// mtime is wrong — `rename` does not itself change a file's mtime, so whatever the temp
-    /// file's mtime was at rename time is exactly what the final path carries. A caller that
-    /// instead set the mtime on the final path *after* `finish()` would leave a real crash
-    /// window: a crash between the rename becoming durable and the mtime fix-up would durably
-    /// publish the wrong (advanced) mtime.
-    ///
-    /// A failure after the temp file was created — from the write itself or from `set_modified` —
-    /// best-effort removes the temp before the error returns, for the same reason [`stage`](Self::stage)
-    /// does (see its doc comment): this path never reaches `pending`, so neither `finish` nor `Drop`
-    /// will ever see it, and no dedicated sweeper exists for it either.
-    ///
-    /// # Returns
-    /// * `Ok(())`      - The write was staged, with its temp file's mtime already set.
-    /// * `Err(String)` - If the temp file could not be created, written, or have its
-    ///                   modification time set.
-    pub fn stage_with_mtime(&self,
-                            file_path: &Path,
-                            content: &[u8],
-                            mtime: std::time::SystemTime) -> Result<(), String> {
-        let temp_path = temp_path_for(file_path)?;
-        let file = match create_and_write_file(&temp_path, content) {
-            Ok(file) => file,
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(e);
-            }
-        };
-
-        if let Err(e) = file.set_modified(mtime) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(format!(
-                "Error while setting the modification time of \"{}\": {}", temp_path.to_string_lossy(), e
-            ));
         }
 
         let mut state = self.state.lock().expect("write batch lock poisoned");
@@ -1435,11 +1382,11 @@ impl WriteBatch {
     /// multiplier on both wall time and peak disk usage that dedupe-by-existence is supposed to
     /// prevent entirely.
     ///
-    /// Checked and inserted under one lock acquisition (the same lock `stage`/`stage_with_mtime`
+    /// Checked and inserted under one lock acquisition (the same lock `stage`
     /// use) so two threads reserving the same path at the same instant can never both "win" —
     /// unlike a separate check-then-stage, which would leave a real (if narrow) race window.
     /// Reserving a path does not itself stage anything; the winning caller is still responsible
-    /// for calling `stage`/`stage_with_mtime` afterward (which records the same path into
+    /// for calling `stage` afterward (which records the same path into
     /// `final_paths` again — a harmless re-insert — and clears it from the leak set below).
     ///
     /// A win also adds `final_path` to `reserved_not_staged` — the set
@@ -1499,7 +1446,7 @@ impl WriteBatch {
     ///
     /// The check itself is `reserved_not_staged`, maintained incrementally rather than
     /// recomputed here: every winning `reserve_final_path` call adds to it, every
-    /// `stage`/`stage_with_mtime` call removes from it, so by the time `finish` runs it already
+    /// `stage` call removes from it, so by the time `finish` runs it already
     /// holds exactly the promises nothing fulfilled — an O(1) empty check on the common,
     /// successful path, not a diff over the whole batch recomputed on every call.
     ///
@@ -2479,19 +2426,102 @@ pub fn get_content_modification_timestamp_for_file(file_metadata: &Metadata) -> 
         ).map(|time| time.as_secs())
 }
 
-/// The modification time of the inventory shard at `shard_path`, in seconds, for the stat cache's
-/// racily-clean guard (see `inventory_utils::is_entry_unchanged`). An unreadable time is 0, which
-/// trusts no entry, so every file is compared by content.
+/// The name of the probe file, directly under the warehouse's metadata root, whose mtime is the
+/// anchor every stat is proven against (see [`StatAnchor`]).
+pub const FILE_NAME_CLOCK_PROBE: &str = "clock";
+
+/// What an entry's stat is proven against when it is taken: the whole-second mtime of a probe
+/// file stamped *before* the stat, on the metadata root's file system.
 ///
-/// # Arguments
-/// * `shard_path` - The path of the shard file.
+/// A stat proves the content it is recorded with only if no later edit could leave the same
+/// mtime behind. An edit after the probe gets an mtime of at least the probe's, so an entry whose
+/// mtime `M` satisfies `M + 1 < P` was last written strictly before any time an edit can still
+/// land at; the extra second covers a working file system that rounds to two-second steps. An
+/// entry that fails the rule is recorded with [`UNPROVEN_MTIME`] and hashed until a later
+/// anchored stat proves it. The trust decision therefore lives in the entry's own bytes, and no
+/// later write of its shard, whatever mtime that write leaves, can raise it.
+///
+/// Both anchors are file-system timestamps, so the process clock never enters the comparison.
+///
+/// [`UNPROVEN_MTIME`]: crate::model::inventory::UNPROVEN_MTIME
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatAnchor {
+    /// The probe's whole-second mtime.
+    At(u64),
+    /// No anchor: every stat is recorded as unproven. For callers whose entries are never
+    /// persisted, so they never write the probe.
+    Unproven,
+}
+
+impl StatAnchor {
+    /// Whether a stat with content mtime `mtime` (whole seconds), taken after this anchor, proves
+    /// the content it is recorded with.
+    pub fn proves(self, mtime: u64) -> bool {
+        match self {
+            StatAnchor::At(anchor) => mtime.saturating_add(1) < anchor,
+            StatAnchor::Unproven => false,
+        }
+    }
+
+    /// The `content_change_timestamp` to record for a stat with content mtime `mtime`: the mtime
+    /// itself when this anchor proves it, [`UNPROVEN_MTIME`] otherwise.
+    ///
+    /// [`UNPROVEN_MTIME`]: crate::model::inventory::UNPROVEN_MTIME
+    pub fn record(self, mtime: u64) -> u64 {
+        if self.proves(mtime) { mtime } else { crate::model::inventory::UNPROVEN_MTIME }
+    }
+}
+
+/// The last stamp of each probe file this process has written: when (monotonic) and the anchor
+/// it produced. Keyed by the probe's absolute path, as one process can work several warehouses.
+static CLOCK_PROBE_STAMPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, u64)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Take a [`StatAnchor`] for a stat about to be made in this warehouse: stamp the clock probe
+/// under the metadata root and read its mtime from the open handle.
+///
+/// The anchor is cached and the probe re-stamped at most once a second of monotonic time; an
+/// older anchor is only ever smaller, so reusing one trusts fewer entries, never more. An anchor
+/// is handed out only once its stamp has completed.
 ///
 /// # Returns
-/// * `u64` - The shard's mtime, or 0.
-pub fn get_shard_mtime_or_zero(shard_path: &Path) -> u64 {
-    get_symlink_metadata_for_path(shard_path).ok()
-        .and_then(|metadata| get_content_modification_timestamp_for_file(&metadata).ok())
-        .unwrap_or(0)
+/// * `Ok(StatAnchor)` - The anchor.
+/// * `Err(String)`    - The probe could not be stamped or read. Proceeding without an anchor
+///   would mean recording stats as proofs nothing backs, so the command must fail.
+pub fn take_stat_anchor() -> Result<StatAnchor, String> {
+    take_stat_anchor_at(&forklift_root().join(FILE_NAME_CLOCK_PROBE))
+}
+
+/// [`take_stat_anchor`] against an explicit probe path.
+pub fn take_stat_anchor_at(probe: &Path) -> Result<StatAnchor, String> {
+    let key = std::path::absolute(probe)
+        .map_err(|err| format!("Could not resolve the clock probe {}: {}", probe.display(), err))?;
+    let mut stamps = CLOCK_PROBE_STAMPS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some((stamped, anchor)) = stamps.get(&key) {
+        if stamped.elapsed() < std::time::Duration::from_secs(1) {
+            return Ok(StatAnchor::At(*anchor));
+        }
+    }
+
+    let stamped = std::time::Instant::now();
+    let anchor = stamp_clock_probe(&key)?;
+    stamps.insert(key, (stamped, anchor));
+
+    Ok(StatAnchor::At(anchor))
+}
+
+/// Write the clock probe and return its whole-second mtime, read from the handle that wrote it.
+fn stamp_clock_probe(probe: &Path) -> Result<u64, String> {
+    use std::io::Write;
+
+    let failed = |err: std::io::Error| format!("Could not stamp the clock probe {}: {}", probe.display(), err);
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(probe)
+        .map_err(failed)?;
+    file.write_all(b"x").map_err(failed)?;
+    let metadata = file.metadata().map_err(failed)?;
+
+    get_content_modification_timestamp_for_file(&metadata)
 }
 
 /// Get the (device, inode) identity of a directory entry, without following a symlink.
@@ -3045,6 +3075,47 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    /// The probe source's two promises: an anchor taken before a write is at most that write's
+    /// whole-second mtime, and the probe is stamped at most once a second, so a burst of stats
+    /// costs one probe write.
+    #[test]
+    fn a_stat_anchor_never_runs_ahead_of_a_later_write_and_is_stamped_once_a_second() {
+        let dir = std::env::temp_dir().join(format!("forklift-clock-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join(FILE_NAME_CLOCK_PROBE);
+
+        let stamped = std::time::Instant::now();
+        let StatAnchor::At(anchor) = take_stat_anchor_at(&probe).unwrap() else {
+            panic!("a stamped probe must give an anchor");
+        };
+        let written = dir.join("written");
+        std::fs::write(&written, b"after").unwrap();
+        let mtime = get_content_modification_timestamp_for_file(&std::fs::metadata(&written).unwrap()).unwrap();
+        assert!(anchor <= mtime, "a write after the anchor must not predate it: {} > {}", anchor, mtime);
+        assert!(!StatAnchor::At(anchor).proves(mtime), "a write after the anchor must not be proven");
+
+        // Within the second, the cached anchor is handed out without touching the probe. A host
+        // stalled past most of that second could legitimately re-stamp, so the check only runs
+        // when it is still well inside it.
+        std::fs::remove_file(&probe).unwrap();
+        let reused = take_stat_anchor_at(&probe).unwrap();
+        if stamped.elapsed() < std::time::Duration::from_millis(900) {
+            assert!(matches!(reused, StatAnchor::At(cached) if cached == anchor));
+            assert!(!probe.exists(), "the probe must not be re-stamped within a second");
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let StatAnchor::At(later) = take_stat_anchor_at(&probe).unwrap() else { unreachable!() };
+        assert!(probe.exists(), "the probe must be re-stamped once a second has passed");
+        assert!(later >= anchor);
+
+        // A probe that cannot be stamped fails loudly rather than handing out an anchor.
+        assert!(take_stat_anchor_at(&dir.join("absent").join(FILE_NAME_CLOCK_PROBE)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_stale_temp_file_from_a_dead_process_with_the_same_id_does_not_block_a_write() {
@@ -3680,7 +3751,7 @@ mod tests {
 
     #[test]
     fn a_staged_write_also_counts_as_reserved() {
-        // `stage`/`stage_with_mtime` populate the same reservation set `reserve_final_path`
+        // `stage` populate the same reservation set `reserve_final_path`
         // checks — a caller that stages a path directly (not through `reserve_final_path` first)
         // still blocks a later reservation attempt for that same path.
         let temp = std::env::temp_dir().join(format!("forklift-writebatch-reserve-stage-{}", std::process::id()));
