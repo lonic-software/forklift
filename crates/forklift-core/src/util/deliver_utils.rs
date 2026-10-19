@@ -194,7 +194,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     // The delivered tree equals the draft's, so switching the current pallet needs no
     // materialization — the working directory already matches, and the bay stands on the
     // delivered parcel.
-    pallet_utils::write_position(&pallet_utils::BayPosition::new(target, Some(object.hash.clone())))?;
+    pallet_utils::record_landed(target, &object.hash)?;
 
     Ok(DeliverOutcome {
         delivered: object.hash,

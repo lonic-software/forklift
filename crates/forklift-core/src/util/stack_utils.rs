@@ -36,7 +36,8 @@ pub enum StackError {
         head: Option<String>,
     },
 
-    /// Any other failure; nothing was stacked.
+    /// Any other failure; nothing was stacked, unless the message says the parcel stands (a step
+    /// after the ref write failed: see [`pallet_utils::landed_but`]).
     Other(String),
 }
 
@@ -462,7 +463,7 @@ pub async fn stack_parcel(description: Option<String>,
 
             if landed {
                 if let Err(cleanup) = clean_up_after_stack(&prepared, &stamp_hashes)
-                    .and_then(|()| pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet, Some(object.hash.clone())))) {
+                    .and_then(|()| pallet_utils::record_landed(&pallet, &object.hash)) {
                     return Err(StackError::Other(format!("{} {}", error, cleanup)));
                 }
             }
@@ -475,8 +476,9 @@ pub async fn stack_parcel(description: Option<String>,
     // whose files already match the new parcel and nothing in progress, which catching up
     // (`shift <pallet>`) records without touching a file. The other order would leave the base at
     // the new parcel with a merge still recorded on the old one.
-    clean_up_after_stack(&prepared, &stamp_hashes)?;
-    pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet, Some(object.hash.clone())))?;
+    clean_up_after_stack(&prepared, &stamp_hashes)
+        .map_err(|e| pallet_utils::landed_but(&pallet, &object.hash, &e))?;
+    pallet_utils::record_landed(&pallet, &object.hash)?;
 
     Ok((object.hash, pallet))
 }

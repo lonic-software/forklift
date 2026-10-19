@@ -123,15 +123,16 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     report.head = remote_head.clone();
 
+    // The fast-forward materializes from the tree this bay holds, and moves the pallet from there.
+    // Checked before "up to date" too: a pallet another bay already lowered leaves this one's
+    // files behind, which only catching up fixes.
     let position = pallet_utils::read_position()?;
+    position.require_current("lowered")?;
 
-    if position.head()?.as_deref() == Some(remote_head.as_str()) {
+    if position.base.as_deref() == Some(remote_head.as_str()) {
         report.outcome = Some(LowerOutcome::UpToDate);
         return Ok(());
     }
-
-    // The fast-forward materializes from the tree this bay holds, and moves the pallet from there.
-    position.require_current("lowered")?;
 
     let local_head = position.base.clone();
 

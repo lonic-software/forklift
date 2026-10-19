@@ -31,14 +31,12 @@ pub async fn handle_command(description: Option<String>) -> Result<(), String> {
 
             return Err(moved_under_merge(&pallet, moved.found.as_deref()).await?.unwrap_or(moved.to_string()));
         }
-        Err(error @ StackError::Behind { .. }) => {
-            let StackError::Behind { pallet, head, .. } = &error else { unreachable!() };
-
-            if let Some(refusal) = moved_under_merge(pallet, head.as_deref()).await? {
+        Err(StackError::Behind { pallet, base, head }) => {
+            if let Some(refusal) = moved_under_merge(&pallet, head.as_deref()).await? {
                 return Err(refusal);
             }
 
-            return Err(error.into());
+            return Err(StackError::Behind { pallet, base, head }.into());
         }
         Err(error) => return Err(error.into()),
     };

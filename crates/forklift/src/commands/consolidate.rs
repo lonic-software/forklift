@@ -355,9 +355,7 @@ pub(crate) async fn stack_completion(description: Option<String>,
                                      anchor: file_utils::StatAnchor) -> Result<String, String> {
     let (error, pallet, parcel, tree) = match stack_utils::stack_parcel(description, Some(our_head)).await {
         Ok((parcel, _)) => return Ok(parcel),
-        Err(StackError::Other(error)) => return Err(error),
-        // Not with an expected base: the caller checked the bay was current before it started.
-        Err(error @ StackError::Behind { .. }) => return Err(error.into()),
+        Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => return Err(error.into()),
         Err(StackError::HeadWrite { error, pallet, parcel, tree }) => (error, pallet, parcel, tree),
     };
 

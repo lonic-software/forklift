@@ -724,6 +724,37 @@ fn lift_franchise_lower_round_trip() {
     assert!(stdout(&lowered_again).contains("Already up to date"), "{}", stdout(&lowered_again));
 }
 
+// A bay whose pallet another bay already lowered to the remote's head is behind, not up to date.
+// Revert: lower's "up to date" check on the pallet's ref ahead of its currency check → it reports
+// up to date and the bay's files stay behind.
+#[test]
+fn lowering_in_a_bay_another_bay_already_lowered_names_the_catch_up() {
+    let area = TestArea::new("lower-stale-bay");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/f.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+
+    let bay_dir = area.path("b-bay");
+    assert_success(&area.forklift("b", &["bay", "add", "w", bay_dir.to_str().unwrap()]));
+    assert_success(&area.forklift("b-bay", &["shift", "main"]));
+
+    area.write_file("a/f.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "f.txt"]));
+    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+
+    let lowered = area.forklift("b-bay", &["lower"]);
+    assert!(!lowered.status.success() && stderr(&lowered).contains("forklift shift main"), "{}{}",
+        stdout(&lowered), stderr(&lowered));
+    assert_eq!(area.read_file("b-bay/f.txt"), "v1\n");
+}
+
 #[test]
 fn the_direct_head_answers_upload_targets_all_direct() {
     // The direct head (`forklift-server`) has no staging prefix, so its `upload-targets`

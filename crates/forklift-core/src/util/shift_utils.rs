@@ -1199,7 +1199,7 @@ pub fn write_head_or_roll_back(pallet: &str,
                                start_tree: Option<&str>,
                                anchor: file_utils::StatAnchor) -> Result<(), String> {
     let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new) else {
-        return crate::util::pallet_utils::write_position(&crate::util::pallet_utils::BayPosition::new(pallet, Some(new.to_string())));
+        return crate::util::pallet_utils::record_landed(pallet, new);
     };
 
     match settle_head_write(pallet, new, error, written_tree, start_tree, anchor)? {
@@ -1245,7 +1245,7 @@ pub fn settle_head_write(pallet: &str,
     use crate::util::pallet_utils::{self, RefUpdateError};
 
     // Wherever the tree is kept at `new`, the bay now stands on it.
-    let stands_on_new = || pallet_utils::write_position(&pallet_utils::BayPosition::new(pallet, Some(new.to_string())));
+    let stands_on_new = || pallet_utils::record_landed(pallet, new);
 
     let error = match error {
         RefUpdateError::Moved(moved) if moved.found.as_deref() == Some(new) => {

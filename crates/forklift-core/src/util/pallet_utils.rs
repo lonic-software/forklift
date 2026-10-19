@@ -317,6 +317,23 @@ pub fn write_position(position: &BayPosition) -> Result<(), String> {
     write_position_in(&bay_root(), position)
 }
 
+/// Record that the active bay now stands on `head`, the parcel this command just moved `pallet`
+/// to. The ref already holds `head`, so a failure says so (see [`landed_but`]).
+pub fn record_landed(pallet: &str, head: &str) -> Result<(), String> {
+    write_position(&BayPosition::new(pallet, Some(head.to_string()))).map_err(|e| landed_but(pallet, head, &e))
+}
+
+/// The error for a step that failed after this command moved `pallet` to `head`: the move stands,
+/// and catching up (`shift <pallet>`) brings the bay to it — recording the position alone when
+/// the files already match it.
+pub fn landed_but(pallet: &str, head: &str, error: &str) -> String {
+    format!(
+        "Pallet \"{}\" now holds parcel {}, but a step after that write failed: {} The parcel \
+        stands; run \"forklift shift {}\" to bring this bay up to it.",
+        pallet, head, error, pallet
+    )
+}
+
 /// [`write_position`] into the bay-local state dir `dir`, whichever bay it belongs to.
 pub fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
     validate_pallet_name(&position.pallet)?;
@@ -720,6 +737,21 @@ mod tests {
 
     fn ref_bytes(name: &str) -> Vec<u8> {
         std::fs::read(get_pallet_ref_path(PalletNamespace::User, name)).unwrap()
+    }
+
+    #[test]
+    fn a_position_that_cannot_be_recorded_after_the_ref_moved_says_the_parcel_stands() {
+        let (root, _scope) = scratch("record-landed");
+        update_pallet_head("main", None, &hash('a')).unwrap();
+
+        // A non-empty directory where the position goes: the atomic rename onto it fails.
+        std::fs::create_dir_all(get_position_path().join("blocker")).unwrap();
+
+        let error = record_landed("main", &hash('a')).unwrap_err();
+        assert!(error.contains(&format!("now holds parcel {}", hash('a'))) && error.contains("The parcel stands")
+            && error.contains("forklift shift main"), "{}", error);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

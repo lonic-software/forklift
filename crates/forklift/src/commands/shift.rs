@@ -23,6 +23,9 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     let position = pallet_utils::read_position()?;
 
     if target == position.pallet {
+        // Catching up is not journaled: it moves no ref, and undoing it could only put back a base
+        // the pallet has already moved past.
+        forklift_core::util::journal_utils::not_journaled();
         output::emit(&catch_up(position).await?);
         return Ok(());
     }
@@ -123,25 +126,19 @@ pub async fn catch_up(position: pallet_utils::BayPosition) -> Result<CaughtUp, S
     // Anchored before the cleanliness check, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    if !has_local_changes(base_tree.as_deref()).await? {
-        let (ops, removed_dirs) = shift_utils::diff_trees(base_tree.as_deref(), &head_tree)?;
+    // Unstaged changes rule out both arms below, whichever tree they are measured against.
+    let unstaged = has_unstaged_changes().await?;
 
-        alias_utils::refuse_collisions(
-            &format!("Catching up with \"{}\"", pallet),
-            &shift_utils::collect_collisions(&ops, &removed_dirs)?,
+    if !unstaged && !has_staged_changes(base_tree.as_deref()).await? {
+        move_files(
+            base_tree.as_deref(), &head_tree, &format!("Catching up with \"{}\"", pallet), anchor,
+            &pallet_utils::BayPosition::new(&pallet, head.clone()),
         )?;
-
-        shift_utils::apply_ops(&ops, &removed_dirs)?;
-
-        let shards = shift_utils::build_inventories_for_tree(&head_tree, shift_utils::TreeProvenance::Written(anchor))?;
-        inventory_utils::replace_all_inventories(&shards)?;
-
-        pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet, head.clone()))?;
 
         return Ok(caught_up(true));
     }
 
-    if !has_local_changes(Some(&head_tree)).await? {
+    if !unstaged && !has_staged_changes(Some(&head_tree)).await? {
         pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet, head.clone()))?;
 
         return Ok(caught_up(false));
@@ -222,30 +219,38 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
 
     ensure_warehouse_is_clean(current_tree_hash.as_deref()).await?;
 
-    let (ops, removed_dirs) = shift_utils::diff_trees(
-        current_tree_hash.as_deref(),
-        &target_tree_hash
+    move_files(
+        current_tree_hash.as_deref(), &target_tree_hash, &format!("Shifting to \"{}\"", target), anchor,
+        &pallet_utils::BayPosition::new(target, Some(target_head.clone())),
     )?;
+
+    Ok(target_head)
+}
+
+/// Move a clean bay's files from `from_tree` (`None` for the empty tree) to `to_tree`, and record
+/// `position` once they stand there. `doing` opens a collision refusal; `anchor` was taken before
+/// the caller's cleanliness check.
+fn move_files(from_tree: Option<&str>,
+              to_tree: &str,
+              doing: &str,
+              anchor: file_utils::StatAnchor,
+              position: &pallet_utils::BayPosition) -> Result<(), String> {
+    let (ops, removed_dirs) = shift_utils::diff_trees(from_tree, to_tree)?;
 
     // New files must never overwrite untracked content, nor land on another entry through a
     // case alias. This is checked up front, before anything is touched, so a conflict aborts
-    // the shift with the warehouse unchanged.
-    alias_utils::refuse_collisions(
-        &format!("Shifting to \"{}\"", target),
-        &shift_utils::collect_collisions(&ops, &removed_dirs)?,
-    )?;
+    // the move with the warehouse unchanged.
+    alias_utils::refuse_collisions(doing, &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
 
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
     // Repopulate the staging area from the target tree ("repopulate on shift"): entries
     // carry the just-materialized files' stat data and the hashes from the tree, so the
     // whole warehouse is "clean" without reading a single file back.
-    let shards = shift_utils::build_inventories_for_tree(&target_tree_hash, shift_utils::TreeProvenance::Written(anchor))?;
+    let shards = shift_utils::build_inventories_for_tree(to_tree, shift_utils::TreeProvenance::Written(anchor))?;
     inventory_utils::replace_all_inventories(&shards)?;
 
-    pallet_utils::write_position(&pallet_utils::BayPosition::new(target, Some(target_head.clone())))?;
-
-    Ok(target_head)
+    pallet_utils::write_position(position)
 }
 
 /// Ensure there are no staged or unstaged changes (untracked files are allowed).
@@ -271,12 +276,21 @@ async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<()
 /// Whether the bay has staged changes against `tree_hash` (`None` for the empty tree) or unstaged
 /// ones (untracked files do not count).
 async fn has_local_changes(tree_hash: Option<&str>) -> Result<bool, String> {
-    let staged = stocktake_utils::collect_staged_changes(tree_hash).await?;
-    let unstaged = stocktake_utils::collect_unstaged_changes().await?
-        .into_iter()
-        .any(|change| change.kind != ChangeKind::Untracked);
+    let (staged, unstaged) = tokio::try_join!(has_staged_changes(tree_hash), has_unstaged_changes())?;
 
-    Ok(!staged.is_empty() || unstaged)
+    Ok(staged || unstaged)
+}
+
+/// Whether the bay has staged changes against `tree_hash` (`None` for the empty tree).
+async fn has_staged_changes(tree_hash: Option<&str>) -> Result<bool, String> {
+    Ok(!stocktake_utils::collect_staged_changes(tree_hash).await?.is_empty())
+}
+
+/// Whether the bay has unstaged changes; untracked files do not count.
+async fn has_unstaged_changes() -> Result<bool, String> {
+    Ok(stocktake_utils::collect_unstaged_changes().await?
+        .into_iter()
+        .any(|change| change.kind != ChangeKind::Untracked))
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).

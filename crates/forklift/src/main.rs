@@ -319,13 +319,7 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     // throughout: a journaling problem must never block or fail a command. A missed entry costs
     // only undo's reach — undo refuses an older entry once the bay no longer matches it — and an
     // unreadable journal is reported by undo itself.
-    //
-    // Catching up (`shift` to the current pallet) is not journaled: it moves no ref, and undoing it
-    // could only put back a base the pallet has already moved past.
-    let catching_up = matches!(&cli.command, Command::Shift { pallet }
-        if forklift_core::util::pallet_utils::read_position().is_ok_and(|position| position.pallet == *pallet));
     let journal_pre = cli.command.journal_op()
-        .filter(|_| !catching_up)
         .and_then(|op| forklift_core::util::journal_utils::capture().ok().map(|pre| (op, pre)));
 
     // A mutating command adds loose objects; captured before `dispatch` consumes `cli`.

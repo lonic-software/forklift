@@ -198,6 +198,8 @@ struct JournalContents {
 /// * `Ok(Snapshot)` - The snapshot.
 /// * `Err(String)`  - If the current pallet, consolidation or cherry-pick state could not be read.
 pub fn capture() -> Result<Snapshot, String> {
+    NOT_JOURNALED.store(false, std::sync::atomic::Ordering::SeqCst);
+
     let position = pallet_utils::read_position()?;
     let heads = position.base
         .map(|base| BTreeMap::from([(position.pallet.clone(), base)]))
@@ -214,6 +216,15 @@ pub fn capture() -> Result<Snapshot, String> {
     pallet_utils::start_write_log();
 
     Ok(snapshot)
+}
+
+/// Set by [`not_journaled`]; cleared by [`capture`] and consumed by [`push_if_changed`].
+static NOT_JOURNALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the running command as one [`push_if_changed`] must not journal, though its kind is
+/// journaled: the command itself knows which form it took.
+pub fn not_journaled() {
+    NOT_JOURNALED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Stop recording head writes without journaling them — for an operation that failed, which
@@ -239,6 +250,10 @@ pub fn discard() {
 /// * `before` - The snapshot captured by [`capture`] before the command ran.
 pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
     let writes = pallet_utils::take_write_log();
+
+    if NOT_JOURNALED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
 
     // The undo journal reverses an operation by restoring refs, which cannot un-create a
     // pallet's very first parcel (that would need deleting the ref). So an operation starting
@@ -276,8 +291,8 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
         .collect();
 
     // An unwritten current pallet is recorded at the base the bay stood on, on each side it was
-    // current (the other side mirrors it): the gate compares the base, and its ref, which the
-    // operation never wrote, is no part of what undo puts back.
+    // current (the other side mirrors it): the gate compares the base. Its two sides differ only
+    // when the bay's base moved to a parcel this operation built, which undo then puts back.
     for pallet in unwritten {
         let was = (pallet == before.current_pallet).then(|| before_base.clone()).flatten();
         let is = (pallet == after.current_pallet).then(|| position.base.clone()).flatten();
@@ -446,8 +461,11 @@ fn current_pallet_moved(pallet: &str, op: &str) -> String {
 /// The bay's position goes back first, to the base `entry.before` records — the tree the bay held
 /// before the operation, never a fresh read of the ref. Then the current pallet's ref: if it moved
 /// after [`check_undoable`] passed, the undo is refused with that check's refusal, before any other
-/// ref or any merge state is touched. A ref the operation never wrote (its heads are equal on both
-/// sides) is not put back at all, so a ref another bay moved since cannot refuse it.
+/// ref or any merge state is touched. A ref whose heads are equal on both sides is not put back at
+/// all, so a ref another bay moved since cannot refuse it. That covers every ref the operation
+/// never wrote but one: a stack whose compare-and-set found its own parcel already on the pallet
+/// moves the bay's base without a logged write, and that parcel, the operation's own, is put back
+/// like a written one.
 ///
 /// When putting the refs back fails, the position is decided by what the current pallet's ref
 /// holds now, never by the kind of error (a write can fail after it landed): at the head the
@@ -534,7 +552,7 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
 
         let pre_head = &entry.before.heads[wire];
 
-        // The operation wrote no ref here: there is nothing to put back.
+        // The heads are equal: there is nothing to put back.
         if pre_head == post_head {
             continue;
         }
@@ -906,8 +924,6 @@ mod tests {
         assert_eq!(keys(&popped.after.heads), ["main", "side"]);
     }
 
-    /// Move `pallet` to `head` the way another bay or process would: a ref write outside this
-    /// process's write log.
     /// Move `pallet` to `new` as an operation in this bay does: the ref, and this bay's position
     /// with it when `pallet` is the one it stands on.
     fn advance(pallet: &str, expected: Option<&str>, new: &str) -> Result<(), pallet_utils::RefUpdateError> {
@@ -920,6 +936,8 @@ mod tests {
         Ok(())
     }
 
+    /// Move `pallet` to `head` the way another bay or process would: a ref write outside this
+    /// process's write log.
     fn move_elsewhere(pallet: &str, head: &str) {
         let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, pallet);
         file_utils::write_file_atomically(&path, format!("{}\n", head).as_bytes()).unwrap();
