@@ -626,17 +626,35 @@ pub fn create_first_new_folder(candidates: impl IntoIterator<Item = PathBuf>) ->
     first_new(candidates, |path| std::fs::create_dir(path)).map(|(path, ())| path)
 }
 
+/// How many names [`pid_numbered`] offers: enough to step past any litter a few killed processes
+/// with this one's id could leave, few enough that a folder filled with it fails rather than spins.
+pub const PID_NUMBERED_TRIES: u64 = 64;
+
+/// The names a temp file or folder is created at, numbered for this process: `name(pid, n)` for
+/// this process's id and the next [`PID_NUMBERED_TRIES`] numbers drawn from `counter`. A site keeps
+/// its own `counter`, so no two calls in one process draw the same name.
+pub fn pid_numbered<'a>(counter: &'a std::sync::atomic::AtomicU64,
+                        name: impl Fn(u32, u64) -> PathBuf + 'a) -> impl Iterator<Item = PathBuf> + 'a {
+    let pid = std::process::id();
+    (0..PID_NUMBERED_TRIES).map(move |_| name(pid, counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+}
+
 fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
                 create: impl Fn(&Path) -> std::io::Result<T>) -> std::io::Result<(PathBuf, T)> {
+    let mut last = None;
     for path in candidates {
         match create(&path) {
             Ok(created) => return Ok((path, created)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(path),
             Err(e) => return Err(e),
         }
     }
 
-    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "every name tried is already taken"))
+    let reason = match last {
+        Some(last) => format!("every name tried is already taken, the last \"{}\"", last.display()),
+        None => "there was no name to try".to_string(),
+    };
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, reason))
 }
 
 /// Write a file atomically: the content is written to a temporary file in the same folder first,
@@ -3517,9 +3535,12 @@ mod tests {
         assert!(std::fs::read_dir(&folders[2]).unwrap().next().is_none(), "the folder made is new and empty");
         assert_eq!(std::fs::read(folders[0].join("left.txt")).unwrap(), b"litter");
 
-        // Every name taken: AlreadyExists, after trying each.
+        // Every name taken: AlreadyExists, after trying each, naming the last one tried.
         let exhausted = create_first_new_folder(folders.clone()).unwrap_err();
         assert_eq!(exhausted.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(exhausted.to_string().contains(&folders.last().unwrap().display().to_string()), "{}", exhausted);
+        let nothing = create_first_new_folder(std::iter::empty()).unwrap_err();
+        assert_eq!(nothing.to_string(), "there was no name to try");
 
         // Any other failure returns at once, without trying the names after it.
         let mut tried = 0;

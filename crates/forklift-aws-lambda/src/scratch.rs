@@ -53,7 +53,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use forklift_core::globals::StorageRootScope;
@@ -82,11 +82,14 @@ impl Scratch {
     /// at the same name is stepped past, never adopted: its objects were mirrored for another
     /// invocation, and presence here is taken as presence in the object store.
     pub fn new() -> Result<Scratch, String> {
-        let candidates = (0..64).map(|_| std::env::temp_dir().join(format!(
-            "forklift-head-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        )));
+        Scratch::new_numbered(&COUNTER)
+    }
+
+    /// [`Scratch::new`] drawing its name from `counter`.
+    fn new_numbered(counter: &AtomicU64) -> Result<Scratch, String> {
+        let candidates = file_utils::pid_numbered(counter, |pid, n| {
+            std::env::temp_dir().join(format!("forklift-head-{}-{}", pid, n))
+        });
         let dir = file_utils::create_first_new_folder(candidates)
             .map_err(|e| format!("Error while creating the scratch warehouse: {}", e))?;
 
@@ -349,16 +352,19 @@ mod tests {
     /// another invocation, and the litter is left alone.
     #[test]
     fn a_dead_runtime_s_scratch_at_the_next_name_is_not_adopted() {
-        let next = COUNTER.load(Ordering::Relaxed);
+        // A counter of the test's own, far from the shared one: other tests drawing from that would
+        // move the next name past the litter, or hold a live scratch where the litter goes.
+        let next = 1 << 40;
+        let counter = AtomicU64::new(next);
         let litter: Vec<_> = (next..next + 8)
             .map(|n| std::env::temp_dir().join(format!("forklift-head-{}-{}", std::process::id(), n)))
             .collect();
         for folder in &litter {
-            std::fs::create_dir_all(folder).unwrap();
+            std::fs::create_dir(folder).unwrap();
             std::fs::write(folder.join("left.txt"), b"litter").unwrap();
         }
 
-        let scratch = Scratch::new();
+        let scratch = Scratch::new_numbered(&counter);
         let error = scratch.as_ref().err().cloned();
         let adopted = scratch.as_ref().is_ok_and(|scratch| scratch.root().join("left.txt").exists());
         let intact = litter.iter().all(|folder| std::fs::read(folder.join("left.txt")).is_ok_and(|c| c == b"litter"));

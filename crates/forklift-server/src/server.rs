@@ -1517,8 +1517,12 @@ static NEXT_CREATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 ///
 /// Blocking: call it from blocking code.
 fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, HandlerError> {
-    use std::sync::atomic::Ordering;
+    create_warehouse_numbered(base, id, &NEXT_CREATION)
+}
 
+/// [`create_warehouse`] drawing its staging names from `counter`.
+fn create_warehouse_numbered(base: &std::path::Path, id: &str,
+                             counter: &std::sync::atomic::AtomicU64) -> Result<Creation, HandlerError> {
     let target = base.join(id);
     if target.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir() {
         return Ok(Creation::Existed);
@@ -1526,9 +1530,8 @@ fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, Handle
 
     // A name taken by a killed earlier process with this one's id, which the startup sweep could
     // not remove, is stepped past rather than failing every creation of `id`.
-    let candidates = (0..64).map(|_| base.join(format!(
-        "{}{}-{}-{}",
-        CREATING_PREFIX, id, std::process::id(), NEXT_CREATION.fetch_add(1, Ordering::Relaxed)
+    let candidates = file_utils::pid_numbered(counter, |pid, n| base.join(format!(
+        "{}{}-{}-{}", CREATING_PREFIX, id, pid, n
     )));
     let staging = file_utils::create_first_new_folder(candidates)
         .map_err(|e| internal(format!("Error while creating the warehouse folder: {}", e)))?;
@@ -4049,8 +4052,10 @@ mod tests {
     #[test]
     fn a_dead_process_s_staging_folder_at_the_next_name_is_stepped_past() {
         let base = scratch_dir("create-litter");
-        let next = NEXT_CREATION.load(std::sync::atomic::Ordering::Relaxed);
-        let litter: Vec<_> = (next..next + 8)
+        // A counter of the test's own: other tests drawing from the shared one would move the
+        // next name past the litter, and the test would pass without stepping past anything.
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let litter: Vec<_> = (0..8)
             .map(|n| base.join(format!("{}w-{}-{}", CREATING_PREFIX, std::process::id(), n)))
             .collect();
         for folder in &litter {
@@ -4058,7 +4063,7 @@ mod tests {
             std::fs::write(folder.join("left.txt"), b"litter").unwrap();
         }
 
-        assert_eq!(create_warehouse(&base, "w").unwrap(), Creation::Created);
+        assert_eq!(create_warehouse_numbered(&base, "w", &counter).unwrap(), Creation::Created);
         assert!(base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT).is_dir());
         assert!(!base.join("w").join("left.txt").exists(), "the litter was adopted");
         for folder in &litter {

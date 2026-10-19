@@ -217,7 +217,7 @@ impl<'a> Exporter<'a> {
             return Ok(hash.clone());
         }
 
-        let (temp_path, file) = create_export_temp(recipe_hash)?;
+        let (temp_path, file) = create_export_temp(recipe_hash, &TEMP_COUNTER)?;
 
         let assemble = || -> Result<(), String> {
             let mut writer = std::io::BufWriter::new(file);
@@ -246,16 +246,15 @@ impl<'a> Exporter<'a> {
 /// Numbers [`create_export_temp`]'s files.
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Create a fresh temp file to assemble the chunked blob `recipe_hash` into for `git hash-object`.
-/// A per-process counter, not just the pid, is part of the name, so no two calls in one process
-/// share it. The file is created new, never opened by name: a shared, world-writable temp folder
+/// Create a fresh temp file to assemble the chunked blob `recipe_hash` into for `git hash-object`,
+/// its name numbered from `counter` as well as by the pid, so no two calls in one process share it. The file is created new, never opened by name: a shared, world-writable temp folder
 /// is no place to follow or truncate a planted symlink. A name already taken, by such a plant or
 /// by a killed earlier process with this one's id, is stepped past.
-fn create_export_temp(recipe_hash: &str) -> Result<(std::path::PathBuf, std::fs::File), String> {
-    let candidates = (0..64).map(|_| std::env::temp_dir().join(format!(
-        "forklift-export-{}-{}-{}.tmp",
-        std::process::id(), TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed), recipe_hash
-    )));
+fn create_export_temp(recipe_hash: &str, counter: &std::sync::atomic::AtomicU64)
+    -> Result<(std::path::PathBuf, std::fs::File), String> {
+    let candidates = file_utils::pid_numbered(counter, |pid, n| {
+        std::env::temp_dir().join(format!("forklift-export-{}-{}-{}.tmp", pid, n, recipe_hash))
+    });
 
     file_utils::create_first_new_file(candidates)
         .map_err(|e| format!("Error while creating a temp file for git export: {}", e))
@@ -436,15 +435,16 @@ mod tests {
     #[test]
     fn a_dead_process_s_temp_file_at_the_next_name_is_stepped_past() {
         let recipe = format!("litter-recipe-{}", std::process::id());
-        let next = TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-        let litter: Vec<_> = (next..next + 8)
+        // A counter of the test's own: other tests exporting would move the next name past the litter.
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let litter: Vec<_> = (0..8)
             .map(|n| std::env::temp_dir().join(format!("forklift-export-{}-{}-{}.tmp", std::process::id(), n, recipe)))
             .collect();
         for file in &litter {
             std::fs::write(file, b"litter").unwrap();
         }
 
-        let created = create_export_temp(&recipe);
+        let created = create_export_temp(&recipe, &counter);
         let contents: Vec<_> = litter.iter().map(|file| std::fs::read(file).unwrap()).collect();
         for file in &litter {
             let _ = std::fs::remove_file(file);
