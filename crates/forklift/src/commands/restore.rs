@@ -180,8 +180,8 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
             }
 
             // Recorded right after `restore_entry` statted the file: the batch anchors the shard's
-            // publish time at this update, so a file statted earlier would record an editor's save
-            // in between against the staged hash.
+            // publish time at its last update (see `ShardMutationBatch`'s doc comment), so a file
+            // statted earlier would record an editor's save in between against the staged hash.
             let recorded = restore_entry(shard_key, item, shard_mtime).and_then(|restored| match restored {
                 Restored::Untouched => {
                     matched_count += 1;
