@@ -609,9 +609,17 @@ mod tests {
             let file = regular_file();
             assert_eq!(writable_stream(file.as_raw_fd()), None);
 
-            let (_, writer) = pipe();
-            let closed = writer.as_raw_fd();
-            drop(writer);
+            // Not a number freed here: tests run in parallel, and a concurrent pipe or socket can
+            // take a freed number before the check. The soft limit on open files is the lowest
+            // number the kernel will not hand out, and nothing in this binary changes the limit.
+            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: `getrlimit` writes into the `rlimit` it is given and reads nothing else.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+            let closed = RawFd::try_from(limit.rlim_cur).expect("the open-file limit fits an fd");
+
+            // What a concurrent test does between choosing the number and checking it.
+            let (_reader, writer) = pipe();
+            assert_eq!(writable_stream(writer.as_raw_fd()), Some(Stream::Pipe));
             assert_eq!(writable_stream(closed), None);
         }
 
