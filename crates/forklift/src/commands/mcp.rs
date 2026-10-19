@@ -1187,7 +1187,7 @@ fn tool_definitions() -> Value {
             object(json!({ "name": string, "revision": string, "all": boolean }), json!([]))),
         tool("restore", "Restore a path from the inventory (or, with staged=true, unstage it).",
             object(json!({ "path": string, "staged": boolean }), json!(["path"]))),
-        tool("undo", "Undo the last stack on the current pallet: move the head to the parent, keeping the changes staged (like git reset --soft HEAD~1). Refuses merge parcels.",
+        tool("undo", "Undo the last stack, consolidate, cherry-pick or shift. A stack, consolidate or cherry-pick is a soft reset that keeps the changes staged (like git reset --soft HEAD~1); a shift shifts back. Refuses when the bay has moved past that operation.",
             object(json!({}), json!([]))),
         tool("heal", "Resolve a standing durability taint (durability_taint refusals, exit 21) that automatic recovery could not clear on its own: restage what it can, then walk every durable ref source to tell a vanished-but-unreferenced object (dropped) from one still referenced (reported, with remedies). A torn taint cannot be resolved this way and needs heavyweight recovery instead.",
             object(json!({}), json!([]))),
