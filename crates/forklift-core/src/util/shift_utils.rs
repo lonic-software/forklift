@@ -843,11 +843,18 @@ fn create_first_new(path: &str, candidates: impl Iterator<Item = PathBuf>) -> Re
 }
 
 /// Set a materialized file's mode: executable (`0o755`) for an executable (chunked or plain)
-/// entry, otherwise `0o644`. A no-op on non-Unix.
+/// entry, otherwise `0o644`. A no-op on non-Unix, and on a volume that keeps no executable bit
+/// (see [`file_utils::executable_bit_is_observable`]), where a `chmod` may be refused.
 fn set_file_mode(fs_path: &Path, path: &str, item_type: DirEntryType) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+
+        let metadata = std::fs::symlink_metadata(fs_path)
+            .map_err(|e| format!("Error while reading the permissions of \"{}\": {}", path, e))?;
+        if !file_utils::executable_bit_is_observable(&metadata)? {
+            return Ok(());
+        }
 
         let is_executable = matches!(
             item_type.on_disk_kind(),
@@ -1018,7 +1025,7 @@ fn verified_tree_entry(file_path: &Path,
     let Ok(metadata) = file_utils::get_symlink_metadata_for_path(file_path) else {
         return Ok(tree_entry.clone());
     };
-    let item_type = file_utils::get_type_of_dir_entry(&metadata);
+    let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
 
     if !item_type.is_file() {
         return Ok(tree_entry.clone());
@@ -1254,6 +1261,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("forklift-copy-into-place-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("work")).unwrap();
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = crate::globals::StorageRootScope::enter(&dir);
         let outside = dir.join("outside.txt");
         std::fs::write(&outside, "untouched\n").unwrap();
         let assembled = dir.join("assembled.tmp");

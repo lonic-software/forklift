@@ -1031,6 +1031,118 @@ fn an_edit_to_a_tracked_file_a_rule_covers_stays_visible_and_blocks_shift() {
     assert_eq!(read(&warehouse, "notes.txt"), "local edit\n", "the edit must survive");
 }
 
+/// A disk image formatted exFAT and attached for one test, detached and deleted when dropped.
+#[cfg(target_os = "macos")]
+struct ExfatVolume {
+    image: PathBuf,
+    mount: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl ExfatVolume {
+    /// Create and attach the image, or `None` where `hdiutil` cannot (outside CI only: on CI the
+    /// macOS leg must reach the volume, or the test it serves would pass without running).
+    fn attach(name: &str) -> Option<ExfatVolume> {
+        let base = std::env::temp_dir().join(format!("forklift-test-{}-{}", name, std::process::id()));
+        let image = base.with_extension("dmg");
+        let mount = base.with_extension("mnt");
+        let _ = std::process::Command::new("hdiutil").args(["detach", "-force"]).arg(&mount).output();
+        let _ = std::fs::remove_file(&image);
+        let _ = std::fs::remove_dir_all(&mount);
+
+        let created = std::process::Command::new("hdiutil")
+            .args(["create", "-size", "32m", "-fs", "ExFAT", "-volname", "FKEXFAT", "-quiet"]).arg(&image)
+            .status();
+        let attached = created.is_ok_and(|status| status.success()) && std::process::Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-quiet", "-mountpoint"]).arg(&mount).arg(&image)
+            .status().is_ok_and(|status| status.success());
+
+        if !attached {
+            assert!(std::env::var_os("CI").is_none(), "hdiutil could not attach an exFAT image on CI");
+            eprintln!("skipping: hdiutil could not attach an exFAT image");
+            let _ = std::fs::remove_file(&image);
+            return None;
+        }
+
+        Some(ExfatVolume { image, mount })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ExfatVolume {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil").args(["detach", "-force", "-quiet"]).arg(&self.mount).status();
+        let _ = std::fs::remove_file(&self.image);
+    }
+}
+
+/// On a volume without an executable bit (exFAT, where every file reads `0700` and a chmod is
+/// ignored), what a stat says about the bit is no change. A warehouse copied onto one reads clean
+/// and shifts back and forth; a tracked executable keeps its bit through load and stack, a new
+/// file is recorded plain, and a chmod the volume drops is reported by nobody. Copied back onto a
+/// volume with the bit, a restore writes each file with the bit its entry records.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_volume_without_the_executable_bit_shifts_twice_and_keeps_each_entry_s_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(volume) = ExfatVolume::attach("exfat-exec-bit") else {
+        return;
+    };
+    let mode = |root: &std::path::Path, name: &str| std::fs::metadata(root.join(name)).unwrap().permissions().mode();
+    let copy = |from: &std::path::Path, to: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(to);
+        let status = std::process::Command::new("cp").arg("-R").arg(from).arg(to).status().unwrap();
+        assert!(status.success(), "cp -R {} {}", from.display(), to.display());
+    };
+
+    let built = warehouse_with_a_diverged_pallet("exfat-exec-bit-built");
+    built.write_file("tool.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(built.root.join("tool.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_success(&built.run(&["load", "tool.sh"]));
+    assert_success(&built.run(&["stack", "tool"]));
+
+    let root = volume.mount.join("warehouse");
+    copy(&built.root, &root);
+    let warehouse = TestWarehouse { root: root.clone(), home: built.home.clone() };
+    assert_ne!(mode(&root, "notes.txt") & 0o111, 0, "exFAT must report the bit set on a plain file");
+
+    assert!(changes(&warehouse, "unstaged").is_empty(), "a copied warehouse reads clean");
+    assert_success(&warehouse.run(&["shift", "feature"]));
+    assert_eq!(read(&warehouse, "notes.txt"), "v2\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_eq!(read(&warehouse, "notes.txt"), "v1\n");
+
+    // A chmod is dropped by the volume and reported by nobody.
+    std::fs::set_permissions(root.join("notes.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(changes(&warehouse, "unstaged").is_empty());
+    let diff = stdout(&warehouse.run(&["diff"]));
+    assert!(!diff.contains("mode:"), "{}", diff);
+
+    warehouse.write_file("new.txt", "new\n");
+    warehouse.write_file("tool.sh", "#!/bin/sh\necho\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "on exfat"]));
+    assert!(changes(&warehouse, "unstaged").is_empty());
+    assert!(changes(&warehouse, "staged").is_empty());
+
+    let probes: Vec<_> = std::fs::read_dir(root.join(".forklift")).unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(forklift_core::util::file_utils::FILE_NAME_PREFIX_EXECUTABLE_BIT_PROBE))
+        .collect();
+    assert!(probes.is_empty(), "probe files left behind: {:?}", probes);
+
+    // Back on a volume with the bit, the entries say which files are executable.
+    let back = std::env::temp_dir().join(format!("forklift-test-exfat-exec-bit-back-{}", std::process::id()));
+    copy(&root, &back);
+    let back = TestWarehouse { root: back, home: built.home.clone() };
+    assert_success(&back.run(&["restore", "."]));
+    assert_ne!(mode(&back.root, "tool.sh") & 0o111, 0, "the tracked executable kept its bit");
+    assert_eq!(mode(&back.root, "notes.txt") & 0o111, 0, "a plain file stayed plain");
+    assert_eq!(mode(&back.root, "new.txt") & 0o111, 0, "a new file on a blind volume is recorded plain");
+    assert!(changes(&back, "unstaged").is_empty());
+}
+
 /// A chmod alone is a change on every side: stocktake reports it unstaged, then staged once
 /// loaded, diff names the mode on both, the parcel records it, and shift refuses to reset it.
 #[cfg(unix)]

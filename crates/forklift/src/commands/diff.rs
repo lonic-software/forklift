@@ -736,7 +736,7 @@ fn inventory_content(path: &str, shards: &HashMap<String, Arc<Inventory>>) -> Re
 fn worktree_content(path: &str, entry_kind: DirEntryType) -> Result<(DiffSide, DirEntryType), String> {
     let fs_path = Path::new(path);
     let metadata = file_utils::get_symlink_metadata_for_path(fs_path)?;
-    let item_type = file_utils::effective_kind(file_utils::get_type_of_dir_entry(&metadata), entry_kind);
+    let item_type = file_utils::effective_kind(&metadata, file_utils::get_type_of_dir_entry(&metadata)?, entry_kind)?;
     let name = split_parent(path).1;
 
     // A worktree file at or above the chunk threshold would be tracked chunked (and is too big to
