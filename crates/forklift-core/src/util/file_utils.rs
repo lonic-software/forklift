@@ -613,7 +613,9 @@ fn create_fresh_temp(file_path: &Path,
 /// name is skipped, never opened: opening it would follow a symlink, or truncate a file someone
 /// else owns. A pid-numbered name is taken by litter when a process that had this one's id was
 /// killed before it cleaned up (Windows reuses ids quickly). Any error but `AlreadyExists` returns
-/// at once; running out of candidates returns `AlreadyExists`.
+/// at once; running out of candidates returns `AlreadyExists`. On Windows a *folder* at a candidate
+/// is refused as access denied, so it returns rather than being skipped: no caller draws file and
+/// folder names from one sequence.
 pub fn create_first_new_file(candidates: impl IntoIterator<Item = PathBuf>) -> std::io::Result<(PathBuf, std::fs::File)> {
     first_new(candidates, |path| std::fs::OpenOptions::new().write(true).create_new(true).open(path))
 }
@@ -3497,14 +3499,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let names = |stem: &str| -> Vec<PathBuf> { (0..3).map(|n| dir.join(format!("{}-{}", stem, n))).collect() };
 
-        // Files: a taken file and a taken folder are skipped and left as they were.
+        // Files: taken names are skipped and left as they were.
         let files = names("file");
         std::fs::write(&files[0], b"litter").unwrap();
-        std::fs::create_dir(&files[1]).unwrap();
+        std::fs::write(&files[1], b"more litter").unwrap();
         let (created, _file) = create_first_new_file(files.clone()).expect("taken names must be stepped past");
         assert_eq!(created, files[2]);
         assert_eq!(std::fs::read(&files[0]).unwrap(), b"litter");
-        assert!(std::fs::read_dir(&files[1]).unwrap().next().is_none());
+        assert_eq!(std::fs::read(&files[1]).unwrap(), b"more litter");
 
         // Folders: a taken folder with content is never adopted, and the content stays.
         let folders = names("folder");
