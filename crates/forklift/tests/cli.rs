@@ -7614,8 +7614,8 @@ fn undo_reverses_a_consolidate_and_a_shift() {
 }
 
 // Regression test for a bug where `undo` rolled back pallet refs it never journaled.
-// `JournalEntry` snapshots every pallet ref (user and meta, `@office` included) before a
-// journaled op so it can be restored, but an office/meta-pallet mutation between the
+// A `JournalEntry` once snapshotted every pallet ref (user and meta, `@office` included) before
+// a journaled op so it could be restored, but an office/meta-pallet mutation between the
 // journaled op and the `undo` is not itself journaled. Undo used to restore `@office`
 // unconditionally along with everything else, silently un-retiring a key that was revoked
 // after the stack. `restore_refs` now only rolls a ref back if it still sits exactly where
