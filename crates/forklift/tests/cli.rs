@@ -4133,6 +4133,44 @@ fn export_git_writes_the_history_into_a_git_repo() {
     assert!(!warehouse.run(&["export-git", out_str]).status.success());
 }
 
+/// Tree names holding a newline or tab, or beginning with a quote, export byte for byte. Fed to
+/// `git mktree` newline-delimited, the first two split an entry and the third is C-unquoted into a
+/// different name. Unix only: Windows file names cannot hold these characters.
+#[cfg(unix)]
+#[test]
+fn export_git_keeps_tree_names_with_line_breaks_tabs_and_quotes() {
+    let warehouse = TestWarehouse::new("export-git-hostile-names");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let names = ["line\nbreak.txt", "tab\there.txt", "\"quo\\164ed\"", "dir\nname/inner.txt"];
+    for name in names {
+        warehouse.write_file(name, "content\n");
+    }
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "hostile names"]));
+
+    let out = warehouse.root.join("exported");
+    assert_success(&warehouse.run(&["export-git", out.to_str().unwrap()]));
+
+    let listing = Command::new("git")
+        .args(["ls-tree", "-r", "-z", "--name-only", "main"])
+        .current_dir(&out)
+        .output()
+        .expect("git must be installed to run this test");
+    assert!(listing.status.success(), "git ls-tree: {}", String::from_utf8_lossy(&listing.stderr));
+
+    let mut exported: Vec<String> = String::from_utf8(listing.stdout).unwrap()
+        .split_terminator('\0')
+        .map(str::to_string)
+        .filter(|name| name != ".forkliftignore")
+        .collect();
+    exported.sort();
+    let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    expected.sort();
+    assert_eq!(exported, expected);
+}
+
 #[test]
 fn self_update_check_reports_without_mutating() {
     // A global command — no warehouse needed. The env override injects "the latest

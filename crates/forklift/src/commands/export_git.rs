@@ -177,15 +177,18 @@ impl<'a> Exporter<'a> {
             } else {
                 self.convert_blob(&item.hash)?
             };
-            entries.push_str(&format!("{} {} {}\t{}\n", mode, kind, blob, name));
+            entries.push_str(&format!("{} {} {}\t{}\0", mode, kind, blob, name));
         }
 
         for (name, item) in tree.get_subtrees() {
             let subtree = self.convert_tree(&item.hash)?;
-            entries.push_str(&format!("040000 tree {}\t{}\n", subtree, name));
+            entries.push_str(&format!("040000 tree {}\t{}\0", subtree, name));
         }
 
-        let git_hash = git_stdin(self.path, &["mktree"], entries.as_bytes())?.trim().to_string();
+        // NUL-terminated (`-z`): a name may hold a newline or tab, and without `-z` mktree also
+        // C-unquotes a name that begins with `"`, writing a different name than the tree holds.
+        // A name never holds NUL (the tree parser refuses one), so NUL frames every entry.
+        let git_hash = git_stdin(self.path, &["mktree", "-z"], entries.as_bytes())?.trim().to_string();
 
         self.trees.insert(forklift_hash.to_string(), git_hash.clone());
 
