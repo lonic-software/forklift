@@ -683,7 +683,11 @@ mod tests {
         ]);
 
         let parcel = store_parcel(&root_tree, Vec::new());
-        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel,
+        ).unwrap();
 
         Fixture { parcel, root_tree, src_tree, api_tree, api_blob, web_tree, web_blob, readme_blob }
     }
@@ -736,7 +740,11 @@ mod tests {
         ]);
         let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
         let parcel = store_parcel(&root_tree, Vec::new());
-        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel,
+        ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
@@ -888,7 +896,11 @@ mod tests {
         ]);
         let root_v2 = store_tree(&[("src", &src_v2, DirEntryType::Tree)]);
         let p2 = store_parcel(&root_v2, vec![p1.clone()]);
-        pallet_utils::set_pallet_head("main", &p2).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &p2,
+        ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
@@ -946,7 +958,11 @@ mod tests {
         ]);
         let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
         let parcel = store_parcel(&root_tree, Vec::new());
-        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel,
+        ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
@@ -1016,7 +1032,11 @@ mod tests {
         ]);
         let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
         let parcel = store_parcel(&root_tree, Vec::new());
-        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel,
+        ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
@@ -1072,7 +1092,11 @@ mod tests {
         ]);
         let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
         let parcel = store_parcel(&root_tree, Vec::new());
-        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel,
+        ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
@@ -1130,7 +1154,11 @@ mod tests {
         ]);
         let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
         let parcel = store_parcel(&root_tree, Vec::new());
-        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel,
+        ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
@@ -1174,7 +1202,11 @@ mod tests {
         ]);
         let root_tree = store_tree(&[("src", &src_tree, DirEntryType::Tree)]);
         let parcel = store_parcel(&root_tree, Vec::new());
-        pallet_utils::set_pallet_head("main", &parcel).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel,
+        ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();

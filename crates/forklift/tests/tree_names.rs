@@ -104,7 +104,11 @@ impl Warehouse {
         };
         let parcel_hash = store(LooseObjectBuilder::build_parcel(&crafted));
 
-        pallet_utils::set_pallet_head(name, &parcel_hash).unwrap();
+        pallet_utils::update_pallet_head(
+            name,
+            pallet_utils::get_pallet_head(name).unwrap().as_deref(),
+            &parcel_hash,
+        ).unwrap();
     }
 }
 
@@ -401,7 +405,11 @@ fn a_symlink_at_the_chunked_assembly_temp_path_is_not_written_through() {
 
     {
         let _scope = StorageRootScope::enter(&warehouse.root);
-        pallet_utils::set_pallet_head("before", &first).unwrap();
+        pallet_utils::update_pallet_head(
+            "before",
+            pallet_utils::get_pallet_head("before").unwrap().as_deref(),
+            &first,
+        ).unwrap();
     }
     warehouse.run_ok(&["shift", "before"]);
     assert!(!warehouse.root.join("big.bin").exists());
@@ -443,7 +451,11 @@ fn with_chunked_file(warehouse: &Warehouse, big: &str) -> Vec<u8> {
 
     {
         let _scope = StorageRootScope::enter(&warehouse.root);
-        pallet_utils::set_pallet_head("before", &first).unwrap();
+        pallet_utils::update_pallet_head(
+            "before",
+            pallet_utils::get_pallet_head("before").unwrap().as_deref(),
+            &first,
+        ).unwrap();
     }
     warehouse.run_ok(&["shift", "before"]);
     content
@@ -559,7 +571,11 @@ fn a_tracked_file_named_like_an_assembly_temp_file_survives_checkout() {
 
     {
         let _scope = StorageRootScope::enter(&warehouse.root);
-        pallet_utils::set_pallet_head("before", &first).unwrap();
+        pallet_utils::update_pallet_head(
+            "before",
+            pallet_utils::get_pallet_head("before").unwrap().as_deref(),
+            &first,
+        ).unwrap();
     }
     warehouse.run_ok(&["shift", "before"]);
     warehouse.run_ok(&["shift", "main"]);

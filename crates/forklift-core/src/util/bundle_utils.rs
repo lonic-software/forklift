@@ -1431,7 +1431,11 @@ mod tests {
         let signature = raw_signature_sidecar("test-key", b"test-signature");
         sign_utils::store_raw_parcel_signature(&parcel_object.hash, &signature).unwrap();
 
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let stats = build_bundle().unwrap();
         assert_eq!(stats.objects, 3, "the parcel, its tree and its one blob");
@@ -1602,7 +1606,11 @@ mod tests {
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
 
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let error = build_bundle().err().expect("a chunked file must refuse the bundle");
         let (code, message, _) = scope_utils::decode_refusal(&error)
@@ -1658,7 +1666,11 @@ mod tests {
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
 
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let error = build_bundle().err().expect("a grandfathered giant must refuse the bundle");
         let (code, message, next_step) = scope_utils::decode_refusal(&error)

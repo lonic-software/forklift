@@ -5137,7 +5137,11 @@ fn build_over_cap_subtree_without_blobs(warehouse_root: &Path, name: &str) -> St
         description: Some("over-cap subtree fixture".to_string()),
     };
     let parcel_hash = store(LooseObjectBuilder::build_parcel(&parcel));
-    pallet_utils::set_pallet_head("main", &parcel_hash).unwrap();
+    pallet_utils::update_pallet_head(
+        "main",
+        pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+        &parcel_hash,
+    ).unwrap();
 
     parcel_hash
 }

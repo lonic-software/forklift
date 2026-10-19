@@ -2257,6 +2257,11 @@ mod tests {
     };
     use crate::util::sign_utils::to_hex;
 
+    /// The office's current head: the base each test's office parcel stacks on.
+    fn office_head() -> Option<String> {
+        crate::util::pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).unwrap()
+    }
+
     const ALICE: &str = "a11ce000-0000-4000-8000-00000000a11c";
     const BOB: &str = "b0b00000-0000-4000-8000-000000000b0b";
 
@@ -3042,7 +3047,7 @@ mod tests {
             };
 
             let genesis = crate::util::office_utils::stack_office_parcel(
-                &state, &admin, "genesis".to_string(), &admin_key_id
+                &state, &admin, "genesis".to_string(), &admin_key_id, office_head().as_deref()
             ).unwrap();
 
             let anchor = TrustAnchor {
@@ -3088,7 +3093,7 @@ mod tests {
             state.keys.push(key);
 
             let head = crate::util::office_utils::stack_office_parcel(
-                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id
+                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id, office_head().as_deref()
             ).unwrap();
 
             (key_id, head)
@@ -3172,7 +3177,7 @@ mod tests {
         mutate(bob_record);
 
         let hostile = crate::util::office_utils::stack_office_parcel(
-            &state, &bob, "self-service edit".to_string(), &bob_key_id
+            &state, &bob, "self-service edit".to_string(), &bob_key_id, office_head().as_deref()
         ).unwrap();
 
         let error = verify_office_privileges(&fixture.anchor, Some(&admitted_head), &hostile)
@@ -3237,7 +3242,7 @@ mod tests {
         }
 
         let approved = crate::util::office_utils::stack_office_parcel(
-            &state, &fixture.admin, "admin reclassifies bob".to_string(), &fixture.admin_key_id
+            &state, &fixture.admin, "admin reclassifies bob".to_string(), &fixture.admin_key_id, office_head().as_deref()
         ).unwrap();
 
         assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &approved).is_ok());
@@ -3274,7 +3279,7 @@ mod tests {
         state.keys.push(new_key);
 
         let rotated = crate::util::office_utils::stack_office_parcel(
-            &state, &bob, "bob rotates his own key".to_string(), &bob_key_id
+            &state, &bob, "bob rotates his own key".to_string(), &bob_key_id, office_head().as_deref()
         ).unwrap();
 
         assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &rotated).is_ok());
@@ -3301,7 +3306,7 @@ mod tests {
         state.keys.push(device_key);
 
         let linked = crate::util::office_utils::stack_office_parcel(
-            &state, &bob, "bob links a second device".to_string(), &bob_key_id
+            &state, &bob, "bob links a second device".to_string(), &bob_key_id, office_head().as_deref()
         ).unwrap();
 
         assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &linked).is_ok());

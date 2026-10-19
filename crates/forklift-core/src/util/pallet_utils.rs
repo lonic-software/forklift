@@ -5,14 +5,14 @@ use crate::util::{file_utils, object_utils};
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
 /// (followed by a new line). Pallet names may contain `/`, which maps to subfolders.
-const FOLDER_NAME_PALLETS_ROOT: &str = "pallets";
+pub(crate) const FOLDER_NAME_PALLETS_ROOT: &str = "pallets";
 
 /// The folder inside the forklift root that holds the *meta* pallet ref files: real
 /// pallets (they hash, sign and transport like any other) that carry tracked metadata
 /// rather than working-directory content — the office (users + keys) today, post-metadata
 /// and provenance later. Kept in their own namespace so no user pallet
 /// name is ever reserved (DESIGN.html §3.3). Mirrors git's `refs/heads/*` vs `refs/notes/*`.
-const FOLDER_NAME_META_ROOT: &str = "meta";
+pub(crate) const FOLDER_NAME_META_ROOT: &str = "meta";
 
 /// The character that qualifies a meta pallet in a revision/wire reference (`@office`).
 /// A bare name is always a user pallet; user names can never start with `@`
@@ -333,55 +333,144 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
     Ok(Some(hash))
 }
 
-/// Set the head parcel hash of the given pallet (atomically). Creates the ref file (and
-/// any subfolders a `/`-separated name needs) when the pallet is unborn.
-///
-/// # Arguments
-/// * `name` - The name of the pallet. Must be a valid pallet name.
-/// * `hash` - The hash of the new head parcel.
-///
-/// # Returns
-/// * `Ok(())`      - If the head was updated.
-/// * `Err(String)` - If the name is invalid or the ref file could not be written.
-pub fn set_pallet_head(name: &str, hash: &str) -> Result<(), String> {
-    set_pallet_head_in(PalletNamespace::User, name, hash)
+/// A ref write refused because the ref no longer held the head the writer's work was based on:
+/// another bay or process moved it while this command ran. Nothing was written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefMoved {
+    /// The ref that moved.
+    pub reference: PalletRef,
+
+    /// The head the writer expected (`None`: the ref was expected not to exist).
+    pub expected: Option<String>,
+
+    /// The head the ref held instead (`None`: it no longer exists).
+    pub found: Option<String>,
 }
 
-/// Set the head parcel hash of the given meta pallet (atomically).
-///
-/// # Arguments
-/// * `name` - The name of the meta pallet. Must be a valid pallet name.
-/// * `hash` - The hash of the new head parcel.
-///
-/// # Returns
-/// * `Ok(())`      - If the head was updated.
-/// * `Err(String)` - If the name is invalid or the ref file could not be written.
-pub fn set_meta_pallet_head(name: &str, hash: &str) -> Result<(), String> {
-    set_pallet_head_in(PalletNamespace::Meta, name, hash)
+impl std::fmt::Display for RefMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let describe = |head: &Option<String>| match head {
+            Some(head) => head.clone(),
+            None => "no head".to_string(),
+        };
+
+        write!(
+            f,
+            "Another bay or process moved pallet \"{}\" while this command ran (it expected {}, \
+            found {}); this command did not move it.",
+            self.reference.to_wire(), describe(&self.expected), describe(&self.found)
+        )
+    }
 }
 
-/// Set the head parcel hash of a pallet in the given namespace (atomically). Creates the
-/// ref file (and any subfolders a `/`-separated name needs) when the pallet is unborn.
+/// Why a ref compare-and-set did not write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefUpdateError {
+    /// The ref moved under the writer (see [`RefMoved`]).
+    Moved(RefMoved),
+
+    /// Anything else: an invalid name or value, or the ref could not be read or written.
+    Failed(String),
+}
+
+impl std::fmt::Display for RefUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefUpdateError::Moved(moved) => moved.fmt(f),
+            RefUpdateError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for RefUpdateError {
+    fn from(message: String) -> Self {
+        RefUpdateError::Failed(message)
+    }
+}
+
+impl From<RefUpdateError> for String {
+    fn from(error: RefUpdateError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Move the head of the given pallet from `expected` to `new` (see [`update_pallet_head_in`]).
+///
+/// # Arguments
+/// * `name`     - The name of the pallet. Must be a valid pallet name.
+/// * `expected` - The head the caller's work was based on (`None`: the pallet is unborn).
+/// * `new`      - The hash of the new head parcel.
+///
+/// # Returns
+/// * `Ok(())`                - The head was moved.
+/// * `Err(RefUpdateError)`   - The ref moved under the caller, or the write failed.
+pub fn update_pallet_head(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
+    update_pallet_head_in(PalletNamespace::User, name, expected, new)
+}
+
+/// Move the head of the given meta pallet from `expected` to `new` (see
+/// [`update_pallet_head_in`]).
+///
+/// # Arguments
+/// * `name`     - The name of the meta pallet. Must be a valid pallet name.
+/// * `expected` - The head the caller's work was based on (`None`: the pallet is unborn).
+/// * `new`      - The hash of the new head parcel.
+///
+/// # Returns
+/// * `Ok(())`                - The head was moved.
+/// * `Err(RefUpdateError)`   - The ref moved under the caller, or the write failed.
+pub fn update_meta_pallet_head(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
+    update_pallet_head_in(PalletNamespace::Meta, name, expected, new)
+}
+
+/// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
+/// pallet ref is written. Under the warehouse's [`RefLock`](crate::util::lock_utils::RefLock),
+/// which every bay shares, the head is read; when it is not `expected` nothing is written and
+/// the write is refused with [`RefMoved`]. Otherwise the ref file is replaced atomically, created
+/// (with any subfolders a `/`-separated name needs) when the pallet is unborn.
+///
+/// `expected` is the head the caller's work was based on, read earlier in the same command, so a
+/// move by another bay or process anywhere between that read and this write is refused rather
+/// than overwritten.
 ///
 /// # Arguments
 /// * `namespace` - The pallet namespace.
 /// * `name`      - The name of the pallet. Must be a valid pallet name.
-/// * `hash`      - The hash of the new head parcel.
+/// * `expected`  - The head the ref must hold (`None`: the ref must not exist).
+/// * `new`       - The hash of the new head parcel.
 ///
 /// # Returns
-/// * `Ok(())`      - If the head was updated.
-/// * `Err(String)` - If the name is invalid, `hash` is not an object hash, or the ref file could
-///                   not be written.
-pub fn set_pallet_head_in(namespace: PalletNamespace, name: &str, hash: &str) -> Result<(), String> {
+/// * `Ok(())`                         - The head was moved.
+/// * `Err(RefUpdateError::Moved)`     - The ref did not hold `expected`; nothing was written.
+/// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
+///                                      ref could not be locked, read or written.
+pub fn update_pallet_head_in(
+    namespace: PalletNamespace,
+    name: &str,
+    expected: Option<&str>,
+    new: &str,
+) -> Result<(), RefUpdateError> {
     validate_pallet_name(name)?;
 
     // The writer holds the reader's rule: a ref `get_pallet_head_in` would refuse is never stored.
-    if !object_utils::is_object_hash(hash) {
-        return Err(format!(
+    if !object_utils::is_object_hash(new) {
+        return Err(RefUpdateError::Failed(format!(
             "Refusing to set the head of pallet \"{}\": the value is not an object hash (64 \
             lowercase hex characters).",
             name
-        ));
+        )));
+    }
+
+    let _lock = crate::util::lock_utils::RefLock::acquire()?;
+
+    let found = get_pallet_head_in(namespace, name)?;
+
+    if found.as_deref() != expected {
+        return Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace, name: name.to_string() },
+            expected: expected.map(str::to_string),
+            found,
+        }));
     }
 
     let path = get_pallet_ref_path(namespace, name);
@@ -390,7 +479,9 @@ pub fn set_pallet_head_in(namespace: PalletNamespace, name: &str, hash: &str) ->
         file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    file_utils::write_file_atomically(&path, format!("{}\n", hash).as_bytes())
+    file_utils::write_file_atomically(&path, format!("{}\n", new).as_bytes())?;
+
+    Ok(())
 }
 
 /// List the names of all user pallets that have a ref file, sorted alphabetically.
@@ -489,6 +580,87 @@ fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::globals::StorageRootScope;
+
+    /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.
+    fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
+        let root = std::env::temp_dir()
+            .join(format!("forklift-pallet-utils-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let scope = StorageRootScope::enter(&root);
+
+        (root, scope)
+    }
+
+    fn hash(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    fn ref_bytes(name: &str) -> Vec<u8> {
+        std::fs::read(get_pallet_ref_path(PalletNamespace::User, name)).unwrap()
+    }
+
+    #[test]
+    fn a_head_write_with_a_stale_expectation_is_refused_and_leaves_the_ref_unchanged() {
+        let (root, _scope) = scratch("cas-mismatch");
+
+        update_pallet_head("main", None, &hash('a')).unwrap();
+        let before = ref_bytes("main");
+
+        match update_pallet_head("main", Some(&hash('b')), &hash('c')) {
+            Err(RefUpdateError::Moved(moved)) => {
+                assert_eq!(moved.reference, PalletRef::user("main"));
+                assert_eq!(moved.expected, Some(hash('b')));
+                assert_eq!(moved.found, Some(hash('a')));
+            }
+            other => panic!("a stale expectation must be refused as moved: {:?}", other.err().map(|e| e.to_string())),
+        }
+
+        assert_eq!(ref_bytes("main"), before, "a refused write must leave the ref byte-identical");
+
+        // Expecting no head against a ref that exists is a stale expectation too.
+        assert!(matches!(update_pallet_head("main", None, &hash('c')), Err(RefUpdateError::Moved(_))));
+        assert_eq!(ref_bytes("main"), before);
+
+        // A matching expectation writes.
+        update_pallet_head("main", Some(&hash('a')), &hash('c')).unwrap();
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('c')));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_head_write_waits_for_the_ref_lock() {
+        let (root, _scope) = scratch("cas-lock");
+
+        update_pallet_head("main", None, &hash('a')).unwrap();
+
+        let held = crate::util::lock_utils::RefLock::acquire().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let writer = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let _scope = StorageRootScope::enter(&root);
+                let result = update_pallet_head("main", Some(&hash('a')), &hash('b')).map_err(String::from);
+                done_tx.send(()).unwrap();
+                result
+            })
+        };
+
+        // A bounded wait can only err toward passing: a writer that is not blocked finishes well
+        // inside it.
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+            "the write must wait while another holder has the ref lock");
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('a')));
+
+        drop(held);
+        writer.join().unwrap().unwrap();
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('b')));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn valid_pallet_names_are_accepted() {

@@ -5621,7 +5621,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         // Incremental compact: no live-set filtering, packs everything loose. This also runs
         // `compact`'s own commit-graph build (unconditional, every call) over `main`'s new head,
@@ -5766,7 +5770,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         // First `compact --all`: X is live (reachable from `main`'s head), so it is packed into a
         // genuine pack -- pack A. No existing packs yet, so nothing here is a `CopyRecord`; this
@@ -5954,7 +5962,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         // First `compact --all`: X is packed good into pack A. No existing packs yet, so nothing
         // here is a `CopyRecord` -- this is a genuine, verified pack.
@@ -6059,7 +6071,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
@@ -6204,7 +6220,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
@@ -6307,7 +6327,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let first = compact(true, false, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
@@ -6428,7 +6452,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         invalidate_cache();
         // Sanity: the giant really is duplicated (a live packed copy plus a corrupt loose file at
@@ -6905,7 +6933,11 @@ mod tests {
             description: Some("crafted".to_string()),
         });
         parcel.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel.hash,
+        ).unwrap();
 
         assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
             "the fixture's target must read before the repack");
@@ -7311,7 +7343,11 @@ mod tests {
         });
         parcel_v2_obj.store().unwrap();
 
-        pallet_utils::set_pallet_head("main", &parcel_v2_obj.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_v2_obj.hash,
+        ).unwrap();
 
         // Corrupt v1's blob loose file in place: a well-formed zstd frame (so it decodes) whose
         // plaintext hashes to a different address (so it fails `verify_object_bytes`) — the
@@ -7417,7 +7453,11 @@ mod tests {
         });
         parcel_v2_obj.store().unwrap();
 
-        pallet_utils::set_pallet_head("main", &parcel_v2_obj.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_v2_obj.hash,
+        ).unwrap();
 
         let stats = compact(false, false, &Progress::NONE).unwrap();
 

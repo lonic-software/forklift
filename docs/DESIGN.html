@@ -530,7 +530,7 @@
 
 <div class="fb">
   <h4><span class="chip done">Shipped 2026-07-05</span> 7.5 Bays — parallel working directories as a primitive</h4>
-  <p>A warehouse has many loading bays: <code>bay &lt;name&gt;</code> creates an additional working directory bound to the same warehouse — shared object store and refs, <b>per-bay inventory, current pallet and lock</b>. N agents work one machine without cloning N times or fighting the warehouse lock (which becomes per-bay, plus a short global ref lock). The sharded inventory already isolates the state that matters; git's worktrees are a bolted-on afterthought with shared-index sharp edges, while bays are the concurrency model designed in. Fleet-on-one-box is the shape agent tooling actually runs in.</p>
+  <p>A warehouse has many loading bays: <code>bay &lt;name&gt;</code> creates an additional working directory bound to the same warehouse — shared object store and refs, <b>per-bay inventory, current pallet and lock</b>. N agents work one machine without cloning N times or fighting the warehouse lock (which becomes per-bay). The refs every bay shares are guarded on their own: every ref write is a compare-and-set against the head its command started from, taken under a kernel lock on the shared <code>.forklift/refs.lock</code> and held only for that one read-compare-write, so a bay never silently overwrites a head another bay moved — the write is refused and the command's own work is rolled back. The sharded inventory already isolates the state that matters; git's worktrees are a bolted-on afterthought with shared-index sharp edges, while bays are the concurrency model designed in. Fleet-on-one-box is the shape agent tooling actually runs in.</p>
 </div>
 
 <div class="fb">

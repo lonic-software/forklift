@@ -2166,7 +2166,7 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
 /// a pallet's not-yet-locally-known newer history could be misclassified "unreferenced" (safe to
 /// drop) purely because this warehouse never looked far enough. A pallet whose remote head has
 /// diverged from its local counterpart (`lower.rs:89-97`'s own check) needs no special-case skip
-/// here: unlike `lower`, this function never calls `set_pallet_head` or merges anything — it only
+/// here: unlike `lower`, this function never calls `update_pallet_head` or merges anything — it only
 /// ever stores content-addressed objects, so there is no ref-move decision for divergence to gate.
 ///
 /// **Pass 2 — a direct, targeted fetch of `candidate_hashes`** ([`remote_utils::
@@ -2192,7 +2192,7 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
 ///
 /// Best-effort and read/store-only throughout: a failure in any one pass, for one pallet, or for
 /// one hash in the targeted batches, never aborts the rest, and nothing here ever calls
-/// `set_pallet_head` or merges a pallet. Whether anything is actually recovered is decided
+/// `update_pallet_head` or merges a pallet. Whether anything is actually recovered is decided
 /// afterward, uniformly, by the caller's own recheck — never by this function's return value (§3.2
 /// D3, see the module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
 ///
@@ -2495,7 +2495,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         // Thread-local sync recorders, NOT the process-wide `barrier_count()`/`dir_sync_count()`:
         // those are global atomics a test on another thread bumps mid-walk, which made this test
@@ -2572,7 +2576,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         absent_subtree_hash
     }
@@ -2660,7 +2668,11 @@ mod tests {
         let _scope = StorageRootScope::enter(&dir);
 
         let vanished_head_hash = "e".repeat(64);
-        pallet_utils::set_pallet_head("main", &vanished_head_hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &vanished_head_hash,
+        ).unwrap();
 
         let targets: BTreeSet<String> = [vanished_head_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets).unwrap().hashes;
@@ -2696,7 +2708,11 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(PathBuf::from(&folder).join(&file_name), &mismatched_bytes).unwrap();
 
-        pallet_utils::set_pallet_head("main", &corrupt_hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &corrupt_hash,
+        ).unwrap();
 
         // Unrelated, non-empty (an empty `targets` set short-circuits before the walk ever runs).
         let targets: BTreeSet<String> = ["1".repeat(64)].into_iter().collect();
@@ -2780,7 +2796,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         chunk_hash
     }
@@ -2932,7 +2952,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let walk_dir = dir.clone();
@@ -3331,7 +3355,11 @@ mod tests {
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
 
-        pallet_utils::set_meta_pallet_head(office_utils::OFFICE_PALLET_NAME, &parcel_object.hash).unwrap();
+        pallet_utils::update_meta_pallet_head(
+            office_utils::OFFICE_PALLET_NAME,
+            pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
     }
 
     /// (iv-c) Finding 4 (round 1, PR #120): the `walk_finds_a_trust_anchor_adopts_hash` sibling
@@ -3552,8 +3580,10 @@ mod tests {
         }).unwrap();
 
         let never_stored_office_head = "f".repeat(64);
-        pallet_utils::set_meta_pallet_head(
-            office_utils::OFFICE_PALLET_NAME, &never_stored_office_head
+        pallet_utils::update_meta_pallet_head(
+            office_utils::OFFICE_PALLET_NAME,
+            pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
+            &never_stored_office_head,
         ).unwrap();
 
         let walk = collect_walk_roots().expect(
@@ -3643,7 +3673,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_meta_pallet_head(office_utils::OFFICE_PALLET_NAME, &parcel_object.hash).unwrap();
+        pallet_utils::update_meta_pallet_head(
+            office_utils::OFFICE_PALLET_NAME,
+            pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         office_utils::write_trust_anchor(&TrustAnchor {
             genesis: "0".repeat(64),
@@ -4230,7 +4264,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         // B vanishes — the crash-lost dentry this whole mechanism exists for.
         std::fs::remove_file(&b_absolute).unwrap();
@@ -4312,7 +4350,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         // Torn; the surviving prefix is irrelevant here (empty) — directory-driven step 1 finds
         // both corrupt objects regardless of what the torn record itself happens to name.
@@ -4946,7 +4988,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         plant_complete_taint(&forklift, &[h_relative.to_string_lossy().as_ref()]);
 
@@ -5282,8 +5328,8 @@ mod tests {
     // ---- Multi-bay ref-pointer resurrection audit ----
     //
     // §10.3's claim: `forklift heal` verbatim-restaging a tainted pallet ref pointer could
-    // silently revert a concurrent, legitimate head move in another bay (the ref file has no
-    // compare-and-swap — `pallet_utils::set_pallet_head_in` is a plain `write_file_atomically`).
+    // silently revert a concurrent, legitimate head move in another bay (heal's restage is not a
+    // compare-and-set: it rewrites the ref file's current bytes, under the shared `RefLock`).
     // The two tests below settle what `restage_object` actually does with a recorded ref path,
     // constructed deterministically (no real concurrency needed — see each test's own comment
     // for why the sequencing alone decides the outcome, with no timing dependence at all).
@@ -5299,7 +5345,7 @@ mod tests {
     }
 
     /// (§10.3, mechanism check 1 — the literal claim) Taint a pallet ref pointer while it holds
-    /// V0; advance the head to V1 via an ordinary, successful `set_pallet_head_in` call (standing
+    /// V0; advance the head to V1 via an ordinary, successful `update_pallet_head` call (standing
     /// in for a legitimate `stack`/`lift` in another bay, sharing the same ref file); then run
     /// `heal`. If §10.3's mechanism is right, `heal`'s verbatim restage of the taint's recorded
     /// path resurrects V0 and the head silently reverts.
@@ -5318,7 +5364,7 @@ mod tests {
     /// snapshot of V0 instead of re-reading the live file → `head_after` comes back V0 → red.
     ///
     /// **Surprise found while building this fixture, worth flagging on its own:**
-    /// `pallet_utils::set_pallet_head`'s own write (`write_file_atomically`) already refuses to
+    /// `pallet_utils::update_pallet_head`'s own write (`write_file_atomically`) already refuses to
     /// report success while ANY taint stands anywhere under the root — `file_utils::
     /// taint_recheck` runs after this write's own rename *and* directory sync both succeed, and
     /// unconditionally errors if `taint_utils::read_taints` finds anything recorded at all,
@@ -5347,7 +5393,11 @@ mod tests {
 
         // V0: the value standing at the moment of the (simulated) failed post-rename directory
         // sync for this ref's own write.
-        pallet_utils::set_pallet_head("main", &v0).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &v0,
+        ).unwrap();
 
         // The taint records the ref's *path* only ("pallets/main") — see this test's own doc
         // comment on why that already rules out a stored-snapshot mechanism.
@@ -5360,7 +5410,11 @@ mod tests {
         // rename to V1 lands first, and only the trailing, blanket taint-recheck then refuses —
         // so the call is deliberately not `.unwrap()`-ed here; what matters for this test is the
         // durable on-disk value it leaves behind, confirmed next.
-        let _ = pallet_utils::set_pallet_head("main", &v1);
+        let _ = pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &v1,
+        );
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap().unwrap(), v1,
             "sanity: the rename to V1 must have physically landed despite the call's own Err");
 
@@ -5408,7 +5462,11 @@ mod tests {
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
 
-        pallet_utils::set_pallet_head("main", &"0".repeat(64)).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &"0".repeat(64),
+        ).unwrap();
         plant_complete_taint(&forklift, &["pallets/main"]);
 
         // The ref file vanishes entirely (e.g. a pallet removed from under the taint) before heal
@@ -5670,7 +5728,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         std::fs::remove_file(&b_absolute).unwrap();
         plant_complete_taint(&forklift, &[b_relative.to_str().unwrap()]);
@@ -5744,7 +5806,11 @@ mod tests {
         // `heal_restaging_a_tainted_pallet_ref_never_reverts_a_later_legitimate_head_move`'s
         // fixture) — present and readable, so `attempt.all_clean()` is true and `run` never even
         // reaches the closure walk. The pack-health warning must still appear.
-        pallet_utils::set_pallet_head("main", &"0".repeat(64)).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &"0".repeat(64),
+        ).unwrap();
         plant_complete_taint(&forklift, &["pallets/main"]);
 
         let outcome = run_heal().expect("an ordinary, present, readable taint must clear cleanly");
@@ -5826,7 +5892,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         // The sibling: a genuinely present, intact loose object H — unrelated to Y, tainted
         // alongside B's pack path so both are recorded in the same taint file.
@@ -5980,7 +6050,11 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+        ).unwrap();
 
         let (folder, file_name) = file_utils::get_path_for_object(&candidate_hash).unwrap();
         let candidate_relative = PathBuf::from(&folder).join(&file_name)
@@ -6044,7 +6118,11 @@ mod tests {
         // An ordinary, present, ref-shaped taint — `restage_object` never queries the pack
         // registry for a non-content-addressed path — so heal has real work to do, independent
         // of the broken pack folder.
-        pallet_utils::set_pallet_head("main", &"0".repeat(64)).unwrap();
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &"0".repeat(64),
+        ).unwrap();
         plant_complete_taint(&forklift, &["pallets/main"]);
 
         let outcome = run_heal().expect(

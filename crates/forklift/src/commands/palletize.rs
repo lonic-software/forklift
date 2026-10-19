@@ -59,7 +59,7 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
         Some(revision) => {
             let parcel_hash = pallet_utils::resolve_revision(revision)?;
 
-            pallet_utils::set_pallet_head(name, &parcel_hash)?;
+            pallet_utils::update_pallet_head(name, None, &parcel_hash)?;
 
             let head = shift::shift_to(name).await?;
 
@@ -79,7 +79,7 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
             let head = pallet_utils::get_pallet_head(&current)?;
 
             if let Some(head) = &head {
-                pallet_utils::set_pallet_head(name, head)?;
+                pallet_utils::update_pallet_head(name, None, head)?;
             }
 
             pallet_utils::set_current_pallet_name(name)?;

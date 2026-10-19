@@ -1163,7 +1163,7 @@ pub fn stack_meta_edits(pallet: &str,
     let parcel = stack_signed_parcel(tree, head.iter().cloned().collect(), actor, description, signer)?;
 
     verify_meta_content(pallet, rules, office, Admission::Admit, head.as_deref(), &parcel)?;
-    pallet_utils::set_meta_pallet_head(pallet, &parcel)?;
+    pallet_utils::update_meta_pallet_head(pallet, head.as_deref(), &parcel)?;
 
     Ok(Some(parcel))
 }
@@ -2419,7 +2419,11 @@ mod tests {
         }
 
         // The writer refuses to stack on any of them, too.
-        pallet_utils::set_meta_pallet_head(PALLET, &old).unwrap();
+        pallet_utils::update_meta_pallet_head(
+            PALLET,
+            pallet_utils::get_meta_pallet_head(PALLET).unwrap().as_deref(),
+            &old,
+        ).unwrap();
         let office = office(&[&alice.record]);
         assert!(write(&office, &alice, &[set("y", &cell(alice.id(), "2"))]).unwrap_err().contains("older forklift"));
 
@@ -2816,7 +2820,11 @@ mod tests {
 
         // Locally, Carol's write arrived from some other remote, then Alice wrote her own.
         let adopted = remote(&root, &carol, &[set("c", &cell(carol.id(), "carol's"))]);
-        pallet_utils::set_meta_pallet_head(PALLET, &adopted).unwrap();
+        pallet_utils::update_meta_pallet_head(
+            PALLET,
+            pallet_utils::get_meta_pallet_head(PALLET).unwrap().as_deref(),
+            &adopted,
+        ).unwrap();
         let ours = write(&office, &alice, &[set("a", &cell(alice.id(), "alice's"))]).unwrap().unwrap();
 
         let why = refusal(replay(&office, &ours, &theirs, &[], &alice));
@@ -3374,7 +3382,12 @@ mod tests {
         edits.push(set(&format!("{}/review/{}", dir, manifest_utils::operator_leaf("alice")),
                        &haul_cell(alice.id(), "haul.review 2", &text("x"))));
         let forged = haul_parcel(None, &alice, &edits);
-        pallet_utils::set_pallet_head_in(pallet_utils::PalletNamespace::Meta, "haul", &forged).unwrap();
+        pallet_utils::update_pallet_head_in(
+            pallet_utils::PalletNamespace::Meta,
+            "haul",
+            pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::Meta, "haul").unwrap().as_deref(),
+            &forged,
+        ).unwrap();
 
         let haul = haul_utils::find_haul(&id[..8]).unwrap();
         let mut unreadable: Vec<&str> = haul.unreadable.iter().map(|cell| cell.path.as_str()).collect();

@@ -35,6 +35,7 @@ use forklift_core::model::remote::{
     distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
+use forklift_core::util::pallet_utils::RefUpdateError;
 use forklift_core::util::lock_utils::{self, BaseServeLock, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, meta_tree,
@@ -959,6 +960,18 @@ fn error_body(message: String) -> ErrorResponse {
         },
         None => ErrorResponse { error: message, code: None, next_step: None },
     }
+}
+
+/// The refusal for a ref update whose old head is not the pallet's head.
+fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
+    (
+        StatusCode::CONFLICT,
+        format!(
+            "The pallet moved: its head is {}, not {}. Lower and retry.",
+            current.unwrap_or("unborn"),
+            expected.unwrap_or("unborn")
+        )
+    )
 }
 
 /// Map an internal storage error to a 500.
@@ -2404,17 +2417,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             }
         }
 
+        // An early refusal, before the audit below spends anything on a request that cannot
+        // land. It is not the guard: the write at the end is the compare-and-set.
         let current = pallet_utils::get_pallet_head_in(namespace, &bare).map_err(internal)?;
 
         if current != request.old_head {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "The pallet moved: its head is {}, not {}. Lower and retry.",
-                    current.as_deref().unwrap_or("unborn"),
-                    request.old_head.as_deref().unwrap_or("unborn")
-                )
-            ));
+            return Err(pallet_moved(current.as_deref(), request.old_head.as_deref()));
         }
 
         // The head is stored as given; a spelling the ref reader refuses is the request's fault,
@@ -2542,7 +2550,15 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             ).map_err(unprocessable)?;
         }
 
-        pallet_utils::set_pallet_head_in(namespace, &bare, &request.new_head).map_err(internal)?;
+        // The compare-and-set against the request's old head, under the warehouse's ref lock, so a
+        // local bay's writer that moved the ref since the check above is refused, not overwritten.
+        match pallet_utils::update_pallet_head_in(namespace, &bare, request.old_head.as_deref(), &request.new_head) {
+            Ok(()) => {}
+            Err(RefUpdateError::Moved(moved)) => {
+                return Err(pallet_moved(moved.found.as_deref(), request.old_head.as_deref()));
+            }
+            Err(RefUpdateError::Failed(e)) => return Err(internal(e)),
+        }
 
         Ok(events)
     }).await;
@@ -4207,7 +4223,8 @@ mod tests {
             };
 
             let genesis = office_utils::stack_office_parcel(
-                &state, &admin, "genesis".to_string(), &key_id
+                &state, &admin, "genesis".to_string(), &key_id,
+                forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref()
             ).unwrap();
 
             office_utils::write_trust_anchor(&TrustAnchor {
@@ -4254,7 +4271,8 @@ mod tests {
             state.keys.push(key);
 
             office_utils::stack_office_parcel(
-                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id
+                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id,
+                forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref()
             ).unwrap();
 
             key_id
@@ -4666,7 +4684,8 @@ mod tests {
                     .expect("quinn-seam must be enrolled")
                     .role = Role::Reader;
                 office_utils::stack_office_parcel(
-                    &office_state, &fixture.admin, "revoke quinn".to_string(), &fixture.admin_key_id
+                    &office_state, &fixture.admin, "revoke quinn".to_string(), &fixture.admin_key_id,
+                    forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref()
                 ).unwrap();
                 drop(guard);
 

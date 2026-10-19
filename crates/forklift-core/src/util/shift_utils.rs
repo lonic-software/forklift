@@ -1188,6 +1188,34 @@ pub fn materialize_tree(from_tree: Option<&str>,
     Ok(())
 }
 
+/// Undo a materialization whose ref write was refused: put the working tree and the inventory
+/// back at `start_tree` (the tree of the head the command started from, or the empty tree for an
+/// unborn pallet) and return the error to report. Runs under the bay lock, so nothing else
+/// touched the bay since `written_tree` was materialized. If the rollback itself fails, the
+/// error says the working tree holds the other tree and that the pallet did not move.
+pub fn roll_back_materialized(moved: &crate::util::pallet_utils::RefMoved,
+                              written_tree: &str,
+                              start_tree: Option<&str>,
+                              anchor: file_utils::StatAnchor) -> String {
+    let start = match start_tree {
+        Some(tree) => Ok(tree.to_string()),
+        None => crate::util::object_utils::empty_tree_hash(),
+    };
+
+    let rolled_back = start.and_then(|start| {
+        materialize_tree(Some(written_tree), &start, "Rolling back", anchor, &Progress::NONE)
+    });
+
+    match rolled_back {
+        Ok(()) => moved.to_string(),
+        Err(err) => format!(
+            "{} The working tree could not be put back ({}): it holds tree {}, not the pallet's \
+            head; shift or restore to bring it back in line.",
+            moved, err, written_tree
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

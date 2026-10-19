@@ -16,6 +16,8 @@ mod internal_refs;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
+#[cfg(test)]
+mod test_support;
 
 /// Windows gives a process's main thread a 1MB stack by default (a linker setting); Linux and
 /// macOS give it 8MB. clap's derive-generated `Cli::command()` — the whole tree of every

@@ -1141,7 +1141,11 @@ fn a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it() {
             tree_hash: node.hash.clone(), parents: vec![parent], actions: Vec::new(), description: None,
         });
         parcel.store().unwrap();
-        pallet_utils::set_meta_pallet_head(tag_utils::TAGS_PALLET_NAME, &parcel.hash).unwrap();
+        pallet_utils::update_meta_pallet_head(
+            tag_utils::TAGS_PALLET_NAME,
+            pallet_utils::get_meta_pallet_head(tag_utils::TAGS_PALLET_NAME).unwrap().as_deref(),
+            &parcel.hash,
+        ).unwrap();
         assert!(tag_utils::read_tags().is_err(), "the fixture needs an unreadable tag history");
     });
 

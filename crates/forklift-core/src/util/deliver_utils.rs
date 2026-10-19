@@ -141,7 +141,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
 
     let parcel = Parcel {
         tree_hash: draft_parcel.tree_hash.clone(),
-        parents: target_head.into_iter().collect(),
+        parents: target_head.iter().cloned().collect(),
         actions,
         description: Some(description.clone().unwrap_or_else(|| format!("Delivered \"{}\".", source))),
     };
@@ -183,7 +183,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         None => pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?.unwrap_or_default(),
     };
 
-    pallet_utils::set_pallet_head(target, &object.hash)?;
+    pallet_utils::update_pallet_head(target, target_head.as_deref(), &object.hash)?;
 
     // The delivered tree equals the draft's, so switching the current pallet needs no
     // materialization — the working directory already matches.

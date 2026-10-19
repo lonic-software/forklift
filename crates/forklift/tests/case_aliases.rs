@@ -104,7 +104,11 @@ impl Warehouse {
         };
         let parcel_hash = store(LooseObjectBuilder::build_parcel(&crafted));
 
-        pallet_utils::set_pallet_head(name, &parcel_hash).unwrap();
+        pallet_utils::update_pallet_head(
+            name,
+            pallet_utils::get_pallet_head(name).unwrap().as_deref(),
+            &parcel_hash,
+        ).unwrap();
     }
 
     fn folds_case(&self) -> bool {

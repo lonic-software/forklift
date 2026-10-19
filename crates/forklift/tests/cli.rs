@@ -11511,3 +11511,32 @@ fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_p
     // Content is still perfectly readable after the cleanup.
     assert_eq!(stdout(&warehouse.run(&["show", "main:a.txt"])), content_before);
 }
+
+/// The ref lock guards refs every bay shares, so it lives in the shared `.forklift`, whichever bay
+/// writes: never in a bay's own storage nor in its working tree.
+#[test]
+fn a_stack_in_a_named_bay_locks_the_shared_refs() {
+    let warehouse = TestWarehouse::new("bay-ref-lock");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("a.txt", "a\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let bay_dir = warehouse.home.join("bay-ref-lock-feature");
+    assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
+
+    // Only the bay's stack below may create it.
+    let shared = warehouse.root.join(".forklift").join("refs.lock");
+    std::fs::remove_file(&shared).unwrap();
+
+    std::fs::write(bay_dir.join("b.txt"), "b\n").unwrap();
+    assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&bay_dir, &["stack", "in the bay"]));
+
+    assert!(shared.is_file(), "the bay's stack must lock the shared refs");
+    assert!(!warehouse.root.join(".forklift").join("bays").join("feature").join("refs.lock").exists(),
+        "the ref lock must not be bay-local");
+    assert!(!bay_dir.join("refs.lock").exists() && !bay_dir.join(".forklift").join("refs.lock").exists(),
+        "the ref lock must not land in the bay's working tree");
+}

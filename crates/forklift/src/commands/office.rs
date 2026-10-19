@@ -93,7 +93,8 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     };
 
     let description = format!("Enrolled operator \"{}\" (genesis).", operator.identifier);
-    let genesis = office_utils::stack_office_parcel(&state, &operator, description, &key_id)?;
+    let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
+    let genesis = office_utils::stack_office_parcel(&state, &operator, description, &key_id, office_head.as_deref())?;
 
     office_utils::write_trust_anchor(&TrustAnchor {
         genesis: genesis.clone(),
@@ -152,7 +153,7 @@ pub fn admit(operator_id: &str,
              class: IdentityClass,
              supervisor: Option<String>) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
     require_admin(&state, &actor_id)?;
 
     let role = Role::parse(role)?;
@@ -223,7 +224,7 @@ pub fn admit(operator_id: &str,
         "Admitted operator \"{}\" as {}{} (identity root {}), by \"{}\".",
         operator_id, role.as_str(), marked, key_id, actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
+    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
 
     output::message(format!(
         "Admitted \"{}\" as {}{} with identity root {} (office parcel {}).",
@@ -252,7 +253,7 @@ fn describe_class(class: IdentityClass, supervisor: Option<&str>) -> String {
 /// endorsing key.
 pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
 
     let key_bytes = sign_utils::from_hex(public_key)
         .map_err(|_| "The public key is not valid hex.".to_string())?;
@@ -281,7 +282,7 @@ pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
         "Linked key {} to \"{}\" (endorsed by key {}).",
         key_id, actor_id, signing_key_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
+    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
 
     output::message(format!(
         "Linked key {} to your identity (office parcel {}).", key_id, parcel
@@ -296,7 +297,7 @@ pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
 /// one can be attributed a key they do not hold).
 pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
 
     if operator_id == actor_id {
         return Err(
@@ -340,7 +341,7 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
         "Authorized key {} for \"{}\", by admin \"{}\".",
         key_id, operator_id, actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
+    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
 
     output::message(format!(
         "Authorized key {} for \"{}\" (office parcel {}).",
@@ -354,7 +355,7 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
 /// lockout protection: the office must always retain at least one admin.
 pub fn role(identifier: &str, role: &str, pallets: Vec<String>) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
     require_admin(&state, &actor_id)?;
 
     let role = Role::parse(role)?;
@@ -389,7 +390,7 @@ pub fn role(identifier: &str, role: &str, pallets: Vec<String>) -> Result<(), St
         "Changed the role of \"{}\" to {}, by \"{}\".",
         identifier, role.as_str(), actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
+    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
 
     output::message(format!(
         "\"{}\" is now a(n) {} (office parcel {}).", identifier, role.as_str(), parcel
@@ -405,7 +406,7 @@ pub fn role(identifier: &str, role: &str, pallets: Vec<String>) -> Result<(), St
 /// so the old keys cannot silently sign anything new.
 pub async fn rotate(offline: bool, passphrase: bool) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, old_key_id, actor_id) = require_signing_actor(&actor)?;
+    let (mut state, office_head, old_key_id, actor_id) = require_signing_actor(&actor)?;
 
     let boundary = revocation_boundary(offline).await?;
 
@@ -431,7 +432,7 @@ pub async fn rotate(offline: bool, passphrase: bool) -> Result<(), String> {
         "Rotated the keys of \"{}\": {} replaces {}.",
         actor_id, new_key_id, old_key_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &old_key_id)?;
+    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &old_key_id, office_head.as_deref())?;
 
     output::message(format!(
         "Rotated keys (office parcel {}).\nNew key id: {}", parcel, new_key_id
@@ -447,7 +448,7 @@ pub async fn rotate(offline: bool, passphrase: bool) -> Result<(), String> {
 /// a shifted clock changes nothing.
 pub async fn retire(key_id: &str, compromised: bool, offline: bool) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
 
     let Some(target) = state.find_key(key_id) else {
         return Err(format!("No key {} is tracked.", key_id));
@@ -504,7 +505,7 @@ pub async fn retire(key_id: &str, compromised: bool, offline: bool) -> Result<()
         "Revoked key {} of \"{}\" ({}), by \"{}\".",
         key_id, target_operator, reason.as_str(), actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id)?;
+    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
 
     let mut report = format!("Revoked key {} ({}; office parcel {}).", key_id, reason.as_str(), parcel);
 
@@ -790,7 +791,9 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         "Re-genesis: new trust root for operator \"{}\" (adopts office head {}).",
         operator.identifier, old_office_head
     );
-    let genesis = office_utils::stack_office_genesis(&new_state, &operator, description, &key_id)?;
+    let genesis = office_utils::stack_office_genesis(
+        &new_state, &operator, description, &key_id, Some(&old_office_head)
+    )?;
 
     office_utils::replace_trust_anchor(&office_utils::TrustAnchor {
         genesis: genesis.clone(),
@@ -898,18 +901,22 @@ fn generate_operator_key(owner: &str, passphrase: bool) -> Result<(String, Strin
 /// established and one of their active keys is present on this machine.
 ///
 /// # Returns
-/// * `Ok((OfficeState, String, String))` - The current office state, the signing key
-///                                         id, and the actor's operator id.
-/// * `Err(String)`                       - If trust is missing, or the operator
-///                                         cannot sign.
-pub(crate) fn require_signing_actor(actor: &Operator) -> Result<(OfficeState, String, String), String> {
+/// * `Ok((OfficeState, Option<String>, String, String))` - The current office state, the
+///                                                         office head it was read from (the
+///                                                         base of the actor's next office
+///                                                         parcel), the signing key id, and
+///                                                         the actor's operator id.
+/// * `Err(String)`                                       - If trust is missing, or the
+///                                                         operator cannot sign.
+pub(crate) fn require_signing_actor(actor: &Operator)
+    -> Result<(OfficeState, Option<String>, String, String), String> {
     if office_utils::read_trust_anchor()?.is_none() {
         return Err(
             "Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string()
         );
     }
 
-    let state = office_utils::read_office_state()?;
+    let (state, office_head) = office_utils::read_office_state_and_head()?;
 
     let Some(actor_id) = state.find_user(&actor.identifier).map(|user| user.identifier.clone()) else {
         return Err(format!(
@@ -925,7 +932,7 @@ pub(crate) fn require_signing_actor(actor: &Operator) -> Result<(OfficeState, St
             actor_id
         ))?;
 
-    Ok((state, signing_key_id, actor_id))
+    Ok((state, office_head, signing_key_id, actor_id))
 }
 
 /// Require that the operator is an office admin (admissions, roles, others' keys).

@@ -14,6 +14,9 @@ const FILE_NAME_SERVE_LOCK: &str = "serve.lock";
 /// The name of the store-access lock sidecar (inside the forklift root folder). Never deleted.
 const FILE_NAME_STORE_ACCESS_LOCK: &str = "store-access.lock";
 
+/// The name of the ref lock sidecar (inside the shared forklift root folder). Never deleted.
+const FILE_NAME_REF_LOCK: &str = "refs.lock";
+
 /// The name of the base-folder lock sidecar of a multi-warehouse server (inside the base folder).
 /// Never deleted. It starts with a dot, which no warehouse id may, so it is never served as one.
 pub const FILE_NAME_BASE_SERVE_LOCK: &str = ".forklift-server.lock";
@@ -47,8 +50,9 @@ impl WarehouseLock {
     /// * `Err(String)`       - If another process holds the lock, or the lock file could
     ///                         not be created.
     pub fn acquire() -> Result<WarehouseLock, String> {
-        // The lock is bay-local: each bay serializes its own mutations independently (ref
-        // updates touch shared refs, but those are short and the CAS is the guard).
+        // The lock is bay-local: each bay serializes its own mutations independently. Pallet
+        // refs are shared by every bay, so a ref write does not rely on this lock: it is a
+        // compare-and-set (`pallet_utils::update_pallet_head_in`) under the shared `RefLock`.
         //
         // Store an *absolute* path: `bay add` changes the working directory mid-command
         // (to materialize the new bay), and the lock must still release at the file it
@@ -401,6 +405,46 @@ impl BaseServeLock {
             )),
             Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
         }
+    }
+}
+
+/// An exclusive lock on the pallet refs (user and meta) that every bay of a warehouse shares,
+/// held for one read → compare → write of a ref and no longer.
+///
+/// The bay lock ([`WarehouseLock`]) is bay-local, so it cannot order two bays' ref writes; this
+/// lock lives in the shared forklift root (`forklift_root()/refs.lock`), which is the same file
+/// from every bay. It is a kernel lock on a never-deleted sidecar, like [`StoreAccessLock`], so a
+/// hard-killed holder leaves nothing stale and a writer may wait. A hold lasts microseconds, so
+/// the wait is not announced.
+///
+/// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
+/// file description conflicts with the first, and on Windows a lock is per handle). Only the
+/// ref compare-and-set and `heal`'s restage of a ref path take it, and neither calls the other.
+pub struct RefLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+impl RefLock {
+    /// Take the ref lock of the active warehouse, waiting while another thread or process holds
+    /// it. The forklift root folder must exist.
+    ///
+    /// # Returns
+    /// * `Ok(RefLock)` - The acquired lock (released when dropped).
+    /// * `Err(String)` - The sidecar could not be opened or locked.
+    pub fn acquire() -> Result<RefLock, String> {
+        RefLock::acquire_in(&forklift_root())
+    }
+
+    /// [`RefLock::acquire`] for the warehouse whose forklift root is `root`, for a caller that
+    /// was handed the root explicitly (heal's restage).
+    pub fn acquire_in(root: &Path) -> Result<RefLock, String> {
+        let path = absolute(root.join(FILE_NAME_REF_LOCK));
+
+        let file = open_lock_sidecar(&path)?;
+        file.lock().map_err(|e| lock_error(&path, &e))?;
+
+        Ok(RefLock { _file: file })
     }
 }
 
