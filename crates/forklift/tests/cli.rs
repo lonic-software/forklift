@@ -2187,6 +2187,152 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
 }
 
+/// A tree large enough for the inventory build to fan out (its files recorded on worker threads,
+/// a level's subtrees loaded in parallel) lands every entry in its own directory's shard, with
+/// that file's own hash, proven: after `import-git`, which verifies each file, and after a
+/// `shift`, which records the files it found clean. The directories share their file names, so
+/// an entry gathered into a sibling's shard reads with the wrong content's hash.
+#[test]
+fn a_large_tree_lands_every_entry_in_its_own_shard() {
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::inventory::UNPROVEN_MTIME;
+    use forklift_core::util::shift_utils;
+
+    let warehouse = TestWarehouse::new("large-tree-shards");
+    let root = warehouse.root.clone();
+
+    // 24 sibling directories (a level of subtrees to load) holding 268 files in all.
+    let mut files: Vec<(String, String)> = (0..4).map(|n| (String::new(), format!("r{}.txt", n))).collect();
+    let dirs = 24;
+    for dir in 0..dirs {
+        files.extend((0..11).map(|n| (format!("d{:02}", dir), format!("f{}.txt", n))));
+    }
+    assert!(files.len() >= shift_utils::WRITTEN_FANOUT_THRESHOLD && files.len() >= shift_utils::VERIFY_FANOUT_THRESHOLD
+        && dirs >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD, "the tree must be large enough to fan out");
+    for (dir, name) in &files {
+        let path = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
+        warehouse.write_file(&path, &format!("{}\n", path));
+    }
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+
+    // An uncommitted same-size edit, old enough by import time for its stat to prove it.
+    warehouse.write_file("d17/f2.txt", "D17/f2.txt\n");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+
+    let untracked_ignore = ("untracked".to_string(), ".forkliftignore".to_string());
+    assert_eq!(unstaged_changes(&warehouse),
+        vec![untracked_ignore.clone(), ("modified".to_string(), "d17/f2.txt".to_string())],
+        "only the edit must read as a change");
+
+    let assert_every_entry_in_place = |step: &str, skip: Option<&str>| {
+        for (dir, name) in &files {
+            let path = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
+            if Some(path.as_str()) == skip {
+                continue;
+            }
+
+            let entry = inventory_entry(&warehouse, dir, name);
+            let hashed = forklift_core::util::object_utils::hash_file_as_entry(
+                name, &root.join(&path), DirEntryType::Normal, DirEntryType::Normal).unwrap().unwrap();
+
+            assert_eq!(entry.hash, hashed.hash, "{}: {} must carry its own file's hash", step, path);
+            assert_ne!(entry.content_change_timestamp, UNPROVEN_MTIME, "{}: {} must be proven", step, path);
+        }
+    };
+
+    assert_every_entry_in_place("import-git", Some("d17/f2.txt"));
+    assert_eq!(inventory_entry(&warehouse, "d17", "f2.txt").content_change_timestamp, UNPROVEN_MTIME,
+        "the edit must not be proven against the tree");
+
+    // A shift between two pallets on the same parcel writes nothing and rebuilds every shard.
+    assert_success(&warehouse.run(&["restore", "d17/f2.txt"]));
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert_success(&warehouse.run(&["palletize", "other"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
+    assert_every_entry_in_place("shift", None);
+}
+
+/// A scoped bay over a tree large enough for the inventory build to fan out inventories its scope
+/// and nothing else: every in-scope entry in its own shard and proven, so the bay reads clean and
+/// an edit deep inside it reads as the only change; no shard for the out-of-scope sibling's
+/// directories, whose level is never loaded; and no entry for the spine's own files.
+#[test]
+fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
+    use forklift_core::util::shift_utils;
+
+    let warehouse = TestWarehouse::new("large-tree-scoped");
+
+    // In scope: 20 directories under src/api, 280 files. Out of scope: as many under src/web,
+    // and a file on the spine.
+    let (dirs, per_dir) = (20, 14);
+    for side in ["api", "web"] {
+        for dir in 0..dirs {
+            for n in 0..per_dir {
+                let path = format!("src/{}/d{:02}/f{}.txt", side, dir, n);
+                warehouse.write_file(&path, &format!("{}\n", path));
+            }
+        }
+    }
+    warehouse.write_file("src/spine.txt", "spine\n");
+    assert!(dirs * per_dir >= shift_utils::WRITTEN_FANOUT_THRESHOLD && dirs >= shift_utils::TREE_LOAD_FANOUT_THRESHOLD,
+        "the scope must be large enough to fan out");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
+    let changes = |dir: &std::path::Path| -> Vec<(String, String)> {
+        let status = warehouse.run_at(dir, &["--json", "stocktake"]);
+        assert_success(&status);
+        let value = json(&status);
+        assert_eq!(value["data"]["staged_count"], 0, "nothing may be staged: {}", stdout(&status));
+        value["data"]["unstaged"].as_array().into_iter().flatten()
+            .map(|change| (change["kind"].as_str().unwrap().to_string(), change["path"].as_str().unwrap().to_string()))
+            .collect()
+    };
+
+    assert_eq!(changes(&scoped_dir), vec![], "a fresh scoped bay must read clean");
+
+    // The bay's entries start unproven (it wrote every file after its anchor): a same-size edit
+    // reads as the only change because every other entry holds its own file's hash.
+    std::fs::write(scoped_dir.join("src/api/d13/f9.txt"), "SRC/api/d13/f9.txt\n").unwrap();
+    assert_eq!(changes(&scoped_dir), vec![("modified".to_string(), "src/api/d13/f9.txt".to_string())]);
+
+    // The bay's shards sit where the main tree's would, under the bay's own inventory root.
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    let main_inventory = std::path::PathBuf::from(forklift_core::util::file_utils::get_path_inventory_root());
+    let bay_inventory = warehouse.root.join(".forklift").join("bays").join("scoped").join("inventory");
+    let shard = |key: &str| {
+        let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key);
+        let path = bay_inventory.join(main_path.strip_prefix(&main_inventory).unwrap());
+        std::fs::read(&path).ok()
+            .map(|bytes| forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes).unwrap())
+    };
+    assert!(bay_inventory.is_dir(), "the bay keeps its own inventory");
+
+    for dir in 0..dirs {
+        let api = shard(&format!("src/api/d{:02}", dir)).expect("every in-scope directory has a shard");
+        assert_eq!(api.get_items_count(), per_dir, "src/api/d{:02} must hold its own files", dir);
+        assert!(shard(&format!("src/web/d{:02}", dir)).is_none(), "an out-of-scope directory has no shard");
+    }
+    assert!(shard("src").and_then(|spine| spine.get_item_by_name("spine.txt")).is_none(),
+        "the spine's own file is out of scope");
+}
+
 /// A symlink in git's tree is proven as a link, and stays clean after import.
 #[cfg(unix)]
 #[test]

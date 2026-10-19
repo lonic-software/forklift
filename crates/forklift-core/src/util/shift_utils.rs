@@ -904,6 +904,10 @@ pub enum TreeProvenance {
 /// Build the inventory shards for the given tree: one shard per directory, its entries built
 /// from the files' metadata, under the given provenance.
 ///
+/// The tree is descended first, loading every in-scope subtree a level at a time; the files are
+/// then recorded in parallel (see [`fanout_utils::prefetch_in_order`]), each independent of every other, and
+/// gathered into their directories' shards on this thread.
+///
 /// # Arguments
 /// * `root_tree_hash` - The hash of the root tree to build shards for.
 /// * `provenance`     - What makes the tree's hashes true of the working files.
@@ -914,7 +918,6 @@ pub enum TreeProvenance {
 ///                                       stamped, or a file read or its metadata gathered.
 pub fn build_inventories_for_tree(root_tree_hash: &str,
                                   provenance: TreeProvenance) -> Result<BTreeMap<String, Inventory>, String> {
-    let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
     let root_tree = object_utils::load_tree(root_tree_hash)?;
 
     // In a scoped bay only the in-scope subtree(s) are inventoried; the spine is descended but
@@ -922,9 +925,88 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
     // or the main tree) inventories the whole tree exactly as before.
     let scope = scope_utils::current_scope()?;
 
-    build_inventory_for_tree_directory(&root_tree, "", root_tree_hash, &mut shards, &scope, provenance)?;
+    let mut shards: Vec<(String, Inventory)> = Vec::new();
+    let mut files: Vec<TreeFile> = Vec::new();
 
-    Ok(shards)
+    collect_tree_directories(root_tree, root_tree_hash, &scope, &mut shards, &mut files)?;
+
+    // Written files share the caller's anchor, taken before its cleanliness check. Verified files
+    // share one taken after every tree is loaded, before any file's stat.
+    let anchor = match provenance {
+        TreeProvenance::Written(anchor) => anchor,
+        TreeProvenance::Verify => file_utils::take_stat_anchor()?,
+    };
+
+    let record = |file: &TreeFile| -> Result<InventoryItem, String> {
+        let path = Path::new(&file.key);
+
+        match provenance {
+            TreeProvenance::Written(_) => inventory_utils::build_inventory_item_from_stat(
+                path,
+                file.name(),
+                file.hash.clone(),
+                file.item_type,
+                anchor,
+            ),
+            TreeProvenance::Verify => verified_tree_entry(
+                path,
+                file.name(),
+                &inventory_utils::build_stale_inventory_item(file.name(), file.hash.clone(), file.item_type),
+                anchor,
+            ),
+        }
+    };
+
+    let gather = |file: &TreeFile, entry: Result<InventoryItem, String>| -> Result<(), String> {
+        shards[file.shard].1.add_item(entry?);
+        Ok(())
+    };
+
+    let threshold = match provenance {
+        TreeProvenance::Written(_) => WRITTEN_FANOUT_THRESHOLD,
+        TreeProvenance::Verify => VERIFY_FANOUT_THRESHOLD,
+    };
+
+    if files.len() < threshold {
+        let mut gather = gather;
+        files.iter().try_for_each(|file| gather(file, record(file)))?;
+    } else {
+        // Unbounded window and budget: the records are small and every one is kept, so nothing
+        // needs holding back. Prefetch over `fanout_map` for its dynamic claiming: a verified
+        // file's cost is its size, and contiguous chunks leave a worker holding the large ones
+        // (measured on git.git: 58 ms against 64 ms).
+        fanout_utils::prefetch_in_order(&files, usize::MAX, usize::MAX, record, |_| 1, gather)?;
+    }
+
+    Ok(shards.into_iter().collect())
+}
+
+/// Below this many files, a tree's written files are recorded on the calling thread. Each is a
+/// single stat of a few microseconds, so the fan-out's threads only pay for themselves over a
+/// few hundred.
+pub const WRITTEN_FANOUT_THRESHOLD: usize = 256;
+
+/// Below this many files, a tree's verified files are recorded on the calling thread. Each is
+/// read and hashed, so the fan-out pays for itself sooner.
+pub const VERIFY_FANOUT_THRESHOLD: usize = 64;
+
+/// One in-scope file of a tree, waiting to be recorded into its directory's shard.
+struct TreeFile {
+    /// The index of its directory's shard in the collected list.
+    shard: usize,
+    /// Its warehouse path key (also its working path, relative to the working directory).
+    key: String,
+    /// The tree entry's hash.
+    hash: String,
+    /// The tree entry's kind.
+    item_type: DirEntryType,
+}
+
+impl TreeFile {
+    /// Its name within the directory: the key's last component.
+    fn name(&self) -> &str {
+        self.key.rsplit_once('/').map_or(self.key.as_str(), |(_, name)| name)
+    }
 }
 
 /// Record one tree file the command did not write: re-proved against its tree entry under an
@@ -951,97 +1033,102 @@ fn verified_tree_entry(file_path: &Path,
     }
 }
 
-/// Build the inventory shard for one directory of a tree (recursively), stamping each shard's
-/// rollup with the tree hash it was built from.
+/// Collect a tree's directories, one level at a time: an empty shard for each, stamped with the
+/// tree hash it is built from where that rollup holds, and its in-scope files to record. Each
+/// level's subtrees are loaded in parallel, independent of each other.
 ///
 /// # Arguments
-/// * `tree`       - The (loaded) tree of the directory.
-/// * `key`        - The warehouse path key of the directory.
-/// * `tree_hash`  - The hash of `tree` itself (its parent's entry for it — `tree` as loaded
-///                  carries no hash of its own; the root passes `root_tree_hash` directly).
-/// * `shards`     - The collected shards.
-/// * `scope`      - The bay's materialization scope.
-/// * `provenance` - What makes the tree's hashes true of the working files.
+/// * `root_tree`      - The (loaded) root tree.
+/// * `root_tree_hash` - The hash of `root_tree` (a loaded tree carries no hash of its own).
+/// * `scope`          - The bay's materialization scope.
+/// * `shards`         - The collected shards, by directory key.
+/// * `files`          - The collected files, each naming its shard's index.
 ///
 /// # Returns
-/// * `Ok(())`      - If the shard was built.
-/// * `Err(String)` - If a subtree could not be loaded, the clock probe stamped, or a file's
-///                   metadata gathered.
-fn build_inventory_for_tree_directory(tree: &TreeItem,
-                                      key: &str,
-                                      tree_hash: &str,
-                                      shards: &mut BTreeMap<String, Inventory>,
-                                      scope: &MaterializationScope,
-                                      provenance: TreeProvenance) -> Result<(), String> {
-    // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
-    // everything in scope, so on the hot, common full-bay path the classify calls below are
-    // pure overhead — short-circuit them away entirely (`diff_directory` does the same).
+/// * `Ok(())`      - If every in-scope directory was collected.
+/// * `Err(String)` - If a subtree could not be loaded.
+fn collect_tree_directories(root_tree: TreeItem,
+                            root_tree_hash: &str,
+                            scope: &MaterializationScope,
+                            shards: &mut Vec<(String, Inventory)>,
+                            files: &mut Vec<TreeFile>) -> Result<(), String> {
+    // Hoisted once (not per entry): a full (unscoped) scope always classifies everything in
+    // scope, so on the hot, common full-bay path the classify calls below are pure overhead —
+    // short-circuit them away entirely (`diff_directory` does the same).
     let scope_is_full = scope.is_full();
 
-    let mut inventory = Inventory::new();
+    // Each directory of the level: its key, its tree's hash, and the loaded tree.
+    let mut level: Vec<(String, String, TreeItem)> = vec![(String::new(), root_tree_hash.to_string(), root_tree)];
 
-    // Written files share the caller's anchor, taken before its cleanliness check. Verified files
-    // are anchored once per directory, before any of its stats.
-    let anchor = match provenance {
-        TreeProvenance::Written(anchor) => anchor,
-        TreeProvenance::Verify => file_utils::take_stat_anchor()?,
-    };
+    while !level.is_empty() {
+        let mut subtrees: Vec<(String, String)> = Vec::new();
 
-    for (name, item) in tree.get_files() {
-        let file_key = join_key(key, name);
+        for (key, tree_hash, tree) in &level {
+            let shard = shards.len();
 
-        // A spine directory's own files are out of scope and were never materialized, so they
-        // are not inventoried — except the root ignore file, which every scope holds in scope.
-        // Only in-scope files land in a shard.
-        if !scope_is_full && scope.classify(&file_key) != ScopeClass::InScope {
-            continue;
+            for (name, item) in tree.get_files() {
+                let file_key = join_key(key, name);
+
+                // A spine directory's own files are out of scope and were never materialized, so
+                // they are not inventoried — except the root ignore file, which every scope holds
+                // in scope. Only in-scope files land in a shard.
+                if !scope_is_full && scope.classify(&file_key) != ScopeClass::InScope {
+                    continue;
+                }
+
+                files.push(TreeFile {
+                    shard,
+                    key: file_key,
+                    hash: item.hash.clone(),
+                    item_type: item.item_type,
+                });
+            }
+
+            let mut inventory = Inventory::new();
+
+            // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when its
+            // content here is a complete materialization of `tree` — see
+            // `tree_utils::rollup_stampable`'s doc comment (shared with `restore --staged`'s own
+            // tree-to-shard builder, which must decide this exactly the same way).
+            if tree_utils::rollup_stampable(scope, key, tree) {
+                inventory.set_rollup_hash(Some(tree_hash.clone()));
+            }
+
+            shards.push((key.clone(), inventory));
+
+            for (name, subtree) in tree.get_subtrees() {
+                let subtree_key = join_key(key, name);
+
+                // Out-of-scope subtrees are sealed by hash — never loaded, never inventoried.
+                if !scope_is_full && scope.classify(&subtree_key) == ScopeClass::OutOfScope {
+                    continue;
+                }
+
+                subtrees.push((subtree_key, subtree.hash.clone()));
+            }
         }
 
-        let file_path = PathBuf::from(file_key);
+        // One-shot loads, kept out of the parsed-tree cache (see `object_utils::load_tree`).
+        let load = |(_, hash): &(String, String)| object_utils::load_tree(hash);
 
-        let entry = match provenance {
-            TreeProvenance::Written(_) => inventory_utils::build_inventory_item_from_stat(
-                &file_path,
-                name,
-                item.hash.clone(),
-                item.item_type,
-                anchor,
-            )?,
-            TreeProvenance::Verify => verified_tree_entry(
-                &file_path,
-                name,
-                &inventory_utils::build_stale_inventory_item(name, item.hash.clone(), item.item_type),
-                anchor,
-            )?,
+        let loaded: Vec<Result<TreeItem, String>> = if subtrees.len() < TREE_LOAD_FANOUT_THRESHOLD {
+            subtrees.iter().map(load).collect()
+        } else {
+            fanout_utils::fanout_map(&subtrees, load)
         };
 
-        inventory.add_item(entry);
-    }
-
-    // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when its content
-    // here is a complete materialization of `tree` — see `tree_utils::rollup_stampable`'s doc
-    // comment (shared with `restore --staged`'s own tree-to-shard builder, which must decide
-    // this exactly the same way).
-    if tree_utils::rollup_stampable(scope, key, tree) {
-        inventory.set_rollup_hash(Some(tree_hash.to_string()));
-    }
-
-    shards.insert(key.to_string(), inventory);
-
-    for (name, subtree) in tree.get_subtrees() {
-        let subtree_key = join_key(key, name);
-
-        // Out-of-scope subtrees are sealed by hash — never loaded, never inventoried.
-        if !scope_is_full && scope.classify(&subtree_key) == ScopeClass::OutOfScope {
-            continue;
-        }
-
-        let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, &subtree.hash, shards, scope, provenance)?;
+        level = subtrees.into_iter()
+            .zip(loaded)
+            .map(|((key, hash), tree)| tree.map(|tree| (key, hash, tree)))
+            .collect::<Result<_, _>>()?;
     }
 
     Ok(())
 }
+
+/// Below this many subtrees in a level, they are loaded on the calling thread: the fan-out's
+/// threads cost more than they save on a handful of tree loads.
+pub const TREE_LOAD_FANOUT_THRESHOLD: usize = 16;
 
 /// Join a directory key and an entry name into the entry's warehouse path.
 fn join_key(key: &str, name: &str) -> String {
