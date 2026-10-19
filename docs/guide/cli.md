@@ -287,9 +287,12 @@ unchanged but its path changed.
 
 A change of kind is a change even when the bytes are the same: a `chmod +x` (or
 `-x`) on a tracked file, or a file replaced by a symlink, reports as `modified` on
-both sides, and `shift` refuses to reset it like any other edit. On Windows, where
-the file system has no executable bit, a tracked file keeps the bit its entry
-records; `load` never clears it there, not even over a staged removal.
+both sides, and `shift` refuses to reset it like any other edit. Where the file
+system has no executable bit (Windows, and on Unix a volume such as exFAT, FAT, or
+some network and FUSE mounts, which Forklift detects by trying a `chmod` in the
+warehouse's metadata folder), a tracked file keeps the bit its entry records, a
+new file is recorded without it, and `load` never clears it, not even over a
+staged removal.
 
 ### `diff` — line-by-line changes (`d`)
 

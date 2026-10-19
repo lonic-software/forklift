@@ -497,7 +497,7 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
             }
 
             let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-            let item_type = file_utils::get_type_of_dir_entry(&metadata);
+            let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
 
             if item_type.is_file() {
                 seen_files.insert(name.clone());
@@ -800,7 +800,7 @@ fn file_id_for_path(path: &str) -> Option<(u64, u64)> {
 fn hash_worktree_file(path: &str) -> Result<String, String> {
     let fs_path = Path::new(path);
     let metadata = file_utils::get_symlink_metadata_for_path(fs_path)?;
-    let item_type = file_utils::get_type_of_dir_entry(&metadata);
+    let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
     let name = last_component(path);
 
     // Compute the identity `load` would record — the recipe hash for a giant, the blob hash for a

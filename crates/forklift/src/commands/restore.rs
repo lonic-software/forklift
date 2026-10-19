@@ -320,7 +320,7 @@ fn matching_content(file_path: &str, item: &InventoryItem, anchor: file_utils::S
         return None;
     }
 
-    let item_type = inventory_utils::effective_kind(item, file_utils::get_type_of_dir_entry(&metadata));
+    let item_type = inventory_utils::effective_kind(item, &metadata, file_utils::get_type_of_dir_entry(&metadata).ok()?).ok()?;
 
     if item_type.on_disk_kind() != item.item_type.on_disk_kind() {
         return None;
@@ -704,9 +704,11 @@ fn proven_by_stat(file_path: &str, item: &InventoryItem) -> bool {
         return false;
     };
 
-    !metadata.is_dir() && inventory_utils::is_entry_unchanged(
-        item, &metadata, file_utils::get_type_of_dir_entry(&metadata), path
-    )
+    let Ok(item_type) = file_utils::get_type_of_dir_entry(&metadata) else {
+        return false;
+    };
+
+    !metadata.is_dir() && inventory_utils::is_entry_unchanged(item, &metadata, item_type, path)
 }
 
 /// Join a directory key and an entry name into the entry's warehouse path.

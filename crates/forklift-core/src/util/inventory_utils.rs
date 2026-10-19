@@ -1315,7 +1315,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             }
 
             let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-            let item_type = file_utils::get_type_of_dir_entry(&metadata);
+            let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
 
             if item_type.is_file() {
                 let existing_entry = existing_inventory.as_ref()
@@ -1539,7 +1539,7 @@ fn directory_has_no_untracked_content(key: &str,
         }
 
         let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
-        let item_type = file_utils::get_type_of_dir_entry(&metadata);
+        let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
 
         // Tracked as what it is on disk now: a file by its live entry, a directory by its
         // registration and, recursively, its content.
@@ -1671,7 +1671,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
                     continue;
                 };
 
-                let item_type = file_utils::get_type_of_dir_entry(&metadata);
+                let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
 
                 // The entry is rebuilt even when only the stat data went stale (same
                 // content), so the refreshed shard keeps the fast path warm. Blobs are staged,
@@ -2557,8 +2557,10 @@ fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
 /// The kind a file has against its entry, given the kind a fresh `stat` reports (see
 /// [`file_utils::effective_kind`]). The bit belongs to the path until a removal is stacked: an
 /// entry staged for removal lends it too, so `remove` then `load` of the same file round-trips.
-pub fn effective_kind(existing: &InventoryItem, stat_kind: DirEntryType) -> DirEntryType {
-    file_utils::effective_kind(stat_kind, existing.item_type)
+pub fn effective_kind(existing: &InventoryItem,
+                      metadata: &std::fs::Metadata,
+                      stat_kind: DirEntryType) -> Result<DirEntryType, String> {
+    file_utils::effective_kind(metadata, stat_kind, existing.item_type)
 }
 
 /// Check whether a file is unchanged compared to its existing inventory entry, based purely
@@ -2599,7 +2601,9 @@ pub fn is_entry_unchanged(existing: &InventoryItem,
     // still hit this fast path and never be re-chunked. A genuine normal↔executable flip is still
     // caught (their on-disk kinds differ), except where a stat cannot see the bit at all (see
     // `effective_kind`).
-    let item_type = effective_kind(existing, item_type);
+    let Ok(item_type) = effective_kind(existing, metadata, item_type) else {
+        return false;
+    };
     if existing.item_type.on_disk_kind() != item_type.on_disk_kind() {
         return false;
     }
@@ -2801,7 +2805,7 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
                                    name: &str,
                                    mode: IngestMode,
                                    anchor: file_utils::StatAnchor) -> Result<FileVerdict, String> {
-    let item_type = effective_kind(existing, item_type);
+    let item_type = effective_kind(existing, metadata, item_type)?;
 
     if is_entry_unchanged(existing, metadata, item_type, path) {
         return Ok(FileVerdict::UnchangedByStat);
@@ -2920,7 +2924,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
     let anchor = file_utils::take_stat_anchor()?;
     let file_metadata = file_utils::get_symlink_metadata_for_path(&fs_path)?;
 
-    let item_type = file_utils::get_type_of_dir_entry(&file_metadata);
+    let item_type = file_utils::get_type_of_dir_entry(&file_metadata)?;
     let existing = inventory.get_item_by_name(&file_name).map(|item| item.as_ref().clone());
 
     let item = match existing {
@@ -3704,7 +3708,7 @@ mod tests {
     }
 
     /// A file whose bytes match its entry but whose executable bit does not is a change where a
-    /// stat can see the bit. Where it cannot (Windows), the entry's bit stands: the stat cache
+    /// stat can see the bit. Where it cannot (Windows, or a volume without the bit), the entry's bit stands: the stat cache
     /// still hits, and nothing would record the file as plain.
     #[test]
     fn a_kind_only_difference_is_a_change_only_where_the_bit_is_observable() {
@@ -3717,8 +3721,10 @@ mod tests {
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         let metadata = file_utils::get_symlink_metadata_for_path(&file).unwrap();
-        let stat_kind = file_utils::get_type_of_dir_entry(&metadata);
+        let stat_kind = file_utils::get_type_of_dir_entry(&metadata).unwrap();
         assert_eq!(stat_kind, DirEntryType::Normal);
+        let observable = file_utils::executable_bit_is_observable(&metadata).unwrap();
+        assert_eq!(observable, cfg!(unix), "the scratch folder is on a volume that keeps the bit where the platform has one");
         let (hashed, _) = build_item_and_object_for_file(&file, "tool.sh", DirEntryType::Normal,
                                                          IngestMode::ComputeOnly,
                                                          file_utils::StatAnchor::Unproven).unwrap();
@@ -3733,11 +3739,11 @@ mod tests {
 
         let executable = entry_of(DirEntryType::Executable);
         match classify(&executable) {
-            FileVerdict::Modified(item, _) if file_utils::EXECUTABLE_BIT_IS_OBSERVABLE => {
+            FileVerdict::Modified(item, _) if observable => {
                 assert_eq!(item.hash, hashed.hash, "a chmod keeps the hash");
                 assert_eq!(item.item_type, DirEntryType::Normal, "the rebuilt item takes the file's kind");
             }
-            FileVerdict::UnchangedByStat if !file_utils::EXECUTABLE_BIT_IS_OBSERVABLE => {}
+            FileVerdict::UnchangedByStat if !observable => {}
             other => panic!("unexpected verdict for a kind-only difference: {}", match other {
                 FileVerdict::UnchangedByStat => "unchanged by stat",
                 FileVerdict::UnchangedByHash(..) => "unchanged by hash",
@@ -3745,7 +3751,7 @@ mod tests {
             }),
         }
         assert_eq!(is_entry_unchanged(&executable, &metadata, stat_kind, &file),
-                   !file_utils::EXECUTABLE_BIT_IS_OBSERVABLE);
+                   !observable);
     }
 
     /// The bit belongs to the path until a removal is stacked: an entry staged for removal lends
@@ -3754,9 +3760,13 @@ mod tests {
     fn an_entry_staged_for_removal_lends_its_bit_like_a_live_one() {
         let live = InventoryItem { item_type: DirEntryType::Executable, ..item("run.sh", 1, InventoryItemState::Normal) };
         let removed = InventoryItem { state: InventoryItemState::Deleted, ..live.clone() };
+        let scratch = Scratch::new("removal-lends-bit");
+        std::fs::write(scratch.root.join("run.sh"), "#!/bin/sh\n").unwrap();
+        let metadata = file_utils::get_symlink_metadata_for_path(&scratch.root.join("run.sh")).unwrap();
 
         for stat_kind in [DirEntryType::Normal, DirEntryType::Executable, DirEntryType::SymbolicLink] {
-            assert_eq!(effective_kind(&removed, stat_kind), effective_kind(&live, stat_kind));
+            assert_eq!(effective_kind(&removed, &metadata, stat_kind).unwrap(),
+                       effective_kind(&live, &metadata, stat_kind).unwrap());
         }
     }
 

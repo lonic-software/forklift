@@ -2361,11 +2361,26 @@ pub fn path_to_string(path: &Path) -> Result<String, String> {
 /// # Arguments
 /// * `metadata` - The metadata of the directory entry.
 ///
+/// A plain file reads as executable only where the working tree's volume keeps the bit (see
+/// [`executable_bit_is_observable`]): elsewhere every plain file reads [`DirEntryType::Normal`], as
+/// on Windows, and [`effective_kind`] lends a tracked file its entry's bit.
+///
 /// # Returns
-/// * `Ok(DirEntryType)` - The type of the directory entry.
-/// * `Err(String)`      - If an error occurred while getting the type of the directory entry.
-pub fn get_type_of_dir_entry(metadata: &Metadata) -> DirEntryType {
-    let is_executable = is_dir_entry_executable(metadata);
+/// * `Ok(DirEntryType)` - The kind.
+/// * `Err(String)`      - If the volume could not be probed for the bit.
+pub fn get_type_of_dir_entry(metadata: &Metadata) -> Result<DirEntryType, String> {
+    let file_type = metadata.file_type();
+
+    if !file_type.is_file() {
+        return Ok(type_of_dir_entry_when(metadata, false));
+    }
+
+    Ok(type_of_dir_entry_when(metadata, executable_bit_is_observable(metadata)?))
+}
+
+/// [`get_type_of_dir_entry`] on a volume that keeps the executable bit or does not.
+fn type_of_dir_entry_when(metadata: &Metadata, executable_bit_is_observable: bool) -> DirEntryType {
+    let is_executable = executable_bit_is_observable && is_dir_entry_executable(metadata);
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
@@ -2379,23 +2394,166 @@ pub fn get_type_of_dir_entry(metadata: &Metadata) -> DirEntryType {
     }
 }
 
-/// Whether a `stat` on this platform reports a file's executable bit. Windows has none, so
-/// [`is_dir_entry_executable`] says `false` for every file there.
-pub const EXECUTABLE_BIT_IS_OBSERVABLE: bool = cfg!(unix);
+/// The name prefix of the probe files [`executable_bit_is_observable`] creates under the bay's
+/// metadata root, each removed again once measured.
+pub const FILE_NAME_PREFIX_EXECUTABLE_BIT_PROBE: &str = "exec-probe-";
 
-/// The kind a tracked file has, given the kind a fresh `stat` reports and the kind its entry
-/// records. Where `stat` cannot see the executable bit, a plain file whose entry is a plain file
-/// keeps the entry's bit: what `stat` says about the bit there is the platform's blind spot, not
-/// a change (git's `core.fileMode=false`). Every other kind is the `stat`'s.
+/// The answers [`executable_bit_is_observable`] has given, keyed by device.
+#[cfg(unix)]
+type ExecutableBitProbes = std::sync::RwLock<std::collections::HashMap<u64, bool>>;
+
+/// This process's [`ExecutableBitProbes`]: the answer belongs to a volume, and the device is in
+/// every `stat`, so a lookup costs no system call.
+#[cfg(unix)]
+static EXECUTABLE_BIT_PROBES: std::sync::LazyLock<ExecutableBitProbes> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Whether a `stat` of the entry `metadata` was read from reports its executable bit, which git
+/// records as `core.fileMode`. Windows has no bit. On Unix a volume may not keep one either (exFAT,
+/// FAT, some SMB and FUSE mounts report every file with the same mode and ignore a `chmod`), so the
+/// volume is asked: a probe file under the bay's metadata root ([`bay_root`]) is set to `0o644` and
+/// then to `0o755`, through the same path calls the walks and materializers use, and the bit is
+/// observable only if both modes read back. Asked once per process and device; nothing is
+/// recorded, so a warehouse copied onto another volume is measured there.
+///
+/// The probe can only measure the metadata root's volume, the working tree's own for the main
+/// tree. An entry on another device (a bay whose working directory sits on another volume than its
+/// warehouse, or a mount inside the working tree) gets the metadata root's answer, as a bay does
+/// for the clock (see [`StatAnchor`]).
+///
+/// A metadata root this process cannot create a file in (no permission, a read-only mount, a full
+/// volume or quota) cannot be measured, and reads as the platform's default (Unix keeps the bit),
+/// so a command that only reads still runs there. On a blind volume what it can then show is a
+/// `chmod` that is not there, never a missed one; a command that writes to the metadata root fails
+/// on that write. Any other failure fails the caller, and is not kept: the next caller probes again,
+/// so a passing one (a descriptor limit, an interrupted call) costs one command nothing but a retry.
+///
+/// [`bay_root`]: crate::globals::bay_root
 ///
 /// # Arguments
+/// * `metadata` - The (symlink) metadata of an entry in the working tree.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether the bit is observable.
+/// * `Err(String)` - If the probe could not be created, set or read for any other reason.
+#[cfg(unix)]
+pub fn executable_bit_is_observable(metadata: &Metadata) -> Result<bool, String> {
+    executable_bit_is_observable_in(&EXECUTABLE_BIT_PROBES, metadata, crate::globals::bay_root)
+}
+
+/// [`executable_bit_is_observable`] with its answers kept in `probes`, probing under `root()`.
+#[cfg(unix)]
+fn executable_bit_is_observable_in(probes: &ExecutableBitProbes,
+                                   metadata: &Metadata,
+                                   root: impl FnOnce() -> PathBuf) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let device = metadata.dev();
+    if let Some(observable) = probes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&device) {
+        return Ok(*observable);
+    }
+
+    let mut probes = probes.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(observable) = probes.get(&device) {
+        return Ok(*observable);
+    }
+
+    let root = root();
+    let root_device = std::fs::metadata(&root)
+        .map_err(|err| format!("Could not probe {} for the executable bit: {}", root.display(), err))?
+        .dev();
+    let observable = match probes.get(&root_device) {
+        Some(observable) => *observable,
+        None => probe_executable_bit(&root)?,
+    };
+    probes.insert(root_device, observable);
+    probes.insert(device, observable);
+
+    Ok(observable)
+}
+
+/// [`executable_bit_is_observable`]: Windows keeps no executable bit.
+#[cfg(not(unix))]
+pub fn executable_bit_is_observable(_metadata: &Metadata) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Create a fresh probe file under `folder`, measure it (see [`measure_executable_bit`]) and
+/// remove it. A name already taken is skipped: it is litter from a dead process with this one's id.
+#[cfg(unix)]
+fn probe_executable_bit(folder: &Path) -> Result<bool, String> {
+    let failed = |path: &Path, err: std::io::Error| format!(
+        "Could not probe {} for the executable bit: {}", path.display(), err
+    );
+
+    for attempt in 0..1024u32 {
+        let path = folder.join(format!("{}{}-{}", FILE_NAME_PREFIX_EXECUTABLE_BIT_PROBE, std::process::id(), attempt));
+
+        match std::fs::File::create_new(&path) {
+            Ok(file) => drop(file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::PermissionDenied
+                                             | std::io::ErrorKind::ReadOnlyFilesystem
+                                             | std::io::ErrorKind::StorageFull
+                                             | std::io::ErrorKind::QuotaExceeded) => {
+                return Ok(true);
+            }
+            Err(err) => return Err(failed(&path, err)),
+        }
+
+        let measured = measure_executable_bit(&path).map_err(|err| failed(&path, err));
+        let removed = match std::fs::remove_file(&path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(failed(&path, err)),
+            _ => Ok(()),
+        };
+
+        return measured.and_then(|observable| removed.map(|_| observable));
+    }
+
+    Err(format!("Could not probe {} for the executable bit: every probe name tried already exists.", folder.display()))
+}
+
+/// Whether the file at `path` keeps the executable bit: set it to `0o644`, then `0o755`, and read
+/// each back with `lstat`. A volume that refuses the `chmod` keeps no bit.
+#[cfg(unix)]
+fn measure_executable_bit(path: &Path) -> Result<bool, std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (mode, executable) in [(0o644, false), (0o755, true)] {
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            Ok(()) => {}
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported) => {
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        }
+
+        if is_dir_entry_executable(&std::fs::symlink_metadata(path)?) != executable {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+/// The kind a tracked file has, given the kind a fresh `stat` reports and the kind its entry
+/// records. Where `stat` cannot see the executable bit (see [`executable_bit_is_observable`]), a
+/// plain file whose entry is a plain file keeps the entry's bit: what `stat` says about the bit
+/// there is the volume's blind spot, not a change (git's `core.fileMode=false`). Every other kind
+/// is the `stat`'s.
+///
+/// # Arguments
+/// * `metadata`   - The (symlink) metadata `stat_kind` was read from.
 /// * `stat_kind`  - The kind [`get_type_of_dir_entry`] reports for the file.
 /// * `entry_kind` - The kind the file's entry records (chunked or not).
 ///
 /// # Returns
-/// The file's kind as the working directory holds it (never chunked).
-pub fn effective_kind(stat_kind: DirEntryType, entry_kind: DirEntryType) -> DirEntryType {
-    effective_kind_when(stat_kind, entry_kind, EXECUTABLE_BIT_IS_OBSERVABLE)
+/// * `Ok(DirEntryType)` - The file's kind as the working directory holds it (never chunked).
+/// * `Err(String)`      - If the volume could not be probed for the bit.
+pub fn effective_kind(metadata: &Metadata,
+                      stat_kind: DirEntryType,
+                      entry_kind: DirEntryType) -> Result<DirEntryType, String> {
+    Ok(effective_kind_when(stat_kind, entry_kind, executable_bit_is_observable(metadata)?))
 }
 
 fn effective_kind_when(stat_kind: DirEntryType,
@@ -3126,6 +3284,109 @@ mod tests {
         assert_eq!(effective_kind_when(Normal, Normal, false), Normal);
         assert_eq!(effective_kind_when(Normal, SymbolicLink, false), Normal, "a link replaced by a file is a change");
         assert_eq!(effective_kind_when(SymbolicLink, Executable, false), SymbolicLink, "a file replaced by a link is a change");
+    }
+
+    /// On a volume without the bit every plain file reads plain, whatever mode it reports, so a
+    /// new file is recorded plain and a tracked one takes its entry's bit; where the bit is kept,
+    /// the mode decides.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_file_reads_executable_only_where_the_volume_keeps_the_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("forklift-kind-when-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("tool.sh");
+        let note = dir.join("note.txt");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::write(&note, "note\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("note.txt", dir.join("link")).unwrap();
+        let kind = |name: &str, observable: bool| type_of_dir_entry_when(
+            &std::fs::symlink_metadata(dir.join(name)).unwrap(), observable);
+
+        assert_eq!(kind("tool.sh", true), DirEntryType::Executable);
+        assert_eq!(kind("note.txt", true), DirEntryType::Normal);
+        assert_eq!(kind("tool.sh", false), DirEntryType::Normal, "a blind volume's mode says nothing");
+        assert_eq!(kind("note.txt", false), DirEntryType::Normal);
+        assert_eq!(kind("link", false), DirEntryType::SymbolicLink);
+        assert_eq!(kind("link", true), DirEntryType::SymbolicLink);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A volume that keeps the bit (the temp folder's) is measured as keeping it, the probe file is
+    /// gone afterwards, and a folder that is not there fails loudly rather than reading as either
+    /// answer.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_measures_a_volume_that_keeps_the_bit_and_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("forklift-exec-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(probe_executable_bit(&dir).unwrap());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the probe file was left behind");
+
+        let error = probe_executable_bit(&dir.join("absent")).unwrap_err();
+        assert!(error.contains("Could not probe"), "{}", error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The answer is kept per device: an entry on the metadata root's volume is measured there,
+    /// one on another device (`/dev/null` stands in for a mount inside the working tree) gets the
+    /// metadata root's answer rather than a probe of a volume nothing may write to, and a failure
+    /// is not kept, so one that passes (a descriptor limit) is retried by the next caller.
+    #[cfg(unix)]
+    #[test]
+    fn the_answer_is_kept_per_device_and_another_device_gets_the_metadata_root_s() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("forklift-exec-probe-device-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.join("note.txt"), "note\n").unwrap();
+        let note = std::fs::symlink_metadata(dir.join("note.txt")).unwrap();
+        let elsewhere = std::fs::symlink_metadata("/dev/null").unwrap();
+        assert_ne!(note.dev(), elsewhere.dev());
+
+        let probes = ExecutableBitProbes::default();
+        assert!(executable_bit_is_observable_in(&probes, &elsewhere, || root.clone()).unwrap());
+        assert_eq!(probes.read().unwrap().get(&note.dev()), Some(&true), "the root's volume was measured");
+        assert_eq!(probes.read().unwrap().get(&elsewhere.dev()), Some(&true));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the probe file was left behind");
+        assert!(executable_bit_is_observable_in(&probes, &note, || unreachable!("answered from the cache")).unwrap());
+
+        let failing = ExecutableBitProbes::default();
+        let absent = dir.join("absent");
+        let error = executable_bit_is_observable_in(&failing, &note, || absent.clone()).unwrap_err();
+        assert!(error.contains("Could not probe"), "{}", error);
+        assert!(failing.read().unwrap().is_empty(), "a failure is not kept");
+        assert!(executable_bit_is_observable_in(&failing, &note, || root.clone()).unwrap(),
+                "the next caller probes again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder this process may not create files in cannot be measured and reads as the
+    /// platform's default, so a command that only reads still runs on a read-only warehouse.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_the_probe_cannot_write_reads_as_the_platform_default() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("forklift-exec-probe-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Root ignores the folder's mode; the refusal is then not observable here.
+        if std::fs::File::create_new(dir.join("writable")).is_err() {
+            assert!(probe_executable_bit(&dir).unwrap());
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
     use crate::globals::StorageRootScope;
 
