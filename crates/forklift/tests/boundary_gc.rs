@@ -1577,7 +1577,10 @@ fn stack_ignores_a_lost_object_the_head_already_names() {
     assert!(stacked.status.success(), "a lost head-only object blocked the stack: {}", String::from_utf8_lossy(&stacked.stderr));
 
     // Control: the same loss on staged work refuses.
-    let more = load_and_name_staged(&warehouse, "more.txt", b"more\n");
+    let mut more = load_and_name_staged(&warehouse, "more.txt", b"more\n");
+    more.retain(|hash| warehouse.scoped(|| {
+        forklift_core::util::object_utils::load_blob(hash).is_ok_and(|blob| blob.content == b"more\n")
+    }));
     assert_eq!(more.len(), 1, "staged {:?} then {:?}", staged, more);
     warehouse.delete_object(&more[0]);
     assert_eq!(warehouse.run(&["stack", "third"]).status.code(), Some(25));
