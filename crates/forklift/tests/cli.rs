@@ -2187,6 +2187,76 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
 }
 
+/// A tree large enough for the inventory build to fan out (its files recorded on worker threads,
+/// a level's subtrees loaded in parallel) lands every entry in its own directory's shard, with
+/// that file's own hash, proven: after `import-git`, which verifies each file, and after a
+/// `shift`, which records the files it found clean. The directories share their file names, so
+/// an entry gathered into a sibling's shard reads with the wrong content's hash.
+#[test]
+fn a_large_tree_lands_every_entry_in_its_own_shard() {
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::inventory::UNPROVEN_MTIME;
+
+    let warehouse = TestWarehouse::new("large-tree-shards");
+    let root = warehouse.root.clone();
+
+    // 24 sibling directories (a level of subtrees to load) holding 100 files in all.
+    let mut files: Vec<(String, String)> = (0..4).map(|n| (String::new(), format!("r{}.txt", n))).collect();
+    for dir in 0..24 {
+        files.extend((0..4).map(|n| (format!("d{:02}", dir), format!("f{}.txt", n))));
+    }
+    for (dir, name) in &files {
+        let path = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
+        warehouse.write_file(&path, &format!("{}\n", path));
+    }
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+
+    // An uncommitted same-size edit, old enough by import time for its stat to prove it.
+    warehouse.write_file("d17/f2.txt", "D17/f2.txt\n");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+
+    let untracked_ignore = ("untracked".to_string(), ".forkliftignore".to_string());
+    assert_eq!(unstaged_changes(&warehouse),
+        vec![untracked_ignore.clone(), ("modified".to_string(), "d17/f2.txt".to_string())],
+        "only the edit must read as a change");
+
+    let assert_every_entry_in_place = |step: &str, skip: Option<&str>| {
+        for (dir, name) in &files {
+            let path = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
+            if Some(path.as_str()) == skip {
+                continue;
+            }
+
+            let entry = inventory_entry(&warehouse, dir, name);
+            let hashed = forklift_core::util::object_utils::hash_file_as_entry(
+                name, &root.join(&path), DirEntryType::Normal, DirEntryType::Normal).unwrap().unwrap();
+
+            assert_eq!(entry.hash, hashed.hash, "{}: {} must carry its own file's hash", step, path);
+            assert_ne!(entry.content_change_timestamp, UNPROVEN_MTIME, "{}: {} must be proven", step, path);
+        }
+    };
+
+    assert_every_entry_in_place("import-git", Some("d17/f2.txt"));
+    assert_eq!(inventory_entry(&warehouse, "d17", "f2.txt").content_change_timestamp, UNPROVEN_MTIME,
+        "the edit must not be proven against the tree");
+
+    // A shift between two pallets on the same parcel writes nothing and rebuilds every shard.
+    assert_success(&warehouse.run(&["restore", "d17/f2.txt"]));
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert_success(&warehouse.run(&["palletize", "other"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
+    assert_every_entry_in_place("shift", None);
+}
+
 /// A symlink in git's tree is proven as a link, and stays clean after import.
 #[cfg(unix)]
 #[test]
