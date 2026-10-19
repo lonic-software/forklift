@@ -325,7 +325,8 @@ unstaged edits, so use it deliberately. Outside a conflict, a file that already 
 staged content is left alone, so its modification time does not change and build tools don't
 see it as edited. `restore --staged path` leaves the
 working directory alone and only un-stages (the inverse of `load`) — the same
-operation as `unload`.
+operation as `unload`. Files that already hold the pallet head's content keep counting as
+unchanged without being re-read on the next `stocktake`.
 
 ### `stack` — commit (`s`)
 

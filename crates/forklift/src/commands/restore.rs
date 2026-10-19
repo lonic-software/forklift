@@ -402,8 +402,9 @@ fn ensure_restorable(file_path: &str) -> Result<(), String> {
 }
 
 /// Reset the inventory entries of the given path to the pallet head (unstage). The
-/// working directory is not touched; the reset entries carry zeroed stat data, so the
-/// next comparison against the working directory rehashes them.
+/// working directory is not touched; a reset entry records the working file's stat data only
+/// where the file provably holds the head's content (see `unstaged_entry`), and zeroed stat data
+/// otherwise, so the next comparison against the working directory rehashes it.
 ///
 /// A path that is neither in the inventory nor in the pallet head is ordinarily an error — but
 /// when it also has zero staged entries anywhere beneath it, there is nothing to reset (nothing
@@ -444,7 +445,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
     if treat_as_directory {
         // Rebuild the whole subtree of the staging area from the head: directories that
         // exist only in the inventory disappear, directories that exist only in the head
-        // come back (with stale stat data).
+        // come back (with zeroed stat data where nothing on disk matches them).
         let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
 
         if let Some(HeadEntry::Tree { tree, hash }) = &head_entry {
@@ -471,10 +472,11 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
 
     match head_entry {
         Some(HeadEntry::File { hash, item_type }) => {
+            let current = read_shard(parent.as_key())?;
+            let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref());
+
             inventory_utils::update_shard(parent.as_key(), |inventory| {
-                inventory.add_item(inventory_utils::build_stale_inventory_item(
-                    &file_name, hash, item_type
-                ));
+                inventory.add_item(entry);
                 Ok(())
             })?;
         }
@@ -579,7 +581,7 @@ fn nothing_staged_under(path: &WarehousePath) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Build stale-stat inventory shards for a head subtree (see `build_stale_inventory_item`).
+/// Build inventory shards for a head subtree, each entry as `unstaged_entry` decides it.
 ///
 /// Scope-aware: only in-scope content is ever written to a scoped bay's working
 /// directory, so restoring "to head" must not resurrect shards for out-of-scope files or
@@ -614,6 +616,7 @@ fn build_stale_shards(tree: &TreeItem,
     let fully_in_scope = scope.is_full() || scope.classify(key) == ScopeClass::InScope;
 
     let mut inventory = Inventory::new();
+    let current = read_shard(key)?;
 
     for (name, item) in tree.get_files() {
         if !fully_in_scope {
@@ -627,11 +630,7 @@ fn build_stale_shards(tree: &TreeItem,
             }
         }
 
-        inventory.add_item(inventory_utils::build_stale_inventory_item(
-            name,
-            item.hash.clone(),
-            item.item_type
-        ));
+        inventory.add_item(unstaged_entry(key, name, item.hash.clone(), item.item_type, current.as_ref()));
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when the reset here
@@ -658,6 +657,46 @@ fn build_stale_shards(tree: &TreeItem,
     }
 
     Ok(())
+}
+
+/// The entry `restore --staged` resets the file `name` in the directory `parent_key` to: the
+/// head's content, with the stat data of the working file when it provably holds that content,
+/// and zeroed stat data (see `build_stale_inventory_item`) otherwise, so the next comparison
+/// rehashes it. A file the current entry already proves by stat keeps that entry; any other is
+/// compared by content, never written.
+///
+/// # Arguments
+/// * `parent_key` - The warehouse path key of the file's directory.
+/// * `name`       - The name of the file.
+/// * `hash`       - The head's blob hash for the file.
+/// * `item_type`  - The head's type for the file.
+/// * `current`    - The directory's shard before the reset, with its mtime, if it has one.
+///
+/// # Returns
+/// * `InventoryItem` - The entry to record.
+fn unstaged_entry(parent_key: &str,
+                  name: &str,
+                  hash: String,
+                  item_type: DirEntryType,
+                  current: Option<&(Inventory, u64)>) -> InventoryItem {
+    let stale = inventory_utils::build_stale_inventory_item(name, hash, item_type);
+
+    // The current entry is a cheaper witness than the content, but only for the same content
+    // and type the head records.
+    let (witness, shard_mtime) = match current
+        .and_then(|(inventory, shard_mtime)| inventory.get_item_by_name(name).map(|item| (item, *shard_mtime)))
+    {
+        Some((item, shard_mtime)) if item.state == InventoryItemState::Normal
+            && item.hash == stale.hash
+            && item.item_type == stale.item_type => (item.as_ref().clone(), shard_mtime),
+        _ => (stale.clone(), 0),
+    };
+
+    match matching_content(&tracked_path(parent_key, name), &witness, shard_mtime) {
+        Some(Restored::Restatted(refreshed)) => refreshed,
+        Some(Restored::Untouched) => witness,
+        _ => stale,
+    }
 }
 
 /// Join a directory key and an entry name into the entry's warehouse path.
