@@ -608,10 +608,10 @@ fn nothing_staged_under(path: &WarehousePath) -> Result<bool, String> {
 /// * `Ok(())`      - If the shards were built.
 /// * `Err(String)` - If a subtree object could not be loaded, or a spine path's type changed.
 fn build_unstaged_shards(tree: &TreeItem,
-                      key: &str,
-                      tree_hash: &str,
-                      shards: &mut BTreeMap<String, Inventory>,
-                      scope: &MaterializationScope) -> Result<(), String> {
+                         key: &str,
+                         tree_hash: &str,
+                         shards: &mut BTreeMap<String, Inventory>,
+                         scope: &MaterializationScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope, or a level already
     // fully in scope, never needs the per-entry classify calls below — short-circuit them away
     // entirely on that hot, common path.
