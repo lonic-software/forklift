@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::stocktake_utils::ChangeKind;
-use forklift_core::util::{alias_utils, inventory_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
+use forklift_core::util::{alias_utils, file_utils, inventory_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
@@ -77,6 +77,9 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
     };
     let target_tree_hash = object_utils::load_parcel(&target_head)?.tree_hash;
 
+    // Anchored before the cleanliness check, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+
     ensure_warehouse_is_clean(current_tree_hash.as_deref()).await?;
 
     let (ops, removed_dirs) = shift_utils::diff_trees(
@@ -97,7 +100,7 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
     // Repopulate the staging area from the target tree ("repopulate on shift"): entries
     // carry the just-materialized files' stat data and the hashes from the tree, so the
     // whole warehouse is "clean" without reading a single file back.
-    let shards = shift_utils::build_inventories_for_tree(&target_tree_hash, shift_utils::TreeProvenance::Written)?;
+    let shards = shift_utils::build_inventories_for_tree(&target_tree_hash, shift_utils::TreeProvenance::Written(anchor))?;
     inventory_utils::replace_all_inventories(&shards)?;
 
     pallet_utils::set_current_pallet_name(target)?;

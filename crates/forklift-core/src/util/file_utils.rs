@@ -3086,6 +3086,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let probe = dir.join(FILE_NAME_CLOCK_PROBE);
 
+        let stamped = std::time::Instant::now();
         let StatAnchor::At(anchor) = take_stat_anchor_at(&probe).unwrap() else {
             panic!("a stamped probe must give an anchor");
         };
@@ -3095,10 +3096,15 @@ mod tests {
         assert!(anchor <= mtime, "a write after the anchor must not predate it: {} > {}", anchor, mtime);
         assert!(!StatAnchor::At(anchor).proves(mtime), "a write after the anchor must not be proven");
 
-        // Within the second, the cached anchor is handed out without touching the probe.
+        // Within the second, the cached anchor is handed out without touching the probe. A host
+        // stalled past most of that second could legitimately re-stamp, so the check only runs
+        // when it is still well inside it.
         std::fs::remove_file(&probe).unwrap();
-        assert!(matches!(take_stat_anchor_at(&probe).unwrap(), StatAnchor::At(cached) if cached == anchor));
-        assert!(!probe.exists(), "the probe must not be re-stamped within a second");
+        let reused = take_stat_anchor_at(&probe).unwrap();
+        if stamped.elapsed() < std::time::Duration::from_millis(900) {
+            assert!(matches!(reused, StatAnchor::At(cached) if cached == anchor));
+            assert!(!probe.exists(), "the probe must not be re-stamped within a second");
+        }
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let StatAnchor::At(later) = take_stat_anchor_at(&probe).unwrap() else { unreachable!() };

@@ -361,6 +361,33 @@ fn the_closure_check_fails_when_a_chunk_of_a_chunked_file_is_missing() {
     });
 }
 
+/// A reload heals a chunked file's objects as it heals a small file's blob: once the file's stat
+/// misses, its unchanged content is re-ingested in the store-writing mode, so a chunk that went
+/// missing from the store comes back.
+#[test]
+fn a_reload_restores_a_missing_chunk_of_an_unchanged_chunked_file() {
+    let warehouse = Warehouse::new("chunk-heal");
+
+    let head = warehouse.stack_large("big.bin", 0x5EED, CHUNK_THRESHOLD + 50_000, "a giant");
+    let victim = warehouse.scoped(|| {
+        let tree = object_utils::load_parcel(&head).expect("the head parcel").tree_hash;
+        let (recipe_hash, _) = object_utils::resolve_tree_file(&tree, "big.bin")
+            .expect("resolve")
+            .expect("big.bin is tracked");
+        object_utils::load_recipe(&recipe_hash).expect("the recipe").chunks[0].hash.clone()
+    });
+    warehouse.delete_object(&victim);
+
+    // Same content, different mtime: the stat misses and the content is re-proved.
+    let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::OpenOptions::new().write(true).open(warehouse.root.join("big.bin")).unwrap()
+        .set_modified(earlier).unwrap();
+    warehouse.run_ok(&["load", "."]);
+
+    assert!(warehouse.scoped(|| file_utils::does_object_exist(&victim).unwrap()),
+        "the reload must store the missing chunk again");
+}
+
 /// The subtree prune (§9.4b W1): a push that leaves a large chunked file untouched must not
 /// re-presence-check its ~million chunks. Proven by making the check *impossible* — a chunk of the
 /// unchanged file is deleted, yet the incremental check still passes, because the file's subtree is

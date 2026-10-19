@@ -111,7 +111,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
         scope_utils::set_bay_scope(&scope)?;
     }
 
-    shift_utils::materialize_tree(None, &tree, "Creating the bay", &Progress::NONE)?;
+    shift_utils::materialize_tree(None, &tree, "Creating the bay", file_utils::take_stat_anchor()?, &Progress::NONE)?;
 
     output::emit(&BayCreated {
         name: name.to_string(),

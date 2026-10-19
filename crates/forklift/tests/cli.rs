@@ -2095,6 +2095,29 @@ fn import_git_proves_an_unedited_symlink() {
     assert_only_the_ignore_file_is_untracked(&warehouse);
 }
 
+/// A file proven against git's tree keeps the tree's kind: an executable bit the tree does not
+/// record (a checkout under `core.fileMode=false`) is not something `import-git` stages.
+#[cfg(unix)]
+#[test]
+fn import_git_keeps_the_tree_kind_of_a_proven_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("import-git-tree-kind");
+    let root = warehouse.root.clone();
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file("tool.sh", "echo hi\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+    std::fs::set_permissions(root.join("tool.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_eq!(inventory_entry(&warehouse, "", "tool.sh").item_type,
+        forklift_core::enums::dir_entry_type::DirEntryType::Normal, "the tree's kind must be kept");
+}
+
 /// An entry `shift` records for a file it just wrote proves nothing, so an edit in that same
 /// second (same size, same mtime and ctime seconds) is still reported after a sibling's load
 /// republishes the shard a second later.

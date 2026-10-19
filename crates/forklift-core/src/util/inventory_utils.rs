@@ -12,7 +12,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{alias_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils};
+use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
@@ -1343,7 +1343,9 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                             // Storing on the unchanged-by-hash path too keeps load
                             // self-healing: a blob that went missing from the object
                             // store comes back on the next re-load. A chunked file's objects
-                            // were already stored during ingest (`object` is `None`).
+                            // were already stored during ingest (`object` is `None`); a large
+                            // file its entry holds as one plain blob is re-proved by streaming,
+                            // so that blob is not healed here.
                             //
                             // Staged, not stored immediately (DESIGN.html §5.0 D item 10, finding
                             // #1): see `context.blob_batch`'s and this task's own doc comments for
@@ -1576,8 +1578,9 @@ fn directory_has_no_untracked_content(key: &str,
 /// Each decision takes its stat anchor at its start, before it stats anything, so every entry it
 /// rebuilds proves itself (see [`file_utils::StatAnchor`]); when the shard is later published
 /// makes no difference to what its entries are trusted for. A file whose stat missed is
-/// re-proved in its entry's representation first (see [`reprove_file`]), so an unchanged file
-/// keeps its storage and is never restaged as a change of storage alone.
+/// classified the way `load`'s walk does (see [`classify_file_against_entry`]), in its entry's
+/// representation, so an unchanged file keeps its storage and is never restaged as a change of
+/// storage alone.
 ///
 /// Every rebuilt file's blob is staged into its own batch, finished on its own — durable —
 /// strictly before `publish_shard_outcomes` stages any shard content (DESIGN.html §5.0 D item 10,
@@ -1670,22 +1673,20 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
 
                 let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
-                if is_entry_unchanged(&item, &metadata, item_type, &file_path) {
-                    continue;
-                }
-
                 // The entry is rebuilt even when only the stat data went stale (same
                 // content), so the refreshed shard keeps the fast path warm. Blobs are staged,
                 // not stored immediately — see the batch comment above. Staging an unchanged
                 // file's blob too heals one that went missing from the store, as `load` does.
-                let rebuilt = match reprove_file(&item, item_type, &file_path, &name, anchor)? {
-                    Some((reproved, object)) => {
+                let rebuilt = match classify_file_against_entry(
+                    &item, &metadata, item_type, &file_path, &name, IngestMode::Store, anchor,
+                )? {
+                    FileVerdict::UnchangedByStat => continue,
+                    FileVerdict::UnchangedByHash(rebuilt, object) | FileVerdict::Modified(rebuilt, object) => {
                         if let Some(mut object) = object {
                             object.store_deferred(&blob_batch)?;
                         }
-                        reproved
+                        rebuilt
                     }
-                    None => build_inventory_item_from_file_deferred(&file_path, &name, item_type, &blob_batch, anchor)?,
                 };
                 changed = true;
 
@@ -2757,8 +2758,16 @@ pub enum FileVerdict {
 
 /// Classify one on-disk file against its existing inventory entry: the stat-cache fast
 /// path first (see `is_entry_unchanged`, including the racily-clean protection), then a
-/// read-and-hash comparison in the entry's own representation (see [`reprove_file`]). Nothing
-/// is written to the object store or the inventory.
+/// read-and-hash comparison in the entry's own representation.
+///
+/// The file is read once when ingesting it would record it in the entry's representation (a
+/// symlink as a symlink, a file below the chunk threshold as a plain blob, one at or above it as
+/// a recipe): the ingested item then either carries the entry's hash or is the modified item.
+/// Only when the two differ — a large file the entry holds as one plain blob, or a chunked entry
+/// whose file shrank — is the file first re-proved in the entry's representation (see
+/// [`reprove_file`]) and then, on a miss, ingested. Nothing is written to the inventory; under
+/// `IngestMode::Store` a chunked file's chunks and recipe are stored as it is ingested, which
+/// heals any that went missing.
 ///
 /// # Arguments
 /// * `existing`  - The inventory entry the file is compared against.
@@ -2786,6 +2795,16 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
         return Ok(FileVerdict::UnchangedByStat);
     }
 
+    if ingest_keeps_representation(existing, metadata, item_type) {
+        let (item, object) = build_item_and_object_for_file(path, name, item_type, mode, anchor)?;
+
+        return Ok(if item.hash == existing.hash {
+            FileVerdict::UnchangedByHash(item, object)
+        } else {
+            FileVerdict::Modified(item, object)
+        });
+    }
+
     if let Some((item, object)) = reprove_file(existing, item_type, path, name, anchor)? {
         return Ok(FileVerdict::UnchangedByHash(item, object));
     }
@@ -2793,6 +2812,23 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
     let (item, object) = build_item_and_object_for_file(path, name, item_type, mode, anchor)?;
 
     Ok(FileVerdict::Modified(item, object))
+}
+
+/// Whether ingesting the file would record it in the existing entry's representation, so the
+/// ingest's own hash decides whether the file still holds the entry's content (see
+/// [`object_utils::hash_file_as_entry`], which this must agree with). A symlink↔file flip never
+/// does: a link target and a file's bytes can hash alike without being the same content.
+fn ingest_keeps_representation(existing: &InventoryItem,
+                               metadata: &std::fs::Metadata,
+                               item_type: DirEntryType) -> bool {
+    let entry_is_link = existing.item_type == DirEntryType::SymbolicLink;
+    if entry_is_link != (item_type == DirEntryType::SymbolicLink) {
+        return false;
+    }
+
+    let ingest_chunks = metadata.len() >= chunk_utils::CHUNK_THRESHOLD_BYTES as u64;
+
+    entry_is_link || existing.item_type.is_chunked() == ingest_chunks
 }
 
 /// Re-prove a file whose stat missed against its existing entry, by hashing it in the entry's
@@ -2803,6 +2839,10 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
 /// file's current kind, so an executable-bit flip is still recorded, and records a fresh stat
 /// under `anchor`. That stat is taken after the hash; any edit since the anchor leaves an mtime
 /// the anchor does not prove, so the entry is then recorded as unproven.
+///
+/// Nothing is stored: a chunked entry is re-chunked only to compute its recipe hash. A writer
+/// that should heal a chunked entry's objects goes through [`classify_file_against_entry`],
+/// which ingests a file still at chunk size in the store-writing mode instead.
 ///
 /// # Arguments
 /// * `existing`  - The inventory entry the file is compared against.
