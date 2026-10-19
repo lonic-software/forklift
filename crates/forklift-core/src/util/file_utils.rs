@@ -2398,9 +2398,9 @@ fn type_of_dir_entry_when(metadata: &Metadata, executable_bit_is_observable: boo
 /// metadata root, each removed again once measured.
 pub const FILE_NAME_PREFIX_EXECUTABLE_BIT_PROBE: &str = "exec-probe-";
 
-/// The answers [`executable_bit_is_observable`] has given, failures included, keyed by device.
+/// The answers [`executable_bit_is_observable`] has given, keyed by device.
 #[cfg(unix)]
-type ExecutableBitProbes = std::sync::RwLock<std::collections::HashMap<u64, Result<bool, String>>>;
+type ExecutableBitProbes = std::sync::RwLock<std::collections::HashMap<u64, bool>>;
 
 /// This process's [`ExecutableBitProbes`]: the answer belongs to a volume, and the device is in
 /// every `stat`, so a lookup costs no system call.
@@ -2425,7 +2425,8 @@ static EXECUTABLE_BIT_PROBES: std::sync::LazyLock<ExecutableBitProbes> =
 /// volume or quota) cannot be measured, and reads as the platform's default (Unix keeps the bit),
 /// so a command that only reads still runs there. On a blind volume what it can then show is a
 /// `chmod` that is not there, never a missed one; a command that writes to the metadata root fails
-/// on that write. Any other failure fails every caller alike, and is not retried.
+/// on that write. Any other failure fails the caller, and is not kept: the next caller probes again,
+/// so a passing one (a descriptor limit, an interrupted call) costs one command nothing but a retry.
 ///
 /// [`bay_root`]: crate::globals::bay_root
 ///
@@ -2448,30 +2449,27 @@ fn executable_bit_is_observable_in(probes: &ExecutableBitProbes,
     use std::os::unix::fs::MetadataExt;
 
     let device = metadata.dev();
-    if let Some(answer) = probes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&device) {
-        return answer.clone();
+    if let Some(observable) = probes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&device) {
+        return Ok(*observable);
     }
 
     let mut probes = probes.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(answer) = probes.get(&device) {
-        return answer.clone();
+    if let Some(observable) = probes.get(&device) {
+        return Ok(*observable);
     }
 
     let root = root();
-    let answer = match std::fs::metadata(&root) {
-        Err(err) => Err(format!("Could not probe {} for the executable bit: {}", root.display(), err)),
-        Ok(root_metadata) => {
-            let answer = match probes.get(&root_metadata.dev()) {
-                Some(answer) => answer.clone(),
-                None => probe_executable_bit(&root),
-            };
-            probes.insert(root_metadata.dev(), answer.clone());
-            answer
-        }
+    let root_device = std::fs::metadata(&root)
+        .map_err(|err| format!("Could not probe {} for the executable bit: {}", root.display(), err))?
+        .dev();
+    let observable = match probes.get(&root_device) {
+        Some(observable) => *observable,
+        None => probe_executable_bit(&root)?,
     };
-    probes.insert(device, answer.clone());
+    probes.insert(root_device, observable);
+    probes.insert(device, observable);
 
-    answer
+    Ok(observable)
 }
 
 /// [`executable_bit_is_observable`]: Windows keeps no executable bit.
@@ -3339,7 +3337,7 @@ mod tests {
     /// The answer is kept per device: an entry on the metadata root's volume is measured there,
     /// one on another device (`/dev/null` stands in for a mount inside the working tree) gets the
     /// metadata root's answer rather than a probe of a volume nothing may write to, and a failure
-    /// is kept like an answer, so a caller that swallows it does not probe again for every file.
+    /// is not kept, so one that passes (a descriptor limit) is retried by the next caller.
     #[cfg(unix)]
     #[test]
     fn the_answer_is_kept_per_device_and_another_device_gets_the_metadata_root_s() {
@@ -3356,8 +3354,8 @@ mod tests {
 
         let probes = ExecutableBitProbes::default();
         assert!(executable_bit_is_observable_in(&probes, &elsewhere, || root.clone()).unwrap());
-        assert_eq!(probes.read().unwrap().get(&note.dev()), Some(&Ok(true)), "the root's volume was measured");
-        assert_eq!(probes.read().unwrap().get(&elsewhere.dev()), Some(&Ok(true)));
+        assert_eq!(probes.read().unwrap().get(&note.dev()), Some(&true), "the root's volume was measured");
+        assert_eq!(probes.read().unwrap().get(&elsewhere.dev()), Some(&true));
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the probe file was left behind");
         assert!(executable_bit_is_observable_in(&probes, &note, || unreachable!("answered from the cache")).unwrap());
 
@@ -3365,8 +3363,9 @@ mod tests {
         let absent = dir.join("absent");
         let error = executable_bit_is_observable_in(&failing, &note, || absent.clone()).unwrap_err();
         assert!(error.contains("Could not probe"), "{}", error);
-        assert_eq!(executable_bit_is_observable_in(&failing, &note, || unreachable!("the failure is kept")),
-                   Err(error));
+        assert!(failing.read().unwrap().is_empty(), "a failure is not kept");
+        assert!(executable_bit_is_observable_in(&failing, &note, || root.clone()).unwrap(),
+                "the next caller probes again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
