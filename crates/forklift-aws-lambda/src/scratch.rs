@@ -77,14 +77,20 @@ pub struct Scratch {
 
 impl Scratch {
     /// Create and prepare a fresh scratch warehouse, removed on drop.
+    ///
+    /// The folder is created new, so a folder a killed earlier process with this one's id left
+    /// at the same name is stepped past, never adopted: its objects were mirrored for another
+    /// invocation, and presence here is taken as presence in the object store.
     pub fn new() -> Result<Scratch, String> {
-        let unique = format!(
+        let candidates = (0..64).map(|_| std::env::temp_dir().join(format!(
             "forklift-head-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
+        )));
+        let dir = file_utils::create_first_new_folder(candidates)
+            .map_err(|e| format!("Error while creating the scratch warehouse: {}", e))?;
 
-        Scratch::at(std::env::temp_dir().join(unique), true)
+        Scratch::at(dir, true)
     }
 
     /// The process-global scratch for `warehouse_id`, created on first use and reused by
@@ -331,4 +337,40 @@ fn materialize_tree(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A killed earlier runtime with this one's process id (a restarted Lambda runtime keeps its
+    /// temp folder and often its id) can leave its scratch at the very name the next one draws.
+    /// The new scratch steps past it and starts empty, rather than adopting objects mirrored for
+    /// another invocation, and the litter is left alone.
+    #[test]
+    fn a_dead_runtime_s_scratch_at_the_next_name_is_not_adopted() {
+        let next = COUNTER.load(Ordering::Relaxed);
+        let litter: Vec<_> = (next..next + 8)
+            .map(|n| std::env::temp_dir().join(format!("forklift-head-{}-{}", std::process::id(), n)))
+            .collect();
+        for folder in &litter {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("left.txt"), b"litter").unwrap();
+        }
+
+        let scratch = Scratch::new();
+        let error = scratch.as_ref().err().cloned();
+        let adopted = scratch.as_ref().is_ok_and(|scratch| scratch.root().join("left.txt").exists());
+        let intact = litter.iter().all(|folder| std::fs::read(folder.join("left.txt")).is_ok_and(|c| c == b"litter"));
+        let fresh_name = scratch.as_ref().is_ok_and(|scratch| !litter.iter().any(|folder| folder == scratch.root()));
+        drop(scratch);
+        for folder in &litter {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+
+        assert_eq!(error, None, "litter must not fail the scratch");
+        assert!(!adopted, "a dead runtime's scratch was adopted");
+        assert!(fresh_name, "the scratch must be made at a name no litter holds");
+        assert!(intact, "litter is left as it was");
+    }
 }

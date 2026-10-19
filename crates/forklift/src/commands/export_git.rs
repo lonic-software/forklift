@@ -6,7 +6,7 @@ use serde::Serialize;
 use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
-use forklift_core::util::{object_utils, pallet_utils};
+use forklift_core::util::{file_utils, object_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the export-git command (§7.8): one-way export of this warehouse's history into a
@@ -217,22 +217,9 @@ impl<'a> Exporter<'a> {
             return Ok(hash.clone());
         }
 
-        // A per-process atomic counter, not just the pid, is part of the temp name: two calls to
-        // `convert_chunked_blob` in the same process (even sequentially, since the previous temp
-        // is removed before this one is created) must never share a name, and this matches the
-        // naming convention `object_utils`/`file_utils` use for their own temp files.
-        static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let write_id = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temp_path = std::env::temp_dir().join(format!(
-            "forklift-export-{}-{}-{}.tmp", std::process::id(), write_id, recipe_hash
-        ));
+        let (temp_path, file) = create_export_temp(recipe_hash)?;
 
         let assemble = || -> Result<(), String> {
-            // `create_new` refuses to open an existing path (including a planted symlink) rather
-            // than following/truncating it — a shared, world-writable /tmp is not a safe place to
-            // open-by-name-and-truncate.
-            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)
-                .map_err(|e| format!("Error while creating a temp file for git export: {}", e))?;
             let mut writer = std::io::BufWriter::new(file);
             object_utils::assemble_chunked_file(recipe_hash, &mut writer)?;
             std::io::Write::flush(&mut writer)
@@ -254,6 +241,24 @@ impl<'a> Exporter<'a> {
 
         Ok(git_hash)
     }
+}
+
+/// Numbers [`create_export_temp`]'s files.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Create a fresh temp file to assemble the chunked blob `recipe_hash` into for `git hash-object`.
+/// A per-process counter, not just the pid, is part of the name, so no two calls in one process
+/// share it. The file is created new, never opened by name: a shared, world-writable temp folder
+/// is no place to follow or truncate a planted symlink. A name already taken, by such a plant or
+/// by a killed earlier process with this one's id, is stepped past.
+fn create_export_temp(recipe_hash: &str) -> Result<(std::path::PathBuf, std::fs::File), String> {
+    let candidates = (0..64).map(|_| std::env::temp_dir().join(format!(
+        "forklift-export-{}-{}-{}.tmp",
+        std::process::id(), TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed), recipe_hash
+    )));
+
+    file_utils::create_first_new_file(candidates)
+        .map_err(|e| format!("Error while creating a temp file for git export: {}", e))
 }
 
 /// The (name, email) and unix time of a parcel's authoring action (`want_author`) or its
@@ -420,4 +425,34 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<ExportReport>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A killed earlier process with this one's id can leave its temp file at the very name the
+    /// next export draws. The export steps past it rather than failing, and leaves it alone.
+    #[test]
+    fn a_dead_process_s_temp_file_at_the_next_name_is_stepped_past() {
+        let recipe = format!("litter-recipe-{}", std::process::id());
+        let next = TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let litter: Vec<_> = (next..next + 8)
+            .map(|n| std::env::temp_dir().join(format!("forklift-export-{}-{}-{}.tmp", std::process::id(), n, recipe)))
+            .collect();
+        for file in &litter {
+            std::fs::write(file, b"litter").unwrap();
+        }
+
+        let created = create_export_temp(&recipe);
+        let contents: Vec<_> = litter.iter().map(|file| std::fs::read(file).unwrap()).collect();
+        for file in &litter {
+            let _ = std::fs::remove_file(file);
+        }
+
+        let (path, _file) = created.expect("litter must not fail the export");
+        let _ = std::fs::remove_file(&path);
+        assert!(!litter.contains(&path), "a taken name was reused: {}", path.display());
+        assert!(contents.iter().all(|content| content == b"litter"), "litter is left as it was");
+    }
 }

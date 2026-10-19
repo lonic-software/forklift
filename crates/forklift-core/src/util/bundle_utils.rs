@@ -282,15 +282,9 @@ impl TemporaryBundleDirectory {
     fn new(parent: &Path) -> Result<TemporaryBundleDirectory, String> {
         // `unique_child` advances its counter on every call, so a leftover directory from a
         // killed builder with a recycled PID costs a retry, never the build.
-        for _ in 0..16 {
-            let path = unique_child(parent, ".bundle-packs");
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(TemporaryBundleDirectory { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("Error while creating bundle pack staging: {}", e)),
-            }
-        }
-        Err("Error while creating bundle pack staging: no unused staging name.".to_string())
+        file_utils::create_first_new_folder((0..16).map(|_| unique_child(parent, ".bundle-packs")))
+            .map(|path| TemporaryBundleDirectory { path })
+            .map_err(|e| format!("Error while creating bundle pack staging: {}", e))
     }
 }
 
