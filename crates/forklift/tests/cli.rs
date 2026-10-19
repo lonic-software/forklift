@@ -1890,6 +1890,16 @@ fn backdate(path: &std::path::Path, seconds: u64) {
     file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
 }
 
+/// The rollup hash of the shard `key`, read straight off disk.
+fn shard_rollup(warehouse: &TestWarehouse, key: &str) -> Option<String> {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+
+    let (_, bytes) = forklift_core::util::file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
+    let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+
+    inventory.get_rollup_hash().cloned()
+}
+
 /// The inventory entry of `name` in the shard `key`, read straight off disk.
 fn inventory_entry(warehouse: &TestWarehouse, key: &str, name: &str) -> forklift_core::model::inventory::InventoryItem {
     let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
@@ -1939,11 +1949,24 @@ fn restore_leaves_files_that_already_match_untouched() {
     let touched_secs = c_touched.0.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     assert_ne!(inventory_entry(&warehouse, "dir", "c.txt").content_change_timestamp, touched_secs);
 
+    let rollup = shard_rollup(&warehouse, "");
+    assert!(rollup.is_some(), "the stack must stamp the root's rollup");
+
     let restored = stdout(&warehouse.run(&["restore", "dir"]));
     assert!(restored.contains("Restored 0 file(s) from the inventory; 2 already matched it."), "{}", restored);
     assert_eq!(file_identity(&warehouse.root.join("dir/c.txt")), c_touched, "a matching file must not be rewritten");
     assert_eq!(inventory_entry(&warehouse, "dir", "c.txt").content_change_timestamp, touched_secs,
         "the hash-matched entry must record the file's fresh stat data");
+
+    // The single-file form records a touched file the same way, and neither form clears a
+    // rollup, since no content changed.
+    backdate(&warehouse.root.join("a.txt"), 7200);
+    let a_touched = file_identity(&warehouse.root.join("a.txt")).0.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let single = stdout(&warehouse.run(&["restore", "a.txt"]));
+    assert!(single.contains("\"a.txt\" already matches the inventory."), "{}", single);
+    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, a_touched,
+        "the hash-matched entry must record the file's fresh stat data");
+    assert_eq!(shard_rollup(&warehouse, ""), rollup, "a stat-only restore must keep the rollups");
 
     let status = stdout(&warehouse.run(&["stocktake"]));
     assert!(status.contains("The working directory matches the inventory"), "must be clean: {}", status);

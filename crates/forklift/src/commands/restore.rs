@@ -120,21 +120,23 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
         ));
     }
 
-    let restored = restore_entry(parent.as_key(), &item, shard_mtime)?;
-    let rewritten = matches!(restored, Restored::Rewritten(_));
+    // Through a batch rather than `update_shard`: recording only stat data keeps the rollups.
+    let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    if let Restored::Restatted(refreshed) | Restored::Rewritten(refreshed) = restored {
-        inventory_utils::update_shard(parent.as_key(), |inventory| {
-            inventory.add_item(refreshed);
-            Ok(())
-        })?;
-    }
+    let message = match restore_entry(parent.as_key(), &item, shard_mtime)? {
+        Restored::Untouched => format!("\"{}\" already matches the inventory.", path.as_key()),
+        Restored::Restatted(refreshed) => {
+            batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
+            format!("\"{}\" already matches the inventory.", path.as_key())
+        }
+        Restored::Rewritten(refreshed) => {
+            batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
+            format!("Restored \"{}\" from the inventory.", path.as_key())
+        }
+    };
 
-    if rewritten {
-        output::message(format!("Restored \"{}\" from the inventory.", path.as_key()));
-    } else {
-        output::message(format!("\"{}\" already matches the inventory.", path.as_key()));
-    }
+    batch.publish()?;
+    output::message(message);
 
     Ok(())
 }
@@ -177,9 +179,9 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
                 continue;
             }
 
-            // Recorded right after `restore_entry` statted the file, as one `update_shard` per
-            // file did: a file statted earlier would record an editor's save in between against
-            // the staged hash.
+            // Recorded right after `restore_entry` statted the file: the batch anchors the shard's
+            // publish time at this update, so a file statted earlier would record an editor's save
+            // in between against the staged hash.
             let recorded = restore_entry(shard_key, item, shard_mtime).and_then(|restored| match restored {
                 Restored::Untouched => {
                     matched_count += 1;
@@ -244,10 +246,7 @@ fn read_shard(key: &str) -> Result<Option<(Inventory, u64)>, String> {
         return Ok(None);
     };
 
-    // An unreadable timestamp trusts no entry, so every file is compared by content.
-    let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
-        .and_then(|metadata| file_utils::get_content_modification_timestamp_for_file(&metadata).ok())
-        .unwrap_or(0);
+    let shard_mtime = file_utils::get_shard_mtime_or_zero(&shard_path);
 
     forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
         .map(|inventory| Some((inventory, shard_mtime)))
@@ -333,6 +332,12 @@ fn matching_content(file_path: &str, item: &InventoryItem, shard_mtime: u64) -> 
     let item_type = file_utils::get_type_of_dir_entry(&metadata);
 
     if item_type.on_disk_kind() != item.item_type.on_disk_kind() {
+        return None;
+    }
+
+    // A size that differs settles it without reading the file. Not for a symlink, whose stored
+    // size is not comparable, nor for an entry with zeroed stat data, which records no size.
+    if item_type != DirEntryType::SymbolicLink && item.inode != 0 && metadata.len() != item.file_size {
         return None;
     }
 

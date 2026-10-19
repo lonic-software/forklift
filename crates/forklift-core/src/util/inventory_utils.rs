@@ -1706,9 +1706,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
                 return Ok(None);
             };
 
-            let shard_mtime = file_utils::get_symlink_metadata_for_path(&shard_path).ok()
-                .and_then(|m| file_utils::get_content_modification_timestamp_for_file(&m).ok())
-                .unwrap_or(0);
+            let shard_mtime = file_utils::get_shard_mtime_or_zero(&shard_path);
 
             let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
                 .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
