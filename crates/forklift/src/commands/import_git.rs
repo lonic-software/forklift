@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
@@ -334,9 +334,6 @@ struct Converter {
     oid_len: usize,
     blobs: HashMap<String, String>,
     trees: HashMap<String, String>,
-    /// Git trees already checked as a commit's root (`ensure_importable_root`), so a reused
-    /// root is read again at most once.
-    checked_roots: HashSet<String>,
     commits: HashMap<String, String>,
     warnings: Vec<String>,
 
@@ -398,7 +395,6 @@ impl Converter {
             oid_len,
             blobs: HashMap::new(),
             trees: HashMap::new(),
-            checked_roots: HashSet::new(),
             commits: HashMap::new(),
             warnings: Vec::new(),
             ingest: pack_direct.then(StoreIngest::new).transpose()?,
@@ -481,12 +477,8 @@ impl Converter {
     /// are revisited, and each blob is considered exactly where history changed it.
     fn convert_tree(&mut self, git_hash: &str, path_prefix: &str) -> Result<String, String> {
         if let Some(hash) = self.trees.get(git_hash).cloned() {
-            // A tree first converted as a subdirectory, where any name is fine, can come back as
-            // a commit's root; a fresh conversion checks its root entries in the loop below.
-            if path_prefix.is_empty() && !self.checked_roots.contains(git_hash) {
-                self.ensure_importable_root(git_hash)?;
-                self.checked_roots.insert(git_hash.to_string());
-            }
+            // Its entries were checked when it was first converted, at whatever depth: the name
+            // rule below holds at every depth alike.
             // Already imported (an identical directory elsewhere in history) — nothing to
             // store, but it is now the newest version at *this* path, so a later version
             // here deltas against it.
@@ -505,9 +497,7 @@ impl Converter {
             e, if path_prefix.is_empty() { "/" } else { path_prefix }
         ))?;
         for entry in entries {
-            if path_prefix.is_empty() {
-                refuse_metadata_alias(git_hash, &entry.name)?;
-            }
+            refuse_metadata_alias(git_hash, path_prefix, &entry.name)?;
 
             let path = join_path(path_prefix, &entry.name);
             let child = match entry.mode.as_str() {
@@ -537,9 +527,6 @@ impl Converter {
         let mut object = LooseObjectBuilder::build_tree(&tree);
         self.store_tree(&mut object, path_prefix, git_hash)?;
 
-        if path_prefix.is_empty() {
-            self.checked_roots.insert(git_hash.to_string());
-        }
         self.trees.insert(git_hash.to_string(), object.hash.clone());
 
         Ok(object.hash)
@@ -614,16 +601,6 @@ impl Converter {
         let depth = self.stored_depth.get(&base_hash).copied().unwrap_or(u32::MAX);
 
         Ok(Some((base_hash, bytes, depth)))
-    }
-
-    /// [`refuse_metadata_alias`] over every entry of the root tree `git_hash`, read again: for a
-    /// tree whose conversion is reused, so its entries were never checked as a root.
-    fn ensure_importable_root(&mut self, git_hash: &str) -> Result<(), String> {
-        let (_, bytes) = self.batch.read(git_hash)?;
-
-        let entries = parse_raw_tree(&bytes, self.oid_len)
-            .map_err(|e| format!("{} It is in the directory \"/\" of the git history.", e))?;
-        entries.iter().try_for_each(|entry| refuse_metadata_alias(git_hash, &entry.name))
     }
 
     /// Rebuild a tree's object bytes from its git hash, for when the cache has evicted them.
@@ -921,16 +898,27 @@ fn parse_identity(text: &str) -> Result<(Operator, i64), String> {
     Ok((Operator { name, identifier: email }, time))
 }
 
-/// Refuse `name` as a top-level entry of the root tree `git_hash` if some file system opens it as
-/// `.forklift`: a parcel carrying it could never be checked out there. The name rule alone, unlike
-/// `stack`, because the tree is git's and no entry of it is on this volume.
-fn refuse_metadata_alias(git_hash: &str, name: &str) -> Result<(), String> {
+/// Refuse `name` as an entry of the git tree `git_hash`, at `path_prefix` from the root, if some
+/// file system opens it as `.forklift`, at any depth: at the top, a parcel carrying it could never
+/// be checked out; below it, checking it out would plant another working tree, which every command
+/// run inside that directory would take for its warehouse. The name rule alone, unlike `stack`,
+/// because the tree is git's and no entry of it is on this volume.
+fn refuse_metadata_alias(git_hash: &str, path_prefix: &str, name: &str) -> Result<(), String> {
     if office_utils::is_metadata_folder_name(name) {
-        return Err(format!(
-            "The git tree {} has the top-level entry {:?}, which some file systems open as the \
-            warehouse's metadata folder, so it cannot be imported.",
-            git_hash, name
-        ));
+        return Err(if path_prefix.is_empty() {
+            format!(
+                "The git tree {} has the top-level entry {:?}, which some file systems open as the \
+                warehouse's metadata folder, so it cannot be imported.",
+                git_hash, name
+            )
+        } else {
+            format!(
+                "The git tree {} at {:?} has the entry {:?}, which some file systems open as a \
+                warehouse's metadata folder, so it cannot be imported: checking it out would plant \
+                another working tree there.",
+                git_hash, path_prefix, name
+            )
+        });
     }
 
     Ok(())

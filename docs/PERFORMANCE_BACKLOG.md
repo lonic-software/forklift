@@ -443,6 +443,37 @@ verified directory handle is what would close it. That rewrites every write sink
 change, not a speed one, so it should be filed on its own if it is wanted. The probe's few percent
 falls only on trees whose top-level names hold a `~`.
 
+## FORK-201: the nested working-tree checks — measured (2026-10-20)
+
+FORK-201 adds three things to the paths above:
+
+- `check_working_path` now tests every component's name, not only the top-level one, and `lstat`s
+  `<ancestor>/.forklift` for each existing ancestor, refusing a path below another working tree's
+  root;
+- every materializer runs `check_planned_paths` over all its paths before the first write. That
+  pre-pass makes the same name and root tests against the working directory as it stands, and it
+  remembers each ancestor directory, so it costs two `lstat`s per directory, not per file;
+- the load and stocktake walks `lstat` `<dir>/.forklift` once for each directory the rules leave
+  them to walk.
+
+**Measured** on macOS (APFS) with hyperfine, release builds of 24b0dc1 against the branch. The
+corpus was 40,000 files in 2,000 directories six levels deep, with `FORKLIFT_FSYNC=0`:
+
+| | 24b0dc1 | FORK-201 | cost |
+|---|---|---|---|
+| `load .`, nothing changed | 410.5 ± 2.9 ms | 413.9 ± 7.2 ms | +0.8% |
+| `stocktake`, clean | 310.9 ± 27.2 ms | 320.1 ± 13.5 ms | within noise |
+| `shift` round trip, the whole tree written then removed | 7.449–7.513 s | 7.680 s | +2.4–3.1% |
+
+For the shift row, a throwaway build that skips the root test in the per-write backstop alone came
+in at 7.498–7.523 s, level with 24b0dc1, so the remaining cost is that one `lstat` per ancestor per
+write: about 400,000 of them, at roughly 0.5 µs each. An uncached pre-pass had cost about 7%.
+
+**Not done.** Dropping the root test from the backstop would recover those 2–3%. It can only fire
+there on a concurrent change, because the pre-pass refuses every `.forklift` name, so no operation
+writes one. But dropping it would require every writer, `restore` included, to run the pre-pass,
+and that is the kind of invariant FORK-173 declined for a 3% walk.
+
 ---
 
 ## Remaining items

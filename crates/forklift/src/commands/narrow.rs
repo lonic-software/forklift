@@ -3,7 +3,8 @@ use forklift_core::error::CoreError;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::stocktake_utils::ChangeKind;
-use forklift_core::util::{inventory_utils, object_utils, pallet_utils, scope_utils, stocktake_utils};
+use std::path::Path;
+use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, scope_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the narrow command (§7.6): shrink this checkout's materialization scope, dropping
@@ -101,6 +102,14 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 /// precedent (`shift` refuses rather than overwrite untracked content) — narrow's delete is
 /// unconditional once it decides to act, so the decision itself must be conservative.
 async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
+    // Before the change walks, which an ignore rule can blind to another working tree's root.
+    if let Some(holder) = find_nested_working_tree(Path::new(prefix)).map_err(CoreError::from)? {
+        return Err(scope_utils::narrow_unclean_refusal(
+            prefix,
+            &format!("another working tree at \"{}\" (it holds a metadata folder)", holder),
+        ));
+    }
+
     // A pure path test, not a one-prefix scope's classifier: every scope also holds the root
     // ignore file in scope, and a change to that file is not a change inside the subtree being
     // narrowed. An ancestor of `prefix` is excluded for the same reason.
@@ -141,6 +150,50 @@ async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
     }
 
     Ok(())
+}
+
+/// The first directory at or below `dir` holding an entry whose name some file system opens as a
+/// metadata folder: the root of another working tree, which removing `dir` would destroy. Read from
+/// the disk alone, never through the ignore rules, which can hide it from every change walk, and
+/// without following a symlink, which removing `dir` would only unlink.
+///
+/// # Arguments
+/// * `dir` - The directory, relative to the checkout root.
+///
+/// # Returns
+/// * `Ok(Some(holder))` - The directory holding such an entry, `/`-separated.
+/// * `Ok(None)`         - If there is none, or `dir` does not exist.
+/// * `Err(String)`      - If a directory could not be read.
+fn find_nested_working_tree(dir: &Path) -> Result<Option<String>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(None),
+        Err(e) => return Err(format!("Error while reading \"{}\": {}", dir.to_string_lossy(), e)),
+    };
+    let mut subdirectories = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Error while reading \"{}\": {}", dir.to_string_lossy(), e))?;
+
+        if office_utils::is_metadata_folder_name(&entry.file_name().to_string_lossy()) {
+            return Ok(Some(dir.to_string_lossy().replace('\\', "/")));
+        }
+
+        let file_type = entry.file_type()
+            .map_err(|e| format!("Error while reading \"{}\": {}", entry.path().to_string_lossy(), e))?;
+
+        if file_type.is_dir() {
+            subdirectories.push(entry.path());
+        }
+    }
+
+    for subdirectory in subdirectories {
+        if let Some(holder) = find_nested_working_tree(&subdirectory)? {
+            return Ok(Some(holder));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Remove a subtree's working files (relative to the checkout root the process entered). A

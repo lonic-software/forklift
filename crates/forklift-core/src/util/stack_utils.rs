@@ -239,6 +239,18 @@ pub async fn stack_parcel(description: Option<String>,
         ));
     }
 
+    // Below the top level, a name some file system opens as a metadata folder would plant another
+    // working tree wherever the parcel is checked out, so no materializer would write it. The
+    // top-level entries are checked once the root tree is built, below.
+    if let Some(path) = inventory_utils::nested_metadata_entry(&prepared)? {
+        return Err(StackError::Other(format!(
+            "Refusing to stack {:?}: it is, on this or some other file system, a warehouse's \
+            metadata folder, so checking it out would plant another working tree inside this one. \
+            Rename it, or unload it and add it to .forkliftignore.",
+            path
+        )));
+    }
+
     // An orphaned skeleton (left behind when a merge is aborted by removing
     // ".forklift/consolidation" directly, instead of resolving it) is harmless on its own — a
     // plain stack never reads it — but stale disk state is untidy and could confuse a future
@@ -299,9 +311,9 @@ pub async fn stack_parcel(description: Option<String>,
     // `.forklift.` anywhere but Windows) would stack fine and then refuse every checkout on a
     // file system that does not, so refuse it here, where it can still be unloaded. A name this
     // volume resolves to the metadata folder (which a whole-directory load walks into) would stack
-    // the folder's own content.
+    // the folder's own content. Deeper names were checked against the inventory above.
     for (name, _) in root_tree.get_subtrees().chain(root_tree.get_files()) {
-        if office_utils::opens_metadata_folder(name)? {
+        if office_utils::opens_metadata_folder(std::path::Path::new(""), name)? {
             return Err(StackError::Other(format!(
                 "Refusing to stack the top-level entry {:?}: it is, on this or some other file \
                 system, the warehouse's metadata folder, so no working directory there could check \

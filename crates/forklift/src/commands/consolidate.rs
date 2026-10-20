@@ -440,7 +440,20 @@ async fn ensure_warehouse_is_clean(our_tree_hash: &str) -> Result<(), String> {
 /// case-only rename on their side is a rename, and a name that lands on another entry through a
 /// case alias is refused naming both (see [`alias_utils`]). Shared with `cherry-pick`, which
 /// applies the same `MergeAction`s.
+///
+/// Every action that touches the working directory first has its path checked by
+/// `shift_utils::check_planned_paths`, so a path that names a metadata folder, or lies inside
+/// another working tree, refuses the whole merge before its first file changes.
 pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &str) -> Result<(), String> {
+    shift_utils::check_planned_paths(actions.iter().filter_map(|action| match action {
+        MergeAction::TakeTheirs { path, .. }
+        | MergeAction::Delete { path }
+        | MergeAction::Merged { path, .. }
+        | MergeAction::Conflict { path, .. } => Some(path.as_str()),
+        // Recorded in the out-of-scope skeleton, never written to the working directory.
+        MergeAction::ResolveOutOfScope { .. } => None,
+    }))?;
+
     let removals = MergeRemovals(actions.iter()
         .filter_map(|action| match action {
             MergeAction::Delete { path } => Some(path.clone()),

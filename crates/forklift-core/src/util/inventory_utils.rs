@@ -12,7 +12,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils};
+use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, tree_utils, warehouse_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
@@ -291,17 +291,48 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// * `Err(String)` - If there was an error.
 pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String> {
     // The walk skips the metadata folder by its exact name, but a named path is loaded whatever
-    // the rules say, so refuse it here. Every spelling some file system opens as the metadata
-    // folder (`.Forklift`, `.forklift.`, `FORKLI~1`) is refused, and so is a name this volume
-    // resolves to it.
-    let first_component = path.as_key().split('/').next().unwrap_or("");
-
-    if office_utils::opens_metadata_folder(first_component)? {
-        return Err(format!(
+    // the rules say, so refuse it here. Every spelling some file system opens as a metadata
+    // folder (`.Forklift`, `.forklift.`, `FORKLI~1`) is refused, in any component, and so is a
+    // name this volume resolves to one.
+    match office_utils::metadata_folder_component(path.as_key())? {
+        Some((0, component)) => return Err(format!(
             "Refusing to load \"{}\": {:?} is, on this or some other file system, the warehouse's \
             metadata folder, and it is never tracked.",
-            path.as_key(), first_component
-        ));
+            path.as_key(), component
+        )),
+        Some((_, component)) => return Err(format!(
+            "Refusing to load \"{}\": {:?} is, on this or some other file system, a warehouse's \
+            metadata folder, and checking it out would plant another working tree inside this one.",
+            path.as_key(), component
+        )),
+        None => {}
+    }
+
+    // A named path never meets the walk's nested-working-tree boundary as an entry of its parent
+    // (`load sub` walks from `sub` itself, and `load sub/x` does not walk), so test every
+    // directory down to it here.
+    if !path.is_root() {
+        let full = path.as_key();
+        let ends = full.match_indices('/').map(|(end, _)| end).chain(std::iter::once(full.len()));
+
+        for end in ends {
+            let key = &full[..end];
+
+            if warehouse_utils::is_working_tree_root(Path::new(key))? {
+                // As the walk judges it (see `rule_verdict`): tracked until every file below it
+                // is staged for removal.
+                let registered = registered_keys()?;
+                if registered.contains(key) && subtree_has_live_entry(key, &registered)? {
+                    return Err(tracked_nested_working_tree_error(key));
+                }
+
+                return Err(format!(
+                    "Refusing to load \"{}\": the folder \"{}\" holds a \".forklift\", so it is the \
+                    root of another working tree, and its content is that working tree's to load.",
+                    path.as_key(), key
+                ));
+            }
+        }
     }
 
     let is_directory = file_utils::is_directory(&path.to_fs_path())?;
@@ -405,6 +436,31 @@ pub enum RuleVerdict {
     /// file replaced by a folder, or a tracked folder by a file). The entry on disk is skipped
     /// like ignored content, and the tracked one is reported as gone, never hidden.
     CoveredOtherType,
+    /// No rule hides the entry, but it is an untracked directory holding a `.forklift` entry: the
+    /// root of another working tree (see [`warehouse_utils::is_working_tree_root`]), whose content
+    /// belongs to that one. Each walk decides what that means: load skips it, stocktake reports it
+    /// as one untracked directory.
+    NestedBoundary,
+}
+
+/// The refusal for a directory this warehouse tracks that has become the root of another working
+/// tree: walking it would report the other tree's metadata as content, and skipping it would report
+/// this warehouse's tracked content there as gone.
+///
+/// # Arguments
+/// * `key` - The directory's warehouse path key.
+pub fn tracked_nested_working_tree_error(key: &str) -> String {
+    let remedy = tree_utils::remedy_path(key);
+
+    format!(
+        "The folder \"{}\" holds a \".forklift\", so it is the root of another working tree, but \
+        this warehouse tracks it. To leave it to the other working tree, run \"forklift remove {}\"{}, \
+        which keeps its files on disk, then \"forklift stack\". Otherwise move its \".forklift\" \
+        out of it.",
+        key,
+        remedy.as_deref().unwrap_or("-- <folder>"),
+        if remedy.is_some() { "" } else { " with that path quoted for your shell" }
+    )
 }
 
 /// The ignore rules' verdict on an entry of a directory. A rule covers only untracked paths,
@@ -414,7 +470,10 @@ pub enum RuleVerdict {
 /// must still be reported as gone, which [`RuleVerdict::CoveredOtherType`] tells apart.
 ///
 /// The inventory is consulted first, and the entry's type (`DirEntry::file_type`, no extra
-/// stat on the common platforms) only when a rule covers a name that is tracked.
+/// stat on the common platforms) only when a rule covers a name that is tracked, or the rules
+/// leave a directory to be walked: then one more lstat asks whether it is the root of another
+/// working tree. That comes after the rules, so an ignored nested working tree stays
+/// [`RuleVerdict::Ignored`]; whatever deletes a directory cannot rely on this verdict.
 ///
 /// # Arguments
 /// * `rules`      - The ignore rules.
@@ -427,7 +486,9 @@ pub enum RuleVerdict {
 ///
 /// # Returns
 /// * `Ok(RuleVerdict)` - The verdict.
-/// * `Err(String)`     - If the entry's type could not be read.
+/// * `Err(String)`     - If the entry's type could not be read, or the entry is a tracked
+///                       directory that has become another working tree's root while some file
+///                       below it is still tracked (see [`tracked_nested_working_tree_error`]).
 pub fn rule_verdict(rules: &file_utils::IgnoreRules,
                     parent: file_utils::Coverage,
                     shard: Option<&Inventory>,
@@ -435,26 +496,59 @@ pub fn rule_verdict(rules: &file_utils::IgnoreRules,
                     name: &str,
                     key: &str,
                     registered: &BTreeSet<String>) -> Result<RuleVerdict, String> {
-    if !rules.excludes(key, false, parent) {
-        return Ok(RuleVerdict::Walk);
+    let is_directory = || entry.file_type()
+        .map(|file_type| file_type.is_dir())
+        .map_err(|e| format!("Error while getting the type of \"{}\": {}", key, e));
+
+    if rules.excludes(key, false, parent) {
+        let has_file_entry = shard.is_some_and(|inventory| has_live_entry(inventory, name));
+        let is_registered = registered.contains(key);
+
+        if rules.excludes(key, true, parent) || (!has_file_entry && !is_registered) {
+            return Ok(RuleVerdict::Ignored);
+        }
+
+        let is_directory = is_directory()?;
+
+        if !((is_directory && is_registered) || (!is_directory && has_file_entry)) {
+            return Ok(RuleVerdict::CoveredOtherType);
+        }
     }
 
-    let has_file_entry = shard.is_some_and(|inventory| has_live_entry(inventory, name));
-    let is_registered = registered.contains(key);
+    // `DirEntry::file_type` does not follow a symlink, so a link to a working tree is a link.
+    if is_directory()? && warehouse_utils::is_working_tree_root(&entry.path())? {
+        // Once every tracked file below it is staged for removal (the way out the error names),
+        // nothing of it is left to report as gone or stale, and it is a boundary like any other.
+        if registered.contains(key) && subtree_has_live_entry(key, registered)? {
+            return Err(tracked_nested_working_tree_error(key));
+        }
 
-    if rules.excludes(key, true, parent) || (!has_file_entry && !is_registered) {
-        return Ok(RuleVerdict::Ignored);
+        return Ok(RuleVerdict::NestedBoundary);
     }
 
-    let is_directory = entry.file_type()
-        .map_err(|e| format!("Error while getting the type of \"{}\": {}", key, e))?
-        .is_dir();
+    Ok(RuleVerdict::Walk)
+}
 
-    if (is_directory && is_registered) || (!is_directory && has_file_entry) {
-        Ok(RuleVerdict::Walk)
-    } else {
-        Ok(RuleVerdict::CoveredOtherType)
+/// Whether the registered directory `key`, or any registered directory below it, has an entry not
+/// staged for removal.
+fn subtree_has_live_entry(key: &str, registered: &BTreeSet<String>) -> Result<bool, String> {
+    let prefix = format!("{}/", key);
+
+    // `sub-x` sorts between `sub` and `sub/`, so the descendants are a range of their own.
+    let below = registered.range(prefix.clone()..).take_while(|tracked| tracked.starts_with(&prefix));
+
+    for tracked in std::iter::once(key).chain(below.map(String::as_str)) {
+        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(tracked)?;
+        let Some(bytes) = bytes else { continue };
+        let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", tracked, e))?;
+
+        if inventory.get_items().any(|(_, item)| item.state != InventoryItemState::Deleted) {
+            return Ok(true);
+        }
     }
+
+    Ok(false)
 }
 
 /// Whether the directory with the given key is tracked: registered in the inventory metadata.
@@ -1304,7 +1398,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             let entry_path = path.child(&name);
 
             // An entry the rules hide is left out of the rebuilt shard either way: a tracked
-            // entry of the other type under its name is then staged as removed.
+            // entry of the other type under its name is then staged as removed. So is another
+            // working tree's root, whose content is that tree's to track.
             let verdict = rule_verdict(
                 &ignore_rules, coverage, existing_inventory.as_ref(),
                 &entry, &name, entry_path.as_key(), &registered,
@@ -1480,7 +1575,8 @@ pub fn build_inventory_item_from_stat(path: &Path,
 
 /// Whether the directory at `path` may be safely replaced (by a file, or cleared to make
 /// way for one) without losing data: it is tracked — its key is registered, see
-/// [`is_tracked_directory`] — and every entry beneath it, recursively, is tracked too. Called for a path a merge or shift
+/// [`is_tracked_directory`] — and every entry beneath it, recursively, is tracked too, so
+/// removing the tracked files leaves it empty. Called for a path a merge or shift
 /// wants to write a new file to that already exists as a directory on disk (a tracked
 /// dir→file flip); the caller still refuses when this returns `false`, exactly as it does
 /// for a plain untracked file at the path.
@@ -1505,9 +1601,10 @@ pub fn directory_is_safe_to_replace(path: &str) -> Result<bool, String> {
 }
 
 /// Recursively check a tracked directory for untracked content (the body of
-/// `directory_is_safe_to_replace`). An untracked entry the ignore rules cover is skipped,
-/// matching `walk_directory_unstaged` in `stocktake_utils`: it is expendable, as in git, not a
-/// collision. A tracked entry a rule matches is checked like any other.
+/// `directory_is_safe_to_replace`). Every untracked entry blocks, ignored or not: applying
+/// removes only tracked files, so anything else would keep the directory from being replaced,
+/// and an ignore rule can hide another working tree's root, which must never be deleted. A
+/// tracked entry a rule matches is checked like any other.
 ///
 /// # Arguments
 /// * `key`          - The warehouse path key of the directory.
@@ -1532,10 +1629,10 @@ fn directory_has_no_untracked_content(key: &str,
         let name = file_utils::get_name_for_file_or_directory(&entry)?;
         let entry_key = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
-        // Content the rules hide never blocks a replace, including an entry that took over a
-        // tracked name as the other type.
+        // Ignored content, an entry that took over a tracked name as the other type, and another
+        // working tree's root are all untracked.
         if !matches!(rule_verdict(ignore_rules, coverage, Some(&inventory), &entry, &name, &entry_key, registered)?, RuleVerdict::Walk) {
-            continue;
+            return Ok(false);
         }
 
         let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
@@ -1890,6 +1987,50 @@ pub fn prepare_stack_inventory(skip: Option<(&str, &MaterializationScope)>) -> R
     }
 
     Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: false, skip: plan })
+}
+
+/// The first path below the top level that `stack` would record in a tree and that names a metadata
+/// folder in some component (see [`office_utils::opens_metadata_folder`]): checking it out would
+/// plant another working tree. Only the shards `prepared` read are asked, each one holding a live
+/// entry: a subtree the rollup skip proved unchanged was checked by the stack that recorded it, and
+/// a directory with no live entry beneath it is in no tree.
+///
+/// # Arguments
+/// * `prepared` - The stack's inventory snapshot.
+///
+/// # Returns
+/// * `Ok(Some(path))` - The first such path, in key order.
+/// * `Ok(None)`       - If there is none.
+/// * `Err(String)`    - If the volume could not say for some name.
+pub fn nested_metadata_entry(prepared: &PreparedInventory) -> Result<Option<String>, String> {
+    for (key, shard) in &prepared.shards {
+        let live: Vec<&str> = shard.get_items()
+            .filter(|(_, item)| item.state != InventoryItemState::Deleted)
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        if live.is_empty() || key.is_empty() {
+            continue;
+        }
+
+        // The top-level component is `stack`'s own root-entry check.
+        for (slash, _) in key.match_indices('/') {
+            let parent = &key[..slash];
+            let end = key[slash + 1..].find('/').map_or(key.len(), |next| slash + 1 + next);
+
+            if office_utils::opens_metadata_folder(Path::new(parent), &key[slash + 1..end])? {
+                return Ok(Some(key[..end].to_string()));
+            }
+        }
+
+        for name in live {
+            if office_utils::opens_metadata_folder(Path::new(key), name)? {
+                return Ok(Some(format!("{}/{}", key, name)));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Read and parse one registered shard for [`prepare_stack_inventory`], noting whether it holds a

@@ -37,6 +37,32 @@ pub fn find_warehouse_root() -> Result<PathBuf, String> {
     }
 }
 
+/// Whether `dir` is the root of a working tree: it holds a `.forklift` entry, folder (a warehouse)
+/// or file (a bay redirect), which [`find_warehouse_root`] stops at from anywhere inside it. Below
+/// the warehouse's own root, such a directory is another working tree, never content of this one.
+///
+/// Stricter than discovery, which follows a symlink: an entry of any kind counts, so a dangling
+/// link is not taken for an ordinary directory either.
+///
+/// # Arguments
+/// * `dir` - The directory, relative to the current directory or absolute.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether `dir` holds a `.forklift` entry (`false` when `dir` does not exist or
+///                   is not a directory).
+/// * `Err(String)` - If the entry could not be read.
+pub fn is_working_tree_root(dir: &Path) -> Result<bool, String> {
+    use std::io::ErrorKind;
+
+    let marker = dir.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => Ok(true),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(false),
+        Err(e) => Err(format!("Error while checking \"{}\": {}", marker.to_string_lossy(), e)),
+    }
+}
+
 /// Discover the warehouse root, remember where the process was invoked from (relative to
 /// the root), and switch the working directory to the root, so that all warehouse paths
 /// (e.g. the object store) resolve correctly regardless of where forklift was invoked.
