@@ -489,7 +489,7 @@ pub(crate) fn remedy_path(path: &str) -> Option<String> {
 /// and the message already wraps the command in them), so such a path gets `None` and the caller
 /// prints a `<path>` placeholder instead. A path starting with `-` is put after `--`, so it is not
 /// taken for an option.
-fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
+pub(crate) fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
     // PowerShell also reads `,` (an array), a leading `@` (splatting) and `+`, `:` in some
     // positions, so Windows keeps to the characters no shell there treats specially.
     let plain = if windows { "._-/" } else { "._-/+@%:," };
