@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{alias_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils};
+use crate::util::{alias_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -250,7 +250,12 @@ impl alias_utils::Removals for OpRemovals {
 /// clean directory (every entry beneath it tracked) — that is a tracked directory the diff is
 /// legitimately replacing with a file (a dir→file flip). Applying the diff must then delete the
 /// directory's contents before writing the file (see `apply_ops`); a directory with any
-/// untracked content beneath it is a genuine collision and still refuses.
+/// untracked content beneath it, ignored or not, is a genuine collision and still refuses.
+///
+/// Every operation's path, writes and removals alike, first goes through [`check_planned_paths`],
+/// so a path that names a metadata folder, or lies inside another working tree, refuses the whole
+/// diff before its first file changes. [`check_working_path`] inside each write and removal is the
+/// backstop, and the only place a symlink parent is judged, once earlier operations have run.
 ///
 /// # Arguments
 /// * `ops`          - The file operations a diff produced.
@@ -258,8 +263,14 @@ impl alias_utils::Removals for OpRemovals {
 ///
 /// # Returns
 /// * `Ok(Vec<Collision>)` - The collisions (empty when there are none).
-/// * `Err(String)`        - If a directory or a shard could not be read or parsed.
+/// * `Err(String)`        - If some operation's path is refused (see [`check_planned_paths`]), or a
+///                          directory or a shard could not be read or parsed.
 pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec<alias_utils::Collision>, String> {
+    check_planned_paths(ops.iter().map(|op| {
+        let (FileOp::Write { path, .. } | FileOp::Remove { path }) = op;
+        path.as_str()
+    }))?;
+
     let removals = OpRemovals::of(ops, removed_dirs);
     let mut check = alias_utils::AliasCheck::new();
     let mut collisions = Vec::new();
@@ -596,9 +607,12 @@ fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: Dir
 /// goes through here, because the path comes from a tree that may have arrived from a remote.
 ///
 /// Refused:
-/// * a first component that opens the warehouse's metadata folder: by any spelling some file
-///   system takes for it, or by resolving to it on this volume (see
-///   [`office_utils::opens_metadata_folder`]);
+/// * a component, at any depth, that opens a metadata folder: by any spelling some file system
+///   takes for it, or by resolving to it on this volume (see
+///   [`office_utils::metadata_folder_component`]). The root's is this warehouse's own; one below
+///   it would plant another working tree, which every later command run inside it would use;
+/// * a parent directory, at any depth, that is the root of another working tree (see
+///   [`warehouse_utils::is_working_tree_root`]): its content is not this warehouse's to write;
 /// * a parent directory, at any depth, that is a symlink: following it would write or remove
 ///   wherever it points. A file system that ignores case also reaches a symlink `lib` through a
 ///   tree directory `LIB`;
@@ -616,10 +630,8 @@ fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: Dir
 pub fn check_working_path(path: &str) -> Result<(), String> {
     let components: Vec<&str> = path.split('/').collect();
 
-    if office_utils::opens_metadata_folder(components[0])? {
-        return Err(format!(
-            "Refusing to touch {:?}: it is inside the warehouse's metadata folder.", path
-        ));
+    if let Some(component) = office_utils::metadata_folder_component(path)? {
+        return Err(metadata_component_refusal(path, component));
     }
 
     #[cfg(windows)]
@@ -629,28 +641,117 @@ pub fn check_working_path(path: &str) -> Result<(), String> {
         }
     }
 
+    check_ancestors(path, &components, true, None)
+}
+
+/// The part of [`check_working_path`] that holds before an operation applies, for the pass that
+/// runs over every operation's path before the first one does: refuse a path with a component
+/// that opens a metadata folder, or one below the root of another working tree as the working
+/// directory stands now. An ancestor that is not a real directory yet (missing, a file or a
+/// symlink) ends the walk, since an earlier operation may still replace it;
+/// [`check_working_path`] judges it again inside the write.
+///
+/// Nothing is written while the pass runs, so what it finds for each ancestor directory is
+/// remembered for the paths after it: a checkout pays two `lstat`s per directory, not per file.
+///
+/// # Arguments
+/// * `paths` - The warehouse paths, relative to the working directory, `/`-separated.
+///
+/// # Returns
+/// * `Ok(())`      - If nothing about any path refuses it before anything applies.
+/// * `Err(String)` - The first refusal, naming its path Debug-quoted.
+pub fn check_planned_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let mut walked: HashMap<PathBuf, bool> = HashMap::new();
+
+    for path in paths {
+        if let Some(component) = office_utils::metadata_folder_component(path)? {
+            return Err(metadata_component_refusal(path, component));
+        }
+
+        let components: Vec<&str> = path.split('/').collect();
+        check_ancestors(path, &components, false, Some(&mut walked))?;
+    }
+
+    Ok(())
+}
+
+/// Walk the existing ancestors of `path` from the root, refusing one that is another working
+/// tree's root, and, if `refuse_symlinks`, one that is a symlink. Without it a symlink ends the
+/// walk like a missing ancestor. `walked`, when given, holds what earlier walks of the same
+/// unchanged working directory found: `true` for a real directory to walk on through, `false` for
+/// one that ends the walk.
+fn check_ancestors(path: &str,
+                   components: &[&str],
+                   refuse_symlinks: bool,
+                   mut walked: Option<&mut HashMap<PathBuf, bool>>) -> Result<(), String> {
     let mut ancestor = PathBuf::new();
 
     for component in &components[..components.len().saturating_sub(1)] {
         ancestor.push(component);
 
-        match std::fs::symlink_metadata(&ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!(
-                    "Refusing to touch {:?}: its parent {:?} is a symlink, and following it could \
-                    leave the working directory.",
-                    path,
-                    ancestor.to_string_lossy()
-                ));
+        if let Some(through) = walked.as_deref().and_then(|walked| walked.get(&ancestor)) {
+            if *through {
+                continue;
             }
-            Ok(_) => {}
-            // Nothing further down exists yet, so nothing further down can be a symlink.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            break;
+        }
+
+        let through = match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if refuse_symlinks {
+                    return Err(format!(
+                        "Refusing to touch {:?}: its parent {:?} is a symlink, and following it could \
+                        leave the working directory.",
+                        path,
+                        ancestor.to_string_lossy()
+                    ));
+                }
+                false
+            }
+            Ok(_) => {
+                if warehouse_utils::is_working_tree_root(&ancestor)? {
+                    return Err(nested_working_tree_refusal(path, &ancestor.to_string_lossy()));
+                }
+                true
+            }
+            // Nothing further down exists yet (or a file stands where a directory will), so
+            // nothing further down can be a symlink or another working tree.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => false,
             Err(e) => return Err(format!("Error while checking \"{}\": {}", ancestor.to_string_lossy(), e)),
+        };
+
+        if let Some(walked) = walked.as_deref_mut() {
+            walked.insert(ancestor.clone(), through);
+        }
+        if !through {
+            break;
         }
     }
 
     Ok(())
+}
+
+/// The refusal for a path one of whose components names a metadata folder.
+fn metadata_component_refusal(path: &str, component: &str) -> String {
+    if path.split('/').next() == Some(component) {
+        format!("Refusing to touch {:?}: it is inside the warehouse's metadata folder.", path)
+    } else {
+        format!(
+            "Refusing to touch {:?}: its component {:?} is, on this or some other file system, a \
+            warehouse's metadata folder, and writing it would plant another working tree inside \
+            this one.",
+            path, component
+        )
+    }
+}
+
+/// The refusal for a path below `root`, the root of another working tree inside this one.
+fn nested_working_tree_refusal(path: &str, root: &str) -> String {
+    format!(
+        "Refusing to touch {:?}: {:?} holds a \".forklift\", so it is another working tree, not \
+        part of this one. Move that working tree out of the way first.",
+        path, root
+    )
 }
 
 /// Why Windows would not take `name` as one plain file name, if it would not: a `\` (a path
@@ -1342,10 +1443,17 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_name_below_the_top_level_is_an_ordinary_path() {
-        // Only the working directory's own `.forklift` is the metadata folder; these name paths
-        // that do not exist here, so no ancestor can be a symlink either.
-        for path in ["docs/.forklift/x", "no-such-dir/.ForkLift", "x.forklift"] {
+    fn a_metadata_name_below_the_top_level_is_refused_before_and_during_a_write() {
+        // These name paths that do not exist here, so no ancestor can be a symlink or another
+        // working tree: only the name decides.
+        for path in ["docs/.forklift/x", "no-such-dir/.ForkLift", "a/b/FORKLI~1"] {
+            for check in [|path| check_planned_paths([path]), check_working_path] {
+                let refused = check(path).expect_err(path);
+                assert!(refused.contains("plant another working tree"), "{:?}: {}", path, refused);
+            }
+        }
+        for path in ["x.forklift", "docs/forklift/x", "docs/.forklifts"] {
+            assert_eq!(check_planned_paths([path]), Ok(()), "{:?} must be accepted", path);
             assert_eq!(check_working_path(path), Ok(()), "{:?} must be accepted", path);
         }
     }

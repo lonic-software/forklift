@@ -454,8 +454,8 @@ pub fn ensure_not_metadata_tree(root_tree_hash: &str) -> Result<(), String> {
     ensure_not_metadata_root(&object_utils::load_tree(root_tree_hash)?)
 }
 
-/// Whether a top-level working-directory name opens the warehouse's metadata folder on some file
-/// system. The match is wider than the exact name, after git's `verify_path` (`is_ntfs_dotgit`,
+/// Whether a working-directory name, at any depth, opens a warehouse's metadata folder on some file
+/// system: at the top level the warehouse's own, below it another working tree's. The match is wider than the exact name, after git's `verify_path` (`is_ntfs_dotgit`,
 /// `is_hfs_dotgit`):
 /// * a file system that ignores case (macOS, Windows) opens `.forklift` for `.ForkLift`. Case is
 ///   folded by Unicode rules, as those file systems fold it, so `.for\u{212A}lift` (KELVIN SIGN)
@@ -505,21 +505,27 @@ fn is_hfs_ignorable(c: char) -> bool {
     matches!(c, '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}')
 }
 
-/// Whether the top-level working-directory name `name` opens the warehouse's metadata folder here:
-/// by [`is_metadata_folder_name`], or, for a name holding a `~` (the mark of every 8.3 short name,
-/// hashed ones included), because it resolves to the same entry as `.forklift` on this volume.
+/// Whether the working-directory entry `name` in the directory `parent` opens a metadata folder
+/// there: by [`is_metadata_folder_name`], or, for a name holding a `~` (the mark of every 8.3 short
+/// name, hashed ones included), because it resolves to the same entry as `parent/.forklift` on this
+/// volume. A `.forklift` in the root is the warehouse's own metadata folder; one in any directory
+/// below it is another working tree's, which warehouse discovery from inside that directory stops at.
 ///
-/// Relative to the current directory, which is the working directory's root: every working-directory
-/// read and write resolves there, so the volume is asked about the very entry the caller touches.
-/// Every check of a top-level name that ends in the working directory (load, stack, every
-/// materializer) asks this one, so they agree on which names are the metadata folder.
+/// `parent` is relative to the current directory, which is the working directory's root (empty for
+/// the root itself): every working-directory read and write resolves there, so the volume is asked
+/// about the very entry the caller touches. Every check of a name that ends in the working directory
+/// (load, stack, every materializer) asks this one, so they agree on which names are the metadata
+/// folder.
+///
+/// # Arguments
+/// * `parent` - The directory holding the entry, relative to the working directory's root.
+/// * `name`   - The entry's name.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether `name` opens the metadata folder.
+/// * `Ok(bool)`    - Whether `name` opens a metadata folder.
 /// * `Err(String)` - If the volume could not say: an entry that cannot be identified is never
 ///                   taken for a different one.
-pub fn opens_metadata_folder(name: &str) -> Result<bool, String> {
-    use std::path::Path;
+pub fn opens_metadata_folder(parent: &std::path::Path, name: &str) -> Result<bool, String> {
     use crate::globals::FOLDER_NAME_FORKLIFT_ROOT;
 
     if is_metadata_folder_name(name) {
@@ -529,7 +535,32 @@ pub fn opens_metadata_folder(name: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    alias_utils::same_entry(Path::new(name), Path::new(FOLDER_NAME_FORKLIFT_ROOT))
+    alias_utils::same_entry(&parent.join(name), &parent.join(FOLDER_NAME_FORKLIFT_ROOT))
+}
+
+/// The first component of the `/`-separated warehouse path `path` that opens a metadata folder in
+/// the directory above it (see [`opens_metadata_folder`]), at any depth: git's `verify_path` rule,
+/// which refuses `.git` in every component, not only the first.
+///
+/// # Arguments
+/// * `path` - The warehouse path, relative to the working directory's root.
+///
+/// # Returns
+/// * `Ok(Some(component))` - The first component that names a metadata folder.
+/// * `Ok(None)`            - If none does.
+/// * `Err(String)`         - If the volume could not say for some component.
+pub fn metadata_folder_component(path: &str) -> Result<Option<&str>, String> {
+    let mut parent = std::path::PathBuf::new();
+
+    for component in path.split('/') {
+        if opens_metadata_folder(&parent, component)? {
+            return Ok(Some(component));
+        }
+
+        parent.push(component);
+    }
+
+    Ok(None)
 }
 
 /// [`ensure_not_metadata_tree`] over a root tree already loaded, matching names with
@@ -545,7 +576,7 @@ pub fn opens_metadata_folder(name: &str) -> Result<bool, String> {
 pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
     let found = root.get_subtrees().chain(root.get_files())
         .map(|(name, _)| name)
-        .find_map(|name| match opens_metadata_folder(name) {
+        .find_map(|name| match opens_metadata_folder(std::path::Path::new(""), name) {
             Ok(true) => Some(Ok(name)),
             Ok(false) => None,
             Err(error) => Some(Err(error)),

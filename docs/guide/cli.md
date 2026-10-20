@@ -63,8 +63,8 @@ predates trust) — import into a fresh warehouse, then `office enroll` to ancho
 legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules
 (gitlinks) are skipped with a warning. A file or directory name that is not valid UTF-8, or that
 is not one path component (`..`, a name containing `/`), stops the import with an error naming it
-and its directory, rather than being imported under a different path; so does a top-level entry
-that some file system opens as `.forklift` (`.Forklift`, `.forklift.`). For agents, this means a project can be moved onto
+and its directory, rather than being imported under a different path; so does an entry at any
+depth that some file system opens as `.forklift` (`.Forklift`, `.forklift.`). For agents, this means a project can be moved onto
 forklift with one command.
 
 A large history lands hundreds of thousands of objects at once — the case the loose store
@@ -247,6 +247,14 @@ the pallet head, unstaging everything staged there; the error names the exact co
 load the folder again, and load by name any file an ignore rule covers that you had loaded by
 name: a folder load never adds those.
 
+A folder below the warehouse root that holds its own `.forklift` (say you ran `prepare` in
+`vendor/lib`) is another working tree: commands run inside it use that warehouse, not this one.
+`load .` leaves it out entirely, `stocktake` lists it once as an untracked `vendor/lib/`, and
+`load vendor/lib` or a path inside it refuses. If this warehouse already tracks that folder,
+`load` and `stocktake` refuse and name the way out: `forklift remove vendor/lib`, which keeps the
+files on disk, then `stack` (re-run the `load` first if a `load` was what refused). Or move the
+inner `.forklift` out of the folder.
+
 ### `unload` — unstage (`ul`)
 
 ```sh
@@ -357,7 +365,8 @@ where trust is established, `stack` also signs the parcel (see
 `stack` requires staged changes — it refuses to create an empty parcel. It refuses a
 top-level entry that some file system opens as the warehouse's `.forklift` folder (`.Forklift`,
 `.forklift.`, …), since no working directory there could check it out: rename it, or unload it
-and add it to `.forkliftignore`. It also
+and add it to `.forkliftignore`. Below the top level it refuses the same spellings, since
+checking one out would plant another working tree inside this one. It also
 refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
 named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
@@ -916,6 +925,12 @@ a new path lands on before it writes anything:
 `restore` likewise refuses a path that names the same file as another entry on
 disk, instead of overwriting it.
 
+The same commands refuse, before anything is written, a pallet that would write below a folder
+holding its own `.forklift` (another working tree; see [`load`](#load--stage-changes-l)) or
+that names a `.forklift` spelling at any depth. Where the target replaces a tracked folder with a
+file, the folder must hold nothing but tracked files: an untracked or ignored file, an empty
+folder or another working tree inside it refuses the command up front.
+
 ### `consolidate` — merge (`con`)
 
 ```sh
@@ -1308,6 +1323,9 @@ store — the dropped content is ordinary reachable history, not garbage — it 
 this checkout shows. A checkout must keep at least one in-scope path; to stop scoping entirely,
 open a fresh full checkout. `narrow` is the counterpart of a bay's `--scope`, not of `expand`:
 `expand` widens what the *warehouse* fetched, `narrow` shrinks what *this checkout* materializes.
+It refuses (`narrow_unclean`) a subtree holding uncommitted work (staged or unstaged changes, or
+untracked files), and one holding another working
+tree (a folder with its own `.forklift`) at any depth, whatever `.forkliftignore` says.
 
 ### `scope-prune` — reclaim disk from a sparse warehouse
 

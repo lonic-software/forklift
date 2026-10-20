@@ -479,7 +479,7 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
 }
 
 /// `path` as it goes into a remedy command on this platform: see [`remedy_path_when`].
-fn remedy_path(path: &str) -> Option<String> {
+pub(crate) fn remedy_path(path: &str) -> Option<String> {
     remedy_path_when(path, cfg!(windows))
 }
 

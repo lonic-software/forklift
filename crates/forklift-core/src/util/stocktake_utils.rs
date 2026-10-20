@@ -494,6 +494,14 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                 // Not in `ignored_names`: the tracked entry under this name is gone and must be
                 // reported, while the untracked one on disk stays hidden.
                 inventory_utils::RuleVerdict::CoveredOtherType => continue,
+                // Another working tree's root: one untracked "<dir>/", never descended into, as
+                // git shows an embedded repository. A registered one gets here only once all its
+                // tracked files are staged for removal, which the staged section reports.
+                inventory_utils::RuleVerdict::NestedBoundary => {
+                    seen_dirs.insert(name.clone());
+                    found.push(Change::new(ChangeKind::Untracked, format!("{}/", entry_key)));
+                    continue;
+                }
             }
 
             let metadata = file_utils::get_symlink_metadata_for_path(&entry.path())?;
