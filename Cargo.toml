@@ -71,8 +71,5 @@ schemars = { version = "1.2", features = ["chrono04"] }
 # ed25519-dalek, promoted to a direct dependency for the two server heads' auth checks so a
 # byte-wise `==` never regresses back in. Zero dependencies of its own — pins no new crate.
 subtle = "2.6"
-# SHA-256 addresses the staged inventory's shard store (file_utils::shard_address): already in the
-# tree through ed25519-dalek at 0.10, so this pins no new crate.
-sha2 = "0.10"
 # Test-only (a forklift-core dev-dependency): already in the tree through reqwest's gzip decoder.
 flate2 = "1"

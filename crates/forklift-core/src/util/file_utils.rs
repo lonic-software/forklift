@@ -2190,14 +2190,14 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
     Ok((metadata_store_path, Some(metadata)))
 }
 
-/// The address of a directory key's shard: the lowercase hex SHA-256 of the key's UTF-8 bytes,
-/// split into its first two digits (the fan-out folder) and the remaining 62 (the shard's own
-/// folder).
+/// The address of a directory key's shard: the lowercase hex BLAKE3 hash of the key's UTF-8 bytes
+/// (the object store's hash function), split into its first two digits (the fan-out folder) and the
+/// remaining 62 (the shard's own folder).
 ///
 /// Every name the store creates is lowercase hex or a fixed lowercase name, so two addresses never
 /// differ only in case or Unicode normalization, and no name ends in a dot or space, holds a `~`,
 /// or matches a Windows device name: distinct keys get distinct shard files on every volume (barring
-/// a SHA-256 collision), and every shard path has the same length whatever the key.
+/// a BLAKE3 collision), and every shard path has the same length whatever the key.
 ///
 /// # Arguments
 /// * `key` - The warehouse path key of the directory (see `WarehousePath::as_key`).
@@ -2205,10 +2205,7 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
 /// # Returns
 /// * `(String, String)` - The fan-out folder name and the shard folder name.
 pub fn shard_address(key: &str) -> (String, String) {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(key.as_bytes());
-    let hex: String = digest.iter().map(|byte| format!("{:02x}", byte)).collect();
+    let hex = blake3::hash(key.as_bytes()).to_hex();
 
     let (fan_out, rest) = hex.split_at(OBJECT_HASH_FOLDER_PATH_CHARACTERS);
     (fan_out.to_string(), rest.to_string())
@@ -3462,6 +3459,16 @@ mod tests {
             assert!(fan_out.len() == 2 && fan_out.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", fan_out);
             assert!(shard.len() == 62 && shard.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", shard);
         }
+    }
+
+    /// A shard's address is the BLAKE3 hash of its key, the object store's hash function: the root
+    /// key "" lands at BLAKE3's published hash of the empty input.
+    #[test]
+    fn a_shard_address_is_the_blake3_hash_of_its_key() {
+        assert_eq!(
+            shard_address(""),
+            ("af".to_string(), "1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string())
+        );
     }
 
     fn shard_folder_relative_components(keys: &[&str]) -> Vec<Vec<String>> {
