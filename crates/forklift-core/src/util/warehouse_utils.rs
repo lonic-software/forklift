@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{bay_utils, config_utils, file_utils, pallet_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, pallet_utils};
 
 /// The directory the user invoked forklift from, relative to the warehouse root.
 /// Set once by [`enter_warehouse`]; empty when the user is at the root itself.
@@ -84,11 +84,68 @@ pub fn enter_warehouse() -> Result<(), String> {
         globals::set_bay_context(redirect.warehouse_root.join(FOLDER_NAME_FORKLIFT_ROOT), redirect.name);
     }
 
-    let relative = cwd.strip_prefix(&root).unwrap_or(Path::new("")).to_path_buf();
-    let _ = CWD_RELATIVE_TO_ROOT.set(relative);
+    let relative = cwd.strip_prefix(&root).unwrap_or(Path::new(""));
+    let _ = CWD_RELATIVE_TO_ROOT.set(respell_as_listed(&root, relative)?);
 
     std::env::set_current_dir(&root)
         .map_err(|e| format!("Error while switching to the working tree root \"{}\": {}", root.to_string_lossy(), e))
+}
+
+/// Respell each component of `relative`, a directory below `root`, as its parent lists it.
+///
+/// A volume can open a directory by a spelling its parent does not list (`DOCS` for `Docs` on a
+/// case-insensitive one), and a process started there may see that spelling as its current
+/// directory. Joined onto a user path, it would mint a key beside the tracked one. The current
+/// directory names one entry, so respelling it chooses nothing on the user's behalf: a component
+/// the parent lists exactly is kept, and any other is replaced by the listed entry that is the
+/// same entry on disk. When no listed entry is, the spelling is refused rather than used.
+///
+/// # Arguments
+/// * `root`     - The warehouse root.
+/// * `relative` - The directory, relative to `root`.
+///
+/// # Returns
+/// * `Ok(PathBuf)` - `relative`, spelled as listed.
+/// * `Err(String)` - If a parent could not be listed, or lists no entry for a component.
+fn respell_as_listed(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let mut respelled = PathBuf::new();
+
+    for component in relative.components() {
+        let name = component.as_os_str();
+        let parent = root.join(&respelled);
+
+        let listing = std::fs::read_dir(&parent)
+            .and_then(|entries| entries.map(|entry| entry.map(|entry| entry.file_name())).collect::<Result<Vec<_>, _>>())
+            .map_err(|e| format!(
+                "Error while listing \"{}\" to find how the current directory is spelled: {}",
+                parent.to_string_lossy(), e
+            ))?;
+
+        if listing.iter().any(|listed| listed == name) {
+            respelled.push(name);
+            continue;
+        }
+
+        let mut listed_as = None;
+        for listed in &listing {
+            if alias_utils::same_entry(&parent.join(name), &parent.join(listed))? {
+                listed_as = Some(listed);
+                break;
+            }
+        }
+
+        let Some(listed) = listed_as else {
+            return Err(format!(
+                "The current directory's component \"{}\" is not listed in \"{}\" under that name or \
+                any other, so Forklift cannot tell which directory it is.",
+                name.to_string_lossy(), parent.to_string_lossy()
+            ));
+        };
+
+        respelled.push(listed);
+    }
+
+    Ok(respelled)
 }
 
 /// Get the directory the user invoked forklift from, relative to the warehouse root.

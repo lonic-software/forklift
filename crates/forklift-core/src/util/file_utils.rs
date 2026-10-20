@@ -43,11 +43,9 @@ const DEFAULT_IGNORED_PATHS: [&str; 1] = [r"^\.forklift(/.*)?$"];
 pub const PATH_SEPARATOR: &str = "/";
 pub const PATH_SEPARATOR_CHAR: char = '/';
 
-/// A prefix for the folder that contains the inventory files of the respective working directory.
-/// E.g. for the `src` folder, the respective inventory folder would be `inv_src`.
-/// This prefix is applied to make sure that folders in the working directory called
-/// `data` or `metadata` do not conflict with the inventory data / metadata files.
-pub const PREFIX_INVENTORY_FOLDER: &str = "inv_";
+/// The folder under the inventory root that holds the shard store: one folder per directory key,
+/// addressed by [`shard_address`], each holding that directory's data file.
+pub const FOLDER_NAME_INVENTORY_STORE: &str = "inv_";
 
 /// The name of the inventory data file.
 pub const FILE_NAME_INVENTORY_DATA: &str = "data";
@@ -56,7 +54,11 @@ pub const FILE_NAME_INVENTORY_DATA: &str = "data";
 pub const FILE_NAME_INVENTORY_METADATA: &str = "metadata";
 /// The record kind and format version of the inventory metadata file (see [`record_utils`]).
 pub const INVENTORY_METADATA_RECORD: &str = "inventory-metadata";
-pub const INVENTORY_METADATA_VERSION: u32 = 1;
+/// Version 2 is the hash-addressed shard store (see [`get_inventory_folder_for_key`]). The version
+/// doubles as the layout marker: a version-1 warehouse keeps its shards at paths this layout never
+/// reads, so [`get_inventory_store_root`] refuses it rather than reading every directory as
+/// unstaged.
+pub const INVENTORY_METADATA_VERSION: u32 = 2;
 
 /// Create a folder if it does not exist yet.
 /// All folders in the given path will be created (if they don't exist already).
@@ -2123,15 +2125,18 @@ pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String
 /// * `Err(String)` - The error message if the inventory file exists, but there was an error while
 /// reading it.
 pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
-    let file_path = get_inventory_data_path_for_key(key);
+    let file_path = get_inventory_data_path_for_key(key)?;
 
-    if !file_path.exists() {
-        return Ok((file_path, None));
+    // Only NotFound is "no shard": anything else, such as a file where a shard folder belongs,
+    // would otherwise read as a directory with nothing staged.
+    match std::fs::read(&file_path) {
+        Ok(bytes) => Ok((file_path, Some(bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, None)),
+        Err(e) => Err(format!(
+            "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
+            if key.is_empty() { "./" } else { key }, file_path.to_string_lossy(), e
+        )),
     }
-
-    std::fs::read(&file_path).map_err(|e|
-        format!("Error while reading inventory from file \"{}\": {}", file_path.to_string_lossy(), e)
-    ).map(|bytes| (file_path, Some(bytes)))
 }
 
 /// The path of the inventory metadata file, whether or not it exists.
@@ -2171,34 +2176,111 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
     Ok((metadata_store_path, Some(metadata)))
 }
 
-/// Get the path of the inventory folder associated with the given warehouse path key.
+/// The address of a directory key's shard: the lowercase hex SHA-256 of the key's UTF-8 bytes,
+/// split into its first two digits (the fan-out folder) and the remaining 62 (the shard's own
+/// folder).
 ///
-/// The warehouse root maps to a folder named after the inventory folder prefix, and *every*
-/// path component below it is prefixed as well, so entries in the working directory can never
-/// collide with the inventory data / metadata files. E.g. for the key `src/data`, the folder is
-/// `.forklift/inventory/inv_/inv_src/inv_data`, which cannot collide with the data *file* of
-/// `src` (`.forklift/inventory/inv_/inv_src/data`).
-///
-/// Nesting the folders like this also means that the inventory folder of a directory contains
-/// the inventory folders of all of its subdirectories, so removing a directory's inventory
-/// removes the inventories of its subdirectories as well.
+/// Every name the store creates is lowercase hex or a fixed lowercase name, so two addresses never
+/// differ only in case or Unicode normalization, and no name ends in a dot or space, holds a `~`,
+/// or matches a Windows device name: distinct keys get distinct shard files on every volume (barring
+/// a SHA-256 collision), and every shard path has the same length whatever the key.
 ///
 /// # Arguments
 /// * `key` - The warehouse path key of the directory (see `WarehousePath::as_key`).
 ///
 /// # Returns
-/// * `PathBuf` - The path of the inventory folder.
-pub fn get_inventory_folder_for_key(key: &str) -> PathBuf {
-    let mut folder = PathBuf::from(get_path_inventory_root());
-    folder.push(PREFIX_INVENTORY_FOLDER);
+/// * `(String, String)` - The fan-out folder name and the shard folder name.
+pub fn shard_address(key: &str) -> (String, String) {
+    use sha2::{Digest, Sha256};
 
-    if !key.is_empty() {
-        for component in key.split(PATH_SEPARATOR_CHAR) {
-            folder.push(format!("{}{}", PREFIX_INVENTORY_FOLDER, component));
+    let digest = Sha256::digest(key.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{:02x}", byte)).collect();
+
+    let (fan_out, rest) = hex.split_at(OBJECT_HASH_FOLDER_PATH_CHARACTERS);
+    (fan_out.to_string(), rest.to_string())
+}
+
+/// The shard folder of `key`, relative to an inventory root: `inv_/<2 hex>/<62 hex>`. For reading
+/// another inventory root's addresses (a walker naming the key of a shard it found); every shard
+/// this process reads or writes goes through [`get_inventory_folder_for_key`] instead.
+pub fn shard_folder_relative(key: &str) -> PathBuf {
+    let (fan_out, rest) = shard_address(key);
+
+    [FOLDER_NAME_INVENTORY_STORE, fan_out.as_str(), rest.as_str()].iter().collect()
+}
+
+/// The inventory roots whose metadata [`gate_inventory_layout`] has already passed in this
+/// process.
+static PASSED_INVENTORY_ROOTS: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// Refuse an inventory root whose metadata header names another format version, once per process
+/// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
+/// that reach a shard without reading the metadata first (`import-git` resets the inventory without
+/// reading it). A damaged, unreadable or absent metadata file passes: the metadata read reports
+/// the first two, and a reset rewrites the file without reading it.
+fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
+    use std::io::BufRead;
+
+    let mut passed = PASSED_INVENTORY_ROOTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if passed.contains(inventory_root) {
+        return Ok(());
+    }
+
+    let metadata_path = inventory_root.join(FILE_NAME_INVENTORY_METADATA);
+
+    // The header line alone decides the version; a longer first line is not a header.
+    let mut header = Vec::new();
+    if let Ok(file) = std::fs::File::open(&metadata_path) {
+        let _ = std::io::Read::take(std::io::BufReader::new(file), 256).read_until(b'\n', &mut header);
+    }
+
+    if header.ends_with(b"\n") {
+        if let Err(e @ record_utils::RecordError::OtherVersion(_)) =
+            record_utils::from_bytes(&header, INVENTORY_METADATA_RECORD, INVENTORY_METADATA_VERSION) {
+            return Err(format!(
+                "The inventory metadata file \"{}\" {}", metadata_path.to_string_lossy(), e.describe()
+            ));
         }
     }
 
-    folder
+    passed.insert(inventory_root.to_path_buf());
+
+    Ok(())
+}
+
+/// The root of the shard store, `inv_` under the inventory root: the one folder that holds every
+/// shard, so removing it clears the whole store.
+///
+/// Fallible because it is the single producer of shard paths: it refuses an inventory whose
+/// metadata names another format version (see [`gate_inventory_layout`]), so no shard is read or
+/// written over a layout this build does not know.
+///
+/// # Returns
+/// * `Ok(PathBuf)` - The path of the store root.
+/// * `Err(String)` - If the inventory metadata is in another format version.
+pub fn get_inventory_store_root() -> Result<PathBuf, String> {
+    let inventory_root = PathBuf::from(get_path_inventory_root());
+
+    gate_inventory_layout(&inventory_root)?;
+
+    Ok(inventory_root.join(FOLDER_NAME_INVENTORY_STORE))
+}
+
+/// Get the path of the inventory folder associated with the given warehouse path key: the store
+/// root, then the key's [`shard_address`]. Folders are flat (a directory's shard folder holds no
+/// other shard), so removing one removes only that directory's shard.
+///
+/// # Arguments
+/// * `key` - The warehouse path key of the directory (see `WarehousePath::as_key`).
+///
+/// # Returns
+/// * `Ok(PathBuf)` - The path of the inventory folder.
+/// * `Err(String)` - If the inventory metadata is in another format version.
+pub fn get_inventory_folder_for_key(key: &str) -> Result<PathBuf, String> {
+    let (fan_out, rest) = shard_address(key);
+
+    Ok(get_inventory_store_root()?.join(fan_out).join(rest))
 }
 
 /// Get the path of the inventory data file associated with the given warehouse path key.
@@ -2208,12 +2290,10 @@ pub fn get_inventory_folder_for_key(key: &str) -> PathBuf {
 /// * `key` - The warehouse path key of the directory (see `WarehousePath::as_key`).
 ///
 /// # Returns
-/// * `PathBuf` - The path of the inventory data file.
-pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
-    let mut file_path = get_inventory_folder_for_key(key);
-    file_path.push(FILE_NAME_INVENTORY_DATA);
-
-    file_path
+/// * `Ok(PathBuf)` - The path of the inventory data file.
+/// * `Err(String)` - If the inventory metadata is in another format version.
+pub fn get_inventory_data_path_for_key(key: &str) -> Result<PathBuf, String> {
+    Ok(get_inventory_folder_for_key(key)?.join(FILE_NAME_INVENTORY_DATA))
 }
 
 /// Check if an object with the given hash exists.

@@ -2430,7 +2430,7 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
     let main_inventory = std::path::PathBuf::from(forklift_core::util::file_utils::get_path_inventory_root());
     let bay_inventory = warehouse.root.join(".forklift").join("bays").join("scoped").join("inventory");
     let shard = |key: &str| {
-        let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key);
+        let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key).unwrap();
         let path = bay_inventory.join(main_path.strip_prefix(&main_inventory).unwrap());
         std::fs::read(&path).ok()
             .map(|bytes| forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes).unwrap())
@@ -2546,7 +2546,7 @@ fn a_load_rewrites_a_v2_shard_with_proven_entries() {
 
     let shard = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-        forklift_core::util::file_utils::get_inventory_data_path_for_key("")
+        forklift_core::util::file_utils::get_inventory_data_path_for_key("").unwrap()
     };
     let mut bytes = std::fs::read(&shard).unwrap();
     assert_eq!(bytes[0], 3, "sanity: a fresh shard is v3");

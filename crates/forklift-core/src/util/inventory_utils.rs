@@ -12,7 +12,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, tree_utils, warehouse_utils};
+use crate::util::{chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, tree_utils, warehouse_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
@@ -186,7 +186,7 @@ pub fn write_shard_mutation_with_extra(key: &str,
     clear_ancestors_batched(key)?;
 
     inventory.set_rollup_hash(None);
-    let shard_path = file_utils::get_inventory_data_path_for_key(key);
+    let shard_path = file_utils::get_inventory_data_path_for_key(key)?;
 
     let Some((extra_path, extra_content)) = extra else {
         return save_inventory(inventory, &shard_path);
@@ -991,14 +991,9 @@ pub enum ShardOutcome {
 /// * `Err(String)` - Phase A or phase B failed; nothing in `outcomes` may be treated as published.
 fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
                           outcomes: &mut BTreeMap<String, ShardOutcome>) -> Result<(), String> {
-    // By case fold: on a case-insensitive volume `Dir`'s clear lands on the shard `dir` names, and
-    // phase B would publish `dir`'s carried rollup straight back over it. Elsewhere this clears a
-    // rollup that did not need it, which costs one skip.
-    let folded_clear_keys: BTreeSet<String> = clear_keys.iter().map(|key| alias_utils::fold_key(key)).collect();
-
     for (key, outcome) in outcomes.iter_mut() {
         if let ShardOutcome::Carry(inventory) = outcome {
-            if folded_clear_keys.contains(&alias_utils::fold_key(key)) {
+            if clear_keys.contains(key) {
                 inventory.set_rollup_hash(None);
             }
         }
@@ -1017,7 +1012,7 @@ fn publish_shard_outcomes(clear_keys: &BTreeSet<String>,
     for (key, outcome) in outcomes.iter() {
         let (ShardOutcome::Carry(inventory) | ShardOutcome::Changed(inventory)) = outcome;
 
-        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(key), &phase_b_batch)?;
+        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(key)?, &phase_b_batch)?;
     }
 
     phase_b_batch.finish()
@@ -1072,19 +1067,8 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 /// [`publish_shard_outcomes`] requires: either stored before the change, or staged through
 /// [`stage_file_storing_blob`](Self::stage_file_storing_blob), whose blobs every publish — the
 /// early one included — makes durable first, in one barrier.
-///
-/// Two keys may name one shard folder: `dir` and `Dir` on a case-insensitive volume, after a
-/// case-only rename. Two in-memory copies of that one file would each be published over the
-/// other, losing one's changes, where one `update_shard` per change read the first change back
-/// through the alias. So a key whose case fold (`alias_utils::fold_key`) matches one already
-/// touched first publishes everything touched so far, and is then read from disk as usual. That
-/// costs one more publish on a volume where the two keys are distinct shards, and nothing else.
-/// If that early publish fails, `update` returns its error and the final `publish` fails too, so
-/// no caller reads the empty batch left behind as everything published.
 pub struct ShardMutationBatch {
     shards: BTreeMap<String, TouchedShard>,
-    folded_keys: BTreeSet<String>,
-    early_publish_failed: bool,
     blobs: file_utils::WriteBatch,
 }
 
@@ -1092,8 +1076,6 @@ impl ShardMutationBatch {
     pub fn new() -> ShardMutationBatch {
         ShardMutationBatch {
             shards: BTreeMap::new(),
-            folded_keys: BTreeSet::new(),
-            early_publish_failed: false,
             blobs: file_utils::WriteBatch::new(),
         }
     }
@@ -1108,20 +1090,10 @@ impl ShardMutationBatch {
     ///
     /// # Returns
     /// * `Ok(())`      - If the change was applied in memory.
-    /// * `Err(String)` - If the shard could not be read or parsed, or the shards touched so far
-    ///                   could not be published before a key that may alias one of them.
+    /// * `Err(String)` - If the shard could not be read or parsed.
     pub fn update(&mut self,
                   key: &str,
                   change: impl FnOnce(&mut Inventory)) -> Result<(), String> {
-        if !self.shards.contains_key(key) && !self.folded_keys.insert(alias_utils::fold_key(key)) {
-            // A key that may alias a shard already touched — see the type's doc comment.
-            if let Err(e) = self.publish_touched() {
-                self.early_publish_failed = true;
-                return Err(e);
-            }
-            self.folded_keys.insert(alias_utils::fold_key(key));
-        }
-
         if !self.shards.contains_key(key) {
             let (_, original_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
@@ -1208,23 +1180,10 @@ impl ShardMutationBatch {
     ///
     /// # Returns
     /// * `Ok(())`      - Every touched shard is durably published and registered.
-    /// * `Err(String)` - If a shard changed underneath the batch, or the publish failed, here or
-    ///                   in an earlier [`update`](Self::update); no shard of this batch may then
-    ///                   be treated as published.
-    pub fn publish(mut self) -> Result<(), String> {
-        if self.early_publish_failed {
-            return Err("Some of this command's inventory changes were not recorded.".to_string());
-        }
-
-        self.publish_touched()
-    }
-
-    /// [`publish`](Self::publish) every shard touched so far, and forget them: a later
-    /// [`update`](Self::update) reads its shard from disk again.
-    fn publish_touched(&mut self) -> Result<(), String> {
-        self.folded_keys.clear();
-
-        let shards = std::mem::take(&mut self.shards);
+    /// * `Err(String)` - If a shard changed underneath the batch, or the publish failed; no shard
+    ///                   of this batch may then be treated as published.
+    pub fn publish(self) -> Result<(), String> {
+        let shards = self.shards;
 
         // Every blob a shard below names, durable before any shard is.
         self.blobs.finish()?;
@@ -2345,20 +2304,19 @@ pub fn replace_subtree_inventories(key: &str,
     // further is needed for `key` and below.
     clear_ancestor_rollups(key)?;
 
-    let folder = file_utils::get_inventory_folder_for_key(key);
-
-    if folder.exists() {
-        std::fs::remove_dir_all(&folder).map_err(|e|
-            format!("Error while clearing the staging area of \"{}\": {}", key, e)
-        )?;
-    }
-
     let (metadata_path, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
     let mut metadata = metadata_opt.unwrap_or_default();
 
     // `path_utils::covers("", _)` is always true, so this one predicate already subsumes the
     // former separate `key.is_empty()` case (drop everything) without a special-cased branch.
-    metadata.retain(|entry| !path_utils::covers(key, metadata_entry_to_key(entry)));
+    let (replaced, kept): (BTreeSet<String>, BTreeSet<String>) = std::mem::take(&mut metadata)
+        .into_iter()
+        .partition(|entry| path_utils::covers(key, metadata_entry_to_key(entry)));
+    metadata = kept;
+
+    for entry in &replaced {
+        remove_shard_folder(metadata_entry_to_key(entry))?;
+    }
 
     // One durability barrier for the whole replacement burst instead of one per shard
     // (DESIGN.html §5.0 D item 8, stage 2b) — every shard here carries a caller-computed,
@@ -2367,13 +2325,15 @@ pub fn replace_subtree_inventories(key: &str,
     let batch = file_utils::WriteBatch::new();
 
     for (shard_key, inventory) in shards {
-        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(shard_key), &batch)?;
+        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(shard_key)?, &batch)?;
         metadata.insert(key_to_metadata_entry(shard_key));
     }
 
     batch.finish()?;
 
     write_metadata_to_file(&metadata_path, &metadata)?;
+
+    sweep_unregistered_shards()?;
 
     load_guard_utils::clear_recorded_under(key);
 
@@ -2398,10 +2358,12 @@ pub fn replace_subtree_inventories(key: &str,
 /// * `Ok(())`      - If the staging area was replaced.
 /// * `Err(String)` - If a folder or file operation failed.
 pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
-    let root_folder = file_utils::get_inventory_folder_for_key("");
+    // The whole store, not the root key's shard: every other shard would otherwise survive, and a
+    // later single-file load of a re-created directory would adopt it as its baseline.
+    let store_root = file_utils::get_inventory_store_root()?;
 
-    if root_folder.exists() {
-        std::fs::remove_dir_all(&root_folder).map_err(|e|
+    if std::fs::symlink_metadata(&store_root).is_ok() {
+        std::fs::remove_dir_all(&store_root).map_err(|e|
             format!("Error while clearing the staging area: {}", e)
         )?;
     }
@@ -2414,7 +2376,7 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
     let batch = file_utils::WriteBatch::new();
 
     for (key, inventory) in shards {
-        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(key), &batch)?;
+        save_inventory_deferred(inventory, &file_utils::get_inventory_data_path_for_key(key)?, &batch)?;
         metadata.insert(key_to_metadata_entry(key));
     }
 
@@ -2498,14 +2460,8 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
                 .any(|other| !removed_keys.contains(metadata_entry_to_key(other)));
 
             if !has_registered_descendant {
-                // Every key beneath this one is already removed, so the whole folder can go.
-                let folder = file_utils::get_inventory_folder_for_key(key);
-
-                if folder.exists() {
-                    std::fs::remove_dir_all(&folder).map_err(|e|
-                        format!("Error while removing the inventory of folder \"{}\": {}", key, e)
-                    )?;
-                }
+                // Every key beneath this one is already removed, so this one can go too.
+                remove_shard_folder(key)?;
 
                 removed_keys.insert(key.to_string());
                 continue;
@@ -2536,7 +2492,7 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
 
             rebuilt.set_rollup_hash(target_rollup);
 
-            let shard_path = file_utils::get_inventory_data_path_for_key(key);
+            let shard_path = file_utils::get_inventory_data_path_for_key(key)?;
 
             save_inventory_deferred(&rebuilt, &shard_path, &batch)?;
         }
@@ -2544,7 +2500,13 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
 
     batch.finish()?;
 
-    update_inventory_metadata(&BTreeSet::new(), &removed_keys)
+    if removed_keys.is_empty() {
+        return Ok(());
+    }
+
+    update_inventory_metadata(&BTreeSet::new(), &removed_keys)?;
+
+    sweep_unregistered_shards()
 }
 
 /// Remove every inventory shard at or under a warehouse path prefix, dropping those keys from
@@ -2586,19 +2548,92 @@ pub fn remove_inventories_under(prefix: &str) -> Result<(), String> {
             continue;
         }
 
-        let folder = file_utils::get_inventory_folder_for_key(key);
-
-        // A parent shard folder earlier in the (sorted) set may have removed this one already.
-        if folder.exists() {
-            std::fs::remove_dir_all(&folder).map_err(|e|
-                format!("Error while removing the inventory of folder \"{}\": {}", key, e)
-            )?;
-        }
+        remove_shard_folder(key)?;
 
         removed_keys.insert(key.to_string());
     }
 
-    update_inventory_metadata(&BTreeSet::new(), &removed_keys)
+    update_inventory_metadata(&BTreeSet::new(), &removed_keys)?;
+
+    sweep_unregistered_shards()
+}
+
+/// Remove the shard folder of `key`, if there is one. Folders are flat, so this removes no other
+/// key's shard.
+fn remove_shard_folder(key: &str) -> Result<(), String> {
+    let folder = file_utils::get_inventory_folder_for_key(key)?;
+
+    match std::fs::remove_dir_all(&folder) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!(
+            "Error while removing the inventory of folder \"{}\": {}", load_guard_utils::display_path(key), e
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Delete every shard folder in the store whose address is not a registered key's, after a
+/// subtree removal has written its metadata. A shard nobody registered exists by design after a
+/// load's publish failed at its join point (its shard landed, its key was never registered), and a
+/// later read by key would adopt it as that directory's baseline.
+///
+/// Safe because every shard-writing command holds the warehouse lock, and a caller sweeps only
+/// after its own metadata write: no shard published by a command still running is unregistered
+/// by then. Nothing staged is lost: the key was not registered before the failed load, so the next
+/// load rebuilds its shard from the disk.
+///
+/// # Returns
+/// * `Ok(())`      - If every unregistered shard folder is gone.
+/// * `Err(String)` - If the metadata or the store could not be read, or a folder not removed.
+fn sweep_unregistered_shards() -> Result<(), String> {
+    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+
+    let registered: BTreeSet<(String, String)> = metadata_opt.unwrap_or_default().iter()
+        .map(|entry| file_utils::shard_address(metadata_entry_to_key(entry)))
+        .collect();
+
+    let store_root = file_utils::get_inventory_store_root()?;
+
+    let read = |folder: &Path| -> Result<Vec<std::fs::DirEntry>, String> {
+        match std::fs::read_dir(folder) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Error while reading directory \"{}\": {}", folder.to_string_lossy(), e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("Error while reading directory \"{}\": {}", folder.to_string_lossy(), e)),
+        }
+    };
+
+    for fan_out in read(&store_root)? {
+        if !fan_out.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+
+        let fan_out_name = fan_out.file_name().to_string_lossy().into_owned();
+
+        for shard in read(&fan_out.path())? {
+            let address = (fan_out_name.clone(), shard.file_name().to_string_lossy().into_owned());
+
+            if registered.contains(&address) {
+                continue;
+            }
+
+            let path = shard.path();
+            let removed = if shard.file_type().is_ok_and(|kind| kind.is_dir()) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+
+            if let Err(e) = removed {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "Error while removing the unregistered inventory shard \"{}\": {}", path.to_string_lossy(), e
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Carry over the entries of the previous inventory that were not re-added by the directory
@@ -3384,10 +3419,10 @@ mod tests {
         // "aaa" sorts before "zzz" and has a genuine unresolved conflict.
         let mut conflicted = Inventory::new();
         conflicted.add_item(item("file.txt", 1, InventoryItemState::FirstParentConflict));
-        save_inventory(&conflicted, &file_utils::get_inventory_data_path_for_key("aaa")).unwrap();
+        save_inventory(&conflicted, &file_utils::get_inventory_data_path_for_key("aaa").unwrap()).unwrap();
 
         // "zzz" sorts after "aaa" and is not a valid inventory shard at all.
-        let corrupt_path = file_utils::get_inventory_data_path_for_key("zzz");
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("zzz").unwrap();
         std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
         std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
 
@@ -3418,9 +3453,9 @@ mod tests {
 
         let mut clean = Inventory::new();
         clean.add_item(item("file.txt", 1, InventoryItemState::Normal));
-        save_inventory(&clean, &file_utils::get_inventory_data_path_for_key("aaa")).unwrap();
+        save_inventory(&clean, &file_utils::get_inventory_data_path_for_key("aaa").unwrap()).unwrap();
 
-        let corrupt_path = file_utils::get_inventory_data_path_for_key("zzz");
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("zzz").unwrap();
         std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
         std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
 
@@ -3444,7 +3479,7 @@ mod tests {
         let mut inventory = Inventory::new();
         inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
         inventory.set_rollup_hash(rollup_hash.map(|h| h.to_string()));
-        save_inventory(&inventory, &file_utils::get_inventory_data_path_for_key(key)).unwrap();
+        save_inventory(&inventory, &file_utils::get_inventory_data_path_for_key(key).unwrap()).unwrap();
     }
 
     fn read_rollup(key: &str) -> Option<String> {
@@ -3505,8 +3540,7 @@ mod tests {
     }
 
     /// A case-only rename of a directory: the old spelling's entry is removed, then the new
-    /// spelling's is written. On a case-insensitive volume both keys name one shard, and the
-    /// second change must see the first; elsewhere they are two shards, each with its own change.
+    /// spelling's is written. The two keys get two shards on every volume, each with its own change.
     #[test]
     fn a_batch_keeps_both_changes_to_keys_that_differ_only_in_case() {
         let _scratch = Scratch::new("batch-case-alias");
@@ -3517,8 +3551,8 @@ mod tests {
         }).unwrap();
         setup.publish().unwrap();
 
-        // The volume decides whether the two spellings are one shard folder.
-        let aliased = file_utils::get_inventory_data_path_for_key("Dir").exists();
+        assert_ne!(file_utils::get_inventory_data_path_for_key("Dir").unwrap(),
+            file_utils::get_inventory_data_path_for_key("dir").unwrap());
 
         let mut batch = ShardMutationBatch::new();
         batch.update("dir", |inventory| { inventory.mark_item_deleted("a.txt"); }).unwrap();
@@ -3527,53 +3561,23 @@ mod tests {
         }).unwrap();
         batch.publish().unwrap();
 
-        let state_in = |key: &str| {
+        let item_in = |key: &str| {
             let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
             let shard = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
-            shard.get_item_by_name("a.txt").map(|item| item.state)
+            shard.get_item_by_name("a.txt").map(|item| (item.state, item.inode))
         };
 
-        if aliased {
-            assert!(state_in("dir") == Some(InventoryItemState::Normal),
-                "the write through the new spelling must not be lost to the removal through the old");
-        } else {
-            assert!(state_in("dir") == Some(InventoryItemState::Deleted), "the old spelling keeps its removal");
-            assert!(state_in("Dir") == Some(InventoryItemState::Normal), "the new spelling keeps its write");
-        }
-        assert!(is_tracked_directory("Dir").unwrap(), "the new spelling is registered either way");
+        assert!(item_in("dir") == Some((InventoryItemState::Deleted, 1)), "the old spelling keeps its removal");
+        assert!(item_in("Dir") == Some((InventoryItemState::Normal, 2)), "the new spelling keeps its write");
+        assert!(is_tracked_directory("dir").unwrap() && is_tracked_directory("Dir").unwrap(),
+            "both spellings are registered");
     }
 
+    /// A rollup is cleared only for the key a change is beneath: `A` is another directory than `a`.
     #[test]
-    fn a_batch_whose_early_publish_failed_does_not_publish_as_if_complete() {
-        let _scratch = Scratch::new("batch-early-publish-fails");
-        stamped_chain_with_sibling();
-
-        let mut batch = ShardMutationBatch::new();
-        batch.update("a", |inventory| {
-            inventory.add_item(item("file.txt", 7, InventoryItemState::Normal));
-        }).unwrap();
-
-        // Someone else rewrites the touched shard, so the publish before the aliasing key fails.
-        update_shard("a", |inventory| {
-            inventory.add_item(item("other.txt", 9, InventoryItemState::Normal));
-            Ok(())
-        }).unwrap();
-
-        let error = batch.update("A", |inventory| { inventory.mark_item_deleted("other.txt"); }).unwrap_err();
-        assert!(error.contains("changed while it was being updated"), "unexpected error: {error}");
-
-        assert!(batch.publish().is_err(), "the final publish must not report the dropped shard as published");
-    }
-
-    #[test]
-    fn a_batch_clears_a_carried_rollup_whose_clear_comes_through_another_spelling() {
+    fn a_batch_keeps_a_carried_rollup_of_a_key_differing_only_in_case_from_a_changed_ancestor() {
         let _scratch = Scratch::new("batch-case-alias-carry");
         stamped_chain_with_sibling();
-
-        // Only a case-insensitive volume makes the two spellings one shard.
-        if !file_utils::get_inventory_data_path_for_key("A").exists() {
-            return;
-        }
 
         let mut batch = ShardMutationBatch::new();
         batch.update("a", |inventory| {
@@ -3584,7 +3588,8 @@ mod tests {
         }).unwrap();
         batch.publish().unwrap();
 
-        assert_eq!(read_rollup("a"), None, "a change beneath \"A\" must clear the rollup carried through \"a\"");
+        assert_eq!(read_rollup("a").as_deref(), Some("rollup"), "a change beneath \"A\" leaves \"a\"'s rollup");
+        assert_eq!(read_rollup(""), None, "the shared root is an ancestor of the change");
     }
 
     #[test]
@@ -3651,7 +3656,7 @@ mod tests {
         batch.publish().unwrap();
 
         let published_mtime = file_utils::get_symlink_metadata_for_path(
-            &file_utils::get_inventory_data_path_for_key("a/b")).unwrap().modified().unwrap();
+            &file_utils::get_inventory_data_path_for_key("a/b").unwrap()).unwrap().modified().unwrap();
         assert!(published_mtime >= between,
             "a file restored before the shard's last change must be trusted as it is with one \
             update_shard per change: got {:?}, expected no earlier than {:?}", published_mtime, between);
@@ -3737,7 +3742,7 @@ mod tests {
 
         assert_eq!(read_rollup(""), None, "narrow must conservatively clear the root's rollup");
         assert_eq!(read_rollup("a"), None, "narrow must conservatively clear the parent's rollup");
-        assert!(!file_utils::get_inventory_data_path_for_key("a/b").exists());
+        assert!(!file_utils::get_inventory_data_path_for_key("a/b").unwrap().exists());
     }
 
     #[test]
@@ -3955,7 +3960,7 @@ mod tests {
         let mut inventory = Inventory::new();
         inventory.add_item(item("kept.txt", 1, InventoryItemState::Normal));
         inventory.add_item(item("removed.txt", 2, InventoryItemState::Deleted));
-        save_inventory(&inventory, &file_utils::get_inventory_data_path_for_key("")).unwrap();
+        save_inventory(&inventory, &file_utils::get_inventory_data_path_for_key("").unwrap()).unwrap();
 
         let mut metadata: BTreeSet<String> = BTreeSet::new();
         metadata.insert(key_to_metadata_entry(""));
@@ -3990,7 +3995,7 @@ mod tests {
         // the working directory — exactly what `load`'s post-walk "leftover dirty entries" pass
         // consults, so this is the shard the join point's dirty-path loop tries (and fails) to
         // parse.
-        let corrupt_path = file_utils::get_inventory_data_path_for_key("gone");
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("gone").unwrap();
         std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
         std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
 
@@ -4018,9 +4023,9 @@ mod tests {
 
         // The walk's own real work is still durable and registered: "entries loaded so far were
         // kept" is a real guarantee, not just wording in the message.
-        assert!(file_utils::get_inventory_data_path_for_key("").exists(),
+        assert!(file_utils::get_inventory_data_path_for_key("").unwrap().exists(),
             "the root shard this walk produced must still exist on disk");
-        assert!(file_utils::get_inventory_data_path_for_key("real.txt").parent().is_some());
+        assert!(file_utils::get_inventory_data_path_for_key("real.txt").unwrap().parent().is_some());
 
         let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         let metadata_after = metadata_opt.unwrap();

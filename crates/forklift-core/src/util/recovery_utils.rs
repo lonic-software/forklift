@@ -3024,7 +3024,7 @@ mod tests {
         // (`<bay-state-dir>/inventory/inv_/data`) without ever entering a bay context.
         let shard_path = bay_utils::bay_state_dir("b")
             .join(FOLDER_NAME_INVENTORY_ROOT)
-            .join(file_utils::PREFIX_INVENTORY_FOLDER)
+            .join(file_utils::shard_folder_relative(""))
             .join(file_utils::FILE_NAME_INVENTORY_DATA);
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_utils::bay_state_dir("b"), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
@@ -3776,7 +3776,7 @@ mod tests {
         });
 
         let bytes = InventoryBuilder::build(&inventory);
-        let shard_path = file_utils::get_inventory_data_path_for_key("src");
+        let shard_path = file_utils::get_inventory_data_path_for_key("src").unwrap();
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
         std::fs::write(&shard_path, bytes).unwrap();
 
