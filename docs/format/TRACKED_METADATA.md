@@ -301,14 +301,15 @@ issued_at = 1782205234
 retired_at = 1782206000    # absent while the key is active
 ```
 
-A key record does not store its id; readers derive it from `public_key`. Every lookup goes
-by key id, while the endorsement and proof-of-possession sign only the public key, so a
-stored id could name one key over another key's material. Readers that build the office
-state refuse a record filed under any name but its own subject's (`<key-id>.toml`,
-`<blake3(identifier)>.toml`), naming the file and the one it belongs in. Since tree entry
-names are unique, this also means no subject can have two records. The writer refuses,
-before signing, a state that would break either rule. Collecting gc's trust pins is the
-one read that does not check file names: it keeps every record's pins.
+A key record does not store its id; readers derive it from `public_key`, and refuse a record
+that has a `key_id` entry. Every lookup goes by key id, while the endorsement and
+proof-of-possession sign only the public key, so a stored id could name one key over another
+key's material. Readers that build the office state refuse a record filed under any name but
+its own subject's (`<key-id>.toml`, `<blake3(identifier)>.toml`), naming the file and the one
+it belongs in, and refuse a folder inside `users/` or `keys/`. Since tree entry names are
+unique, this also means no subject can have two records. The writer refuses, before storing
+anything, a state that would break either rule. Collecting trust pins for gc, heal and
+recovery is the one read that does not check file names: it keeps every record's pins.
 
 Retired keys are **retained forever**: they still verify the parcels that were signed
 while they were active. The private halves never enter the warehouse; they live in the
