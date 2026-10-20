@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -10,7 +10,8 @@ use crate::model::tree_item::TreeItem;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{file_utils, inventory_utils, object_utils};
+use crate::error::{CoreError, RefusalCode};
+use crate::util::{audit_utils, fanout_utils, file_utils, inventory_utils, object_utils};
 
 /// Build (and store) tree objects from an already-parsed [`inventory_utils::PreparedInventory`]
 /// snapshot, bottom-up: one tree object per inventoried directory, staged into `batch` instead of
@@ -282,6 +283,225 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 
         Ok(())
     }
+}
+
+/// How many paths a [`require_staged_content_present`] refusal names before summarizing the rest
+/// as "and N more"; the count is always exact.
+const MAX_NAMED_LOST_PATHS: usize = 8;
+
+/// Below this many changed files the presence probes run on the calling thread; above it they fan
+/// out ([`fanout_utils::fanout_map`]). A probe is one existence lookup (a recipe's, one per chunk),
+/// so a handful are not worth a thread each.
+const PARALLEL_PROBE_THRESHOLD: usize = 256;
+
+/// Refuse a freshly built tree that names staged content the store does not hold: a changed
+/// file's object, or for a chunked file any chunk its recipe names. Called by `stack` and `park`'s
+/// push on the root [`build_tree_from_inventory_deferred`] returned, before anything is published.
+///
+/// Only what differs from the head is checked, the way `audit_utils::verify_tree_closure` prunes
+/// against its bases: an entry whose hash equals the head's at the same path (a whole subtree
+/// included, and every subtree the rollup skip injected by hash) is not staged work, and no
+/// remedy in this bay could restore it. A staged entry that is absent is loss, not a sparse gap:
+/// it was loaded into this bay, and a sparse bay keeps no shard for what it leaves out. Nothing
+/// after the build can tell the two apart (`audit` accepts a parcel naming an absent object), so
+/// only a later `restore` would fail (FORK-157).
+///
+/// The walk reads the built tree in memory (its objects are staged in a batch, unreadable before
+/// the barrier) and loads the head's trees from the store. A head tree that cannot be read fails
+/// the call with that error: without it, files that only mirror the head would be blamed as lost
+/// staged work under a remedy that cannot clear them. A recipe that is present but unreadable
+/// fails the same way, unclassified: `restore --staged` then `load` cannot repair it, because a
+/// store skips writing an object whose hash is already present, so its error names only
+/// `restore --staged` to leave the file out. The check is for presence: see
+/// [`probe_staged_object`] for what a present but damaged object gets.
+///
+/// # Arguments
+/// * `root`           - The built root, as [`build_tree_from_inventory_deferred`] returned it
+///                      (before any scoped splice).
+/// * `head_tree_hash` - The root tree of the parcel the new one stacks on, if any.
+///
+/// # Returns
+/// * `Ok(())`         - Every changed entry's content is present.
+/// * `Err(CoreError)` - A `staged_content_missing` refusal naming each path that lost content; or
+///                      a head tree or recipe could not be read, or the store not consulted.
+pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&str>) -> Result<(), CoreError> {
+    let mut changed = Vec::new();
+    collect_changed_files(root, head_tree_hash, "", &mut changed)?;
+
+    // Two flat passes, so the fan-out follows the probe count rather than the file count: one
+    // large file's chunks are as many probes as that many small files.
+    let probes = probe_all(&changed, |(path, hash, chunked)| probe_staged_object(path, hash, *chunked))?;
+
+    let mut wanted: Vec<&str> = probes.iter()
+        .filter_map(|probe| match probe { StagedObject::Chunked(chunks) => Some(chunks), _ => None })
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let present = probe_all(&wanted, |chunk| file_utils::does_object_exist(chunk))?;
+    let absent: HashSet<&str> = wanted.iter().zip(present).filter(|(_, present)| !present).map(|(chunk, _)| *chunk).collect();
+
+    let mut lost = Vec::new();
+    for ((path, hash, _), probe) in changed.iter().zip(&probes) {
+        match probe {
+            StagedObject::Present => {}
+            StagedObject::Absent => lost.push((path, format!("its content {} is missing from the store", hash))),
+            StagedObject::Chunked(chunks) => {
+                let absent_of = |chunks: &[String]| Ok(chunks.iter().filter(|chunk| absent.contains(chunk.as_str())).cloned().collect());
+                if let Err(why) = audit_utils::report_missing_chunks(hash, chunks, &absent_of) {
+                    lost.push((path, format!("its content is incomplete: {}", why)));
+                }
+            }
+        }
+    }
+
+    let Some((first_path, first_reason)) = lost.first() else {
+        return Ok(());
+    };
+
+    let (message, next_step) = if lost.len() == 1 {
+        (
+            format!(
+                "\"{}\" is staged, but {}; no parcel was made, since one naming it could not be \
+                restored.",
+                first_path, first_reason
+            ),
+            match remedy_path(first_path) {
+                Some(quoted) => format!(
+                    "Run \"forklift restore --staged {}\", then \"forklift load {}\" to stage it again \
+                    from its working copy.",
+                    quoted, quoted
+                ),
+                None => "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", \
+                    with that path quoted for your shell, to stage it again from its working copy.".to_string(),
+            },
+        )
+    } else {
+        let named: Vec<String> = lost.iter().take(MAX_NAMED_LOST_PATHS)
+            .map(|(path, reason)| format!("\"{}\" ({})", path, reason))
+            .collect();
+        let overflow = lost.len() - named.len();
+        let and_more = if overflow > 0 { format!(", and {} more", overflow) } else { String::new() };
+
+        (
+            format!(
+                "{} staged files have content missing from the store: {}{}. No parcel was made, \
+                since one naming them could not be restored.",
+                lost.len(), named.join("; "), and_more
+            ),
+            "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", for each, \
+            to stage it again from its working copy.".to_string(),
+        )
+    };
+
+    Err(CoreError::refusal(RefusalCode::StagedContentMissing, format!("{} {}", message, next_step), next_step))
+}
+
+/// The walk behind [`require_staged_content_present`]: append `(path, hash, chunked)` for every
+/// file under `tree` whose hash differs from the head's entry at its path. A head tree that cannot
+/// be read is an error, never an empty explanation.
+fn collect_changed_files(tree: &TreeItem,
+                         head_tree_hash: Option<&str>,
+                         prefix: &str,
+                         changed: &mut Vec<(String, String, bool)>) -> Result<(), String> {
+    if head_tree_hash == Some(tree.hash.as_str()) {
+        return Ok(());
+    }
+
+    let path_of = |name: &str| if prefix.is_empty() { name.to_string() } else { format!("{}/{}", prefix, name) };
+    let head_tree = match head_tree_hash {
+        Some(hash) => Some(object_utils::load_tree(hash).map_err(|e| format!(
+            "The head's tree {} for \"{}\" could not be read, so staged changes there cannot be told \
+            apart from what the head already holds: {}. No parcel was made.",
+            hash, if prefix.is_empty() { "." } else { prefix }, e.trim_end_matches('.')
+        ))?),
+        None => None,
+    };
+    let head_file = |name: &str| head_tree.as_ref().and_then(|head| head.get_file(name)).map(|file| file.hash.as_str());
+    let head_subtree = |name: &str| head_tree.as_ref().and_then(|head| head.get_subtree(name)).map(|subtree| subtree.hash.as_str());
+
+    for (name, file) in tree.get_files() {
+        if head_file(name) != Some(file.hash.as_str()) {
+            changed.push((path_of(name), file.hash.clone(), file.item_type.is_chunked()));
+        }
+    }
+
+    for (name, subtree) in tree.get_subtrees() {
+        collect_changed_files(subtree, head_subtree(name), &path_of(name), changed)?;
+    }
+
+    Ok(())
+}
+
+/// What [`probe_staged_object`] found for one changed file.
+enum StagedObject {
+    Present,
+    Absent,
+    /// A recipe that is present and readable, with its chunks still to probe.
+    Chunked(Vec<String>),
+}
+
+/// Map `probe` over `items`, inline below [`PARALLEL_PROBE_THRESHOLD`] (stopping at the first
+/// error) and fanned out at or above it; any error fails the whole call.
+fn probe_all<T: Sync, R: Send>(items: &[T], probe: impl Fn(&T) -> Result<R, String> + Sync) -> Result<Vec<R>, String> {
+    if items.len() < PARALLEL_PROBE_THRESHOLD {
+        items.iter().map(probe).collect()
+    } else {
+        fanout_utils::fanout_map(items, probe).into_iter().collect()
+    }
+}
+
+/// Probe one changed file's object: present, absent, or for a chunked file its recipe's chunk
+/// list. `Err` when the store could not be consulted, or the recipe is present and cannot be read.
+///
+/// Presence only, not integrity: a blob or chunk that is present but damaged is not read here,
+/// and surfaces at `restore` or `audit --full`. A recipe is read because its chunks are named in
+/// it, so damage to it is caught on the way.
+fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedObject, String> {
+    if !file_utils::does_object_exist(hash)? {
+        return Ok(StagedObject::Absent);
+    }
+
+    if !chunked {
+        return Ok(StagedObject::Present);
+    }
+
+    let remedy = remedy_path(path);
+    object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
+        "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
+        Loading the file again will not replace it while the damaged object stays in place; run \
+        \"forklift restore --staged {}\"{} to leave it out and stack the rest.",
+        path, hash, e.trim_end_matches('.'),
+        remedy.as_deref().unwrap_or("-- <path>"),
+        if remedy.is_some() { "" } else { " with that path quoted for your shell" }
+    ))
+}
+
+/// `path` as it goes into a remedy command on this platform: see [`remedy_path_when`].
+fn remedy_path(path: &str) -> Option<String> {
+    remedy_path_when(path, cfg!(windows))
+}
+
+/// `path` as one argument of a remedy command. Unchanged when it holds only characters no shell
+/// treats specially, and single-quoted for a POSIX shell otherwise. On Windows there is no quoting
+/// that both `cmd` and PowerShell read as one literal argument (both expand inside double quotes,
+/// and the message already wraps the command in them), so such a path gets `None` and the caller
+/// prints a `<path>` placeholder instead. A path starting with `-` is put after `--`, so it is not
+/// taken for an option.
+fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
+    // PowerShell also reads `,` (an array), a leading `@` (splatting) and `+`, `:` in some
+    // positions, so Windows keeps to the characters no shell there treats specially.
+    let plain = if windows { "._-/" } else { "._-/+@%:," };
+    let quoted = if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
+        path.to_string()
+    } else if windows {
+        return None;
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    };
+
+    Some(if path.starts_with('-') { format!("-- {}", quoted) } else { quoted })
 }
 
 /// Splice freshly built in-scope subtree(s) over the current head's spine to produce the
@@ -808,5 +1028,35 @@ mod subtree_closure_tests {
             }
             SubtreeClosure::Overflowed => panic!("a closure of 5 must not overflow a cap of 100"),
         }
+    }
+
+    /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
+    /// would split or expand is single-quoted for POSIX (embedded quotes included) and left to a
+    /// placeholder on Windows, and a leading `-` goes after `--`.
+    #[test]
+    fn a_remedy_path_is_one_argument() {
+        let mut failures = Vec::new();
+        let cases = [
+            ("src/a-b_c.v2.rs", Some("src/a-b_c.v2.rs"), Some("src/a-b_c.v2.rs")),
+            ("My Docs/report v2.txt", Some("'My Docs/report v2.txt'"), None),
+            ("it's$HOME", Some("'it'\\''s$HOME'"), None),
+            ("=notes", Some("'=notes'"), None),
+            ("100%", Some("100%"), None),
+            ("a,b.txt", Some("a,b.txt"), None),
+            ("@notes.txt", Some("@notes.txt"), None),
+            ("c++/x:y", Some("c++/x:y"), None),
+            ("-draft.txt", Some("-- -draft.txt"), Some("-- -draft.txt")),
+            ("-my draft", Some("-- '-my draft'"), None),
+            ("", Some("''"), None),
+        ];
+        for (path, posix, windows) in cases {
+            for (is_windows, expected) in [(false, posix), (true, windows)] {
+                let got = remedy_path_when(path, is_windows);
+                if got.as_deref() != expected {
+                    failures.push(format!("{:?} (windows: {}): expected {:?}, got {:?}", path, is_windows, expected, got));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

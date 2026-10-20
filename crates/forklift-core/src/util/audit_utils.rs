@@ -2228,7 +2228,18 @@ fn verify_recipe_chunks_present(
     let chunks = load_recipe_chunks(recipe_hash)
         .map_err(|e| format!("Recipe {} is missing or unreadable: {}", recipe_hash, e))?;
 
-    let mut missing = chunks_missing(&chunks)?;
+    report_missing_chunks(recipe_hash, &chunks, chunks_missing)
+}
+
+/// The half of [`verify_recipe_chunks_present`] after the recipe is read: ask `chunks_missing`
+/// which of `chunks` the store lacks, and fail naming them. For a caller that has already read the
+/// recipe itself, to tell an unreadable one apart from one with absent chunks.
+pub(crate) fn report_missing_chunks(
+    recipe_hash: &str,
+    chunks: &[String],
+    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let mut missing = chunks_missing(chunks)?;
 
     if missing.is_empty() {
         return Ok(());

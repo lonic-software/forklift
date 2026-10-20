@@ -194,7 +194,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     // Staged inventory leaves (FORK-156): loaded-but-unstacked content is referenced by its
     // bay's inventory shard and by nothing else, so without this a repack drops it at once (no
     // grace on packed objects) and a loose sweep drops it once the grace period passes, while
-    // `stocktake` still shows the file staged and `stack` signs a parcel over the missing hash.
+    // `stocktake` still shows the file staged and the next `stack` refuses over the lost object.
     // Same leaf treatment as a tree's file entry below: the hash is marked live unread, and a
     // chunked entry's recipe is descended for its chunks.
     // Only a newly inserted recipe is descended, so one recipe staged in many bays is read once.

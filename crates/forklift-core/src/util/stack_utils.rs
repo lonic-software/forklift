@@ -266,6 +266,10 @@ pub async fn stack_parcel(description: Option<String>,
     let partial_root = partial_root
         .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
 
+    // A staged file whose content the store lost since its `load` must stop the stack here: a
+    // parcel naming it would pass `audit` and fail only at a later `restore`.
+    tree_utils::require_staged_content_present(&partial_root, head_root_hash.as_deref())?;
+
     // In a scoped (sparse) bay the dock materializes only the in-scope subtree(s), so the freshly
     // built root above is a sparse partial that would drop every out-of-scope sibling. The overlay
     // splices it onto the head's spine — copying out-of-scope siblings verbatim by hash — so the
