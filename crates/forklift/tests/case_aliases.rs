@@ -920,7 +920,9 @@ fn park_over_an_unloaded_case_only_rename_leaves_it_an_unstaged_move() {
 }
 
 /// A remedy's paths are shell arguments: a name holding a space is offered quoted, and the
-/// commands, split as a shell splits them, stage only the rename.
+/// commands, split as a shell splits them, stage only the rename. On Windows no quoting holds for
+/// every shell, so the path is offered as a placeholder instead (see the alias check's own tests).
+#[cfg(unix)]
 #[test]
 fn a_named_load_remedy_quotes_each_path_for_the_shell() {
     let warehouse = with_unrelated_work("reach-quoted", &[("My Notes", "n\n")]);
@@ -1048,7 +1050,10 @@ fn a_named_load_through_a_symlink_is_not_respelled_inside_its_target() {
     let exact = warehouse.run(&["load", "link/file"]);
 
     assert!(!stderr(&typed).contains(NAMED_SPELLING_REFUSAL), "{}", stderr(&typed));
-    assert_eq!(typed.status.success(), exact.status.success(), "{} / {}", stderr(&typed), stderr(&exact));
+    // Only a volume that folds case opens the typed spelling at all.
+    if warehouse.folds_case() {
+        assert_eq!(typed.status.success(), exact.status.success(), "{} / {}", stderr(&typed), stderr(&exact));
+    }
 }
 
 /// In a scoped bay the scope is judged by the path the volume opens, so a case typo of an in-scope
