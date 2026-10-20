@@ -361,18 +361,21 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
     };
 
     let (message, next_step) = if lost.len() == 1 {
-        let quoted = remedy_path(first_path);
         (
             format!(
                 "\"{}\" is staged, but {}; no parcel was made, since one naming it could not be \
                 restored.",
                 first_path, first_reason
             ),
-            format!(
-                "Run \"forklift restore --staged {}\", then \"forklift load {}\" to stage it again \
-                from its working copy.",
-                quoted, quoted
-            ),
+            match remedy_path(first_path) {
+                Some(quoted) => format!(
+                    "Run \"forklift restore --staged {}\", then \"forklift load {}\" to stage it again \
+                    from its working copy.",
+                    quoted, quoted
+                ),
+                None => "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", \
+                    with that path quoted for your shell, to stage it again from its working copy.".to_string(),
+            },
         )
     } else {
         let named: Vec<String> = lost.iter().take(MAX_NAMED_LOST_PATHS)
@@ -387,8 +390,8 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
                 since one naming them could not be restored.",
                 lost.len(), named.join("; "), and_more
             ),
-            "Run \"forklift restore --staged <path>\", then \"forklift load <path>\", for each, to \
-            stage it again from its working copy.".to_string(),
+            "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", for each, \
+            to stage it again from its working copy.".to_string(),
         )
     };
 
@@ -411,7 +414,7 @@ fn collect_changed_files(tree: &TreeItem,
         Some(hash) => Some(object_utils::load_tree(hash).map_err(|e| format!(
             "The head's tree {} for \"{}\" could not be read, so staged changes there cannot be told \
             apart from what the head already holds: {}. No parcel was made.",
-            hash, if prefix.is_empty() { "." } else { prefix }, e
+            hash, if prefix.is_empty() { "." } else { prefix }, e.trim_end_matches('.')
         ))?),
         None => None,
     };
@@ -467,32 +470,35 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
     object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
         "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
         Loading the file again will not replace it while the damaged object stays in place; run \
-        \"forklift restore --staged {}\" to leave it out and stack the rest.",
-        path, hash, e, remedy_path(path)
+        \"forklift restore --staged {}\"{} to leave it out and stack the rest.",
+        path, hash, e.trim_end_matches('.'),
+        remedy_path(path).unwrap_or_else(|| "-- <path>".to_string()),
+        if remedy_path(path).is_some() { "" } else { " with that path quoted for your shell" }
     ))
 }
 
 /// `path` as it goes into a remedy command on this platform: see [`remedy_path_when`].
-fn remedy_path(path: &str) -> String {
+fn remedy_path(path: &str) -> Option<String> {
     remedy_path_when(path, cfg!(windows))
 }
 
 /// `path` as one argument of a remedy command. Unchanged when it holds only characters no shell
-/// treats specially; otherwise double-quoted for Windows (where a path cannot hold `"`) and
-/// single-quoted for a POSIX shell. A path starting with `-` is put after `--`, so it is not
-/// taken for an option. Windows quoting is for `cmd` and PowerShell alike, which still expand a
-/// `%`/`$` inside double quotes.
-fn remedy_path_when(path: &str, windows: bool) -> String {
+/// treats specially, and single-quoted for a POSIX shell otherwise. On Windows there is no quoting
+/// that both `cmd` and PowerShell read as one literal argument (both expand inside double quotes,
+/// and the message already wraps the command in them), so such a path gets `None` and the caller
+/// prints a `<path>` placeholder instead. A path starting with `-` is put after `--`, so it is not
+/// taken for an option.
+fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
     let plain = if windows { "._-/+@:," } else { "._-/+@%:," };
     let quoted = if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
         path.to_string()
     } else if windows {
-        format!("\"{}\"", path)
+        return None;
     } else {
         format!("'{}'", path.replace('\'', "'\\''"))
     };
 
-    if path.starts_with('-') { format!("-- {}", quoted) } else { quoted }
+    Some(if path.starts_with('-') { format!("-- {}", quoted) } else { quoted })
 }
 
 /// Splice freshly built in-scope subtree(s) over the current head's spine to produce the
@@ -1022,26 +1028,26 @@ mod subtree_closure_tests {
     }
 
     /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
-    /// would split or expand is quoted the platform's way (embedded POSIX quotes included), and a
-    /// leading `-` goes after `--`.
+    /// would split or expand is single-quoted for POSIX (embedded quotes included) and left to a
+    /// placeholder on Windows, and a leading `-` goes after `--`.
     #[test]
     fn a_remedy_path_is_one_argument() {
         let mut failures = Vec::new();
         let cases = [
-            ("src/a-b_c.v2.rs", "src/a-b_c.v2.rs", "src/a-b_c.v2.rs"),
-            ("My Docs/report v2.txt", "'My Docs/report v2.txt'", "\"My Docs/report v2.txt\""),
-            ("it's$HOME", "'it'\\''s$HOME'", "\"it's$HOME\""),
-            ("=notes", "'=notes'", "\"=notes\""),
-            ("100%", "100%", "\"100%\""),
-            ("-draft.txt", "-- -draft.txt", "-- -draft.txt"),
-            ("-my draft", "-- '-my draft'", "-- \"-my draft\""),
-            ("", "''", "\"\""),
+            ("src/a-b_c.v2.rs", Some("src/a-b_c.v2.rs"), Some("src/a-b_c.v2.rs")),
+            ("My Docs/report v2.txt", Some("'My Docs/report v2.txt'"), None),
+            ("it's$HOME", Some("'it'\\''s$HOME'"), None),
+            ("=notes", Some("'=notes'"), None),
+            ("100%", Some("100%"), None),
+            ("-draft.txt", Some("-- -draft.txt"), Some("-- -draft.txt")),
+            ("-my draft", Some("-- '-my draft'"), None),
+            ("", Some("''"), None),
         ];
         for (path, posix, windows) in cases {
             for (is_windows, expected) in [(false, posix), (true, windows)] {
                 let got = remedy_path_when(path, is_windows);
-                if got != expected {
-                    failures.push(format!("{:?} (windows: {}): expected {}, got {}", path, is_windows, expected, got));
+                if got.as_deref() != expected {
+                    failures.push(format!("{:?} (windows: {}): expected {:?}, got {:?}", path, is_windows, expected, got));
                 }
             }
         }
