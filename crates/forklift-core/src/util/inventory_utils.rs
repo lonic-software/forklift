@@ -2615,6 +2615,12 @@ fn sweep_unregistered_shards() {
         return;
     };
 
+    // A link in place of the store is damage that only a wholesale reset repairs; listing through
+    // it would sweep whatever it points at.
+    if !std::fs::symlink_metadata(&store_root).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
+
     let read = |folder: &Path| -> Vec<std::fs::DirEntry> {
         std::fs::read_dir(folder).map(|entries| entries.filter_map(Result::ok).collect()).unwrap_or_default()
     };
@@ -4276,6 +4282,29 @@ mod tests {
         assert!(std::fs::symlink_metadata(&link).is_err(), "the link is gone");
         assert_eq!(std::fs::read(outside.join("notes.txt")).unwrap(), b"kept", "a file behind the link is kept");
         assert!(outside.join("project").is_dir(), "a folder behind the link is kept");
+    }
+
+    /// A sweep never lists through a link in place of the store, so nothing it points at is swept.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_does_not_enter_a_linked_store() {
+        let scratch = Scratch::new("sweep-linked-store");
+        stamped_chain_with_sibling();
+
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(outside.join("src")).unwrap();
+        std::fs::write(outside.join("notes.txt"), b"kept").unwrap();
+        std::fs::write(outside.join("src").join("main.rs"), b"kept").unwrap();
+
+        let store_root = file_utils::get_inventory_store_root().unwrap();
+        std::fs::remove_dir_all(&store_root).unwrap();
+        std::os::unix::fs::symlink(&outside, &store_root).unwrap();
+
+        sweep_unregistered_shards();
+
+        assert_eq!(std::fs::read(outside.join("notes.txt")).unwrap(), b"kept", "a file behind the link is kept");
+        assert_eq!(std::fs::read(outside.join("src").join("main.rs")).unwrap(), b"kept",
+            "a folder's contents behind the link are kept");
     }
 
     /// A link in a shard slot is removed itself, on every platform, and what it points at is kept.
