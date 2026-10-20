@@ -292,20 +292,23 @@ enforce this per office parcel against the *signer's* role in the previous state
 parcel can never grant its own author privileges. The genesis operator is an admin, and
 the office always retains at least one (lockout protection in `office role`).
 
-A key record (`key-id` = the Blake3 hex hash of the raw Ed25519 public key bytes):
+A key record, filed as `keys/<key-id>.toml` (`key-id` = the Blake3 hex hash of the raw
+Ed25519 public key bytes):
 ```toml
-key_id = "68fdb07d…"
 operator = "mate@lonic.net"
 public_key = "9d61b19d…"   # Ed25519, 32 bytes, hex
 issued_at = 1782205234
 retired_at = 1782206000    # absent while the key is active
 ```
 
-Readers recompute `key_id` from `public_key` and refuse a record where the two disagree:
-every lookup goes by key id, while the endorsement and proof-of-possession sign only the
-public key, so the id must be derived rather than trusted. An office tree holding two
-record files for one key id, or for one user identifier, is likewise refused, naming both
-files. File names are not otherwise checked against the records they hold.
+A key record does not store its id; readers derive it from `public_key`. Every lookup goes
+by key id, while the endorsement and proof-of-possession sign only the public key, so a
+stored id could name one key over another key's material. Readers that build the office
+state refuse a record filed under any name but its own subject's (`<key-id>.toml`,
+`<blake3(identifier)>.toml`), naming the file and the one it belongs in. Since tree entry
+names are unique, this also means no subject can have two records. The writer refuses,
+before signing, a state that would break either rule. Collecting gc's trust pins is the
+one read that does not check file names: it keeps every record's pins.
 
 Retired keys are **retained forever**: they still verify the parcels that were signed
 while they were active. The private halves never enter the warehouse; they live in the

@@ -863,12 +863,11 @@ pub(crate) mod tests {
         let malformed_user_toml =
             "identifier = \"op@broken\"\nenrolled_at = 1\nidentity_root = \"r\"\n"; // no "role"
         let valid_key_toml = format!(
-            "key_id = \"53147f3ce49ed4f60dfa5b9654c36ba6103c11f5737df3dabd4cbd296c4161bd\"\n\
-             operator = \"op@x\"\n\
+            "operator = \"op@x\"\n\
              public_key = \"deadbeef\"\n\
              issued_at = 1\n\
              distrust_boundary = [\"{}\"]\n\
-             authorized_by = \"53147f3ce49ed4f60dfa5b9654c36ba6103c11f5737df3dabd4cbd296c4161bd\"\n\
+             authorized_by = \"test-key-1\"\n\
              endorsement = \"ee\"\n\
              proof_of_possession = \"pp\"\n",
             pinned_hash

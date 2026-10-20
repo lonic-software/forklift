@@ -6,8 +6,6 @@
 //! objects, the records inherit hashing, signing and (later) transport for free, and the
 //! office pallet's parcel history *is* the audit trail of every user and key change.
 
-use std::collections::HashMap;
-
 use chrono::Utc;
 use toml_edit::{value, DocumentMut};
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -224,7 +222,9 @@ impl UserRecord {
 /// parcels that were signed while they were active.
 #[derive(Clone)]
 pub struct KeyRecord {
-    /// The key id: the Blake3 hex hash of the raw public key bytes.
+    /// The key id: the Blake3 hex hash of the raw public key bytes. Never stored in the
+    /// record: [`parse_key_record`] derives it from `public_key`, and the record's file name
+    /// is `<key_id>.toml`.
     pub key_id: String,
 
     /// The identifier of the operator the key belongs to.
@@ -400,10 +400,7 @@ pub fn endorse_key(public_key_hex: &str,
     )?;
 
     Ok(KeyRecord {
-        key_id: sign_utils::key_id_for_public_key(
-            &sign_utils::from_hex(public_key_hex)
-                .map_err(|_| "The public key is not valid hex.".to_string())?
-        ),
+        key_id: key_id_of(public_key_hex)?,
         operator: operator.to_string(),
         public_key: public_key_hex.to_string(),
         issued_at,
@@ -897,19 +894,18 @@ fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
     };
 
     let mut keys = Vec::new();
-    let mut file_names = Vec::new();
 
-    for (name, file) in keys_tree.get_files() {
+    // File names are deliberately not checked against the records here, unlike in
+    // `read_office_state_of`: this reader only gathers pins that keep history alive, so a
+    // misfiled record's pins are kept (the union of every record's) rather than the office
+    // refused — judging the office's integrity is the verifying readers' job.
+    for (_, file) in keys_tree.get_files() {
         let record = load_object_classified(&file.hash, parse_record_bytes)?;
         keys.push(parse_key_record(&record).map_err(|e| OfficeReadError {
             kind: OfficeReadErrorKind::UnparseableRecord,
             message: e,
         })?);
-        file_names.push(name.as_str());
     }
-
-    verify_unique_subjects("key", keys.iter().map(|key| key.key_id.as_str()).zip(file_names))
-        .map_err(|e| OfficeReadError { kind: OfficeReadErrorKind::UnparseableRecord, message: e })?;
 
     keys.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
 
@@ -1095,35 +1091,33 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
         return Ok(OfficeState { users, keys });
     };
 
-    let mut user_files: Vec<String> = Vec::new();
-    let mut key_files: Vec<String> = Vec::new();
-
     for (name, item) in tracked.get_subtrees() {
         let subtree = object_utils::load_tree(&item.hash)?;
 
         match name.as_str() {
             TREE_NAME_USERS => {
                 for (file_name, file) in subtree.get_files() {
-                    users.push(parse_user_record(&load_record(&file.hash)?)?);
-                    user_files.push(file_name.clone());
+                    let user = parse_user_record(&load_record(&file.hash)?)?;
+                    verify_record_file_name(
+                        office_parcel_hash, TREE_NAME_USERS, file_name,
+                        &user_record_file_name(&user), &format!("user {}", user.identifier),
+                    )?;
+                    users.push(user);
                 }
             }
             TREE_NAME_KEYS => {
                 for (file_name, file) in subtree.get_files() {
-                    keys.push(parse_key_record(&load_record(&file.hash)?)?);
-                    key_files.push(file_name.clone());
+                    let key = parse_key_record(&load_record(&file.hash)?)?;
+                    verify_record_file_name(
+                        office_parcel_hash, TREE_NAME_KEYS, file_name,
+                        &key_record_file_name(&key), &format!("key {}", key.key_id),
+                    )?;
+                    keys.push(key);
                 }
             }
             _ => {}
         }
     }
-
-    verify_unique_subjects(
-        "user", users.iter().map(|user| user.identifier.as_str()).zip(user_files.iter().map(String::as_str)),
-    )?;
-    verify_unique_subjects(
-        "key", keys.iter().map(|key| key.key_id.as_str()).zip(key_files.iter().map(String::as_str)),
-    )?;
 
     users.sort_by(|a, b| a.identifier.cmp(&b.identifier));
     keys.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
@@ -1198,10 +1192,18 @@ pub fn build_and_sign_office_parcel(state: &OfficeState,
                                     description: String,
                                     signing_key_id: &str,
                                     parents: Vec<String>) -> Result<String, String> {
+    // Refuse, before anything is stored or signed, a state no reader would accept: a key
+    // whose id is not its public key's, or two records for one subject (which would also
+    // collapse into one file here, silently dropping the other).
     let mut users_tree = TreeItem::new(TREE_NAME_USERS.to_string(), String::new(), DirEntryType::Tree);
 
     for user in &state.users {
-        let file_name = format!("{}{}", blake3::hash(user.identifier.as_bytes()).to_hex(), RECORD_SUFFIX);
+        let file_name = user_record_file_name(user);
+
+        if users_tree.get_files().any(|(name, _)| *name == file_name) {
+            return Err(format!("The office state holds two records for user {}.", user.identifier));
+        }
+
         let blob_hash = store_record(&user_record_to_toml(user))?;
 
         users_tree.add_child(TreeItem::new(file_name, blob_hash, DirEntryType::Normal));
@@ -1210,7 +1212,20 @@ pub fn build_and_sign_office_parcel(state: &OfficeState,
     let mut keys_tree = TreeItem::new(TREE_NAME_KEYS.to_string(), String::new(), DirEntryType::Tree);
 
     for key in &state.keys {
-        let file_name = format!("{}{}", key.key_id, RECORD_SUFFIX);
+        let actual_id = key_id_of(&key.public_key)?;
+
+        if key.key_id != actual_id {
+            return Err(format!(
+                "The office state holds key {} with a public key whose id is {}.", key.key_id, actual_id
+            ));
+        }
+
+        let file_name = key_record_file_name(key);
+
+        if keys_tree.get_files().any(|(name, _)| *name == file_name) {
+            return Err(format!("The office state holds two records for key {}.", key.key_id));
+        }
+
         let blob_hash = store_record(&key_record_to_toml(key))?;
 
         keys_tree.add_child(TreeItem::new(file_name, blob_hash, DirEntryType::Normal));
@@ -1407,7 +1422,6 @@ fn parse_user_record(toml: &str) -> Result<UserRecord, String> {
 fn key_record_to_toml(key: &KeyRecord) -> String {
     let mut doc = DocumentMut::new();
 
-    doc["key_id"] = value(key.key_id.as_str());
     doc["operator"] = value(key.operator.as_str());
     doc["public_key"] = value(key.public_key.as_str());
     doc["issued_at"] = value(key.issued_at);
@@ -1464,10 +1478,12 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
     // that is legitimately absent instead of always-present.
     let distrust_boundary = read_optional_string_array(&doc, "distrust_boundary", "key record")?;
 
-    let record = KeyRecord {
-        key_id: read_string(&doc, "key_id", "key record")?,
+    let public_key = read_string(&doc, "public_key", "key record")?;
+
+    Ok(KeyRecord {
+        key_id: key_id_of(&public_key)?,
         operator: read_string(&doc, "operator", "key record")?,
-        public_key: read_string(&doc, "public_key", "key record")?,
+        public_key,
         issued_at: read_integer(&doc, "issued_at", "key record")?,
         // Optional, strict, same split: absent means the key is active (the common case;
         // `key_record_to_toml` omits it), but a present non-integer value must error rather than
@@ -1483,63 +1499,56 @@ fn parse_key_record(toml: &str) -> Result<KeyRecord, String> {
         authorized_by: read_string(&doc, "authorized_by", "key record")?,
         endorsement: read_string(&doc, "endorsement", "key record")?,
         proof_of_possession: read_string(&doc, "proof_of_possession", "key record")?,
-    };
-
-    verify_key_id_binding(&record)?;
-
-    Ok(record)
+    })
 }
 
-/// Check that a key record's `key_id` is the id of its own `public_key`. Every lookup
-/// ([`OfficeState::find_key`], a signature sidecar's key id) goes by `key_id`, while the
-/// endorsement and proof-of-possession sign only `public_key` — so without this a record
-/// could carry an existing key's id over a different key, and the verifier, which treats a
-/// known id as already endorsed, would let that key sign as the one it names (FORK-74).
-fn verify_key_id_binding(record: &KeyRecord) -> Result<(), String> {
-    let key_bytes = sign_utils::from_hex(&record.public_key).map_err(|_| format!(
-        "The key record for key {} has a public_key that is not valid hex.", record.key_id
-    ))?;
+/// The id of a hex-encoded public key. A key record does not store its id: every lookup
+/// ([`OfficeState::find_key`], a signature sidecar's key id) goes by id, while the
+/// endorsement and proof-of-possession sign only the public key, so a stored id could name
+/// one key over another's key material (FORK-74).
+fn key_id_of(public_key_hex: &str) -> Result<String, String> {
+    let key_bytes = sign_utils::from_hex(public_key_hex)
+        .map_err(|_| format!("A key record's public_key {} is not valid hex.", public_key_hex))?;
 
-    let expected = sign_utils::key_id_for_public_key(&key_bytes);
-
-    if record.key_id != expected {
-        return Err(format!(
-            "The key record for key {} carries a public key whose id is {}. A key's id is the \
-            hash of its public key, so the record has been tampered with.",
-            record.key_id, expected
-        ));
-    }
-
-    Ok(())
+    Ok(sign_utils::key_id_for_public_key(&key_bytes))
 }
 
-/// Check that no two record files in a state name the same subject: a key id across the
-/// key records, an identifier across the user records. Every reader resolves a subject to
-/// its first match, so a second record for it would be unreachable to some checks and
-/// decisive for others, depending only on the order the state is sorted in (FORK-74).
+/// The file a key record is filed under in the office tree: `<key_id>.toml`.
+fn key_record_file_name(key: &KeyRecord) -> String {
+    format!("{}{}", key.key_id, RECORD_SUFFIX)
+}
+
+/// The file a user record is filed under in the office tree: `<blake3(identifier)>.toml`.
+fn user_record_file_name(user: &UserRecord) -> String {
+    format!("{}{}", blake3::hash(user.identifier.as_bytes()).to_hex(), RECORD_SUFFIX)
+}
+
+/// Check that a record sits in the file its own subject names. Tree entry names are unique,
+/// so this is also what makes two records for one subject impossible: every reader resolves a
+/// subject to its first match, and a second record would be unreachable to some checks and
+/// decisive for others (FORK-74).
 ///
 /// # Arguments
-/// * `kind`     - What the records are, for the message ("key", "user").
-/// * `subjects` - Each record's subject and the file it was read from.
-///
-/// # Returns
-/// * `Ok(())`      - If every subject appears once.
-/// * `Err(String)` - Naming the subject and both files, otherwise.
-fn verify_unique_subjects<'a>(kind: &str,
-                              subjects: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), String> {
-    let mut seen: HashMap<&str, &str> = HashMap::new();
-
-    for (subject, file_name) in subjects {
-        if let Some(first) = seen.insert(subject, file_name) {
-            return Err(format!(
-                "The office records {} and {} both describe {} {}. Each {} has exactly one \
-                record, so the office has been tampered with.",
-                first, file_name, kind, subject, kind
-            ));
-        }
+/// * `office_parcel_hash` - The office parcel being read, for the message.
+/// * `tree_name`          - The record subtree (`users`, `keys`), for the message.
+/// * `file_name`          - The file the record was read from.
+/// * `expected`           - The file its subject names.
+/// * `subject`            - The subject, described for the message ("key <id>").
+fn verify_record_file_name(office_parcel_hash: &str,
+                           tree_name: &str,
+                           file_name: &str,
+                           expected: &str,
+                           subject: &str) -> Result<(), String> {
+    if file_name == expected {
+        return Ok(());
     }
 
-    Ok(())
+    Err(format!(
+        "The office parcel {} files the record for {} as {}/{}, but that record belongs in \
+        {}/{}. Forklift never writes a record under another name, so this office may have been \
+        tampered with.",
+        office_parcel_hash, subject, tree_name, file_name, tree_name, expected
+    ))
 }
 
 /// Read a required string field from a TOML document, strictly: an absent key errors naming
@@ -1685,7 +1694,7 @@ fn strict_string_array(array: &toml_edit::Array, field: &str, record_kind: &str)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn user(class: IdentityClass, supervisor: Option<&str>) -> UserRecord {
@@ -1852,12 +1861,11 @@ mod tests {
     /// the sibling test below for the missing-key case staying valid.
     #[test]
     fn a_non_string_distrust_boundary_entry_in_a_key_record_errors_naming_it() {
-        let toml = "key_id = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
-            operator = \"op@x\"\n\
+        let toml = "operator = \"op@x\"\n\
             public_key = \"ab\"\n\
             issued_at = 1\n\
             distrust_boundary = [\"a-real-hash\", 42]\n\
-            authorized_by = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
+            authorized_by = \"k1\"\n\
             endorsement = \"ee\"\n\
             proof_of_possession = \"pp\"\n";
 
@@ -1876,11 +1884,10 @@ mod tests {
     /// breaking every active key's record.
     #[test]
     fn a_key_record_with_no_distrust_boundary_key_parses_as_empty() {
-        let toml = "key_id = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
-            operator = \"op@x\"\n\
+        let toml = "operator = \"op@x\"\n\
             public_key = \"ab\"\n\
             issued_at = 1\n\
-            authorized_by = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
+            authorized_by = \"k1\"\n\
             endorsement = \"ee\"\n\
             proof_of_possession = \"pp\"\n";
 
@@ -1989,12 +1996,11 @@ mod tests {
     /// present-but-damaged reason would turn a legitimate revocation into a spurious rejection.
     #[test]
     fn a_present_non_string_revocation_reason_in_a_key_record_errors_naming_it() {
-        let toml = "key_id = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
-            operator = \"op@x\"\n\
+        let toml = "operator = \"op@x\"\n\
             public_key = \"ab\"\n\
             issued_at = 1\n\
             revocation_reason = 7\n\
-            authorized_by = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
+            authorized_by = \"k1\"\n\
             endorsement = \"ee\"\n\
             proof_of_possession = \"pp\"\n";
 
@@ -2010,12 +2016,11 @@ mod tests {
     /// than silently read as active.
     #[test]
     fn a_present_non_integer_retired_at_in_a_key_record_errors_naming_it() {
-        let toml = "key_id = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
-            operator = \"op@x\"\n\
+        let toml = "operator = \"op@x\"\n\
             public_key = \"ab\"\n\
             issued_at = 1\n\
             retired_at = \"soon\"\n\
-            authorized_by = \"9684c9512e291450365020bc8c8510e4bf2fe65f3587e73f593ffd1f950409cc\"\n\
+            authorized_by = \"k1\"\n\
             endorsement = \"ee\"\n\
             proof_of_possession = \"pp\"\n";
 
@@ -2210,15 +2215,16 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------
-    // Key-id binding and unique subjects (FORK-74)
+    // Key ids derived from public keys; records filed under their subjects (FORK-74)
     // -------------------------------------------------------------------------------
 
-    /// A structurally valid key record for `public_key`, claiming `key_id`.
-    fn key_record_claiming(key_id: &str, public_key: &str, issued_at: i64) -> String {
+    /// A structurally valid key record for `public_key`, with whatever extra lines `extra`
+    /// adds (a stale `key_id` field, a distrust boundary).
+    fn key_record_for(public_key: &str, extra: &str) -> String {
         format!(
-            "key_id = \"{}\"\noperator = \"op@x\"\npublic_key = \"{}\"\nissued_at = {}\n\
-             authorized_by = \"{}\"\nendorsement = \"ee\"\nproof_of_possession = \"pp\"\n",
-            key_id, public_key, issued_at, key_id
+            "{}operator = \"op@x\"\npublic_key = \"{}\"\nissued_at = 1\n\
+             authorized_by = \"k1\"\nendorsement = \"ee\"\nproof_of_possession = \"pp\"\n",
+            extra, public_key
         )
     }
 
@@ -2228,24 +2234,35 @@ mod tests {
         (sign_utils::to_hex(&bytes), sign_utils::key_id_for_public_key(&bytes))
     }
 
-    /// A key record whose `key_id` is not the hash of its `public_key` is refused at parse:
-    /// it is exactly the record that lets one key sign under another's id.
+    /// A key record's id is the hash of its public key, whatever the record says: a `key_id`
+    /// line naming another key (the shape every record had before ids were derived) is not
+    /// read, so no record can put one key's material under another key's id.
     #[test]
-    fn a_key_record_whose_id_is_not_its_public_keys_hash_is_refused() {
+    fn a_key_records_id_is_derived_from_its_public_key_never_read_from_it() {
         let (public_key, own_id) = bound_key(7);
         let (_, other_id) = bound_key(9);
 
-        let error = match parse_key_record(&key_record_claiming(&other_id, &public_key, 1)) {
-            Err(e) => e,
-            Ok(_) => panic!("a key record claiming another key's id must not parse"),
-        };
-        assert!(error.contains(&other_id), "the error must name the claimed id: {}", error);
-        assert!(error.contains(&own_id), "the error must name the key's real id: {}", error);
+        let parsed = parse_key_record(&key_record_for(&public_key, &format!("key_id = \"{}\"\n", other_id)))
+            .expect("a key record parses whatever stale key_id line it carries");
+        assert_eq!(parsed.key_id, own_id);
+
+        let parsed = parse_key_record(&key_record_for(&public_key, "")).unwrap();
+        assert_eq!(parsed.key_id, own_id);
     }
 
-    /// The other direction: a record `key_record_to_toml` writes for a real key parses back.
+    /// A public key that is not hex has no id, so its record does not parse.
     #[test]
-    fn an_emitted_key_record_with_a_bound_id_round_trips() {
+    fn a_key_record_whose_public_key_is_not_hex_errors_naming_it() {
+        let error = match parse_key_record(&key_record_for("not-hex", "")) {
+            Err(e) => e,
+            Ok(_) => panic!("a key record with a non-hex public key must not parse"),
+        };
+        assert!(error.contains("not-hex"), "the error must name the public key: {}", error);
+    }
+
+    /// `key_record_to_toml` writes no `key_id`, and what it writes parses back to the same key.
+    #[test]
+    fn an_emitted_key_record_stores_no_id_and_round_trips() {
         let (public_key, key_id) = bound_key(7);
         let record = KeyRecord {
             key_id: key_id.clone(),
@@ -2260,17 +2277,36 @@ mod tests {
             proof_of_possession: "pp".to_string(),
         };
 
-        let parsed = parse_key_record(&key_record_to_toml(&record))
-            .expect("a record whose id is its public key's hash must parse");
+        let toml = key_record_to_toml(&record);
+        assert!(!toml.parse::<DocumentMut>().unwrap().contains_key("key_id"), "no key_id is stored: {}", toml);
+
+        let parsed = parse_key_record(&toml).unwrap();
         assert_eq!(parsed.key_id, key_id);
         assert_eq!(parsed.public_key, public_key);
     }
 
-    /// Store an office parcel whose `keys` and `users` trees hold exactly the given
-    /// `(file name, record)` pairs, make it the office head, and return its hash. File names
-    /// are free here, unlike in [`build_and_sign_office_parcel`], which is what lets a test
-    /// plant two records for one subject.
-    fn plant_office(keys: &[(&str, String)], users: &[(&str, String)]) -> String {
+    /// Each user and key record of `state`, as a `(file name, record)` pair filed under the
+    /// id or identifier the record holds in memory — unchecked, unlike
+    /// [`build_and_sign_office_parcel`], so a test can file a record where no writer would.
+    pub(crate) fn naive_record_entries(state: &OfficeState) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        let users = state.users.iter()
+            .map(|user| (user_record_file_name(user), user_record_to_toml(user)))
+            .collect();
+        let keys = state.keys.iter()
+            .map(|key| (key_record_file_name(key), key_record_to_toml(key)))
+            .collect();
+
+        (users, keys)
+    }
+
+    /// Store an office parcel whose `users` and `keys` trees hold exactly the given
+    /// `(file name, record)` pairs, sign it with `signer` if given, make it the office head,
+    /// and return its hash. File names are free here, unlike in
+    /// [`build_and_sign_office_parcel`], which is what lets a test misfile a record.
+    pub(crate) fn plant_office(users: &[(String, String)],
+                               keys: &[(String, String)],
+                               parents: Vec<String>,
+                               signer: Option<&str>) -> String {
         let mut users_tree = TreeItem::new(TREE_NAME_USERS.to_string(), String::new(), DirEntryType::Tree);
         for (name, toml) in users {
             users_tree.add_child(TreeItem::new(name.to_string(), store_record(toml).unwrap(), DirEntryType::Normal));
@@ -2299,11 +2335,16 @@ mod tests {
         root_object.store().unwrap();
 
         let parcel = Parcel {
-            tree_hash: root_object.hash, parents: Vec::new(), actions: Vec::new(),
+            tree_hash: root_object.hash, parents, actions: Vec::new(),
             description: Some("planted office".to_string()),
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
+
+        if let Some(signer) = signer {
+            let signature = sign_utils::sign_parcel_hash(signer, &parcel_object.hash).unwrap();
+            sign_utils::store_parcel_signature(&parcel_object.hash, &signature).unwrap();
+        }
 
         let head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
         pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, head.as_deref(), &parcel_object.hash).unwrap();
@@ -2320,67 +2361,122 @@ mod tests {
         (scope, dir)
     }
 
-    /// Two key records for one key, differing in `issued_at`, are refused by both office
-    /// readers whichever of the two sorts first. Both records are well bound (same public
-    /// key), so only the subject check can refuse them: a second record for a known key is
-    /// never re-endorsed, and `find_key` returns whichever sorts first, so such a shadow
-    /// could, for example, present a revoked key as active.
+    fn entry(name: &str, toml: String) -> (String, String) {
+        (name.to_string(), toml)
+    }
+
+    /// A key record filed under any name but its own id is refused, naming the parcel, the
+    /// file and the file it belongs in. This is also what refuses two records for one key —
+    /// tree entry names are unique, so the second must sit under a name not its own — which
+    /// matters because a second record for a known key is never re-endorsed, and `find_key`
+    /// returns whichever sorts first: such a shadow could present a revoked key as active.
     #[test]
-    fn two_key_records_for_one_key_id_are_refused_in_both_orders() {
-        let (scope, dir) = enter_scratch_warehouse("duplicate-key");
+    fn a_key_record_filed_under_another_name_is_refused() {
+        let (scope, dir) = enter_scratch_warehouse("misfiled-key");
         let (public_key, key_id) = bound_key(7);
+        let (_, other_id) = bound_key(9);
+        let own_file = format!("{}.toml", key_id);
 
-        for (first_issued, second_issued) in [(1, 2), (2, 1)] {
-            let planted = plant_office(&[
-                ("a.toml", key_record_claiming(&key_id, &public_key, first_issued)),
-                ("b.toml", key_record_claiming(&key_id, &public_key, second_issued)),
-            ], &[]);
+        for misfiled in [format!("{}.toml", other_id), "a.toml".to_string()] {
+            for keys in [
+                vec![entry(&misfiled, key_record_for(&public_key, ""))],
+                vec![entry(&own_file, key_record_for(&public_key, "")), entry(&misfiled, key_record_for(&public_key, ""))],
+            ] {
+                let planted = plant_office(&[], &keys, Vec::new(), None);
 
-            let error = match read_office_state_of(&planted) {
-                Err(e) => e,
-                Ok(_) => panic!("two records for key {} must not read as an office state", key_id),
-            };
-            assert!(error.contains("a.toml") && error.contains("b.toml"),
-                "the error must name both files: {}", error);
-            assert!(error.contains(&key_id), "the error must name the key: {}", error);
-
-            let error = match read_trust_pin_keys() {
-                Err(e) => e.message,
-                Ok(_) => panic!("the trust-pin reader must refuse two records for key {}", key_id),
-            };
-            assert!(error.contains("a.toml") && error.contains("b.toml"),
-                "the error must name both files: {}", error);
+                let error = match read_office_state_of(&planted) {
+                    Err(e) => e,
+                    Ok(_) => panic!("a key record filed as {} must not read", misfiled),
+                };
+                assert!(error.contains(&planted), "the error must name the parcel: {}", error);
+                assert!(error.contains(&format!("keys/{}", misfiled)), "the error must name the file: {}", error);
+                assert!(error.contains(&format!("keys/{}", own_file)),
+                    "the error must name the file the record belongs in: {}", error);
+            }
         }
 
-        // The domain was non-empty: one record for the same key reads on both readers.
-        let planted = plant_office(&[("a.toml", key_record_claiming(&key_id, &public_key, 1))], &[]);
-        assert_eq!(read_office_state_of(&planted).unwrap().keys.len(), 1);
-        assert_eq!(read_trust_pin_keys().ok().unwrap().len(), 1);
+        // The domain was non-empty: the same record under its own name reads.
+        let planted = plant_office(&[], &[entry(&own_file, key_record_for(&public_key, ""))], Vec::new(), None);
+        assert_eq!(read_office_state_of(&planted).unwrap().keys[0].key_id, key_id);
 
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Two user records for one identifier are refused, naming both files; distinct
-    /// identifiers still read.
+    /// The same for user records: filed under any name but the hash of the identifier, refused.
     #[test]
-    fn two_user_records_for_one_identifier_are_refused() {
-        let (scope, dir) = enter_scratch_warehouse("duplicate-user");
-        let record = user_record_to_toml(&user(IdentityClass::Human, None));
-        let mut other = user(IdentityClass::Human, None);
-        other.identifier = "other@x".to_string();
+    fn a_user_record_filed_under_another_name_is_refused() {
+        let (scope, dir) = enter_scratch_warehouse("misfiled-user");
+        let record = user(IdentityClass::Human, None);
+        let own_file = user_record_file_name(&record);
 
-        let planted = plant_office(&[], &[("u1.toml", record.clone()), ("u2.toml", record.clone())]);
+        let planted = plant_office(&[
+            entry(&own_file, user_record_to_toml(&record)), entry("u2.toml", user_record_to_toml(&record)),
+        ], &[], Vec::new(), None);
         let error = match read_office_state_of(&planted) {
             Err(e) => e,
-            Ok(_) => panic!("two records for one user must not read as an office state"),
+            Ok(_) => panic!("a user record filed as u2.toml must not read"),
         };
-        assert!(error.contains("u1.toml") && error.contains("u2.toml"),
-            "the error must name both files: {}", error);
+        assert!(error.contains("users/u2.toml") && error.contains(&format!("users/{}", own_file)),
+            "the error must name the file and the file it belongs in: {}", error);
         assert!(error.contains("op@x"), "the error must name the user: {}", error);
 
-        let planted = plant_office(&[], &[("u1.toml", record), ("u2.toml", user_record_to_toml(&other))]);
-        assert_eq!(read_office_state_of(&planted).unwrap().users.len(), 2);
+        let planted = plant_office(&[entry(&own_file, user_record_to_toml(&record))], &[], Vec::new(), None);
+        assert_eq!(read_office_state_of(&planted).unwrap().users.len(), 1);
+
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The trust-pin reader, which only gathers pins that keep history alive, keeps a misfiled
+    /// record's pins instead of refusing the office: the union of every record's pins is the
+    /// safe side for collecting roots.
+    #[test]
+    fn the_trust_pin_reader_keeps_a_misfiled_records_pins() {
+        let (scope, dir) = enter_scratch_warehouse("misfiled-pins");
+        let (public_key, _) = bound_key(7);
+
+        plant_office(&[], &[
+            entry("a.toml", key_record_for(&public_key, "distrust_boundary = [\"pin-a\"]\n")),
+            entry("b.toml", key_record_for(&public_key, "distrust_boundary = [\"pin-b\"]\n")),
+        ], Vec::new(), None);
+
+        let keys = read_trust_pin_keys().ok().expect("the trust-pin reader does not judge file names");
+        let pins: Vec<&str> = keys.iter().flat_map(|key| key.distrust_boundary.iter().map(String::as_str)).collect();
+        assert!(pins.contains(&"pin-a") && pins.contains(&"pin-b"), "both records' pins are kept: {:?}", pins);
+
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The writer refuses, before signing, a state no reader would accept: a key whose id is
+    /// not its public key's, and two records for one key or one user (which would otherwise
+    /// collapse into one file, silently dropping one).
+    #[test]
+    fn the_office_writer_refuses_a_state_no_reader_would_accept() {
+        let (scope, dir) = enter_scratch_warehouse("writer-refuses");
+        let actor = crate::model::operator::Operator { name: "op".to_string(), identifier: "op@x".to_string() };
+        let (public_key, key_id) = bound_key(7);
+        let (_, other_id) = bound_key(9);
+        let key = parse_key_record(&key_record_for(&public_key, "")).unwrap();
+
+        let mut rebound = key.clone();
+        rebound.key_id = other_id.clone();
+        let error = build_and_sign_office_parcel(
+            &OfficeState { users: Vec::new(), keys: vec![rebound] }, &actor, "x".to_string(), &key_id, Vec::new(),
+        ).err().expect("a key whose id is not its public key's must not be written");
+        assert!(error.contains(&other_id) && error.contains(&key_id), "the error must name both ids: {}", error);
+
+        let error = build_and_sign_office_parcel(
+            &OfficeState { users: Vec::new(), keys: vec![key.clone(), key.clone()] }, &actor, "x".to_string(), &key_id, Vec::new(),
+        ).err().expect("two records for one key must not be written");
+        assert!(error.contains("two records") && error.contains(&key_id), "{}", error);
+
+        let user = user(IdentityClass::Human, None);
+        let error = build_and_sign_office_parcel(
+            &OfficeState { users: vec![user.clone(), user], keys: Vec::new() }, &actor, "x".to_string(), &key_id, Vec::new(),
+        ).err().expect("two records for one user must not be written");
+        assert!(error.contains("two records") && error.contains("op@x"), "{}", error);
 
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
