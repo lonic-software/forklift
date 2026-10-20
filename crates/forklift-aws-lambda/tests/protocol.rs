@@ -608,6 +608,135 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
     assert!(err.message.contains("not an admin"), "{}", err.message);
 }
 
+/// FORK-220: an office parcel that oversteps its signer's privileges is a `403` on this head too,
+/// now that the chain walk finds it: a writer promoting themselves to admin. The same promotion
+/// signed by the admin is admitted, so the refusal is the signer's role and nothing else.
+#[test]
+fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not() {
+    let area = Area::new("self-promotion");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+
+    let worker = "worker@forklift";
+    area.forklift("wh", &["config", "operator.identifier", worker]);
+    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    let mut admit: Vec<&str> = keygen.lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .collect();
+    admit.extend(["--role", "writer"]);
+    area.forklift("wh", &admit);
+
+    // Sign both promotions in process, with the area's own keys. Nothing else in this binary
+    // signs in process, and the CLI runs get the variable explicitly; the guard restores it
+    // even if signing panics.
+    struct KeysDirScope(Option<String>);
+
+    impl Drop for KeysDirScope {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
+                None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
+            }
+        }
+    }
+
+    let (office_head, by_worker, by_admin, demotion) = {
+        let _keys = KeysDirScope(std::env::var("FORKLIFT_KEYS_DIR").ok());
+        std::env::set_var("FORKLIFT_KEYS_DIR", area.path("keys"));
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)
+            .expect("read the office head")
+            .expect("office head");
+
+        let mut state = office_utils::read_office_state().expect("the office state");
+        let root_of = |identifier: &str| state.find_user(identifier).expect("enrolled").identity_root.clone();
+        let (worker_key, admin_key) = (root_of(worker), root_of("tester@forklift"));
+        state.users.iter_mut().find(|user| user.identifier == worker).unwrap().role = office_utils::Role::Admin;
+
+        let sign = |identifier: &str, key_id: &str| {
+            let actor = forklift_core::model::operator::Operator {
+                name: identifier.to_string(),
+                identifier: identifier.to_string(),
+            };
+            office_utils::build_and_sign_office_parcel(
+                &state, &actor, "promote the worker".to_string(), key_id, vec![office_head.clone()]
+            )
+            .expect("sign the promotion")
+        };
+
+        let (by_worker, by_admin) = (sign(worker, &worker_key), sign("tester@forklift", &admin_key));
+
+        // The admin demoting the worker again, on top of the worker's own promotion.
+        let mut demoted = state.clone();
+        demoted.users.iter_mut().find(|user| user.identifier == worker).unwrap().role = office_utils::Role::Writer;
+        let admin = forklift_core::model::operator::Operator {
+            name: "tester@forklift".to_string(),
+            identifier: "tester@forklift".to_string(),
+        };
+        let demotion = office_utils::build_and_sign_office_parcel(
+            &demoted, &admin, "demote the worker".to_string(), &admin_key, vec![by_worker.clone()]
+        )
+        .expect("sign the demotion");
+
+        (office_head.clone(), by_worker, by_admin, demotion)
+    };
+
+    let harvest = harvest(&area.path("wh"));
+    let office_wire = format!("@{}", OFFICE_PALLET_NAME);
+
+    let lift = |promotion: &str| {
+        let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+        upload_all(&head, &harvest);
+        head.put_trust(&harvest.trust.clone().expect("trust")).expect("put trust");
+        head.ref_update(&office_wire, &RefUpdateRequest { old_head: None, new_head: office_head.clone() })
+            .expect("lift the admitted office");
+
+        head.ref_update(&office_wire, &RefUpdateRequest {
+            old_head: Some(office_head.clone()),
+            new_head: promotion.to_string(),
+        })
+    };
+
+    let err = lift(&by_worker).expect_err("a writer's self-promotion");
+    assert_eq!(err.status, Status::Forbidden, "{}", err.message);
+    assert!(err.message.contains("not an admin"), "{}", err.message);
+
+    lift(&by_admin).expect("an admin's promotion");
+
+    // The worker's promotion planted past the head, as a store written before the check would
+    // hold it: the admin's legitimate demotion on top is refused, but the overstep is not the
+    // admin's, so it is a 422 and not a 403.
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest);
+    head.put_trust(&harvest.trust.clone().expect("trust")).expect("put trust");
+    head.ref_update(&office_wire, &RefUpdateRequest { old_head: None, new_head: office_head.clone() })
+        .expect("lift the admitted office");
+    let trust = head.refs.get_trust().expect("read trust");
+    assert!(matches!(
+        head.refs.compare_and_set_head(
+            pallet_utils::PalletNamespace::Meta,
+            OFFICE_PALLET_NAME,
+            Some(&office_head),
+            &by_worker,
+            OfficePrecondition::NotConsumed,
+            trust.as_ref().map(|(_, raw)| raw.as_str()),
+        ),
+        Ok(CasOutcome::Committed)
+    ));
+
+    let err = head.ref_update(&office_wire, &RefUpdateRequest {
+        old_head: Some(by_worker.clone()),
+        new_head: demotion,
+    })
+    .expect_err("a demotion on top of a held overstep");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains(&by_worker), "{}", err.message);
+    assert!(err.message.contains("already in this warehouse's office"), "{}", err.message);
+}
+
 /// On a trusted warehouse, a user-pallet lift before the office is lifted is refused: the
 /// audit has no keys to verify against.
 #[test]

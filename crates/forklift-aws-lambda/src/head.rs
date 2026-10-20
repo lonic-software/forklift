@@ -14,7 +14,7 @@
 //! check anywhere in this crate to be the adapter's concern *of*: this type has no caller-
 //! identity concept at all, so it cannot consult an office role for who is calling. It is not
 //! a uniform "role for who signed" either: the office pallet's own parcels are checked against
-//! their signer's role, as of that parcel's own signing (`verify_office_privileges`); every
+//! their signer's role, as of that parcel's own signing (`verify_office_chain`); every
 //! other pallet's parcels are accepted when they are either validly signed by a key the
 //! office currently tracks and has not revoked, or unsigned/untracked-key but reachable from
 //! the trust boundary (tolerated as legacy), or signed by a revoked key but reachable from that
@@ -508,7 +508,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
     /// checks, and it differs by pallet: for the office pallet, every office-modifying parcel's
     /// *signer* is checked against the office role it held as of that parcel's own signing
-    /// (`verify_office_privileges`); for a meta pallet (`meta_tree::meta_rules`),
+    /// (`verify_office_chain`); for a meta pallet (`meta_tree::meta_rules`),
     /// every new parcel passes `verify_meta_content` against the verified office, and the pallet
     /// is refused outright without one; for any other pallet, a parcel is accepted when it is
     /// either validly signed by a key the office currently tracks and has not revoked, or
@@ -726,16 +726,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             } else if let Some(anchor) = &anchor {
                 if is_office {
                     // The office chain carries the keys; verify it against the anchor, and
-                    // that every new parcel stayed within its signer's privileges.
+                    // that every parcel stayed within its signer's privileges.
                     audit_utils::verify_office_chain_memoized(anchor, &request.new_head)
-                        .map_err(HeadError::unprocessable)?;
-
-                    audit_utils::verify_office_privileges(
-                        anchor,
-                        request.old_head.as_deref(),
-                        &request.new_head,
-                    )
-                    .map_err(HeadError::forbidden)?;
+                        .map_err(|error| HeadError::office_lift(error, office_head.as_deref()))?;
                 } else {
                     // Any non-office pallet: audit its new history against the office state.
                     let office_head = office_head.as_deref().ok_or_else(|| {

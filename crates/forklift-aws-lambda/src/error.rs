@@ -18,15 +18,16 @@ pub enum Status {
     TemporaryRedirect,
     /// `401` — no valid bearer token was presented (the transport-authentication seam).
     Unauthorized,
-    /// `403` — `audit_utils::verify_office_privileges` (the only site that constructs this
-    /// status) refuses an office-modifying parcel. That covers more than a role violation: no
-    /// signature at all, a signing key untracked at that point, a parcel with no parent, an
-    /// unreadable chain (a parcel that fails to load), a key-permanence violation
-    /// (`verify_key_permanence` — a key removed, altered, or a revocation un-done or added
-    /// without a reason; this one binds admins too), and — the role check itself — a *signer*
-    /// who lacked the office role (or self-service right) it needed as of that parcel's own
-    /// signing. Not a caller role or grant — this crate has no caller-identity concept to check
-    /// one against, so this is never about who transported the request.
+    /// `403` — `audit_utils::verify_office_chain` found, in the segment an office lift brings,
+    /// an authentic parcel that its signer had no right to make (`OfficeChainError::Unauthorized`,
+    /// mapped by [`HeadError::office_lift`]): a key-permanence violation (`verify_key_permanence`
+    /// — a key removed or altered, or a revocation undone or added without a reason; this one
+    /// binds admins too), a *signer* who lacked the office role (or self-service right) it
+    /// needed as of that parcel's own signing, or a key endorsed by someone whose authority
+    /// does not cover it. An inauthentic chain, or an overstep already in the held office, is a
+    /// `422` instead. Not a
+    /// caller role or grant — this crate has no caller-identity concept to check one against,
+    /// so this is never about who transported the request.
     Forbidden,
     /// `404` — no such warehouse, object, signature or bundle.
     NotFound,
@@ -97,6 +98,19 @@ impl HeadError {
     /// A `403 Forbidden` — an authorization failure.
     pub fn forbidden(message: impl Into<String>) -> HeadError {
         HeadError { status: Status::Forbidden, message: message.into() }
+    }
+
+    /// A lifted office chain that did not verify: a `403` when a parcel the lift brings
+    /// oversteps its signer's privileges, a `422` otherwise (see
+    /// `audit_utils::classify_office_lift_refusal`).
+    pub fn office_lift(error: forklift_core::util::audit_utils::OfficeChainError,
+                       held_head: Option<&str>) -> HeadError {
+        use forklift_core::util::audit_utils::{self, OfficeLiftRefusal};
+
+        match audit_utils::classify_office_lift_refusal(error, held_head) {
+            OfficeLiftRefusal::Overstep(message) => HeadError::forbidden(message),
+            OfficeLiftRefusal::Unprocessable(message) => HeadError::unprocessable(message),
+        }
     }
 
     /// A `503 Service Unavailable` — a transient refusal (contention, not a moved value).
