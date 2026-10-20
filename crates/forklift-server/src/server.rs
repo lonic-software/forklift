@@ -985,14 +985,12 @@ fn unprocessable(message: String) -> HandlerError {
 }
 
 /// Map a lifted office chain that did not verify: a 403 when a parcel the lift brings
-/// oversteps its signer's privileges, a 422 otherwise (see `audit_utils::is_lift_overstep`).
-fn office_lift_refusal(error: audit_utils::OfficeChainError,
-                       anchor: &office_utils::TrustAnchor,
-                       held_head: Option<&str>) -> HandlerError {
-    if audit_utils::is_lift_overstep(&error, anchor, held_head) {
-        (StatusCode::FORBIDDEN, error.into())
-    } else {
-        unprocessable(error.into())
+/// oversteps its signer's privileges, a 422 otherwise (see
+/// `audit_utils::classify_office_lift_refusal`).
+fn office_lift_refusal(error: audit_utils::OfficeChainError, held_head: Option<&str>) -> HandlerError {
+    match audit_utils::classify_office_lift_refusal(error, held_head) {
+        audit_utils::OfficeLiftRefusal::Overstep(message) => (StatusCode::FORBIDDEN, message),
+        audit_utils::OfficeLiftRefusal::Unprocessable(message) => unprocessable(message),
     }
 }
 
@@ -2494,9 +2492,10 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // Authentic is not authorized: the walk also holds every office parcel within
             // its *signer's* privileges (admins change anything; everyone else only their
             // own keys). That is a content invariant, so it holds no matter which token
-            // transported the chain, and its refusal is a 403 rather than a 422.
+            // transported the chain. Its refusal is a 403 when the lift brought the overstep,
+            // and a 422 when the office already held it.
             let new_office_state = audit_utils::verify_office_chain_memoized(&anchor, &request.new_head)
-                .map_err(|error| office_lift_refusal(error, &anchor, office_head.as_deref()))?;
+                .map_err(|error| office_lift_refusal(error, office_head.as_deref()))?;
 
             // Newly revoked keys (active before, revoked after) become events. The
             // pre-lift roster is the office state already read above: on this branch

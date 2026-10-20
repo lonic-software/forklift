@@ -733,6 +733,8 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
     })
     .expect_err("a demotion on top of a held overstep");
     assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains(&by_worker), "{}", err.message);
+    assert!(err.message.contains("already in this warehouse's office"), "{}", err.message);
 }
 
 /// On a trusted warehouse, a user-pallet lift before the office is lifted is refused: the

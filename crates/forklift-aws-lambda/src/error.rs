@@ -24,8 +24,8 @@ pub enum Status {
     /// — a key removed or altered, or a revocation undone or added without a reason; this one
     /// binds admins too), a *signer* who lacked the office role (or self-service right) it
     /// needed as of that parcel's own signing, or a key endorsed by someone whose authority
-    /// does not cover it. An inauthentic chain, or an overstep that cannot be pinned on the
-    /// lift because the held office does not verify, is a `422` instead. Not a
+    /// does not cover it. An inauthentic chain, or an overstep already in the held office, is a
+    /// `422` instead. Not a
     /// caller role or grant — this crate has no caller-identity concept to check one against,
     /// so this is never about who transported the request.
     Forbidden,
@@ -102,19 +102,16 @@ impl HeadError {
 
     /// A lifted office chain that did not verify: a `403` when a parcel the lift brings
     /// oversteps its signer's privileges, a `422` otherwise (see
-    /// `audit_utils::is_lift_overstep`).
+    /// `audit_utils::classify_office_lift_refusal`).
     pub fn office_lift(error: forklift_core::util::audit_utils::OfficeChainError,
-                       anchor: &forklift_core::util::office_utils::TrustAnchor,
                        held_head: Option<&str>) -> HeadError {
-        use forklift_core::util::audit_utils;
+        use forklift_core::util::audit_utils::{self, OfficeLiftRefusal};
 
-        if audit_utils::is_lift_overstep(&error, anchor, held_head) {
-            HeadError::forbidden(error)
-        } else {
-            HeadError::unprocessable(error)
+        match audit_utils::classify_office_lift_refusal(error, held_head) {
+            OfficeLiftRefusal::Overstep(message) => HeadError::forbidden(message),
+            OfficeLiftRefusal::Unprocessable(message) => HeadError::unprocessable(message),
         }
     }
-
 
     /// A `503 Service Unavailable` — a transient refusal (contention, not a moved value).
     pub fn service_unavailable(message: impl Into<String>) -> HeadError {

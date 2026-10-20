@@ -314,12 +314,12 @@ check.
 4. **Trust** (only when the remote holds an anchor):
    * for the office pallet: the whole office chain from the genesis to `new_head`
      verifies forward. Each parcel is signed by a key active in the *previous* state,
-     with every key it adds properly endorsed, else `422`. Each parcel also stays within
+     with every key it adds carrying valid proofs, else `422`. Each parcel also stays within
      its signer's privileges as of the previous state (only an admin changes user records
-     or other users' keys, and nobody removes, alters or un-revokes a key), else `403`.
-     The `403` is given only when the held office verifies on its own, which proves the
-     overstep is in the lifted segment; otherwise the refusal is `422`, and a forged
-     parcel anywhere in the chain is reported as `422` ahead of any overstep;
+     or other users' keys, only an admin's key endorses a key for another user, and nobody
+     removes, alters or un-revokes a key), else `403`. The refusal names the first failing
+     parcel in chain order. When that overstepping parcel is already in the held office, the
+     lift did not bring it: the refusal is `422` and says so;
    * for `@kv`: the office must be lifted (with no anchor or no office, `@kv` is refused
      with `422`), and every parcel from `old_head` to `new_head` passes the meta content
      check — one parent, signed by an office key, every cell it adds or changes stamped with
