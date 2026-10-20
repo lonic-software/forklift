@@ -230,14 +230,15 @@
 //! `forklift heal`) — only this locked verb rescans; doing so lock-free would be exactly the
 //! unsound, non-content-addressed restage I1/I2 exist to forbid, at store-wide scale.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    bay_utils, file_utils, heal_utils, object_utils, office_utils, pack_utils,
-    pallet_utils, remote_utils, scope_utils, sign_utils, tag_utils, taint_utils,
+    bay_utils, file_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
+    pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
+    taint_utils,
 };
 use crate::util::progress_utils::Progress;
 
@@ -287,8 +288,8 @@ pub struct HealOutcome {
     /// in a pack despite a vanished loose dentry (I4, `heal_utils::RestageOutcome::RecoveredPacked`),
     /// or (for a shard) a staging concern that carries no object-trust risk at all.
     pub resolved: Vec<String>,
-    /// Advisory notes that never block clearing: the "re-run the load" remedy note for each
-    /// vanished inventory shard, a note for each bay whose local state could not be read this run
+    /// Advisory notes that never block clearing: a note for each vanished inventory shard, naming
+    /// its directory where a registered key addresses it, a note for each bay whose local state could not be read this run
     /// (see `collect_walk_roots`'s `Tolerate` policy) naming the bay and how to clean it up,
     /// (FORK-47, DESIGN.html §3.1.1) one line per quarantined or unenumerable pack index this run
     /// found — emitted unconditionally, whether or not this run's own taint touches it (see
@@ -830,13 +831,31 @@ async fn resolve_the_rest(
     }
 
     let mut notes: Vec<String> = Vec::new();
+    let mut owners = ShardOwners::default();
     for relative in &shard_vanished {
         resolved.push(relative.to_string_lossy().into_owned());
+
+        // A shard's path no longer spells its directory, so the note names the key instead.
+        let gone = match owners.owner(&forklift_root().join(relative)) {
+            ShardOwner::Registered(key) => format!(
+                "the staged inventory of folder \"{}\" (shard \"{}\") is gone; if that staging state \
+                mattered, re-run the load that produced it",
+                load_guard_utils::display_path(&key), relative.to_string_lossy()
+            ),
+            ShardOwner::Unregistered => format!(
+                "the staged inventory shard \"{}\" is gone; it matches no registered directory",
+                relative.to_string_lossy()
+            ),
+            ShardOwner::Unknown => format!(
+                "the staged inventory shard \"{}\" is gone, and the directory it belonged to could not \
+                be determined",
+                relative.to_string_lossy()
+            ),
+        };
         notes.push(format!(
-            "the staged inventory shard \"{}\" is gone; if that staging state mattered, re-run \
-            the load that produced it — a vanished shard is staging state, not an object \
-            reference, so it never blocks clearing this taint",
-            relative.to_string_lossy()
+            "{} — a vanished shard is staging state, not an object reference, so it never blocks \
+            clearing this taint",
+            gone
         ));
     }
     // F6, PR #120 round 2: a trust-pin root this run confirmed is genuinely never held locally
@@ -1537,12 +1556,10 @@ fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> 
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!(
-                "Error while reading inventory shard \"{}\": {}", path.to_string_lossy(), e
-            )),
+            Err(e) => return Err(format!("Error while reading {}: {}", describe_shard(&path), e)),
         };
         let inventory = crate::parser::inventory::inventory_parser::parse_inventory(&bytes)
-            .map_err(|e| format!("Error while parsing inventory shard \"{}\": {}", path.to_string_lossy(), e))?;
+            .map_err(|e| format!("Error while parsing {}: {}", describe_shard(&path), e))?;
 
         for (_, item) in inventory.get_items() {
             hashes.push((item.hash.clone(), item.item_type));
@@ -1550,6 +1567,81 @@ fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> 
     }
 
     Ok(())
+}
+
+/// Whose shard a data file is: the registered key the shard store addresses there, by the
+/// metadata of the inventory root holding it.
+enum ShardOwner {
+    /// The key whose address the shard is at.
+    Registered(String),
+    /// The metadata was read, and no registered key's address is the shard's.
+    Unregistered,
+    /// The path is not a shard store address, or that inventory root's metadata could not be read.
+    Unknown,
+}
+
+/// Finds the key whose shard a data file is. Shard paths are hashes, so the key is recovered by
+/// hashing each registered key of the inventory root that holds the shard and matching the
+/// address; each root's registered addresses are hashed once, however many shards are asked about.
+#[derive(Default)]
+struct ShardOwners {
+    /// Inventory root → shard address → registered key; `None` when its metadata could not be read.
+    roots: HashMap<PathBuf, Option<HashMap<(String, String), String>>>,
+}
+
+impl ShardOwners {
+    /// Whose shard `shard_path` is.
+    ///
+    /// # Arguments
+    /// * `shard_path` - The shard's data file, at `<inventory root>/inv_/<2 hex>/<62 hex>/data`.
+    fn owner(&mut self, shard_path: &Path) -> ShardOwner {
+        let name = |path: Option<&Path>| path.and_then(|path| path.file_name()).and_then(|name| name.to_str()).map(String::from);
+
+        let shard_folder = shard_path.parent();
+        let fan_out = shard_folder.and_then(Path::parent);
+        let store = fan_out.and_then(Path::parent);
+
+        let (Some(shard), Some(fan_out_name), Some(store_name), Some(inventory_root)) =
+            (name(shard_folder), name(fan_out), name(store), store.and_then(Path::parent)) else {
+            return ShardOwner::Unknown;
+        };
+
+        if store_name != file_utils::FOLDER_NAME_INVENTORY_STORE {
+            return ShardOwner::Unknown;
+        }
+
+        let registered = self.roots.entry(inventory_root.to_path_buf()).or_insert_with(|| {
+            let bytes = std::fs::read(inventory_root.join(file_utils::FILE_NAME_INVENTORY_METADATA)).ok()?;
+            let entries = record_utils::from_bytes(
+                &bytes, file_utils::INVENTORY_METADATA_RECORD, file_utils::INVENTORY_METADATA_VERSION
+            ).ok()?;
+
+            Some(entries.iter()
+                .map(|entry| inventory_utils::metadata_entry_to_key(entry))
+                .map(|key| (file_utils::shard_address(key), key.to_string()))
+                .collect())
+        });
+
+        match registered {
+            None => ShardOwner::Unknown,
+            Some(registered) => registered.get(&(fan_out_name, shard))
+                .map_or(ShardOwner::Unregistered, |key| ShardOwner::Registered(key.clone())),
+        }
+    }
+}
+
+/// Name a shard for a message by its directory, which its path no longer spells.
+fn describe_shard(shard_path: &Path) -> String {
+    match ShardOwners::default().owner(shard_path) {
+        ShardOwner::Registered(key) => format!(
+            "the inventory of folder \"{}\" (shard \"{}\")",
+            load_guard_utils::display_path(&key), shard_path.to_string_lossy()
+        ),
+        ShardOwner::Unregistered => format!(
+            "the inventory shard \"{}\", which matches no registered directory", shard_path.to_string_lossy()
+        ),
+        ShardOwner::Unknown => format!("the inventory shard \"{}\"", shard_path.to_string_lossy()),
+    }
 }
 
 /// Recursively enumerate every staged-inventory shard `data` file's absolute path under `folder`
@@ -3021,10 +3113,11 @@ mod tests {
         let bytes = InventoryBuilder::build(&inventory);
 
         // Bay "b"'s staged inventory, planted directly by path — mirrors the real on-disk shape
-        // (`<bay-state-dir>/inventory/inv_/data`) without ever entering a bay context.
+        // (`<bay-state-dir>/inventory/inv_/<2 hex>/<62 hex>/data`) without ever entering a bay
+        // context.
         let shard_path = bay_utils::bay_state_dir("b")
             .join(FOLDER_NAME_INVENTORY_ROOT)
-            .join(file_utils::PREFIX_INVENTORY_FOLDER)
+            .join(file_utils::shard_folder_relative(""))
             .join(file_utils::FILE_NAME_INVENTORY_DATA);
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_utils::bay_state_dir("b"), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
@@ -3721,7 +3814,7 @@ mod tests {
             VanishedClass::Loose(hash) if hash == "abcdef1234567890"
         ));
         assert!(matches!(
-            classify_vanished(Path::new("inventory/inv_/inv_src/data")),
+            classify_vanished(&Path::new("inventory").join(file_utils::shard_folder_relative("src")).join("data")),
             VanishedClass::Shard
         ));
         assert!(matches!(
@@ -3776,7 +3869,7 @@ mod tests {
         });
 
         let bytes = InventoryBuilder::build(&inventory);
-        let shard_path = file_utils::get_inventory_data_path_for_key("src");
+        let shard_path = file_utils::get_inventory_data_path_for_key("src").unwrap();
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
         std::fs::write(&shard_path, bytes).unwrap();
 
@@ -6153,6 +6246,112 @@ mod tests {
             outcome.notes.iter().any(|note| note.contains("pack health could not be determined this run")),
             "the degrade fallback line must be reported, not silently dropped: {:?}", outcome.notes
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A fresh warehouse whose staging registers `keys`, each with a one-entry shard.
+    fn staged_warehouse(name: &str, keys: &[&str]) -> (PathBuf, crate::globals::StorageRootScope) {
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+
+        let shards = keys.iter().map(|key| {
+            let mut inventory = crate::model::inventory::Inventory::new();
+            inventory.add_item(crate::model::inventory::InventoryItem {
+                metadata_change_timestamp: 0,
+                content_change_timestamp: 0,
+                device: 0,
+                inode: 0,
+                item_type: DirEntryType::Normal,
+                user_id: 0,
+                group_id: 0,
+                file_size: 0,
+                hash: "a".repeat(64),
+                file_name_length: "file.txt".len() as u64,
+                state: crate::enums::inventory_item_state::InventoryItemState::Normal,
+                name: "file.txt".to_string(),
+            });
+            (key.to_string(), inventory)
+        }).collect();
+        inventory_utils::replace_all_inventories(&shards).unwrap();
+
+        (root, scope)
+    }
+
+    fn shard_data_path(key: &str) -> PathBuf {
+        PathBuf::from(file_utils::get_path_inventory_root())
+            .join(file_utils::shard_folder_relative(key))
+            .join(file_utils::FILE_NAME_INVENTORY_DATA)
+    }
+
+    /// A shard's path no longer spells its directory, so a walker error names the directory by
+    /// the registered key whose address the shard is at, or says that none is.
+    #[test]
+    fn a_walker_error_names_the_directory_a_shard_belongs_to() {
+        let (root, _scope) = staged_warehouse("walker-names-key", &["", "docs"]);
+        let inventory_root = PathBuf::from(file_utils::get_path_inventory_root());
+
+        std::fs::write(shard_data_path("docs"), b"not a shard").unwrap();
+        let error = walk_shard_files(&inventory_root, &mut Vec::new()).unwrap_err();
+        assert!(error.contains("parsing the inventory of folder \"docs\""), "{}", error);
+
+        std::fs::remove_dir_all(shard_data_path("docs").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(shard_data_path("ghost").parent().unwrap()).unwrap();
+        std::fs::write(shard_data_path("ghost"), b"not a shard").unwrap();
+        let error = walk_shard_files(&inventory_root, &mut Vec::new()).unwrap_err();
+        assert!(error.contains("which matches no registered directory"), "{}", error);
+        assert!(!error.contains("ghost"), "{}", error);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_walker_read_error_names_the_directory_a_shard_belongs_to() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _scope) = staged_warehouse("walker-read-names-key", &["", "docs"]);
+        let data = shard_data_path("docs");
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root reads through any mode, so there is no read error to name.
+        if std::fs::read(&data).is_err() {
+            let error = walk_shard_files(&PathBuf::from(file_utils::get_path_inventory_root()), &mut Vec::new())
+                .unwrap_err();
+            assert!(error.contains("reading the inventory of folder \"docs\""), "{}", error);
+        }
+
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Heal's note on a vanished shard names its directory when a registered key addresses it,
+    /// and otherwise says it matches none, whether the key was never registered or was
+    /// unregistered since.
+    #[test]
+    fn heal_names_the_directory_of_a_vanished_shard_or_says_none_matches() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let (root, _scope) = staged_warehouse("heal-names-key", &["", "docs", "old"]);
+        inventory_utils::remove_inventories_under("old").unwrap();
+        std::fs::remove_file(shard_data_path("docs")).unwrap();
+
+        let relative = |key: &str| shard_data_path(key).strip_prefix(forklift_root()).unwrap().to_string_lossy().into_owned();
+        let (docs, never, old) = (relative("docs"), relative("never"), relative("old"));
+        plant_complete_taint(&forklift_root(), &[&docs, &never, &old]);
+
+        let outcome = run_heal().expect("vanished shards never block clearing a taint");
+        let note_for = |path: &str| outcome.notes.iter().find(|note| note.contains(path)).cloned()
+            .unwrap_or_else(|| panic!("no note for {}: {:?}", path, outcome.notes));
+
+        assert!(note_for(&docs).contains("inventory of folder \"docs\""), "{}", note_for(&docs));
+        for path in [&never, &old] {
+            assert!(note_for(path).contains("it matches no registered directory"), "{}", note_for(path));
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }

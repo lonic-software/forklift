@@ -596,7 +596,7 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
     std::fs::remove_dir_all(warehouse.root.join("a/b/c")).unwrap();
     {
         let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-        let shard_folder = forklift_core::util::file_utils::get_inventory_folder_for_key("a/b/c");
+        let shard_folder = forklift_core::util::file_utils::get_inventory_folder_for_key("a/b/c").unwrap();
         std::fs::remove_dir_all(&shard_folder).unwrap();
     }
 
@@ -755,7 +755,7 @@ fn stack_never_reads_a_shard_beneath_a_rollup_that_matches_the_head() {
 
         let deep_shard = {
             let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-            forklift_core::util::file_utils::get_inventory_data_path_for_key("untouched/deep")
+            forklift_core::util::file_utils::get_inventory_data_path_for_key("untouched/deep").unwrap()
         };
         assert!(deep_shard.is_file(), "untouched/deep must have a shard of its own: {}", deep_shard.display());
         std::fs::write(&deep_shard, b"not a shard").unwrap();

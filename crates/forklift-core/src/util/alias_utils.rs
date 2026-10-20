@@ -75,6 +75,20 @@ fn resolved_identity(path: &Path) -> Result<Option<Identity>, String> {
     }
 }
 
+/// The entry of `listing` (the names `parent` lists) that `name` in `parent` resolves to on disk:
+/// case-fold candidates first, then (a normalization alias, say) every entry. `None` when `name`
+/// does not resolve, or no listed entry can be identified as it; an entry that cannot be
+/// identified is passed over, never taken for a match.
+pub fn listed_alias<'a>(parent: &Path, name: &str, listing: &'a [String]) -> Option<&'a String> {
+    let target = identity(&parent.join(name))?;
+    let fold = fold_key(name);
+
+    let (candidates, rest): (Vec<&String>, Vec<&String>) = listing.iter()
+        .partition(|listed| fold_key(listed) == fold);
+
+    candidates.into_iter().chain(rest).find(|listed| identity(&parent.join(listed)) == Some(target))
+}
+
 /// The candidate key two names must share before a probe is spent on them: a full case fold
 /// (`ß` and `ss`, the Kelvin sign and `k`, `ﬁ` and `fi` all meet) in canonical decomposition (an
 /// NFC and an NFD spelling meet). It proposes pairs; the volume decides them.
@@ -236,7 +250,7 @@ impl AliasCheck {
             let listed = self.listing(&parent).is_some_and(|names| names.contains(name));
 
             if !listed {
-                return Ok(match self.find_occupant(&parent, name, &key) {
+                return Ok(match self.find_occupant(&parent, name) {
                     Some((occupant, occupant_is_dir)) => Occupancy::Alias { component: key, occupant, occupant_is_dir },
                     None => Occupancy::Unidentified { component: key },
                 });
@@ -255,24 +269,15 @@ impl AliasCheck {
         Ok(Occupancy::Listed)
     }
 
-    /// The listed sibling of `name` in `parent` that `key` resolves to: case-fold candidates
-    /// first, then (a normalization alias, say) every entry.
-    fn find_occupant(&mut self, parent: &str, name: &str, key: &str) -> Option<(String, bool)> {
-        let target = identity(Path::new(key))?;
+    /// The listed sibling of `name` in `parent` that the two resolve to (see [`listed_alias`]).
+    fn find_occupant(&mut self, parent: &str, name: &str) -> Option<(String, bool)> {
         let names: Vec<String> = self.listing(parent)?.iter().cloned().collect();
-        let fold = fold_key(name);
+        let listed = listed_alias(Path::new(parent), name, &names)?;
 
-        let (candidates, rest): (Vec<&String>, Vec<&String>) = names.iter()
-            .partition(|listed| fold_key(listed) == fold);
+        let listed_key = if parent.is_empty() { listed.clone() } else { format!("{}/{}", parent, listed) };
+        let is_dir = std::fs::symlink_metadata(&listed_key).is_ok_and(|metadata| metadata.is_dir());
 
-        candidates.into_iter().chain(rest).find_map(|listed| {
-            let listed_key = if parent.is_empty() { listed.clone() } else { format!("{}/{}", parent, listed) };
-
-            (identity(Path::new(&listed_key)) == Some(target)).then(|| {
-                let is_dir = std::fs::symlink_metadata(&listed_key).is_ok_and(|metadata| metadata.is_dir());
-                (listed_key, is_dir)
-            })
-        })
+        Some((listed_key, is_dir))
     }
 
     /// Judge one path a materialization creates.

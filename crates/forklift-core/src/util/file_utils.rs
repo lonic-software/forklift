@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
+use crate::util::load_guard_utils;
 use crate::util::record_utils;
 use crate::util::taint_utils;
 
@@ -43,11 +44,9 @@ const DEFAULT_IGNORED_PATHS: [&str; 1] = [r"^\.forklift(/.*)?$"];
 pub const PATH_SEPARATOR: &str = "/";
 pub const PATH_SEPARATOR_CHAR: char = '/';
 
-/// A prefix for the folder that contains the inventory files of the respective working directory.
-/// E.g. for the `src` folder, the respective inventory folder would be `inv_src`.
-/// This prefix is applied to make sure that folders in the working directory called
-/// `data` or `metadata` do not conflict with the inventory data / metadata files.
-pub const PREFIX_INVENTORY_FOLDER: &str = "inv_";
+/// The folder under the inventory root that holds the shard store: one folder per directory key,
+/// addressed by [`shard_address`], each holding that directory's data file.
+pub const FOLDER_NAME_INVENTORY_STORE: &str = "inv_";
 
 /// The name of the inventory data file.
 pub const FILE_NAME_INVENTORY_DATA: &str = "data";
@@ -56,7 +55,11 @@ pub const FILE_NAME_INVENTORY_DATA: &str = "data";
 pub const FILE_NAME_INVENTORY_METADATA: &str = "metadata";
 /// The record kind and format version of the inventory metadata file (see [`record_utils`]).
 pub const INVENTORY_METADATA_RECORD: &str = "inventory-metadata";
-pub const INVENTORY_METADATA_VERSION: u32 = 1;
+/// Version 2 is the hash-addressed shard store (see [`get_inventory_folder_for_key`]). The version
+/// doubles as the layout marker: a version-1 warehouse keeps its shards at paths this layout never
+/// reads, so [`get_inventory_store_root`] refuses it rather than reading every directory as
+/// unstaged.
+pub const INVENTORY_METADATA_VERSION: u32 = 2;
 
 /// Create a folder if it does not exist yet.
 /// All folders in the given path will be created (if they don't exist already).
@@ -2101,8 +2104,7 @@ fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {
 pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String> {
     let (path, bytes_opt) = retrieve_inventory_or_none_by_key(key)?;
     let bytes = bytes_opt.ok_or(format!(
-        "Inventory file not found for folder \"{}\".",
-        if key.is_empty() { "./" } else { key }
+        "Inventory file not found for folder \"{}\".", load_guard_utils::display_path(key)
     ))?;
 
     Ok((path, bytes))
@@ -2123,15 +2125,44 @@ pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String
 /// * `Err(String)` - The error message if the inventory file exists, but there was an error while
 /// reading it.
 pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
-    let file_path = get_inventory_data_path_for_key(key);
+    let file_path = get_inventory_data_path_for_key(key)?;
 
-    if !file_path.exists() {
-        return Ok((file_path, None));
+    let display_key = load_guard_utils::display_path(key);
+
+    // Only an absent shard is "no shard": anything else, such as a file where a shard folder
+    // belongs, would otherwise read as a directory with nothing staged.
+    match std::fs::read(&file_path) {
+        Ok(bytes) => Ok((file_path, Some(bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Windows reports a read through a regular file as not found, so a non-folder in the
+            // shard's folder chain is looked for explicitly.
+            match non_folder_in_shard_chain(&file_path) {
+                Some(folder) => Err(format!(
+                    "Error while reading the inventory of folder \"{}\": \"{}\" is not a folder.",
+                    display_key, folder.to_string_lossy()
+                )),
+                None => Ok((file_path, None)),
+            }
+        }
+        Err(e) => Err(format!(
+            "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
+            display_key, file_path.to_string_lossy(), e
+        )),
     }
+}
 
-    std::fs::read(&file_path).map_err(|e|
-        format!("Error while reading inventory from file \"{}\": {}", file_path.to_string_lossy(), e)
-    ).map(|bytes| (file_path, Some(bytes)))
+/// The first entry, from a shard's own folder up to the inventory root, that exists and is not a
+/// folder: the shard folder, its fan-out folder and the store root, where Forklift makes only real
+/// folders and a link is damage, then the inventory root, which may be a link to the folder it was
+/// moved to but must resolve to one.
+fn non_folder_in_shard_chain(data_path: &Path) -> Option<&Path> {
+    let mut chain = data_path.ancestors().skip(1);
+
+    let in_store = chain.by_ref().take(3)
+        .find(|folder| std::fs::symlink_metadata(folder).is_ok_and(|meta| !meta.is_dir()));
+
+    in_store.or_else(|| chain.next().filter(|root| std::fs::symlink_metadata(root).is_ok()
+        && !std::fs::metadata(root).is_ok_and(|meta| meta.is_dir())))
 }
 
 /// The path of the inventory metadata file, whether or not it exists.
@@ -2171,34 +2202,106 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
     Ok((metadata_store_path, Some(metadata)))
 }
 
-/// Get the path of the inventory folder associated with the given warehouse path key.
+/// The address of a directory key's shard: the lowercase hex BLAKE3 hash of the key's UTF-8 bytes
+/// (the object store's hash function), split into its first two digits (the fan-out folder) and the
+/// remaining 62 (the shard's own folder).
 ///
-/// The warehouse root maps to a folder named after the inventory folder prefix, and *every*
-/// path component below it is prefixed as well, so entries in the working directory can never
-/// collide with the inventory data / metadata files. E.g. for the key `src/data`, the folder is
-/// `.forklift/inventory/inv_/inv_src/inv_data`, which cannot collide with the data *file* of
-/// `src` (`.forklift/inventory/inv_/inv_src/data`).
-///
-/// Nesting the folders like this also means that the inventory folder of a directory contains
-/// the inventory folders of all of its subdirectories, so removing a directory's inventory
-/// removes the inventories of its subdirectories as well.
+/// Every name the store creates is lowercase hex or a fixed lowercase name, so two addresses never
+/// differ only in case or Unicode normalization, and no name ends in a dot or space, holds a `~`,
+/// or matches a Windows device name: distinct keys get distinct shard files on every volume (barring
+/// a BLAKE3 collision), and every shard path has the same length whatever the key.
 ///
 /// # Arguments
 /// * `key` - The warehouse path key of the directory (see `WarehousePath::as_key`).
 ///
 /// # Returns
-/// * `PathBuf` - The path of the inventory folder.
-pub fn get_inventory_folder_for_key(key: &str) -> PathBuf {
-    let mut folder = PathBuf::from(get_path_inventory_root());
-    folder.push(PREFIX_INVENTORY_FOLDER);
+/// * `(String, String)` - The fan-out folder name and the shard folder name.
+pub fn shard_address(key: &str) -> (String, String) {
+    let hex = blake3::hash(key.as_bytes()).to_hex();
 
-    if !key.is_empty() {
-        for component in key.split(PATH_SEPARATOR_CHAR) {
-            folder.push(format!("{}{}", PREFIX_INVENTORY_FOLDER, component));
+    let (fan_out, rest) = hex.split_at(OBJECT_HASH_FOLDER_PATH_CHARACTERS);
+    (fan_out.to_string(), rest.to_string())
+}
+
+/// The shard folder of `key`, relative to an inventory root: `inv_/<2 hex>/<62 hex>`. For reading
+/// another inventory root's addresses (a walker naming the key of a shard it found); every shard
+/// this process reads or writes goes through [`get_inventory_folder_for_key`] instead.
+pub fn shard_folder_relative(key: &str) -> PathBuf {
+    let (fan_out, rest) = shard_address(key);
+
+    [FOLDER_NAME_INVENTORY_STORE, fan_out.as_str(), rest.as_str()].iter().collect()
+}
+
+/// The inventory roots whose metadata [`gate_inventory_layout`] has already passed in this
+/// process. A read lock answers every shard path after the first, so parallel shard work shares it.
+static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync::RwLock::new(BTreeSet::new());
+
+/// Refuse an inventory root whose metadata header names another format version, once per process
+/// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
+/// that reach a shard without reading the metadata first (`import-git` resets the inventory without
+/// reading it). A damaged, unreadable or absent metadata file passes: the metadata read reports
+/// the first two, and a reset rewrites the file without reading it.
+fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
+    use std::io::BufRead;
+
+    if PASSED_INVENTORY_ROOTS.read().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(inventory_root) {
+        return Ok(());
+    }
+
+    let metadata_path = inventory_root.join(FILE_NAME_INVENTORY_METADATA);
+
+    // The header line alone decides the version; a longer first line is not a header.
+    let mut header = Vec::new();
+    if let Ok(file) = std::fs::File::open(&metadata_path) {
+        let _ = std::io::Read::take(std::io::BufReader::new(file), 256).read_until(b'\n', &mut header);
+    }
+
+    if header.ends_with(b"\n") {
+        if let Err(e @ record_utils::RecordError::OtherVersion(_)) =
+            record_utils::from_bytes(&header, INVENTORY_METADATA_RECORD, INVENTORY_METADATA_VERSION) {
+            return Err(format!(
+                "The inventory metadata file \"{}\" {}", metadata_path.to_string_lossy(), e.describe()
+            ));
         }
     }
 
-    folder
+    PASSED_INVENTORY_ROOTS.write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(inventory_root.to_path_buf());
+
+    Ok(())
+}
+
+/// The root of the shard store, `inv_` under the inventory root: the one folder that holds every
+/// shard, so removing it clears the whole store.
+///
+/// Fallible because it is the single producer of shard paths: it refuses an inventory whose
+/// metadata names another format version (see [`gate_inventory_layout`]), so no shard is read or
+/// written over a layout this build does not know.
+///
+/// # Returns
+/// * `Ok(PathBuf)` - The path of the store root.
+/// * `Err(String)` - If the inventory metadata is in another format version.
+pub fn get_inventory_store_root() -> Result<PathBuf, String> {
+    let inventory_root = PathBuf::from(get_path_inventory_root());
+
+    gate_inventory_layout(&inventory_root)?;
+
+    Ok(inventory_root.join(FOLDER_NAME_INVENTORY_STORE))
+}
+
+/// Get the path of the inventory folder associated with the given warehouse path key: the store
+/// root, then the key's [`shard_address`]. Folders are flat (a directory's shard folder holds no
+/// other shard), so removing one removes only that directory's shard.
+///
+/// # Arguments
+/// * `key` - The warehouse path key of the directory (see `WarehousePath::as_key`).
+///
+/// # Returns
+/// * `Ok(PathBuf)` - The path of the inventory folder.
+/// * `Err(String)` - If the inventory metadata is in another format version.
+pub fn get_inventory_folder_for_key(key: &str) -> Result<PathBuf, String> {
+    let (fan_out, rest) = shard_address(key);
+
+    Ok(get_inventory_store_root()?.join(fan_out).join(rest))
 }
 
 /// Get the path of the inventory data file associated with the given warehouse path key.
@@ -2208,12 +2311,10 @@ pub fn get_inventory_folder_for_key(key: &str) -> PathBuf {
 /// * `key` - The warehouse path key of the directory (see `WarehousePath::as_key`).
 ///
 /// # Returns
-/// * `PathBuf` - The path of the inventory data file.
-pub fn get_inventory_data_path_for_key(key: &str) -> PathBuf {
-    let mut file_path = get_inventory_folder_for_key(key);
-    file_path.push(FILE_NAME_INVENTORY_DATA);
-
-    file_path
+/// * `Ok(PathBuf)` - The path of the inventory data file.
+/// * `Err(String)` - If the inventory metadata is in another format version.
+pub fn get_inventory_data_path_for_key(key: &str) -> Result<PathBuf, String> {
+    Ok(get_inventory_folder_for_key(key)?.join(FILE_NAME_INVENTORY_DATA))
 }
 
 /// Check if an object with the given hash exists.
@@ -3345,6 +3446,94 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keys a volume may fold into one spelling, and keys of any length or depth, get distinct
+    /// shard folders of one fixed shape, spelled in characters no volume folds.
+    #[test]
+    fn shard_folders_are_distinct_for_keys_a_volume_may_fold_together() {
+        let long = "x".repeat(250);
+        let deep = vec!["A"; 200].join("/");
+        let keys = [
+            "", "docs", "Docs", "DOCS", "docs/a", "Docs/a", "caf\u{e9}", "cafe\u{301}", "a", "a.", "a ",
+            "PROGRA~1", "progra~1", "stra\u{df}e", "strasse", &long, &deep,
+        ];
+
+        let folders: Vec<String> = keys.iter()
+            .map(|key| shard_folder_relative(key).to_string_lossy().into_owned())
+            .collect();
+
+        let folded: BTreeSet<String> = folders.iter().map(|folder| crate::util::alias_utils::fold_key(folder)).collect();
+        assert_eq!(folded.len(), keys.len(), "{:?}", folders);
+
+        for folder in &shard_folder_relative_components(&keys) {
+            let [store, fan_out, shard] = folder.as_slice() else { panic!("{:?}", folder) };
+            assert_eq!(store, FOLDER_NAME_INVENTORY_STORE);
+            assert!(fan_out.len() == 2 && fan_out.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", fan_out);
+            assert!(shard.len() == 62 && shard.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", shard);
+        }
+    }
+
+    /// A shard's address is the BLAKE3 hash of its key, the object store's hash function: the root
+    /// key "" lands at BLAKE3's published hash of the empty input.
+    #[test]
+    fn a_shard_address_is_the_blake3_hash_of_its_key() {
+        assert_eq!(
+            shard_address(""),
+            ("af".to_string(), "1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string())
+        );
+    }
+
+    /// Every link of a shard's folder chain is checked up to the inventory root, so a file at any of
+    /// them reads as damage rather than as no shard (Windows reports a read through a file as not
+    /// found).
+    #[test]
+    fn a_file_anywhere_in_a_shards_folder_chain_is_found() {
+        let root = std::env::temp_dir().join(format!("forklift-shard-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("inventory/inv_/af/rest/data");
+
+        let chain = ["inventory/inv_/af/rest", "inventory/inv_/af", "inventory/inv_", "inventory"];
+        for link in chain {
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(link).parent().unwrap()).unwrap();
+            std::fs::write(root.join(link), b"not a folder").unwrap();
+
+            assert_eq!(non_folder_in_shard_chain(&data), Some(root.join(link).as_path()), "{}", link);
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+        assert_eq!(non_folder_in_shard_chain(&data), None, "an intact chain");
+
+        // An inventory root moved behind a link to a folder is a folder; a link that resolves to
+        // nothing is not. Inside the store, every link is damage, whatever it points at.
+        #[cfg(unix)]
+        {
+            std::fs::rename(root.join("inventory"), root.join("relocated")).unwrap();
+            std::os::unix::fs::symlink(root.join("relocated"), root.join("inventory")).unwrap();
+            assert_eq!(non_folder_in_shard_chain(&data), None, "a linked inventory root");
+
+            std::fs::rename(root.join("relocated/inv_/af"), root.join("fan-out")).unwrap();
+            std::os::unix::fs::symlink(root.join("fan-out"), root.join("relocated/inv_/af")).unwrap();
+            assert_eq!(non_folder_in_shard_chain(&data), Some(root.join("inventory/inv_/af").as_path()),
+                       "a linked fan-out folder");
+
+            std::fs::remove_file(root.join("inventory")).unwrap();
+            std::os::unix::fs::symlink(root.join("unmounted"), root.join("inventory")).unwrap();
+            assert_eq!(non_folder_in_shard_chain(&data), Some(root.join("inventory").as_path()),
+                       "a dangling inventory root");
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn shard_folder_relative_components(keys: &[&str]) -> Vec<Vec<String>> {
+        keys.iter()
+            .map(|key| shard_folder_relative(key).components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect())
+            .collect()
+    }
 
     /// Where the bit is observable the stat's kind stands; where it is not, a plain file takes
     /// its plain entry's kind, in both directions, and nothing else is projected.

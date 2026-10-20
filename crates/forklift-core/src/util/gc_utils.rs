@@ -744,7 +744,7 @@ pub(crate) mod tests {
 
         let shard_path = bay_utils::bay_state_dir(bay)
             .join(crate::globals::FOLDER_NAME_INVENTORY_ROOT)
-            .join(file_utils::PREFIX_INVENTORY_FOLDER)
+            .join(file_utils::shard_folder_relative(""))
             .join(file_utils::FILE_NAME_INVENTORY_DATA);
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_utils::bay_state_dir(bay), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();

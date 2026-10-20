@@ -1540,7 +1540,10 @@ fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_
 
     // The root's shard: a rebuild of it without the old entries would not know x.log is
     // tracked, and the rule would drop it without a staged removal.
-    warehouse.write_file(".forklift/inventory/inv_/data", "not a shard\n");
+    let root_shard = std::path::Path::new(".forklift/inventory")
+        .join(forklift_core::util::file_utils::shard_folder_relative(""))
+        .join("data");
+    warehouse.write_file(root_shard.to_str().unwrap(), "not a shard\n");
     let load = warehouse.run(&["load", "."]);
     assert!(!load.status.success(), "{}", stdout(&load));
     assert!(stderr(&load).contains("cannot be read"), "{}", stderr(&load));
@@ -2430,7 +2433,7 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
     let main_inventory = std::path::PathBuf::from(forklift_core::util::file_utils::get_path_inventory_root());
     let bay_inventory = warehouse.root.join(".forklift").join("bays").join("scoped").join("inventory");
     let shard = |key: &str| {
-        let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key);
+        let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key).unwrap();
         let path = bay_inventory.join(main_path.strip_prefix(&main_inventory).unwrap());
         std::fs::read(&path).ok()
             .map(|bytes| forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes).unwrap())
@@ -2546,7 +2549,7 @@ fn a_load_rewrites_a_v2_shard_with_proven_entries() {
 
     let shard = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-        forklift_core::util::file_utils::get_inventory_data_path_for_key("")
+        forklift_core::util::file_utils::get_inventory_data_path_for_key("").unwrap()
     };
     let mut bytes = std::fs::read(&shard).unwrap();
     assert_eq!(bytes[0], 3, "sanity: a fresh shard is v3");

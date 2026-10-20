@@ -425,8 +425,9 @@ fn a_shift_refuses_a_dangling_symlink_reached_through_another_spelling() {
     assert_eq!(std::fs::read_link(warehouse.root.join("README")).unwrap(), Path::new("nowhere"));
 }
 
-/// Staging a case-only directory rename on a folding volume records both spellings (FORK-179);
-/// restoring the old one would write through the new one's file.
+/// A case-only directory rename on a folding volume stages as a move; restoring the old spelling
+/// would write through the new one's file. While the removal is staged the restore is refused for
+/// that, and once it is unstaged, for naming the same file.
 #[test]
 fn restore_refuses_a_path_that_names_another_spellings_file() {
     let warehouse = Warehouse::new("restore-alias", &[("app.txt", "app\n"), ("Docs/a", "old\n")]);
@@ -437,6 +438,13 @@ fn restore_refuses_a_path_that_names_another_spellings_file() {
     std::fs::rename(warehouse.root.join("Docs"), warehouse.root.join("docs")).unwrap();
     warehouse.write("docs/a", "changed\n");
     warehouse.run_ok(&["load", "."]);
+
+    let staged = warehouse.run(&["restore", "Docs/a"]);
+    assert!(!staged.status.success());
+    assert!(stderr(&staged).contains("The removal of \"Docs/a\" is staged"), "{}", stderr(&staged));
+    assert_eq!(warehouse.read("docs/a"), "changed\n");
+
+    warehouse.run_ok(&["unload", "Docs/a"]);
 
     let restored = warehouse.run(&["restore", "Docs/a"]);
     assert!(!restored.status.success());

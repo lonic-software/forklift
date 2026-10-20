@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{bay_utils, config_utils, file_utils, pallet_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, pallet_utils};
 
 /// The directory the user invoked forklift from, relative to the warehouse root.
 /// Set once by [`enter_warehouse`]; empty when the user is at the root itself.
@@ -84,11 +84,67 @@ pub fn enter_warehouse() -> Result<(), String> {
         globals::set_bay_context(redirect.warehouse_root.join(FOLDER_NAME_FORKLIFT_ROOT), redirect.name);
     }
 
-    let relative = cwd.strip_prefix(&root).unwrap_or(Path::new("")).to_path_buf();
-    let _ = CWD_RELATIVE_TO_ROOT.set(relative);
+    let relative = cwd.strip_prefix(&root).unwrap_or(Path::new(""));
+    let _ = CWD_RELATIVE_TO_ROOT.set(respell_as_listed(&root, relative)?);
 
     std::env::set_current_dir(&root)
         .map_err(|e| format!("Error while switching to the working tree root \"{}\": {}", root.to_string_lossy(), e))
+}
+
+/// Respell each component of `relative`, a directory below `root`, as its parent lists it.
+///
+/// A volume can open a directory by a spelling its parent does not list (`DOCS` for `Docs` on a
+/// case-insensitive one), and a process started there may see that spelling as its current
+/// directory. Joined onto a user path, it would mint a key beside the tracked one. The current
+/// directory names one entry, so respelling it chooses nothing on the user's behalf: a component
+/// the parent lists exactly is kept, and any other is replaced by the listed entry that is the
+/// same entry on disk. When no listed entry can be identified as it (none is, or the volume will
+/// not identify the entry), the spelling is refused rather than used: the parent's listing has
+/// already shown it is not the listed name, so keeping it would mint the alias key. A parent
+/// that cannot be listed (traversable but unreadable) cannot be asked, so its component keeps the
+/// spelling the volume opened.
+///
+/// # Arguments
+/// * `root`     - The warehouse root.
+/// * `relative` - The directory, relative to `root`.
+///
+/// # Returns
+/// * `Ok(PathBuf)` - `relative`, spelled as listed.
+/// * `Err(String)` - If a listed parent lists no entry for a component.
+fn respell_as_listed(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let mut respelled = PathBuf::new();
+
+    for component in relative.components() {
+        let name = component.as_os_str();
+        let parent = root.join(&respelled);
+
+        let Ok(listing) = std::fs::read_dir(&parent)
+            .and_then(|entries| entries.map(|entry| entry.map(|entry| entry.file_name())).collect::<Result<Vec<_>, _>>()) else {
+            respelled.push(name);
+            continue;
+        };
+
+        if listing.iter().any(|listed| listed == name) {
+            respelled.push(name);
+            continue;
+        }
+
+        // A name that is not valid UTF-8 is no warehouse key, so only UTF-8 entries can be it.
+        let names: Vec<String> = listing.into_iter().filter_map(|listed| listed.into_string().ok()).collect();
+        let listed = name.to_str().and_then(|name| alias_utils::listed_alias(&parent, name, &names));
+
+        let Some(listed) = listed else {
+            return Err(format!(
+                "The current directory's component \"{}\" is not listed in \"{}\" under that name, and \
+                no entry listed there could be identified as it, so Forklift cannot tell which directory it is.",
+                name.to_string_lossy(), parent.to_string_lossy()
+            ));
+        };
+
+        respelled.push(listed);
+    }
+
+    Ok(respelled)
 }
 
 /// Get the directory the user invoked forklift from, relative to the warehouse root.
@@ -149,4 +205,58 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
     }
 
     Ok(created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A component the parent lists exactly is kept; one it lists under another spelling of the
+    /// same entry takes the listed spelling; one it lists under no spelling is refused.
+    #[test]
+    fn a_current_directory_is_respelled_as_its_parents_list_it() {
+        let root = std::env::temp_dir().join(format!("forklift-warehouse-respell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs/Sub")).unwrap();
+
+        assert_eq!(respell_as_listed(&root, Path::new("docs/Sub")).unwrap(), Path::new("docs/Sub"));
+        assert_eq!(respell_as_listed(&root, Path::new("")).unwrap(), Path::new(""));
+
+        let folds = root.join("DOCS").exists();
+        if folds {
+            assert_eq!(respell_as_listed(&root, Path::new("DOCS/sub")).unwrap(), Path::new("docs/Sub"));
+        }
+
+        let error = respell_as_listed(&root, Path::new("docs/missing")).unwrap_err();
+        assert!(error.contains("\"missing\" is not listed"), "{}", error);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Below a parent that can be traversed but not listed, a component keeps the spelling it was
+    /// opened by, and the components above it are still respelled.
+    #[cfg(unix)]
+    #[test]
+    fn a_current_directory_below_an_unlistable_parent_keeps_its_spelling() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("forklift-warehouse-respell-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("locked/inner")).unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o100)).unwrap();
+
+        // Root lists through any mode, so there is no unlistable parent to test.
+        let unlistable = std::fs::read_dir(root.join("locked")).is_err();
+        assert!(unlistable || unsafe { libc::geteuid() } == 0, "the parent was listable");
+        if unlistable {
+            assert_eq!(respell_as_listed(&root, Path::new("locked/inner")).unwrap(), Path::new("locked/inner"));
+
+            if root.join("LOCKED").exists() {
+                assert_eq!(respell_as_listed(&root, Path::new("LOCKED/inner")).unwrap(), Path::new("locked/inner"));
+            }
+        }
+
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
