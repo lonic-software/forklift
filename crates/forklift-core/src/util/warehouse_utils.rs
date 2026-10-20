@@ -98,7 +98,9 @@ pub fn enter_warehouse() -> Result<(), String> {
 /// directory. Joined onto a user path, it would mint a key beside the tracked one. The current
 /// directory names one entry, so respelling it chooses nothing on the user's behalf: a component
 /// the parent lists exactly is kept, and any other is replaced by the listed entry that is the
-/// same entry on disk. When no listed entry is, the spelling is refused rather than used. A parent
+/// same entry on disk. When no listed entry can be identified as it (none is, or the volume will
+/// not identify the entry), the spelling is refused rather than used: the parent's listing has
+/// already shown it is not the listed name, so keeping it would mint the alias key. A parent
 /// that cannot be listed (traversable but unreadable) cannot be asked, so its component keeps the
 /// spelling the volume opened.
 ///
@@ -133,8 +135,8 @@ fn respell_as_listed(root: &Path, relative: &Path) -> Result<PathBuf, String> {
 
         let Some(listed) = listed else {
             return Err(format!(
-                "The current directory's component \"{}\" is not listed in \"{}\" under that name or \
-                any other, so Forklift cannot tell which directory it is.",
+                "The current directory's component \"{}\" is not listed in \"{}\" under that name, and \
+                no entry listed there could be identified as it, so Forklift cannot tell which directory it is.",
                 name.to_string_lossy(), parent.to_string_lossy()
             ));
         };

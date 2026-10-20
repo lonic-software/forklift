@@ -2136,21 +2136,26 @@ pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<V
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Windows reports a read through a regular file as not found, so a non-folder in the
             // shard's folder chain is looked for explicitly.
-            for folder in file_path.ancestors().skip(1).take(3) {
-                if std::fs::symlink_metadata(folder).is_ok_and(|meta| !meta.is_dir()) {
-                    return Err(format!(
-                        "Error while reading the inventory of folder \"{}\": \"{}\" is not a folder.",
-                        display_key, folder.to_string_lossy()
-                    ));
-                }
+            match non_folder_in_shard_chain(&file_path) {
+                Some(folder) => Err(format!(
+                    "Error while reading the inventory of folder \"{}\": \"{}\" is not a folder.",
+                    display_key, folder.to_string_lossy()
+                )),
+                None => Ok((file_path, None)),
             }
-            Ok((file_path, None))
         }
         Err(e) => Err(format!(
             "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
             display_key, file_path.to_string_lossy(), e
         )),
     }
+}
+
+/// The first entry, from a shard's own folder up to the inventory root, that exists and is not a
+/// folder: the shard folder, its fan-out folder, the store root and the inventory root.
+fn non_folder_in_shard_chain(data_path: &Path) -> Option<&Path> {
+    data_path.ancestors().skip(1).take(4)
+        .find(|folder| std::fs::symlink_metadata(folder).is_ok_and(|meta| !meta.is_dir()))
 }
 
 /// The path of the inventory metadata file, whether or not it exists.
@@ -3469,6 +3474,30 @@ mod tests {
             shard_address(""),
             ("af".to_string(), "1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string())
         );
+    }
+
+    /// Every link of a shard's folder chain is checked up to the inventory root, so a file at any of
+    /// them reads as damage rather than as no shard (Windows reports a read through a file as not
+    /// found).
+    #[test]
+    fn a_file_anywhere_in_a_shards_folder_chain_is_found() {
+        let root = std::env::temp_dir().join(format!("forklift-shard-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("inventory/inv_/af/rest/data");
+
+        let chain = ["inventory/inv_/af/rest", "inventory/inv_/af", "inventory/inv_", "inventory"];
+        for link in chain {
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(link).parent().unwrap()).unwrap();
+            std::fs::write(root.join(link), b"not a folder").unwrap();
+
+            assert_eq!(non_folder_in_shard_chain(&data), Some(root.join(link).as_path()), "{}", link);
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+        assert_eq!(non_folder_in_shard_chain(&data), None, "an intact chain");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn shard_folder_relative_components(keys: &[&str]) -> Vec<Vec<String>> {
