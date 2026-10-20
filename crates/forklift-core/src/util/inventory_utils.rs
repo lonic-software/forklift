@@ -12,7 +12,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, tree_utils, warehouse_utils};
+use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, tree_utils, warehouse_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
@@ -308,6 +308,8 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
         None => {}
     }
 
+    refuse_unlisted_spelling(path.as_key())?;
+
     // A named path never meets the walk's nested-working-tree boundary as an entry of its parent
     // (`load sub` walks from `sub` itself, and `load sub/x` does not walk), so test every
     // directory down to it here.
@@ -346,6 +348,60 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
     load_guard_utils::mark_load_completed(path.as_key());
 
     Ok(())
+}
+
+/// Refuse a named path that some directory along it does not list under exactly that spelling,
+/// as the walk judges every name it loads. `lstat` alone would open a case or normalization
+/// alias of a listed entry, and loading under that spelling would stage a second live entry for
+/// one file. The path is refused as a case-sensitive volume would refuse it, naming the path this
+/// volume opens instead and the one way to stage it: if that path or a directory above it is one
+/// entry with something the inventory holds live, the pair's own remedy (loading the listed path
+/// alone would leave the pair), otherwise loading the listed path. A path that opens nothing is
+/// left to the load's own error.
+fn refuse_unlisted_spelling(key: &str) -> Result<(), String> {
+    let mut check = alias_utils::AliasCheck::new();
+
+    let Some(listed) = check.resolve(key)? else {
+        return Ok(());
+    };
+
+    if listed == key {
+        return Ok(());
+    }
+
+    let nodes = alias_utils::Nodes::from_live_files(live_file_paths()?);
+
+    let remedy = match check.pair_along(&listed, &nodes)? {
+        Some((prefix, node)) => format!(
+            "The inventory still holds \"{}\", which this file system opens as \"{}\" too, so loading \
+            \"{}\" alone would leave two entries for one file. {}",
+            node, prefix, listed, check.remedy(&prefix, &node, &nodes)?.instructions()
+        ),
+        None => format!("To load it, run \"forklift load {}\" from the working tree's root.", listed),
+    };
+
+    Err(format!(
+        "Nothing is listed as \"{}\": this file system opens \"{}\" under that name. {}",
+        key, listed, remedy
+    ))
+}
+
+/// The path of every live (not `Deleted`) file entry the inventory holds.
+fn live_file_paths() -> Result<BTreeSet<String>, String> {
+    let mut paths = BTreeSet::new();
+
+    for key in registered_keys()? {
+        let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(&key)?;
+        let Some(bytes) = bytes else { continue };
+        let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
+
+        paths.extend(inventory.get_items()
+            .filter(|(_, item)| item.state != InventoryItemState::Deleted)
+            .map(|(name, _)| if key.is_empty() { name.to_string() } else { format!("{}/{}", key, name) }));
+    }
+
+    Ok(paths)
 }
 
 /// Stage a file or directory for removal: its inventory entries are marked as

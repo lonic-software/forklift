@@ -614,3 +614,266 @@ fn a_pair_beneath_a_replaced_symlink_is_probed_in_the_working_directory() {
         assert_eq!(warehouse.read("lib/D/y"), "y\n");
     }
 }
+
+/// A warehouse with `files` stacked beside `other` and `third`, then `other` edited and loaded,
+/// `third` edited and left unstaged, and an untracked `stray`: the unrelated work a named load's
+/// remedy is checked against.
+fn with_unrelated_work(name: &str, files: &[(&str, &str)]) -> Warehouse {
+    let mut stacked = files.to_vec();
+    stacked.extend([("other", "o\n"), ("third", "t\n")]);
+
+    let warehouse = Warehouse::new(name, &stacked);
+    warehouse.write("other", "o2\n");
+    warehouse.run_ok(&["load", "other"]);
+    warehouse.write("third", "t2\n");
+    warehouse.write("stray", "s\n");
+
+    warehouse
+}
+
+impl Warehouse {
+    fn rename(&self, from: &str, to: &str) {
+        std::fs::rename(self.root.join(from), self.root.join(to)).unwrap();
+    }
+
+    /// The staged lines and the lines not in the inventory a stocktake lists, whitespace collapsed
+    /// ("moved: README -> readme").
+    fn stocktake(&self) -> (BTreeSet<String>, BTreeSet<String>) {
+        let output = stdout(&self.run_ok(&["stocktake"]));
+        let section = |heading: &str| -> BTreeSet<String> {
+            output.lines()
+                .skip_while(|line| !line.starts_with(heading))
+                .skip(1)
+                .take_while(|line| !line.trim().is_empty())
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect()
+        };
+
+        (section("Staged changes"), section("Changes not in the inventory"))
+    }
+
+    /// Run each command a refusal offers, from the root, in order.
+    fn run_offered(&self, offered: &[Vec<String>]) {
+        for command in offered {
+            let args: Vec<&str> = command.iter().map(String::as_str).collect();
+            self.run_ok(&args);
+        }
+    }
+
+    /// Park, then pop, both succeeding.
+    fn park_and_pop(&self) {
+        self.run_ok(&["park"]);
+        self.run_ok(&["park", "pop"]);
+    }
+}
+
+const NAMED_SPELLING_REFUSAL: &str = "this file system opens";
+const STAGES_EVERYTHING: &str = "That stages every change in the working tree, not only this one, unstaged \
+    edits and untracked files included: check \"forklift stocktake\" before stacking.";
+
+/// The commands a refusal offers ("From the working tree's root, run "forklift a", then
+/// "forklift b"."), each split into its arguments. "forklift stocktake" is a check, not a remedy.
+fn offered_commands(output: &Output) -> Vec<Vec<String>> {
+    let stderr = stderr(output);
+    let Some((_, offer)) = stderr.split_once("From the working tree's root, run ")
+        .or_else(|| stderr.split_once("To load it, run ")) else {
+        return Vec::new();
+    };
+
+    offer.split('"')
+        .skip(1)
+        .step_by(2)
+        .take_while(|command| command.starts_with("forklift ") && *command != "forklift stocktake")
+        .map(|command| command.split(' ').skip(1).map(str::to_string).collect())
+        .collect()
+}
+
+/// A named load refused for its spelling: it fails naming the path the volume opens, and offers
+/// exactly `offered`.
+fn assert_spelling_refused(output: &Output, typed: &str, listed: &str, offered: &[&str]) {
+    let stderr = stderr(output);
+    assert!(!output.status.success(), "`load {}` was taken: {}", typed, stdout(output));
+    assert!(stderr.contains(&format!("Nothing is listed as \"{}\": this file system opens \"{}\"", typed, listed)),
+        "the refusal must name \"{}\": {}", listed, stderr);
+
+    let offered_now: Vec<String> = offered_commands(output).iter().map(|command| command.join(" ")).collect();
+    assert_eq!(offered_now, offered, "the remedy offered for `load {}`: {}", typed, stderr);
+}
+
+/// On a case-sensitive volume an unlisted spelling opens nothing, so the load fails as it always
+/// has, offering nothing.
+fn assert_plain_failure(output: &Output) {
+    assert!(!output.status.success(), "{}", stdout(output));
+    assert!(!stderr(output).contains(NAMED_SPELLING_REFUSAL), "{}", stderr(output));
+}
+
+/// After an unloaded case-only rename, a load that types an unlisted spelling would stage a second
+/// live entry for the one file, and a park from there loses it. The refusal offers the pair's own
+/// remedy instead, which stages only the rename and leaves unrelated work as it was.
+#[test]
+fn a_named_load_of_an_unlisted_spelling_offers_the_pair_scoped_remedy() {
+    let states: [(&str, &str, bool, &[&str]); 3] = [
+        ("README", "unloaded", false, &["remove README", "load readme"]),
+        ("README", "readme-loaded", true, &["remove README"]),
+        ("Readme", "third-spelling", false, &["remove README", "load readme"]),
+    ];
+
+    for (typed, label, load_new_first, offered) in states {
+        let warehouse = with_unrelated_work(&format!("reach-file-{}", label), &[("README", "r\n")]);
+        warehouse.rename("README", "readme");
+        if load_new_first {
+            warehouse.run_ok(&["load", "readme"]);
+        }
+
+        let loaded = warehouse.run(&["load", typed]);
+
+        if !warehouse.folds_case() {
+            assert_plain_failure(&loaded);
+            continue;
+        }
+        assert_spelling_refused(&loaded, typed, "readme", offered);
+
+        warehouse.run_offered(&offered_commands(&loaded));
+        let (staged, unstaged) = warehouse.stocktake();
+        assert_eq!(staged, BTreeSet::from(["moved: README -> readme".to_string(), "modified: other".to_string()]),
+            "{}: only the rename is newly staged", label);
+        assert_eq!(unstaged, BTreeSet::from(["modified: third".to_string(), "untracked: stray".to_string()]),
+            "{}: unrelated work stays as it was", label);
+
+        warehouse.park_and_pop();
+        assert!(listed(&warehouse.root).contains("readme"), "{}: the file survives park", label);
+        assert!(!listed(&warehouse.root).contains("README"), "{}", label);
+        assert_eq!(warehouse.read("readme"), "r\n", "{}", label);
+    }
+}
+
+/// With the rename already staged as a move, the old spelling is no longer live, so there is no
+/// pair: the refusal offers the listed spelling, and a park after the refused load keeps the file.
+#[test]
+fn a_named_load_of_an_old_spelling_after_a_staged_move_offers_the_listed_spelling() {
+    let warehouse = with_unrelated_work("reach-staged-move", &[("README", "r\n")]);
+    warehouse.rename("README", "readme");
+    warehouse.run_ok(&["load", "."]);
+
+    let loaded = warehouse.run(&["load", "README"]);
+
+    if !warehouse.folds_case() {
+        assert_plain_failure(&loaded);
+        return;
+    }
+    assert_spelling_refused(&loaded, "README", "readme", &["load readme"]);
+
+    warehouse.park_and_pop();
+    assert!(listed(&warehouse.root).contains("readme"), "the file survives park");
+    assert!(!listed(&warehouse.root).contains("README"));
+
+    warehouse.run_offered(&offered_commands(&loaded));
+    let (staged, _) = warehouse.stocktake();
+    assert!(staged.contains("moved: README -> readme"), "the move stays staged: {:?}", staged);
+}
+
+/// With no rename, a typed spelling the directory does not list is a typo: the refusal offers the
+/// listed spelling, which loads, instead of registering the typed one beside it.
+#[test]
+fn a_named_load_of_a_case_typo_offers_the_listed_spelling() {
+    let nfd = "cafe\u{301}";
+    let warehouse = Warehouse::new("reach-typo", &[("README", "r\n"), ("Docs/a", "a\n"), (nfd, "c\n")]);
+    warehouse.write("README", "r2\n");
+    warehouse.write("Docs/a", "a2\n");
+
+    let typos: [(&str, &str); 2] = [("readme", "README"), ("DOCS/a", "Docs/a")];
+
+    for (typed, listed) in typos {
+        let loaded = warehouse.run(&["load", typed]);
+
+        if !warehouse.folds_case() {
+            assert_plain_failure(&loaded);
+            continue;
+        }
+        let offered = format!("load {}", listed);
+        assert_spelling_refused(&loaded, typed, listed, &[offered.as_str()]);
+        warehouse.run_offered(&offered_commands(&loaded));
+    }
+
+    if warehouse.folds_case() {
+        let (staged, _) = warehouse.stocktake();
+        assert_eq!(staged, BTreeSet::from(["modified: README".to_string(), "modified: Docs/a".to_string()]));
+    }
+
+    let nfc = "caf\u{e9}";
+    let loaded = warehouse.run(&["load", nfc]);
+    if folds_normalization(&warehouse.base) {
+        let offered = format!("load {}", nfd);
+        assert_spelling_refused(&loaded, nfc, nfd, &[offered.as_str()]);
+        warehouse.run_offered(&offered_commands(&loaded));
+    } else {
+        assert_plain_failure(&loaded);
+    }
+}
+
+/// Under a directory renamed in case only, the old directory spelling is still live (as the
+/// directory itself, as an ancestor of a live file, or as the parent of a live alias), so loading
+/// the listed path alone would leave the pair. The refusal offers loading the working tree's root,
+/// and says that this stages everything else too, which the stocktake after it shows.
+#[test]
+fn a_named_load_under_a_case_renamed_directory_offers_loading_the_root() {
+    let states: [(&str, &[(&str, &str)], &[(&str, &str)], &str, &str, &str); 3] = [
+        ("depth-one", &[("Docs/a", "a\n")], &[("Docs", "docs")], "DOCS/a", "docs/a", "moved: Docs/a -> docs/a"),
+        ("ancestor", &[("Docs/sub/a", "a\n")], &[("Docs", "docs")], "Docs/sub/a", "docs/sub/a",
+            "moved: Docs/sub/a -> docs/sub/a"),
+        ("alias-under-parent", &[("Docs/README", "a\n")], &[("Docs/README", "Docs/readme"), ("Docs", "docs")],
+            "docs/README", "docs/readme", "moved: Docs/README -> docs/readme"),
+    ];
+
+    for (label, files, renames, typed, opened, moved) in states {
+        let warehouse = with_unrelated_work(&format!("reach-dir-{}", label), files);
+        for (from, to) in renames {
+            warehouse.rename(from, to);
+        }
+
+        let loaded = warehouse.run(&["load", typed]);
+
+        if !warehouse.folds_case() {
+            assert_plain_failure(&loaded);
+            continue;
+        }
+        assert_spelling_refused(&loaded, typed, opened, &["load ."]);
+        assert!(stderr(&loaded).contains(STAGES_EVERYTHING), "{}: {}", label, stderr(&loaded));
+
+        warehouse.run_offered(&offered_commands(&loaded));
+        let (staged, unstaged) = warehouse.stocktake();
+        let expected: BTreeSet<String> = [moved, "modified: other", "modified: third", "added: stray"]
+            .into_iter().map(str::to_string).collect();
+        assert_eq!(staged, expected, "{}: the root's load stages the unrelated work too", label);
+        assert!(unstaged.is_empty(), "{}: {:?}", label, unstaged);
+
+        warehouse.park_and_pop();
+        assert_eq!(warehouse.read(opened), "a\n", "{}: the file survives park", label);
+        assert!(listed(&warehouse.root).contains("docs"), "{}", label);
+        assert!(!listed(&warehouse.root).contains("Docs"), "{}", label);
+    }
+}
+
+/// Park re-stages tracked entries through `lstat`, which opens an unloaded case-only rename's new
+/// spelling: the entry stays live, so park succeeds and the rename is left as an unstaged move.
+#[test]
+fn park_over_an_unloaded_case_only_rename_leaves_it_an_unstaged_move() {
+    let warehouse = Warehouse::new("park-unloaded-rename", &[("README", "r\n"), ("other", "o\n")]);
+    if !warehouse.folds_case() {
+        return;
+    }
+    warehouse.write("other", "o2\n");
+    warehouse.run_ok(&["load", "other"]);
+    warehouse.rename("README", "readme");
+
+    warehouse.run_ok(&["park"]);
+    let (staged, unstaged) = warehouse.stocktake();
+    assert!(staged.is_empty(), "{:?}", staged);
+    assert_eq!(unstaged, BTreeSet::from(["moved: README -> readme".to_string()]));
+    assert!(listed(&warehouse.root).contains("readme"));
+    assert_eq!(warehouse.read("readme"), "r\n");
+
+    warehouse.run_ok(&["park", "pop"]);
+    let (staged, _) = warehouse.stocktake();
+    assert_eq!(staged, BTreeSet::from(["modified: other".to_string()]));
+}

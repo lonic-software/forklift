@@ -46,3 +46,65 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
         crate::docgen::OutputSchema::of::<Loaded>(),
     ]
 }
+
+/// The alias test a named load chooses its remedy by. It reads paths against the process working
+/// directory, so each test holds it through a working-tree warehouse.
+#[cfg(all(test, unix))]
+mod tests {
+    use forklift_core::util::alias_utils::AliasCheck;
+    use crate::test_support::Warehouse;
+
+    /// Whether the working directory's volume opens a name spelled in another case.
+    fn folds_case() -> bool {
+        std::fs::write("case-probe", "").unwrap();
+        let folds = std::path::Path::new("CASE-PROBE").exists();
+        std::fs::remove_file("case-probe").unwrap();
+        folds
+    }
+
+    #[test]
+    fn spellings_that_open_one_listed_entry_are_one_entry() {
+        let _warehouse = Warehouse::with_working_tree("alias-one-listed");
+        let folds = folds_case();
+        std::fs::create_dir("Docs").unwrap();
+        std::fs::write("Docs/README", "r\n").unwrap();
+        let mut check = AliasCheck::new();
+
+        assert_eq!(check.resolve("Docs/README").unwrap().as_deref(), Some("Docs/README"));
+        assert_eq!(check.resolve("docs/readme").unwrap().as_deref(), folds.then_some("Docs/README"),
+            "an aliased directory does not end the walk");
+        assert_eq!(check.one_entry("Docs/README", "Docs/readme").unwrap(), folds, "a listed and an unlisted spelling");
+        assert_eq!(check.one_entry("Docs/readme", "Docs/Readme").unwrap(), folds, "two unlisted spellings of a third");
+        assert_eq!(check.one_entry("docs/readme", "Docs/README").unwrap(), folds, "a pair under an aliased directory");
+        assert!(!check.one_entry("Docs/README", "Docs/other").unwrap(), "names that do not fold together");
+    }
+
+    #[test]
+    fn spellings_that_both_open_nothing_are_one_entry_when_the_volume_folds_them() {
+        let _warehouse = Warehouse::with_working_tree("alias-both-gone");
+        let folds = folds_case();
+        std::fs::create_dir("d").unwrap();
+        // Where the old directory spelling is now a file, both paths meet "not a directory".
+        std::fs::write("docs", "x\n").unwrap();
+        let mut check = AliasCheck::new();
+
+        assert_eq!(check.resolve("d/README").unwrap(), None);
+        assert_eq!(check.one_entry("d/README", "d/readme").unwrap(), folds);
+        assert_eq!(check.one_entry("gone/README", "GONE/README").unwrap(), folds, "a missing parent is probed above it");
+        assert_eq!(check.resolve("Docs/a").unwrap(), None, "\"not a directory\" is an absence, not an error");
+        assert_eq!(check.one_entry("Docs/a", "docs/a").unwrap(), folds);
+    }
+
+    #[test]
+    fn names_listed_under_their_own_spelling_are_two_entries() {
+        let _warehouse = Warehouse::with_working_tree("alias-hard-links");
+        if folds_case() {
+            return;
+        }
+        std::fs::write("README", "r\n").unwrap();
+        std::fs::hard_link("README", "readme").unwrap();
+        let mut check = AliasCheck::new();
+
+        assert!(!check.one_entry("README", "readme").unwrap(), "hard links listed under both names are two entries");
+    }
+}

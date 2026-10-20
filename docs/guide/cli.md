@@ -255,6 +255,21 @@ A folder below the warehouse root that holds its own `.forklift` (say you ran `p
 files on disk, then `stack` (re-run the `load` first if a `load` was what refused). Or move the
 inner `.forklift` out of the folder.
 
+A path you name must be spelled the way its folder lists it, as it would on a case-sensitive file
+system. On a case-insensitive one (the default on macOS and Windows), or one that ignores Unicode
+normalization, `load readme` would otherwise open a file listed as `README` and stage a second
+entry for it. `load` refuses such a path, names the spelling the file system opens instead, and
+gives the one way to stage it:
+
+- For a typo, load the listed spelling (`forklift load README`).
+- After a case-only rename you have not loaded yet (`README` renamed to `readme`), naming the old
+  spelling offers `forklift remove README`, then `forklift load readme`. That stages just the
+  rename and leaves your other changes as they were.
+- When the renamed name is a folder (`Docs` to `docs`), it offers loading the nearest folder above
+  it whose spelling is listed: `forklift load .` from the working tree's root for a top-level
+  folder. That stages every change under that folder, unstaged edits and untracked files included,
+  so check `stocktake` before you stack.
+
 ### `unload` — unstage (`ul`)
 
 ```sh
