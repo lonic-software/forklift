@@ -3305,8 +3305,7 @@ mod tests {
         use crate::model::tree_item::TreeItem;
 
         let key_toml = format!(
-            "key_id = \"test-key-1\"\n\
-             operator = \"op@x\"\n\
+            "operator = \"op@x\"\n\
              public_key = \"deadbeef\"\n\
              issued_at = 1\n\
              distrust_boundary = [\"{}\"]\n\
@@ -3641,10 +3640,10 @@ mod tests {
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
 
-        // A key record missing its required "key_id" field — present and verified as a blob, but
-        // does not parse as a key record.
+        // A key record missing its required "operator" field — present and verified as a blob,
+        // but does not parse as a key record.
         let malformed_key_toml =
-            "operator = \"op@x\"\npublic_key = \"deadbeef\"\nissued_at = 1\n\
+            "public_key = \"deadbeef\"\nissued_at = 1\n\
              authorized_by = \"k\"\nendorsement = \"ee\"\nproof_of_possession = \"pp\"\n";
         let mut key_blob = LooseObjectBuilder::build_blob(&Blob { content: malformed_key_toml.as_bytes().to_vec() });
         key_blob.store().unwrap();

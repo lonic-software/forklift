@@ -863,8 +863,7 @@ pub(crate) mod tests {
         let malformed_user_toml =
             "identifier = \"op@broken\"\nenrolled_at = 1\nidentity_root = \"r\"\n"; // no "role"
         let valid_key_toml = format!(
-            "key_id = \"test-key-1\"\n\
-             operator = \"op@x\"\n\
+            "operator = \"op@x\"\n\
              public_key = \"deadbeef\"\n\
              issued_at = 1\n\
              distrust_boundary = [\"{}\"]\n\
