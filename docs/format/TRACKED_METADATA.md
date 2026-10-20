@@ -306,12 +306,13 @@ that has a `key_id` entry. Every lookup goes by key id, while the endorsement an
 proof-of-possession sign only the public key, so a stored id could name one key over another
 key's material. Readers that build the office state refuse a record filed under any name but
 its own subject's (`<key-id>.toml`, `<blake3(identifier)>.toml`), naming the file and the one
-it belongs in. They also refuse a folder inside `users/` or `keys/`, and a `users` or `keys`
-entry that is a file rather than a folder. Since tree entry names are unique, no subject can
+it belongs in. They also refuse a folder inside `users/` or `keys/`, and a `.forklift`, `tracked`,
+`users` or `keys` entry that is a file rather than a folder. Since tree entry names are unique, no subject can
 have two records. The writer refuses, before storing anything, a state no reader would accept.
 Collecting trust pins for gc, heal and recovery is the one read that checks neither file names
 nor nested folders: it keeps the pins of every record under `keys/`, at any depth. It still
-refuses a `keys` file, which would otherwise read as an office with no pins.
+refuses a file in place of `.forklift`, `tracked` or `keys`, which would otherwise read as an
+office with no pins.
 
 Retired keys are **retained forever**: they still verify the parcels that were signed
 while they were active. The private halves never enter the warehouse; they live in the

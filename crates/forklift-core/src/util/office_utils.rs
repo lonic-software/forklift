@@ -800,6 +800,10 @@ pub enum OfficeReadErrorKind {
     /// durably written; restaging cannot change them. Remedy: fix (or hand-restore a good copy of)
     /// the record itself.
     UnparseableRecord,
+    /// Every object loaded, but the office tree holds a file where Forklift only ever writes a
+    /// folder (`.forklift`, `tracked` or `keys`). The parcel is signed as it is, so neither heal
+    /// nor editing a record changes it. Remedy: roll `@office` back to a good head.
+    MalformedOffice,
     /// Any other read failure (a present-but-corrupt object, an I/O error) that does not fit
     /// either of the two more specific — and more actionable — kinds above.
     Other,
@@ -859,10 +863,18 @@ fn load_object_classified<T>(
 /// [`file_utils::StoreReadOutcome::Absent`]), never guessed from a deeper loader's error text.
 /// There is deliberately no separate presence check before the load: that check-then-load shape
 /// used the taint-gated predicate and had a window between the two, both of which round 3 removed.
-fn resolve_subtree_classified(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, OfficeReadError> {
+fn resolve_subtree_classified(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str])
+    -> Result<Option<TreeItem>, OfficeReadError> {
     let mut current = load_object_classified(root_tree_hash, object_utils::parse_local_tree_bytes)?;
 
-    for component in path {
+    for (depth, component) in path.iter().enumerate() {
+        if current.get_files().any(|(name, _)| name == component) {
+            return Err(OfficeReadError {
+                kind: OfficeReadErrorKind::MalformedOffice,
+                message: file_in_place_of_folder(office_parcel_hash, &path[..=depth]),
+            });
+        }
+
         let subtree_hash = current.get_subtrees()
             .find(|(name, _)| name == component)
             .map(|(_, item)| item.hash.clone());
@@ -876,12 +888,23 @@ fn resolve_subtree_classified(root_tree_hash: &str, path: &[&str]) -> Result<Opt
     Ok(Some(current))
 }
 
+/// The refusal for an office tree that holds a file where Forklift only ever writes a folder:
+/// read as an absent folder instead, it would drop every record below it.
+fn file_in_place_of_folder(office_parcel_hash: &str, path: &[&str]) -> String {
+    let path = path.join("/");
+    format!(
+        "The office parcel {} holds a file {}, but {} is a folder of records. Forklift never \
+        writes a file there, so this office may have been tampered with.",
+        office_parcel_hash, path, path
+    )
+}
+
 /// The trust-pin-relevant slice of the office record: every key's own `distrust_boundary` — the
 /// only thing [`collect_trust_pin_roots`] consumes from the office chain, never a user record (F5,
 /// PR #120 round 2 — see [`collect_trust_pin_roots`]'s own doc comment for why that matters).
-/// Walks `.forklift/tracked/keys` and every folder under it directly ([`resolve_subtree_classified`] returns `Ok(None)` for
-/// a missing component, per its shared [`resolve_subtree`] counterpart) rather than
-/// [`read_office_state`]'s full users-and-keys parse. Classified per [`OfficeReadErrorKind`] so
+/// Walks `.forklift/tracked/keys` and every folder under it directly, rather than
+/// [`read_office_state`]'s full users-and-keys parse: an absent folder on the way holds no pins,
+/// while a file in a folder's place is refused ([`resolve_subtree_classified`]). Classified per [`OfficeReadErrorKind`] so
 /// [`collect_trust_pin_roots`]'s `Tolerate` branch can word its remedy correctly (F4, same round).
 fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
     let head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(OfficeReadError::other)?;
@@ -889,23 +912,9 @@ fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
 
     let parcel = load_object_classified(&head, object_utils::parse_local_parcel_bytes)?;
 
-    let Some(tracked) = resolve_subtree_classified(
-        &parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED],
+    let Some(keys_tree) = resolve_subtree_classified(
+        &head, &parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_KEYS],
     )? else {
-        return Ok(Vec::new());
-    };
-
-    // A `keys` file instead of a folder would otherwise read as "no keys" and drop every pin.
-    if tracked.get_files().any(|(name, _)| name == TREE_NAME_KEYS) {
-        return Err(OfficeReadError::other(format!(
-            "The office parcel {} holds a file {}, but {} is a folder of key records. Forklift \
-            never writes a file there, so this office may have been tampered with.",
-            head, TREE_NAME_KEYS, TREE_NAME_KEYS)));
-    }
-
-    let Some(keys_hash) = tracked.get_subtrees()
-        .find(|(name, _)| name.as_str() == TREE_NAME_KEYS)
-        .map(|(_, item)| item.hash.clone()) else {
         return Ok(Vec::new());
     };
 
@@ -915,10 +924,11 @@ fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
     // `read_office_state_of`: this reader only gathers pins that keep history alive, so a
     // misfiled or nested record's pins are kept (the union of every record's) rather than the
     // office refused — judging the office's integrity is the verifying readers' job.
-    let mut pending = vec![keys_hash];
-    while let Some(tree_hash) = pending.pop() {
-        let tree = load_object_classified(&tree_hash, object_utils::parse_local_tree_bytes)?;
-        pending.extend(tree.get_subtrees().map(|(_, item)| item.hash.clone()));
+    let mut pending = vec![keys_tree];
+    while let Some(tree) = pending.pop() {
+        for (_, item) in tree.get_subtrees() {
+            pending.push(load_object_classified(&item.hash, object_utils::parse_local_tree_bytes)?);
+        }
         for (_, file) in tree.get_files() {
             let record = load_object_classified(&file.hash, parse_record_bytes)?;
             keys.push(parse_key_record(&record).map_err(|e| OfficeReadError {
@@ -950,8 +960,11 @@ fn degraded_office_note(kind: OfficeReadErrorKind, error: &str) -> String {
         OfficeReadErrorKind::UnparseableRecord =>
             "fix (or hand-restore a good copy of) the record itself — its bytes are exactly what \
              was durably written, so re-running heal alone will not change them",
+        OfficeReadErrorKind::MalformedOffice =>
+            "roll \"@office\" back to a head whose office tree is well formed, then re-run \
+             \"forklift heal\"",
         OfficeReadErrorKind::Other =>
-            "resolve the error named below, then re-run \"forklift heal\"",
+            "resolve that error, then re-run \"forklift heal\"",
     };
 
     format!(
@@ -1108,7 +1121,9 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
     let mut users: Vec<UserRecord> = Vec::new();
     let mut keys: Vec<KeyRecord> = Vec::new();
 
-    let Some(tracked) = resolve_subtree(&tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED])? else {
+    let Some(tracked) = resolve_subtree(
+        office_parcel_hash, &tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED],
+    )? else {
         return Ok(OfficeState { users, keys });
     };
 
@@ -1116,10 +1131,8 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
     // such records.
     if let Some((name, _)) = tracked.get_files()
         .find(|(name, _)| name.as_str() == TREE_NAME_USERS || name.as_str() == TREE_NAME_KEYS) {
-        return Err(format!(
-            "The office parcel {} holds a file {}, but {} is a folder of records. Forklift never \
-            writes a file there, so this office may have been tampered with.",
-            office_parcel_hash, name, name
+        return Err(file_in_place_of_folder(
+            office_parcel_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, name.as_str()],
         ));
     }
 
@@ -1383,11 +1396,16 @@ fn parse_record_bytes(hash: &str, bytes: &[u8]) -> Result<String, String> {
 /// # Returns
 /// * `Ok(Some(TreeItem))` - The resolved (loaded) subtree.
 /// * `Ok(None)`           - If a component does not exist.
-/// * `Err(String)`        - If a tree object could not be loaded.
-fn resolve_subtree(root_tree_hash: &str, path: &[&str]) -> Result<Option<TreeItem>, String> {
+/// * `Err(String)`        - If a tree object could not be loaded, or a component is a file.
+fn resolve_subtree(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str])
+    -> Result<Option<TreeItem>, String> {
     let mut current = object_utils::load_tree(root_tree_hash)?;
 
-    for component in path {
+    for (depth, component) in path.iter().enumerate() {
+        if current.get_files().any(|(name, _)| name == component) {
+            return Err(file_in_place_of_folder(office_parcel_hash, &path[..=depth]));
+        }
+
         let subtree_hash = current.get_subtrees()
             .find(|(name, _)| name == component)
             .map(|(_, item)| item.hash.clone());
@@ -2429,6 +2447,11 @@ pub(crate) mod tests {
 
         let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         root_tree.add_child(forklift_tree);
+        plant_root(root_tree, parents, signer)
+    }
+
+    /// Plant an office parcel over a hand-built root tree whose subtrees are already stored.
+    fn plant_root(root_tree: TreeItem, parents: Vec<String>, signer: Option<&str>) -> String {
         let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
         root_object.store().unwrap();
 
@@ -2660,32 +2683,49 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A `keys` or `users` entry stored as a file rather than a folder is refused, rather than
-    /// read as an office with no such records — on the client path that would remove every key.
-    /// The trust-pin reader refuses a `keys` file too, since it would otherwise drop every pin.
+    /// A `.forklift`, `tracked`, `keys` or `users` entry stored as a file rather than a folder is
+    /// refused, rather than read as an office with no such records — on the client path that
+    /// would remove every key. The trust-pin reader refuses a file on its way to `keys` too, since
+    /// it would otherwise drop every pin.
     #[test]
     fn a_record_tree_stored_as_a_file_is_refused() {
         let (scope, dir) = enter_scratch_warehouse("record-tree-file");
         let (public_key, key_id) = bound_key(7);
         let record = key_record_for(&public_key, "distrust_boundary = [\"pin-a\"]\n");
 
-        for tree_name in [TREE_NAME_KEYS, TREE_NAME_USERS] {
-            let mut tracked = TreeItem::new(TREE_NAME_TRACKED.to_string(), String::new(), DirEntryType::Tree);
-            tracked.add_child(TreeItem::new(tree_name.to_string(), store_record(&record).unwrap(), DirEntryType::Normal));
-            let planted = plant_tracked(tracked, Vec::new(), None);
+        let shapes: [&[&str]; 4] = [
+            &[TREE_NAME_FORKLIFT],
+            &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED],
+            &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_KEYS],
+            &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_USERS],
+        ];
+        for path in shapes {
+            // A file at the end of `path`, inside folders for every component before it.
+            let (file_name, folders) = path.split_last().unwrap();
+            let mut item = TreeItem::new(file_name.to_string(), store_record(&record).unwrap(), DirEntryType::Normal);
+            let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            for folder in folders.iter().rev() {
+                let mut tree = TreeItem::new(folder.to_string(), String::new(), DirEntryType::Tree);
+                tree.add_child(item);
+                store_subtree(&mut tree).unwrap();
+                item = tree;
+            }
+            root.add_child(item);
+            let planted = plant_root(root, Vec::new(), None);
+            let shown = format!("a file {},", path.join("/"));
 
             let error = match read_office_state_of(&planted) {
                 Err(e) => e,
-                Ok(_) => panic!("a file {} must not read", tree_name),
+                Ok(_) => panic!("a file {} must not read", path.join("/")),
             };
-            assert!(error.contains(&planted) && error.contains(&format!("a file {},", tree_name)),
+            assert!(error.contains(&planted) && error.contains(&shown),
                 "the error must name the parcel and the file: {}", error);
 
             let pins = read_trust_pin_keys();
-            if tree_name == TREE_NAME_KEYS {
-                let error = pins.err().expect("the trust-pin reader must refuse a keys file");
-                assert!(error.kind == OfficeReadErrorKind::Other && error.message.contains("a file keys,"),
-                    "the trust-pin reader must name the keys file: {:?}", error.message);
+            if *file_name != TREE_NAME_USERS {
+                let error = pins.err().expect("the trust-pin reader must refuse a file on the way to keys");
+                assert!(error.kind == OfficeReadErrorKind::MalformedOffice && error.message.contains(&shown),
+                    "the trust-pin reader must name the file: {:?}", error.message);
             } else {
                 assert!(pins.map_err(|e| e.message).unwrap().is_empty(), "a users file holds no pins");
             }
@@ -2723,6 +2763,32 @@ pub(crate) mod tests {
         let keys = read_trust_pin_keys().map_err(|e| e.message).unwrap();
         let pins: Vec<&str> = keys.iter().flat_map(|key| key.distrust_boundary.iter().map(String::as_str)).collect();
         assert_eq!(pins, vec!["pin-nested"], "the nested record's pins are kept");
+
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A malformed office tree is worded with the roll-back remedy when heal tolerates it, and
+    /// refuses gc, which reads fail-closed: neither heal nor a record fix can change a signed tree.
+    #[test]
+    fn a_malformed_office_words_the_roll_back_remedy() {
+        let (scope, dir) = enter_scratch_warehouse("malformed-remedy");
+        write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64), enabled_at: 0, boundary: Vec::new(), prior_genesis: None, adopts: None,
+        }).unwrap();
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new(
+            TREE_NAME_FORKLIFT.to_string(), store_record("x = 1").unwrap(), DirEntryType::Normal,
+        ));
+        plant_root(root, Vec::new(), None);
+
+        let note = collect_trust_pin_roots(TrustPinReadPolicy::Tolerate).unwrap().degraded
+            .expect("a malformed office must be recorded as degraded");
+        assert!(note.contains("well formed") && note.contains("a file .forklift,"),
+            "the note must name the file and word the roll-back remedy: {}", note);
+        assert!(collect_trust_pin_roots(TrustPinReadPolicy::FailClosed).is_err(),
+            "gc must refuse a malformed office");
 
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
