@@ -4552,6 +4552,38 @@ mod tests {
         assert_eq!(lift_bob_promotion(&fixture, &fixture.admin, &fixture.admin_key_id).await, StatusCode::OK);
     }
 
+    /// FORK-220: a 403 names the lifter's own overstep, so an overstep the warehouse already
+    /// held is not pinned on a legitimate lift on top of it: that refusal is a 422. The held
+    /// self-promotion is planted past the server, as a store written before the check would be.
+    #[tokio::test]
+    async fn a_held_overstep_under_a_legitimate_lift_is_unprocessable_not_forbidden() {
+        let fixture = OfficeFixture::genesis("post-ref-held-overstep");
+        let bob_key_id = fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
+        let bob = Operator { name: "bob".to_string(), identifier: "bob".to_string() };
+
+        let mut promoted = office_utils::read_office_state().unwrap();
+        promoted.users.iter_mut().find(|user| user.identifier == "bob").unwrap().role = Role::Admin;
+        let base = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
+        let held = office_utils::stack_office_parcel(
+            &promoted, &bob, "bob promotes himself".to_string(), &bob_key_id, base.as_deref()
+        ).unwrap();
+
+        // The admin demotes Bob again: legitimate in itself.
+        let mut demoted = promoted.clone();
+        demoted.users.iter_mut().find(|user| user.identifier == "bob").unwrap().role = Role::Writer;
+        let lifted = office_utils::build_and_sign_office_parcel(
+            &demoted, &fixture.admin, "demote bob".to_string(), &fixture.admin_key_id, vec![held.clone()]
+        ).unwrap();
+
+        let response = post_ref_update(
+            State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
+            Path(ref_update_params("@office")),
+            Json(RefUpdateRequest { old_head: Some(held), new_head: lifted })
+        ).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     /// FORK-220: an office parcel that is not authentic stays a 422: one signed by a key the office
     /// does not track.
     #[tokio::test]
