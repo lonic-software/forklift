@@ -259,7 +259,8 @@ A path you name must be spelled the way its folder lists it, as it would on a ca
 system. On a case-insensitive one (the default on macOS and Windows), or one that ignores Unicode
 normalization, `load readme` would otherwise open a file listed as `README` and stage a second
 entry for it. `load` refuses such a path, names the spelling the file system opens instead, and
-gives the one way to stage it:
+gives the one way to stage it. (Beneath a folder you may enter but not list, the spelling cannot be
+checked, so the path is taken as typed.)
 
 - For a typo, load the listed spelling (`forklift load README`).
 - After a case-only rename you have not loaded yet (`README` renamed to `readme`), naming the old
