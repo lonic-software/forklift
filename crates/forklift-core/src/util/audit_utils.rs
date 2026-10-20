@@ -276,7 +276,8 @@ enum KeyRefusal {
 /// The proofs behind every key a new office state introduces: its identity-root pin, its
 /// proof-of-possession, and an endorsement by a then-active key that, for one of the
 /// operator's own keys, chains to their identity root. Whose authority covers a
-/// cross-identity endorsement is [`verify_new_key_endorsements`]' privilege check.
+/// cross-identity endorsement is checked by [`verify_new_key_endorsements`]: a privilege
+/// refusal after the genesis, and a proof refusal at it.
 fn verify_new_key_proofs(previous: Option<&OfficeState>,
                          current: &OfficeState) -> Result<(), String> {
     use crate::util::office_utils::{key_endorsement_payload, key_pop_payload};

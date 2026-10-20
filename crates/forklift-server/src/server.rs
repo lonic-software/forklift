@@ -4577,10 +4577,14 @@ mod tests {
         let response = post_ref_update(
             State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
             Path(ref_update_params("@office")),
-            Json(RefUpdateRequest { old_head: Some(held), new_head: lifted })
+            Json(RefUpdateRequest { old_head: Some(held.clone()), new_head: lifted })
         ).await.into_response();
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(message.contains(&held), "{}", message);
+        assert!(message.contains("already in this warehouse's office"), "{}", message);
     }
 
     /// FORK-220: an office parcel that is not authentic stays a 422: one signed by a key the office
