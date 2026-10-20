@@ -2152,10 +2152,12 @@ pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<V
 }
 
 /// The first entry, from a shard's own folder up to the inventory root, that exists and is not a
-/// folder: the shard folder, its fan-out folder, the store root and the inventory root.
+/// folder: the shard folder, its fan-out folder, the store root and the inventory root. A link is
+/// judged by what it points at, as the read through it was, so a store relocated behind a link to a
+/// folder is a folder.
 fn non_folder_in_shard_chain(data_path: &Path) -> Option<&Path> {
     data_path.ancestors().skip(1).take(4)
-        .find(|folder| std::fs::symlink_metadata(folder).is_ok_and(|meta| !meta.is_dir()))
+        .find(|folder| std::fs::metadata(folder).is_ok_and(|meta| !meta.is_dir()))
 }
 
 /// The path of the inventory metadata file, whether or not it exists.
@@ -3497,6 +3499,15 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::create_dir_all(data.parent().unwrap()).unwrap();
         assert_eq!(non_folder_in_shard_chain(&data), None, "an intact chain");
+
+        // An inventory relocated behind a link to a folder is a folder, as the read through it is.
+        #[cfg(unix)]
+        {
+            std::fs::rename(root.join("inventory"), root.join("relocated")).unwrap();
+            std::os::unix::fs::symlink(root.join("relocated"), root.join("inventory")).unwrap();
+            assert_eq!(non_folder_in_shard_chain(&data), None, "a linked inventory root");
+        }
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 

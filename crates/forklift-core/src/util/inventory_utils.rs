@@ -2362,11 +2362,7 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
     // later single-file load of a re-created directory would adopt it as its baseline.
     let store_root = file_utils::get_inventory_store_root()?;
 
-    if std::fs::symlink_metadata(&store_root).is_ok() {
-        std::fs::remove_dir_all(&store_root).map_err(|e|
-            format!("Error while clearing the staging area: {}", e)
-        )?;
-    }
+    remove_store_entry(&store_root).map_err(|e| format!("Error while clearing the staging area: {}", e))?;
 
     let mut metadata: BTreeSet<String> = BTreeSet::new();
 
@@ -2573,10 +2569,14 @@ fn remove_shard_folder(key: &str) -> Result<(), String> {
 }
 
 /// Remove one entry of the shard store: a folder with everything in it, or a file or link in a
-/// folder's place. An entry already gone is not an error.
+/// folder's place. A link is removed itself, never what it points at. An entry already gone is not
+/// an error.
 fn remove_store_entry(path: &Path) -> std::io::Result<()> {
     let removed = match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        // Windows removes a link to a folder (or a junction) only as a folder.
+        Ok(metadata) if metadata.is_symlink() => std::fs::remove_file(path)
+            .or_else(|e| std::fs::remove_dir(path).map_err(|_| e)),
         Ok(_) => std::fs::remove_file(path),
         Err(e) => Err(e),
     };
@@ -2620,7 +2620,10 @@ fn sweep_unregistered_shards() {
     };
 
     for fan_out in read(&store_root) {
-        if !fan_out.file_type().is_ok_and(|kind| kind.is_dir()) {
+        // Only folders belong at the fan-out level; anything else would block every shard whose
+        // address starts with its name.
+        if !std::fs::metadata(fan_out.path()).is_ok_and(|metadata| metadata.is_dir()) {
+            let _ = remove_store_entry(&fan_out.path());
             continue;
         }
 
@@ -4235,6 +4238,61 @@ mod tests {
         remove_inventories_under("a").expect("a file in a registered slot is removable");
 
         assert!(std::fs::symlink_metadata(&folder).is_err(), "the file in the slot is gone");
+        assert_only_registered_shards_remain();
+    }
+
+    /// Only folders belong at the fan-out level, so a sweep removes a file there whatever its name.
+    #[test]
+    fn a_sweep_removes_a_file_at_the_fan_out_level() {
+        let _scratch = Scratch::new("sweep-fan-out-file");
+        stamped_chain_with_sibling();
+
+        let stray = file_utils::get_inventory_store_root().unwrap().join("ff");
+        std::fs::write(&stray, b"not a folder").unwrap();
+
+        remove_inventories_under("a").unwrap();
+
+        assert!(std::fs::symlink_metadata(&stray).is_err(), "the file at the fan-out level is gone");
+    }
+
+    /// A link in a shard slot is removed itself, on every platform, and what it points at is kept.
+    #[test]
+    fn removing_a_link_to_a_folder_in_a_shard_slot_keeps_its_target() {
+        let scratch = Scratch::new("remove-linked-slot");
+        stamped_chain_with_sibling();
+
+        let target = scratch.root.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("kept"), b"kept").unwrap();
+
+        let folder = file_utils::get_inventory_folder_for_key("a/b").unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &folder).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&target, &folder).unwrap();
+
+        remove_inventories_under("a").expect("a link in a registered slot is removable");
+
+        assert!(std::fs::symlink_metadata(&folder).is_err(), "the link is gone");
+        assert_eq!(std::fs::read(target.join("kept")).unwrap(), b"kept", "its target is untouched");
+    }
+
+    /// A wholesale reset is the way out of a damaged store, so a file where the store's folder
+    /// belongs must not block it.
+    #[test]
+    fn replacing_every_inventory_removes_a_file_in_place_of_the_store() {
+        let _scratch = Scratch::new("reset-store-is-a-file");
+        stamped_chain_with_sibling();
+
+        let store_root = file_utils::get_inventory_store_root().unwrap();
+        std::fs::remove_dir_all(&store_root).unwrap();
+        std::fs::write(&store_root, b"not a folder").unwrap();
+
+        replace_all_inventories(&BTreeMap::from([("".to_string(), Inventory::new())]))
+            .expect("a file in place of the store must not block the reset");
+
+        assert!(std::fs::symlink_metadata(&store_root).unwrap().is_dir());
         assert_only_registered_shards_remain();
     }
 
