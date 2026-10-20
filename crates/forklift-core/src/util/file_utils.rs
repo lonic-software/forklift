@@ -2152,12 +2152,17 @@ pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<V
 }
 
 /// The first entry, from a shard's own folder up to the inventory root, that exists and is not a
-/// folder: the shard folder, its fan-out folder, the store root and the inventory root. A link is
-/// judged by what it points at, as the read through it was, so a store relocated behind a link to a
-/// folder is a folder.
+/// folder: the shard folder, its fan-out folder and the store root, where Forklift makes only real
+/// folders and a link is damage, then the inventory root, which may be a link to the folder it was
+/// moved to but must resolve to one.
 fn non_folder_in_shard_chain(data_path: &Path) -> Option<&Path> {
-    data_path.ancestors().skip(1).take(4)
-        .find(|folder| std::fs::metadata(folder).is_ok_and(|meta| !meta.is_dir()))
+    let mut chain = data_path.ancestors().skip(1);
+
+    let in_store = chain.by_ref().take(3)
+        .find(|folder| std::fs::symlink_metadata(folder).is_ok_and(|meta| !meta.is_dir()));
+
+    in_store.or_else(|| chain.next().filter(|root| std::fs::symlink_metadata(root).is_ok()
+        && !std::fs::metadata(root).is_ok_and(|meta| meta.is_dir())))
 }
 
 /// The path of the inventory metadata file, whether or not it exists.
@@ -3500,12 +3505,23 @@ mod tests {
         std::fs::create_dir_all(data.parent().unwrap()).unwrap();
         assert_eq!(non_folder_in_shard_chain(&data), None, "an intact chain");
 
-        // An inventory relocated behind a link to a folder is a folder, as the read through it is.
+        // An inventory root moved behind a link to a folder is a folder; a link that resolves to
+        // nothing is not. Inside the store, every link is damage, whatever it points at.
         #[cfg(unix)]
         {
             std::fs::rename(root.join("inventory"), root.join("relocated")).unwrap();
             std::os::unix::fs::symlink(root.join("relocated"), root.join("inventory")).unwrap();
             assert_eq!(non_folder_in_shard_chain(&data), None, "a linked inventory root");
+
+            std::fs::rename(root.join("relocated/inv_/af"), root.join("fan-out")).unwrap();
+            std::os::unix::fs::symlink(root.join("fan-out"), root.join("relocated/inv_/af")).unwrap();
+            assert_eq!(non_folder_in_shard_chain(&data), Some(root.join("inventory/inv_/af").as_path()),
+                       "a linked fan-out folder");
+
+            std::fs::remove_file(root.join("inventory")).unwrap();
+            std::os::unix::fs::symlink(root.join("unmounted"), root.join("inventory")).unwrap();
+            assert_eq!(non_folder_in_shard_chain(&data), Some(root.join("inventory").as_path()),
+                       "a dangling inventory root");
         }
 
         std::fs::remove_dir_all(&root).unwrap();

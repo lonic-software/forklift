@@ -2620,9 +2620,10 @@ fn sweep_unregistered_shards() {
     };
 
     for fan_out in read(&store_root) {
-        // Only folders belong at the fan-out level; anything else would block every shard whose
-        // address starts with its name.
-        if !std::fs::metadata(fan_out.path()).is_ok_and(|metadata| metadata.is_dir()) {
+        // Only real folders belong at the fan-out level; anything else would block every shard
+        // whose address starts with its name. A link is removed itself and never entered, so
+        // nothing it points at is swept.
+        if !fan_out.file_type().is_ok_and(|kind| kind.is_dir()) {
             let _ = remove_store_entry(&fan_out.path());
             continue;
         }
@@ -4253,6 +4254,28 @@ mod tests {
         remove_inventories_under("a").unwrap();
 
         assert!(std::fs::symlink_metadata(&stray).is_err(), "the file at the fan-out level is gone");
+    }
+
+    /// A link at the fan-out level is damage: the sweep removes the link and never enters it, so
+    /// nothing outside the store is swept.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_removes_a_linked_fan_out_folder_without_entering_it() {
+        let scratch = Scratch::new("sweep-fan-out-link");
+        stamped_chain_with_sibling();
+
+        let outside = scratch.root.join("outside");
+        std::fs::create_dir_all(outside.join("project")).unwrap();
+        std::fs::write(outside.join("notes.txt"), b"kept").unwrap();
+
+        let link = file_utils::get_inventory_store_root().unwrap().join("zz");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        remove_inventories_under("a").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).is_err(), "the link is gone");
+        assert_eq!(std::fs::read(outside.join("notes.txt")).unwrap(), b"kept", "a file behind the link is kept");
+        assert!(outside.join("project").is_dir(), "a folder behind the link is kept");
     }
 
     /// A link in a shard slot is removed itself, on every platform, and what it points at is kept.
