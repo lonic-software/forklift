@@ -1065,8 +1065,8 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 ///
 /// Every blob a change makes an entry name must be durable before its shard is published, as
 /// [`publish_shard_outcomes`] requires: either stored before the change, or staged through
-/// [`stage_file_storing_blob`](Self::stage_file_storing_blob), whose blobs every publish — the
-/// early one included — makes durable first, in one barrier.
+/// [`stage_file_storing_blob`](Self::stage_file_storing_blob), whose blobs every publish makes
+/// durable first, in one barrier.
 pub struct ShardMutationBatch {
     shards: BTreeMap<String, TouchedShard>,
     blobs: file_utils::WriteBatch,

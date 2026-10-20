@@ -230,7 +230,7 @@
 //! `forklift heal`) — only this locked verb rescans; doing so lock-free would be exactly the
 //! unsound, non-content-addressed restage I1/I2 exist to forbid, at store-wide scale.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
@@ -288,8 +288,8 @@ pub struct HealOutcome {
     /// in a pack despite a vanished loose dentry (I4, `heal_utils::RestageOutcome::RecoveredPacked`),
     /// or (for a shard) a staging concern that carries no object-trust risk at all.
     pub resolved: Vec<String>,
-    /// Advisory notes that never block clearing: the "re-run the load" remedy note for each
-    /// vanished inventory shard, a note for each bay whose local state could not be read this run
+    /// Advisory notes that never block clearing: a note for each vanished inventory shard, naming
+    /// its directory where a registered key addresses it, a note for each bay whose local state could not be read this run
     /// (see `collect_walk_roots`'s `Tolerate` policy) naming the bay and how to clean it up,
     /// (FORK-47, DESIGN.html §3.1.1) one line per quarantined or unenumerable pack index this run
     /// found — emitted unconditionally, whether or not this run's own taint touches it (see
@@ -831,11 +831,12 @@ async fn resolve_the_rest(
     }
 
     let mut notes: Vec<String> = Vec::new();
+    let mut owners = ShardOwners::default();
     for relative in &shard_vanished {
         resolved.push(relative.to_string_lossy().into_owned());
 
         // A shard's path no longer spells its directory, so the note names the key instead.
-        let gone = match shard_owner(&forklift_root().join(relative)) {
+        let gone = match owners.owner(&forklift_root().join(relative)) {
             ShardOwner::Registered(key) => format!(
                 "the staged inventory of folder \"{}\" (shard \"{}\") is gone; if that staging state \
                 mattered, re-run the load that produced it",
@@ -847,7 +848,7 @@ async fn resolve_the_rest(
             ),
             ShardOwner::Unknown => format!(
                 "the staged inventory shard \"{}\" is gone, and the directory it belonged to could not \
-                be determined; if that staging state mattered, re-run the load that produced it",
+                be determined",
                 relative.to_string_lossy()
             ),
         };
@@ -1579,48 +1580,59 @@ enum ShardOwner {
     Unknown,
 }
 
-/// Find the key whose shard `shard_path` is. Shard paths are hashes, so the key is recovered by
+/// Finds the key whose shard a data file is. Shard paths are hashes, so the key is recovered by
 /// hashing each registered key of the inventory root that holds the shard and matching the
-/// address.
-///
-/// # Arguments
-/// * `shard_path` - The shard's data file, at `<inventory root>/inv_/<2 hex>/<62 hex>/data`.
-fn shard_owner(shard_path: &Path) -> ShardOwner {
-    let name = |path: Option<&Path>| path.and_then(|path| path.file_name()).and_then(|name| name.to_str()).map(String::from);
+/// address; each root's registered addresses are hashed once, however many shards are asked about.
+#[derive(Default)]
+struct ShardOwners {
+    /// Inventory root → shard address → registered key; `None` when its metadata could not be read.
+    roots: HashMap<PathBuf, Option<HashMap<(String, String), String>>>,
+}
 
-    let shard_folder = shard_path.parent();
-    let fan_out = shard_folder.and_then(Path::parent);
-    let store = fan_out.and_then(Path::parent);
+impl ShardOwners {
+    /// Whose shard `shard_path` is.
+    ///
+    /// # Arguments
+    /// * `shard_path` - The shard's data file, at `<inventory root>/inv_/<2 hex>/<62 hex>/data`.
+    fn owner(&mut self, shard_path: &Path) -> ShardOwner {
+        let name = |path: Option<&Path>| path.and_then(|path| path.file_name()).and_then(|name| name.to_str()).map(String::from);
 
-    let (Some(shard), Some(fan_out_name), Some(store_name), Some(inventory_root)) =
-        (name(shard_folder), name(fan_out), name(store), store.and_then(Path::parent)) else {
-        return ShardOwner::Unknown;
-    };
+        let shard_folder = shard_path.parent();
+        let fan_out = shard_folder.and_then(Path::parent);
+        let store = fan_out.and_then(Path::parent);
 
-    if store_name != file_utils::FOLDER_NAME_INVENTORY_STORE {
-        return ShardOwner::Unknown;
+        let (Some(shard), Some(fan_out_name), Some(store_name), Some(inventory_root)) =
+            (name(shard_folder), name(fan_out), name(store), store.and_then(Path::parent)) else {
+            return ShardOwner::Unknown;
+        };
+
+        if store_name != file_utils::FOLDER_NAME_INVENTORY_STORE {
+            return ShardOwner::Unknown;
+        }
+
+        let registered = self.roots.entry(inventory_root.to_path_buf()).or_insert_with(|| {
+            let bytes = std::fs::read(inventory_root.join(file_utils::FILE_NAME_INVENTORY_METADATA)).ok()?;
+            let entries = record_utils::from_bytes(
+                &bytes, file_utils::INVENTORY_METADATA_RECORD, file_utils::INVENTORY_METADATA_VERSION
+            ).ok()?;
+
+            Some(entries.iter()
+                .map(|entry| inventory_utils::metadata_entry_to_key(entry))
+                .map(|key| (file_utils::shard_address(key), key.to_string()))
+                .collect())
+        });
+
+        match registered {
+            None => ShardOwner::Unknown,
+            Some(registered) => registered.get(&(fan_out_name, shard))
+                .map_or(ShardOwner::Unregistered, |key| ShardOwner::Registered(key.clone())),
+        }
     }
-
-    let Ok(bytes) = std::fs::read(inventory_root.join(file_utils::FILE_NAME_INVENTORY_METADATA)) else {
-        return ShardOwner::Unknown;
-    };
-    let Ok(entries) = record_utils::from_bytes(
-        &bytes, file_utils::INVENTORY_METADATA_RECORD, file_utils::INVENTORY_METADATA_VERSION
-    ) else {
-        return ShardOwner::Unknown;
-    };
-
-    let address = (fan_out_name, shard);
-
-    entries.iter()
-        .map(|entry| inventory_utils::metadata_entry_to_key(entry))
-        .find(|key| file_utils::shard_address(key) == address)
-        .map_or(ShardOwner::Unregistered, |key| ShardOwner::Registered(key.to_string()))
 }
 
 /// Name a shard for a message by its directory, which its path no longer spells.
 fn describe_shard(shard_path: &Path) -> String {
-    match shard_owner(shard_path) {
+    match ShardOwners::default().owner(shard_path) {
         ShardOwner::Registered(key) => format!(
             "the inventory of folder \"{}\" (shard \"{}\")",
             load_guard_utils::display_path(&key), shard_path.to_string_lossy()

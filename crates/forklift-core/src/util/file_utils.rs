@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
+use crate::util::load_guard_utils;
 use crate::util::record_utils;
 use crate::util::taint_utils;
 
@@ -2103,8 +2104,7 @@ fn read_cache_put(hash: &str, bytes: std::sync::Arc<Vec<u8>>) {
 pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String> {
     let (path, bytes_opt) = retrieve_inventory_or_none_by_key(key)?;
     let bytes = bytes_opt.ok_or(format!(
-        "Inventory file not found for folder \"{}\".",
-        if key.is_empty() { "./" } else { key }
+        "Inventory file not found for folder \"{}\".", load_guard_utils::display_path(key)
     ))?;
 
     Ok((path, bytes))
@@ -2127,7 +2127,7 @@ pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String
 pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
     let file_path = get_inventory_data_path_for_key(key)?;
 
-    let display_key = if key.is_empty() { "./" } else { key };
+    let display_key = load_guard_utils::display_path(key);
 
     // Only an absent shard is "no shard": anything else, such as a file where a shard folder
     // belongs, would otherwise read as a directory with nothing staged.
@@ -2224,8 +2224,8 @@ pub fn shard_folder_relative(key: &str) -> PathBuf {
 }
 
 /// The inventory roots whose metadata [`gate_inventory_layout`] has already passed in this
-/// process.
-static PASSED_INVENTORY_ROOTS: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+/// process. A read lock answers every shard path after the first, so parallel shard work shares it.
+static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync::RwLock::new(BTreeSet::new());
 
 /// Refuse an inventory root whose metadata header names another format version, once per process
 /// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
@@ -2235,9 +2235,7 @@ static PASSED_INVENTORY_ROOTS: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::
 fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
     use std::io::BufRead;
 
-    let mut passed = PASSED_INVENTORY_ROOTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    if passed.contains(inventory_root) {
+    if PASSED_INVENTORY_ROOTS.read().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(inventory_root) {
         return Ok(());
     }
 
@@ -2258,7 +2256,7 @@ fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
         }
     }
 
-    passed.insert(inventory_root.to_path_buf());
+    PASSED_INVENTORY_ROOTS.write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(inventory_root.to_path_buf());
 
     Ok(())
 }
