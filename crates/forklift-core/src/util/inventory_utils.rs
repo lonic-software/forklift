@@ -308,8 +308,6 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
         None => {}
     }
 
-    refuse_unlisted_spelling(path.as_key())?;
-
     // A named path never meets the walk's nested-working-tree boundary as an entry of its parent
     // (`load sub` walks from `sub` itself, and `load sub/x` does not walk), so test every
     // directory down to it here.
@@ -336,6 +334,9 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
             }
         }
     }
+
+    // After the nested-working-tree test: a load it refuses under any spelling is never offered.
+    refuse_unlisted_spelling(path.as_key())?;
 
     let is_directory = file_utils::is_directory(&path.to_fs_path())?;
 
@@ -377,7 +378,7 @@ fn refuse_unlisted_spelling(key: &str) -> Result<(), String> {
             \"{}\" alone would leave two entries for one file. {}",
             node, prefix, listed, check.remedy(&prefix, &node, &nodes)?.instructions()
         ),
-        None => format!("To load it, run \"forklift load {}\" from the working tree's root.", listed),
+        None => alias_utils::Remedy::Load(listed.clone()).instructions(),
     };
 
     Err(format!(

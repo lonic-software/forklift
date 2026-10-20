@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::util::alias_utils::AliasCheck;
 use forklift_core::util::inventory_utils;
 use forklift_core::util::path_utils::WarehousePath;
 use crate::output::{self, CommandOutput};
@@ -17,7 +18,10 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     // In a scoped bay an out-of-scope path is not materialized, so staging it would be a
     // confusing "not in the inventory" (or a silent no-op) — refuse it clearly instead (§7.6).
-    crate::commands::scope::ensure_path_in_scope(path.as_key())?;
+    // The scope is judged by the path the volume opens, so a case or normalization alias of an
+    // in-scope path meets the spelling refusal, which names the listed path, not this one.
+    let opened = AliasCheck::new().resolve(path.as_key())?;
+    crate::commands::scope::ensure_path_in_scope(opened.as_deref().unwrap_or(path.as_key()))?;
 
     inventory_utils::add_changes_to_inventory(&path).await?;
 
@@ -51,7 +55,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 /// directory, so each test holds it through a working-tree warehouse.
 #[cfg(all(test, unix))]
 mod tests {
-    use forklift_core::util::alias_utils::AliasCheck;
+    use super::AliasCheck;
     use crate::test_support::Warehouse;
 
     /// Whether the working directory's volume opens a name spelled in another case.

@@ -55,9 +55,13 @@ impl Warehouse {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_in(&self.root, args)
+    }
+
+    fn run_in(&self, dir: &Path, args: &[&str]) -> Output {
         forklift_command()
             .args(args)
-            .current_dir(&self.root)
+            .current_dir(dir)
             .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
             .env("FORKLIFT_KEYS_DIR", self.home.join("keys"))
             .output()
@@ -639,7 +643,14 @@ impl Warehouse {
     /// The staged lines and the lines not in the inventory a stocktake lists, whitespace collapsed
     /// ("moved: README -> readme").
     fn stocktake(&self) -> (BTreeSet<String>, BTreeSet<String>) {
-        let output = stdout(&self.run_ok(&["stocktake"]));
+        self.stocktake_in(&self.root)
+    }
+
+    /// [`stocktake`](Warehouse::stocktake) of the working tree at `dir`.
+    fn stocktake_in(&self, dir: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
+        let output = self.run_in(dir, &["stocktake"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let output = stdout(&output);
         let section = |heading: &str| -> BTreeSet<String> {
             output.lines()
                 .skip_while(|line| !line.starts_with(heading))
@@ -654,9 +665,15 @@ impl Warehouse {
 
     /// Run each command a refusal offers, from the root, in order.
     fn run_offered(&self, offered: &[Vec<String>]) {
+        self.run_offered_in(&self.root, offered);
+    }
+
+    /// Run each command a refusal offers, from the working tree at `dir`, in order.
+    fn run_offered_in(&self, dir: &Path, offered: &[Vec<String>]) {
         for command in offered {
             let args: Vec<&str> = command.iter().map(String::as_str).collect();
-            self.run_ok(&args);
+            let output = self.run_in(dir, &args);
+            assert!(output.status.success(), "`{}` failed: {}", args.join(" "), stderr(&output));
         }
     }
 
@@ -672,7 +689,8 @@ const STAGES_EVERYTHING: &str = "That stages every change in the working tree, n
     edits and untracked files included: check \"forklift stocktake\" before stacking.";
 
 /// The commands a refusal offers ("From the working tree's root, run "forklift a", then
-/// "forklift b"."), each split into its arguments. "forklift stocktake" is a check, not a remedy.
+/// "forklift b"."), each split into its arguments as a POSIX shell reads them. "forklift
+/// stocktake" is a check, not a remedy.
 fn offered_commands(output: &Output) -> Vec<Vec<String>> {
     let stderr = stderr(output);
     let Some((_, offer)) = stderr.split_once("From the working tree's root, run ")
@@ -684,8 +702,31 @@ fn offered_commands(output: &Output) -> Vec<Vec<String>> {
         .skip(1)
         .step_by(2)
         .take_while(|command| command.starts_with("forklift ") && *command != "forklift stocktake")
-        .map(|command| command.split(' ').skip(1).map(str::to_string).collect())
+        .map(|command| shell_words(command).into_iter().skip(1).collect())
         .collect()
+}
+
+/// `command` split into arguments as a POSIX shell reads it: single quotes keep their content
+/// literal, and a backslash outside them keeps the next character.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = command.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' => words.extend(word.take()),
+            '\'' => {
+                let current = word.get_or_insert_with(String::new);
+                current.extend(chars.by_ref().take_while(|&c| c != '\''));
+            }
+            '\\' => word.get_or_insert_with(String::new).extend(chars.next()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+
+    words
 }
 
 /// A named load refused for its spelling: it fails naming the path the volume opens, and offers
@@ -876,4 +917,136 @@ fn park_over_an_unloaded_case_only_rename_leaves_it_an_unstaged_move() {
     warehouse.run_ok(&["park", "pop"]);
     let (staged, _) = warehouse.stocktake();
     assert_eq!(staged, BTreeSet::from(["modified: other".to_string()]));
+}
+
+/// A remedy's paths are shell arguments: a name holding a space is offered quoted, and the
+/// commands, split as a shell splits them, stage only the rename.
+#[test]
+fn a_named_load_remedy_quotes_each_path_for_the_shell() {
+    let warehouse = with_unrelated_work("reach-quoted", &[("My Notes", "n\n")]);
+    warehouse.rename("My Notes", "my notes");
+
+    let loaded = warehouse.run(&["load", "My Notes"]);
+
+    if !warehouse.folds_case() {
+        assert_plain_failure(&loaded);
+        return;
+    }
+    assert!(stderr(&loaded).contains("run \"forklift remove 'My Notes'\", then \"forklift load 'my notes'\"."),
+        "{}", stderr(&loaded));
+    assert_spelling_refused(&loaded, "My Notes", "my notes", &["remove My Notes", "load my notes"]);
+
+    warehouse.run_offered(&offered_commands(&loaded));
+    let (staged, _) = warehouse.stocktake();
+    assert_eq!(staged, BTreeSet::from(["moved: My Notes -> my notes".to_string(), "modified: other".to_string()]));
+}
+
+/// A folder that can be entered but not listed cannot say how a name in it is spelled, so a named
+/// load beneath it is taken as typed, as it was before the spelling was checked.
+#[cfg(unix)]
+#[test]
+fn a_named_load_beneath_a_folder_that_cannot_be_listed_is_taken_as_typed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = Warehouse::new("reach-unlistable", &[("secret/file", "s\n")]);
+    warehouse.write("secret/file", "s2\n");
+    let secret = warehouse.root.join("secret");
+
+    // The owner may enter the folder but not list it.
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o311)).unwrap();
+    if unsafe { libc::geteuid() } == 0 {
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    assert!(std::fs::read_dir(&secret).is_err(), "the folder must not be listable");
+
+    let loaded = warehouse.run(&["load", "secret/file"]);
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(loaded.status.success(), "{}", stderr(&loaded));
+    let (staged, _) = warehouse.stocktake();
+    assert_eq!(staged, BTreeSet::from(["modified: secret/file".to_string()]));
+}
+
+/// Sharing a fold key only proposes a member of the pair. A live name the volume keeps apart
+/// (`straße` beside `strasse` on a volume that folds case but not `ß`) is another file, so the
+/// pair's remedy leaves its unstaged deletion alone.
+#[test]
+fn a_pair_remedy_leaves_a_name_the_volume_keeps_apart() {
+    let warehouse = with_unrelated_work("reach-eszett", &[("Strasse", "s\n"), ("straße", "e\n")]);
+    let names = listed(&warehouse.root);
+    if !warehouse.folds_case() || !names.contains("Strasse") || !names.contains("straße") {
+        return;
+    }
+    std::fs::remove_file(warehouse.root.join("straße")).unwrap();
+    warehouse.rename("Strasse", "strasse");
+
+    let loaded = warehouse.run(&["load", "Strasse"]);
+
+    assert_spelling_refused(&loaded, "Strasse", "strasse", &["remove Strasse", "load strasse"]);
+    warehouse.run_offered(&offered_commands(&loaded));
+    let (staged, unstaged) = warehouse.stocktake();
+    assert_eq!(staged, BTreeSet::from(["moved: Strasse -> strasse".to_string(), "modified: other".to_string()]));
+    assert!(unstaged.contains("removed: straße"), "the deletion stays unstaged: {:?}", unstaged);
+}
+
+/// A path inside another working tree is refused as that, under any spelling: the spelling
+/// refusal never offers a load the nested-working-tree refusal would then turn down.
+#[test]
+fn a_named_load_into_another_working_tree_is_refused_as_that_under_any_spelling() {
+    let warehouse = Warehouse::new("reach-nested", &[("app", "a\n")]);
+    warehouse.write("sub/x", "x\n");
+    std::fs::create_dir(warehouse.root.join("sub/.forklift")).unwrap();
+
+    let loaded = warehouse.run(&["load", "Sub/x"]);
+
+    if !warehouse.folds_case() {
+        assert_plain_failure(&loaded);
+        return;
+    }
+    assert!(!loaded.status.success(), "{}", stdout(&loaded));
+    assert!(stderr(&loaded).contains("root of another working tree"), "{}", stderr(&loaded));
+    assert!(!stderr(&loaded).contains(NAMED_SPELLING_REFUSAL), "{}", stderr(&loaded));
+}
+
+/// The warehouse never enters a symlink, so a path beneath one is not respelled inside the link's
+/// target: a load through it goes as it would under its exact spelling, never offering a path
+/// through the link.
+#[cfg(unix)]
+#[test]
+fn a_named_load_through_a_symlink_is_not_respelled_inside_its_target() {
+    let warehouse = Warehouse::new("reach-link", &[("app", "a\n")]);
+    let outside = warehouse.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("file"), "f\n").unwrap();
+    std::os::unix::fs::symlink(&outside, warehouse.root.join("link")).unwrap();
+
+    let typed = warehouse.run(&["load", "link/FILE"]);
+    let exact = warehouse.run(&["load", "link/file"]);
+
+    assert!(!stderr(&typed).contains(NAMED_SPELLING_REFUSAL), "{}", stderr(&typed));
+    assert_eq!(typed.status.success(), exact.status.success(), "{} / {}", stderr(&typed), stderr(&exact));
+}
+
+/// In a scoped bay the scope is judged by the path the volume opens, so a case typo of an in-scope
+/// path meets the spelling refusal (naming the listed path, which loads) rather than being called
+/// out of scope.
+#[test]
+fn a_named_load_of_an_in_scope_alias_in_a_scoped_bay_offers_the_listed_spelling() {
+    let warehouse = Warehouse::new("reach-scoped", &[("Docs/a", "a\n"), ("app", "p\n")]);
+    let bay = warehouse.base.join("bay");
+    warehouse.run_ok(&["bay", "add", "scoped", bay.to_str().unwrap(), "--scope", "Docs"]);
+    std::fs::write(bay.join("Docs/a"), "a2\n").unwrap();
+
+    let loaded = warehouse.run_in(&bay, &["load", "DOCS/a"]);
+
+    if !warehouse.folds_case() {
+        assert_plain_failure(&loaded);
+        return;
+    }
+    assert_spelling_refused(&loaded, "DOCS/a", "Docs/a", &["load Docs/a"]);
+
+    warehouse.run_offered_in(&bay, &offered_commands(&loaded));
+    let (staged, _) = warehouse.stocktake_in(&bay);
+    assert_eq!(staged, BTreeSet::from(["modified: Docs/a".to_string()]));
 }

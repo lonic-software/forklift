@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::parser::inventory::inventory_parser;
-use crate::util::{file_utils, inventory_utils};
+use crate::util::{file_utils, inventory_utils, tree_utils};
 
 /// A file's identity as the file system reports it without following a symlink: the same pair the
 /// inventory records (see [`file_utils::get_device_and_inode`]).
@@ -276,39 +276,44 @@ impl AliasCheck {
     /// walk goes on inside that sibling, so an aliased directory does not end it the way it ends
     /// [`occupancy`]. A component that does not resolve, the way [`resolved_identity`] judges it,
     /// makes the path open nothing: a walk continued into an occupant that is now a file meets
-    /// "not a directory" there, which is an absence, not an error.
+    /// "not a directory" there, which is an absence, not an error. So does a path that goes on
+    /// beneath a component that is not a directory (a symlink, which the warehouse never enters,
+    /// or a file), since `lstat` would otherwise judge the rest inside a link's target.
+    ///
+    /// A directory that can be entered but not listed cannot tell which spelling it holds, so its
+    /// component is kept as typed and the walk goes on, as the current directory's respelling
+    /// keeps it (see `warehouse_utils::respell_as_listed`): a path is never refused only because
+    /// its spelling cannot be checked.
     ///
     /// # Returns
     /// * `Ok(Some(String))` - The listed path (`path` itself when every component is listed).
     /// * `Ok(None)`         - If nothing is at the path.
-    /// * `Err(String)`      - If a component could not be read, a directory could not be listed,
-    ///                        or a component resolves to an entry no listed name can be
-    ///                        identified as.
+    /// * `Err(String)`      - If a component could not be read, or resolves to an entry no
+    ///                        listed name can be identified as.
     ///
     /// [`occupancy`]: AliasCheck::occupancy
     pub fn resolve(&mut self, path: &str) -> Result<Option<String>, String> {
         use std::io::ErrorKind;
 
         let mut resolved = String::new();
+        let mut names = path.split('/').filter(|name| !name.is_empty()).peekable();
 
-        for name in path.split('/').filter(|name| !name.is_empty()) {
+        while let Some(name) = names.next() {
             let key = join(&resolved, name);
 
-            match std::fs::symlink_metadata(&key) {
+            let is_dir = match std::fs::symlink_metadata(&key) {
                 Err(error) if matches!(error.kind(),
                     ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::InvalidFilename) => return Ok(None),
                 Err(error) => return Err(format!("Error while getting metadata for path \"{}\": {}", key, error)),
-                Ok(_) => {}
-            }
-
-            let Some(listing) = self.listing(&resolved) else {
-                return Err(format!(
-                    "Could not list the folder \"{}\" to check how \"{}\" is spelled there.",
-                    if resolved.is_empty() { "." } else { &resolved }, name
-                ));
+                Ok(metadata) => metadata.is_dir(),
             };
 
-            if listing.contains(name) {
+            let listed = self.listing(&resolved).is_none_or(|listing| listing.contains(name));
+
+            if listed {
+                if !is_dir && names.peek().is_some() {
+                    return Ok(None);
+                }
                 resolved = key;
                 continue;
             }
@@ -320,6 +325,9 @@ impl AliasCheck {
                 ));
             };
 
+            if !std::fs::symlink_metadata(&occupant).is_ok_and(|metadata| metadata.is_dir()) && names.peek().is_some() {
+                return Ok(None);
+            }
             resolved = occupant;
         }
 
@@ -402,9 +410,18 @@ impl AliasCheck {
     pub fn remedy(&mut self, first: &str, second: &str, nodes: &Nodes) -> Result<Remedy, String> {
         let (parent, name) = first.rsplit_once('/').unwrap_or(("", first));
         let fold = fold_key(name);
-        let members: Vec<(&str, bool)> = nodes.children(parent)
+        let candidates: Vec<(&str, bool)> = nodes.children(parent)
             .filter(|(member, _)| fold_key(member) == fold)
             .collect();
+
+        // Sharing a key only proposes a member: one the volume keeps apart is another file, and
+        // its own work is not this pair's to stage.
+        let mut members = Vec::new();
+        for (member, is_dir) in candidates {
+            if member == name || self.one_entry(first, &join(parent, member))? {
+                members.push((member, is_dir));
+            }
+        }
 
         let listed = match self.resolve(first)? {
             Some(listed) => Some(listed),
@@ -624,9 +641,11 @@ impl Nodes {
     }
 }
 
-/// The one way out of a pair of inventory entries that are one entry on disk.
+/// The one way out of a named load refused for its spelling.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Remedy {
+    /// No pair: load the listed spelling.
+    Load(String),
     /// For a pair of files under a parent whose every component is listed under its own name,
     /// where no live spelling of the pair is a directory above a live entry and the entry on disk,
     /// if any, is not a directory: remove each live spelling that is not listed (one path per
@@ -646,30 +665,57 @@ pub enum Remedy {
 
 impl Remedy {
     /// The remedy as instructions, for an error message. Every command is run from the working
-    /// tree's root.
+    /// tree's root, and every path in it is one shell argument (see [`instructions_when`]).
+    ///
+    /// [`instructions_when`]: Remedy::instructions_when
     pub fn instructions(&self) -> String {
-        match self {
+        self.instructions_when(cfg!(windows))
+    }
+
+    /// [`instructions`] as the platform `windows` says: a path no shell there reads as one
+    /// literal argument becomes `-- <path>`, and the message then names, in order, the paths to
+    /// put in their place.
+    ///
+    /// [`instructions`]: Remedy::instructions
+    fn instructions_when(&self, windows: bool) -> String {
+        let mut unquoted = Vec::new();
+        let mut command = |verb: &str, path: &str| match tree_utils::remedy_path_when(path, windows) {
+            Some(quoted) => format!("\"forklift {} {}\"", verb, quoted),
+            None => {
+                unquoted.push(format!("\"{}\"", path));
+                format!("\"forklift {} -- <path>\"", verb)
+            }
+        };
+
+        let instructions = match self {
+            Remedy::Load(path) => format!("To load it, run {} from the working tree's root.", command("load", path)),
             Remedy::PairScoped { removes, load } => {
-                let commands: Vec<String> = removes.iter().map(|path| format!("\"forklift remove {}\"", path))
-                    .chain(load.iter().map(|path| format!("\"forklift load {}\"", path)))
-                    .collect();
+                let mut commands: Vec<String> = removes.iter().map(|path| command("remove", path)).collect();
+                commands.extend(load.iter().map(|path| command("load", path)));
 
                 format!("From the working tree's root, run {}.", commands.join(", then "))
             }
             Remedy::LoadDirectory(directory) => {
                 let (target, scope) = if directory.is_empty() {
-                    (".".to_string(), "the working tree".to_string())
+                    (".", "the working tree".to_string())
                 } else {
-                    (directory.clone(), format!("\"{}\"", directory))
+                    (directory.as_str(), format!("\"{}\"", directory))
                 };
 
                 format!(
-                    "From the working tree's root, run \"forklift load {}\". That stages every change in {}, \
-                    not only this one, unstaged edits and untracked files included: check \"forklift stocktake\" \
-                    before stacking.",
-                    target, scope
+                    "From the working tree's root, run {}. That stages every change in {}, not only this \
+                    one, unstaged edits and untracked files included: check \"forklift stocktake\" before \
+                    stacking.",
+                    command("load", target), scope
                 )
             }
+        };
+
+        if unquoted.is_empty() {
+            instructions
+        } else {
+            format!("{} In place of each <path>, put {}, in that order, quoted for your shell.",
+                instructions, unquoted.join(", then "))
         }
     }
 }
@@ -820,5 +866,29 @@ mod tests {
             return;
         }
         assert!(verdict.is_err(), "an unreadable entry was answered with a guess: {:?}", verdict);
+    }
+
+    /// Every path a remedy names is one shell argument; where no quoting holds for every shell
+    /// (Windows), the command takes `-- <path>` and the message names the paths in order.
+    #[test]
+    fn a_remedy_names_each_path_as_one_argument() {
+        let pair = Remedy::PairScoped {
+            removes: vec!["My Notes".to_string(), "-x".to_string()],
+            load: Some("my notes".to_string()),
+        };
+
+        assert_eq!(pair.instructions_when(false),
+            "From the working tree's root, run \"forklift remove 'My Notes'\", then \"forklift remove -- -x\", \
+            then \"forklift load 'my notes'\".");
+        assert_eq!(pair.instructions_when(true),
+            "From the working tree's root, run \"forklift remove -- <path>\", then \"forklift remove -- -x\", \
+            then \"forklift load -- <path>\". In place of each <path>, put \"My Notes\", then \"my notes\", in \
+            that order, quoted for your shell.");
+        assert_eq!(Remedy::Load("a b".to_string()).instructions_when(false),
+            "To load it, run \"forklift load 'a b'\" from the working tree's root.");
+        assert!(Remedy::LoadDirectory("a b".to_string()).instructions_when(false)
+            .starts_with("From the working tree's root, run \"forklift load 'a b'\". That stages every change in \"a b\""));
+        assert!(Remedy::LoadDirectory(String::new()).instructions_when(true)
+            .starts_with("From the working tree's root, run \"forklift load .\". That stages every change in the working tree"));
     }
 }
