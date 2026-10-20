@@ -879,7 +879,7 @@ fn resolve_subtree_classified(root_tree_hash: &str, path: &[&str]) -> Result<Opt
 /// The trust-pin-relevant slice of the office record: every key's own `distrust_boundary` — the
 /// only thing [`collect_trust_pin_roots`] consumes from the office chain, never a user record (F5,
 /// PR #120 round 2 — see [`collect_trust_pin_roots`]'s own doc comment for why that matters).
-/// Walks `.forklift/tracked/keys` directly ([`resolve_subtree_classified`] returns `Ok(None)` for
+/// Walks `.forklift/tracked/keys` and every folder under it directly ([`resolve_subtree_classified`] returns `Ok(None)` for
 /// a missing component, per its shared [`resolve_subtree`] counterpart) rather than
 /// [`read_office_state`]'s full users-and-keys parse. Classified per [`OfficeReadErrorKind`] so
 /// [`collect_trust_pin_roots`]'s `Tolerate` branch can word its remedy correctly (F4, same round).
@@ -889,24 +889,43 @@ fn read_trust_pin_keys() -> Result<Vec<KeyRecord>, OfficeReadError> {
 
     let parcel = load_object_classified(&head, object_utils::parse_local_parcel_bytes)?;
 
-    let Some(keys_tree) = resolve_subtree_classified(
-        &parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, TREE_NAME_KEYS],
+    let Some(tracked) = resolve_subtree_classified(
+        &parcel.tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED],
     )? else {
+        return Ok(Vec::new());
+    };
+
+    // A `keys` file instead of a folder would otherwise read as "no keys" and drop every pin.
+    if tracked.get_files().any(|(name, _)| name == TREE_NAME_KEYS) {
+        return Err(OfficeReadError::other(format!(
+            "The office parcel {} holds a file {}, but {} is a folder of key records. Forklift \
+            never writes a file there, so this office may have been tampered with.",
+            head, TREE_NAME_KEYS, TREE_NAME_KEYS)));
+    }
+
+    let Some(keys_hash) = tracked.get_subtrees()
+        .find(|(name, _)| name.as_str() == TREE_NAME_KEYS)
+        .map(|(_, item)| item.hash.clone()) else {
         return Ok(Vec::new());
     };
 
     let mut keys = Vec::new();
 
-    // File names are deliberately not checked against the records here, unlike in
+    // File names and folder shape are deliberately not checked here, unlike in
     // `read_office_state_of`: this reader only gathers pins that keep history alive, so a
-    // misfiled record's pins are kept (the union of every record's) rather than the office
-    // refused — judging the office's integrity is the verifying readers' job.
-    for (_, file) in keys_tree.get_files() {
-        let record = load_object_classified(&file.hash, parse_record_bytes)?;
-        keys.push(parse_key_record(&record).map_err(|e| OfficeReadError {
-            kind: OfficeReadErrorKind::UnparseableRecord,
-            message: e,
-        })?);
+    // misfiled or nested record's pins are kept (the union of every record's) rather than the
+    // office refused — judging the office's integrity is the verifying readers' job.
+    let mut pending = vec![keys_hash];
+    while let Some(tree_hash) = pending.pop() {
+        let tree = load_object_classified(&tree_hash, object_utils::parse_local_tree_bytes)?;
+        pending.extend(tree.get_subtrees().map(|(_, item)| item.hash.clone()));
+        for (_, file) in tree.get_files() {
+            let record = load_object_classified(&file.hash, parse_record_bytes)?;
+            keys.push(parse_key_record(&record).map_err(|e| OfficeReadError {
+                kind: OfficeReadErrorKind::UnparseableRecord,
+                message: e,
+            })?);
+        }
     }
 
     keys.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
@@ -1093,30 +1112,46 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
         return Ok(OfficeState { users, keys });
     };
 
+    // A `users` or `keys` file instead of a folder would otherwise read as an office with no
+    // such records.
+    if let Some((name, _)) = tracked.get_files()
+        .find(|(name, _)| name.as_str() == TREE_NAME_USERS || name.as_str() == TREE_NAME_KEYS) {
+        return Err(format!(
+            "The office parcel {} holds a file {}, but {} is a folder of records. Forklift never \
+            writes a file there, so this office may have been tampered with.",
+            office_parcel_hash, name, name
+        ));
+    }
+
     for (name, item) in tracked.get_subtrees() {
         let subtree = object_utils::load_tree(&item.hash)?;
 
         if name == TREE_NAME_USERS || name == TREE_NAME_KEYS {
             if let Some((nested, _)) = subtree.get_subtrees().next() {
                 return Err(format!(
-                    "The office parcel {} holds a folder {}/{}, but that folder holds only record \
-                    files. Forklift never writes one there, so this office may have been tampered with.",
-                    office_parcel_hash, name, nested
+                    "The office parcel {} holds a folder {}/{}, but {}/ holds only record files. \
+                    Forklift never writes a folder there, so this office may have been tampered with.",
+                    office_parcel_hash, name, nested, name
                 ));
             }
         }
 
-        // A record that does not parse is named by parcel and file, as a misfiled one is.
+        // A record that cannot be loaded or does not parse is named by parcel and file, as a
+        // misfiled one is.
         let unreadable = |file_name: &str, error: String| format!(
             "The office parcel {} holds a record {}/{} that cannot be read: {}",
+            office_parcel_hash, name, file_name, error
+        );
+        let unparseable = |file_name: &str, error: String| format!(
+            "The office parcel {} holds a record {}/{} that does not parse: {}",
             office_parcel_hash, name, file_name, error
         );
 
         match name.as_str() {
             TREE_NAME_USERS => {
                 for (file_name, file) in subtree.get_files() {
-                    let user = load_record(&file.hash).and_then(|toml| parse_user_record(&toml))
-                        .map_err(|e| unreadable(file_name, e))?;
+                    let toml = load_record(&file.hash).map_err(|e| unreadable(file_name, e))?;
+                    let user = parse_user_record(&toml).map_err(|e| unparseable(file_name, e))?;
                     verify_record_file_name(
                         office_parcel_hash, TREE_NAME_USERS, file_name,
                         &user_record_file_name(&user), &format!("user {}", user.identifier),
@@ -1126,8 +1161,8 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
             }
             TREE_NAME_KEYS => {
                 for (file_name, file) in subtree.get_files() {
-                    let key = load_record(&file.hash).and_then(|toml| parse_key_record(&toml))
-                        .map_err(|e| unreadable(file_name, e))?;
+                    let toml = load_record(&file.hash).map_err(|e| unreadable(file_name, e))?;
+                    let key = parse_key_record(&toml).map_err(|e| unparseable(file_name, e))?;
                     verify_record_file_name(
                         office_parcel_hash, TREE_NAME_KEYS, file_name,
                         &key_record_file_name(&key), &format!("key {}", key.key_id),
@@ -2380,6 +2415,12 @@ pub(crate) mod tests {
         let mut tracked_tree = TreeItem::new(TREE_NAME_TRACKED.to_string(), String::new(), DirEntryType::Tree);
         tracked_tree.add_child(users_tree);
         tracked_tree.add_child(keys_tree);
+
+        plant_tracked(tracked_tree, parents, signer)
+    }
+
+    /// Plant an office parcel over a hand-built `tracked` tree, for shapes no writer produces.
+    fn plant_tracked(mut tracked_tree: TreeItem, parents: Vec<String>, signer: Option<&str>) -> String {
         store_subtree(&mut tracked_tree).unwrap();
 
         let mut forklift_tree = TreeItem::new(TREE_NAME_FORKLIFT.to_string(), String::new(), DirEntryType::Tree);
@@ -2612,8 +2653,76 @@ pub(crate) mod tests {
 
         let planted = plant_office(&[], &[entry("x.toml", "not = [toml".to_string())], Vec::new(), None);
         let error = read_office_state_of(&planted).err().expect("an unparseable record must not read");
-        assert!(error.contains(&planted) && error.contains("keys/x.toml"),
+        assert!(error.contains(&planted) && error.contains("keys/x.toml") && error.contains("does not parse"),
             "the error must name the parcel and the file: {}", error);
+
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `keys` or `users` entry stored as a file rather than a folder is refused, rather than
+    /// read as an office with no such records — on the client path that would remove every key.
+    /// The trust-pin reader refuses a `keys` file too, since it would otherwise drop every pin.
+    #[test]
+    fn a_record_tree_stored_as_a_file_is_refused() {
+        let (scope, dir) = enter_scratch_warehouse("record-tree-file");
+        let (public_key, key_id) = bound_key(7);
+        let record = key_record_for(&public_key, "distrust_boundary = [\"pin-a\"]\n");
+
+        for tree_name in [TREE_NAME_KEYS, TREE_NAME_USERS] {
+            let mut tracked = TreeItem::new(TREE_NAME_TRACKED.to_string(), String::new(), DirEntryType::Tree);
+            tracked.add_child(TreeItem::new(tree_name.to_string(), store_record(&record).unwrap(), DirEntryType::Normal));
+            let planted = plant_tracked(tracked, Vec::new(), None);
+
+            let error = match read_office_state_of(&planted) {
+                Err(e) => e,
+                Ok(_) => panic!("a file {} must not read", tree_name),
+            };
+            assert!(error.contains(&planted) && error.contains(&format!("a file {},", tree_name)),
+                "the error must name the parcel and the file: {}", error);
+
+            let pins = read_trust_pin_keys();
+            if tree_name == TREE_NAME_KEYS {
+                let error = pins.err().expect("the trust-pin reader must refuse a keys file");
+                assert!(error.kind == OfficeReadErrorKind::Other && error.message.contains("a file keys,"),
+                    "the trust-pin reader must name the keys file: {:?}", error.message);
+            } else {
+                assert!(pins.map_err(|e| e.message).unwrap().is_empty(), "a users file holds no pins");
+            }
+        }
+
+        // The domain was non-empty: the same record in a keys folder reads, pins included.
+        plant_office(&[], &[entry(&format!("{}.toml", key_id), record)], Vec::new(), None);
+        assert_eq!(read_trust_pin_keys().map_err(|e| e.message).unwrap().len(), 1);
+
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The trust-pin reader keeps the pins of a record nested in a folder under `keys/`, which
+    /// the verifying reader refuses: the union of every record's pins is the safe side.
+    #[test]
+    fn the_trust_pin_reader_keeps_a_nested_records_pins() {
+        let (scope, dir) = enter_scratch_warehouse("nested-pins");
+        let (public_key, key_id) = bound_key(7);
+
+        let mut nested = TreeItem::new("deeper".to_string(), String::new(), DirEntryType::Tree);
+        nested.add_child(TreeItem::new(
+            format!("{}.toml", key_id),
+            store_record(&key_record_for(&public_key, "distrust_boundary = [\"pin-nested\"]\n")).unwrap(),
+            DirEntryType::Normal,
+        ));
+        store_subtree(&mut nested).unwrap();
+        let mut keys = TreeItem::new(TREE_NAME_KEYS.to_string(), String::new(), DirEntryType::Tree);
+        keys.add_child(nested);
+        store_subtree(&mut keys).unwrap();
+        let mut tracked = TreeItem::new(TREE_NAME_TRACKED.to_string(), String::new(), DirEntryType::Tree);
+        tracked.add_child(keys);
+        plant_tracked(tracked, Vec::new(), None);
+
+        let keys = read_trust_pin_keys().map_err(|e| e.message).unwrap();
+        let pins: Vec<&str> = keys.iter().flat_map(|key| key.distrust_boundary.iter().map(String::as_str)).collect();
+        assert_eq!(pins, vec!["pin-nested"], "the nested record's pins are kept");
 
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
