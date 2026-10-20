@@ -1585,3 +1585,58 @@ fn stack_ignores_a_lost_object_the_head_already_names() {
     warehouse.delete_object(&more[0]);
     assert_eq!(warehouse.run(&["stack", "third"]).status.code(), Some(25));
 }
+
+/// FORK-157 — damage the remedy cannot repair is not reported as lost staged content. A head tree
+/// that cannot be read would otherwise leave every file beneath it looking staged (the staged file
+/// sits inside it, since an unchanged subtree is pruned by hash and never read); a recipe that is
+/// present but unreadable would be "re-stored" by a load that skips writing a hash already there.
+/// Each fails the stack with an error naming the damaged object, not exit 25. Red with the head
+/// tree read made tolerant again (the head arm refuses with exit 25 over `lib/x.txt`).
+#[test]
+fn stack_names_an_unreadable_head_tree_or_recipe_as_itself() {
+    let mut failures = Vec::new();
+
+    for arm in ["head-tree", "recipe"] {
+        let warehouse = Warehouse::new(&format!("unreadable-{}", arm));
+        let before = warehouse.loose_objects();
+        warehouse.stack("lib/x.txt", "x\n", "first");
+        let first_objects: Vec<String> = warehouse.loose_objects().difference(&before).cloned().collect();
+
+        let (damaged, file) = if arm == "head-tree" {
+            let lib_tree = warehouse.scoped(|| first_objects.iter().find(|hash| {
+                forklift_core::util::object_utils::load_tree(hash).is_ok_and(|tree| tree.get_file("x.txt").is_some())
+            }).cloned());
+            let Some(lib_tree) = lib_tree else {
+                failures.push(format!("{}: no tree holding x.txt among {:?}", arm, first_objects));
+                continue;
+            };
+            load_and_name_staged(&warehouse, "lib/wip.txt", b"work in progress\n");
+            (lib_tree, "lib")
+        } else {
+            let staged = load_and_name_staged(&warehouse, "big.bin", &chunkable_content());
+            let recipe = staged.iter()
+                .find(|hash| warehouse.scoped(|| forklift_core::util::object_utils::load_recipe(hash).is_ok()))
+                .cloned();
+            let Some(recipe) = recipe else {
+                failures.push(format!("{}: no recipe among {:?}", arm, staged));
+                continue;
+            };
+            (recipe, "big.bin")
+        };
+
+        let path = warehouse.root.join(".forklift").join("objects").join(&damaged[..2]).join(&damaged[2..]);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"not an object").unwrap();
+
+        let stacked = warehouse.run(&["stack", "second"]);
+        let stderr = String::from_utf8_lossy(&stacked.stderr).to_string();
+        if stacked.status.success() || stacked.status.code() == Some(25) || !stderr.contains(&damaged) || !stderr.contains(file) {
+            failures.push(format!(
+                "{}: the stack must fail naming {} and {}, not as lost staged content; got {:?}: {}",
+                arm, file, damaged, stacked.status.code(), stderr
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

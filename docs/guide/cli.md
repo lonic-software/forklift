@@ -367,7 +367,9 @@ file, its recipe or any of its chunks) — lost after the `load`, say to a crash
 deletion. A parcel signed over it would pass `audit` and fail only at a later `restore`. Loading
 the file again is not enough while it is unchanged on disk, because `load` then stores nothing:
 run `restore --staged` on it, then `load` it again from its working copy. Files the head already
-holds unchanged are not checked here; their content is `audit`'s and `restore`'s to answer for.
+holds unchanged are not checked here; a lost object of theirs surfaces at `restore` (or at
+`audit --full`). A head tree, or a staged large file's recipe, that is in the store but cannot be
+read stops the stack with an error naming it, since neither remedy can repair it.
 
 ### Large files
 
@@ -1129,7 +1131,9 @@ like `stack` commits into a stacked one — so it refuses under the same
 `incomplete_load` guard (see the note under `load` above) if a previous `load`
 never finished cleanly, and under the same `staged_content_missing` refusal (exit 25, see
 `stack`) if the store lost a staged file's content. Here it matters more: the push resets the
-working copy, so a parked parcel naming lost content could never be popped back.
+working copy, so a parked parcel naming lost content could never be popped back. That refusal
+comes after `park` has staged your tracked changes, as `load` would have, so they stay staged
+when it refuses.
 
 ---
 
