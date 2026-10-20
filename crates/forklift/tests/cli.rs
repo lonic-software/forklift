@@ -1540,7 +1540,10 @@ fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_
 
     // The root's shard: a rebuild of it without the old entries would not know x.log is
     // tracked, and the rule would drop it without a staged removal.
-    warehouse.write_file(".forklift/inventory/inv_/data", "not a shard\n");
+    let root_shard = std::path::Path::new(".forklift/inventory")
+        .join(forklift_core::util::file_utils::shard_folder_relative(""))
+        .join("data");
+    warehouse.write_file(root_shard.to_str().unwrap(), "not a shard\n");
     let load = warehouse.run(&["load", "."]);
     assert!(!load.status.success(), "{}", stdout(&load));
     assert!(stderr(&load).contains("cannot be read"), "{}", stderr(&load));

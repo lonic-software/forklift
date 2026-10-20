@@ -2127,14 +2127,28 @@ pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String
 pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
     let file_path = get_inventory_data_path_for_key(key)?;
 
-    // Only NotFound is "no shard": anything else, such as a file where a shard folder belongs,
-    // would otherwise read as a directory with nothing staged.
+    let display_key = if key.is_empty() { "./" } else { key };
+
+    // Only an absent shard is "no shard": anything else, such as a file where a shard folder
+    // belongs, would otherwise read as a directory with nothing staged.
     match std::fs::read(&file_path) {
         Ok(bytes) => Ok((file_path, Some(bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, None)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Windows reports a read through a regular file as not found, so a non-folder in the
+            // shard's folder chain is looked for explicitly.
+            for folder in file_path.ancestors().skip(1).take(3) {
+                if std::fs::symlink_metadata(folder).is_ok_and(|meta| !meta.is_dir()) {
+                    return Err(format!(
+                        "Error while reading the inventory of folder \"{}\": \"{}\" is not a folder.",
+                        display_key, folder.to_string_lossy()
+                    ));
+                }
+            }
+            Ok((file_path, None))
+        }
         Err(e) => Err(format!(
             "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
-            if key.is_empty() { "./" } else { key }, file_path.to_string_lossy(), e
+            display_key, file_path.to_string_lossy(), e
         )),
     }
 }
@@ -3425,6 +3439,40 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keys a volume may fold into one spelling, and keys of any length or depth, get distinct
+    /// shard folders of one fixed shape, spelled in characters no volume folds.
+    #[test]
+    fn shard_folders_are_distinct_for_keys_a_volume_may_fold_together() {
+        let long = "x".repeat(250);
+        let deep = vec!["A"; 200].join("/");
+        let keys = [
+            "", "docs", "Docs", "DOCS", "docs/a", "Docs/a", "caf\u{e9}", "cafe\u{301}", "a", "a.", "a ",
+            "PROGRA~1", "progra~1", "stra\u{df}e", "strasse", &long, &deep,
+        ];
+
+        let folders: Vec<String> = keys.iter()
+            .map(|key| shard_folder_relative(key).to_string_lossy().into_owned())
+            .collect();
+
+        let folded: BTreeSet<String> = folders.iter().map(|folder| crate::util::alias_utils::fold_key(folder)).collect();
+        assert_eq!(folded.len(), keys.len(), "{:?}", folders);
+
+        for folder in &shard_folder_relative_components(&keys) {
+            let [store, fan_out, shard] = folder.as_slice() else { panic!("{:?}", folder) };
+            assert_eq!(store, FOLDER_NAME_INVENTORY_STORE);
+            assert!(fan_out.len() == 2 && fan_out.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", fan_out);
+            assert!(shard.len() == 62 && shard.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", shard);
+        }
+    }
+
+    fn shard_folder_relative_components(keys: &[&str]) -> Vec<Vec<String>> {
+        keys.iter()
+            .map(|key| shard_folder_relative(key).components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect())
+            .collect()
+    }
 
     /// Where the bit is observable the stat's kind stands; where it is not, a plain file takes
     /// its plain entry's kind, in both directions, and nothing else is projected.

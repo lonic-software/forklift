@@ -34,9 +34,9 @@
 //!
 //! The marker lives beside the inventory metadata file — directly under
 //! [`file_utils::get_path_inventory_root`] (the bay-local staging root), a **sibling** of the
-//! `inv_`-prefixed shard tree, never inside it. Every operation that replaces staging wholesale
-//! or by subtree (`inventory_utils::replace_all_inventories`, `inventory_utils::
-//! replace_subtree_inventories`) removes only that `inv_` subtree specifically — never the
+//! `inv_` shard store, never inside it. Every operation that replaces staging wholesale or by
+//! subtree (`inventory_utils::replace_all_inventories`, `inventory_utils::
+//! replace_subtree_inventories`) removes shards only inside that `inv_` store — never the
 //! inventory root folder itself — so none of them can delete the marker in passing; those same
 //! two functions are also where this module's clearing side of the contract is wired in (see
 //! [`clear_recorded_under`] and [`clear_all_recorded`]).

@@ -4060,6 +4060,115 @@ mod tests {
         assert!(error.contains("has no format header"), "{}", error);
     }
 
+    /// Every shard folder in the store, by path.
+    fn stored_shards() -> BTreeSet<std::path::PathBuf> {
+        let store = file_utils::get_inventory_store_root().unwrap();
+        let mut found = BTreeSet::new();
+
+        for fan_out in std::fs::read_dir(&store).into_iter().flatten() {
+            for shard in std::fs::read_dir(fan_out.unwrap().path()).unwrap() {
+                found.insert(shard.unwrap().path());
+            }
+        }
+
+        found
+    }
+
+    /// The shard folder of every registered key.
+    fn registered_shards() -> BTreeSet<std::path::PathBuf> {
+        let (_, metadata) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        metadata.unwrap_or_default().iter()
+            .map(|entry| file_utils::get_inventory_folder_for_key(metadata_entry_to_key(entry)).unwrap())
+            .collect()
+    }
+
+    /// A shard no registered key addresses: written, never registered.
+    fn plant_ghost() {
+        write_stamped_shard("ghost", None);
+        assert!(stored_shards().contains(&file_utils::get_inventory_folder_for_key("ghost").unwrap()));
+    }
+
+    /// After a subtree removal, the store holds exactly the registered keys' shards, so a key
+    /// registered later never reads a shard left over from before.
+    fn assert_only_registered_shards_remain() {
+        assert_eq!(stored_shards(), registered_shards());
+        assert!(file_utils::retrieve_inventory_or_none_by_key("ghost").unwrap().1.is_none());
+    }
+
+    #[test]
+    fn replacing_a_subtree_leaves_only_registered_shards_in_the_store() {
+        let _scratch = Scratch::new("sweep-replace-subtree");
+        stamped_chain_with_sibling();
+        plant_ghost();
+
+        let mut replacement = Inventory::new();
+        replacement.add_item(item("new.txt", 9, InventoryItemState::Normal));
+        replace_subtree_inventories("a", &BTreeMap::from([("a".to_string(), replacement)])).unwrap();
+
+        assert!(!file_utils::get_inventory_folder_for_key("a/b").unwrap().exists(), "a/b was replaced away");
+        assert_only_registered_shards_remain();
+    }
+
+    #[test]
+    fn removing_inventories_under_a_key_leaves_only_registered_shards_in_the_store() {
+        let _scratch = Scratch::new("sweep-remove-under");
+        stamped_chain_with_sibling();
+        plant_ghost();
+
+        remove_inventories_under("a").unwrap();
+
+        assert!(!file_utils::get_inventory_folder_for_key("a/b").unwrap().exists());
+        assert_only_registered_shards_remain();
+    }
+
+    #[test]
+    fn a_stack_cleanup_that_unregisters_a_key_leaves_only_registered_shards_in_the_store() {
+        let _scratch = Scratch::new("sweep-cleanup");
+
+        let mut root = Inventory::new();
+        root.add_item(item("kept.txt", 1, InventoryItemState::Normal));
+        save_inventory(&root, &file_utils::get_inventory_data_path_for_key("").unwrap()).unwrap();
+
+        let mut emptied = Inventory::new();
+        emptied.add_item(item("removed.txt", 2, InventoryItemState::Deleted));
+        save_inventory(&emptied, &file_utils::get_inventory_data_path_for_key("a").unwrap()).unwrap();
+
+        let metadata: BTreeSet<String> = ["", "a"].iter().map(|key| key_to_metadata_entry(key)).collect();
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+        plant_ghost();
+
+        let prepared = prepare_stack_inventory(None).unwrap();
+        cleanup_after_stack_with(&prepared, &BTreeMap::new()).unwrap();
+
+        assert!(!is_tracked_directory("a").unwrap(), "the emptied directory is unregistered");
+        assert_only_registered_shards_remain();
+    }
+
+    #[test]
+    fn replacing_every_inventory_removes_unregistered_shards_too() {
+        let _scratch = Scratch::new("sweep-replace-all");
+        stamped_chain_with_sibling();
+        plant_ghost();
+
+        replace_all_inventories(&BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
+
+        assert_only_registered_shards_remain();
+    }
+
+    /// Where a shard's folder should be, a file is damage, never a directory with nothing staged.
+    #[test]
+    fn a_file_in_place_of_a_shard_folder_is_refused_by_the_key_it_belongs_to() {
+        let _scratch = Scratch::new("shard-folder-is-a-file");
+
+        let folder = file_utils::get_inventory_folder_for_key("docs").unwrap();
+        std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
+        std::fs::write(&folder, b"not a folder").unwrap();
+
+        let error = file_utils::retrieve_inventory_or_none_by_key("docs").unwrap_err();
+        assert!(error.contains("inventory of folder \"docs\""), "{}", error);
+    }
+
     #[test]
     fn replacing_every_inventory_overwrites_a_damaged_metadata_file_without_reading_it() {
         let _scratch = Scratch::new("metadata-damaged-reset");

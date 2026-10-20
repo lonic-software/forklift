@@ -207,3 +207,30 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
 
     Ok(created)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A component the parent lists exactly is kept; one it lists under another spelling of the
+    /// same entry takes the listed spelling; one it lists under no spelling is refused.
+    #[test]
+    fn a_current_directory_is_respelled_as_its_parents_list_it() {
+        let root = std::env::temp_dir().join(format!("forklift-warehouse-respell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs/Sub")).unwrap();
+
+        assert_eq!(respell_as_listed(&root, Path::new("docs/Sub")).unwrap(), Path::new("docs/Sub"));
+        assert_eq!(respell_as_listed(&root, Path::new("")).unwrap(), Path::new(""));
+
+        let folds = root.join("DOCS").exists();
+        if folds {
+            assert_eq!(respell_as_listed(&root, Path::new("DOCS/sub")).unwrap(), Path::new("docs/Sub"));
+        }
+
+        let error = respell_as_listed(&root, Path::new("docs/missing")).unwrap_err();
+        assert!(error.contains("\"missing\" is not listed"), "{}", error);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

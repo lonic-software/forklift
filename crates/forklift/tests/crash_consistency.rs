@@ -992,8 +992,8 @@ fn park_pop_whose_staging_fails_keeps_the_parcel_parked() {
     assert!(area.run(&["park"]).status.success());
     assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file.txt")).unwrap(), "v1\n");
 
-    let shard_folder = find_dir_named(&warehouse.join(".forklift"), "inv_dir0")
-        .expect("dir0 has a shard folder");
+    let shard_folder = shard_folder_of(&warehouse, "dir0");
+    assert!(shard_folder.is_dir(), "dir0 has a shard folder");
 
     std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -1075,22 +1075,10 @@ fn consolidate_whose_action_fails_stages_nothing() {
         "dir0/gone0.txt is an unstaged deletion: {status_json}");
 }
 
-/// The first directory named `name` beneath `root`, searched depth-first.
+/// The shard folder of directory `key` in the staged inventory of `warehouse`.
 #[cfg(unix)]
-fn find_dir_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if entry.file_name() == name {
-            return Some(path);
-        }
-        if let Some(found) = find_dir_named(&path, name) {
-            return Some(found);
-        }
-    }
-    None
+fn shard_folder_of(warehouse: &Path, key: &str) -> PathBuf {
+    warehouse.join(".forklift/inventory").join(forklift_core::util::file_utils::shard_folder_relative(key))
 }
 
 /// Five lines whose first `feature` edits and whose last `main` edits, so the two merge cleanly.
@@ -1340,8 +1328,8 @@ fn consolidate_whose_staging_fails_records_nothing_in_progress() {
     let warehouse = area.warehouse();
     diverged_merge_fixture(&area, 1, false);
 
-    let shard_folder = find_dir_named(&warehouse.join(".forklift"), "inv_dir0")
-        .expect("dir0 has a shard folder");
+    let shard_folder = shard_folder_of(&warehouse, "dir0");
+    assert!(shard_folder.is_dir(), "dir0 has a shard folder");
 
     std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o555)).unwrap();
 
