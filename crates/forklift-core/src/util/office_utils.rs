@@ -801,11 +801,11 @@ pub enum OfficeReadErrorKind {
     /// the record itself.
     UnparseableRecord,
     /// Every object loaded, but the office tree holds a file where Forklift only ever writes a
-    /// folder (`.forklift`, `tracked` or `keys`). The parcel is signed as it is, so neither heal
-    /// nor editing a record changes it. Remedy: roll `@office` back to a good head.
+    /// folder (`.forklift`, `tracked` or `keys`). No record is at fault, so there is no record to
+    /// fix, and heal cannot change the tree. Remedy: roll `@office` back to a good head.
     MalformedOffice,
     /// Any other read failure (a present-but-corrupt object, an I/O error) that does not fit
-    /// either of the two more specific — and more actionable — kinds above.
+    /// any of the three more specific — and more actionable — kinds above.
     Other,
 }
 
@@ -893,8 +893,8 @@ fn resolve_subtree_classified(office_parcel_hash: &str, root_tree_hash: &str, pa
 fn file_in_place_of_folder(office_parcel_hash: &str, path: &[&str]) -> String {
     let path = path.join("/");
     format!(
-        "The office parcel {} holds a file {}, but {} is a folder of records. Forklift never \
-        writes a file there, so this office may have been tampered with.",
+        "The office parcel {} holds a file {}, but {} is a folder. Forklift never writes a \
+        file there, so this office may have been tampered with.",
         office_parcel_hash, path, path
     )
 }
