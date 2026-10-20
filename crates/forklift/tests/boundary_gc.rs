@@ -1591,7 +1591,8 @@ fn stack_ignores_a_lost_object_the_head_already_names() {
 /// sits inside it, since an unchanged subtree is pruned by hash and never read); a recipe that is
 /// present but unreadable would be "re-stored" by a load that skips writing a hash already there.
 /// Each fails the stack with an error naming the damaged object, not exit 25. Red with the head
-/// tree read made tolerant again (the head arm refuses with exit 25 over `lib/x.txt`).
+/// tree read made tolerant again (the head arm stacks over the damage without a word), and with an
+/// unreadable recipe reported as missing (the recipe arm refuses with exit 25 and the false remedy).
 #[test]
 fn stack_names_an_unreadable_head_tree_or_recipe_as_itself() {
     let mut failures = Vec::new();
