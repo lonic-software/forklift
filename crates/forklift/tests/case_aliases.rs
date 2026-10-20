@@ -1009,6 +1009,29 @@ fn a_named_load_into_another_working_tree_is_refused_as_that_under_any_spelling(
     assert!(!stderr(&loaded).contains(NAMED_SPELLING_REFUSAL), "{}", stderr(&loaded));
 }
 
+/// A tracked folder that became another working tree's root is found under the spelling it is
+/// registered by, so a load typing another spelling gets the tracked folder's own way out, which
+/// leaves the folder to the other working tree.
+#[test]
+fn a_named_load_into_a_tracked_folder_turned_working_tree_offers_its_way_out_under_any_spelling() {
+    let warehouse = Warehouse::new("reach-nested-tracked", &[("app", "a\n"), ("sub/x", "x\n")]);
+    std::fs::create_dir(warehouse.root.join("sub/.forklift")).unwrap();
+
+    let loaded = warehouse.run(&["load", "Sub/x"]);
+
+    if !warehouse.folds_case() {
+        assert_plain_failure(&loaded);
+        return;
+    }
+    assert!(!loaded.status.success(), "{}", stdout(&loaded));
+    assert!(stderr(&loaded).contains("but this warehouse tracks it. To leave it to the other working tree, run \
+        \"forklift remove sub\""), "{}", stderr(&loaded));
+
+    warehouse.run_ok(&["remove", "sub"]);
+    warehouse.run_ok(&["stack", "leave sub"]);
+    assert!(warehouse.root.join("sub/x").exists(), "the folder's files stay on disk");
+}
+
 /// The warehouse never enters a symlink, so a path beneath one is not respelled inside the link's
 /// target: a load through it goes as it would under its exact spelling, never offering a path
 /// through the link.

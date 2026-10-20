@@ -284,12 +284,13 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// leave the marker in place; `stack` and `park` refuse while any is.
 ///
 /// # Arguments
-/// * `path` - The path of the file or directory to add to the inventory.
+/// * `path`  - The path of the file or directory to add to the inventory.
+/// * `check` - The load's alias check: listings it has already read are not read again.
 ///
 /// # Returns
 /// * `Ok(())`      - If the operation was successful.
 /// * `Err(String)` - If there was an error.
-pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String> {
+pub async fn add_changes_to_inventory(path: &WarehousePath, check: &mut alias_utils::AliasCheck) -> Result<(), String> {
     // The walk skips the metadata folder by its exact name, but a named path is loaded whatever
     // the rules say, so refuse it here. Every spelling some file system opens as a metadata
     // folder (`.Forklift`, `.forklift.`, `FORKLI~1`) is refused, in any component, and so is a
@@ -308,11 +309,15 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
         None => {}
     }
 
+    // The path the volume opens, so a directory this warehouse registers is found under the
+    // spelling it is registered by, whatever spelling was typed.
+    let opened = check.resolve(path.as_key())?;
+
     // A named path never meets the walk's nested-working-tree boundary as an entry of its parent
     // (`load sub` walks from `sub` itself, and `load sub/x` does not walk), so test every
     // directory down to it here.
     if !path.is_root() {
-        let full = path.as_key();
+        let full = opened.as_deref().unwrap_or(path.as_key());
         let ends = full.match_indices('/').map(|(end, _)| end).chain(std::iter::once(full.len()));
 
         for end in ends {
@@ -336,7 +341,7 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
     }
 
     // After the nested-working-tree test: a load it refuses under any spelling is never offered.
-    refuse_unlisted_spelling(path.as_key())?;
+    refuse_unlisted_spelling(path.as_key(), opened, check)?;
 
     let is_directory = file_utils::is_directory(&path.to_fs_path())?;
 
@@ -358,11 +363,9 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
 /// volume opens instead and the one way to stage it: if that path or a directory above it is one
 /// entry with something the inventory holds live, the pair's own remedy (loading the listed path
 /// alone would leave the pair), otherwise loading the listed path. A path that opens nothing is
-/// left to the load's own error.
-fn refuse_unlisted_spelling(key: &str) -> Result<(), String> {
-    let mut check = alias_utils::AliasCheck::new();
-
-    let Some(listed) = check.resolve(key)? else {
+/// left to the load's own error. `opened` is what `check` resolved `key` to.
+fn refuse_unlisted_spelling(key: &str, opened: Option<String>, check: &mut alias_utils::AliasCheck) -> Result<(), String> {
+    let Some(listed) = opened else {
         return Ok(());
     };
 

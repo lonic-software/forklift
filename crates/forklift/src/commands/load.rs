@@ -20,10 +20,12 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     // confusing "not in the inventory" (or a silent no-op) — refuse it clearly instead (§7.6).
     // The scope is judged by the path the volume opens, so a case or normalization alias of an
     // in-scope path meets the spelling refusal, which names the listed path, not this one.
-    let opened = AliasCheck::new().resolve(path.as_key())?;
+    // One check serves the whole load, so no directory is listed twice.
+    let mut check = AliasCheck::new();
+    let opened = check.resolve(path.as_key())?;
     crate::commands::scope::ensure_path_in_scope(opened.as_deref().unwrap_or(path.as_key()))?;
 
-    inventory_utils::add_changes_to_inventory(&path).await?;
+    inventory_utils::add_changes_to_inventory(&path, &mut check).await?;
 
     output::emit(&Loaded { path: path.as_key().to_string() });
 
