@@ -3330,4 +3330,41 @@ mod tests {
 
         assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &linked).is_ok());
     }
+
+    /// FORK-74, at the site the client and `audit` rely on: a writer's office parcel that
+    /// keeps the admin's key id but swaps in the writer's own public key is refused by
+    /// `verify_office_chain`. Before the fix the chain verified, and the resulting state
+    /// resolved the admin's key id to the writer's key — so the writer's signatures would be
+    /// attributed to the admin. (`verify_office_privileges` also refused it, through
+    /// `verify_key_permanence`, but only the server and Lambda heads run that check.)
+    #[test]
+    fn an_office_parcel_rebinding_a_key_id_to_another_public_key_is_refused() {
+        let fixture = PrivilegeFixture::new("rebind-key-id");
+        let (bob_key_id, admitted_head) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        // The domain is non-empty: the admitted chain itself verifies.
+        assert!(verify_office_chain(&fixture.anchor, &admitted_head).is_ok());
+
+        let mut state = crate::util::office_utils::read_office_state().unwrap();
+        let bob_public = state.find_key(&bob_key_id).unwrap().public_key.clone();
+        let admin_key = state.keys.iter_mut()
+            .find(|key| key.key_id == fixture.admin_key_id)
+            .expect("the admin's root key is tracked");
+        admin_key.public_key = bob_public;
+
+        let hostile = crate::util::office_utils::stack_office_parcel(
+            &state, &bob, "rebind the admin's key id".to_string(), &bob_key_id, office_head().as_deref()
+        ).unwrap();
+
+        let error = match verify_office_chain(&fixture.anchor, &hostile) {
+            Err(e) => e,
+            Ok(_) => panic!("a key id rebound to another public key must not verify"),
+        };
+        assert!(error.contains(&fixture.admin_key_id), "the error must name the key: {}", error);
+        assert!(error.contains(&bob_key_id),
+            "the error must name the id the public key really has: {}", error);
+    }
 }
