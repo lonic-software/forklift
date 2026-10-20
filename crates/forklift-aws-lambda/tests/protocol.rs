@@ -643,7 +643,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
         }
     }
 
-    let (office_head, by_worker, by_admin) = {
+    let (office_head, by_worker, by_admin, demotion) = {
         let _keys = KeysDirScope(std::env::var("FORKLIFT_KEYS_DIR").ok());
         std::env::set_var("FORKLIFT_KEYS_DIR", area.path("keys"));
         let _scope = StorageRootScope::enter(&area.path("wh"));
@@ -667,7 +667,21 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
             .expect("sign the promotion")
         };
 
-        (office_head.clone(), sign(worker, &worker_key), sign("tester@forklift", &admin_key))
+        let (by_worker, by_admin) = (sign(worker, &worker_key), sign("tester@forklift", &admin_key));
+
+        // The admin demoting the worker again, on top of the worker's own promotion.
+        let mut demoted = state.clone();
+        demoted.users.iter_mut().find(|user| user.identifier == worker).unwrap().role = office_utils::Role::Writer;
+        let admin = forklift_core::model::operator::Operator {
+            name: "tester@forklift".to_string(),
+            identifier: "tester@forklift".to_string(),
+        };
+        let demotion = office_utils::build_and_sign_office_parcel(
+            &demoted, &admin, "demote the worker".to_string(), &admin_key, vec![by_worker.clone()]
+        )
+        .expect("sign the demotion");
+
+        (office_head.clone(), by_worker, by_admin, demotion)
     };
 
     let harvest = harvest(&area.path("wh"));
@@ -691,6 +705,34 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
     assert!(err.message.contains("not an admin"), "{}", err.message);
 
     lift(&by_admin).expect("an admin's promotion");
+
+    // The worker's promotion planted past the head, as a store written before the check would
+    // hold it: the admin's legitimate demotion on top is refused, but the overstep is not the
+    // admin's, so it is a 422 and not a 403.
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest);
+    head.put_trust(&harvest.trust.clone().expect("trust")).expect("put trust");
+    head.ref_update(&office_wire, &RefUpdateRequest { old_head: None, new_head: office_head.clone() })
+        .expect("lift the admitted office");
+    let trust = head.refs.get_trust().expect("read trust");
+    assert!(matches!(
+        head.refs.compare_and_set_head(
+            pallet_utils::PalletNamespace::Meta,
+            OFFICE_PALLET_NAME,
+            Some(&office_head),
+            &by_worker,
+            OfficePrecondition::NotConsumed,
+            trust.as_ref().map(|(_, raw)| raw.as_str()),
+        ),
+        Ok(CasOutcome::Committed)
+    ));
+
+    let err = head.ref_update(&office_wire, &RefUpdateRequest {
+        old_head: Some(by_worker.clone()),
+        new_head: demotion,
+    })
+    .expect_err("a demotion on top of a held overstep");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
 }
 
 /// On a trusted warehouse, a user-pallet lift before the office is lifted is refused: the
