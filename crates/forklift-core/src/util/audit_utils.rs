@@ -123,7 +123,10 @@ fn verify_new_key_endorsements(previous: Option<&OfficeState>,
 
     for key in &current.keys {
         if previous.map_or(false, |state| state.find_key(&key.key_id).is_some()) {
-            continue; // Not new; immutability is enforced by the privilege check.
+            // Not new. Its id is bound to the public key endorsed when it was added (the
+            // office reader recomputes it), but its other fields are held immutable only by
+            // `verify_key_permanence`, which this chain walk does not run.
+            continue;
         }
 
         let user = current.find_user(&key.operator).ok_or(format!(

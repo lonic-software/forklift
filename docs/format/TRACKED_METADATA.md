@@ -301,6 +301,12 @@ issued_at = 1782205234
 retired_at = 1782206000    # absent while the key is active
 ```
 
+Readers recompute `key_id` from `public_key` and refuse a record where the two disagree:
+every lookup goes by key id, while the endorsement and proof-of-possession sign only the
+public key, so the id must be derived rather than trusted. An office tree holding two
+record files for one key id, or for one user identifier, is likewise refused, naming both
+files. File names are not otherwise checked against the records they hold.
+
 Retired keys are **retained forever**: they still verify the parcels that were signed
 while they were active. The private halves never enter the warehouse; they live in the
 operator's `~/.forklift-keys/<key-id>.key` (mode 0600, `FORKLIFT_KEYS_DIR` overrides
