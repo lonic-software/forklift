@@ -2333,9 +2333,9 @@ pub fn replace_subtree_inventories(key: &str,
 
     write_metadata_to_file(&metadata_path, &metadata)?;
 
-    sweep_unregistered_shards()?;
-
     load_guard_utils::clear_recorded_under(key);
+
+    sweep_unregistered_shards();
 
     Ok(())
 }
@@ -2506,7 +2506,9 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
 
     update_inventory_metadata(&BTreeSet::new(), &removed_keys)?;
 
-    sweep_unregistered_shards()
+    sweep_unregistered_shards();
+
+    Ok(())
 }
 
 /// Remove every inventory shard at or under a warehouse path prefix, dropping those keys from
@@ -2555,19 +2557,33 @@ pub fn remove_inventories_under(prefix: &str) -> Result<(), String> {
 
     update_inventory_metadata(&BTreeSet::new(), &removed_keys)?;
 
-    sweep_unregistered_shards()
+    sweep_unregistered_shards();
+
+    Ok(())
 }
 
-/// Remove the shard folder of `key`, if there is one. Folders are flat, so this removes no other
-/// key's shard.
+/// Remove the shard folder of `key`, if there is one, or whatever non-folder occupies its slot.
+/// Folders are flat, so this removes no other key's shard.
 fn remove_shard_folder(key: &str) -> Result<(), String> {
     let folder = file_utils::get_inventory_folder_for_key(key)?;
 
-    match std::fs::remove_dir_all(&folder) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!(
-            "Error while removing the inventory of folder \"{}\": {}", load_guard_utils::display_path(key), e
-        )),
-        _ => Ok(()),
+    remove_store_entry(&folder).map_err(|e| format!(
+        "Error while removing the inventory of folder \"{}\": {}", load_guard_utils::display_path(key), e
+    ))
+}
+
+/// Remove one entry of the shard store: a folder with everything in it, or a file or link in a
+/// folder's place. An entry already gone is not an error.
+fn remove_store_entry(path: &Path) -> std::io::Result<()> {
+    let removed = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) => Err(e),
+    };
+
+    match removed {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -2581,59 +2597,43 @@ fn remove_shard_folder(key: &str) -> Result<(), String> {
 /// by then. Nothing staged is lost: the key was not registered before the failed load, so the next
 /// load rebuilds its shard from the disk.
 ///
-/// # Returns
-/// * `Ok(())`      - If every unregistered shard folder is gone.
-/// * `Err(String)` - If the metadata or the store could not be read, or a folder not removed.
-fn sweep_unregistered_shards() -> Result<(), String> {
-    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
+/// Best-effort, and always its caller's last step: by the time it runs the caller's own change
+/// has landed, so failing the command would leave the state cleared after it (a recorded merge, a
+/// load marker, a narrowed subtree's files) behind for nothing. An entry it cannot read or remove
+/// stays where it is, as every ghost does until a sweep reaches it, and the next subtree removal
+/// tries again.
+fn sweep_unregistered_shards() {
+    let Ok((_, metadata_opt)) = file_utils::retrieve_inventory_metadata_or_none() else {
+        return;
+    };
 
     let registered: BTreeSet<(String, String)> = metadata_opt.unwrap_or_default().iter()
         .map(|entry| file_utils::shard_address(metadata_entry_to_key(entry)))
         .collect();
 
-    let store_root = file_utils::get_inventory_store_root()?;
-
-    let read = |folder: &Path| -> Result<Vec<std::fs::DirEntry>, String> {
-        match std::fs::read_dir(folder) {
-            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Error while reading directory \"{}\": {}", folder.to_string_lossy(), e)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(format!("Error while reading directory \"{}\": {}", folder.to_string_lossy(), e)),
-        }
+    let Ok(store_root) = file_utils::get_inventory_store_root() else {
+        return;
     };
 
-    for fan_out in read(&store_root)? {
+    let read = |folder: &Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(folder).map(|entries| entries.filter_map(Result::ok).collect()).unwrap_or_default()
+    };
+
+    for fan_out in read(&store_root) {
         if !fan_out.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
 
         let fan_out_name = fan_out.file_name().to_string_lossy().into_owned();
 
-        for shard in read(&fan_out.path())? {
+        for shard in read(&fan_out.path()) {
             let address = (fan_out_name.clone(), shard.file_name().to_string_lossy().into_owned());
 
-            if registered.contains(&address) {
-                continue;
-            }
-
-            let path = shard.path();
-            let removed = if shard.file_type().is_ok_and(|kind| kind.is_dir()) {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-
-            if let Err(e) = removed {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(format!(
-                        "Error while removing the unregistered inventory shard \"{}\": {}", path.to_string_lossy(), e
-                    ));
-                }
+            if !registered.contains(&address) {
+                let _ = remove_store_entry(&shard.path());
             }
         }
     }
-
-    Ok(())
 }
 
 /// Carry over the entries of the previous inventory that were not re-added by the directory
@@ -4153,6 +4153,88 @@ mod tests {
 
         replace_all_inventories(&BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
 
+        assert_only_registered_shards_remain();
+    }
+
+    /// An unregistered entry the sweep cannot remove: a folder inside a fan-out folder nobody may
+    /// write to. Returns the fan-out folder, to make writable again before the scratch is dropped.
+    #[cfg(unix)]
+    fn plant_unremovable_ghost() -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Not hex, so no key's shard ever lands in it.
+        let fan_out = file_utils::get_inventory_store_root().unwrap().join("zz");
+        std::fs::create_dir_all(fan_out.join("ghost")).unwrap();
+        std::fs::set_permissions(&fan_out, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        fan_out
+    }
+
+    #[cfg(unix)]
+    fn make_writable(folder: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The sweep runs after the replacement has landed, so an entry it cannot remove must not fail
+    /// the command or leave the load marker over a subtree that was just rebuilt.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_that_cannot_remove_an_entry_still_clears_the_replaced_subtrees_load_marker() {
+        let _scratch = Scratch::new("sweep-blocked-replace");
+        stamped_chain_with_sibling();
+
+        let batch = file_utils::WriteBatch::new();
+        load_guard_utils::stage_start_marker(&batch, "a").unwrap();
+        batch.finish().unwrap();
+        assert!(load_guard_utils::check_no_incomplete_load().is_err(), "the marker is recorded");
+
+        let fan_out = plant_unremovable_ghost();
+
+        let mut replacement = Inventory::new();
+        replacement.add_item(item("new.txt", 9, InventoryItemState::Normal));
+        let result = replace_subtree_inventories("a", &BTreeMap::from([("a".to_string(), replacement)]));
+
+        let ghost_survived = fan_out.join("ghost").exists();
+        make_writable(&fan_out);
+
+        result.expect("a sweep failure must not fail a replacement that has landed");
+        assert!(load_guard_utils::check_no_incomplete_load().is_ok(), "the rebuilt subtree's marker is cleared");
+        assert!(ghost_survived || unsafe { libc::geteuid() } == 0, "the sweep was really blocked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_that_cannot_remove_an_entry_does_not_fail_a_subtree_removal() {
+        let _scratch = Scratch::new("sweep-blocked-remove-under");
+        stamped_chain_with_sibling();
+        let fan_out = plant_unremovable_ghost();
+
+        let result = remove_inventories_under("a");
+
+        let ghost_survived = fan_out.join("ghost").exists();
+        make_writable(&fan_out);
+
+        result.expect("a sweep failure must not fail a removal that has landed");
+        assert!(!is_tracked_directory("a").unwrap());
+        assert!(ghost_survived || unsafe { libc::geteuid() } == 0, "the sweep was really blocked");
+    }
+
+    /// A registered key whose slot holds a file instead of a folder is removed like an unregistered
+    /// one, so the damage does not block `narrow` or `restore --staged` over that subtree.
+    #[test]
+    fn removing_a_registered_key_removes_a_file_in_place_of_its_shard_folder() {
+        let _scratch = Scratch::new("remove-registered-file-slot");
+        stamped_chain_with_sibling();
+
+        let folder = file_utils::get_inventory_folder_for_key("a/b").unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::fs::write(&folder, b"not a folder").unwrap();
+
+        remove_inventories_under("a").expect("a file in a registered slot is removable");
+
+        assert!(std::fs::symlink_metadata(&folder).is_err(), "the file in the slot is gone");
         assert_only_registered_shards_remain();
     }
 
