@@ -18,12 +18,14 @@ pub enum Status {
     TemporaryRedirect,
     /// `401` — no valid bearer token was presented (the transport-authentication seam).
     Unauthorized,
-    /// `403` — `audit_utils::verify_office_chain` found an authentic office parcel that its
-    /// signer had no right to make (`OfficeChainError::Unauthorized`, mapped by
-    /// [`HeadError::office_chain`]): a key-permanence violation (`verify_key_permanence` — a
-    /// key removed or altered, or a revocation undone or added without a reason; this one
-    /// binds admins too), or a *signer* who lacked the office role (or self-service right) it
-    /// needed as of that parcel's own signing. An inauthentic chain is a `422` instead. Not a
+    /// `403` — `audit_utils::verify_office_chain` found, in the segment an office lift brings,
+    /// an authentic parcel that its signer had no right to make (`OfficeChainError::Unauthorized`,
+    /// mapped by [`HeadError::office_lift`]): a key-permanence violation (`verify_key_permanence`
+    /// — a key removed or altered, or a revocation undone or added without a reason; this one
+    /// binds admins too), a *signer* who lacked the office role (or self-service right) it
+    /// needed as of that parcel's own signing, or a key endorsed by someone whose authority
+    /// does not cover it. An inauthentic chain, or an overstep that cannot be pinned on the
+    /// lift because the held office does not verify, is a `422` instead. Not a
     /// caller role or grant — this crate has no caller-identity concept to check one against,
     /// so this is never about who transported the request.
     Forbidden,
@@ -98,16 +100,21 @@ impl HeadError {
         HeadError { status: Status::Forbidden, message: message.into() }
     }
 
-    /// An office chain that did not verify: a `403` when a parcel oversteps its signer's
-    /// privileges, a `422` when the chain is not authentic.
-    pub fn office_chain(error: forklift_core::util::audit_utils::OfficeChainError) -> HeadError {
-        use forklift_core::util::audit_utils::OfficeChainError;
+    /// A lifted office chain that did not verify: a `403` when a parcel the lift brings
+    /// oversteps its signer's privileges, a `422` otherwise (see
+    /// `audit_utils::is_lift_overstep`).
+    pub fn office_lift(error: forklift_core::util::audit_utils::OfficeChainError,
+                       anchor: &forklift_core::util::office_utils::TrustAnchor,
+                       held_head: Option<&str>) -> HeadError {
+        use forklift_core::util::audit_utils;
 
-        match error {
-            OfficeChainError::Unauthorized(reason) => HeadError::forbidden(reason),
-            OfficeChainError::Inauthentic(reason) => HeadError::unprocessable(reason),
+        if audit_utils::is_lift_overstep(&error, anchor, held_head) {
+            HeadError::forbidden(error)
+        } else {
+            HeadError::unprocessable(error)
         }
     }
+
 
     /// A `503 Service Unavailable` — a transient refusal (contention, not a moved value).
     pub fn service_unavailable(message: impl Into<String>) -> HeadError {

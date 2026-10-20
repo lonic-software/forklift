@@ -630,11 +630,22 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
     area.forklift("wh", &admit);
 
     // Sign both promotions in process, with the area's own keys. Nothing else in this binary
-    // signs in process; the CLI runs get the variable explicitly.
-    let previous_keys_dir = std::env::var("FORKLIFT_KEYS_DIR").ok();
-    std::env::set_var("FORKLIFT_KEYS_DIR", area.path("keys"));
+    // signs in process, and the CLI runs get the variable explicitly; the guard restores it
+    // even if signing panics.
+    struct KeysDirScope(Option<String>);
+
+    impl Drop for KeysDirScope {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
+                None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
+            }
+        }
+    }
 
     let (office_head, by_worker, by_admin) = {
+        let _keys = KeysDirScope(std::env::var("FORKLIFT_KEYS_DIR").ok());
+        std::env::set_var("FORKLIFT_KEYS_DIR", area.path("keys"));
         let _scope = StorageRootScope::enter(&area.path("wh"));
         let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)
             .expect("read the office head")
@@ -658,11 +669,6 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
 
         (office_head.clone(), sign(worker, &worker_key), sign("tester@forklift", &admin_key))
     };
-
-    match previous_keys_dir {
-        Some(previous) => std::env::set_var("FORKLIFT_KEYS_DIR", previous),
-        None => std::env::remove_var("FORKLIFT_KEYS_DIR"),
-    }
 
     let harvest = harvest(&area.path("wh"));
     let office_wire = format!("@{}", OFFICE_PALLET_NAME);

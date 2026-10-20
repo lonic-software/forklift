@@ -41,11 +41,19 @@ impl std::fmt::Display for OfficeChainError {
 
 impl std::error::Error for OfficeChainError {}
 
+impl OfficeChainError {
+    /// The same class, with its reason rephrased (e.g. prefixed with the parcel it names).
+    fn map_reason(self, rephrase: impl FnOnce(String) -> String) -> OfficeChainError {
+        match self {
+            OfficeChainError::Inauthentic(reason) => OfficeChainError::Inauthentic(rephrase(reason)),
+            OfficeChainError::Unauthorized(reason) => OfficeChainError::Unauthorized(rephrase(reason)),
+        }
+    }
+}
+
 impl From<OfficeChainError> for String {
     fn from(error: OfficeChainError) -> String {
-        match error {
-            OfficeChainError::Inauthentic(message) | OfficeChainError::Unauthorized(message) => message,
-        }
+        error.message().to_string()
     }
 }
 
@@ -64,6 +72,10 @@ impl From<OfficeChainError> for String {
 ///   admins too: keys are retained forever, their records are immutable, and a revocation is
 ///   append-once. The genesis needs no such check.
 ///
+/// An inauthentic chain is reported in preference to an unauthorized one: the walk notes the
+/// first privilege violation and carries on, so a forged parcel anywhere above it is still
+/// found, and the refusal names what is actually wrong with the chain's provenance.
+///
 /// Every caller (the `audit` command, a client adopting or reading the office, and both
 /// server heads on admission) runs this one walk, so history a server admitted and history a
 /// client verifies offline are held to the same rules.
@@ -77,8 +89,11 @@ impl From<OfficeChainError> for String {
 /// * `Err(OfficeChainError::Inauthentic(_))`  - If the chain does not reach the genesis, or
 ///                                              a parcel is unreadable or fails its signature
 ///                                              or endorsement checks.
-/// * `Err(OfficeChainError::Unauthorized(_))` - If a parcel breaks key permanence or exceeds
-///                                              its signer's privileges.
+/// * `Err(OfficeChainError::Unauthorized(_))` - If the chain is authentic, but a parcel
+///                                              breaks key permanence, exceeds its signer's
+///                                              privileges, or adds a key endorsed beyond
+///                                              its authorizer's authority (the first such
+///                                              parcel is named).
 pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, OfficeChainError> {
     use OfficeChainError::{Inauthentic, Unauthorized};
 
@@ -107,6 +122,7 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     chain.reverse();
 
     let mut previous_state: Option<OfficeState> = None;
+    let mut first_unauthorized: Option<String> = None;
 
     for hash in &chain {
         let state = crate::util::office_utils::read_office_state_of(hash).map_err(Inauthentic)?;
@@ -129,17 +145,30 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
                 hash, signature.key_id
             )))?;
 
-        verify_new_key_endorsements(previous_state.as_ref(), &state).map_err(|reason| {
-            Inauthentic(format!("The office parcel {} {}", hash, reason))
-        })?;
+        let endorsed = verify_new_key_endorsements(previous_state.as_ref(), &state)
+            .map_err(|error| error.map_reason(|reason| format!("The office parcel {} {}", hash, reason)));
 
-        if let Some(previous) = &previous_state {
-            verify_parcel_privileges(previous, &state, &signer).map_err(|reason| {
-                Unauthorized(format!("The office parcel {} {}.", hash, reason))
-            })?;
+        let privileged = match &previous_state {
+            Some(previous) => verify_parcel_privileges(previous, &state, &signer)
+                .map_err(|reason| Unauthorized(format!("The office parcel {} {}.", hash, reason))),
+            None => Ok(()),
+        };
+
+        // An inauthentic parcel ends the walk; an unauthorized one is noted and the walk goes
+        // on, so a forgery above it still takes precedence.
+        for outcome in [endorsed, privileged] {
+            match outcome {
+                Ok(()) => {}
+                Err(Unauthorized(reason)) => { first_unauthorized.get_or_insert(reason); }
+                Err(inauthentic) => return Err(inauthentic),
+            }
         }
 
         previous_state = Some(state);
+    }
+
+    if let Some(reason) = first_unauthorized {
+        return Err(Unauthorized(reason));
     }
 
     Ok(previous_state.expect("the chain contains at least the genesis"))
@@ -189,11 +218,61 @@ fn verify_parcel_privileges(previous: &OfficeState,
 /// * `current`  - The office state the parcel records.
 ///
 /// # Returns
-/// * `Ok(())`      - If every new key is properly endorsed.
-/// * `Err(String)` - The reason a key is not (phrased to follow "The office parcel X").
+/// * `Ok(())`                                 - If every new key is properly endorsed.
+/// * `Err(OfficeChainError::Inauthentic(_))`  - If a key's proofs do not hold up (phrased
+///                                              to follow "The office parcel X").
+/// * `Err(OfficeChainError::Unauthorized(_))` - If a key is properly signed, but endorsed by
+///                                              someone whose authority does not cover it.
 fn verify_new_key_endorsements(previous: Option<&OfficeState>,
-                               current: &OfficeState) -> Result<(), String> {
-    use crate::util::office_utils::{key_endorsement_payload, key_pop_payload, Role};
+                               current: &OfficeState) -> Result<(), OfficeChainError> {
+    use crate::util::office_utils::Role;
+
+    // The scope check is the one privilege rule here: every other failure is a proof that
+    // does not hold up.
+    verify_new_key_proofs(previous, current).map_err(OfficeChainError::Inauthentic)?;
+
+    for key in &current.keys {
+        if previous.map_or(false, |state| state.find_key(&key.key_id).is_some()) {
+            continue;
+        }
+
+        let authorized_by = &key.authorized_by;
+
+        // Present and of a tracked user: the proofs above established both.
+        let authorizer = current.find_key(authorized_by).expect("verified by the proofs");
+
+        if authorized_by == &key.key_id || authorizer.operator == key.operator {
+            continue;
+        }
+
+        // A cross-identity authorization (§8.6): only an admin's key may (the scope of a
+        // key-authorization equals the scope of the authorizer's authority).
+        let scope = previous.unwrap_or(current);
+
+        let authorizer_is_admin = scope.find_key(authorized_by)
+            .and_then(|admin_key| scope.find_user(&admin_key.operator))
+            .map(|admin| admin.role == Role::Admin)
+            .unwrap_or(false);
+
+        if !authorizer_is_admin {
+            return Err(OfficeChainError::Unauthorized(format!(
+                "adds key {} for \"{}\" authorized by key {} of \"{}\", who is not \
+                an admin here.",
+                key.key_id, key.operator, authorized_by, authorizer.operator
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// The proofs behind every key a new office state introduces: its identity-root pin, its
+/// proof-of-possession, and an endorsement by a then-active key that, for one of the
+/// operator's own keys, chains to their identity root. Whose authority covers a
+/// cross-identity endorsement is [`verify_new_key_endorsements`]' privilege check.
+fn verify_new_key_proofs(previous: Option<&OfficeState>,
+                         current: &OfficeState) -> Result<(), String> {
+    use crate::util::office_utils::{key_endorsement_payload, key_pop_payload};
 
     // The identity root pinned in a user record must actually be one of their keys.
     for user in &current.users {
@@ -302,23 +381,6 @@ fn verify_new_key_endorsements(previous: Option<&OfficeState>,
                     "adds key {} whose endorsement chain does not reach the identity \
                     root {}.",
                     key.key_id, root_id
-                ));
-            }
-        } else {
-            // A cross-identity authorization: only an admin's key may (the scope of a
-            // key-authorization equals the scope of the authorizer's authority).
-            let scope = previous.unwrap_or(current);
-
-            let authorizer_is_admin = scope.find_key(authorized_by)
-                .and_then(|admin_key| scope.find_user(&admin_key.operator))
-                .map(|admin| admin.role == Role::Admin)
-                .unwrap_or(false);
-
-            if !authorizer_is_admin {
-                return Err(format!(
-                    "adds key {} for \"{}\" authorized by key {} of \"{}\", who is not \
-                    an admin here.",
-                    key.key_id, key.operator, authorized_by, authorizer.operator
                 ));
             }
         }
@@ -874,6 +936,24 @@ pub fn verify_office_chain_memoized(
     Ok(state)
 }
 
+/// Whether an office lift's refusal is the lifter's own privilege overstep (a `403`) rather
+/// than an office that does not verify (a `422`).
+///
+/// The walk runs from the genesis, so an unauthorized parcel it names could be in the history
+/// the warehouse already held rather than in the lifted segment. The overstep is pinned on the
+/// lift only when the held office verifies on its own, which proves the parcel is new. When it
+/// does not (a held office that is itself bad, or one a regenesis left behind under an earlier
+/// genesis), nothing can be pinned on this lift, and the refusal stays a `422`.
+///
+/// # Arguments
+/// * `error`     - The lifted head's refusal.
+/// * `anchor`    - The trust anchor it was verified against.
+/// * `held_head` - The office head before the lift (`None` for the first office lift).
+pub fn is_lift_overstep(error: &OfficeChainError, anchor: &TrustAnchor, held_head: Option<&str>) -> bool {
+    matches!(error, OfficeChainError::Unauthorized(_))
+        && held_head.map_or(true, |head| verify_office_chain_memoized(anchor, head).is_ok())
+}
+
 /// The memo key: which warehouse, under which anchor, at which office head.
 fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
     format!(
@@ -891,8 +971,9 @@ fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
 /// Take the memo, recovering from a poisoned lock rather than failing.
 ///
 /// A poisoned mutex means some thread panicked while holding it — an internal fault, and
-/// never the caller's doing. Both server heads map a failure of the memoized verification to
-/// `422 Unprocessable`, so returning an error here would tell a client its lift was invalid
+/// never the caller's doing. Both server heads map a failure of the memoized verification to a
+/// client-side refusal (`422`, or `403` for a privilege overstep), so returning an error here
+/// would tell a client its lift was invalid
 /// because the server had a bug. And there is nothing to protect: this is a cache of results
 /// that can always be recomputed. So the poison is cleared, whatever was in the memo is
 /// dropped, and the next verification simply repopulates it.
@@ -2370,7 +2451,10 @@ mod tests {
         let (rogue, rogue_id, rogue_hex) = keypair(9);
         state.keys.push(endorsed_key(ALICE, &rogue, &rogue_id, &rogue_hex, &rogue, &rogue_id));
 
-        let error = verify_new_key_endorsements(None, &state).unwrap_err();
+        let error = match verify_new_key_endorsements(None, &state) {
+            Err(OfficeChainError::Inauthentic(reason)) => reason,
+            other => panic!("expected inauthentic, got {:?}", other),
+        };
         assert!(error.contains("only the identity root"), "{}", error);
         assert!(error.contains(&root_id), "{}", error);
     }
@@ -2392,7 +2476,10 @@ mod tests {
 
         // Tampering with the endorsement is detected.
         current.keys[1].endorsement = "00".repeat(64);
-        let error = verify_new_key_endorsements(Some(&previous), &current).unwrap_err();
+        let error = match verify_new_key_endorsements(Some(&previous), &current) {
+            Err(OfficeChainError::Inauthentic(reason)) => reason,
+            other => panic!("expected inauthentic, got {:?}", other),
+        };
         assert!(error.contains("does not verify"), "{}", error);
     }
 
@@ -2413,7 +2500,10 @@ mod tests {
             ],
         };
 
-        let error = verify_new_key_endorsements(Some(&previous), &current).unwrap_err();
+        let error = match verify_new_key_endorsements(Some(&previous), &current) {
+            Err(OfficeChainError::Inauthentic(reason)) => reason,
+            other => panic!("expected inauthentic, got {:?}", other),
+        };
         assert!(error.contains("does not reach the identity root"), "{}", error);
     }
 
@@ -2454,7 +2544,10 @@ mod tests {
             ],
         };
 
-        let error = verify_new_key_endorsements(Some(&current), &next).unwrap_err();
+        let error = match verify_new_key_endorsements(Some(&current), &next) {
+            Err(OfficeChainError::Unauthorized(reason)) => reason,
+            other => panic!("expected unauthorized, got {:?}", other),
+        };
         assert!(error.contains("not an admin"), "{}", error);
 
         // The same admission endorsed by the admin passes.
@@ -2486,7 +2579,10 @@ mod tests {
             keys: vec![previous.keys[0].clone(), key],
         };
 
-        let error = verify_new_key_endorsements(Some(&previous), &current).unwrap_err();
+        let error = match verify_new_key_endorsements(Some(&previous), &current) {
+            Err(OfficeChainError::Inauthentic(reason)) => reason,
+            other => panic!("expected inauthentic, got {:?}", other),
+        };
         assert!(error.contains("proof-of-possession does not verify"), "{}", error);
     }
 
@@ -2567,7 +2663,10 @@ mod tests {
             ],
         };
 
-        let error = verify_new_key_endorsements(Some(&previous), &current).unwrap_err();
+        let error = match verify_new_key_endorsements(Some(&previous), &current) {
+            Err(OfficeChainError::Inauthentic(reason)) => reason,
+            other => panic!("expected inauthentic, got {:?}", other),
+        };
         assert!(error.contains("revoked at that point"), "{}", error);
     }
 
@@ -2580,7 +2679,10 @@ mod tests {
             keys: vec![state.keys[0].clone()],
         };
 
-        let error = verify_new_key_endorsements(None, &broken).unwrap_err();
+        let error = match verify_new_key_endorsements(None, &broken) {
+            Err(OfficeChainError::Inauthentic(reason)) => reason,
+            other => panic!("expected inauthentic, got {:?}", other),
+        };
         assert!(error.contains("pins identity root"), "{}", error);
     }
 
@@ -3448,7 +3550,7 @@ mod tests {
         const CAROL: &str = "ca401000-0000-4000-8000-0000000ca401";
 
         let fixture = PrivilegeFixture::new("buried-promotion");
-        let (bob_key_id, _) = fixture.admit(
+        let (bob_key_id, bob_admitted) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
         let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
@@ -3472,6 +3574,87 @@ mod tests {
                 assert!(reason.contains("changes user records"), "{}", reason);
             }
             other => panic!("a buried self-promotion must be refused: {:?}", other.err()),
+        }
+
+        // A head pins the overstep on a lift only when the held office verifies without it:
+        // lifting `top` onto a held `hostile` is not the lifter's overstep, while lifting it
+        // onto the clean admission (or as the first office) is.
+        let error = verify_office_chain(&fixture.anchor, &top).err().expect("refused above");
+        assert!(!is_lift_overstep(&error, &fixture.anchor, Some(&hostile)));
+        assert!(is_lift_overstep(&error, &fixture.anchor, Some(&bob_admitted)));
+        assert!(is_lift_overstep(&error, &fixture.anchor, None));
+    }
+
+    /// FORK-220: a forged parcel is reported ahead of an earlier privilege overstep, so a
+    /// chain that is both is refused for its provenance, and never as merely unauthorized.
+    #[test]
+    fn a_forgery_above_a_privilege_violation_is_reported_as_inauthentic() {
+        let fixture = PrivilegeFixture::new("forgery-above-overstep");
+        let (bob_key_id, _) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        let mut promoted = crate::util::office_utils::read_office_state().unwrap();
+        promoted.users.iter_mut().find(|user| user.identifier == BOB).unwrap().role = Role::Admin;
+
+        let overstep = crate::util::office_utils::stack_office_parcel(
+            &promoted, &bob, "bob promotes himself".to_string(), &bob_key_id, office_head().as_deref()
+        ).unwrap();
+        assert!(matches!(verify_office_chain(&fixture.anchor, &overstep), Err(OfficeChainError::Unauthorized(_))));
+
+        // On top, a parcel rebinding the admin's key id to Bob's public key: not authentic.
+        let mut forged = promoted.clone();
+        let bob_public = forged.find_key(&bob_key_id).unwrap().public_key.clone();
+        forged.keys.iter_mut().find(|key| key.key_id == fixture.admin_key_id).unwrap().public_key = bob_public;
+
+        let (users, keys) = crate::util::office_utils::tests::naive_record_entries(&forged);
+        let top = crate::util::office_utils::tests::plant_office(
+            &users, &keys, vec![overstep.clone()], Some(&bob_key_id)
+        );
+
+        let error = verify_office_chain(&fixture.anchor, &top).err().expect("the forgery is refused");
+        match &error {
+            OfficeChainError::Inauthentic(reason) => assert!(reason.contains(&fixture.admin_key_id), "{}", reason),
+            other => panic!("a forgery must be reported as inauthentic: {:?}", other),
+        }
+
+        assert!(!is_lift_overstep(&error, &fixture.anchor, None), "an inauthentic chain is never a 403");
+    }
+
+    /// FORK-220: endorsing another user's key is a privilege, so a key a writer endorsed for
+    /// someone else is refused as unauthorized even when an admin signs the parcel that adds it.
+    #[test]
+    fn a_writer_endorsing_another_users_key_is_refused_as_unauthorized() {
+        const CAROL: &str = "ca401000-0000-4000-8000-0000000ca401";
+
+        let fixture = PrivilegeFixture::new("writer-endorses-carol");
+        let (bob_key_id, _) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let (_, carol_admitted) = fixture.admit(
+            CAROL, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        assert!(verify_office_chain(&fixture.anchor, &carol_admitted).is_ok());
+
+        let (key_id, public_key) = sign_utils::generate_keypair(CAROL).unwrap();
+        let pop = crate::util::office_utils::sign_key_pop(&key_id, &public_key, CAROL).unwrap();
+        let mut state = crate::util::office_utils::read_office_state().unwrap();
+        state.keys.push(crate::util::office_utils::endorse_key(
+            &public_key, CAROL, &bob_key_id, &pop, 1_700_000_002
+        ).unwrap());
+
+        let hostile = crate::util::office_utils::stack_office_parcel(
+            &state, &fixture.admin, "add a key for carol".to_string(), &fixture.admin_key_id, office_head().as_deref()
+        ).unwrap();
+
+        match verify_office_chain(&fixture.anchor, &hostile) {
+            Err(OfficeChainError::Unauthorized(reason)) => {
+                assert!(reason.contains(&hostile), "{}", reason);
+                assert!(reason.contains("who is not an admin here"), "{}", reason);
+            }
+            other => panic!("a writer's endorsement of another user's key must be refused as \
+                unauthorized: {:?}", other.err()),
         }
     }
 }

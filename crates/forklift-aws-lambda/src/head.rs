@@ -728,7 +728,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // The office chain carries the keys; verify it against the anchor, and
                     // that every parcel stayed within its signer's privileges.
                     audit_utils::verify_office_chain_memoized(anchor, &request.new_head)
-                        .map_err(HeadError::office_chain)?;
+                        .map_err(|error| HeadError::office_lift(error, anchor, office_head.as_deref()))?;
                 } else {
                     // Any non-office pallet: audit its new history against the office state.
                     let office_head = office_head.as_deref().ok_or_else(|| {
