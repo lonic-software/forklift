@@ -271,6 +271,14 @@ checked, so the path is taken as typed.)
   folder. That stages every change under that folder, unstaged edits and untracked files included,
   so check `stocktake` before you stack.
 
+The inventory can still come to hold two spellings of one entry, for instance when a folder is
+renamed again after its contents were loaded, or when both spellings are staged and the file is
+then deleted. `stack` and `park` refuse it before recording anything, because no command could
+write such a parcel back on this file system. The refusal names the pair nearest the root and the
+same kind of way out: `forklift remove` for each spelling the folder does not list, then
+`forklift load` of the one it does, or `forklift load .` in the nearest listed folder. Then run
+the command again.
+
 ### `unload` — unstage (`ul`)
 
 ```sh
@@ -935,6 +943,9 @@ a new path lands on before it writes anything:
   written, and the refusal names both entries. Rename one of them on a
   case-sensitive file system. The pair stays valid in the warehouse and
   materializes normally wherever the file system tells the names apart.
+- Leaving such a tree for one that keeps only one spelling never loses the kept
+  file: removing the other spelling deletes the one file both name, so it is
+  written back from the target under the spelling the target keeps.
 - An untracked file reached through another spelling is refused under its own
   name, like any other untracked collision.
 

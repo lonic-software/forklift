@@ -23,6 +23,8 @@ use crate::util::{alias_utils, audit_utils, fanout_utils, file_utils, inventory_
 ///   except the warehouse root.
 /// * Ancestor directories that have no shard of their own (e.g. only `src/a` was ever
 ///   loaded) are synthesized so the chain root → `src` → `a` exists in the tree.
+/// * Two live entries this volume holds as one are refused before anything is staged (see
+///   [`refuse_alias_pairs`]).
 ///
 /// Used by `stack` (`stack_utils::stack_parcel`) and `park` push (`park::park_changes`,
 /// DESIGN.html §5.0 D item 10, finding #3). `stack`'s `prepared` snapshot is the single
