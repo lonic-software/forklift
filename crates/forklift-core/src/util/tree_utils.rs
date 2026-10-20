@@ -467,13 +467,14 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
         return Ok(StagedObject::Present);
     }
 
+    let remedy = remedy_path(path);
     object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
         "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
         Loading the file again will not replace it while the damaged object stays in place; run \
         \"forklift restore --staged {}\"{} to leave it out and stack the rest.",
         path, hash, e.trim_end_matches('.'),
-        remedy_path(path).unwrap_or_else(|| "-- <path>".to_string()),
-        if remedy_path(path).is_some() { "" } else { " with that path quoted for your shell" }
+        remedy.as_deref().unwrap_or("-- <path>"),
+        if remedy.is_some() { "" } else { " with that path quoted for your shell" }
     ))
 }
 
@@ -489,7 +490,9 @@ fn remedy_path(path: &str) -> Option<String> {
 /// prints a `<path>` placeholder instead. A path starting with `-` is put after `--`, so it is not
 /// taken for an option.
 fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
-    let plain = if windows { "._-/+@:," } else { "._-/+@%:," };
+    // PowerShell also reads `,` (an array), a leading `@` (splatting) and `+`, `:` in some
+    // positions, so Windows keeps to the characters no shell there treats specially.
+    let plain = if windows { "._-/" } else { "._-/+@%:," };
     let quoted = if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
         path.to_string()
     } else if windows {
@@ -1039,6 +1042,9 @@ mod subtree_closure_tests {
             ("it's$HOME", Some("'it'\\''s$HOME'"), None),
             ("=notes", Some("'=notes'"), None),
             ("100%", Some("100%"), None),
+            ("a,b.txt", Some("a,b.txt"), None),
+            ("@notes.txt", Some("@notes.txt"), None),
+            ("c++/x:y", Some("c++/x:y"), None),
             ("-draft.txt", Some("-- -draft.txt"), Some("-- -draft.txt")),
             ("-my draft", Some("-- '-my draft'"), None),
             ("", Some("''"), None),
