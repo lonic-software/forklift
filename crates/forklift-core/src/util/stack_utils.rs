@@ -246,7 +246,7 @@ pub async fn stack_parcel(description: Option<String>,
         return Err(StackError::Other(format!(
             "Refusing to stack {:?}: it is, on this or some other file system, a warehouse's \
             metadata folder, so checking it out would plant another working tree inside this one. \
-            Rename it, or stage its removal and add it to .forkliftignore.",
+            Rename it, or unload it and add it to .forkliftignore.",
             path
         )));
     }

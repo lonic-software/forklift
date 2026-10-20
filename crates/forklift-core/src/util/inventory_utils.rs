@@ -295,12 +295,12 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
     // folder (`.Forklift`, `.forklift.`, `FORKLI~1`) is refused, in any component, and so is a
     // name this volume resolves to one.
     match office_utils::metadata_folder_component(path.as_key())? {
-        Some(component) if path.as_key().split('/').next() == Some(component) => return Err(format!(
+        Some((0, component)) => return Err(format!(
             "Refusing to load \"{}\": {:?} is, on this or some other file system, the warehouse's \
             metadata folder, and it is never tracked.",
             path.as_key(), component
         )),
-        Some(component) => return Err(format!(
+        Some((_, component)) => return Err(format!(
             "Refusing to load \"{}\": {:?} is, on this or some other file system, a warehouse's \
             metadata folder, and checking it out would plant another working tree inside this one.",
             path.as_key(), component
@@ -312,16 +312,18 @@ pub async fn add_changes_to_inventory(path: &WarehousePath) -> Result<(), String
     // (`load sub` walks from `sub` itself, and `load sub/x` does not walk), so test every
     // directory down to it here.
     if !path.is_root() {
-        let mut directory = std::path::PathBuf::new();
+        let full = path.as_key();
+        let ends = full.match_indices('/').map(|(end, _)| end).chain(std::iter::once(full.len()));
 
-        for component in path.as_key().split('/') {
-            directory.push(component);
+        for end in ends {
+            let key = &full[..end];
 
-            if warehouse_utils::is_working_tree_root(&directory)? {
-                let key = directory.to_string_lossy().replace('\\', "/");
-
-                if is_tracked_directory(&key)? {
-                    return Err(tracked_nested_working_tree_error(&key));
+            if warehouse_utils::is_working_tree_root(Path::new(key))? {
+                // As the walk judges it (see `rule_verdict`): tracked until every file below it
+                // is staged for removal.
+                let registered = registered_keys()?;
+                if registered.contains(key) && subtree_has_live_entry(key, &registered)? {
+                    return Err(tracked_nested_working_tree_error(key));
                 }
 
                 return Err(format!(
@@ -2012,16 +2014,13 @@ pub fn nested_metadata_entry(prepared: &PreparedInventory) -> Result<Option<Stri
         }
 
         // The top-level component is `stack`'s own root-entry check.
-        let (top, rest) = key.split_once('/').unwrap_or((key.as_str(), ""));
-        let mut parent = std::path::PathBuf::from(top);
+        for (slash, _) in key.match_indices('/') {
+            let parent = &key[..slash];
+            let end = key[slash + 1..].find('/').map_or(key.len(), |next| slash + 1 + next);
 
-        for component in rest.split('/').filter(|component| !component.is_empty()) {
-            if office_utils::opens_metadata_folder(&parent, component)? {
-                parent.push(component);
-                return Ok(Some(parent.to_string_lossy().replace('\\', "/")));
+            if office_utils::opens_metadata_folder(Path::new(parent), &key[slash + 1..end])? {
+                return Ok(Some(key[..end].to_string()));
             }
-
-            parent.push(component);
         }
 
         for name in live {

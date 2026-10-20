@@ -546,15 +546,16 @@ pub fn opens_metadata_folder(parent: &std::path::Path, name: &str) -> Result<boo
 /// * `path` - The warehouse path, relative to the working directory's root.
 ///
 /// # Returns
-/// * `Ok(Some(component))` - The first component that names a metadata folder.
-/// * `Ok(None)`            - If none does.
-/// * `Err(String)`         - If the volume could not say for some component.
-pub fn metadata_folder_component(path: &str) -> Result<Option<&str>, String> {
+/// * `Ok(Some((depth, component)))` - The first component that names a metadata folder, and its
+///                                    depth: 0 for the top level, where it is this warehouse's own.
+/// * `Ok(None)`                     - If none does.
+/// * `Err(String)`                  - If the volume could not say for some component.
+pub fn metadata_folder_component(path: &str) -> Result<Option<(usize, &str)>, String> {
     let mut parent = std::path::PathBuf::new();
 
-    for component in path.split('/') {
+    for (depth, component) in path.split('/').enumerate() {
         if opens_metadata_folder(&parent, component)? {
-            return Ok(Some(component));
+            return Ok(Some((depth, component)));
         }
 
         parent.push(component);

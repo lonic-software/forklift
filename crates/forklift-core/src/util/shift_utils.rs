@@ -630,8 +630,8 @@ fn write_regular_file(fs_path: &Path, path: &str, content: &[u8], item_type: Dir
 pub fn check_working_path(path: &str) -> Result<(), String> {
     let components: Vec<&str> = path.split('/').collect();
 
-    if let Some(component) = office_utils::metadata_folder_component(path)? {
-        return Err(metadata_component_refusal(path, component));
+    if let Some((depth, component)) = office_utils::metadata_folder_component(path)? {
+        return Err(metadata_component_refusal(path, depth, component));
     }
 
     #[cfg(windows)]
@@ -664,8 +664,8 @@ pub fn check_planned_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Resu
     let mut walked: HashMap<PathBuf, bool> = HashMap::new();
 
     for path in paths {
-        if let Some(component) = office_utils::metadata_folder_component(path)? {
-            return Err(metadata_component_refusal(path, component));
+        if let Some((depth, component)) = office_utils::metadata_folder_component(path)? {
+            return Err(metadata_component_refusal(path, depth, component));
         }
 
         let components: Vec<&str> = path.split('/').collect();
@@ -708,14 +708,16 @@ fn check_ancestors(path: &str,
                 }
                 false
             }
+            // A file where a directory will be: an earlier operation replaces it.
+            Ok(metadata) if !metadata.is_dir() => false,
             Ok(_) => {
                 if warehouse_utils::is_working_tree_root(&ancestor)? {
                     return Err(nested_working_tree_refusal(path, &ancestor.to_string_lossy()));
                 }
                 true
             }
-            // Nothing further down exists yet (or a file stands where a directory will), so
-            // nothing further down can be a symlink or another working tree.
+            // Nothing further down exists yet (or, mid-apply, a file stands above it), so nothing
+            // further down can be a symlink or another working tree.
             Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => false,
             Err(e) => return Err(format!("Error while checking \"{}\": {}", ancestor.to_string_lossy(), e)),
         };
@@ -731,9 +733,9 @@ fn check_ancestors(path: &str,
     Ok(())
 }
 
-/// The refusal for a path one of whose components names a metadata folder.
-fn metadata_component_refusal(path: &str, component: &str) -> String {
-    if path.split('/').next() == Some(component) {
+/// The refusal for a path whose component at `depth` names a metadata folder.
+fn metadata_component_refusal(path: &str, depth: usize, component: &str) -> String {
+    if depth == 0 {
         format!("Refusing to touch {:?}: it is inside the warehouse's metadata folder.", path)
     } else {
         format!(

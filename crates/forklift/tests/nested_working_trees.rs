@@ -261,7 +261,7 @@ fn a_crafted_tree_with_an_ordinary_nested_name_shifts() {
 
 /// A name some file system opens as a metadata folder, below the top level, is not stacked: as a
 /// file, and as a directory deeper down. Neither spelling is a metadata folder on this volume, so
-/// the walk stages both.
+/// the walk stages both. The way out the refusal names, unloading it and ignoring it, then stacks.
 #[test]
 fn stack_refuses_a_metadata_folder_name_below_the_top_level() {
     let mut cases = vec![("file", "sub/FORKLI~1", "sub/FORKLI~1")];
@@ -274,12 +274,21 @@ fn stack_refuses_a_metadata_folder_name_below_the_top_level() {
         let warehouse = Warehouse::new(&format!("stack-{}", kind));
         let head = warehouse.head("main");
         warehouse.write(written, "x\n");
+        warehouse.write("zzz.txt", "also staged\n");
         warehouse.run_ok(&["load", "."]);
 
         let stack = warehouse.run(&["stack", "nested"]);
         assert!(!stack.status.success(), "stack accepted {}", written);
         assert!(stderr(&stack).contains(&format!("{:?}", refused)), "the refusal must name {}: {}", refused, stderr(&stack));
+        assert!(stderr(&stack).contains("unload it and add it to .forkliftignore"), "{}", stderr(&stack));
         assert_eq!(warehouse.head("main"), head, "a parcel was stacked");
+
+        warehouse.run_ok(&["unload", refused]);
+        warehouse.write(".forkliftignore", &format!("^{}$\n", refused.replace('.', "\\.")));
+        warehouse.run_ok(&["load", "."]);
+        warehouse.run_ok(&["stack", "without it"]);
+        assert_ne!(warehouse.head("main"), head);
+        assert_eq!(warehouse.changes("staged"), Vec::<(String, String)>::new());
     }
 }
 
@@ -340,6 +349,10 @@ fn a_tracked_folder_that_becomes_a_nested_working_tree_refuses_until_it_is_remov
         }
 
         warehouse.run_ok(&["remove", "sub"]);
+        let named = warehouse.run(&["load", "sub/x.txt"]);
+        assert!(!named.status.success(), "a named load into the nested tree must still refuse");
+        assert!(stderr(&named).contains("that working tree's to load"),
+            "once removed, the named load must not name the way out again: {}", stderr(&named));
         if after_load {
             warehouse.run_ok(&["load", "."]);
         }
