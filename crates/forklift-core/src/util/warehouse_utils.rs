@@ -241,10 +241,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("forklift-warehouse-respell-locked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("locked/inner")).unwrap();
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o711)).unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o100)).unwrap();
 
         // Root lists through any mode, so there is no unlistable parent to test.
-        if std::fs::read_dir(root.join("locked")).is_err() {
+        let unlistable = std::fs::read_dir(root.join("locked")).is_err();
+        assert!(unlistable || unsafe { libc::geteuid() } == 0, "the parent was listable");
+        if unlistable {
             assert_eq!(respell_as_listed(&root, Path::new("locked/inner")).unwrap(), Path::new("locked/inner"));
 
             if root.join("LOCKED").exists() {
