@@ -185,7 +185,7 @@ every meta pallet is exempt from it **at transport** (the set is fixed — `@off
 granted. `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the paragraph below the
 table) is the authoritative statement of that transport rule and of what the content-level
 audit checks on top of it — in short, only `@office` gets a content-level signer-role check
-there (`verify_office_privileges`), and per-pallet grants are checked in no audit at all. `@kv`,
+there (the office chain walk, which every head, client and `audit` runs), and per-pallet grants are checked in no audit at all. `@kv`,
 `@manifest`, `@tags` and `@haul` get a content check instead: each needs the office, and every value must
 be stamped with the key that signed the parcel writing it, so no one can put a value in another
 operator's name. On top of that, a `@manifest` entry can be changed or removed only by the
@@ -213,8 +213,9 @@ clears any earlier restriction back to unrestricted, rather than leaving it
 untouched.
 
 The office always keeps at least one admin (lockout protection). Non-admins can
-only change their own keys; a remote enforces the same rule on every lift, so a
-parcel can never grant its own author privileges.
+only change their own keys. Every office chain verification enforces that rule,
+whether it runs on a remote at lift, in a client or in `audit`, so a parcel can
+never grant its own author privileges.
 
 ---
 
@@ -402,11 +403,13 @@ forklift audit @office  # just the office chain
 ```
 
 Everything is verified offline against the pinned anchor: the office chain
-forward from genesis (each parcel signed by a key active in the previous state;
-only genesis self-signs), then the pallet's parcels (each signed by a tracked
+forward from genesis (each parcel signed by a key active in the previous state,
+only genesis self-signs; and each within its signer's role in that state: a
+non-admin changes only their own keys, and nobody removes or alters a key or
+undoes a revocation), then the pallet's parcels (each signed by a tracked
 key; pre-trust "legacy" parcels tolerated only when reachable from the recorded
-boundary). Stripped or corrupted signatures, an unknown key, or a chain that
-doesn't reach genesis fail with a non-zero exit. The server head runs the exact
+boundary). Stripped or corrupted signatures, an unknown key, a parcel beyond its signer's
+role, or a chain that doesn't reach genesis fail with a non-zero exit. The server head runs the exact
 same checks before it accepts any ref update, so a remote can never be pushed
 into a state a local `audit` would reject.
 

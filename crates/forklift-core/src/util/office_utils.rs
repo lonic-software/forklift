@@ -210,7 +210,7 @@ pub struct UserRecord {
 
 impl UserRecord {
     /// Whether the user may move the given working pallet (the office pallet has its
-    /// own rules — see `verify_office_privileges`).
+    /// own rules — see `audit_utils::verify_office_chain`).
     pub fn may_write_pallet(&self, pallet: &str) -> bool {
         match self.role {
             Role::Admin => true,

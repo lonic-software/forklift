@@ -272,7 +272,7 @@ short: a validly-signed, non-revoked parcel on an ordinary pallet passes
 checked there (`may_write_pallet` has exactly one call site in the workspace outside its own
 unit test, the server's transport gate) — but the **office** pallet is the exception: every
 office-modifying parcel is checked in content audit against its signer's role
-(`verify_office_privileges`), regardless of how, or whether, the caller authenticated. A server
+(the office chain walk, `verify_office_chain`, which a client and `audit` run as well as both heads), regardless of how, or whether, the caller authenticated. A server
 run with only the shared static token, an `--open` server, or the AWS serverless head does not
 resolve a caller to an operator identity at all, so none of them run the *transport* rule above
 — but that office content-level check still applies.

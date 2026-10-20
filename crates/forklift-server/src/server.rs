@@ -984,6 +984,15 @@ fn unprocessable(message: String) -> HandlerError {
     (StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
+/// Map an office chain that did not verify: a 403 when a parcel oversteps its signer's
+/// privileges, a 422 when the chain is not authentic.
+fn office_chain_refusal(error: audit_utils::OfficeChainError) -> HandlerError {
+    match error {
+        audit_utils::OfficeChainError::Unauthorized(reason) => (StatusCode::FORBIDDEN, reason),
+        audit_utils::OfficeChainError::Inauthentic(reason) => unprocessable(reason),
+    }
+}
+
 /// Compare two bearer tokens without leaking which byte differs first: a naive `==` on `str`
 /// short-circuits at the first mismatch, which is exactly the timing side channel a bearer
 /// check must not have. The slice lengths are still compared up front (`subtle`'s own
@@ -2397,7 +2406,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     // Anyone but a reader may transport a meta pallet's history. Content
                     // authorization below differs by meta pallet, not a uniform "signer's
                     // role" check: @office's parcels are checked, per parcel, against the
-                    // signer's role (`verify_office_privileges`); a meta pallet's against
+                    // signer's role (`verify_office_chain`); a meta pallet's against
                     // its own rules (`verify_meta_content`), which for @tags include an
                     // admin rule. No meta pallet gets a pallet grant check.
                     user.role != office_utils::Role::Reader
@@ -2479,18 +2488,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 "Establish the trust anchor (PUT /v1/trust) before lifting the office.".to_string()
             ))?;
 
+            // Authentic is not authorized: the walk also holds every office parcel within
+            // its *signer's* privileges (admins change anything; everyone else only their
+            // own keys). That is a content invariant, so it holds no matter which token
+            // transported the chain, and its refusal is a 403 rather than a 422.
             let new_office_state = audit_utils::verify_office_chain_memoized(&anchor, &request.new_head)
-                .map_err(unprocessable)?;
-
-            // Authentic is not authorized: every new office parcel must stay within
-            // its *signer's* privileges (admins change anything; everyone else only
-            // their own keys). This is a content invariant — it holds no matter which
-            // token transported the chain.
-            audit_utils::verify_office_privileges(
-                &anchor,
-                request.old_head.as_deref(),
-                &request.new_head
-            ).map_err(|reason| (StatusCode::FORBIDDEN, reason))?;
+                .map_err(office_chain_refusal)?;
 
             // Newly revoked keys (active before, revoked after) become events. The
             // pre-lift roster is the office state already read above: on this branch
@@ -2538,7 +2541,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             ))?;
 
             let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
-                .map_err(unprocessable)?;
+                .map_err(|error| unprocessable(error.into()))?;
 
             // Incremental: everything reachable from old_head was verified when
             // old_head was committed, so only the new slice is audited.
@@ -4509,6 +4512,57 @@ mod tests {
         let status = response.into_response().status();
         assert_ne!(status, StatusCode::FORBIDDEN, "an in-grant writer must clear the auth gate");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "it must instead fail on the missing object");
+    }
+
+    /// Lift an office parcel promoting "bob" (a writer) to admin, signed by `signer`'s key and
+    /// stacked on the fixture's current office head, with the admin's token, and return the
+    /// status. The admin may transport the office, so any refusal comes from its content check.
+    async fn lift_bob_promotion(fixture: &OfficeFixture, signer: &Operator, signer_key_id: &str) -> StatusCode {
+        let head = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)
+            .unwrap()
+            .expect("the fixture's office head");
+
+        let mut state = office_utils::read_office_state().unwrap();
+        state.users.iter_mut().find(|user| user.identifier == "bob").unwrap().role = Role::Admin;
+
+        let promotion = office_utils::build_and_sign_office_parcel(
+            &state, signer, "promote bob".to_string(), signer_key_id, vec![head.clone()]
+        ).unwrap();
+
+        post_ref_update(
+            State(admin_token_state(fixture)), headers_with_bearer("tok-alice"),
+            Path(ref_update_params("@office")),
+            Json(RefUpdateRequest { old_head: Some(head), new_head: promotion })
+        ).await.into_response().status()
+    }
+
+    /// FORK-220: an office parcel that oversteps its signer's privileges is a 403, even now that
+    /// the chain walk (not a second check) finds it. The admin-signed control shows the domain is
+    /// non-empty and the 403 is not the transport gate.
+    #[tokio::test]
+    async fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not() {
+        let fixture = OfficeFixture::genesis("post-ref-self-promotion");
+        let bob_key_id = fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
+        let bob = Operator { name: "bob".to_string(), identifier: "bob".to_string() };
+
+        assert_eq!(lift_bob_promotion(&fixture, &bob, &bob_key_id).await, StatusCode::FORBIDDEN);
+        assert_eq!(lift_bob_promotion(&fixture, &fixture.admin, &fixture.admin_key_id).await, StatusCode::OK);
+    }
+
+    /// FORK-220: an office parcel that is not authentic stays a 422: one signed by a key the office
+    /// does not track.
+    #[tokio::test]
+    async fn an_office_parcel_signed_by_an_untracked_key_is_unprocessable() {
+        let fixture = OfficeFixture::genesis("post-ref-untracked-office-signer");
+        fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
+
+        let stranger = Operator { name: "mallory".to_string(), identifier: "mallory".to_string() };
+        let (stranger_key_id, _) = forklift_core::util::sign_utils::generate_keypair("mallory").unwrap();
+
+        assert_eq!(
+            lift_bob_promotion(&fixture, &stranger, &stranger_key_id).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 
     // ---------------------------------------------------------------------------------

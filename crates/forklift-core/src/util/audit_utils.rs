@@ -11,22 +11,77 @@ use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
 
+/// Why an office chain did not verify. The heads answer the two classes differently: an
+/// inauthentic chain is bad input, while an authentic parcel that oversteps its signer's
+/// privileges is something that signer may not do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfficeChainError {
+    /// The chain is unreadable or does not reach the genesis, a parcel's signature does not
+    /// verify against a then-active key, or a key it adds is not properly endorsed.
+    Inauthentic(String),
+    /// The chain is authentic, but a parcel breaks key permanence or exceeds its signer's
+    /// privileges.
+    Unauthorized(String),
+}
+
+impl OfficeChainError {
+    /// The refusal, phrased for the user.
+    pub fn message(&self) -> &str {
+        match self {
+            OfficeChainError::Inauthentic(message) | OfficeChainError::Unauthorized(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for OfficeChainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for OfficeChainError {}
+
+impl From<OfficeChainError> for String {
+    fn from(error: OfficeChainError) -> String {
+        match error {
+            OfficeChainError::Inauthentic(message) | OfficeChainError::Unauthorized(message) => message,
+        }
+    }
+}
+
 /// Verify the office chain from the genesis forward and return the final office state.
 ///
 /// Office history is linear: the chain is walked head → genesis, then verified forward.
-/// Every office parcel must be signed by a key that was active in the *previous* office
-/// state — introducing a key and signing with it in the same parcel is only valid at
-/// the genesis (that self-signature is the trust-on-first-use anchor).
+/// Each parcel is checked for two things:
+///
+/// * **Authentic**: signed by a key that was active in the *previous* office state, with
+///   every key it adds properly endorsed. Introducing a key and signing with it in the same
+///   parcel is only valid at the genesis (that self-signature is the trust-on-first-use
+///   anchor).
+/// * **Authorized**: within its signer's privileges, as of the previous state, so a parcel
+///   cannot grant its own author anything. An admin may change anything; everyone else only
+///   their own keys (self-service rotation, retirement, device linking). Key permanence binds
+///   admins too: keys are retained forever, their records are immutable, and a revocation is
+///   append-once. The genesis needs no such check.
+///
+/// Every caller (the `audit` command, a client adopting or reading the office, and both
+/// server heads on admission) runs this one walk, so history a server admitted and history a
+/// client verifies offline are held to the same rules.
 ///
 /// # Arguments
 /// * `anchor`      - The trust anchor.
 /// * `office_head` - The head of the office pallet to verify.
 ///
 /// # Returns
-/// * `Ok(OfficeState)` - The verified head state.
-/// * `Err(String)`     - If the chain does not reach the genesis, or any office parcel
-///                       fails verification.
-pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, String> {
+/// * `Ok(OfficeState)`                       - The verified head state.
+/// * `Err(OfficeChainError::Inauthentic(_))`  - If the chain does not reach the genesis, or
+///                                              a parcel is unreadable or fails its signature
+///                                              or endorsement checks.
+/// * `Err(OfficeChainError::Unauthorized(_))` - If a parcel breaks key permanence or exceeds
+///                                              its signer's privileges.
+pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, OfficeChainError> {
+    use OfficeChainError::{Inauthentic, Unauthorized};
+
     let mut chain: Vec<String> = Vec::new();
     let mut cursor = office_head.to_string();
 
@@ -37,15 +92,15 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
             break;
         }
 
-        let parcel = object_utils::load_parcel(&cursor)?;
+        let parcel = object_utils::load_parcel(&cursor).map_err(Inauthentic)?;
 
         match parcel.parents.first() {
             Some(parent) => cursor = parent.clone(),
-            None => return Err(format!(
+            None => return Err(Inauthentic(format!(
                 "The office chain does not reach the genesis parcel {} (it ends at {}). \
                 The warehouse may have been tampered with.",
                 anchor.genesis, cursor
-            )),
+            ))),
         }
     }
 
@@ -54,39 +109,72 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     let mut previous_state: Option<OfficeState> = None;
 
     for hash in &chain {
-        let state = crate::util::office_utils::read_office_state_of(hash)?;
+        let state = crate::util::office_utils::read_office_state_of(hash).map_err(Inauthentic)?;
 
-        {
-            let lookup_state = previous_state.as_ref().unwrap_or(&state);
+        let lookup_state = previous_state.as_ref().unwrap_or(&state);
 
-            verify_one_signature(hash, lookup_state, "office parcel")?;
+        verify_one_signature(hash, lookup_state, "office parcel").map_err(Inauthentic)?;
 
-            // A revoked key must not extend the office chain: the signer has to be
-            // active in the state the signature is checked against.
-            let signature = sign_utils::load_parcel_signature(hash)?
-                .expect("verify_one_signature loaded this signature");
+        // A revoked key must not extend the office chain: the signer has to be
+        // active in the state the signature is checked against.
+        let signature = sign_utils::load_parcel_signature(hash).map_err(Inauthentic)?
+            .expect("verify_one_signature loaded this signature");
 
-            let signer_active = lookup_state.find_key(&signature.key_id)
-                .map(|key| key.is_active())
-                .unwrap_or(false);
-
-            if !signer_active {
-                return Err(format!(
-                    "The office parcel {} is signed with key {}, which is revoked at \
-                    that point. The warehouse may have been tampered with.",
-                    hash, signature.key_id
-                ));
-            }
-        }
+        let signer = lookup_state.find_key(&signature.key_id)
+            .filter(|key| key.is_active())
+            .map(|key| key.operator.clone())
+            .ok_or_else(|| Inauthentic(format!(
+                "The office parcel {} is signed with key {}, which is revoked at \
+                that point. The warehouse may have been tampered with.",
+                hash, signature.key_id
+            )))?;
 
         verify_new_key_endorsements(previous_state.as_ref(), &state).map_err(|reason| {
-            format!("The office parcel {} {}", hash, reason)
+            Inauthentic(format!("The office parcel {} {}", hash, reason))
         })?;
+
+        if let Some(previous) = &previous_state {
+            verify_parcel_privileges(previous, &state, &signer).map_err(|reason| {
+                Unauthorized(format!("The office parcel {} {}.", hash, reason))
+            })?;
+        }
 
         previous_state = Some(state);
     }
 
     Ok(previous_state.expect("the chain contains at least the genesis"))
+}
+
+/// Check that one office parcel stays within its signer's privileges, as of the state
+/// before it: the key invariants bind everyone, and a non-admin may touch only their own keys.
+///
+/// # Arguments
+/// * `previous` - The office state before the parcel.
+/// * `current`  - The office state the parcel records.
+/// * `signer`   - The operator whose key signed the parcel, resolved in `previous`.
+///
+/// # Returns
+/// * `Ok(())`      - If the change is within the signer's privileges.
+/// * `Err(String)` - The reason it is not (phrased to follow "The office parcel X").
+fn verify_parcel_privileges(previous: &OfficeState,
+                            current: &OfficeState,
+                            signer: &str) -> Result<(), String> {
+    // Chain invariants that bind admins too: keys are retained forever, their records are
+    // immutable, and a revocation is append-once, so nobody quietly un-revokes a key or
+    // rewrites its boundary.
+    verify_key_permanence(previous, current)?;
+
+    let is_admin = previous.find_user(signer)
+        .map(|user| user.role == crate::util::office_utils::Role::Admin)
+        .unwrap_or(false);
+
+    if is_admin {
+        return Ok(());
+    }
+
+    verify_self_service_change(previous, current, signer).map_err(|reason| format!(
+        "(signed by \"{}\", not an admin) {}", signer, reason
+    ))
 }
 
 /// Verify the sigchain endorsements of every key a new office state introduces
@@ -124,8 +212,8 @@ fn verify_new_key_endorsements(previous: Option<&OfficeState>,
     for key in &current.keys {
         if previous.map_or(false, |state| state.find_key(&key.key_id).is_some()) {
             // Not new. Its id is the hash of the public key endorsed when it was added (a
-            // record stores no id; the office reader derives it), but its other fields are
-            // held immutable only by `verify_key_permanence`, which this chain walk does not run.
+            // record stores no id; the office reader derives it), and its other fields are
+            // held immutable by `verify_key_permanence`, which the chain walk also runs.
             continue;
         }
 
@@ -745,7 +833,7 @@ pub fn verified_local_office() -> Result<OfficeState, String> {
     let office_head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
         .ok_or("The office pallet is unborn; use \"office enroll\" first.".to_string())?;
 
-    verify_office_chain_memoized(&anchor, &office_head)
+    Ok(verify_office_chain_memoized(&anchor, &office_head)?)
 }
 
 /// [`verify_office_chain`], remembered for the life of the process.
@@ -770,7 +858,7 @@ pub fn verified_local_office() -> Result<OfficeState, String> {
 pub fn verify_office_chain_memoized(
     anchor: &TrustAnchor,
     office_head: &str,
-) -> Result<OfficeState, String> {
+) -> Result<OfficeState, OfficeChainError> {
     let key = office_chain_key(anchor, office_head);
     let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()));
 
@@ -1220,88 +1308,6 @@ impl DistrustBoundaryMemo {
 
         Ok(self.gaps.get(&key.key_id).unwrap())
     }
-}
-
-/// Verify that every new office parcel stays within its signer's privileges.
-///
-/// `verify_office_chain` proves the chain is *authentic* (signed by then-active keys);
-/// this proves it is *authorized*: an admin may change anything, everyone else only
-/// their own keys (self-service rotation/retirement). The signer's role is taken from
-/// the state *before* the parcel — a parcel cannot grant its own author privileges.
-/// The genesis needs no check (it is the trust-on-first-use anchor).
-///
-/// # Arguments
-/// * `anchor`   - The trust anchor.
-/// * `old_head` - The already-committed office head (`None` checks back to genesis).
-/// * `new_head` - The office head being committed.
-///
-/// # Returns
-/// * `Ok(())`      - If every new parcel is within its signer's privileges.
-/// * `Err(String)` - If a parcel exceeds them (or the chain is unreadable).
-pub fn verify_office_privileges(anchor: &TrustAnchor,
-                                old_head: Option<&str>,
-                                new_head: &str) -> Result<(), String> {
-    // The office chain is linear: walk new_head down to the committed head (or the
-    // genesis), newest first.
-    let mut chain: Vec<String> = Vec::new();
-    let mut cursor = new_head.to_string();
-
-    loop {
-        if Some(cursor.as_str()) == old_head || cursor == anchor.genesis {
-            break;
-        }
-
-        chain.push(cursor.clone());
-
-        match object_utils::load_parcel(&cursor)?.parents.first() {
-            Some(parent) => cursor = parent.clone(),
-            None => break,
-        }
-    }
-
-    for hash in chain.iter().rev() {
-        let parent = object_utils::load_parcel(hash)?
-            .parents
-            .first()
-            .cloned()
-            .ok_or(format!("The office parcel {} has no parent.", hash))?;
-
-        let previous = crate::util::office_utils::read_office_state_of(&parent)?;
-        let current = crate::util::office_utils::read_office_state_of(hash)?;
-
-        let signature = sign_utils::load_parcel_signature(hash)?
-            .ok_or(format!("The office parcel {} carries no signature.", hash))?;
-
-        let signer = previous.find_key(&signature.key_id)
-            .map(|key| key.operator.clone())
-            .ok_or(format!(
-                "The office parcel {} is signed with key {}, which is not tracked at \
-                that point.",
-                hash, signature.key_id
-            ))?;
-
-        // Chain invariants that bind admins too (like the last-admin rule): keys are
-        // retained forever, their records are immutable, and a revocation is
-        // append-once — nobody quietly un-revokes a key or rewrites its boundary.
-        verify_key_permanence(&previous, &current).map_err(|reason| format!(
-            "The office parcel {} {}.", hash, reason
-        ))?;
-
-        let is_admin = previous.find_user(&signer)
-            .map(|user| user.role == crate::util::office_utils::Role::Admin)
-            .unwrap_or(false);
-
-        if is_admin {
-            continue;
-        }
-
-        verify_self_service_change(&previous, &current, &signer).map_err(|reason| format!(
-            "The office parcel {} (signed by \"{}\", not an admin) {}.",
-            hash, signer, reason
-        ))?;
-    }
-
-    Ok(())
 }
 
 /// Check the key invariants no office parcel may break, no matter who signed it:
@@ -2973,11 +2979,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------
-    // verify_office_privileges — user-record permanence (FORK-76)
+    // Office privileges in the chain walk — user-record permanence (FORK-76), FORK-220
     //
     // `verify_self_service_change` is the only governance check a non-admin's office
     // parcel faces (an admin's signature short-circuits past it entirely, see
-    // `verify_office_privileges`). These tests build real, disk-signed office chains —
+    // `verify_parcel_privileges`). These tests build real, disk-signed office chains —
     // through the same `office_utils`/`sign_utils` calls the CLI's `office` commands
     // use — so a fixture that never actually reached the non-admin branch could not
     // pass by accident, and a hostile parcel is signed with the attacker's own real key,
@@ -3185,13 +3191,16 @@ mod tests {
 
     /// Build a fixture with `BOB` admitted as a plain writer, apply `mutate` to Bob's own
     /// user record, sign the resulting parcel with Bob's own (real, disk) key, and return
-    /// the error `verify_office_privileges` raises for it.
+    /// the refusal `verify_office_chain` raises for it.
     fn refuse_self_service_user_edit(name: &str, mutate: impl FnOnce(&mut UserRecord)) -> String {
         let fixture = PrivilegeFixture::new(name);
         let (bob_key_id, admitted_head) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
         let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        // The domain is non-empty: the chain up to the admission verifies.
+        assert!(verify_office_chain(&fixture.anchor, &admitted_head).is_ok());
 
         let mut state = crate::util::office_utils::read_office_state().unwrap();
         let bob_record = state.users.iter_mut().find(|record| record.identifier == BOB)
@@ -3202,13 +3211,16 @@ mod tests {
             &state, &bob, "self-service edit".to_string(), &bob_key_id, office_head().as_deref()
         ).unwrap();
 
-        let error = verify_office_privileges(&fixture.anchor, Some(&admitted_head), &hostile)
-            .expect_err("a non-admin editing their own user record must be refused");
+        let error = match verify_office_chain(&fixture.anchor, &hostile) {
+            Err(OfficeChainError::Unauthorized(reason)) => reason,
+            other => panic!("a non-admin editing their own user record must be refused as \
+                unauthorized: {:?}", other.err()),
+        };
 
         // Proves the fixture actually reached `verify_self_service_change` (the
         // non-admin branch) rather than short-circuiting at the admin check: this exact
         // wording, naming the non-admin signer, is only produced by that branch (see
-        // `verify_office_privileges`'s error-wrapping around it).
+        // `verify_parcel_privileges`'s error-wrapping around it).
         assert!(error.contains("not an admin"), "{}", error);
         assert!(error.contains(BOB), "{}", error);
         assert!(error.contains("changes user records"), "{}", error);
@@ -3251,7 +3263,7 @@ mod tests {
     #[test]
     fn an_admin_may_change_a_users_class_or_supervisor() {
         let fixture = PrivilegeFixture::new("admin-class-change");
-        let (_, admitted_head) = fixture.admit(
+        fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
 
@@ -3267,7 +3279,7 @@ mod tests {
             &state, &fixture.admin, "admin reclassifies bob".to_string(), &fixture.admin_key_id, office_head().as_deref()
         ).unwrap();
 
-        assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &approved).is_ok());
+        assert!(verify_office_chain(&fixture.anchor, &approved).is_ok());
     }
 
     /// Falsifier 5 (over-tightened check): a non-admin's self-service key rotation still
@@ -3275,7 +3287,7 @@ mod tests {
     #[test]
     fn a_non_admin_self_service_key_rotation_still_passes() {
         let fixture = PrivilegeFixture::new("writer-key-rotation");
-        let (bob_key_id, admitted_head) = fixture.admit(
+        let (bob_key_id, _) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
         let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
@@ -3304,7 +3316,7 @@ mod tests {
             &state, &bob, "bob rotates his own key".to_string(), &bob_key_id, office_head().as_deref()
         ).unwrap();
 
-        assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &rotated).is_ok());
+        assert!(verify_office_chain(&fixture.anchor, &rotated).is_ok());
     }
 
     /// Falsifier 6 (over-tightened check): a non-admin parcel that changes nothing about
@@ -3313,7 +3325,7 @@ mod tests {
     #[test]
     fn a_non_admin_parcel_that_touches_no_user_record_still_passes() {
         let fixture = PrivilegeFixture::new("writer-link-device");
-        let (bob_key_id, admitted_head) = fixture.admit(
+        let (bob_key_id, _) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
         let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
@@ -3331,15 +3343,14 @@ mod tests {
             &state, &bob, "bob links a second device".to_string(), &bob_key_id, office_head().as_deref()
         ).unwrap();
 
-        assert!(verify_office_privileges(&fixture.anchor, Some(&admitted_head), &linked).is_ok());
+        assert!(verify_office_chain(&fixture.anchor, &linked).is_ok());
     }
 
     /// FORK-74, at the site the client and `audit` rely on: a writer's office parcel that
     /// files its own public key under the admin's key id is refused by `verify_office_chain`.
     /// Before the fix the chain verified, and the resulting state resolved the admin's key id
     /// to the writer's key — so the writer's signatures would be attributed to the admin.
-    /// (`verify_office_privileges` also refused it, through `verify_key_permanence`, but only
-    /// the server and Lambda heads run that check.)
+    /// It is refused as inauthentic, at parse time, before any privilege check runs.
     #[test]
     fn an_office_parcel_rebinding_a_key_id_to_another_public_key_is_refused() {
         let fixture = PrivilegeFixture::new("rebind-key-id");
@@ -3364,11 +3375,103 @@ mod tests {
         );
 
         let error = match verify_office_chain(&fixture.anchor, &hostile) {
-            Err(e) => e,
-            Ok(_) => panic!("a key id rebound to another public key must not verify"),
+            Err(OfficeChainError::Inauthentic(reason)) => reason,
+            other => panic!("a key id rebound to another public key must not verify: {:?}", other.err()),
         };
         assert!(error.contains(&fixture.admin_key_id), "the error must name the key: {}", error);
         assert!(error.contains(&format!("keys/{}.toml", bob_key_id)),
             "the error must name the file the record belongs in: {}", error);
+    }
+    /// FORK-220: a writer promoting themselves to admin is refused by the walk every client and
+    /// `audit` run, not only by a head's admission check. Before the fix the chain verified.
+    #[test]
+    fn a_writer_promoting_themselves_to_admin_is_refused() {
+        refuse_self_service_user_edit("self-promotion", |user| {
+            user.role = Role::Admin;
+        });
+    }
+
+    /// FORK-220: reverting someone else's revocation is refused, whoever signs it. A writer
+    /// trips key permanence the same way an admin does, so the second parcel (an admin's, from
+    /// the same base) shows the rule is permanence and not the self-service check.
+    #[test]
+    fn un_revoking_another_users_key_is_refused_for_a_writer_and_an_admin() {
+        const CAROL: &str = "ca401000-0000-4000-8000-0000000ca401";
+
+        let fixture = PrivilegeFixture::new("unrevoke-foreign");
+        let (bob_key_id, _) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let (carol_key_id, _) = fixture.admit(
+            CAROL, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        // The admin revokes Carol's key: a legitimate change, so the domain is non-empty.
+        let mut revoked = crate::util::office_utils::read_office_state().unwrap();
+        let carol_key = revoked.keys.iter_mut().find(|key| key.key_id == carol_key_id).unwrap();
+        carol_key.retired_at = Some(1_700_000_003);
+        carol_key.revocation_reason = Some(crate::util::office_utils::RevocationReason::Compromise);
+        carol_key.distrust_boundary = Vec::new();
+
+        let revoked_head = crate::util::office_utils::stack_office_parcel(
+            &revoked, &fixture.admin, "revoke carol".to_string(), &fixture.admin_key_id, office_head().as_deref()
+        ).unwrap();
+        assert!(verify_office_chain(&fixture.anchor, &revoked_head).is_ok());
+
+        let mut restored = revoked.clone();
+        let carol_key = restored.keys.iter_mut().find(|key| key.key_id == carol_key_id).unwrap();
+        carol_key.retired_at = None;
+        carol_key.revocation_reason = None;
+
+        for (actor, key_id) in [(&bob, &bob_key_id), (&fixture.admin, &fixture.admin_key_id)] {
+            let hostile = crate::util::office_utils::build_and_sign_office_parcel(
+                &restored, actor, "un-revoke carol".to_string(), key_id, vec![revoked_head.clone()]
+            ).unwrap();
+
+            match verify_office_chain(&fixture.anchor, &hostile) {
+                Err(OfficeChainError::Unauthorized(reason)) => {
+                    assert!(reason.contains(&hostile), "{}", reason);
+                    assert!(reason.contains(&format!("alters the revocation of key {}", carol_key_id)),
+                        "{}", reason);
+                }
+                other => panic!("{} un-revoking another user's key must be refused as \
+                    unauthorized: {:?}", actor.identifier, other.err()),
+            }
+        }
+    }
+
+    /// FORK-220: the walk checks every parcel, not only the newest, so a violation stays refused
+    /// under later, legitimate parcels. A client verifies a head it never saw grow.
+    #[test]
+    fn a_privilege_violation_below_legitimate_parcels_is_refused() {
+        const CAROL: &str = "ca401000-0000-4000-8000-0000000ca401";
+
+        let fixture = PrivilegeFixture::new("buried-promotion");
+        let (bob_key_id, _) = fixture.admit(
+            BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+
+        let mut promoted = crate::util::office_utils::read_office_state().unwrap();
+        promoted.users.iter_mut().find(|user| user.identifier == BOB).unwrap().role = Role::Admin;
+
+        let hostile = crate::util::office_utils::stack_office_parcel(
+            &promoted, &bob, "bob promotes himself".to_string(), &bob_key_id, office_head().as_deref()
+        ).unwrap();
+
+        // An admin admission on top: legitimate in itself.
+        let (_, top) = fixture.admit(
+            CAROL, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
+        );
+        assert_ne!(top, hostile);
+
+        match verify_office_chain(&fixture.anchor, &top) {
+            Err(OfficeChainError::Unauthorized(reason)) => {
+                assert!(reason.contains(&hostile), "the refusal must name the violating parcel: {}", reason);
+                assert!(reason.contains("changes user records"), "{}", reason);
+            }
+            other => panic!("a buried self-promotion must be refused: {:?}", other.err()),
+        }
     }
 }
