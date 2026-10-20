@@ -401,6 +401,43 @@ impl AliasCheck {
         Ok(None)
     }
 
+    /// The shallowest pair among `nodes`: two sibling node paths that are one entry on this
+    /// volume, as [`one_entry`] judges them, from the parent nearest the root that holds one.
+    /// Comparing siblings is enough: if two node paths are one entry, their ancestors where they
+    /// first differ are too, and those are siblings under one parent spelled identically.
+    ///
+    /// # Returns
+    /// * `Ok(Option<(String, String)>)` - The shallowest pair, if there is one.
+    /// * `Err(String)`                  - If the disk could not be read, or a needed probe could
+    ///                                    not be made.
+    ///
+    /// [`one_entry`]: AliasCheck::one_entry
+    pub fn first_pair(&mut self, nodes: &Nodes) -> Result<Option<(String, String)>, String> {
+        let mut parents: Vec<&String> = nodes.children.keys().collect();
+        parents.sort_by_key(|parent| if parent.is_empty() { 0 } else { parent.matches('/').count() + 1 });
+
+        for parent in parents {
+            let mut classes: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+            for (name, _) in nodes.children(parent) {
+                classes.entry(fold_key(name)).or_default().push(name);
+            }
+
+            for names in classes.values().filter(|names| names.len() > 1) {
+                for (index, first) in names.iter().enumerate() {
+                    for second in &names[index + 1..] {
+                        let (first, second) = (join(parent, first), join(parent, second));
+
+                        if self.one_entry(&first, &second)? {
+                            return Ok(Some((first, second)));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// The one way out of a pair `first` and `second` (sibling node paths that are one entry):
     /// see [`Remedy`] for the two forms and when each applies.
     ///
@@ -608,7 +645,7 @@ fn join(parent: &str, name: &str) -> String {
 }
 
 /// The paths the inventory holds live, as the alias test compares them: every live file entry,
-/// and every directory above one.
+/// every directory above one, and every directory known to hold one without being read.
 #[derive(Debug, Default)]
 pub struct Nodes {
     files: BTreeSet<String>,
@@ -619,20 +656,36 @@ pub struct Nodes {
 impl Nodes {
     /// The nodes of these live file entry paths (warehouse keys).
     pub fn from_live_files(files: BTreeSet<String>) -> Nodes {
-        let mut children: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+        Nodes::from_live(files, std::iter::empty())
+    }
+
+    /// The nodes of these live file entry paths, and of `directories`: directory keys that hold a
+    /// live entry somewhere beneath them, whatever is beneath them is not listed.
+    pub fn from_live<'a>(files: BTreeSet<String>, directories: impl IntoIterator<Item = &'a str>) -> Nodes {
+        let mut nodes = Nodes { files: BTreeSet::new(), children: BTreeMap::new() };
 
         for file in &files {
-            let names: Vec<&str> = file.split('/').collect();
-
-            for depth in 0..names.len() {
-                let is_dir = depth + 1 < names.len();
-                let entry = children.entry(names[..depth].join("/")).or_default()
-                    .entry(names[depth].to_string()).or_insert(false);
-                *entry |= is_dir;
-            }
+            nodes.add(file, false);
+        }
+        for directory in directories {
+            nodes.add(directory, true);
         }
 
-        Nodes { files, children }
+        nodes.files = files;
+        nodes
+    }
+
+    /// Add `path` and every directory above it. A parent already present has its own ancestors
+    /// added, so each directory is walked up from once.
+    fn add(&mut self, path: &str, is_dir: bool) {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let known = self.children.contains_key(parent);
+
+        *self.children.entry(parent.to_string()).or_default().entry(name.to_string()).or_insert(false) |= is_dir;
+
+        if !known && !parent.is_empty() {
+            self.add(parent, true);
+        }
     }
 
     /// The node names directly under `parent`, each with whether it is a directory node.

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
@@ -65,7 +66,12 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
     // this is a no-op there and the behavior is byte-for-byte what it always was.
     let scope = scope_utils::current_scope()?;
 
-    diff_directory(from_tree.as_ref(), Some(&to_tree), "", &mut ops, &mut removed_dirs, &scope)?;
+    let mut aliased_removes = Vec::new();
+    diff_directory(from_tree.as_ref(), Some(&to_tree), "", &mut Plan {
+        ops: &mut ops, removed_dirs: &mut removed_dirs, aliased_removes: &mut aliased_removes,
+    }, false, &scope)?;
+
+    keep_aliased_files(&to_tree, &aliased_removes, &mut ops, &scope)?;
 
     // Deepest directories first, so empty-directory cleanup can proceed bottom-up.
     removed_dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
@@ -73,14 +79,26 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
     Ok((ops, removed_dirs))
 }
 
+/// What [`diff_directory`] collects.
+struct Plan<'a> {
+    /// The file operations.
+    ops: &'a mut Vec<FileOp>,
+    /// The source-only directories.
+    removed_dirs: &'a mut Vec<String>,
+    /// Each removed path some component of which shares a [`alias_utils::fold_key`] with a
+    /// sibling in the source tree: the only removals that can reach a kept file through an alias
+    /// (see [`keep_aliased_files`]).
+    aliased_removes: &'a mut Vec<String>,
+}
+
 /// Diff one directory level of two trees (recursively).
 ///
 /// # Arguments
-/// * `from`         - This directory in the source tree (if it exists there).
-/// * `to`           - This directory in the target tree (if it exists there).
-/// * `key`          - The warehouse path key of the directory.
-/// * `ops`          - The collected file operations.
-/// * `removed_dirs` - The collected source-only directories.
+/// * `from`    - This directory in the source tree (if it exists there).
+/// * `to`      - This directory in the target tree (if it exists there).
+/// * `key`     - The warehouse path key of the directory.
+/// * `plan`    - Where the operations, removed directories and aliased removals are collected.
+/// * `aliased` - Whether some component of `key` shares a fold key with a source sibling.
 ///
 /// # Returns
 /// * `Ok(())`      - If the directory was diffed.
@@ -88,8 +106,8 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
 fn diff_directory(from: Option<&TreeItem>,
                   to: Option<&TreeItem>,
                   key: &str,
-                  ops: &mut Vec<FileOp>,
-                  removed_dirs: &mut Vec<String>,
+                  plan: &mut Plan,
+                  aliased: bool,
                   scope: &MaterializationScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
     // everything in scope, so on the hot, common full-bay path the scope checks below are
@@ -103,6 +121,10 @@ fn diff_directory(from: Option<&TreeItem>,
     let to_files: BTreeMap<&String, &TreeItem> = to
         .map(|tree| tree.get_files().collect())
         .unwrap_or_default();
+
+    // The source names here that share a fold key with another: a removal beneath one may reach,
+    // on a folding volume, the file its sibling keeps.
+    let paired = from.map(fold_paired_names).unwrap_or_default();
 
     for (name, to_item) in &to_files {
         let child_key = join_key(key, name);
@@ -123,7 +145,7 @@ fn diff_directory(from: Option<&TreeItem>,
             .unwrap_or(false);
 
         if !is_unchanged {
-            ops.push(FileOp::Write {
+            plan.ops.push(FileOp::Write {
                 path: child_key,
                 hash: to_item.hash.clone(),
                 item_type: to_item.item_type,
@@ -141,7 +163,10 @@ fn diff_directory(from: Option<&TreeItem>,
         }
 
         if !to_files.contains_key(*name) {
-            ops.push(FileOp::Remove { path: child_key });
+            if aliased || paired.contains(name.as_str()) {
+                plan.aliased_removes.push(child_key.clone());
+            }
+            plan.ops.push(FileOp::Remove { path: child_key });
         }
     }
 
@@ -179,8 +204,8 @@ fn diff_directory(from: Option<&TreeItem>,
             from_loaded.as_ref(),
             Some(&to_loaded),
             &child_key,
-            ops,
-            removed_dirs,
+            plan,
+            aliased || paired.contains(name.as_str()),
             scope,
         )?;
     }
@@ -195,12 +220,101 @@ fn diff_directory(from: Option<&TreeItem>,
         if !to_subtrees.contains_key(*name) {
             let from_loaded = object_utils::load_tree(&from_subtree.hash)?;
 
-            diff_directory(Some(&from_loaded), None, &subtree_key, ops, removed_dirs, scope)?;
-            removed_dirs.push(subtree_key);
+            diff_directory(Some(&from_loaded), None, &subtree_key, plan, aliased || paired.contains(name.as_str()), scope)?;
+            plan.removed_dirs.push(subtree_key);
         }
     }
 
     Ok(())
+}
+
+/// The names in `tree` (files and subtrees) that share an [`alias_utils::fold_key`] with another.
+fn fold_paired_names(tree: &TreeItem) -> HashSet<&str> {
+    let mut classes: HashMap<String, Vec<&str>> = HashMap::new();
+
+    for (name, _) in tree.get_files().chain(tree.get_subtrees()) {
+        classes.entry(alias_utils::fold_key(name)).or_default().push(name.as_str());
+    }
+
+    classes.into_values().filter(|names| names.len() > 1).flatten().collect()
+}
+
+/// Keep every file the target holds that a planned removal would unlink through an alias. On a
+/// folding volume a source tree may hold `README` beside `readme` where the disk holds one file:
+/// removing `readme` unlinks `README` too, and an unchanged `README` has no operation of its own
+/// to bring it back. So for each removal `r` and each other target file `k` with no operation of
+/// its own, in scope, that shares `r`'s fold key component by component and is one entry with
+/// `r` on disk now, a write of `k` from the target is added. Removals run before writes (see
+/// [`apply_ops_each`]), so `k` is written back under its own spelling once `r` is gone. The added
+/// write is not new: what occupies `k` is `r`, which the plan removes first.
+///
+/// # Arguments
+/// * `to`              - The target root tree.
+/// * `aliased_removes` - The removals to check (see [`Plan::aliased_removes`]).
+/// * `ops`             - The plan's operations, extended in place.
+/// * `scope`           - The materialization scope.
+///
+/// # Returns
+/// * `Ok(())`      - If every kept file was judged.
+/// * `Err(String)` - If a tree could not be loaded, or an entry on disk could not be identified.
+fn keep_aliased_files(to: &TreeItem,
+                      aliased_removes: &[String],
+                      ops: &mut Vec<FileOp>,
+                      scope: &MaterializationScope) -> Result<(), String> {
+    if aliased_removes.is_empty() {
+        return Ok(());
+    }
+
+    let mut planned: HashSet<String> = ops.iter().map(|op| op_path(op).to_string()).collect();
+    let mut kept = Vec::new();
+
+    for removed in aliased_removes {
+        for (path, item) in fold_equal_files(to, removed)? {
+            if planned.contains(&path)
+                || (!scope.is_full() && scope.classify(&path) == ScopeClass::OutOfScope)
+                || !alias_utils::same_entry(Path::new(removed), Path::new(&path))? {
+                continue;
+            }
+
+            planned.insert(path.clone());
+            kept.push(FileOp::Write { path, hash: item.hash, item_type: item.item_type, is_new: false });
+        }
+    }
+
+    ops.extend(kept);
+    Ok(())
+}
+
+/// The files of `tree` whose path shares `path`'s fold key component by component, each with its
+/// entry.
+fn fold_equal_files(tree: &TreeItem, path: &str) -> Result<Vec<(String, TreeItem)>, String> {
+    let (directory, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let mut directories: Vec<(String, Cow<TreeItem>)> = vec![(String::new(), Cow::Borrowed(tree))];
+
+    for component in directory.split('/').filter(|component| !component.is_empty()) {
+        let fold = alias_utils::fold_key(component);
+        let mut next = Vec::new();
+
+        for (key, directory) in &directories {
+            for (subtree_name, subtree) in directory.get_subtrees() {
+                if alias_utils::fold_key(subtree_name) == fold {
+                    next.push((join_key(key, subtree_name), Cow::Owned(object_utils::load_tree(&subtree.hash)?)));
+                }
+            }
+        }
+
+        directories = next;
+    }
+
+    let fold = alias_utils::fold_key(name);
+
+    Ok(directories.iter()
+        .flat_map(|(key, directory)| directory.get_files()
+            .filter(|(file_name, _)| alias_utils::fold_key(file_name) == fold)
+            .map(|(file_name, item)| (join_key(key, file_name), item.clone()))
+            .collect::<Vec<_>>())
+        .filter(|(file_path, _)| file_path != path)
+        .collect())
 }
 
 /// What a diff removes before it writes: every `Remove` path, and every source-only directory
