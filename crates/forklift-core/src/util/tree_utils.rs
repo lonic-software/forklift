@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -311,7 +311,9 @@ const PARALLEL_PROBE_THRESHOLD: usize = 256;
 /// the call with that error: without it, files that only mirror the head would be blamed as lost
 /// staged work under a remedy that cannot clear them. A recipe that is present but unreadable
 /// fails the same way, unclassified: `restore --staged` then `load` cannot repair it, because a
-/// store skips writing an object whose hash is already present.
+/// store skips writing an object whose hash is already present, so its error names only
+/// `restore --staged` to leave the file out. The check is for presence: see
+/// [`probe_staged_object`] for what a present but damaged object gets.
 ///
 /// # Arguments
 /// * `root`           - The built root, as [`build_tree_from_inventory_deferred`] returned it
@@ -326,17 +328,31 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
     let mut changed = Vec::new();
     collect_changed_files(root, head_tree_hash, "", &mut changed)?;
 
-    let probe = |(path, hash, chunked): &(String, String, bool)| probe_staged_content(path, hash, *chunked);
-    let probed = if changed.len() < PARALLEL_PROBE_THRESHOLD {
-        changed.iter().map(probe).collect::<Vec<_>>()
-    } else {
-        fanout_utils::fanout_map(&changed, probe)
-    };
+    // Two flat passes, so the fan-out follows the probe count rather than the file count: one
+    // large file's chunks are as many probes as that many small files.
+    let probes = probe_all(&changed, |(path, hash, chunked)| probe_staged_object(path, hash, *chunked))?;
+
+    let mut wanted: Vec<&str> = probes.iter()
+        .filter_map(|probe| match probe { StagedObject::Chunked(chunks) => Some(chunks), _ => None })
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let present = probe_all(&wanted, |chunk| file_utils::does_object_exist(chunk))?;
+    let absent: HashSet<&str> = wanted.iter().zip(present).filter(|(_, present)| !present).map(|(chunk, _)| *chunk).collect();
 
     let mut lost = Vec::new();
-    for result in probed {
-        if let Some(lost_path) = result? {
-            lost.push(lost_path);
+    for ((path, hash, _), probe) in changed.iter().zip(&probes) {
+        match probe {
+            StagedObject::Present => {}
+            StagedObject::Absent => lost.push((path, format!("its content {} is missing from the store", hash))),
+            StagedObject::Chunked(chunks) => {
+                let absent_of = |chunks: &[String]| Ok(chunks.iter().filter(|chunk| absent.contains(chunk.as_str())).cloned().collect());
+                if let Err(why) = audit_utils::report_missing_chunks(hash, chunks, &absent_of) {
+                    lost.push((path, format!("its content is incomplete: {}", why)));
+                }
+            }
         }
     }
 
@@ -345,7 +361,7 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
     };
 
     let (message, next_step) = if lost.len() == 1 {
-        let quoted = shell_quoted(first_path);
+        let quoted = remedy_path(first_path);
         (
             format!(
                 "\"{}\" is staged, but {}; no parcel was made, since one naming it could not be \
@@ -394,7 +410,7 @@ fn collect_changed_files(tree: &TreeItem,
     let head_tree = match head_tree_hash {
         Some(hash) => Some(object_utils::load_tree(hash).map_err(|e| format!(
             "The head's tree {} for \"{}\" could not be read, so staged changes there cannot be told \
-            apart from what the head already holds: {}",
+            apart from what the head already holds: {}. No parcel was made.",
             hash, if prefix.is_empty() { "." } else { prefix }, e
         ))?),
         None => None,
@@ -415,37 +431,68 @@ fn collect_changed_files(tree: &TreeItem,
     Ok(())
 }
 
-/// Probe one changed file's content: `Ok(Some((path, reason)))` when its object, or for a chunked
-/// file any chunk, is absent; `Err` when the store could not be consulted or its recipe, present,
-/// could not be read.
-fn probe_staged_content(path: &str, hash: &str, chunked: bool) -> Result<Option<(String, String)>, String> {
+/// What [`probe_staged_object`] found for one changed file.
+enum StagedObject {
+    Present,
+    Absent,
+    /// A recipe that is present and readable, with its chunks still to probe.
+    Chunked(Vec<String>),
+}
+
+/// Map `probe` over `items`, inline below [`PARALLEL_PROBE_THRESHOLD`] (stopping at the first
+/// error) and fanned out at or above it; any error fails the whole call.
+fn probe_all<T: Sync, R: Send>(items: &[T], probe: impl Fn(&T) -> Result<R, String> + Sync) -> Result<Vec<R>, String> {
+    if items.len() < PARALLEL_PROBE_THRESHOLD {
+        items.iter().map(probe).collect()
+    } else {
+        fanout_utils::fanout_map(items, probe).into_iter().collect()
+    }
+}
+
+/// Probe one changed file's object: present, absent, or for a chunked file its recipe's chunk
+/// list. `Err` when the store could not be consulted, or the recipe is present and cannot be read.
+///
+/// Presence only, not integrity: a blob or chunk that is present but damaged is not read here,
+/// and surfaces at `restore` or `audit --full`. A recipe is read because its chunks are named in
+/// it, so damage to it is caught on the way.
+fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedObject, String> {
     if !file_utils::does_object_exist(hash)? {
-        return Ok(Some((path.to_string(), format!("its content {} is missing from the store", hash))));
+        return Ok(StagedObject::Absent);
     }
 
     if !chunked {
-        return Ok(None);
+        return Ok(StagedObject::Present);
     }
 
-    let chunks = object_utils::recipe_chunk_hashes(hash).map_err(|e| format!(
+    object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
         "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
-        Loading the file again will not replace it while the damaged object stays in place.",
-        path, hash, e
-    ))?;
-
-    Ok(audit_utils::verify_recipe_chunks_present(hash, &|_| Ok(chunks.clone()), &audit_utils::local_chunks_missing)
-        .err()
-        .map(|why| (path.to_string(), format!("its content is incomplete: {}", why))))
+        Loading the file again will not replace it while the damaged object stays in place; run \
+        \"forklift restore --staged {}\" to leave it out and stack the rest.",
+        path, hash, e, remedy_path(path)
+    ))
 }
 
-/// `path` as one shell word for a remedy command: unchanged when it holds only characters no
-/// shell treats specially, single-quoted otherwise.
-fn shell_quoted(path: &str) -> String {
-    if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "._-/+@%=:,".contains(c)) {
+/// `path` as it goes into a remedy command on this platform: see [`remedy_path_when`].
+fn remedy_path(path: &str) -> String {
+    remedy_path_when(path, cfg!(windows))
+}
+
+/// `path` as one argument of a remedy command. Unchanged when it holds only characters no shell
+/// treats specially; otherwise double-quoted for Windows (where a path cannot hold `"`) and
+/// single-quoted for a POSIX shell. A path starting with `-` is put after `--`, so it is not
+/// taken for an option. Windows quoting is for `cmd` and PowerShell alike, which still expand a
+/// `%`/`$` inside double quotes.
+fn remedy_path_when(path: &str, windows: bool) -> String {
+    let plain = if windows { "._-/+@:," } else { "._-/+@%:," };
+    let quoted = if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || plain.contains(c)) {
         path.to_string()
+    } else if windows {
+        format!("\"{}\"", path)
     } else {
         format!("'{}'", path.replace('\'', "'\\''"))
-    }
+    };
+
+    if path.starts_with('-') { format!("-- {}", quoted) } else { quoted }
 }
 
 /// Splice freshly built in-scope subtree(s) over the current head's spine to produce the
@@ -974,13 +1021,30 @@ mod subtree_closure_tests {
         }
     }
 
-    /// A remedy command's path is one shell word: plain paths stay as they are, and anything a
-    /// shell would split or expand is single-quoted, embedded quotes included.
+    /// A remedy command's path is one argument: plain paths stay as they are, anything a shell
+    /// would split or expand is quoted the platform's way (embedded POSIX quotes included), and a
+    /// leading `-` goes after `--`.
     #[test]
-    fn a_remedy_path_is_one_shell_word() {
-        assert_eq!(shell_quoted("src/a-b_c.v2.rs"), "src/a-b_c.v2.rs");
-        assert_eq!(shell_quoted("My Docs/report v2.txt"), "'My Docs/report v2.txt'");
-        assert_eq!(shell_quoted("it's$HOME"), "'it'\\''s$HOME'");
-        assert_eq!(shell_quoted(""), "''");
+    fn a_remedy_path_is_one_argument() {
+        let mut failures = Vec::new();
+        let cases = [
+            ("src/a-b_c.v2.rs", "src/a-b_c.v2.rs", "src/a-b_c.v2.rs"),
+            ("My Docs/report v2.txt", "'My Docs/report v2.txt'", "\"My Docs/report v2.txt\""),
+            ("it's$HOME", "'it'\\''s$HOME'", "\"it's$HOME\""),
+            ("=notes", "'=notes'", "\"=notes\""),
+            ("100%", "100%", "\"100%\""),
+            ("-draft.txt", "-- -draft.txt", "-- -draft.txt"),
+            ("-my draft", "-- '-my draft'", "-- \"-my draft\""),
+            ("", "''", "\"\""),
+        ];
+        for (path, posix, windows) in cases {
+            for (is_windows, expected) in [(false, posix), (true, windows)] {
+                let got = remedy_path_when(path, is_windows);
+                if got != expected {
+                    failures.push(format!("{:?} (windows: {}): expected {}, got {}", path, is_windows, expected, got));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

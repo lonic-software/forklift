@@ -2185,7 +2185,7 @@ const MAX_NAMED_MISSING_CHUNKS: usize = 32;
 /// bounded-concurrency batch of S3 `HEAD`s ([`crate`]-external: `ObjectStore::objects_missing`),
 /// where a probe is a network round trip and a large recipe lists thousands of chunks — the whole
 /// reason the seam is a bulk `&[hash] -> missing` call rather than a per-hash existence check.
-pub(crate) fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, String> {
+fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, String> {
     let mut missing = Vec::new();
 
     for chunk in chunks {
@@ -2220,7 +2220,7 @@ pub(crate) fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, Str
 /// * `load_recipe_chunks` - Reads the recipe's ordered chunk hashes (local store, or object store).
 /// * `chunks_missing`     - Given a recipe's full chunk-hash list, returns the subset the store
 ///                          lacks (in any order). Non-tolerant: a non-empty result fails the walk.
-pub(crate) fn verify_recipe_chunks_present(
+fn verify_recipe_chunks_present(
     recipe_hash: &str,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
@@ -2228,7 +2228,18 @@ pub(crate) fn verify_recipe_chunks_present(
     let chunks = load_recipe_chunks(recipe_hash)
         .map_err(|e| format!("Recipe {} is missing or unreadable: {}", recipe_hash, e))?;
 
-    let mut missing = chunks_missing(&chunks)?;
+    report_missing_chunks(recipe_hash, &chunks, chunks_missing)
+}
+
+/// The half of [`verify_recipe_chunks_present`] after the recipe is read: ask `chunks_missing`
+/// which of `chunks` the store lacks, and fail naming them. For a caller that has already read the
+/// recipe itself, to tell an unreadable one apart from one with absent chunks.
+pub(crate) fn report_missing_chunks(
+    recipe_hash: &str,
+    chunks: &[String],
+    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let mut missing = chunks_missing(chunks)?;
 
     if missing.is_empty() {
         return Ok(());
