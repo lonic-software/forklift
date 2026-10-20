@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use serde::Serialize;
 use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
@@ -284,7 +285,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
     // exactly as before.
     let scope = scope_utils::current_scope()?;
 
-    let actions = merge_utils::compute_merge_actions(
+    let mut actions = merge_utils::compute_merge_actions(
         &base_tree_hash, &our_tree_hash, &their_tree_hash, current, their_label, &scope
     )?;
 
@@ -304,6 +305,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
         return Ok(MergeStatus::Conflicts(paths));
     }
 
+    keep_aliased_files(&mut actions, &our_tree_hash, &scope)?;
     ensure_no_untracked_collisions(&actions, their_label)?;
 
     let mut conflict_paths = apply_merge_actions(&actions)?;
@@ -519,6 +521,45 @@ impl alias_utils::Removals for MergeRemovals {
         let prefix = format!("{}/", key);
         self.0.iter().any(|path| path.starts_with(&prefix))
     }
+}
+
+/// Keep every file our tree holds, unchanged by the merge, that one of its deletions would unlink
+/// through an alias: on a folding volume, deleting `readme` where our tree also holds `README`
+/// unlinks the one file both name. Each is taken back from our tree, written after the deletions
+/// under its own spelling (see [`shift_utils::kept_through_aliases`]). Shared with `cherry-pick`.
+pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
+                                 our_tree_hash: &str,
+                                 scope: &scope_utils::MaterializationScope) -> Result<(), String> {
+    let removed: Vec<String> = actions.iter()
+        .filter_map(|action| match action {
+            MergeAction::Delete { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if removed.is_empty() {
+        return Ok(());
+    }
+
+    let our_tree = object_utils::load_tree(our_tree_hash)?;
+    let planned: HashSet<&str> = actions.iter().map(|action| match action {
+        MergeAction::TakeTheirs { path, .. }
+        | MergeAction::Delete { path }
+        | MergeAction::Merged { path, .. }
+        | MergeAction::Conflict { path, .. }
+        | MergeAction::ResolveOutOfScope { path, .. } => path.as_str(),
+    }).collect();
+
+    let kept = shift_utils::kept_through_aliases(&our_tree, &removed, &planned, scope)?;
+
+    actions.extend(kept.into_iter().map(|(path, item)| MergeAction::TakeTheirs {
+        path,
+        hash: item.hash,
+        item_type: item.item_type,
+        is_new: false,
+    }));
+
+    Ok(())
 }
 
 /// Whether applying a conflict writes its file: inline content, or a chunked file materialized

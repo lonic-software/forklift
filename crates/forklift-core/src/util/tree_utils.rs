@@ -197,17 +197,22 @@ pub async fn build_tree_from_inventory_deferred(
 ///                   read or probe failure.
 fn refuse_alias_pairs(prepared: &inventory_utils::PreparedInventory) -> Result<(), String> {
     let skip = &prepared.skip;
-    let join = |parent: &str, name: &str| if parent.is_empty() { name.to_string() } else { format!("{}/{}", parent, name) };
-
-    let files: BTreeSet<String> = prepared.shards.iter()
+    let live = || prepared.shards.iter()
         .filter(|(key, _)| !skip.pruned.contains(*key))
-        .flat_map(|(key, inventory)| inventory.get_items()
+        .map(|(key, inventory)| (key, inventory.get_items()
             .filter(|(_, item)| item.state != InventoryItemState::Deleted)
-            .map(|(name, _)| join(key, name))
-            .collect::<Vec<_>>())
-        .collect();
+            .map(|(name, _)| name)))
+        .filter_map(|(key, mut names)| names.next().map(|first| (key, std::iter::once(first).chain(names))));
     let skipped: Vec<String> = skip.injections.iter()
-        .flat_map(|(parent, children)| children.iter().map(|(name, _)| join(parent, name)))
+        .flat_map(|(parent, children)| children.iter().map(|(name, _)| join_key(parent, name)))
+        .collect();
+
+    if !has_fold_equal_siblings(live().map(|(key, names)| (key.as_str(), names.map(String::as_str))), &skipped) {
+        return Ok(());
+    }
+
+    let files: BTreeSet<String> = live()
+        .flat_map(|(key, names)| names.map(|name| join_key(key, name)).collect::<Vec<_>>())
         .collect();
 
     let nodes = alias_utils::Nodes::from_live(files, skipped.iter().map(String::as_str));
@@ -222,6 +227,54 @@ fn refuse_alias_pairs(prepared: &inventory_utils::PreparedInventory) -> Result<(
         a parcel holding both could not be written back here. {} Then run this command again.",
         first, second, check.remedy(&first, &second, &nodes)?.instructions()
     ))
+}
+
+/// Whether some directory holds two names with one [`alias_utils::fold_key`], among the live
+/// files of `live` (each directory key with its file names) and the directories they and
+/// `skipped` imply. Only such a pair can be one entry, so with none the full check is skipped and
+/// the whole tree's paths are never collected in one place.
+fn has_fold_equal_siblings<'a, N>(live: impl Iterator<Item = (&'a str, N)>, skipped: &[String]) -> bool
+where N: Iterator<Item = &'a str> {
+    // Every directory the nodes imply, each once, by parent.
+    let mut directories: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut files: Vec<(&str, Vec<&str>)> = Vec::new();
+
+    fn add_directory(key: &str, directories: &mut HashMap<String, HashSet<String>>) {
+        let mut key = key;
+
+        while !key.is_empty() {
+            let (parent, name) = key.rsplit_once('/').unwrap_or(("", key));
+
+            if !directories.entry(parent.to_string()).or_default().insert(name.to_string()) {
+                break;
+            }
+
+            key = parent;
+        }
+    }
+
+    for (key, names) in live {
+        add_directory(key, &mut directories);
+        files.push((key, names.collect()));
+    }
+
+    for root in skipped {
+        add_directory(root, &mut directories);
+    }
+
+    fn collides<'b>(mut names: impl Iterator<Item = &'b str>) -> bool {
+        let mut folds = HashSet::new();
+        names.any(|name| !folds.insert(alias_utils::fold_key(name)))
+    }
+
+    let file_keys: HashSet<&str> = files.iter().map(|(key, _)| *key).collect();
+
+    files.iter().any(|(key, names)| {
+        let subdirectories = directories.get(*key).into_iter().flatten().map(String::as_str);
+        collides(names.iter().copied().chain(subdirectories))
+    }) || directories.iter()
+        .filter(|(key, _)| !file_keys.contains(key.as_str()))
+        .any(|(_, names)| collides(names.iter().map(String::as_str)))
 }
 
 /// The per-directory task of the tree build: build (and store) the tree object for one

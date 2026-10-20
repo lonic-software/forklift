@@ -93,6 +93,12 @@ pub fn listed_alias<'a>(parent: &Path, name: &str, listing: &'a [String]) -> Opt
 /// (`ß` and `ss`, the Kelvin sign and `k`, `ﬁ` and `fi` all meet) in canonical decomposition (an
 /// NFC and an NFD spelling meet). It proposes pairs; the volume decides them.
 pub fn fold_key(name: &str) -> String {
+    // An ASCII name folds to its ASCII lowercase, and has no decomposition: the common case,
+    // spared the three passes below.
+    if name.is_ascii() {
+        return name.to_ascii_lowercase();
+    }
+
     name.to_lowercase().to_uppercase().to_lowercase().nfd().collect()
 }
 
