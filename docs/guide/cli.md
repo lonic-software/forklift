@@ -248,11 +248,19 @@ load the folder again, and load by name any file an ignore rule covers that you 
 name: a folder load never adds those.
 
 Forklift never makes a link inside the staging area (`.forklift/inventory` may itself be a link,
-for an inventory moved elsewhere). A link found inside it, at a folder's stored inventory or any
-folder above it, is treated as damage and is never followed, even when what it points at looks
-like a valid inventory: following it would take another folder's state for this one's, or write
-outside the staging area. Every command that reads the folder refuses and names the link. Remove
-the link, then run `restore --staged .` to reset the staging area to the pallet head.
+for an inventory moved elsewhere). A link found inside it, whether at a folder's stored inventory,
+at any folder above that, or in place of the inventory metadata file, is treated as damage. It is
+never followed, even when what it points at looks valid: following it would take another folder's
+state, or another staging area's list of folders, for this one's, or write outside the staging
+area. Every command that reads it refuses and names the link. Remove the link, then run
+`restore --staged .` to reset the staging area to the pallet head. When the refusal comes from
+`gc` or `heal`, which read every bay's staging area, it names the checkout the staging area
+belongs to; run the reset there.
+
+The inventory folder itself is different. If `.forklift/inventory` is a link whose target is out of
+reach, such as a drive that is not mounted, Forklift refuses rather than treat the staging area as
+empty. The way out is to make the target available again, not to reset: a reset would abandon
+everything staged there.
 
 A folder below the warehouse root that holds its own `.forklift` (say you ran `prepare` in
 `vendor/lib`) is another working tree: commands run inside it use that warehouse, not this one.

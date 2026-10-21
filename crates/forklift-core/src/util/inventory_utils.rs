@@ -5145,9 +5145,13 @@ mod tests {
         let metadata = file_utils::get_inventory_metadata_path();
         let outside = scratch.root.join("other-metadata");
         std::fs::rename(&metadata, &outside).unwrap();
+        std::fs::write(&outside, "/forklift-inventory-metadata 999\n").unwrap();
         link_to(&outside, &metadata, false);
 
+        // Not even the format-version gate opens it, so the refusal names the link, not a version.
+        let store_root = file_utils::get_inventory_store_root();
         let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
+        assert!(store_root.is_ok(), "{store_root:?}");
         assert!(error.contains("is not a file (a link is never followed)") && error.contains("restore --staged ."), "{error}");
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).

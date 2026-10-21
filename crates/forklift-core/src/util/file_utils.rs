@@ -2366,8 +2366,9 @@ static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync:
 /// Refuse an inventory root whose metadata header names another format version, once per process
 /// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
 /// that reach a shard without reading the metadata first (`import-git` resets the inventory without
-/// reading it). A damaged, unreadable or absent metadata file passes: the metadata read reports
-/// the first two, and a reset rewrites the file without reading it.
+/// reading it). A damaged, unreadable or absent metadata file passes, as does one that is not a
+/// regular file, which is never opened (a link is never followed): the metadata read reports all
+/// but the absent one, and a reset rewrites the file without reading it.
 fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
     use std::io::BufRead;
 
@@ -2379,7 +2380,8 @@ fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
 
     // The header line alone decides the version; a longer first line is not a header.
     let mut header = Vec::new();
-    if let Ok(file) = std::fs::File::open(&metadata_path) {
+    let regular = std::fs::symlink_metadata(&metadata_path).is_ok_and(|metadata| metadata.is_file());
+    if let Some(file) = regular.then(|| std::fs::File::open(&metadata_path).ok()).flatten() {
         let _ = std::io::Read::take(std::io::BufReader::new(file), 256).read_until(b'\n', &mut header);
     }
 

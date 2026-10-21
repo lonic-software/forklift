@@ -1651,7 +1651,33 @@ fn describe_shard(shard_path: &Path) -> String {
 /// its referenced hashes, step 2's roots) and the §8.3 torn rescan's step 1 (restages each one's
 /// own bytes, regardless of content) need identically, so this is the one place that walk is
 /// written; the two callers differ only in what they do with the paths this returns.
-fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+fn walk_shard_data_files(inventory_root: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+    walk_shard_data_files_below(inventory_root, inventory_root, found)
+}
+
+/// Which checkout's staging area `inventory_root` is, for a remedy that must be run there: a walk
+/// covers every bay's, and a reset run in another checkout would unstage that checkout's work.
+fn staging_area_owner(inventory_root: &Path) -> String {
+    let state = inventory_root.parent().unwrap_or(inventory_root);
+    let checkout = if state == forklift_root() {
+        state.parent().map(Path::to_path_buf)
+    } else {
+        state.file_name().and_then(|name| name.to_str())
+            .and_then(|name| bay_utils::read_bay_path(name).ok().flatten())
+    };
+
+    match checkout {
+        Some(dir) => format!(
+            "This staging area belongs to the checkout \"{}\": run the command there.", dir.to_string_lossy()
+        ),
+        None => format!(
+            "This staging area belongs to the bay whose state is \"{}\": run the command in that bay's checkout.",
+            state.to_string_lossy()
+        ),
+    }
+}
+
+fn walk_shard_data_files_below(inventory_root: &Path, folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
     // A folder absent from the start, or removed while the walk descends (its last shard
     // unstaged concurrently), holds no shards. An inventory root that is a link to a folder out of
     // reach is not absent: what it stages is unknown, so it cannot count as nothing.
@@ -1659,7 +1685,9 @@ fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), 
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if std::fs::symlink_metadata(folder).is_ok() {
-                return Err(file_utils::unresolved_inventory_root(folder));
+                return Err(format!(
+                    "{} {}", file_utils::unresolved_inventory_root(folder), staging_area_owner(inventory_root)
+                ));
             }
             return Ok(());
         }
@@ -1679,13 +1707,13 @@ fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), 
 
         if kind.is_symlink() {
             return Err(format!(
-                "\"{}\" in the staging area is a link, which Forklift never makes there, so it is not followed. {}",
-                path.to_string_lossy(), file_utils::STAGING_DAMAGE_REMEDY
+                "\"{}\" in the staging area is a link, which Forklift never makes there, so it is not followed. {} {}",
+                path.to_string_lossy(), file_utils::STAGING_DAMAGE_REMEDY, staging_area_owner(inventory_root)
             ));
         }
 
         if kind.is_dir() {
-            walk_shard_data_files(&path, found)?;
+            walk_shard_data_files_below(inventory_root, &path, found)?;
             continue;
         }
 
@@ -6343,6 +6371,7 @@ mod tests {
 
         let error = walk_shard_files(&inventory_root, &mut Vec::new()).expect_err("an unreachable root");
         assert!(error.contains("does not resolve to a folder"), "{error}");
+        assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{error}");
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -6372,6 +6401,7 @@ mod tests {
 
             let error = walked.expect_err(level);
             assert!(error.contains("is a link") && error.contains("restore --staged ."), "{level}: {error}");
+            assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{level}: {error}");
 
             std::fs::remove_dir_all(&root).ok();
         }
