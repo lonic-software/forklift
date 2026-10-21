@@ -303,16 +303,27 @@ pub fn kept_through_aliases(tree: &TreeItem,
     let mut kept = Vec::new();
 
     for removed in removed {
+        // The disk is read only for a removal with a fold-equal candidate, and only along paths
+        // the planned-path check accepts: a path it refuses is left to that refusal, which runs
+        // before anything is applied.
+        let candidates: Vec<(String, TreeItem)> = index.fold_equal_files(removed)?.into_iter()
+            .filter(|(path, _)| path != removed
+                && !planned.contains(path.as_str())
+                && !seen.contains(path)
+                && (scope.is_full() || scope.classify(path) != ScopeClass::OutOfScope)
+                && check_working_path(path).is_ok())
+            .collect();
+
+        if candidates.is_empty() || check_working_path(removed).is_err() {
+            continue;
+        }
+
         let Some(removed_listed) = check.resolve(removed)? else {
             continue;
         };
 
-        for (path, item) in index.fold_equal_files(removed)? {
-            if path == *removed
-                || planned.contains(path.as_str())
-                || seen.contains(&path)
-                || (!scope.is_full() && scope.classify(&path) == ScopeClass::OutOfScope)
-                || check.resolve(&path)?.as_ref() != Some(&removed_listed) {
+        for (path, item) in candidates {
+            if check.resolve(&path)?.as_ref() != Some(&removed_listed) {
                 continue;
             }
 
