@@ -29,7 +29,9 @@ use crate::output::{self, CommandOutput};
 /// The imported history is **unsigned** (it predates any trust): import into a warehouse
 /// where trust is not yet established, then `office enroll` to anchor it as the legacy
 /// boundary. Run it from the git repository's directory (`forklift import-git .`), so the
-/// checked-out working tree already matches the imported HEAD.
+/// checked-out working tree already holds the imported HEAD — except a file git converted on
+/// checkout (line endings, `ident`, a smudge filter), which reads as an unstaged change, since
+/// the history keeps the bytes git stored and forklift converts nothing.
 ///
 /// A large import lands hundreds of thousands of objects at once, which is exactly the case
 /// the loose object store is slowest in — writing (and later compacting away) one file per
@@ -122,7 +124,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     }
 
     // Check out git's HEAD branch (or the first branch) as the current pallet, and build
-    // the inventory from it so a colocated working tree reads clean.
+    // the inventory from it so a colocated working tree reads clean wherever it holds the tree.
     let default_branch = default_branch(path).ok();
     let current = default_branch.as_ref()
         .and_then(|branch| imported.iter().find(|(name, _)| name == branch))

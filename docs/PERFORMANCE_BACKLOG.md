@@ -206,7 +206,8 @@ FORK-163 section below, and the rest is FORK-192.
 
 **Found on the way:**
 - FORK-187: `import-git` records git's LF blob against the stat of a CRLF-converted working
-  file (`eol=crlf`), so the file reads modified once its stat cache misses.
+  file (`eol=crlf`), so the file reads modified once its stat cache misses. Closed by FORK-208's
+  re-proving tree build: such a file now reads modified from the import on (pinned under FORK-187).
 - FORK-182: the stat refresh stocktake never persists, which made copied warehouses rehash
   everything.
 

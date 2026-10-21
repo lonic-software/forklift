@@ -2303,6 +2303,51 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
 }
 
+/// Forklift has no checkout conversion, so a file git rewrote on checkout (`eol=crlf`, `ident`)
+/// does not hold the bytes `import-git` imports for it. It reads as an unstaged change from the
+/// first stocktake, and still does once its stat no longer matches, rather than reading clean
+/// until then. A file git checked out unconverted reads clean throughout.
+#[test]
+fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
+    let warehouse = TestWarehouse::new("import-git-converted");
+    let root = warehouse.root.clone();
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    git_in(&root, &["config", "core.autocrlf", "false"]);
+    warehouse.write_file(".gitattributes", "*.bat eol=crlf\nid.txt ident\n");
+    warehouse.write_file("run.bat", "echo one\necho two\n");
+    warehouse.write_file("id.txt", "$Id$\n");
+    warehouse.write_file("plain.txt", "plain\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+
+    // Checked out again, git writes the converted bytes; the plain file comes back as it was.
+    for name in ["run.bat", "id.txt", "plain.txt"] {
+        std::fs::remove_file(root.join(name)).unwrap();
+    }
+    git_in(&root, &["checkout", "--", "run.bat", "id.txt", "plain.txt"]);
+    assert_eq!(std::fs::read(root.join("run.bat")).unwrap(), b"echo one\r\necho two\r\n");
+    assert_ne!(std::fs::read(root.join("id.txt")).unwrap(), b"$Id$\n");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["import-git", "."]));
+
+    let expected = vec![
+        ("untracked".to_string(), ".forkliftignore".to_string()),
+        ("modified".to_string(), "id.txt".to_string()),
+        ("modified".to_string(), "run.bat".to_string()),
+    ];
+    assert_eq!(unstaged_changes(&warehouse), expected, "right after the import");
+
+    // A new mtime makes every entry's stat miss, so each file is hashed again.
+    for name in ["run.bat", "id.txt", "plain.txt"] {
+        backdate(&root.join(name), 60);
+    }
+    assert_eq!(unstaged_changes(&warehouse), expected, "once the stats miss");
+}
+
 /// A tree large enough for the inventory build to fan out (its files recorded on worker threads,
 /// a level's subtrees loaded in parallel) lands every entry in its own directory's shard, with
 /// that file's own hash, proven: after `import-git`, which verifies each file, and after a

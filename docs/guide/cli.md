@@ -73,6 +73,15 @@ and its directory, rather than being imported under a different path; so does an
 depth that some file system opens as `.forklift` (`.Forklift`, `.forklift.`). For agents, this means a project can be moved onto
 forklift with one command.
 
+Forklift stores a file's bytes as they are and has no checkout conversion, so the history keeps
+the bytes git stored. A file git rewrote when it checked the file out (line endings from
+`eol=crlf`, `text` or `core.autocrlf`, an `ident` expansion, a smudge `filter` such as Git LFS)
+holds other bytes than its imported entry. The import checks every working file against the
+imported tree, so such a file reads `modified` from the first `stocktake`, the same way an
+uncommitted edit does. `load` and stack it to track the checked-out bytes, or check it out from
+git again without the conversion. The import does not refuse such a repository: git.git itself
+converts its `.bat` files.
+
 A large history lands hundreds of thousands of objects at once — the case the loose store
 is slowest and largest in — so the imported objects are written **straight into native
 packs** ([`compact`](#compact--pack-the-object-store)'s format, without the detour through
