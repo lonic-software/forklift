@@ -294,11 +294,20 @@ fn remove(name: &str) -> Result<(), String> {
     // leave the directory naming a bay that no longer exists.
     let left = match bay_dir.as_ref().map(|bay_dir| bay_utils::remove_bay_redirect(bay_dir, &globals::forklift_root(), name)) {
         None | Some(Ok(())) => None,
-        Some(Err(bay_utils::RedirectRemoval::Kept(e))) => return Err(format!(
-            "{} The bay \"{}\" was kept, since its working directory still redirects to it. To remove it \
-            anyway, delete the folder \"{}\" by hand, then run this command again.",
-            e, name, bay_dir.unwrap_or_default().join(globals::FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
-        )),
+        Some(Err(bay_utils::RedirectRemoval::Kept(e))) => {
+            let entry = bay_dir.unwrap_or_default().join(globals::FOLDER_NAME_FORKLIFT_ROOT);
+            // Named by what it is, so the deletion the remedy asks for is the one that works.
+            let kind = match std::fs::symlink_metadata(&entry) {
+                Ok(metadata) if metadata.file_type().is_symlink() => "link",
+                Ok(metadata) if metadata.is_dir() => "folder",
+                _ => "file",
+            };
+            return Err(format!(
+                "{} The bay \"{}\" was kept, since its working directory may still redirect to it. To \
+                remove it anyway, delete the {} \"{}\" by hand, then run this command again.",
+                e, name, kind, entry.to_string_lossy()
+            ));
+        }
         Some(Err(bay_utils::RedirectRemoval::Left(e))) => Some(e),
     };
 
