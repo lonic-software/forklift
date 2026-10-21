@@ -1448,7 +1448,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
     "notes": {
-      "description": "Advisory notes that never blocked clearing: the \"re-run the load\" remedy for each vanished\ninventory shard in `resolved`, a note for each bay whose local state could not be\nread this run (skipped rather than blocking recovery) naming the bay and how to clean it\nup, and — only when this run's own closure walk actually confirmed one — a note for each\ntrust pin (a trust or distrust boundary) that is not held locally. That last kind is never\nunconditional: a run with nothing left to check after restaging skips the closure walk\nentirely (there is nothing for it to resolve), so it reports no pin note even when one\ngenuinely applies; a run that still has something dangling reports no pin note either, since\nthis field only ever appears on a fully-cleared run.",
+      "description": "Advisory notes that never blocked clearing: a note for each vanished inventory shard in\n`resolved`, a note for each bay whose local state could not be\nread this run (skipped rather than blocking recovery) naming the bay and how to clean it\nup, and — only when this run's own closure walk actually confirmed one — a note for each\ntrust pin (a trust or distrust boundary) that is not held locally. That last kind is never\nunconditional: a run with nothing left to check after restaging skips the closure walk\nentirely (there is nothing for it to resolve), so it reports no pin note even when one\ngenuinely applies; a run that still has something dangling reports no pin note either, since\nthis field only ever appears on a fully-cleared run.",
       "items": {
         "type": "string"
       },
@@ -1718,6 +1718,13 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "unheld": {
+      "description": "Every checked-out file that does not hold the content imported for it (an uncommitted\nedit or deletion, or a file git converted as it checked it out), in tree order. Each reads\nas an unstaged change. The warning names only the first few.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "warnings": {
       "description": "Anything skipped or worth flagging (e.g. submodules).",
