@@ -1,7 +1,9 @@
 use crate::model::inventory::Inventory;
 
 /// Build an inventory object's content with version `V2026_10_19`: byte-identical to
-/// `V2026_07_15`. The version marks shards whose entries prove themselves (see the parser).
+/// `V2026_07_15`. The version marked shards whose entries prove themselves against one probe
+/// whatever their device; since `V2026_10_21` its entries parse unproven (see the parser), and
+/// new shards are written as `V2026_10_21`.
 ///
 /// # Arguments
 /// * `inventory` - The inventory data.

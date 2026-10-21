@@ -1629,9 +1629,11 @@ mod tests {
     /// boundary — enforcement of what an identity may touch lives remote-side (the server's
     /// role-and-transport authorization), not in the client's bay bookkeeping. Every bay
     /// operation is non-destructive: `add` refuses
-    /// onto a non-empty directory, and `remove` only deletes forklift's own redirect file and
-    /// bay-state folder, never the materialized working tree or anything the agent didn't
-    /// create — so nothing here needs a tighter gate than the rest of the surface.
+    /// onto a non-empty directory, and `remove` only deletes the bay's own `.forklift` entry (one
+    /// whose redirect names that bay of this warehouse, left in place otherwise; a link is
+    /// deleted as a link, never followed) and its bay-state folder, never the materialized working tree
+    /// or anything the agent didn't create — so nothing here needs a tighter gate than the rest
+    /// of the surface.
     const HUMAN_ONLY: &[&str] = &[
         "alias",       // manage the `fl` shell alias next to this binary (host concern)
         "prepare",     // create a warehouse (setup)

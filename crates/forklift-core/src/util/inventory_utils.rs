@@ -1546,10 +1546,10 @@ pub fn build_inventory_item_from_stat(path: &Path,
                                       anchor: file_utils::StatAnchor) -> Result<InventoryItem, String> {
     let metadata = file_utils::get_symlink_metadata_for_path(path)?;
 
-    let mtime = anchor.record(file_utils::get_content_modification_timestamp_for_file(&metadata)?);
-    let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
-
     let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
+
+    let mtime = anchor.record(device_id, file_utils::get_content_modification_timestamp_for_file(&metadata)?);
+    let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
     let (user_id, group_id) = file_utils::get_owners_for_file(&metadata);
 
@@ -3278,10 +3278,10 @@ fn build_item_and_object_for_file(path: &Path,
                                   -> Result<(InventoryItem, Option<LooseObject>), String> {
     let metadata = file_utils::get_symlink_metadata_for_path(path)?;
 
-    let mtime = anchor.record(file_utils::get_content_modification_timestamp_for_file(&metadata)?);
-    let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
-
     let (device_id, inode) = file_utils::get_device_and_inode(path, &metadata)?;
+
+    let mtime = anchor.record(device_id, file_utils::get_content_modification_timestamp_for_file(&metadata)?);
+    let ctime = file_utils::get_metadata_modification_timestamp_for_file(&metadata);
 
     let (user_id, group_id) = file_utils::get_owners_for_file(&metadata);
     let ingested = object_utils::ingest_file(name, path, item_type, mode)?;
@@ -3706,7 +3706,7 @@ mod tests {
 
         let recorded = build_inventory_item_from_stat(&link, "link", "hash".to_string(),
                                                       DirEntryType::SymbolicLink,
-                                                      file_utils::StatAnchor::At(u64::MAX)).unwrap();
+                                                      anchor_proving_all_on(&link)).unwrap();
         let link_metadata = std::fs::symlink_metadata(&link).unwrap();
         assert_eq!(recorded.inode, std::os::unix::fs::MetadataExt::ino(&link_metadata));
 
@@ -4165,6 +4165,12 @@ mod tests {
 
     /// Set a file's modification time directly, through an open write handle — never a
     /// reopen-by-path (the project's Windows fsync convention).
+    /// An anchor that proves every mtime on `path`'s device, as one stamped long after the file was.
+    fn anchor_proving_all_on(path: &Path) -> file_utils::StatAnchor {
+        let metadata = file_utils::get_symlink_metadata_for_path(path).unwrap();
+        file_utils::StatAnchor::At { device: file_utils::get_device_and_inode(path, &metadata).unwrap().0, stamp: u64::MAX }
+    }
+
     fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(mtime).unwrap();
@@ -4214,9 +4220,10 @@ mod tests {
             &file_utils::get_symlink_metadata_for_path(&file).unwrap()).unwrap();
         assert_eq!(mtime, 1_000_000);
 
-        let recorded = |anchor: u64| build_inventory_item_from_stat(
+        let file_utils::StatAnchor::At { device, .. } = anchor_proving_all_on(&file) else { unreachable!() };
+        let recorded = |stamp: u64| build_inventory_item_from_stat(
             &file, "a.txt", "hash".to_string(), DirEntryType::Normal,
-            file_utils::StatAnchor::At(anchor)).unwrap().content_change_timestamp;
+            file_utils::StatAnchor::At { device, stamp }).unwrap().content_change_timestamp;
         assert_eq!(recorded(mtime + 2), mtime, "two whole seconds before the anchor is proven");
         assert_eq!(recorded(mtime + 1), UNPROVEN_MTIME, "one second before the anchor is not proven");
         assert_eq!(recorded(mtime), UNPROVEN_MTIME, "the anchor's own second is not proven");
@@ -4225,6 +4232,24 @@ mod tests {
                                                       DirEntryType::Normal,
                                                       file_utils::StatAnchor::Unproven).unwrap();
         assert_eq!(unproven.content_change_timestamp, UNPROVEN_MTIME);
+    }
+
+    /// A file recorded from a stat is proven only against an anchor taken on its own device: an
+    /// anchor from any other volume says nothing about its clock.
+    #[test]
+    fn an_entry_recorded_from_a_stat_is_unproven_against_another_devices_anchor() {
+        let scratch = Scratch::new("anchor-other-device");
+        let file = scratch.root.join("a.txt");
+        std::fs::write(&file, "content").unwrap();
+        set_mtime(&file, std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+
+        let file_utils::StatAnchor::At { device, stamp } = anchor_proving_all_on(&file) else { unreachable!() };
+        let recorded = |device| build_inventory_item_from_stat(
+            &file, "a.txt", "hash".to_string(), DirEntryType::Normal,
+            file_utils::StatAnchor::At { device, stamp }).unwrap().content_change_timestamp;
+        assert_eq!(recorded(device.wrapping_add(1)), UNPROVEN_MTIME,
+                   "an anchor on another device must not prove the file");
+        assert_eq!(recorded(device), 1_000_000, "the file's own device's anchor proves it");
     }
 
     /// A file whose bytes match its entry but whose executable bit does not is a change where a
@@ -4249,7 +4274,7 @@ mod tests {
                                                          IngestMode::ComputeOnly,
                                                          file_utils::StatAnchor::Unproven).unwrap();
         let entry_of = |kind: DirEntryType| build_inventory_item_from_stat(
-            &file, "tool.sh", hashed.hash.clone(), kind, file_utils::StatAnchor::At(u64::MAX)).unwrap();
+            &file, "tool.sh", hashed.hash.clone(), kind, anchor_proving_all_on(&file)).unwrap();
         let classify = |entry: &InventoryItem| classify_file_against_entry(
             entry, &metadata, stat_kind, &file, "tool.sh", IngestMode::ComputeOnly,
             file_utils::StatAnchor::Unproven).unwrap();
@@ -4299,7 +4324,7 @@ mod tests {
         let metadata = file_utils::get_symlink_metadata_for_path(&file).unwrap();
         let mut entry = build_inventory_item_from_stat(&file, "a.txt", "hash".to_string(),
                                                        DirEntryType::Normal,
-                                                       file_utils::StatAnchor::At(u64::MAX)).unwrap();
+                                                       anchor_proving_all_on(&file)).unwrap();
         assert!(is_entry_unchanged(&entry, &metadata, DirEntryType::Normal, &file));
         entry.content_change_timestamp = UNPROVEN_MTIME;
         assert!(!is_entry_unchanged(&entry, &metadata, DirEntryType::Normal, &file),

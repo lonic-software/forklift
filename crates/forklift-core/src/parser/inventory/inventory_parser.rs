@@ -119,28 +119,31 @@ mod tests {
     }
 
     /// The same shard bytes under an older version code: v1 and v2 entries were proven against the
-    /// shard's own mtime, an anchor that no longer exists, so they parse unproven; v3 entries
-    /// carry their own proof and keep it. An unknown version is refused, never guessed.
+    /// shard's own mtime, an anchor that no longer exists, and v3 entries against one probe whatever
+    /// their device, so all of them parse unproven; v4 entries were proven on their own device and
+    /// keep it. An unknown version is refused, never guessed.
     #[test]
-    fn entries_of_a_shard_older_than_v3_parse_unproven() {
+    fn entries_of_a_shard_older_than_v4_parse_unproven() {
         use crate::enums::inventory_version::InventoryVersion;
         use crate::model::inventory::UNPROVEN_MTIME;
 
         let mut inventory = crate::model::inventory::Inventory::new();
         inventory.add_item(item("file.txt"));
         let latest = InventoryBuilder::build(&inventory);
-        assert_eq!(latest[0] as u64, InventoryVersion::V2026_10_19.get_code(), "sanity: a one-byte version code");
+        assert_eq!(latest[0] as u64, InventoryVersion::V2026_10_21.get_code(), "sanity: a one-byte version code");
 
         let parsed = parse_inventory(&latest).unwrap();
         assert_eq!(parsed.get_item_by_name("file.txt").unwrap().content_change_timestamp, 1_700_000_001);
 
-        let mut v2 = latest.clone();
-        v2[0] = InventoryVersion::V2026_07_15.get_code() as u8;
-        let parsed = parse_inventory(&v2).unwrap();
-        let entry = parsed.get_item_by_name("file.txt").unwrap();
-        assert_eq!(entry.content_change_timestamp, UNPROVEN_MTIME, "a v2 entry must parse unproven");
-        assert_eq!(entry.hash, item("file.txt").hash, "only the proof is dropped");
-        assert_eq!(entry.inode, 12345);
+        for older in [InventoryVersion::V2026_07_15, InventoryVersion::V2026_10_19] {
+            let mut bytes = latest.clone();
+            bytes[0] = older.get_code() as u8;
+            let parsed = parse_inventory(&bytes).unwrap();
+            let entry = parsed.get_item_by_name("file.txt").unwrap();
+            assert_eq!(entry.content_change_timestamp, UNPROVEN_MTIME, "a v{} entry must parse unproven", older.get_code());
+            assert_eq!(entry.hash, item("file.txt").hash, "only the proof is dropped");
+            assert_eq!(entry.inode, 12345);
+        }
 
         let mut unknown = latest;
         unknown[0] = 0x7f;

@@ -149,13 +149,14 @@ pub fn current_scope_root() -> Option<PathBuf> {
     STORAGE_ROOT.with(|cell| cell.borrow().clone())
 }
 
-/// A bay context (§7.5): the shared `.forklift` a bay borrows, and the bay's name. A bay's
-/// working directory is *not* the warehouse, so unlike the main tree its cwd cannot locate
-/// the shared `.forklift` — this records it. Process-global (not thread-local) on purpose:
-/// the CLI's parallel walks (`TaskExecutor` workers) run on threads that do not inherit
-/// thread-locals, and they must see the same shared root and bay.
+/// A bay context (§7.5): the shared `.forklift` a bay borrows, the bay's own `.forklift` folder,
+/// and the bay's name. A bay's working directory is *not* the warehouse, so unlike the main tree
+/// its cwd cannot locate the shared `.forklift` — this records it. Process-global (not
+/// thread-local) on purpose: the CLI's parallel walks (`TaskExecutor` workers) run on threads
+/// that do not inherit thread-locals, and they must see the same shared root and bay.
 struct BayContext {
     shared_forklift: PathBuf,
+    working_forklift: PathBuf,
     name: String,
 }
 
@@ -163,10 +164,14 @@ static BAY_CONTEXT: RwLock<Option<BayContext>> = RwLock::new(None);
 
 /// Enter a bay for the rest of this process (the CLI sets this once, after discovery, when
 /// it was invoked inside a bay). `shared_forklift` is the warehouse's `.forklift` folder
-/// the bay shares; `name` is the bay.
-pub fn set_bay_context(shared_forklift: PathBuf, name: String) {
-    *BAY_CONTEXT.write().expect("the bay context lock is poisoned") =
-        Some(BayContext { shared_forklift: normalize_root(&shared_forklift), name });
+/// the bay shares; `working_forklift` is the bay's own `.forklift` folder in its working
+/// directory (see [`working_forklift`]), absolute; `name` is the bay.
+pub fn set_bay_context(shared_forklift: PathBuf, working_forklift: PathBuf, name: String) {
+    *BAY_CONTEXT.write().expect("the bay context lock is poisoned") = Some(BayContext {
+        shared_forklift: normalize_root(&shared_forklift),
+        working_forklift: normalize_root(&working_forklift),
+        name,
+    });
     BAY_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -206,6 +211,20 @@ pub fn bay_root() -> PathBuf {
         None => forklift_root(),
         Some(name) => forklift_root().join(FOLDER_NAME_BAYS_ROOT).join(name),
     }
+}
+
+/// The `.forklift` folder in the working tree's own root: a bay's own folder (which holds its
+/// redirect), and [`forklift_root`] otherwise. It lives on the working tree's volume even when the
+/// shared `.forklift` does not, so the probes that learn how that volume stamps times and keeps
+/// the executable bit are written here. Nothing creates it on demand: a bay whose folder was
+/// removed fails its probes rather than growing an empty `.forklift` that would read as a
+/// warehouse.
+pub fn working_forklift() -> PathBuf {
+    if let Some(context) = BAY_CONTEXT.read().expect("the bay context lock is poisoned").as_ref() {
+        return context.working_forklift.clone();
+    }
+
+    forklift_root()
 }
 
 /// The root folder of the active warehouse itself (see [`forklift_root`]) — for the

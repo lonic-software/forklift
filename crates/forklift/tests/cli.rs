@@ -1044,8 +1044,12 @@ impl ExfatVolume {
     /// macOS leg must reach the volume, or the test it serves would pass without running).
     fn attach(name: &str) -> Option<ExfatVolume> {
         let base = std::env::temp_dir().join(format!("forklift-test-{}-{}", name, std::process::id()));
-        let image = base.with_extension("dmg");
-        let mount = base.with_extension("mnt");
+        ExfatVolume::attach_at(name, base.with_extension("mnt"))
+    }
+
+    /// [`Self::attach`], mounted at `mount`.
+    fn attach_at(name: &str, mount: PathBuf) -> Option<ExfatVolume> {
+        let image = std::env::temp_dir().join(format!("forklift-test-{}-{}.dmg", name, std::process::id()));
         let _ = std::process::Command::new("hdiutil").args(["detach", "-force"]).arg(&mount).output();
         let _ = std::fs::remove_file(&image);
         let _ = std::fs::remove_dir_all(&mount);
@@ -1141,6 +1145,111 @@ fn a_volume_without_the_executable_bit_shifts_twice_and_keeps_each_entry_s_bit()
     assert_eq!(mode(&back.root, "notes.txt") & 0o111, 0, "a plain file stayed plain");
     assert_eq!(mode(&back.root, "new.txt") & 0o111, 0, "a new file on a blind volume is recorded plain");
     assert!(changes(&back, "unstaged").is_empty());
+}
+
+/// The inventory entry `name` in shard `key` of bay `bay`'s own staging area. A bay keeps its
+/// inventory under the shared root's `bays/<bay>/`, so it is read off a copy laid out as a
+/// warehouse's.
+#[cfg(target_os = "macos")]
+fn bay_inventory_entry(warehouse: &TestWarehouse, bay: &str, key: &str, name: &str) -> forklift_core::model::inventory::InventoryItem {
+    let copy = warehouse.home.join(format!("bay-inventory-{}", bay));
+    let _ = std::fs::remove_dir_all(&copy);
+    std::fs::create_dir_all(copy.join(".forklift")).unwrap();
+    let inventory = warehouse.root.join(".forklift").join("bays").join(bay).join("inventory");
+    let status = std::process::Command::new("cp").arg("-R").arg(&inventory).arg(copy.join(".forklift").join("inventory"))
+        .status().unwrap();
+    assert!(status.success(), "cp -R {}", inventory.display());
+
+    inventory_entry(&TestWarehouse { root: copy, home: warehouse.home.clone() }, key, name)
+}
+
+/// A bay on another volume than its warehouse stamps its clock probe on its own volume, so its
+/// files are proven against that volume's clock: entries older than the stamp are recorded
+/// proven rather than rehashed on every stocktake.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bay_on_another_volume_proves_its_entries_against_its_own_clock() {
+    use forklift_core::model::inventory::UNPROVEN_MTIME;
+
+    let Some(volume) = ExfatVolume::attach("exfat-bay-anchor") else {
+        return;
+    };
+    let warehouse = TestWarehouse::new("exfat-bay-anchor");
+    warehouse.write_file("code.txt", "v1\n");
+    warehouse.write_file("lib/util.txt", "util\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = volume.mount.join("bay");
+    assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
+    for path in ["code.txt", "lib/util.txt"] {
+        backdate(&bay_dir.join(path), 3600);
+    }
+
+    let bay = TestWarehouse { root: bay_dir.clone(), home: warehouse.home.clone() };
+    assert_success(&bay.run(&["load", "."]));
+
+    for (key, name) in [("", "code.txt"), ("lib", "util.txt")] {
+        assert_ne!(bay_inventory_entry(&warehouse, "feature", key, name).content_change_timestamp, UNPROVEN_MTIME,
+            "{} on the bay's volume must be proven against the bay's own clock", name);
+    }
+}
+
+/// A bay on a volume without the executable bit learns that from a probe on its own volume, not
+/// the warehouse's: its plain files read clean after `bay add`, not as executable changes.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bay_on_a_volume_without_the_executable_bit_reads_clean() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(volume) = ExfatVolume::attach("exfat-bay-exec-bit") else {
+        return;
+    };
+    let warehouse = TestWarehouse::new("exfat-bay-exec-bit");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = volume.mount.join("bay");
+    assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
+    assert_ne!(std::fs::metadata(bay_dir.join("code.txt")).unwrap().permissions().mode() & 0o111, 0,
+        "exFAT must report the bit set on a plain file");
+
+    let bay = TestWarehouse { root: bay_dir, home: warehouse.home.clone() };
+    assert!(changes(&bay, "unstaged").is_empty(), "the bay's plain files must read clean");
+}
+
+/// A volume mounted inside a main working tree: its files are recorded unproven, since the anchor
+/// was stamped on the warehouse's volume and says nothing about another's clock, while the
+/// warehouse volume's own files are proven.
+#[cfg(target_os = "macos")]
+#[test]
+fn files_on_a_volume_mounted_inside_the_tree_are_recorded_unproven() {
+    use forklift_core::model::inventory::UNPROVEN_MTIME;
+
+    let warehouse = TestWarehouse::new("exfat-nested-mount");
+    std::fs::create_dir_all(&warehouse.root).unwrap();
+    let Some(_volume) = ExfatVolume::attach_at("exfat-nested-mount", warehouse.root.join("vol")) else {
+        return;
+    };
+    warehouse.write_file("a.txt", "a\n");
+    warehouse.write_file("vol/b.txt", "b\n");
+    backdate(&warehouse.root.join("a.txt"), 3600);
+    backdate(&warehouse.root.join("vol").join("b.txt"), 3600);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "a.txt"]));
+    assert_success(&warehouse.run(&["load", "vol/b.txt"]));
+
+    assert_ne!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, UNPROVEN_MTIME,
+        "a file on the warehouse's volume must be proven");
+    assert_eq!(inventory_entry(&warehouse, "vol", "b.txt").content_change_timestamp, UNPROVEN_MTIME,
+        "a file on another volume must not be proven against the warehouse's clock");
 }
 
 /// A chmod alone is a change on every side: stocktake reports it unstaged, then staged once
@@ -2609,33 +2718,36 @@ fn an_edit_in_the_second_of_a_shift_survives_a_sibling_load() {
     panic!("no attempt edited a.txt within the second shift wrote it");
 }
 
-/// A shard written before entries proved themselves (format v2) parses with every entry
-/// unproven, and the next directory load rewrites it as v3 with real stat data.
+/// A shard written before entries proved themselves (format v2), or before a proof named the
+/// device it was taken on (v3), parses with every entry unproven, and the next directory load
+/// rewrites it as v4 with real stat data.
 #[test]
-fn a_load_rewrites_a_v2_shard_with_proven_entries() {
-    let warehouse = TestWarehouse::new("v2-shard-rewrite");
-    warehouse.write_file("a.txt", "one\n");
-    backdate(&warehouse.root.join("a.txt"), 3600);
-    assert_success(&warehouse.run(&["prepare"]));
-    assert_success(&warehouse.run(&["load", "."]));
+fn a_load_rewrites_an_older_shard_with_proven_entries() {
+    for older in [2u8, 3] {
+        let warehouse = TestWarehouse::new(&format!("v{}-shard-rewrite", older));
+        warehouse.write_file("a.txt", "one\n");
+        backdate(&warehouse.root.join("a.txt"), 3600);
+        assert_success(&warehouse.run(&["prepare"]));
+        assert_success(&warehouse.run(&["load", "."]));
 
-    let shard = {
-        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-        forklift_core::util::file_utils::get_inventory_data_path_for_key("").unwrap()
-    };
-    let mut bytes = std::fs::read(&shard).unwrap();
-    assert_eq!(bytes[0], 3, "sanity: a fresh shard is v3");
-    bytes[0] = 2;
-    std::fs::write(&shard, bytes).unwrap();
-    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp,
-        forklift_core::model::inventory::UNPROVEN_MTIME, "a v2 entry must parse unproven");
-    assert_only_the_ignore_file_is_untracked_or_clean(&warehouse);
+        let shard = {
+            let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+            forklift_core::util::file_utils::get_inventory_data_path_for_key("").unwrap()
+        };
+        let mut bytes = std::fs::read(&shard).unwrap();
+        assert_eq!(bytes[0], 4, "sanity: a fresh shard is v4");
+        bytes[0] = older;
+        std::fs::write(&shard, bytes).unwrap();
+        assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp,
+            forklift_core::model::inventory::UNPROVEN_MTIME, "a v{} entry must parse unproven", older);
+        assert_only_the_ignore_file_is_untracked_or_clean(&warehouse);
 
-    assert_success(&warehouse.run(&["load", "."]));
-    assert_eq!(std::fs::read(&shard).unwrap()[0], 3, "the load must rewrite the shard as v3");
-    let mtime = file_identity(&warehouse.root.join("a.txt")).0
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime);
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_eq!(std::fs::read(&shard).unwrap()[0], 4, "the load must rewrite a v{} shard as v4", older);
+        let mtime = file_identity(&warehouse.root.join("a.txt")).0
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime);
+    }
 }
 
 fn assert_only_the_ignore_file_is_untracked_or_clean(warehouse: &TestWarehouse) {
@@ -2680,10 +2792,10 @@ fn re_proving_an_unproven_entry_never_hides_a_kind_change() {
         forklift_core::enums::dir_entry_type::DirEntryType::Executable, "the chmod must be recorded");
 }
 
-/// The clock probe lives under the shared metadata root, so a bay, whose `.forklift` is a
-/// redirect file, stamps the warehouse's probe rather than failing on its own.
+/// A bay stamps the clock probe in its own `.forklift` folder, on its own volume, never the
+/// warehouse's: an anchor measured on another volume proves nothing about the bay's files.
 #[test]
-fn a_bay_stamps_the_shared_clock_probe() {
+fn a_bay_stamps_its_own_clock_probe() {
     let warehouse = TestWarehouse::new("bay-clock-probe");
     warehouse.write_file("code.txt", "v1\n");
     assert_success(&warehouse.run(&["prepare"]));
@@ -2693,13 +2805,16 @@ fn a_bay_stamps_the_shared_clock_probe() {
 
     let bay_dir = warehouse.home.join("bay-clock");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
-    let probe = warehouse.root.join(".forklift").join(forklift_core::util::file_utils::FILE_NAME_CLOCK_PROBE);
-    let _ = std::fs::remove_file(&probe);
+    let shared_probe = warehouse.root.join(".forklift").join(forklift_core::util::file_utils::FILE_NAME_CLOCK_PROBE);
+    let bay_probe = bay_dir.join(".forklift").join(forklift_core::util::file_utils::FILE_NAME_CLOCK_PROBE);
+    let _ = std::fs::remove_file(&shared_probe);
+    let _ = std::fs::remove_file(&bay_probe);
 
     std::fs::write(bay_dir.join("code.txt"), "v2\n").unwrap();
     assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
-    assert!(probe.is_file(), "the bay's load must stamp the shared probe");
-    assert!(bay_dir.join(".forklift").is_file(), "the bay's redirect must stay a file");
+    assert!(bay_probe.is_file(), "the bay's load must stamp the bay's own probe");
+    assert!(!shared_probe.exists(), "the bay's load must not stamp the warehouse's probe");
+    assert!(bay_dir.join(".forklift").join("redirect").is_file(), "the bay's .forklift stays a folder holding its redirect");
 }
 
 /// A file whose bytes match but whose kind does not (an executable bit set by hand) is still
@@ -6107,7 +6222,7 @@ fn a_bay_whose_path_file_cannot_be_read_is_neither_listed_blank_nor_half_removed
     assert!(!removed.status.success());
     assert!(stderr(&removed).contains("To remove the bay by hand"), "{}", stderr(&removed));
     assert!(warehouse.root.join(".forklift/bays/feature").is_dir());
-    assert!(bay_dir.join(".forklift").is_file());
+    assert!(bay_dir.join(".forklift").join("redirect").is_file());
 }
 
 #[test]
@@ -6126,7 +6241,7 @@ fn a_bay_whose_path_file_is_missing_still_lists_and_removes() {
     // before the redirect, so neither exists. Unlike a damaged path file, nothing is misread, and
     // the bay is removable.
     std::fs::remove_file(warehouse.root.join(".forklift/bays/feature/path")).unwrap();
-    std::fs::remove_file(bay_dir.join(".forklift")).unwrap();
+    std::fs::remove_dir_all(bay_dir.join(".forklift")).unwrap();
 
     let listed = warehouse.run(&["bay"]);
     assert_success(&listed);
@@ -12242,7 +12357,7 @@ fn bay_remove_of_a_dot_name_or_a_path_removes_nothing() {
         assert!(forklift.join("objects").is_dir(), "\"{}\" removed the objects", name);
         assert!(forklift.join("pallets").is_dir(), "\"{}\" removed the pallets", name);
         assert!(forklift.join("bays").join("b1").is_dir(), "\"{}\" removed bay b1's state", name);
-        assert!(bay_dir.join(".forklift").is_file(), "\"{}\" removed bay b1's redirect", name);
+        assert!(bay_dir.join(".forklift").join("redirect").is_file(), "\"{}\" removed bay b1's redirect", name);
     }
 
     assert_success(&warehouse.run(&["stocktake"]));
@@ -12302,7 +12417,7 @@ fn a_bay_positioned_on_an_invalid_pallet_name_fails_loudly_and_heal_keeps_the_ta
 #[test]
 fn a_bay_redirect_naming_an_invalid_bay_refuses_to_enter_it() {
     let (warehouse, bay_dir) = warehouse_with_a_bay("bay-invalid-redirect");
-    let redirect = bay_dir.join(".forklift");
+    let redirect = bay_dir.join(".forklift").join("redirect");
     let content = std::fs::read_to_string(&redirect).unwrap();
     let rewritten: Vec<&str> = content.lines().map(|line| if line == "b1" { "B1" } else { line }).collect();
     assert_ne!(rewritten.join("\n"), content.trim_end(), "the redirect names b1 on its own line");
@@ -12312,16 +12427,132 @@ fn a_bay_redirect_naming_an_invalid_bay_refuses_to_enter_it() {
     assert!(!output.status.success(), "an invalid bay name must not be entered");
     assert!(stderr(&output).contains("names an invalid bay"), "{}", stderr(&output));
     assert!(stderr(&output).contains("forklift bay remove B1"), "{}", stderr(&output));
-    assert!(stderr(&output).contains("delete this redirect file"), "{}", stderr(&output));
+    assert!(stderr(&output).contains("delete the folder"), "{}", stderr(&output));
 
     // The named ways out: the warehouse lists no bay "B1" (its folder is "b1"), so removal refuses
-    // and leaves b1 alone; deleting the redirect file stops treating the folder as a bay.
+    // and leaves b1 alone; deleting the bay's .forklift folder stops treating the directory as a bay.
     let removed = warehouse.run(&["bay", "remove", "B1"]);
     assert!(!removed.status.success());
     assert!(warehouse.root.join(".forklift/bays/b1").is_dir());
-    std::fs::remove_file(&redirect).unwrap();
+    std::fs::remove_dir_all(bay_dir.join(".forklift")).unwrap();
     let output = warehouse.run_at(&bay_dir, &["stocktake"]);
     assert!(!stderr(&output).contains("names an invalid bay"), "{}", stderr(&output));
+}
+
+/// A bay whose `.forklift` is a redirect file in the older format is refused, naming the in-place
+/// conversion. Followed literally, it yields a working bay and never touches the bay's own file
+/// named `redirect`.
+#[test]
+fn an_old_format_bay_redirect_is_refused_with_a_conversion_that_works() {
+    let (warehouse, bay_dir) = warehouse_with_a_bay("bay-old-format");
+    let forklift = bay_dir.join(".forklift");
+    let content = std::fs::read(forklift.join("redirect")).unwrap();
+    std::fs::remove_dir_all(&forklift).unwrap();
+    std::fs::write(&forklift, &content).unwrap();
+    std::fs::write(bay_dir.join("redirect"), "the bay's own file\n").unwrap();
+    // The bay's tree holds the remedy's first-choice name, so the remedy names another.
+    std::fs::create_dir(bay_dir.join(".forklift.new")).unwrap();
+    std::fs::write(bay_dir.join(".forklift.new").join("keep.txt"), "the bay's own folder\n").unwrap();
+
+    let bay = TestWarehouse { root: bay_dir.clone(), home: warehouse.home.clone() };
+    let refused = bay.run(&["stocktake"]);
+    let message = stderr(&refused);
+    assert!(message.contains("older version of Forklift")
+        && message.contains("create the new folder") && message.contains(".forklift.new-1\"")
+        && message.contains(&format!(".forklift.new-1{}redirect\"", std::path::MAIN_SEPARATOR))
+        && message.contains("then rename"), "the refusal must name the conversion: {}", message);
+    assert!(!message.contains(".forklift.new\""), "the remedy must not name a folder the tree holds: {}", message);
+    assert!(!refused.status.success());
+
+    let staging = bay_dir.join(".forklift.new-1");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::rename(&forklift, staging.join("redirect")).unwrap();
+    std::fs::rename(&staging, &forklift).unwrap();
+
+    let untracked = changes(&bay, "unstaged");
+    assert!(untracked.contains(&("untracked".to_string(), "redirect".to_string()))
+        && untracked.iter().all(|(kind, _)| kind == "untracked"), "{:?}", untracked);
+    assert_eq!(std::fs::read_to_string(bay_dir.join("redirect")).unwrap(), "the bay's own file\n");
+    assert_eq!(std::fs::read_to_string(bay_dir.join(".forklift.new").join("keep.txt")).unwrap(), "the bay's own folder\n");
+}
+
+/// `bay remove` first moves the bay's `.forklift` folder aside: while that fails, the directory
+/// still redirects, so the bay's state is kept and the failure reported. Once it can, nothing is
+/// left behind.
+#[cfg(unix)]
+#[test]
+fn a_bay_whose_folder_cannot_be_moved_aside_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (warehouse, bay_dir) = warehouse_with_a_bay("bay-remove-kept");
+    std::fs::set_permissions(&bay_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // A user who can write a read-only folder (root) cannot be refused the rename this needs.
+    if std::fs::write(bay_dir.join("probe"), "").is_ok() {
+        std::fs::set_permissions(&bay_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: a read-only folder is writable here");
+        return;
+    }
+
+    let removed = warehouse.run(&["bay", "remove", "b1"]);
+    std::fs::set_permissions(&bay_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(warehouse.root.join(".forklift/bays/b1").is_dir(), "the bay's state must be kept");
+    assert!(bay_dir.join(".forklift").join("redirect").is_file(), "the directory must still be the bay");
+    assert!(stderr(&removed).contains("was kept"), "{}", stderr(&removed));
+    let way_out = format!("delete the folder \"{}\" by hand, then run this command again",
+                          bay_dir.join(".forklift").to_string_lossy());
+    assert!(stderr(&removed).contains(&way_out), "the refusal must name the way out: {}", stderr(&removed));
+    assert!(!removed.status.success());
+
+    // Followed literally, the way out removes the bay.
+    std::fs::remove_dir_all(bay_dir.join(".forklift")).unwrap();
+    assert_success(&warehouse.run(&["bay", "remove", "b1"]));
+    assert!(!warehouse.root.join(".forklift/bays/b1").exists());
+    let left: Vec<String> = std::fs::read_dir(&bay_dir).unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".forklift"))
+        .collect();
+    assert!(left.is_empty(), "left behind: {:?}", left);
+}
+
+/// `bay remove` deletes only the bay's own `.forklift`: once its directory holds another
+/// warehouse, that warehouse is left whole and named, and the bay's state is still removed.
+#[test]
+fn removing_a_bay_whose_directory_now_holds_a_warehouse_leaves_that_warehouse_alone() {
+    let (warehouse, bay_dir) = warehouse_with_a_bay("bay-remove-reused");
+    std::fs::remove_dir_all(&bay_dir).unwrap();
+    std::fs::create_dir_all(&bay_dir).unwrap();
+    let reused = TestWarehouse { root: bay_dir.clone(), home: warehouse.home.clone() };
+    assert_success(&reused.run(&["prepare"]));
+    let before = metadata_listing(&reused, "");
+
+    let removed = warehouse.run(&["bay", "remove", "b1"]);
+
+    assert_eq!(metadata_listing(&reused, ""), before, "the other warehouse must be left whole");
+    assert!(!warehouse.root.join(".forklift/bays/b1").exists(), "the bay's state is removed");
+    assert!(stderr(&removed).contains("was left in place") && stderr(&removed).contains("was removed"),
+            "the entry must be named: {}", stderr(&removed));
+    assert!(!removed.status.success());
+}
+
+/// `prepare` in a bay's working directory refuses, and adds nothing to the bay's `.forklift`
+/// folder: filled with warehouse pieces it would be neither a bay nor a warehouse.
+#[test]
+fn prepare_refuses_a_bay_and_creates_nothing() {
+    let (warehouse, bay_dir) = warehouse_with_a_bay("bay-prepare");
+    let listing = || {
+        let mut names: Vec<String> = std::fs::read_dir(bay_dir.join(".forklift")).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+
+    let prepared = warehouse.run_at(&bay_dir, &["prepare"]);
+    assert_eq!(listing(), before, "prepare must create nothing in the bay's folder");
+    assert!(stderr(&prepared).contains("belongs to a bay"), "{}", stderr(&prepared));
+    assert!(!prepared.status.success());
 }
 
 /// A bay with no position yet still lists, on no pallet: absence is the one read that is not an

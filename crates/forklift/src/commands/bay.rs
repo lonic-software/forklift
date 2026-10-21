@@ -100,7 +100,9 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // Enter the bay to check out its pallet and materialize its working tree. The current
     // warehouse lock stored its path at acquire time, so switching context here does not
     // affect its release.
-    globals::set_bay_context(warehouse_root.join(globals::FOLDER_NAME_FORKLIFT_ROOT), name.to_string());
+    globals::set_bay_context(
+        warehouse_root.join(globals::FOLDER_NAME_FORKLIFT_ROOT), bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT), name.to_string()
+    );
     std::env::set_current_dir(&bay_dir)
         .map_err(|e| format!("Error while entering the bay \"{}\": {}", bay_dir.to_string_lossy(), e))?;
 
@@ -282,18 +284,38 @@ fn remove(name: &str) -> Result<(), String> {
     // cannot be read refuses: removing the state alone would leave that directory redirecting
     // to a bay that no longer exists.
     let bay_dir = bay_utils::read_bay_path(name).map_err(|e| format!(
-        "{} To remove the bay by hand, delete the \".forklift\" file in its working directory and \
+        "{} To remove the bay by hand, delete the \".forklift\" folder in its working directory and \
         the folder \"{}\".",
         e, bay_utils::bay_state_dir(name).to_string_lossy()
     ))?;
 
-    // Drop the redirect so the directory is no longer a bay (best effort — the working
-    // tree may already be gone).
-    if let Some(bay_dir) = bay_dir {
-        let _ = std::fs::remove_file(bay_dir.join(globals::FOLDER_NAME_FORKLIFT_ROOT));
-    }
+    // Drop the bay's `.forklift` folder so the directory is no longer a bay (a working tree that
+    // is already gone is fine). While it still redirects, the state is kept: dropping it would
+    // leave the directory naming a bay that no longer exists.
+    let left = match bay_dir.as_ref().map(|bay_dir| bay_utils::remove_bay_redirect(bay_dir, &globals::forklift_root(), name)) {
+        None | Some(Ok(())) => None,
+        Some(Err(bay_utils::RedirectRemoval::Kept(e))) => {
+            let entry = bay_dir.unwrap_or_default().join(globals::FOLDER_NAME_FORKLIFT_ROOT);
+            // Named by what it is, so the deletion the remedy asks for is the one that works.
+            let kind = match std::fs::symlink_metadata(&entry) {
+                Ok(metadata) if metadata.file_type().is_symlink() => "link",
+                Ok(metadata) if metadata.is_dir() => "folder",
+                _ => "file",
+            };
+            return Err(format!(
+                "{} The bay \"{}\" was kept, since its working directory may still redirect to it. To \
+                remove it anyway, delete the {} \"{}\" by hand, then run this command again.",
+                e, name, kind, entry.to_string_lossy()
+            ));
+        }
+        Some(Err(bay_utils::RedirectRemoval::Left(e))) => Some(e),
+    };
 
     bay_utils::remove_bay_state(name)?;
+
+    if let Some(e) = left {
+        return Err(format!("The bay \"{}\" was removed. {}", name, e));
+    }
 
     output::emit(&BayRemoved { name: name.to_string() });
 

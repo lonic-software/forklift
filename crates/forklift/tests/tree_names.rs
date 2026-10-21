@@ -245,54 +245,6 @@ fn a_root_entry_that_only_resembles_a_metadata_alias_still_shifts() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn a_top_level_name_this_volume_resolves_to_the_metadata_folder_is_not_loaded() {
-    // A bay's `.forklift` is a redirect file, so a hard link can give it a second name. A name
-    // holding a `~` (what every 8.3 short name holds) is judged by the volume, not by its
-    // spelling: loading `meta~1` would track the redirect.
-    let warehouse = Warehouse::new("metadata-identity");
-    let bay = warehouse.base.join("bay");
-    warehouse.run_ok(&["bay", "add", "linked", bay.to_str().unwrap()]);
-    assert!(std::fs::symlink_metadata(bay.join(".forklift")).unwrap().is_file(), "the bay has no redirect file");
-    std::fs::hard_link(bay.join(".forklift"), bay.join("meta~1")).unwrap();
-    std::fs::write(bay.join("other~1"), "ordinary\n").unwrap();
-
-    let run = |args: &[&str]| forklift_command()
-        .args(args)
-        .current_dir(&bay)
-        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
-        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
-        .output()
-        .unwrap();
-
-    // A parcel naming the alias is refused up front, by that name, before anything trips over the
-    // entry it opens.
-    warehouse.craft_pallet(|blob| vec![subtree("meta~1", blob)]);
-    let shifted = run(&["shift", "evil"]);
-    let stderr = String::from_utf8_lossy(&shifted.stderr);
-    assert!(!shifted.status.success(), "shift accepted the alias; stderr: {}", stderr);
-    assert!(stderr.contains("\"meta~1\", which is the warehouse's metadata"),
-        "the refusal must name the alias as the metadata folder; stderr: {}", stderr);
-
-    let refused = run(&["load", "meta~1"]);
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(!refused.status.success(), "the alias was loaded; stderr: {}", stderr);
-    assert!(stderr.contains("metadata folder"), "the refusal must say why; stderr: {}", stderr);
-
-    let accepted = run(&["load", "other~1"]);
-    assert!(accepted.status.success(), "{}", String::from_utf8_lossy(&accepted.stderr));
-
-    // A whole-directory load walks into the alias, since it skips the metadata folder by its exact
-    // name only; stack, which checks every top-level name, refuses it there.
-    let walked = run(&["load", "."]);
-    assert!(walked.status.success(), "{}", String::from_utf8_lossy(&walked.stderr));
-    let stacked = run(&["stack", "alias"]);
-    let stderr = String::from_utf8_lossy(&stacked.stderr);
-    assert!(!stacked.status.success(), "stack accepted the alias; stderr: {}", stderr);
-    assert!(stderr.contains("\"meta~1\": it is"), "the refusal must name the alias; stderr: {}", stderr);
-}
-
 /// The 8.3 short name NTFS gave `path`'s last component, if it gave one.
 #[cfg(windows)]
 fn short_name(path: &std::path::Path) -> Option<String> {
@@ -333,6 +285,36 @@ fn a_hashed_short_name_of_the_metadata_folder_is_refused() {
 
     warehouse.craft_pallet(|blob| vec![subtree(&short, blob)]);
     assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), &format!("{:?}", short));
+}
+
+#[test]
+fn a_bay_refuses_entries_that_name_its_own_metadata_folder() {
+    // A bay's `.forklift` is a folder holding its redirect and its volume's probes: a parcel naming
+    // it, in any case, is refused there and writes nothing into it, and nothing inside it loads.
+    let warehouse = Warehouse::new("bay-metadata");
+    let bay = warehouse.base.join("bay");
+    warehouse.run_ok(&["bay", "add", "linked", bay.to_str().unwrap()]);
+    let metadata = bay.join(".forklift");
+    let run = |args: &[&str]| forklift_command()
+        .args(args)
+        .current_dir(&bay)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
+        .output()
+        .unwrap();
+
+    for name in [".forklift", ".ForkLift"] {
+        warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
+        let shifted = run(&["shift", "evil"]);
+        let stderr = String::from_utf8_lossy(&shifted.stderr);
+        assert!(!metadata.join("escaped.txt").exists(), "the parcel wrote into the bay's metadata folder");
+        assert!(!shifted.status.success(), "shift accepted {:?}; stderr: {}", name, stderr);
+        assert!(stderr.contains(&format!("{:?}", name)), "the refusal must name {:?}; stderr: {}", name, stderr);
+    }
+
+    let loaded = run(&["load", ".forklift/redirect"]);
+    assert!(!loaded.status.success(), "the bay's redirect was loaded");
+    assert!(metadata.join("redirect").is_file(), "the bay's redirect is untouched");
 }
 
 /// Whether the warehouse's file system treats names differently by case.

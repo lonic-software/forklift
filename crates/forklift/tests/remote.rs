@@ -6619,3 +6619,37 @@ fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
     assert_ne!(failed.status.code(), Some(24), "the working pallet's failure outranks the conflict");
     assert!(stderr(&failed).contains("no pallet") && stderr(&failed).contains("@kv conflicted"), "{}", stderr(&failed));
 }
+
+/// A bay's working directory holds a `.forklift` folder too, but `forklift-server` neither
+/// prepares nor serves one as a warehouse: prepare would fill the bay's folder with warehouse
+/// pieces, and serve would hand out a directory that is not a warehouse.
+#[test]
+fn the_server_neither_prepares_nor_serves_a_bay() {
+    let area = TestArea::new("server-bay-root");
+    let bay = area.path("bay");
+    let forklift = bay.join(".forklift");
+    std::fs::create_dir_all(&forklift).unwrap();
+    std::fs::write(forklift.join("redirect"), "redirect").unwrap();
+    let bay_str = bay.to_str().unwrap();
+
+    let prepared = server_command().args(["prepare", "--root", bay_str]).output().unwrap();
+    assert_eq!(std::fs::read_dir(&forklift).unwrap().count(), 1, "prepare must create nothing in the bay's folder");
+    assert!(stderr(&prepared).contains("belongs to a bay"), "{}", stderr(&prepared));
+    assert!(!prepared.status.success());
+
+    // Waited on with a deadline: a server that took the bay for a warehouse would serve it forever.
+    let mut serving = server_command().args(["serve", "--root", bay_str, "--addr", "127.0.0.1:0", "--open"])
+        .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while serving.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = serving.kill();
+            let _ = serving.wait();
+            panic!("forklift-server served a bay as a warehouse");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let served = serving.wait_with_output().unwrap();
+    assert!(stderr(&served).contains("is a bay's working directory"), "{}", stderr(&served));
+    assert!(!served.status.success());
+}
