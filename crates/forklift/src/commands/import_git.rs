@@ -813,18 +813,29 @@ fn git_str(path: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// The local branches, as `(branch name, commit hash)`.
+///
+/// Read as full ref names with the `refs/heads/` prefix taken off here, never as git's short
+/// names: git shortens a branch to `heads/<name>` whenever it finds the name ambiguous (a tag of
+/// the same name, or on Windows a device name it probes as a file).
 fn branches(path: &str) -> Result<Vec<(String, String)>, String> {
-    let text = git_str(path, &["for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads/"])?;
+    let text = git_str(path, &["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"])?;
 
-    Ok(text.lines()
+    text.lines()
         .filter_map(|line| line.split_once(' '))
-        .map(|(commit, branch)| (branch.to_string(), commit.to_string()))
-        .collect())
+        .map(|(commit, refname)| Ok((branch_name(refname)?, commit.to_string())))
+        .collect()
 }
 
-/// Git's HEAD branch name (the default checkout).
+/// Git's HEAD branch name (the default checkout), read like [`branches`].
 fn default_branch(path: &str) -> Result<String, String> {
-    Ok(git_str(path, &["symbolic-ref", "--short", "HEAD"])?.trim().to_string())
+    branch_name(git_str(path, &["symbolic-ref", "HEAD"])?.trim())
+}
+
+/// A branch's name from its full ref name.
+fn branch_name(refname: &str) -> Result<String, String> {
+    refname.strip_prefix("refs/heads/")
+        .map(str::to_string)
+        .ok_or(format!("Git reported \"{}\", which is not a local branch.", refname))
 }
 
 /// Every commit reachable from the local branches, oldest first (so parents precede

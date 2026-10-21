@@ -12178,7 +12178,14 @@ fn git_repo_with_branches(dir: &std::path::Path, branches: &[&str]) {
     git_in(dir, &["pack-refs", "--all"]);
 
     let head = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap();
+    assert!(head.status.success(), "git rev-parse HEAD: {}", String::from_utf8_lossy(&head.stderr));
     let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+
+    // Written by hand, so each name still passes git's own check: only a branch git allows is
+    // tested. `check-ref-format` is a pure string check and creates no file.
+    for branch in branches {
+        git_in(dir, &["check-ref-format", "--branch", branch]);
+    }
     // The file declares itself sorted (git binary-searches it), so it is kept sorted by ref name.
     let packed = std::fs::read_to_string(dir.join(".git").join("packed-refs")).unwrap();
     let (header, refs): (Vec<&str>, Vec<&str>) = packed.lines().partition(|line| line.starts_with('#'));
@@ -12255,6 +12262,10 @@ fn import_git_lowercases_a_branch_and_keeps_a_lowercase_one() {
 
     let dir = warehouse.home.join("repo");
     git_repo_with_branches(&dir, &["Feature/Login", "fix/fork-17", "@wip", "feature/@wip"]);
+    // A tag sharing a branch's name makes git's short name for the branch `heads/<name>`; the
+    // branch still imports under its own name, and so does the default branch.
+    git_in(&dir, &["tag", "fix/fork-17"]);
+    git_in(&dir, &["tag", "main"]);
     assert_success(&warehouse.run(&["import-git", dir.to_str().unwrap()]));
 
     // A component that would start with "-" is anchored alike at every level.
@@ -12262,5 +12273,7 @@ fn import_git_lowercases_a_branch_and_keeps_a_lowercase_one() {
     for name in ["main", "feature/login", "fix/fork-17", "branch-wip", "feature/branch-wip"] {
         assert!(pallets.lines().any(|line| line.trim_start_matches('*').trim() == name), "{}: {}", name, pallets);
     }
-    assert!(!pallets.contains("Feature"), "{}", pallets);
+    assert!(!pallets.contains("Feature") && !pallets.contains("heads/"), "{}", pallets);
+    assert!(pallets.lines().any(|line| line.starts_with('*') && line.trim_start_matches('*').trim() == "main"),
+        "the default branch is checked out: {}", pallets);
 }
