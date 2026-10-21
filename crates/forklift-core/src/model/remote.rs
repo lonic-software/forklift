@@ -10,6 +10,11 @@ use crate::util::office_utils::TrustAnchor;
 /// it does not know; the version only changes when the wire format changes.
 pub const PROTOCOL_VERSION: &str = "2026-07-05";
 
+/// A head's `422` for a client-sent hash spelled any way but the object store's own, 64 lowercase
+/// hex characters. Both heads give it word for word, and never repeat the value.
+pub const REFUSAL_NOT_AN_OBJECT_HASH: &str =
+    "A hash in the request is not an object hash (64 lowercase hex characters).";
+
 /// The largest number of hashes accepted by one `POST /v1/objects/missing` request;
 /// clients batch larger sets.
 pub const MAX_MISSING_BATCH: usize = 10_000;

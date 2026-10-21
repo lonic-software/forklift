@@ -1,6 +1,7 @@
 use crate::model::recipe::{Recipe, RecipeChunk};
 use crate::util::byte_utils;
 use crate::util::chunk_utils::MAX_CHUNK_BYTES;
+use crate::util::object_utils;
 
 /// The length, in bytes, of an ASCII-hex Blake3 hash as stored in a recipe.
 const HASH_HEX_LEN: usize = 64;
@@ -91,15 +92,10 @@ fn read_hash(cursor: &mut usize, input: &[u8]) -> Result<String, String> {
         .filter(|end| *end <= input.len())
         .ok_or_else(|| "Recipe hash is truncated.".to_string())?;
 
-    let bytes = &input[*cursor..end];
-
-    if !bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err("Recipe hash is not lowercase hex.".to_string());
-    }
-
-    // Every byte is an ASCII hex digit, so this is always valid UTF-8.
-    let hash = String::from_utf8(bytes.to_vec())
-        .map_err(|_| "Recipe hash is not valid UTF-8.".to_string())?;
+    let hash = std::str::from_utf8(&input[*cursor..end]).ok()
+        .filter(|text| object_utils::is_object_hash(text))
+        .ok_or_else(|| "Recipe hash is not lowercase hex.".to_string())?
+        .to_string();
 
     *cursor = end;
     Ok(hash)

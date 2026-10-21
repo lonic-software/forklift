@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use forklift_core::model::remote::{
     RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo,
-    LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION,
+    LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
@@ -1089,5 +1089,5 @@ fn require_object_hash(hash: &str) -> HeadResult<()> {
         return Ok(());
     }
 
-    Err(HeadError::unprocessable("A hash in the request is not an object hash (64 lowercase hex characters)."))
+    Err(HeadError::unprocessable(REFUSAL_NOT_AN_OBJECT_HASH))
 }

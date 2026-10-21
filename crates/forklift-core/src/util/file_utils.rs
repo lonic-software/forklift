@@ -173,12 +173,46 @@ pub fn is_object_hash_or_prefix(hash: &str) -> bool {
     hash.len() > OBJECT_HASH_FOLDER_PATH_CHARACTERS && is_lowercase_hex(hash)
 }
 
-/// Whether `name` is an object fan-out folder's name, as [`get_path_for_object`] spells it: two
-/// lowercase hex digits. The loose-store sweeps (`gc`, `compact`, a heal's restage listing) take
-/// their candidate hashes from these folders, so they share this rule with the path builder: a
-/// folder it would never produce holds nothing they should pack, delete or restage.
+/// Whether `name`, as a listing of `objects/` returns it, may be an object fan-out folder: two hex
+/// digits in either case. The pack folder and anything else are not. The loose-store sweeps
+/// (`gc`, `compact`, a heal's restage listing) then pass each entry inside through
+/// [`canonical_loose_entry`], which decides what a spelling other than lowercase holds.
 pub fn is_fan_out_folder_name(name: &str) -> bool {
-    name.len() == OBJECT_HASH_FOLDER_PATH_CHARACTERS && is_lowercase_hex(name)
+    name.len() == OBJECT_HASH_FOLDER_PATH_CHARACTERS && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The spelling [`get_path_for_object`] gives a listed loose-store entry, `(folder, file)`, if
+/// that path opens this very entry; `None` if it does not.
+///
+/// The path builder writes lowercase, yet a folder or file spelled otherwise (`AB`, `CDEF…`) can
+/// turn up. On a case-insensitive file system the lowercase path opens it, so it *is* the object:
+/// gc must keep it while it is live, compact must pack it, and a store-wide heal must restage it,
+/// all under the lowercase hash. On a case-sensitive one the store never opens it, so a sweep
+/// leaves it alone. Which of the two holds is read from the entry's identity rather than guessed
+/// from the platform. An entry already spelled in lowercase is its own answer, at no cost.
+///
+/// # Arguments
+/// * `folder`    - The fan-out folder's path, as listed.
+/// * `file_name` - The entry's name inside it, as listed.
+///
+/// # Returns
+/// * `Some((String, String))` - The folder and file name the path builder spells.
+/// * `None`                   - The path builder's spelling does not reach this entry.
+pub fn canonical_loose_entry(folder: &Path, file_name: &str) -> Option<(String, String)> {
+    let folder_name = folder.file_name()?.to_str()?;
+    let lower_folder = folder_name.to_ascii_lowercase();
+    let lower_file = file_name.to_ascii_lowercase();
+
+    if lower_folder == folder_name && lower_file == file_name {
+        return Some((lower_folder, lower_file));
+    }
+
+    let identity = |path: &Path| std::fs::symlink_metadata(path).ok()
+        .and_then(|metadata| get_device_and_inode(path, &metadata).ok());
+    let listed = identity(&folder.join(file_name))?;
+    let spelled = identity(&folder.with_file_name(&lower_folder).join(&lower_file))?;
+
+    (listed == spelled).then_some((lower_folder, lower_file))
 }
 
 /// Every byte of `text` is `0-9` or `a-f`.
@@ -4157,6 +4191,40 @@ mod tests {
             assert_eq!(hash_from_object_path(&final_path), Some(hash.clone()),
                 "must recover the exact hash \"{hash}\" that produced this path");
         }
+    }
+
+    /// A respelled entry resolves to the path builder's spelling exactly when that spelling opens
+    /// it: on a case-insensitive file system it does, on a case-sensitive one it does not, and
+    /// there even a real lowercase entry beside it is a different file, not this one.
+    ///
+    /// Revert: the identity comparison answers `Some` without checking → red on a case-sensitive
+    /// volume (Linux CI). Revert: a respelled entry answers `None` → red on a case-insensitive one
+    /// (macOS, Windows).
+    #[test]
+    fn a_respelled_loose_entry_resolves_only_where_the_lowercase_path_opens_it() {
+        let temp = std::env::temp_dir().join(format!("forklift-respelled-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join("ab")).unwrap();
+        std::fs::write(temp.join("ab").join("cdef"), b"object").unwrap();
+
+        let lower = Some(("ab".to_string(), "cdef".to_string()));
+        assert_eq!(canonical_loose_entry(&temp.join("ab"), "cdef"), lower, "lowercase is its own spelling");
+
+        std::fs::rename(temp.join("ab"), temp.join("AB")).unwrap();
+        std::fs::rename(temp.join("AB").join("cdef"), temp.join("AB").join("CdEf")).unwrap();
+        let folds = temp.join("ab").join("cdef").exists();
+
+        let resolved = canonical_loose_entry(&temp.join("AB"), "CdEf");
+        assert_eq!(resolved, if folds { lower.clone() } else { None }, "folds: {}", folds);
+
+        if !folds {
+            std::fs::create_dir_all(temp.join("ab")).unwrap();
+            std::fs::write(temp.join("ab").join("cdef"), b"another file").unwrap();
+            assert_eq!(canonical_loose_entry(&temp.join("AB"), "CdEf"), None,
+                "a lowercase entry beside it is not this entry");
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]

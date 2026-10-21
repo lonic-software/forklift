@@ -4389,6 +4389,12 @@ fn enumerate_loose_objects() -> Result<Vec<PackTarget>, String> {
                 continue;
             }
 
+            // Packed under the path builder's spelling, and only where that spelling reaches
+            // the entry: elsewhere no read ever opens it.
+            let Some((prefix, name)) = file_utils::canonical_loose_entry(&folder.path(), &name) else {
+                continue;
+            };
+
             let hash = format!("{}{}", prefix, name);
             let Some(hash_bytes) = hash_to_bytes(&hash) else {
                 // Not a valid object hash — leave it untouched rather than pack junk.
@@ -4972,14 +4978,7 @@ fn hash_to_bytes(hash: &str) -> Option<[u8; HASH_LEN]> {
         return None;
     }
 
-    let bytes = sign_utils::from_hex(hash).ok()?;
-    if bytes.len() != HASH_LEN {
-        return None;
-    }
-
-    let mut array = [0u8; HASH_LEN];
-    array.copy_from_slice(&bytes);
-    Some(array)
+    sign_utils::from_hex(hash).ok()?.try_into().ok()
 }
 
 /// Read a little-endian u64 at `offset` in `bytes` (offset is always in bounds by construction).
@@ -5626,6 +5625,40 @@ pub(crate) mod tests {
         assert!(!is_in_packs(&upper).unwrap(), "the pack index does not decode an uppercase spelling");
         let packed = file_utils::does_object_exist(&upper);
         assert!(packed.is_err(), "packed: an uppercase spelling is refused, got {:?}", packed);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A loose object listed under a respelled fan-out folder (`AB/…`) is packed under its
+    /// lowercase hash wherever reads open it there (a case-insensitive file system), and left
+    /// alone wherever they do not.
+    ///
+    /// Revert: the enumeration drops respelled entries (`file_utils::canonical_loose_entry` →
+    /// `None`) → it is never packed → red on macOS and Windows. Revert: the enumeration lowercases
+    /// without the identity check → a stranger is packed → red on Linux.
+    #[test]
+    fn compact_packs_a_respelled_loose_object_exactly_where_reads_reach_it() {
+        let temp = std::env::temp_dir().join(format!("forklift-pack-respelled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let (hash, content) = (0..)
+            .map(|i| format!("respelled {}", i).into_bytes())
+            .map(|content| (blake3::hash(&content).to_hex().to_string(), content))
+            .find(|(hash, _)| hash[..2].bytes().any(|b| b.is_ascii_alphabetic()))
+            .unwrap();
+        store_loose(&hash, &content);
+
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        let upper = Path::new(&folder).with_file_name(hash[..2].to_ascii_uppercase());
+        std::fs::rename(&folder, &upper).unwrap();
+        let folds = Path::new(&folder).join(&file_name).exists();
+
+        compact(false, false, &Progress::NONE).unwrap();
+
+        assert_eq!(is_in_packs(&hash).unwrap(), folds, "packed exactly where reads reach it (folds: {})", folds);
+        assert_eq!(upper.join(&file_name).exists(), !folds, "the loose entry goes once packed");
 
         std::fs::remove_dir_all(&temp).ok();
     }

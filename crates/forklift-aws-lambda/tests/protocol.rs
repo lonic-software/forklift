@@ -1417,6 +1417,9 @@ fn hash_taking_endpoints_refuse_an_uppercase_hash_as_unprocessable() {
     ];
     for (endpoint, err) in errors {
         assert_eq!(err.status, Status::Unprocessable, "{}: {}", endpoint, err.message);
+        // The spelling check's own refusal, not another 422 further in (`object put` without a
+        // session, `signature put` with bytes that are no signature, are 422s of their own).
+        assert!(err.message.contains("not an object hash"), "{}: {}", endpoint, err.message);
         assert!(!err.message.contains(&upper), "{}: the value is not repeated: {}", endpoint, err.message);
     }
 }

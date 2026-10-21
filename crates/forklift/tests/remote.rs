@@ -853,9 +853,13 @@ fn every_hash_taking_endpoint_refuses_an_uppercase_spelling_as_client_error() {
         ("batch", http_post_json(&server.url, "/v1/objects/batch", &batch)),
         ("object", http_get(&server.url, &format!("/v1/objects/{}", upper))),
         ("signature", http_get(&server.url, &format!("/v1/signatures/{}", upper))),
+        ("object put", http_send_json(&server.url, "PUT", &format!("/v1/objects/{}", upper), "{}")),
+        ("signature put", http_send_json(&server.url, "PUT", &format!("/v1/signatures/{}", upper), "{}")),
     ];
     for (endpoint, (status, body)) in responses {
         assert!(status.starts_with("HTTP/1.1 422"), "{}: {} / {}", endpoint, status, body);
+        // The spelling check's own refusal, not another 422 further in.
+        assert!(body.contains("not an object hash"), "{}: {}", endpoint, body);
         assert!(!body.contains(&upper), "{}: the client's value is not repeated: {}", endpoint, body);
     }
 }

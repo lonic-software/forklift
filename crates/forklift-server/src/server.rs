@@ -32,7 +32,7 @@ use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
-    distinct_resolve_identifiers, resolve_answer_cap,
+    REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::RefUpdateError;
@@ -1428,7 +1428,7 @@ fn require_object_hashes(hashes: &[String]) -> Result<(), HandlerError> {
         return Ok(());
     }
 
-    Err(unprocessable("A hash in the request is not an object hash (64 lowercase hex characters).".to_string()))
+    Err(unprocessable(REFUSAL_NOT_AN_OBJECT_HASH.to_string()))
 }
 
 /// Validate a warehouse id (the one shared rule, [`warehouse_utils::validate_warehouse_id`]); a
@@ -2108,14 +2108,14 @@ async fn put_object(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    if let Err(error) = check_admission(&state, &params, &principal, "upload", None).await {
+        return error_response(error);
+    }
+
     let hash = match hash_param(&params) {
         Ok(hash) => hash,
         Err(error) => return error_response(error),
     };
-
-    if let Err(error) = check_admission(&state, &params, &principal, "upload", None).await {
-        return error_response(error);
-    }
 
     let result = blocking(warehouse, move || {
         require_uploader(&principal)?;
@@ -2176,14 +2176,14 @@ async fn put_signature(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    if let Err(error) = check_admission(&state, &params, &principal, "upload", None).await {
+        return error_response(error);
+    }
+
     let hash = match hash_param(&params) {
         Ok(hash) => hash,
         Err(error) => return error_response(error),
     };
-
-    if let Err(error) = check_admission(&state, &params, &principal, "upload", None).await {
-        return error_response(error);
-    }
 
     let result = blocking(warehouse, move || {
         require_uploader(&principal)?;

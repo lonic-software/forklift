@@ -1275,8 +1275,14 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
                 continue;
             }
 
+            // A name spelled other than in lowercase is matched under the spelling a read opens
+            // it by, or not at all, so a match is always a hash the store answers for.
+            let Some((folder_name, file_name)) = file_utils::canonical_loose_entry(&folder, &file_name) else {
+                continue;
+            };
+
             if file_name.starts_with(rest) {
-                matches.push(format!("{}{}", &prefix[0..2], file_name));
+                matches.push(format!("{}{}", folder_name, file_name));
             }
         }
     }

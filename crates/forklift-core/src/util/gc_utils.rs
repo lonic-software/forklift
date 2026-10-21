@@ -78,10 +78,7 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 
         // The pack folder holds packed objects, not loose ones; it is not a hash fan-out
         // folder, so skip it — its `.pack`/`.idx` files are not garbage. (Collecting inside
-        // packs is a repack concern, not this loose sweep.) So is a folder spelled any other way
-        // (uppercase `AB`): its candidate hashes could never match the lowercase live set, so on a
-        // case-insensitive file system, where reads do reach it, sweeping it would delete live
-        // objects.
+        // packs is a repack concern, not this loose sweep.)
         if !file_utils::is_fan_out_folder_name(&prefix) {
             continue;
         }
@@ -91,12 +88,19 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 
         for file in files {
             let file = file.map_err(|e| format!("Error while listing an objects folder: {}", e))?;
-            let name = file.file_name().to_string_lossy().to_string();
+            let listed = file.file_name().to_string_lossy().to_string();
 
             // Sidecars are swept with their object, never on their own.
-            if name.ends_with(".sig") {
+            if listed.ends_with(".sig") {
                 continue;
             }
+
+            // The live set holds lowercase hashes, so an entry spelled otherwise is judged under
+            // the spelling that reaches it, or not at all: on a case-insensitive file system
+            // `AB/…` is a live object that reads open, and its listed name would mark it garbage.
+            let Some((prefix, name)) = file_utils::canonical_loose_entry(&folder.path(), &listed) else {
+                continue;
+            };
 
             stats.scanned += 1;
 
@@ -544,20 +548,43 @@ pub(crate) mod tests {
         assert!(!loose_path(&garbage).exists(), "the unreachable object is gone");
     }
 
-    /// gc takes its candidate hashes from the fan-out folders' names, and the live set holds only
-    /// lowercase hashes, so a folder spelled `AB` would have every file in it judged garbage. On a
-    /// case-insensitive file system reads do reach such a folder, so the object is live and readable
-    /// there, and the sweep would delete it. Such a folder is never swept.
+    /// gc takes its candidate hashes from the names it lists, and the live set holds only
+    /// lowercase hashes, so a live blob listed as `AB/…` or `ab/CDEF…` would be judged garbage by
+    /// its listed name. On a case-insensitive file system reads do reach it, so it is live and
+    /// readable there, and the sweep would delete it. It is judged under the lowercase spelling.
     ///
-    /// Revert: `file_utils::is_fan_out_folder_name` accepts either case → the live blob in the
-    /// uppercase folder is deleted → red.
+    /// Revert: the sweep hashes the listed names (skip `file_utils::canonical_loose_entry`) → the
+    /// live blob is deleted → red.
     #[test]
-    fn gc_never_sweeps_a_fan_out_folder_spelled_in_uppercase() {
-        let _scratch = Scratch::new("gc-uppercase-folder");
+    fn gc_never_sweeps_a_live_blob_in_a_fan_out_folder_spelled_in_uppercase() {
+        gc_keeps_a_respelled_live_blob("gc-uppercase-folder", |path| {
+            let folder = path.parent().unwrap();
+            let upper = folder.with_file_name(folder.file_name().unwrap().to_ascii_uppercase());
+            std::fs::rename(folder, &upper).unwrap();
+            upper.join(path.file_name().unwrap())
+        });
+    }
+
+    /// The file-name level of the same rule (see the folder test above).
+    #[test]
+    fn gc_never_sweeps_a_live_blob_whose_file_name_is_spelled_in_uppercase() {
+        gc_keeps_a_respelled_live_blob("gc-uppercase-file", |path| {
+            let upper = path.with_file_name(path.file_name().unwrap().to_ascii_uppercase());
+            std::fs::rename(path, &upper).unwrap();
+            upper
+        });
+    }
+
+    /// Store a live blob whose fan-out folder and file name both carry letters, respell its entry
+    /// with `respell`, run gc, and require the entry to survive. Where the volume folds case the
+    /// blob must also still read back, which shows the entry was live, not a stranger.
+    fn gc_keeps_a_respelled_live_blob(label: &str, respell: impl Fn(&Path) -> PathBuf) {
+        let _scratch = Scratch::new(label);
 
         // A live blob whose fan-out folder has an uppercase spelling distinct from its own (two
         // letters), sharing that folder with neither its tree nor its parcel.
-        let letters = |hash: &str| hash[..2].bytes().all(|b| b.is_ascii_alphabetic());
+        let letters = |hash: &str| hash[..2].bytes().all(|b| b.is_ascii_alphabetic())
+            && hash[2..].bytes().any(|b| b.is_ascii_alphabetic());
         let (blob, tree, parcel) = (0..)
             .find_map(|i| {
                 let blob = LooseObjectBuilder::build_blob(&Blob { content: format!("blob {}\n", i).into_bytes() });
@@ -584,15 +611,16 @@ pub(crate) mod tests {
         let main = pallet_utils::get_pallet_head("main").unwrap();
         pallet_utils::update_pallet_head("main", main.as_deref(), &parcel.hash).unwrap();
 
-        let lower_folder = loose_path(&blob.hash).parent().unwrap().to_path_buf();
-        let upper_folder = lower_folder.with_file_name(blob.hash[..2].to_ascii_uppercase());
-        std::fs::rename(&lower_folder, &upper_folder).unwrap();
-        let moved = upper_folder.join(&blob.hash[2..]);
-        assert!(moved.exists(), "the blob sits in the uppercase folder");
+        let moved = respell(&loose_path(&blob.hash));
+        assert!(moved.exists(), "the blob sits under the respelled entry");
+        let folds = loose_path(&blob.hash).exists();
 
         collect_garbage(0).expect("gc runs");
 
-        assert!(moved.exists(), "gc must not sweep a folder the path builder never spells");
+        assert!(moved.exists(), "gc must not sweep a live blob by its listed spelling (folds: {})", folds);
+        if folds {
+            assert!(file_utils::does_object_exist(&blob.hash).unwrap(), "the live blob still reads back");
+        }
     }
 
     #[test]
