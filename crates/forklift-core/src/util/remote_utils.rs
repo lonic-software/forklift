@@ -4725,8 +4725,9 @@ async fn lift_pallet_inner(client: &RemoteClient,
         if !adopted_reset && !merge_utils::is_ancestor(remote_head, local_head)? {
             // Known locally but not lowered: the remote is ahead when it already holds everything
             // here, and diverged otherwise. The walk runs through the remote's history, which may
-            // be only partly here (a head fetched before its ancestors); lowering brings the rest
-            // in either way, so a walk that cannot finish names that.
+            // be only partly here (a head fetched before its ancestors) — or a local object may be
+            // unreadable. The two cannot be told apart, so a walk that cannot finish classifies
+            // nothing: it says what it could not decide, and that lowering brings the history in.
             return Err(match merge_utils::is_ancestor(local_head, remote_head) {
                 Ok(true) => pallet_utils::remote_ahead_refusal(format!(
                     "The remote's pallet \"{}\" is ahead of this warehouse's (head {}). \"lower\" \
@@ -4734,9 +4735,10 @@ async fn lift_pallet_inner(client: &RemoteClient,
                     pallet, remote_head
                 )),
                 Ok(false) => diverged_refusal(pallet, remote_head),
-                Err(e) => pallet_utils::remote_ahead_refusal(format!(
-                    "The remote's pallet \"{}\" has parcels this warehouse does not hold in full \
-                    (head {}: {}). \"lower\" first.",
+                Err(e) => CoreError::Other(format!(
+                    "Could not tell whether the remote's pallet \"{}\" (head {}) is ahead of this \
+                    warehouse's or diverged from it: {}. \"lower\" brings in the remote's history, \
+                    if that is what is missing.",
                     pallet, remote_head, e
                 )),
             }.into());
@@ -4788,14 +4790,14 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
         RefusalCode::Diverged,
         format!(
             "The local pallet \"{p}\" and the remote have diverged. The remote parcels are \
-            fetched; palletize the remote head into its own pallet (\"palletize {p}-remote {s}\", \
+            fetched; palletize the remote head into its own pallet (\"palletize {p}-remote-{s} {s}\", \
             which moves this bay onto it), shift back (\"shift {p}\"), consolidate it \
-            (\"consolidate {p}-remote\"), and lift the result.",
+            (\"consolidate {p}-remote-{s}\"), and lift the result.",
             p = pallet, s = short
         ),
         format!(
-            "forklift palletize {p}-remote {s}; then forklift shift {p}; then forklift consolidate \
-            {p}-remote; then forklift lift",
+            "forklift palletize {p}-remote-{s} {s}; then forklift shift {p}; then forklift \
+            consolidate {p}-remote-{s}; then forklift lift",
             p = pallet, s = short
         ),
     )
@@ -6269,7 +6271,7 @@ mod tests {
         assert_eq!(code("@office"), None);
         assert_eq!(code("@kv"), Some((RefusalCode::Diverged, "forklift lower".to_string())));
         assert!(code("main").is_some_and(|(code, step)| code == RefusalCode::Diverged
-            && step.starts_with("forklift palletize main-remote aaaaaaaaaaaa; then forklift shift main;")));
+            && step.starts_with("forklift palletize main-remote-aaaaaaaaaaaa aaaaaaaaaaaa; then forklift shift main;")));
     }
     use std::path::PathBuf;
     use std::sync::Mutex;
