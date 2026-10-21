@@ -2179,33 +2179,84 @@ pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String
 ///    * `Some(Vec<u8>)` - The contents of the inventory file.
 /// * `Ok((PathBuf, None))` - If the inventory file was not found:
 ///    * `PathBuf` - The path where the inventory file should have been.
-/// * `Err(String)` - The error message if the inventory file exists, but there was an error while
-/// reading it.
+/// * `Err(String)` - If the inventory file exists but could not be read, or the shard's address is
+/// damaged (see [`judge_shard_address`]).
 pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
-    let file_path = get_inventory_data_path_for_key(key)?;
+    let (file_path, present) = judge_shard_address(key)?;
 
-    let display_key = load_guard_utils::display_path(key);
+    if !present {
+        return Ok((file_path, None));
+    }
 
-    // Only an absent shard is "no shard": anything else, such as a file where a shard folder
-    // belongs, would otherwise read as a directory with nothing staged.
     match std::fs::read(&file_path) {
         Ok(bytes) => Ok((file_path, Some(bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Windows reports a read through a regular file as not found, so a non-folder in the
-            // shard's folder chain is looked for explicitly.
-            match non_folder_in_shard_chain(&file_path) {
-                Some(folder) => Err(format!(
-                    "Error while reading the inventory of folder \"{}\": \"{}\" is not a folder.",
-                    display_key, folder.to_string_lossy()
-                )),
-                None => Ok((file_path, None)),
-            }
-        }
+        // Removed since it was judged: a concurrent writer unstaged it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, None)),
         Err(e) => Err(format!(
             "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
-            display_key, file_path.to_string_lossy(), e
+            load_guard_utils::display_path(key), file_path.to_string_lossy(), e
         )),
     }
+}
+
+/// The path of `key`'s shard, and whether a shard is there, once every level of its address has
+/// been judged without following a link.
+///
+/// Only an absent shard is "no shard": anything else, such as a file where a shard folder belongs,
+/// would otherwise read as a directory with nothing staged. And Forklift makes only real folders
+/// and a regular file on a shard's address, so a link at any level is damage: read through it,
+/// another folder's file would pass for this directory's staged state, and written through it, a
+/// shard would land outside the staging area.
+///
+/// # Arguments
+/// * `key` - The warehouse path key of the directory.
+///
+/// # Returns
+/// * `Ok((PathBuf, bool))` - The shard's path, and whether a shard file is there.
+/// * `Err(String)`         - If a level of the address is not what Forklift makes there, or could
+///                           not be read.
+pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
+    let file_path = get_inventory_data_path_for_key(key)?;
+
+    let damaged = |entry: &Path, expected: &str| Err(format!(
+        "The inventory of folder \"{}\" cannot be used: \"{}\" is not a {} (a link is never followed). {}",
+        load_guard_utils::display_path(key), entry.to_string_lossy(), expected, STAGING_DAMAGE_REMEDY
+    ));
+
+    // The folders first: below a non-folder, the shard itself reads as not found on Windows and as
+    // not a directory elsewhere, and neither names the damage.
+    if let Some(folder) = non_folder_in_shard_chain(&file_path) {
+        if file_path.ancestors().nth(4) == Some(folder) {
+            return Err(unresolved_inventory_root(folder));
+        }
+        return damaged(folder, "folder");
+    }
+
+    match std::fs::symlink_metadata(&file_path) {
+        Ok(metadata) if metadata.is_file() => Ok((file_path, true)),
+        Ok(_) => damaged(&file_path, "file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, false)),
+        Err(e) => Err(format!(
+            "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
+            load_guard_utils::display_path(key), file_path.to_string_lossy(), e
+        )),
+    }
+}
+
+/// What a user does about damage Forklift never makes in the staging area, such as a link: remove
+/// the entry, then reset the staging area to the pallet head.
+pub const STAGING_DAMAGE_REMEDY: &str =
+    "Remove it, then run \"forklift restore --staged .\" to reset the staging area to the pallet head.";
+
+/// The refusal for an inventory root that is there but does not resolve to a folder. It may be a
+/// link to an inventory moved elsewhere whose target is out of reach, such as an unmounted drive:
+/// then the way out is to bring the target back, since a reset would abandon what is staged there.
+pub fn unresolved_inventory_root(inventory_root: &Path) -> String {
+    format!(
+        "The inventory folder \"{}\" does not resolve to a folder. If it is a link to an inventory moved \
+        elsewhere, make its target available again (a drive that is not mounted, say); otherwise {}",
+        inventory_root.to_string_lossy(), STAGING_DAMAGE_REMEDY.replacen("Remove", "remove", 1)
+    )
 }
 
 /// The first entry, from a shard's own folder up to the inventory root, that exists and is not a
@@ -2237,12 +2288,31 @@ pub fn get_inventory_metadata_path() -> PathBuf {
 /// * `Ok((PathBuf, None))` - If the inventory metadata file does not exist:
 ///    * `PathBuf` - The path where the inventory metadata file should have been.
 /// * `Err(String)` - The error message if the inventory metadata file exists, but there was an
-/// error while reading it.
+/// error while reading it, or it is not a regular file, or the inventory root does not resolve to
+/// a folder.
 pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet<String>>), String> {
     let metadata_store_path = get_inventory_metadata_path();
 
-    if !metadata_store_path.exists() {
-        return Ok((metadata_store_path, None));
+    // The registered set decides what every writer may touch, so it is never read through a link,
+    // and an inventory root that is out of reach is not taken for one with nothing registered.
+    match std::fs::symlink_metadata(&metadata_store_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(format!(
+            "The inventory metadata \"{}\" is not a file (a link is never followed). {}",
+            metadata_store_path.to_string_lossy(), STAGING_DAMAGE_REMEDY
+        )),
+        Err(e) => {
+            let inventory_root = PathBuf::from(get_path_inventory_root());
+            if std::fs::symlink_metadata(&inventory_root).is_ok() && !std::fs::metadata(&inventory_root).is_ok_and(|meta| meta.is_dir()) {
+                return Err(unresolved_inventory_root(&inventory_root));
+            }
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok((metadata_store_path, None));
+            }
+            return Err(format!(
+                "Error while reading inventory metadata from file \"{}\": {}", metadata_store_path.to_string_lossy(), e
+            ));
+        }
     }
 
     let metadata_bytes = std::fs::read(&metadata_store_path)
@@ -2296,8 +2366,9 @@ static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync:
 /// Refuse an inventory root whose metadata header names another format version, once per process
 /// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
 /// that reach a shard without reading the metadata first (`import-git` resets the inventory without
-/// reading it). A damaged, unreadable or absent metadata file passes: the metadata read reports
-/// the first two, and a reset rewrites the file without reading it.
+/// reading it). A damaged, unreadable or absent metadata file passes, as does one that is not a
+/// regular file, which is never opened (a link is never followed): the metadata read reports all
+/// but the absent one, and a reset rewrites the file without reading it.
 fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
     use std::io::BufRead;
 
@@ -2309,7 +2380,8 @@ fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
 
     // The header line alone decides the version; a longer first line is not a header.
     let mut header = Vec::new();
-    if let Ok(file) = std::fs::File::open(&metadata_path) {
+    let regular = std::fs::symlink_metadata(&metadata_path).is_ok_and(|metadata| metadata.is_file());
+    if let Some(file) = regular.then(|| std::fs::File::open(&metadata_path).ok()).flatten() {
         let _ = std::io::Read::take(std::io::BufReader::new(file), 256).read_until(b'\n', &mut header);
     }
 

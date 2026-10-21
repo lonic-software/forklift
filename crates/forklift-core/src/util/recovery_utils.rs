@@ -1651,12 +1651,51 @@ fn describe_shard(shard_path: &Path) -> String {
 /// its referenced hashes, step 2's roots) and the §8.3 torn rescan's step 1 (restages each one's
 /// own bytes, regardless of content) need identically, so this is the one place that walk is
 /// written; the two callers differ only in what they do with the paths this returns.
-fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+fn walk_shard_data_files(inventory_root: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+    walk_shard_data_files_below(inventory_root, inventory_root, found)
+}
+
+/// Which checkout's staging area `inventory_root` is, for a remedy that must be run there: a walk
+/// covers every bay's, and a reset run in another checkout would unstage that checkout's work.
+///
+/// Made absolute first: the main tree's state folder is the relative `.forklift` when no storage
+/// root is set, and its parent would name no checkout at all.
+fn staging_area_owner(inventory_root: &Path) -> String {
+    let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let inventory_root = absolute(inventory_root);
+    let state = inventory_root.parent().unwrap_or(&inventory_root);
+    let checkout = if state == absolute(&forklift_root()) {
+        state.parent().map(Path::to_path_buf)
+    } else {
+        state.file_name().and_then(|name| name.to_str())
+            .and_then(|name| bay_utils::read_bay_path(name).ok().flatten())
+    };
+
+    match checkout {
+        Some(dir) => format!(
+            "This staging area belongs to the checkout \"{}\": run the command there.", dir.to_string_lossy()
+        ),
+        None => format!(
+            "This staging area belongs to the bay whose state is \"{}\": run the command in that bay's checkout.",
+            state.to_string_lossy()
+        ),
+    }
+}
+
+fn walk_shard_data_files_below(inventory_root: &Path, folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
     // A folder absent from the start, or removed while the walk descends (its last shard
-    // unstaged concurrently), holds no shards.
+    // unstaged concurrently), holds no shards. An inventory root that is a link to a folder out of
+    // reach is not absent: what it stages is unknown, so it cannot count as nothing.
     let entries = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(folder).is_ok() {
+                return Err(format!(
+                    "{} {}", file_utils::unresolved_inventory_root(folder), staging_area_owner(inventory_root)
+                ));
+            }
+            return Ok(());
+        }
         Err(e) => return Err(format!("Error while reading directory \"{}\": {}", folder.to_string_lossy(), e)),
     };
 
@@ -1664,8 +1703,22 @@ fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), 
         let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
         let path = entry.path();
 
-        if path.is_dir() {
-            walk_shard_data_files(&path, found)?;
+        // `DirEntry::file_type` does not follow a link. Forklift makes none below an inventory
+        // root, so one is damage: entering it would count another folder's files as staged
+        // shards, and passing over it would drop whatever the link stands in for from a walk that
+        // must see every shard, so the walk stops.
+        let kind = entry.file_type()
+            .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
+
+        if kind.is_symlink() {
+            return Err(format!(
+                "\"{}\" in the staging area is a link, which Forklift never makes there, so it is not followed. {} {}",
+                path.to_string_lossy(), file_utils::STAGING_DAMAGE_REMEDY, staging_area_owner(inventory_root)
+            ));
+        }
+
+        if kind.is_dir() {
+            walk_shard_data_files_below(inventory_root, &path, found)?;
             continue;
         }
 
@@ -6307,6 +6360,66 @@ mod tests {
         assert!(!error.contains("ghost"), "{}", error);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An inventory root that is a link to a folder out of reach holds an unknown set of shards, so
+    /// a walk that must see every one of them fails rather than find none.
+    #[test]
+    fn a_walk_over_an_inventory_root_out_of_reach_fails() {
+        let (root, _scope) = staged_warehouse("walker-root-out-of-reach", &["", "docs"]);
+        let inventory_root = PathBuf::from(file_utils::get_path_inventory_root());
+        std::fs::rename(&inventory_root, root.join("drive")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("unmounted"), &inventory_root).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(root.join("unmounted"), &inventory_root).unwrap();
+
+        let error = walk_shard_files(&inventory_root, &mut Vec::new()).expect_err("an unreachable root");
+        assert!(error.contains("does not resolve to a folder"), "{error}");
+        assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{error}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Without a storage root, as in the main tree's CLI, the state folder is the relative
+    /// `.forklift`, and the checkout a refusal names is still the absolute folder holding it.
+    #[test]
+    fn a_relative_main_tree_names_its_checkout_absolutely() {
+        let owner = staging_area_owner(&forklift_root().join(FOLDER_NAME_INVENTORY_ROOT));
+
+        let checkout = std::env::current_dir().unwrap();
+        assert!(owner.contains(&format!("belongs to the checkout \"{}\"", checkout.to_string_lossy())), "{owner}");
+    }
+
+    /// A link in the store stops a walk rather than be followed, whether it stands in for a shard's
+    /// folder or its data file: a valid shard behind it is never counted as staged.
+    #[test]
+    fn a_walker_never_follows_a_link_in_the_store() {
+        for level in ["slot", "data"] {
+            let (root, _scope) = staged_warehouse(&format!("walker-link-{level}"), &["", "docs"]);
+            let data = shard_data_path("docs");
+            let linked = if level == "slot" { data.parent().unwrap().to_path_buf() } else { data.clone() };
+
+            let outside = root.join("outside");
+            std::fs::rename(&linked, &outside).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, &linked).unwrap();
+            #[cfg(windows)]
+            if level == "slot" {
+                std::os::windows::fs::symlink_dir(&outside, &linked).unwrap();
+            } else {
+                std::os::windows::fs::symlink_file(&outside, &linked).unwrap();
+            }
+
+            let mut hashes = Vec::new();
+            let walked = walk_shard_files(&PathBuf::from(file_utils::get_path_inventory_root()), &mut hashes);
+
+            let error = walked.expect_err(level);
+            assert!(error.contains("is a link") && error.contains("restore --staged ."), "{level}: {error}");
+            assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{level}: {error}");
+
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     #[cfg(unix)]

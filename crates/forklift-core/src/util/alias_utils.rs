@@ -20,7 +20,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use crate::enums::inventory_item_state::InventoryItemState;
-use crate::parser::inventory::inventory_parser;
 use crate::util::{file_utils, inventory_utils, tree_utils};
 
 /// A file's identity as the file system reports it without following a symlink: the same pair the
@@ -208,12 +207,23 @@ pub enum Verdict {
 pub struct AliasCheck {
     listings: HashMap<String, Option<BTreeSet<String>>>,
     directories: HashMap<String, (bool, bool)>,
+    ledger: Option<inventory_utils::ShardLedger>,
 }
 
 impl AliasCheck {
     /// A check with nothing read yet.
     pub fn new() -> AliasCheck {
         AliasCheck::default()
+    }
+
+    /// Whether the inventory holds a live file entry at `key` (see [`tracked_file`]), against the
+    /// registered set as this check first read it.
+    pub fn tracked_file(&mut self, key: &str) -> Result<bool, String> {
+        if self.ledger.is_none() {
+            self.ledger = Some(inventory_utils::ShardLedger::read()?);
+        }
+
+        tracked_file(self.ledger.as_ref().unwrap(), key)
     }
 
     /// The names a directory lists (`None` when it cannot be read as a directory).
@@ -532,7 +542,7 @@ impl AliasCheck {
             Occupancy::Alias { occupant, occupant_is_dir: false, .. } | Occupancy::NonDirectory { occupant } => {
                 if removals.removes_file(&occupant) {
                     Verdict::Proceed
-                } else if tracked_file(&occupant)? {
+                } else if self.tracked_file(&occupant)? {
                     Verdict::Refuse(Collision::Alias { path: path.to_string(), occupant })
                 } else {
                     Verdict::Refuse(Collision::Untracked(occupant))
@@ -827,16 +837,15 @@ fn probe_aliases(parent: &str, first: &str, second: &str) -> Result<bool, String
 }
 
 /// Whether the inventory holds a live file entry at `key`.
-pub fn tracked_file(key: &str) -> Result<bool, String> {
+///
+/// Read through `ledger`: a parent that is not registered holds nothing staged, whatever its
+/// shard's address holds. The answer decides what a materialization may write over.
+pub fn tracked_file(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<bool, String> {
     let (parent, name) = key.rsplit_once('/').unwrap_or(("", key));
-    let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(parent)?;
 
-    let Some(bytes) = bytes else {
+    let Some(inventory) = ledger.inventory(parent)? else {
         return Ok(false);
     };
-
-    let inventory = inventory_parser::parse_inventory(&bytes)
-        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", parent, e))?;
 
     Ok(matches!(inventory.get_item_by_name(name), Some(item) if item.state != InventoryItemState::Deleted))
 }
