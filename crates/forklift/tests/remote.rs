@@ -1319,6 +1319,23 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert!(!stale.status.success(), "{}", stdout(&stale));
     assert!(stderr(&stale).contains("v9.9 has no local change"), "{}", stderr(&stale));
 
+    let refused = area.forklift("b", &["tag", "create", "v2.0", "main"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("is not an admin"), "{}", stderr(&refused));
+
+    // With its key retired as well the worker can sign nothing, and theirs still drops the tag:
+    // a drop signs no parcel.
+    let list = stdout(&area.forklift("a", &["office", "list"]));
+    let worker_key_id = list.lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("key "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("office list shows the worker's key")
+        .to_string();
+    assert_success(&area.forklift("a", &["office", "retire", &worker_key_id]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+
     assert_success(&area.forklift("b", &["lower", "--keep", "tags:v1.1=theirs"]));
     assert_eq!(area.read_file("b/.forklift/meta/tags").trim(), remote_tags, "theirs returns @tags to the remote's head");
     assert!(!area.forklift("b", &["tag", "show", "v1.1"]).status.success(), "the refused tag is dropped");
@@ -1330,9 +1347,6 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert!(!in_sync.status.success(), "{}", stdout(&in_sync));
     assert!(stderr(&in_sync).contains("@tags holds no local change the remote lacks"), "{}", stderr(&in_sync));
 
-    let refused = area.forklift("b", &["tag", "create", "v2.0", "main"]);
-    assert!(!refused.status.success());
-    assert!(stderr(&refused).contains("is not an admin"), "{}", stderr(&refused));
 }
 
 #[test]
