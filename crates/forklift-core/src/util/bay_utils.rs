@@ -306,8 +306,8 @@ enum Ownership {
 
 /// Whose the entry `forklift` is. It is judged as every command judges it, following links
 /// ([`classify_forklift`]), so that what removal calls this bay's is exactly what commands run
-/// there treat as this bay. Only a definite answer is `NotOurs`; anything that could not be read
-/// or resolved is `Unknown`, so the bay is kept rather than dropped while it may still redirect.
+/// there treat as this bay. Only a definite answer is `NotOurs`; anything that could not be read,
+/// parsed or resolved is `Unknown`, so the bay is kept rather than dropped while it may still redirect.
 ///
 /// # Arguments
 /// * `forklift`        - The `.forklift` entry at the bay's recorded path.
@@ -328,9 +328,10 @@ fn ownership(forklift: &Path, shared_forklift: &Path, name: &str) -> Ownership {
             "Error while reading the bay redirect \"{}\": {}", record.to_string_lossy(), e
         )),
     };
+    // A record this version cannot read (a newer version's, or damaged) may still be this bay's.
     let redirect = match parse_redirect_record(&record, &bytes) {
         Ok(redirect) => redirect,
-        Err(e) => return Ownership::NotOurs(e),
+        Err(e) => return Ownership::Unknown(e),
     };
     if redirect.name != name {
         return Ownership::NotOurs(format!("it redirects to the bay \"{}\"", redirect.name));
@@ -1121,6 +1122,13 @@ mod tests {
             }
             std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
+
+        // A redirect this version cannot parse may be this bay's, written by a newer version: kept.
+        let unparsed = bay("unparsed");
+        write_bay_redirect(&unparsed, &warehouse, "review").unwrap();
+        std::fs::write(unparsed.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_BAY_REDIRECT), b"not a record").unwrap();
+        kept(remove_bay_redirect(&unparsed, &shared, "review"));
+        assert!(unparsed.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_BAY_REDIRECT).is_file(), "the bay folder is kept");
 
         // A bay of this name whose warehouse no longer resolves may be this one moved: kept.
         let moved = bay("moved");
