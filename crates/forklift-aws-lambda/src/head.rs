@@ -964,18 +964,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// The `409` for a ref that is not where the client expected it.
     fn moved(&self, current: &Option<String>, expected: &Option<String>) -> HeadError {
-        HeadError::conflict(
-            forklift_core::util::pallet_utils::pallet_moved_refusal(current.as_deref(), expected.as_deref()).into()
-        )
+        HeadError::conflict(String::from(
+            forklift_core::util::pallet_utils::pallet_moved_refusal(current.as_deref(), expected.as_deref())
+        ))
     }
 
     /// The `409` for an office lift landing between the audit and the commit: the pallet
     /// itself did not move, but the office state the audit trusted did.
     fn office_moved(&self, current: &Option<String>) -> HeadError {
-        HeadError::conflict(forklift_core::util::pallet_utils::remote_ahead_refusal(format!(
+        HeadError::conflict(String::from(forklift_core::util::pallet_utils::remote_ahead_refusal(format!(
             "The office pallet moved during the audit: its head is now {}. Lower and retry.",
             current.as_deref().unwrap_or("unborn")
-        )).into())
+        ))))
     }
 
     /// The `409` for the trust anchor changing between the audit and the commit (established,
