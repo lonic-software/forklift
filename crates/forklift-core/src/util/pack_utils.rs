@@ -249,7 +249,8 @@ pub struct StoreStatus {
     /// Pack indexes that parsed but whose paired data file could not be loaded (FORK-47,
     /// DESIGN.html §3.1.1). The objects they name are quarantined, not lost: a read of one
     /// classifies an honest `Unverifiable` (never a bare `Absent`), and `forklift heal` can still
-    /// refetch them from a configured remote. Empty on a healthy store.
+    /// refetch from a configured remote any of them under a durability taint. Empty on a healthy
+    /// store.
     pub quarantined_packs: Vec<PackIndexProblem>,
     /// Packs that load but whose index fails full validation (a corrupt bucket, or records that
     /// do not tile the data file). Reads keep serving their sound buckets; an object in a corrupt
