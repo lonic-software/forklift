@@ -57,8 +57,11 @@
 //!   walk's own blob-publish batch, the walk's first durable mutation — see that function's own
 //!   doc comment for the crash-ordering argument.
 //! * `inventory_utils::add_file_to_inventory` (a single-file `load`) folds it into the loaded
-//!   file's own shard-content publish via `inventory_utils::write_shard_mutation_with_extra` —
-//!   that shard write is this path's first (and only) durable mutation.
+//!   file's own shard-content publish via `inventory_utils::write_shard_mutation_with_extra`.
+//!   That shard write is not this path's first durable mutation when the parent directory is new:
+//!   the parent is registered first (see `inventory_utils::ShardLedger`). A crash between the two
+//!   leaves the parent registered with no shard and no marker, which is still consistent: a
+//!   registered directory with no shard holds no entry, so it stages nothing.
 //!
 //! Crash analysis: a crash before either of those barriers commits leaves the marker's write
 //! unpublished (an invisible staged temp — see `file_utils::WriteBatch::stage`) exactly like
@@ -66,7 +69,7 @@
 //! crash after the barrier commits makes the marker durable together with (never after) whatever
 //! else that barrier published, so a load interrupted right past that point is still caught. In
 //! neither case can the marker's absence and a durable staging mutation from the same load ever
-//! disagree.
+//! disagree: a registration that lands before the barrier stages nothing on its own.
 //!
 //! ## Clearing scope
 //!

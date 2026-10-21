@@ -104,7 +104,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
     let (parent, file_name) = path.split_parent()?;
 
-    let Some(inventory) = read_shard(parent.as_key())? else {
+    let Some(inventory) = inventory_utils::ShardLedger::read()?.inventory(parent.as_key())? else {
         return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
     };
 
@@ -150,8 +150,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 /// * `Ok(())`      - If the restore completed.
 /// * `Err(String)` - If the directory has no inventory or a write failed.
 fn restore_worktree_directory(key: &str) -> Result<(), String> {
-    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
-    let metadata = metadata_opt.unwrap_or_default();
+    let ledger = inventory_utils::ShardLedger::read()?;
 
     let mut restored_any = false;
     let mut restored_count = 0usize;
@@ -159,16 +158,14 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     let mut batch = inventory_utils::ShardMutationBatch::new();
     let mut result: Result<(), String> = Ok(());
 
-    for entry in &metadata {
-        let shard_key = inventory_utils::metadata_entry_to_key(entry);
-
+    for shard_key in ledger.keys() {
         if !path_utils::covers(key, shard_key) {
             continue;
         }
 
         restored_any = true;
 
-        let inventory = match read_shard(shard_key) {
+        let inventory = match ledger.inventory(shard_key) {
             Ok(Some(shard)) => shard,
             Ok(None) => continue,
             Err(e) => { result = Err(e); break; }
@@ -232,19 +229,6 @@ fn restore_worktree_directory(key: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// The parsed shard at `key`, or `None` when it has no shard file.
-fn read_shard(key: &str) -> Result<Option<Inventory>, String> {
-    let (_, shard_bytes) = file_utils::retrieve_inventory_or_none_by_key(key)?;
-
-    let Some(bytes) = shard_bytes else {
-        return Ok(None);
-    };
-
-    forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)
-        .map(Some)
-        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))
 }
 
 /// What restoring one tracked entry did.
@@ -442,7 +426,9 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
             // written to this bay's working directory.
             let scope = scope_utils::current_scope()?;
 
-            build_unstaged_shards(tree, path.as_key(), hash, &mut shards, &scope)?;
+            let ledger = inventory_utils::ShardLedger::read()?;
+
+            build_unstaged_shards(&ledger, tree, path.as_key(), hash, &mut shards, &scope)?;
         }
 
         inventory_utils::replace_subtree_inventories(path.as_key(), &shards)?;
@@ -461,7 +447,9 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
     match head_entry {
         Some(HeadEntry::File { hash, item_type }) => {
             // As in `build_unstaged_shards`, an unreadable shard only costs the shortcut.
-            let current = read_shard(parent.as_key()).unwrap_or(None);
+            let current = inventory_utils::ShardLedger::read()
+                .and_then(|ledger| ledger.inventory(parent.as_key()))
+                .unwrap_or(None);
             let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref())?;
 
             // Through a batch rather than `update_shard`: an entry that already matched the head
@@ -535,33 +523,24 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
 ///                   exists.
 /// * `Err(String)` - A shard could not be read or parsed.
 fn nothing_staged_under(path: &WarehousePath) -> Result<bool, String> {
+    let ledger = inventory_utils::ShardLedger::read()?;
+
     if !path.is_root() {
         let (parent, file_name) = path.split_parent()?;
-        let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(parent.as_key())?;
 
-        if let Some(bytes) = bytes_opt {
-            let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)?;
-
+        if let Some(inventory) = ledger.inventory(parent.as_key())? {
             if inventory.get_item_by_name(&file_name).is_some() {
                 return Ok(false);
             }
         }
     }
 
-    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
-    let Some(metadata) = metadata_opt else { return Ok(true) };
-
-    for entry in &metadata {
-        let shard_key = inventory_utils::metadata_entry_to_key(entry);
-
+    for shard_key in ledger.keys() {
         if !path_utils::covers(path.as_key(), shard_key) {
             continue;
         }
 
-        let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(shard_key)?;
-
-        let Some(bytes) = bytes_opt else { continue };
-        let inventory = forklift_core::parser::inventory::inventory_parser::parse_inventory(&bytes)?;
+        let Some(inventory) = ledger.inventory(shard_key)? else { continue };
 
         if inventory.get_items_count() > 0 {
             return Ok(false);
@@ -595,7 +574,8 @@ fn nothing_staged_under(path: &WarehousePath) -> Result<bool, String> {
 /// # Returns
 /// * `Ok(())`      - If the shards were built.
 /// * `Err(String)` - If a subtree object could not be loaded, or a spine path's type changed.
-fn build_unstaged_shards(tree: &TreeItem,
+fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
+                         tree: &TreeItem,
                          key: &str,
                          tree_hash: &str,
                          shards: &mut BTreeMap<String, Inventory>,
@@ -608,7 +588,7 @@ fn build_unstaged_shards(tree: &TreeItem,
     let mut inventory = Inventory::new();
     // The current shard only saves work, so one that cannot be read is no reason to refuse the
     // reset that rebuilds it.
-    let current = read_shard(key).unwrap_or(None);
+    let current = ledger.inventory(key).unwrap_or(None);
 
     for (name, item) in tree.get_files() {
         if !fully_in_scope {
@@ -645,7 +625,7 @@ fn build_unstaged_shards(tree: &TreeItem,
         }
 
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_unstaged_shards(&subtree_loaded, &child_key, &subtree.hash, shards, scope)?;
+        build_unstaged_shards(ledger, &subtree_loaded, &child_key, &subtree.hash, shards, scope)?;
     }
 
     Ok(())
