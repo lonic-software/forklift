@@ -1768,11 +1768,14 @@ refusal before ever reaching its own fetch):
   these sources at all, and so never reports on them.
 - **An object the check walks through could not be read** — one that only a damaged pack index
   might hold (its data file missing, a corrupt part of the index, another format version, or an
-  index that does not parse). What that object references is unknown, so `heal` clears nothing on
-  that run: every taint it could not confirm is safe to drop stays, not only those beneath the
-  object. The note names the objects and the index; fix that index as its line under "Pack index
-  problems" says (an index of another format version means re-creating the warehouse, not moving
-  the file aside), then re-run `heal`. A torn record is likewise left standing.
+  index that does not parse). What that object references is unknown, so `heal` clears no vanished
+  object on that run: every one it could not confirm is safe to drop keeps its taint, not only those
+  beneath the object (paths it restaged or read back verified still clear). The note names the
+  objects and the index. `heal` does not refetch these objects itself, so fix the index by hand:
+  restore its pack files from a good copy (a missing data file or a damaged index); move an index
+  that does not parse out of the pack folder if it holds nothing this warehouse needs; or, for an
+  index of another format version, re-create the warehouse — never move that one aside, which would
+  make its objects read as missing. Then re-run `heal`. A torn record is likewise left standing.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of

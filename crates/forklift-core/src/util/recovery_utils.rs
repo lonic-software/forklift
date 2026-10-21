@@ -2592,8 +2592,9 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix what is named above (a bay's state, the office record, or a pack index, as its own \
-        line says), then run \
+        "Fix what is named above (a bay's state, the office record, or a pack index: restore its \
+        pack files from a good copy, move an index that does not parse out of the pack folder, or \
+        re-create the warehouse for one of another format version), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )
@@ -2667,7 +2668,9 @@ fn dangling_refusal(root: &Path, lines: &[String], degraded: &[String]) -> CoreE
         format!(
             "At least one of these could not be conclusively checked because a source of durable \
             references (a bay's saved state, or the office record), or a pack index holding \
-            objects they reach, could not be read this run — fix it as its line above says, then re-run \
+            objects they reach, could not be read this run — fix it (for a pack index: restore its pack files from a good \
+            copy, move an index that does not parse out of the pack folder, or re-create the \
+            warehouse for one of another format version), then re-run \
             \"forklift heal\"; it may resolve on its own once everything is readable. Whatever \
             is still dangling after that needs a heavyweight resolution: {}",
             HEAVYWEIGHT_EXITS
