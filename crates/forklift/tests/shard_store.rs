@@ -250,3 +250,28 @@ fn a_load_from_a_differently_spelled_current_directory_stages_under_the_listed_k
     assert!(!status.contains("DOCS"), "status: {}", status);
     assert!(status.contains("The working directory matches the inventory"), "status: {}", status);
 }
+
+/// A shard left in the store at a directory no longer registered is never read: restoring a file
+/// it lists does not bring the file back.
+#[test]
+fn restore_never_reads_a_shard_of_an_unregistered_directory() {
+    let warehouse = Warehouse::new("restore-unregistered", &[("kept.txt", "kept\n")]);
+    warehouse.write("docs/a.txt", "staged\n");
+    warehouse.run_ok(&["load", "docs/a.txt"]);
+
+    let inventory = warehouse.root.join(".forklift/inventory");
+    let shard = inventory.join(forklift_core::util::file_utils::shard_folder_relative("docs")).join("data");
+    let saved = std::fs::read(&shard).unwrap();
+
+    warehouse.run_ok(&["restore", "--staged", "."]);
+    assert!(!shard.exists(), "the reset unregistered docs and removed its shard");
+
+    std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+    std::fs::write(&shard, saved).unwrap();
+    std::fs::remove_file(warehouse.root.join("docs/a.txt")).unwrap();
+
+    let output = warehouse.run(&["restore", "docs/a.txt"]);
+
+    assert!(!warehouse.root.join("docs/a.txt").exists(),
+        "restore read the shard of an unregistered directory: {}", stdout(&output));
+}

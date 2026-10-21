@@ -21,9 +21,10 @@
 //! ref source still reaches it: pallet heads (both namespaces), every bay's parked parcels,
 //! every bay's in-progress consolidation (its `their_head`), the trust anchor's adopted
 //! head (a re-genesis pin, §8.7), and every bay's staged inventory shards **enumerated from the
-//! files on disk**, never the registration ledger (`inventory_utils::write_metadata_to_file` is a
-//! non-atomic, unsynced `std::fs::write` that is blind to a published-but-unregistered shard — the
-//! phase-B wart; a walk that trusted it could silently miss a real dangling reference). The taint
+//! files on disk**, never the registration ledger (`inventory_utils::ShardLedger`), which is blind
+//! to a shard sitting in the store unregistered — a walk that trusted it could silently miss a
+//! real dangling reference; see [`collect_walk_roots`]'s own doc comment for where such a shard
+//! comes from). The taint
 //! is over the *shared* object store, so every bay-local source is read across every bay
 //! (`bay_utils::all_bay_state_dirs`), never just the active one — see
 //! [`collect_walk_roots`]'s own doc comment for why. An object no live ref reaches is safe to drop
@@ -1518,10 +1519,11 @@ pub(crate) fn gc_root_sources(
 /// resurrect from it.
 ///
 /// Staged inventory shards are enumerated by walking the shard **files on disk**, never the
-/// registration ledger (`inventory_utils::write_metadata_to_file`'s plain, unsynced
-/// `std::fs::write`, which is blind to a shard published but never registered — the phase-B
-/// wart §3.2 calls out by name; a walk that trusted the ledger could silently miss a real
-/// dangling reference).
+/// registration ledger (`inventory_utils::ShardLedger`). No writer publishes a shard at an
+/// unregistered key, but one can still sit in the store unregistered (damage, a store written
+/// before keys were registered first, a power loss that undid an unsynced unlink), and a walk that
+/// trusted the ledger would miss whatever such a shard references. Counting it is the safe
+/// direction: it can only keep an object, never drop one.
 fn collect_walk_roots() -> Result<WalkRoots, String> {
     // `Tolerate`/`Tolerate` — see this function's own doc comment for why heal, unlike gc, must
     // not brick on a single unreadable bay or office record.
@@ -3833,11 +3835,10 @@ mod tests {
 
     #[test]
     fn shard_referenced_hash_is_found_even_when_never_registered_in_the_ledger() {
-        // The phase-B "published but unregistered shard" shape (§3.2): a shard file exists on
-        // disk referencing an object, but the (non-atomic, unsynced) registration ledger
-        // (`inventory_utils::write_metadata_to_file`) was never updated to mention it. The
-        // closure walk must still find the reference — it enumerates shard files on disk, never
-        // the ledger. Mutation: enumerate shards from the ledger instead of disk → red (the
+        // A shard file exists on disk referencing an object, but the registration ledger
+        // (`inventory_utils::ShardLedger`) does not mention it — damage, or a store written before
+        // keys were registered first. The closure walk must still find the reference — it
+        // enumerates shard files on disk, never the ledger. Mutation: enumerate shards from the ledger instead of disk → red (the
         // ledger here is deliberately left absent).
         use crate::builder::inventory::InventoryBuilder;
         use crate::enums::inventory_item_state::InventoryItemState;

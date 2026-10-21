@@ -296,9 +296,8 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
         if let Some(injected) = SYNC_DIR_FAULT.with(|f| {
             let mut f = f.borrow_mut();
             f.attempted.push(dir.to_path_buf());
-            f.fail_needle.as_deref()
-                .filter(|needle| dir.to_string_lossy().contains(needle))
-                .map(|_| format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()))
+            f.fails(dir)
+                .then(|| format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()))
         }) {
             return Err(injected);
         }
@@ -325,7 +324,7 @@ thread_local! {
     /// `pack_utils`'s tests (a different module, same crate, same `--cfg test` unit-test binary)
     /// can drive it too.
     static SYNC_DIR_FAULT: std::cell::RefCell<DirSyncFaultState> =
-        const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None }) };
+        const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false }) };
 }
 
 /// RAII scope for [`SYNC_DIR_FAULT`]: both construction and `Drop` reset this thread's state, so
@@ -339,7 +338,7 @@ pub(crate) struct SyncDirFaultGuard;
 impl SyncDirFaultGuard {
     /// Record every directory [`sync_dir`] is asked to sync; fail none of them.
     pub(crate) fn recording() -> Self {
-        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
         SyncDirFaultGuard
     }
 
@@ -349,6 +348,7 @@ impl SyncDirFaultGuard {
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
+            fail_exact: false,
         });
         SyncDirFaultGuard
     }
@@ -357,7 +357,7 @@ impl SyncDirFaultGuard {
 #[cfg(test)]
 impl Drop for SyncDirFaultGuard {
     fn drop(&mut self) {
-        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+        SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
     }
 }
 
@@ -1207,13 +1207,25 @@ thread_local! {
     /// reset (see its own doc comment) is what additionally isolates tests from each other when
     /// they instead run sequentially (`--test-threads=1`) and reuse the same thread.
     static DIR_SYNC_FAULT: std::cell::RefCell<DirSyncFaultState> =
-        const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None }) };
+        const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false }) };
 }
 
 #[cfg(test)]
 struct DirSyncFaultState {
     attempted: Vec<PathBuf>,
     fail_needle: Option<String>,
+    /// Whether `fail_needle` must equal the whole path rather than occur in it.
+    fail_exact: bool,
+}
+
+#[cfg(test)]
+impl DirSyncFaultState {
+    fn fails(&self, dir: &Path) -> bool {
+        let path = dir.to_string_lossy();
+
+        self.fail_needle.as_deref()
+            .is_some_and(|needle| if self.fail_exact { path == needle } else { path.contains(needle) })
+    }
 }
 
 /// RAII scope for [`DIR_SYNC_FAULT`]: both construction and `Drop` reset this thread's state, so
@@ -1226,16 +1238,29 @@ pub(crate) struct DirSyncFaultGuard;
 impl DirSyncFaultGuard {
     /// Record every directory `fsync_dir_data` is asked to sync; fail none of them.
     pub(crate) fn recording() -> Self {
-        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
         DirSyncFaultGuard
     }
 
     /// Record every directory, and fail (with a distinctive error, no filesystem access) any
     /// whose path contains `needle`.
-    fn failing(needle: &str) -> Self {
+    pub(crate) fn failing(needle: &str) -> Self {
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
+            fail_exact: false,
+        });
+        DirSyncFaultGuard
+    }
+
+    /// Record every directory, and fail only `dir` itself. A folder's path is contained in every
+    /// path below it, so [`failing`](Self::failing) cannot fail a folder without failing its
+    /// descendants too.
+    pub(crate) fn failing_exactly(dir: &Path) -> Self {
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
+            attempted: Vec::new(),
+            fail_needle: Some(dir.to_string_lossy().into_owned()),
+            fail_exact: true,
         });
         DirSyncFaultGuard
     }
@@ -1244,7 +1269,7 @@ impl DirSyncFaultGuard {
 #[cfg(test)]
 impl Drop for DirSyncFaultGuard {
     fn drop(&mut self) {
-        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None });
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
     }
 }
 
@@ -1274,9 +1299,8 @@ pub(crate) fn fsync_dir_data(dir: &Path) -> Result<(), String> {
     if let Some(injected) = DIR_SYNC_FAULT.with(|f| {
         let mut f = f.borrow_mut();
         f.attempted.push(dir.to_path_buf());
-        f.fail_needle.as_deref()
-            .filter(|needle| dir.to_string_lossy().contains(needle))
-            .map(|_| format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()))
+        f.fails(dir)
+            .then(|| format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()))
     }) {
         return Err(injected);
     }
@@ -1292,6 +1316,39 @@ pub(crate) fn fsync_dir_data(dir: &Path) -> Result<(), String> {
 
     DIR_SYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// Fsync each of `folders` once, so every entry change already made inside them (an unlink
+/// included) is durable before the caller's next write. No device flush: the caller's next write
+/// must be one whose own file sync flushes the device, such as [`replace_file_atomically`]
+/// (`sync_all`, which is `F_FULLFSYNC` on macOS), and it borrows that flush for these folders.
+///
+/// A no-op when [`fsync_enabled`] is false, and on non-Unix targets, exactly like [`sync_dir`].
+///
+/// # Arguments
+/// * `folders` - The folders to sync. Each must exist.
+///
+/// # Returns
+/// * `Ok(())`      - Every folder was synced.
+/// * `Err(String)` - A folder could not be opened or synced; the ones before it were.
+pub(crate) fn sync_folders_before_flushed_write(folders: &BTreeSet<PathBuf>) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        if !fsync_enabled() {
+            return Ok(());
+        }
+
+        for folder in folders {
+            fsync_dir_data(folder)?;
+        }
+
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = folders;
+        Ok(())
+    }
 }
 
 /// Best-effort removes every staged temp still referenced by `pending` — the cleanup a failed or
