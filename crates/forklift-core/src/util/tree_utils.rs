@@ -11,7 +11,7 @@ use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::error::{CoreError, RefusalCode};
-use crate::util::{audit_utils, fanout_utils, file_utils, inventory_utils, object_utils};
+use crate::util::{alias_utils, audit_utils, fanout_utils, file_utils, inventory_utils, object_utils};
 
 /// Build (and store) tree objects from an already-parsed [`inventory_utils::PreparedInventory`]
 /// snapshot, bottom-up: one tree object per inventoried directory, staged into `batch` instead of
@@ -23,6 +23,8 @@ use crate::util::{audit_utils, fanout_utils, file_utils, inventory_utils, object
 ///   except the warehouse root.
 /// * Ancestor directories that have no shard of their own (e.g. only `src/a` was ever
 ///   loaded) are synthesized so the chain root → `src` → `a` exists in the tree.
+/// * Two live entries this volume holds as one are refused before anything is staged (see
+///   [`refuse_alias_pairs`]).
 ///
 /// Used by `stack` (`stack_utils::stack_parcel`) and `park` push (`park::park_changes`,
 /// DESIGN.html §5.0 D item 10, finding #3). `stack`'s `prepared` snapshot is the single
@@ -116,6 +118,8 @@ pub async fn build_tree_from_inventory_deferred(
         return Ok((Some(TreeItem::new(String::new(), whole_tree_hash.clone(), DirEntryType::Tree)), BTreeMap::new()));
     }
 
+    refuse_alias_pairs(prepared)?;
+
     // Every pruned key (a skipped subtree's root, and everything beneath it) is excluded from
     // the task graph entirely — as if it were never inventoried. Its parent instead gets it
     // injected verbatim (by hash) inside `build_tree_for_inventory_key`, from the plan's
@@ -178,6 +182,99 @@ pub async fn build_tree_from_inventory_deferred(
         .collect();
 
     Ok((Some(root), tree_hashes))
+}
+
+/// Refuse a tree that would record two entries this volume holds as one (README and readme on a
+/// case-folding volume, two spellings of one directory, a pair any number of levels down): no
+/// materializer could write such a tree back here, and a removal of one spelling would delete the
+/// other's file. Judged before anything is staged, by [`alias_utils::AliasCheck::first_pair`] over
+/// the live entries the build reads and the skipped subtrees beside them. A pair wholly inside a
+/// skipped subtree is already in the head tree, so it is not newly recorded and is not read.
+///
+/// # Returns
+/// * `Ok(())`      - If no two node paths are one entry.
+/// * `Err(String)` - The refusal, naming the shallowest pair and the way to clear it, or a disk
+///                   read or probe failure.
+fn refuse_alias_pairs(prepared: &inventory_utils::PreparedInventory) -> Result<(), String> {
+    let skip = &prepared.skip;
+    let live = || prepared.shards.iter()
+        .filter(|(key, _)| !skip.pruned.contains(*key))
+        .map(|(key, inventory)| (key, inventory.get_items()
+            .filter(|(_, item)| item.state != InventoryItemState::Deleted)
+            .map(|(name, _)| name)))
+        .filter_map(|(key, mut names)| names.next().map(|first| (key, std::iter::once(first).chain(names))));
+    let skipped: Vec<String> = skip.injections.iter()
+        .flat_map(|(parent, children)| children.iter().map(|(name, _)| join_key(parent, name)))
+        .collect();
+
+    if !has_fold_equal_siblings(live().map(|(key, names)| (key.as_str(), names.map(String::as_str))), &skipped) {
+        return Ok(());
+    }
+
+    let files: BTreeSet<String> = live()
+        .flat_map(|(key, names)| names.map(|name| join_key(key, name)).collect::<Vec<_>>())
+        .collect();
+
+    let nodes = alias_utils::Nodes::from_live(files, skipped.iter().map(String::as_str));
+    let mut check = alias_utils::AliasCheck::new();
+
+    let Some((first, second)) = check.first_pair(&nodes)? else {
+        return Ok(());
+    };
+
+    Err(format!(
+        "The inventory holds both \"{}\" and \"{}\", which this file system treats as one entry, so \
+        a parcel holding both could not be written back here. {} Then run this command again.",
+        first, second, check.remedy(&first, &second, &nodes)?.instructions()
+    ))
+}
+
+/// Whether some directory holds two names with one [`alias_utils::fold_key`], among the live
+/// files of `live` (each directory key with its file names) and the directories they and
+/// `skipped` imply. Only such a pair can be one entry, so with none the full check is skipped and
+/// the whole tree's paths are never collected in one place.
+fn has_fold_equal_siblings<'a, N>(live: impl Iterator<Item = (&'a str, N)>, skipped: &[String]) -> bool
+where N: Iterator<Item = &'a str> {
+    // Every directory the nodes imply, each once, by parent.
+    let mut directories: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut files: Vec<(&str, Vec<&str>)> = Vec::new();
+
+    fn add_directory(key: &str, directories: &mut HashMap<String, HashSet<String>>) {
+        let mut key = key;
+
+        while !key.is_empty() {
+            let (parent, name) = key.rsplit_once('/').unwrap_or(("", key));
+
+            if !directories.entry(parent.to_string()).or_default().insert(name.to_string()) {
+                break;
+            }
+
+            key = parent;
+        }
+    }
+
+    for (key, names) in live {
+        add_directory(key, &mut directories);
+        files.push((key, names.collect()));
+    }
+
+    for root in skipped {
+        add_directory(root, &mut directories);
+    }
+
+    fn collides<'b>(mut names: impl Iterator<Item = &'b str>) -> bool {
+        let mut folds = HashSet::new();
+        names.any(|name| !folds.insert(alias_utils::fold_key(name)))
+    }
+
+    let file_keys: HashSet<&str> = files.iter().map(|(key, _)| *key).collect();
+
+    files.iter().any(|(key, names)| {
+        let subdirectories = directories.get(*key).into_iter().flatten().map(String::as_str);
+        collides(names.iter().copied().chain(subdirectories))
+    }) || directories.iter()
+        .filter(|(key, _)| !file_keys.contains(key.as_str()))
+        .any(|(_, names)| collides(names.iter().map(String::as_str)))
 }
 
 /// The per-directory task of the tree build: build (and store) the tree object for one

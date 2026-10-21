@@ -111,9 +111,9 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     // A cherry-pick refuses in a scoped bay (above), so the merge always runs at full scope —
     // every path is in scope and materialized, exactly today's behavior.
-    let actions = merge_utils::compute_merge_actions(
-        &base_tree, &our_tree, &theirs_tree, &current, &source_label,
-        &forklift_core::util::scope_utils::MaterializationScope::full(),
+    let scope = forklift_core::util::scope_utils::MaterializationScope::full();
+    let mut actions = merge_utils::compute_merge_actions(
+        &base_tree, &our_tree, &theirs_tree, &current, &source_label, &scope,
     )?;
 
     // Every change the source made is already present here: an empty pick.
@@ -124,6 +124,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
         ));
     }
 
+    consolidate::keep_aliased_files(&mut actions, &our_tree, &scope)?;
     consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
 
     let mut conflicts = consolidate::apply_merge_actions(&actions)?;
