@@ -56,7 +56,8 @@ use std::path::PathBuf;
 use std::process::Output;
 
 use forklift_core::globals::StorageRootScope;
-use forklift_core::util::{audit_utils, file_utils, gc_utils, office_utils};
+use forklift_core::enums::parcel_action_type::ParcelActionType;
+use forklift_core::util::{audit_utils, file_utils, gc_utils, object_utils, office_utils};
 
 mod common;
 use common::forklift_command;
@@ -904,6 +905,14 @@ fn undoing_a_completed_pick_whose_source_was_collected_is_refused_and_changes_no
         err
     );
 
+    // The refusal consumed no journal entry: a second undo meets the same entry, not an older one.
+    let again = warehouse.run(&["undo"]);
+    assert!(
+        !again.status.success() && String::from_utf8_lossy(&again.stderr).contains(&format!("cherry-pick of {}", source)),
+        "a second undo must meet the same refused entry; stderr: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+
     std::fs::write(warehouse.root.join("app.txt"), "on top\n").unwrap();
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "on top"]);
@@ -940,6 +949,21 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
 
     std::fs::remove_file(pick_state_file(&warehouse)).unwrap();
     warehouse.run_ok(&["stack", "completed pick"]);
+
+    // As the refusal says, the stacked changes record the operator as their only author. With the
+    // source gone its authors cannot be preserved, so the claim's whole content is one Author,
+    // the stacker.
+    let parcel = warehouse.scoped(|| object_utils::load_parcel(&warehouse.head("main")).unwrap());
+    let authors: Vec<&str> = parcel.actions.iter()
+        .filter(|action| matches!(action.action, ParcelActionType::Author))
+        .map(|action| action.operator.identifier.as_str())
+        .collect();
+    let stackers: Vec<&str> = parcel.actions.iter()
+        .filter(|action| matches!(action.action, ParcelActionType::Stack))
+        .map(|action| action.operator.identifier.as_str())
+        .collect();
+    assert_eq!(stackers.len(), 1, "one stacker: {:?}", stackers);
+    assert_eq!(authors, stackers, "the stacker must be the only author after the abort");
 }
 
 /// FORK-83 — THE HEALING READER, fixed: an absent tag subject no longer wedges the warehouse.

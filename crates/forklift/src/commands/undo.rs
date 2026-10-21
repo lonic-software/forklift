@@ -18,7 +18,7 @@ use crate::output::{self, CommandOutput};
 /// An empty journal means there is nothing to undo. An entry is reversed only while the bay is
 /// still where its operation left it (`journal_utils::check_undoable`); otherwise an operation
 /// outside the journal ran since, and reversing the entry would undo an older operation than
-/// the user's last.
+/// the user's last. Nor is one reversed that would put back a cherry-pick whose source is gone.
 ///
 /// The journal entry is only ever consumed (`journal_utils::pop`) once its undo has fully
 /// succeeded — `peek` looks at it first. A refused or failed undo must leave the journal exactly

@@ -366,12 +366,16 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// older operation than the user's last. Refs other than the current pallet are not compared: they
 /// are shared by every bay, and `restore_refs` already leaves any that moved alone.
 ///
+/// A bay that matches is still refused when the entry would put back a cherry-pick whose source
+/// this store no longer holds (see [`refuse_a_pick_without_its_source`]).
+///
 /// # Arguments
 /// * `entry` - The entry `undo` is about to reverse.
 ///
 /// # Returns
 /// * `Ok(())`      - The bay matches; the entry may be reversed.
-/// * `Err(String)` - The refusal, naming what differs; or the state could not be read.
+/// * `Err(String)` - The refusal, naming what differs or the lost pick source; or the state could
+///                   not be read.
 pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     let now = BayState::read()?;
     let after = entry.after.bay_state();
