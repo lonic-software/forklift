@@ -833,7 +833,9 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
 
         // A stale key's shard is already gone, so it is unregistered in the same write, before
         // anything publishes. A failed write leaves it registered with no shard, which reads as an
-        // empty directory until the next load finds it stale again.
+        // empty directory until the next load finds it stale again. A blob-batch failure needs no
+        // such write: it sets `result` before the dirty-path pass, which then never runs, so there
+        // are no stale keys to unregister.
         let published = ShardLedger::read().and_then(|mut ledger| {
             ledger.update(&stale_keys, &new_inventory_paths)?;
             publish_shard_outcomes(&ledger, &clear_keys, &mut outcomes)
@@ -842,11 +844,6 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         if let Err(e) = published {
             if result.is_ok() { result = Err(Some(e)); }
         }
-    } else if !stale_keys.is_empty() {
-        // Stale keys are only ever populated by a dirty-path pass that ran (in full, or up to the
-        // point it failed) over a fully successful walk; their shards are gone, so unregistering
-        // them is safe even though nothing publishes.
-        unregister_inventory_keys(&stale_keys)?;
     }
 
     if let Err(e) = result {
@@ -4311,12 +4308,10 @@ mod tests {
 
     #[test]
     fn a_corrupt_dirty_shard_during_load_yields_the_resilience_message_not_a_raw_parse_error() {
-        // Regression (multi-agent review of PR #59, finding 2): a join-point failure (here, a
-        // leftover shard that fails to parse) used to `?`-propagate straight out of
-        // `create_inventory_for_directory`, bypassing the failure-resilience branch entirely —
-        // skipping `update_inventory_metadata` for whatever *was* successfully published this
-        // walk, and surfacing a raw parse error instead of the documented "entries loaded so far
-        // were kept, re-run" message a walk failure already gives.
+        // A join-point failure (here, a leftover shard that fails to parse) must not
+        // `?`-propagate straight out of `create_inventory_for_directory`: what the walk decided
+        // is still registered and published, and the user sees the documented "entries loaded so
+        // far were kept, re-run" message a walk failure gives, not a raw parse error.
         let _scratch = Scratch::new("load-corrupt-dirty-shard");
 
         // A previously-registered directory whose shard is corrupt, with no counterpart left in
