@@ -2,8 +2,8 @@
 //!
 //! A failed or abandoned lift leaves verified objects with no ref pointing at them.
 //! The collector marks everything reachable from the GC roots — every pallet head and
-//! trust pin, plus every bay's parked parcels, in-progress consolidation and staged
-//! inventory, when those local states exist — and sweeps the rest, with an mtime grace
+//! trust pin, plus every bay's base, parked parcels, in-progress consolidation or cherry-pick
+//! and staged inventory, when those local states exist — and sweeps the rest, with an mtime grace
 //! period protecting the objects of in-flight lifts.
 //!
 //! The mark walk is presence-tolerant: a store can legitimately hold only some of a

@@ -485,7 +485,9 @@ exactly as it is — trust operations such as a key retirement are preserved, ne
 outright when the bay no longer matches what the journaled operation left: the current
 pallet was switched since (`palletize` and `deliver` switch pallets without being
 journaled), the current pallet's head moved (a merged haul, a fast-forwarding `lower`), or a
-consolidation or cherry-pick was started or finished. Continue forward instead. Working-tree
+consolidation or cherry-pick was started or finished. It also refuses to undo the `stack` that
+completed a cherry-pick once the picked parcel is gone from the warehouse (a `gc` can collect it
+when no pallet reaches it), since the pick it would put back could never complete. Continue forward instead. Working-tree
 commands in between — `load`, `remove`, `park` — change none of that and do not block it:
 after a `park`, `undo` soft-resets beneath the parked work. `park pop` then re-applies it,
 unless the parked work touches a path the undone parcel changed — it refuses that until the

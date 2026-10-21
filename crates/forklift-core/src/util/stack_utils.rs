@@ -391,7 +391,14 @@ pub async fn stack_parcel(description: Option<String>,
 
     let actions = match &cherry_pick {
         Some(state) => {
-            let authors = cherry_pick_utils::collect_source_authors(&state.source, &operator)?;
+            let authors = cherry_pick_utils::collect_source_authors(&state.source, &operator).map_err(|e| {
+                StackError::Other(format!(
+                    "The cherry-pick in progress cannot be completed: its source parcel {} cannot \
+                    be read ({}). Nothing was stacked. Abort the pick ({}); stacking its changes \
+                    after that records you as their only author.",
+                    state.source, e, cherry_pick_utils::abort_hint()
+                ))
+            })?;
 
             let mut actions: Vec<ParcelAction> = authors.into_iter()
                 .map(|author| ParcelAction {

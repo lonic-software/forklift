@@ -19,7 +19,7 @@
 //! record) and, for the object-shaped ones, checks whether the object it names is genuinely absent
 //! (present elsewhere — another pack, or loose — is not a loss) and, if so, whether *any* durable
 //! ref source still reaches it: pallet heads (both namespaces), every bay's parked parcels,
-//! every bay's in-progress consolidation (its `their_head`), the trust anchor's adopted
+//! every parcel a bay's in-progress consolidation or cherry-pick records, the trust anchor's adopted
 //! head (a re-genesis pin, §8.7), and every bay's staged inventory shards **enumerated from the
 //! files on disk**, never the registration ledger (`inventory_utils::ShardLedger`), which is blind
 //! to a shard sitting in the store unregistered — a walk that trusted it could silently miss a
@@ -1329,7 +1329,8 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
 /// the registration ledger) — see the module doc comment.
 struct WalkRoots {
     /// Parcel hashes to walk ancestry-and-tree-closure from: every pallet head (both namespaces),
-    /// every bay's parked parcels, and every bay's in-progress consolidation `their_head`. A hash
+    /// every bay's parked parcels, and every parcel a bay's in-progress consolidation or
+    /// cherry-pick records. A hash
     /// here that is itself absent is treated as an ordinary dangling reference — see
     /// [`walk_closure_for`]. Every one of these is a ref THIS warehouse's own commands set, so its
     /// absence is genuine local loss, never "maybe never fetched" — unlike [`Self::pin_parcels`]
@@ -1381,8 +1382,8 @@ struct WalkRoots {
 
 /// [`gc_root_sources`]'s result — see that function's own doc comment.
 pub(crate) struct GcRootSources {
-    /// Every pallet head (both namespaces) plus every readable bay's parked-parcel and
-    /// in-progress-consolidation `their_head` roots.
+    /// Every pallet head (both namespaces) plus every readable bay's base, parked parcels and
+    /// in-progress consolidation and cherry-pick parcels.
     pub parcels: Vec<String>,
     /// Every trust-pin root this call could establish, each paired with its own
     /// [`office_utils::PinAbsencePolicy`] — see [`gc_root_sources`]'s own doc comment for why the
@@ -1488,8 +1489,8 @@ pub(crate) fn gc_root_sources(
 ///
 /// **Invariant with [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set):**
 /// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
-/// bay's parked parcels, every bay's in-progress consolidation `their_head`, and every trust-pin
-/// root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
+/// bay's parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
+/// and every trust-pin root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
 /// `distrust_boundary`, FORK-81 — and every bay's staged inventory shard leaves, FORK-156). If
 /// gc ever treats an object as live, this walk must never call the same object safe to drop —
 /// otherwise `forklift heal` could clear a taint over an object `forklift gc` would refuse to
