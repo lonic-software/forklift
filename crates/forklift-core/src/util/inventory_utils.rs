@@ -1039,7 +1039,8 @@ pub enum ShardOutcome {
 /// invariant; phase B is simply not attempted if phase A never returns `Ok`) — every caller
 /// treats an `Err` here as "nothing in `outcomes` is known to be published", exactly as if this
 /// were still one inline step of its own join point: phase B may have written some shards before
-/// it failed, so none is registered or relied on, and none is rolled back as if never written.
+/// it failed, so no caller registers a key on the strength of this call, and none rolls an
+/// outcome back as if it were never written.
 ///
 /// # Arguments
 /// * `clear_keys` - Every ancestor key some outcome's real content change invalidates.
