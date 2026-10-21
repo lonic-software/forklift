@@ -582,11 +582,10 @@ itself as well as the findings.
    merge as in progress; the barrier count no longer grows with the action count. bench112,
    50 actions over 5 directories: `consolidate` 882 → 85 ms; 30-action `cherry-pick`
    556 → 78 ms. A `Merged` action's blob goes into a write batch the shard batch owns, which
-   every publish of it — an early one too, for a key that may alias one it already touched —
-   finishes in one barrier before any shard naming those blobs is published. A failed action
-   stages nothing (conflict entries staged with no merge in progress could be neither completed
-   nor aborted); either failure records nothing as in progress and says that some or all of the
-   applied changes are unstaged.
+   its one publish finishes in one barrier before any shard naming those blobs is published. A
+   failed action stages nothing (conflict entries staged with no merge in progress could be
+   neither completed nor aborted); either failure records nothing as in progress and says that
+   some or all of the applied changes are unstaged.
 3. **FIXED (PR A, hardened by review round 2). `park` push** — ~8.9 ms/changed file
    across three unbatched layers: the per-file blob store inside
    `refresh_tracked_entries`, the per-directory tree-object store inside

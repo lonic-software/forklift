@@ -1037,8 +1037,10 @@ pub enum ShardOutcome {
 /// A failure in either phase is folded into the returned `Err` and the *other* phase is skipped
 /// (phase A failing skips phase B entirely, preserving `write_shard_mutation`'s ordering
 /// invariant; phase B is simply not attempted if phase A never returns `Ok`) — every caller
-/// treats an `Err` here as "nothing in `outcomes` was published", exactly as if this were still
-/// one inline step of its own join point.
+/// treats an `Err` here as "nothing in `outcomes` is known to be published", exactly as if this
+/// were still one inline step of its own join point: phase B may have written some shards before
+/// it failed, so no caller registers a key on the strength of this call, and none rolls an
+/// outcome back as if it were never written.
 ///
 /// # Arguments
 /// * `clear_keys` - Every ancestor key some outcome's real content change invalidates.
