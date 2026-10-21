@@ -1161,7 +1161,7 @@ mod tests {
     /// grammar refuses, still fails the listing naming it.
     #[test]
     fn a_name_that_only_resembles_a_temp_still_fails_the_listing() {
-        for impostor in ["x~", "main.tmp~1-", "Main.tmp~1-2", "con.tmp~1-1", "bad name.tmp~3-4"] {
+        for impostor in ["x~", "main.tmp~1-", "Main.tmp~1-2", "-x.tmp~1-1", "bad name.tmp~3-4"] {
             let (root, _scope) = scratch("temp-impostor");
             update_pallet_head("main", None, &hash('a')).unwrap();
             std::fs::write(get_pallets_folder().join(impostor), format!("{}\n", hash('c'))).unwrap();

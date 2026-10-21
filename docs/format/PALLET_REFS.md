@@ -52,7 +52,9 @@ Ref files are updated atomically: the new content is written to a temp file besi
 named `<name>.tmp~<pid>-<n>` (`<pid>` the writing process, `<n>` a per-process counter), which is
 then renamed onto the ref. The `~` puts every temp name outside the name rules, so a temp is never
 a pallet: one left by a write that was killed before its rename is skipped by the listing, not
-counted as a ref, and no pallet's ref file can share a temp's name.
+counted as a ref, and no pallet's ref file can share a temp's name. Only a temp whose name before
+`.tmp~` is a valid pallet name is skipped; any other file spelled like a temp (`Main.tmp~1-2`)
+fails the listing like any other invalid name.
 
 ## The current pallet
 
