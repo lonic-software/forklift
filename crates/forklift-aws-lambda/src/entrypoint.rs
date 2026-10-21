@@ -49,7 +49,8 @@ use forklift_core::model::remote::{
     RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers,
 };
-use forklift_core::util::pallet_utils::DEFAULT_PALLET_NAME;
+use forklift_core::util::pallet_utils::{validate_pallet_name, DEFAULT_PALLET_NAME};
+use forklift_core::util::warehouse_utils;
 
 use crate::aws::AwsConfig;
 use crate::error::{HeadError, HeadResult};
@@ -82,11 +83,22 @@ pub enum Routing {
 /// The region is deliberately absent: the provider chain reads `AWS_REGION`, so pinning it
 /// here would only shadow it.
 pub fn config_from_env() -> Result<(AwsConfig, Routing), String> {
-    let bucket = require_env("FORKLIFT_S3_BUCKET")?;
-    let table = require_env("FORKLIFT_DYNAMODB_TABLE")?;
+    config_from(|name| std::env::var(name).ok())
+}
 
-    let (warehouse_id, routing) = match std::env::var("FORKLIFT_WAREHOUSE_ID") {
-        Ok(id) if !id.is_empty() => (id.clone(), Routing::Single(id)),
+/// [`config_from_env`] over any variable source. The two names a client must also accept, the
+/// single-routing warehouse id and the default pallet, are validated here, so a misconfigured head
+/// refuses to start rather than serving names every client refuses.
+fn config_from(var: impl Fn(&str) -> Option<String>) -> Result<(AwsConfig, Routing), String> {
+    let bucket = require_var(&var, "FORKLIFT_S3_BUCKET")?;
+    let table = require_var(&var, "FORKLIFT_DYNAMODB_TABLE")?;
+
+    let (warehouse_id, routing) = match var("FORKLIFT_WAREHOUSE_ID") {
+        Some(id) if !id.is_empty() => {
+            warehouse_utils::validate_warehouse_id(&id)
+                .map_err(|e| format!("The FORKLIFT_WAREHOUSE_ID environment variable is invalid: {}", e))?;
+            (id.clone(), Routing::Single(id))
+        }
         // No fixed id: the id travels in the path, so the config carries a placeholder the
         // per-request head overrides. The shared object store and the client builders never
         // read it (only the per-warehouse ref store and scratch pool do, and both are keyed
@@ -96,32 +108,29 @@ pub fn config_from_env() -> Result<(AwsConfig, Routing), String> {
 
     let mut config = AwsConfig::new(bucket, table, warehouse_id);
 
-    if let Ok(endpoint) = std::env::var("FORKLIFT_AWS_ENDPOINT_URL") {
+    if let Some(endpoint) = var("FORKLIFT_AWS_ENDPOINT_URL") {
         if !endpoint.is_empty() {
             config = config.with_endpoint_url(endpoint);
         }
     }
 
-    let default_pallet = std::env::var("FORKLIFT_DEFAULT_PALLET")
-        .ok()
+    let default_pallet = var("FORKLIFT_DEFAULT_PALLET")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_PALLET_NAME.to_string());
+    validate_pallet_name(&default_pallet)
+        .map_err(|e| format!("The FORKLIFT_DEFAULT_PALLET environment variable is invalid: {}", e))?;
     config = config.with_default_pallet(default_pallet);
 
     Ok((config, routing))
 }
 
-/// Read a required environment variable, or explain which one is missing.
-fn require_env(name: &str) -> Result<String, String> {
-    std::env::var(name)
-        .map_err(|_| format!("The {} environment variable must be set.", name))
-        .and_then(|value| {
-            if value.is_empty() {
-                Err(format!("The {} environment variable must not be empty.", name))
-            } else {
-                Ok(value)
-            }
-        })
+/// Read a required variable, or explain which one is missing.
+fn require_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<String, String> {
+    match var(name) {
+        None => Err(format!("The {} environment variable must be set.", name)),
+        Some(value) if value.is_empty() => Err(format!("The {} environment variable must not be empty.", name)),
+        Some(value) => Ok(value),
+    }
 }
 
 /// A verified non-blank bearer token: the *only* way to build [`AuthConfig::Token`]'s payload,
@@ -608,31 +617,10 @@ where
     }
 }
 
-/// Validate a warehouse id: a single safe path component, exactly `forklift-server`'s rule.
-/// Stricter than a pallet name, because the id both keys the ref partition and (hashed) names
-/// the warm-scratch directory.
+/// Validate a warehouse id (the one shared rule, which forklift-server applies too); a refusal is
+/// unprocessable.
 fn validate_warehouse_id(id: &str) -> HeadResult<()> {
-    let reject = |reason: &str| {
-        Err(HeadError::unprocessable(format!("\"{}\" is not a valid warehouse id: {}.", id, reason)))
-    };
-
-    if id.is_empty() {
-        return reject("it is empty");
-    }
-
-    if id.len() > 100 {
-        return reject("it is longer than 100 characters");
-    }
-
-    if id.starts_with('.') || id.starts_with('-') {
-        return reject("it must not start with \".\" or \"-\"");
-    }
-
-    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
-        return reject("only ASCII letters, digits, \".\", \"_\" and \"-\" are allowed");
-    }
-
-    Ok(())
+    warehouse_utils::validate_warehouse_id(id).map_err(HeadError::unprocessable)
 }
 
 /// Pull one `key=value` out of a raw query string. Values are simple (a lift session id, a
@@ -835,6 +823,42 @@ mod tests {
         assert_eq!(body.error, "An internal error occurred.");
         assert!(body.code.is_none());
         assert!(!body.error.contains("forklift-prod-abc123"), "infra detail hidden: {}", body.error);
+    }
+
+    /// A variable source holding `overrides` on top of the two required names.
+    fn env_with(overrides: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let mut vars: std::collections::HashMap<String, String> = [
+            ("FORKLIFT_S3_BUCKET", "bucket"), ("FORKLIFT_DYNAMODB_TABLE", "table"),
+        ].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        for (key, value) in overrides {
+            vars.insert(key.to_string(), value.to_string());
+        }
+        move |name| vars.get(name).cloned()
+    }
+
+    /// FORK-77: a head configured with a name every client refuses must not start. A mixed-case
+    /// warehouse id or default pallet is refused, naming the variable; the defaults, a portable
+    /// id, and multi routing (an empty id is the placeholder, never validated) all start.
+    #[test]
+    fn config_refuses_names_outside_the_portable_grammar() {
+        let error = config_from(env_with(&[("FORKLIFT_WAREHOUSE_ID", "Acme")])).err().unwrap();
+        assert!(error.contains("FORKLIFT_WAREHOUSE_ID"), "{}", error);
+        assert!(error.contains("\"Acme\" is not a valid warehouse id"), "{}", error);
+
+        let error = config_from(env_with(&[("FORKLIFT_DEFAULT_PALLET", "Main")])).err().unwrap();
+        assert!(error.contains("FORKLIFT_DEFAULT_PALLET"), "{}", error);
+        assert!(error.contains("\"Main\" is not a valid pallet name"), "{}", error);
+
+        let (_, routing) = config_from(env_with(&[])).unwrap();
+        assert!(matches!(routing, Routing::Multi));
+
+        let (_, routing) = config_from(env_with(&[("FORKLIFT_WAREHOUSE_ID", "")])).unwrap();
+        assert!(matches!(routing, Routing::Multi), "an empty id selects multi routing");
+
+        let (_, routing) = config_from(env_with(&[
+            ("FORKLIFT_WAREHOUSE_ID", "acme"), ("FORKLIFT_DEFAULT_PALLET", "trunk"),
+        ])).unwrap();
+        assert!(matches!(routing, Routing::Single(ref id) if id == "acme"));
     }
 
     /// A plain non-500 error passes through with no code (an older client ignores the absent field).

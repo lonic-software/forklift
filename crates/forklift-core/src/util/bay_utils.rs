@@ -104,6 +104,9 @@ pub fn read_bay_redirect(forklift_path: &Path) -> Result<BayRedirect, String> {
     if name.is_empty() {
         return Err("The bay redirect has no bay name.".to_string());
     }
+    pallet_utils::validate_pallet_name(&name).map_err(|e| format!(
+        "The bay redirect \"{}\" names an invalid bay: {}", forklift_path.to_string_lossy(), e
+    ))?;
 
     Ok(BayRedirect {
         warehouse_root: PathBuf::from(warehouse_root),
@@ -369,9 +372,47 @@ fn degraded_bay_note(dir: &Path, error: &str) -> String {
     }
 }
 
+/// Whether `name` is, byte for byte, a bay folder listed in `.forklift/bays/`. This is the way
+/// to address a bay whose name the grammar refuses (so it can be removed), and so it matches the
+/// raw entries rather than validating the name: `.`, `..` and a name holding a separator are
+/// never listed entries, so they never resolve to the forklift root or to another folder. A name
+/// ending in `.` or a space is refused too, since Windows resolves such a path to a different
+/// folder. Entries that are not valid UTF-8 are compared as they are, never a reason to fail.
+///
+/// # Returns
+/// * `Ok(true)`    - If a real folder (not a link) of exactly that name is listed.
+/// * `Ok(false)`   - If none is.
+/// * `Err(String)` - If the bays folder could not be read.
+pub fn is_listed_bay(name: &str) -> Result<bool, String> {
+    if name.is_empty() || name.ends_with('.') || name.ends_with(' ') {
+        return Ok(false);
+    }
+
+    let folder = forklift_root().join(FOLDER_NAME_BAYS_ROOT);
+
+    if !folder.is_dir() {
+        return Ok(false);
+    }
+
+    for entry in file_utils::read_directory(&folder)? {
+        let entry = entry.map_err(|e| format!("Error while reading a bay entry: {}", e))?;
+
+        if entry.file_name() == std::ffi::OsStr::new(name) {
+            return Ok(file_utils::get_symlink_metadata_for_path(&entry.path())?.is_dir());
+        }
+    }
+
+    Ok(false)
+}
+
 /// Remove a bay's local state folder. The bay's pallet (a normal ref) is left untouched;
-/// removing the working directory is the caller's choice.
+/// removing the working directory is the caller's choice. Only a listed bay folder is removed
+/// (see [`is_listed_bay`]).
 pub fn remove_bay_state(name: &str) -> Result<(), String> {
+    if !is_listed_bay(name)? {
+        return Err(format!("There is no bay named \"{}\".", name));
+    }
+
     let state = bay_state_dir(name);
 
     std::fs::remove_dir_all(&state)
@@ -379,9 +420,22 @@ pub fn remove_bay_state(name: &str) -> Result<(), String> {
 }
 
 /// Read a bay's current pallet (from its bay-local position), for listing from the main tree.
-/// `None` when the bay has no position yet or it cannot be read.
-pub fn read_bay_current_pallet(name: &str) -> Option<String> {
-    pallet_utils::read_position_in(&bay_state_dir(name)).ok().map(|position| position.pallet)
+///
+/// # Returns
+/// * `Ok(None)`         - If the bay has no position file yet.
+/// * `Ok(Some(String))` - The pallet the bay stands on.
+/// * `Err(String)`      - If the position is present but cannot be read or names an invalid pallet.
+pub fn read_bay_current_pallet(name: &str) -> Result<Option<String>, String> {
+    let dir = bay_state_dir(name);
+    let path = dir.join(pallet_utils::FILE_NAME_POSITION);
+
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Error while reading the bay position file \"{}\": {}", path.to_string_lossy(), e)),
+        Ok(_) => {}
+    }
+
+    pallet_utils::read_position_in(&dir).map(|position| Some(position.pallet))
 }
 
 /// The current bay's local-state folder — a convenience over [`bay_root`].
@@ -498,6 +552,119 @@ mod tests {
             assert_eq!(redirect.warehouse_root, PathBuf::from(root));
             assert_eq!(redirect.name, "review");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_redirect_naming_an_invalid_bay_is_refused() {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-bay-utils-redirect-invalid-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let forklift_path = dir.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+        write_bay_redirect(&dir, Path::new("/srv/warehouse"), "review").unwrap();
+        assert_eq!(read_bay_redirect(&forklift_path).unwrap().name, "review");
+
+        for name in ["Review", "..", "review."] {
+            write_bay_redirect(&dir, Path::new("/srv/warehouse"), name).unwrap();
+            let error = read_bay_redirect(&forklift_path).err().expect(name);
+            assert!(error.contains("names an invalid bay") && error.contains(&format!("\"{}\" is not a valid pallet name", name)),
+                "{}: {}", name, error);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fresh warehouse root with the given bay folders (and one plain file) under `bays/`.
+    fn bays_fixture(name: &str, bays: &[&str]) -> (PathBuf, StorageRootScope) {
+        let dir = std::env::temp_dir().join(format!("forklift-bay-utils-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bays_root = dir.join(FOLDER_NAME_FORKLIFT_ROOT).join(FOLDER_NAME_BAYS_ROOT);
+        std::fs::create_dir_all(&bays_root).unwrap();
+        for bay in bays {
+            std::fs::create_dir_all(bays_root.join(bay)).unwrap();
+            std::fs::write(bays_root.join(bay).join("marker"), bay).unwrap();
+        }
+        std::fs::write(bays_root.join("plain-file"), "not a bay").unwrap();
+        std::fs::write(dir.join(FOLDER_NAME_FORKLIFT_ROOT).join("keep"), "shared state").unwrap();
+        let scope = StorageRootScope::enter(&dir);
+
+        (dir, scope)
+    }
+
+    /// `bay remove` addresses a bay by its exact folder name: a refused name that is a real folder
+    /// resolves, while `.`, `..`, a path, a spelling the folder does not have byte for byte, a
+    /// trailing `.` or space, and a plain file never do.
+    #[test]
+    fn only_an_exactly_listed_bay_folder_resolves() {
+        let (dir, _scope) = bays_fixture("listed", &["b1", "Main"]);
+
+        assert!(is_listed_bay("b1").unwrap());
+        assert!(is_listed_bay("Main").unwrap(), "a folder the grammar refuses must still resolve");
+
+        for name in ["", ".", "..", "b1/..", "b1/../b1", "../bays/b1", "main", "B1", "b1.", "b1 ", "plain-file", "absent"] {
+            assert!(!is_listed_bay(name).unwrap(), "must not resolve: {:?}", name);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live data-loss case: removing `..` once emptied the whole forklift root. Only a listed
+    /// folder is ever removed, and removing a refused name removes exactly that folder.
+    #[test]
+    fn removing_bay_state_never_leaves_the_bays_folder() {
+        let (dir, _scope) = bays_fixture("remove", &["b1", "Main"]);
+        let root = dir.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+        for name in ["..", ".", "b1/..", "b1/../..", ""] {
+            assert!(remove_bay_state(name).is_err(), "must refuse: {:?}", name);
+            assert!(root.join("keep").is_file() && root.join("bays/b1/marker").is_file() && root.join("bays/Main/marker").is_file(),
+                "{:?} removed something", name);
+        }
+
+        remove_bay_state("Main").unwrap();
+        assert!(!root.join("bays/Main").exists());
+        assert!(root.join("keep").is_file() && root.join("bays/b1/marker").is_file(), "only the named folder goes");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sibling whose name is not UTF-8 neither aborts the match nor blocks removing another bay.
+    /// Linux only: APFS refuses such a name outright and NTFS names are UTF-16.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_sibling_does_not_block_resolving_a_bay() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (dir, _scope) = bays_fixture("non-utf8", &["b1"]);
+        let odd = std::ffi::OsStr::from_bytes(b"bad\xff");
+        std::fs::create_dir_all(forklift_root().join(FOLDER_NAME_BAYS_ROOT).join(odd)).unwrap();
+        assert!(list_bays().is_err(), "the fixture must hold an entry the plain listing cannot read");
+
+        assert!(is_listed_bay("b1").unwrap());
+        remove_bay_state("b1").unwrap();
+        assert!(!bay_state_dir("b1").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Only a missing position reads as "no pallet"; a position naming a refused pallet is an
+    /// error, never a silent absence.
+    #[test]
+    fn a_bay_pallet_is_absent_only_when_the_bay_has_no_position() {
+        let (dir, _scope) = bays_fixture("current-pallet", &["fresh", "good", "bad"]);
+
+        assert_eq!(read_bay_current_pallet("fresh").unwrap(), None);
+
+        pallet_utils::write_position_in(&bay_state_dir("good"), &pallet_utils::BayPosition::new("good", None)).unwrap();
+        assert_eq!(read_bay_current_pallet("good").unwrap(), Some("good".to_string()));
+
+        std::fs::write(bay_state_dir("bad").join(pallet_utils::FILE_NAME_POSITION),
+            record_utils::to_bytes("position", 1, ["Main", ""])).unwrap();
+        let error = read_bay_current_pallet("bad").unwrap_err();
+        assert!(error.contains("\"Main\" is not a valid pallet name"), "{}", error);
 
         std::fs::remove_dir_all(&dir).ok();
     }

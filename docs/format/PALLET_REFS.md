@@ -21,9 +21,20 @@ named `a/b` cannot coexist — the file system enforces this, matching git's beh
 
 A pallet name consists of `/`-separated components. Each component:
 
-* consists of ASCII letters, digits, `.`, `_` and `-`,
+* consists of lowercase ASCII letters, digits, `.`, `_` and `-`,
 * is not empty, and is not `.` or `..`,
-* does not start with `-` (such a name would be indistinguishable from a flag).
+* does not start with `-` (such a name would be indistinguishable from a flag),
+* does not end with `.`,
+* does not have a Windows device name as its stem (the text before its first `.`): `con`,
+  `prn`, `aux`, `nul`, `com1`–`com9`, `lpt1`–`lpt9`. So `con.txt` is refused, while `console` and
+  `x.con` are allowed.
+
+These rules make every valid name mean the same ref file on every host. A ref file is the name
+used verbatim as a path, so `Main` and `main` would be one file on a case-folding volume (macOS,
+Windows), and Windows strips a trailing `.` and opens a device for a reserved stem. A name
+outside the rules is refused, never folded to a valid spelling; the refusal suggests the
+lowercase spelling when that alone would make it valid. A ref file whose name breaks the rules
+(written by hand or by an older version) makes the pallet listing fail, naming the file.
 
 ### Content
 

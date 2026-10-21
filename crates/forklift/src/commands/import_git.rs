@@ -74,6 +74,10 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         return Err(format!("\"{}\" has no local branches to import.", path));
     }
 
+    // Every branch is mapped and checked before anything is converted or written, so a branch
+    // that cannot become a pallet refuses the import with the warehouse untouched.
+    let pallets = map_branches(&branches)?;
+
     let progress = events::progress();
     let mut converter = Converter::new(path, !no_compact)?;
 
@@ -108,15 +112,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     // Each local branch becomes a pallet.
     let mut imported: Vec<(String, String)> = Vec::new();
 
-    for (branch, commit) in &branches {
-        let pallet = sanitize_pallet_name(branch);
-
-        if pallet_utils::does_pallet_exist(&pallet) {
-            return Err(format!(
-                "Pallet \"{}\" already exists; import into a fresh warehouse.", pallet
-            ));
-        }
-
+    for ((branch, commit), pallet) in branches.iter().zip(pallets) {
         let head = converter.commits.get(commit).cloned().ok_or(format!(
             "Branch \"{}\" points at a commit that was not imported.", branch
         ))?;
@@ -974,11 +970,58 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Turn a git branch name into a valid forklift pallet name, replacing characters forklift
-/// does not allow (it keeps `/`, so `feature/x` survives).
+/// Map every branch to its pallet name (see [`sanitize_pallet_name`]), in branch order, and refuse
+/// the import naming the branch or branches when a mapped name is not a valid pallet name, when
+/// two branches map to one name, or when the name is already a pallet in this warehouse.
+fn map_branches(branches: &[(String, String)]) -> Result<Vec<String>, String> {
+    let pallets: Vec<String> = branches.iter().map(|(branch, _)| sanitize_pallet_name(branch)).collect();
+
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        if let Err(e) = pallet_utils::validate_pallet_name(pallet) {
+            return Err(format!(
+                "Branch \"{}\" cannot be imported: it maps to {}. Rename the branch in git and import again.",
+                branch, e
+            ));
+        }
+    }
+
+    let mut by_pallet: HashMap<&str, Vec<&str>> = HashMap::new();
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        by_pallet.entry(pallet.as_str()).or_default().push(branch.as_str());
+    }
+
+    for pallet in &pallets {
+        let sharing = &by_pallet[pallet.as_str()];
+
+        if sharing.len() > 1 {
+            let names: Vec<String> = sharing.iter().map(|branch| format!("\"{}\"", branch)).collect();
+            return Err(format!(
+                "Branches {} all map to pallet \"{}\"; rename all but one in git and import again.",
+                names.join(", "), pallet
+            ));
+        }
+    }
+
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        if pallet_utils::does_pallet_exist(pallet) {
+            return Err(format!(
+                "Branch \"{}\" maps to pallet \"{}\", which already exists in this warehouse. Import \
+                into a warehouse without that pallet, or rename the branch in git.",
+                branch, pallet
+            ));
+        }
+    }
+
+    Ok(pallets)
+}
+
+/// Turn a git branch name into a pallet name: lowercased, with the characters forklift does not
+/// allow replaced (it keeps `/`, so `feature/x` survives). The result may still be refused (a
+/// component ending in `.`, or a device name such as `con`); [`map_branches`] checks it.
 fn sanitize_pallet_name(branch: &str) -> String {
     let sanitized: String = branch.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/') { c } else { '-' })
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '/') { c } else { '-' })
         .collect();
 
     // A leading '-' (or an empty result) would be rejected; anchor it.

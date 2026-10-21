@@ -11991,3 +11991,236 @@ fn a_stack_in_a_named_bay_locks_the_shared_refs() {
     assert!(!bay_dir.join("refs.lock").exists() && !bay_dir.join(".forklift").join("refs.lock").exists(),
         "the ref lock must not land in the bay's working tree");
 }
+
+// FORK-77: one portable name grammar. A pallet or bay name must be lowercase ASCII, digits and
+// `._-` (pallets also `/`), so no two names a client accepts can alias on a case-folding disk; a
+// name outside it is refused on the way in and fails loudly on the way out.
+
+/// A warehouse with code.txt stacked on main and a bay "b1" beside it; the bay's directory.
+fn warehouse_with_a_bay(name: &str) -> (TestWarehouse, PathBuf) {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-b1");
+    assert_success(&warehouse.run(&["bay", "add", "b1", bay_dir.to_str().unwrap()]));
+    (warehouse, bay_dir)
+}
+
+/// Every file and folder under `relative` (inside `.forklift`), sorted, as a snapshot.
+fn metadata_listing(warehouse: &TestWarehouse, relative: &str) -> Vec<String> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            out.push(path.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+            if path.symlink_metadata().unwrap().is_dir() {
+                walk(&path, base, out);
+            }
+        }
+    }
+
+    let base = warehouse.root.join(".forklift").join(relative);
+    let mut out = Vec::new();
+    walk(&base, &base, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn naming_commands_refuse_a_name_outside_the_grammar_and_suggest_the_lowercase_one() {
+    let (warehouse, _bay_dir) = warehouse_with_a_bay("name-grammar-refusals");
+    let pallets_before = metadata_listing(&warehouse, "pallets");
+
+    for args in [
+        vec!["palletize", "Main"], vec!["palletize", "feature/X"], vec!["palletize", "con.txt"],
+        vec!["palletize", "main."], vec!["shift", "Main"],
+    ] {
+        let output = warehouse.run(&args);
+        assert!(!output.status.success(), "{:?} must be refused", args);
+        assert!(stderr(&output).contains("is not a valid pallet name"), "{:?}: {}", args, stderr(&output));
+    }
+    assert!(stderr(&warehouse.run(&["palletize", "Main"])).contains("the lowercase \"main\" is valid"));
+
+    let bay_dir = warehouse.home.join("bay-upper");
+    let added = warehouse.run(&["bay", "add", "Review", bay_dir.to_str().unwrap()]);
+    assert!(!added.status.success(), "an uppercase bay name must be refused");
+    assert!(!bay_dir.join(".forklift").exists(), "the refused bay wrote no redirect");
+
+    assert_eq!(metadata_listing(&warehouse, "pallets"), pallets_before, "no ref was written");
+    assert!(stdout(&warehouse.run(&["stocktake"])).contains("main"), "the warehouse stays on main");
+}
+
+/// F26: `bay remove ..` once resolved to the bays folder's parent and emptied `.forklift`. Removal
+/// now matches a listed bay folder byte for byte, so a dot name or a path names no bay at all.
+#[test]
+fn bay_remove_of_a_dot_name_or_a_path_removes_nothing() {
+    let (warehouse, bay_dir) = warehouse_with_a_bay("bay-remove-dots");
+    let forklift = warehouse.root.join(".forklift");
+
+    for name in ["..", ".", "b1/..", "b1/", "./b1", "B1", "b1.", "b1 "] {
+        let output = warehouse.run(&["bay", "remove", name]);
+        assert!(!output.status.success(), "\"{}\" must not resolve to a bay", name);
+        assert!(stderr(&output).contains("There is no bay named"), "\"{}\": {}", name, stderr(&output));
+
+        assert!(forklift.join("objects").is_dir(), "\"{}\" removed the objects", name);
+        assert!(forklift.join("pallets").is_dir(), "\"{}\" removed the pallets", name);
+        assert!(forklift.join("bays").join("b1").is_dir(), "\"{}\" removed bay b1's state", name);
+        assert!(bay_dir.join(".forklift").is_file(), "\"{}\" removed bay b1's redirect", name);
+    }
+
+    assert_success(&warehouse.run(&["stocktake"]));
+    assert_success(&warehouse.run(&["bay", "remove", "b1"]));
+    assert!(!forklift.join("bays").join("b1").exists());
+    assert!(forklift.join("objects").is_dir());
+}
+
+/// A bays folder whose name is outside the grammar (one an older build or a hand edit left) makes
+/// the listing fail naming it and the way out, and that way out removes exactly that folder.
+#[test]
+fn a_bay_folder_with_an_invalid_name_fails_the_listing_and_is_removable_by_its_exact_name() {
+    let (warehouse, _bay_dir) = warehouse_with_a_bay("bay-folder-invalid-name");
+    let bays = warehouse.root.join(".forklift").join("bays");
+    std::fs::create_dir(bays.join("Main")).unwrap();
+
+    let listed = warehouse.run(&["bay"]);
+    assert!(!listed.status.success(), "the listing must not skip or show an invalid bay name");
+    assert!(stderr(&listed).contains("is not a valid pallet name"), "{}", stderr(&listed));
+    assert!(stderr(&listed).contains("forklift bay remove Main"), "{}", stderr(&listed));
+
+    // The recovery commands stay open while the folder stands.
+    assert_success(&warehouse.run(&["heal"]));
+
+    assert_success(&warehouse.run(&["bay", "remove", "Main"]));
+    assert!(!bays.join("Main").exists());
+    assert!(bays.join("b1").is_dir(), "only the named folder was removed");
+    assert_success(&warehouse.run(&["bay"]));
+}
+
+/// A bay whose position names a pallet outside the grammar fails loudly everywhere it is read:
+/// the listing names the bay, and heal over a standing taint refuses naming it rather than
+/// clearing on a root set that is missing that bay.
+#[test]
+fn a_bay_positioned_on_an_invalid_pallet_name_fails_loudly_and_heal_keeps_the_taint() {
+    let (warehouse, _bay_dir) = warehouse_with_a_bay("bay-invalid-position");
+    let base = bay_base(&warehouse, Some("b1"));
+    write_position(&warehouse, Some("b1"), "Main", &base);
+
+    let listed = warehouse.run(&["bay"]);
+    assert!(!listed.status.success(), "the listing must not show the bay on no pallet");
+    assert!(stderr(&listed).contains("Bay \"b1\" could not be listed"), "{}", stderr(&listed));
+    assert!(stderr(&listed).contains("names an invalid pallet"), "{}", stderr(&listed));
+
+    let fake_hash = "1".repeat(64);
+    let relative = loose_object_relative_path(&fake_hash);
+    plant_taint(&warehouse, &[&relative]);
+
+    let healed = warehouse.run(&["heal"]);
+    assert!(!healed.status.success(), "heal must not clear on a root set missing bay b1");
+    assert!(stderr(&healed).contains("b1"), "the refusal names the bay: {}", stderr(&healed));
+    assert_eq!(recorded_taint_paths(&warehouse), vec![relative.clone()], "the taint stands");
+}
+
+/// A bay redirect naming a bay outside the grammar refuses to enter the bay rather than resolving
+/// it to whatever folder the disk folds it onto.
+#[test]
+fn a_bay_redirect_naming_an_invalid_bay_refuses_to_enter_it() {
+    let (warehouse, bay_dir) = warehouse_with_a_bay("bay-invalid-redirect");
+    let redirect = bay_dir.join(".forklift");
+    let content = std::fs::read_to_string(&redirect).unwrap();
+    let rewritten: Vec<&str> = content.lines().map(|line| if line == "b1" { "B1" } else { line }).collect();
+    assert_ne!(rewritten.join("\n"), content.trim_end(), "the redirect names b1 on its own line");
+    std::fs::write(&redirect, format!("{}\n", rewritten.join("\n"))).unwrap();
+
+    let output = warehouse.run_at(&bay_dir, &["stocktake"]);
+    assert!(!output.status.success(), "an invalid bay name must not be entered");
+    assert!(stderr(&output).contains("names an invalid bay"), "{}", stderr(&output));
+}
+
+/// A bay with no position yet still lists, on no pallet: absence is the one read that is not an
+/// error.
+#[test]
+fn a_bay_without_a_position_still_lists() {
+    let (warehouse, _bay_dir) = warehouse_with_a_bay("bay-no-position");
+    std::fs::remove_file(position_path(&warehouse, Some("b1"))).unwrap();
+
+    let listed = warehouse.run(&["bay"]);
+    assert_success(&listed);
+    assert!(stdout(&listed).contains("b1"), "{}", stdout(&listed));
+}
+
+/// A git repo at `dir` with one commit on `main` and a branch per name in `branches`.
+fn git_repo_with_branches(dir: &std::path::Path, branches: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git_in(dir, &["add", "-A"]);
+    git_in(dir, &["commit", "-qm", "first"]);
+    for branch in branches {
+        git_in(dir, &["branch", branch]);
+    }
+}
+
+/// import-git maps and checks every branch before converting anything: a branch that maps outside
+/// the grammar, two branches that map to one pallet, or a branch mapping onto an existing pallet
+/// each refuse naming the branches, and no object or ref is written.
+#[test]
+fn import_git_refuses_an_unmappable_branch_set_before_writing_anything() {
+    let warehouse = TestWarehouse::new("import-git-mapping");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let cases: [(&str, &[&str], &[&str]); 2] = [
+        ("repo-collide", &["a+b", "a-b"], &["\"a+b\"", "\"a-b\"", "all map to pallet \"a-b\""]),
+        ("repo-device", &["con"], &["Branch \"con\" cannot be imported", "reserved device name"]),
+    ];
+    for (repo, branches, expected) in cases {
+        let dir = warehouse.home.join(repo);
+        git_repo_with_branches(&dir, branches);
+
+        let objects_before = metadata_listing(&warehouse, "objects");
+        let pallets_before = metadata_listing(&warehouse, "pallets");
+
+        let output = warehouse.run(&["import-git", dir.to_str().unwrap()]);
+        assert!(!output.status.success(), "{}: the import must be refused", repo);
+        for text in expected {
+            assert!(stderr(&output).contains(text), "{}: {}", repo, stderr(&output));
+        }
+        assert_eq!(metadata_listing(&warehouse, "objects"), objects_before, "{}: no object written", repo);
+        assert_eq!(metadata_listing(&warehouse, "pallets"), pallets_before, "{}: no ref written", repo);
+    }
+
+    // A branch that maps onto a pallet the warehouse already has.
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["load", "code.txt"]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    let dir = warehouse.home.join("repo-existing");
+    git_repo_with_branches(&dir, &[]);
+    let objects_before = metadata_listing(&warehouse, "objects");
+    let output = warehouse.run(&["import-git", dir.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("maps to pallet \"main\", which already exists"), "{}", stderr(&output));
+    assert_eq!(metadata_listing(&warehouse, "objects"), objects_before, "no object written");
+}
+
+/// Lowercasing is part of the mapping, so a mixed-case branch imports under its lowercase name,
+/// and an already-lowercase branch keeps its name exactly.
+#[test]
+fn import_git_lowercases_a_branch_and_keeps_a_lowercase_one() {
+    let warehouse = TestWarehouse::new("import-git-lowercase");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let dir = warehouse.home.join("repo");
+    git_repo_with_branches(&dir, &["Feature/Login", "fix/fork-17"]);
+    assert_success(&warehouse.run(&["import-git", dir.to_str().unwrap()]));
+
+    let pallets = stdout(&warehouse.run(&["palletize"]));
+    for name in ["main", "feature/login", "fix/fork-17"] {
+        assert!(pallets.lines().any(|line| line.trim_start_matches('*').trim() == name), "{}: {}", name, pallets);
+    }
+    assert!(!pallets.contains("Feature"), "{}", pallets);
+}

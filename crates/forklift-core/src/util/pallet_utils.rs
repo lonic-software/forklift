@@ -141,11 +141,74 @@ pub(crate) fn get_pallet_ref_path(namespace: PalletNamespace, name: &str) -> Pat
     path
 }
 
+/// The Windows device names. A file whose stem (the text before its first `.`) is one of these
+/// opens the device on Windows, whatever its extension, so no portable name may use one.
+const RESERVED_DEVICE_STEMS: [&str; 22] = [
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Check one component of a portable name: one path component that means the same file on every
+/// host. It holds only lowercase ASCII letters, digits, `.`, `_` and `-`; it is not `.` or `..`;
+/// it does not start with `-` or end with `.`; and its stem is not a Windows device name. Case
+/// is refused rather than folded, so two names that differ as strings never share a file on a
+/// case-folding volume. The caller refuses an empty component.
+///
+/// # Arguments
+/// * `component` - The component (non-empty).
+/// * `allowed`   - The character list the refusal names (the caller's separator, if any).
+///
+/// # Returns
+/// * `None`         - If the component is portable.
+/// * `Some(String)` - The reason it is not.
+pub(crate) fn portable_component_problem(component: &str, allowed: &str) -> Option<String> {
+    if component == "." || component == ".." {
+        return Some("\".\" and \"..\" are not allowed as path components".to_string());
+    }
+
+    if component.starts_with('-') {
+        return Some("path components must not start with \"-\"".to_string());
+    }
+
+    let is_valid_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-';
+
+    if !component.chars().all(is_valid_char) {
+        return Some(format!("only lowercase ASCII letters, digits, {} are allowed", allowed));
+    }
+
+    if component.ends_with('.') {
+        return Some("path components must not end with \".\"".to_string());
+    }
+
+    let stem = component.split('.').next().unwrap_or(component);
+
+    if RESERVED_DEVICE_STEMS.contains(&stem) {
+        return Some(format!("\"{}\" is a reserved device name on Windows", stem));
+    }
+
+    None
+}
+
+/// Append the lowercase spelling of `name` to a refusal when lowercasing alone would make it
+/// valid. The spelling is only suggested: a name is never folded to it.
+pub(crate) fn with_lowercase_hint(reason: String, name: &str, is_valid: impl Fn(&str) -> bool) -> String {
+    let lowered = name.to_ascii_lowercase();
+
+    if lowered != name && is_valid(&lowered) {
+        format!("{}; the lowercase \"{}\" is valid", reason, lowered)
+    } else {
+        reason
+    }
+}
+
 /// Validate a pallet name.
 ///
-/// Names may consist of `/`-separated components of ASCII letters, digits, `.`, `_`
-/// and `-`. Components must not be empty, must not be `.` or `..`, and must not start
-/// with a `-` (such a name would be indistinguishable from a flag on the command line).
+/// Names are `/`-separated components, each a portable component (see
+/// [`portable_component_problem`]): lowercase ASCII letters, digits, `.`, `_` and `-`, not `.`
+/// or `..`, not starting with `-` (such a name would be indistinguishable from a flag on the
+/// command line), not ending with `.`, and not a Windows device name. Components must not be
+/// empty.
 ///
 /// # Arguments
 /// * `name` - The pallet name to validate.
@@ -154,33 +217,32 @@ pub(crate) fn get_pallet_ref_path(namespace: PalletNamespace, name: &str) -> Pat
 /// * `Ok(())`      - If the name is valid.
 /// * `Err(String)` - If the name is not valid.
 pub fn validate_pallet_name(name: &str) -> Result<(), String> {
-    let error = |reason: &str| Err(format!("\"{}\" is not a valid pallet name: {}", name, reason));
+    match pallet_name_problem(name) {
+        None => Ok(()),
+        Some(reason) => {
+            let reason = with_lowercase_hint(reason, name, |lowered| pallet_name_problem(lowered).is_none());
+            Err(format!("\"{}\" is not a valid pallet name: {}", name, reason))
+        }
+    }
+}
 
+/// The reason `name` is not a valid pallet name, if it is not (see [`validate_pallet_name`]).
+fn pallet_name_problem(name: &str) -> Option<String> {
     if name.is_empty() {
-        return error("it is empty");
+        return Some("it is empty".to_string());
     }
 
     for component in name.split('/') {
         if component.is_empty() {
-            return error("it contains an empty path component");
+            return Some("it contains an empty path component".to_string());
         }
 
-        if component == "." || component == ".." {
-            return error("\".\" and \"..\" are not allowed as path components");
-        }
-
-        if component.starts_with('-') {
-            return error("path components must not start with \"-\"");
-        }
-
-        let is_valid_char = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
-
-        if !component.chars().all(is_valid_char) {
-            return error("only ASCII letters, digits, \".\", \"_\", \"-\" and \"/\" are allowed");
+        if let Some(reason) = portable_component_problem(component, "\".\", \"_\", \"-\" and \"/\"") {
+            return Some(reason);
         }
     }
 
-    Ok(())
+    None
 }
 
 /// Check whether a user pallet exists (i.e. it has a ref file — it was stacked on at least
@@ -691,7 +753,8 @@ pub fn all_pallet_refs() -> Result<Vec<(PalletRef, String)>, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the folder was processed.
-/// * `Err(String)` - If a folder or entry could not be read.
+/// * `Err(String)` - If a folder or entry could not be read, or a ref file's name is not a
+///                   valid pallet name.
 fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) -> Result<(), String> {
     for entry_result in file_utils::read_directory(&folder.to_path_buf())? {
         let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
@@ -708,6 +771,13 @@ fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) ->
         if metadata.is_dir() {
             collect_pallet_names(&entry.path(), &full_name, names)?;
         } else {
+            // A ref file is a pallet only under a valid name. One that is not was written by
+            // hand or by an older grammar, and listing it would hand every reader a name it
+            // refuses (or, on a case-folding volume, an alias of another pallet).
+            validate_pallet_name(&full_name).map_err(|e| format!(
+                "The ref file \"{}\" does not name a valid pallet: {}.",
+                std::path::absolute(entry.path()).unwrap_or_else(|_| entry.path()).to_string_lossy(), e
+            ))?;
             names.push(full_name);
         }
     }
@@ -853,7 +923,7 @@ mod tests {
 
     #[test]
     fn valid_pallet_names_are_accepted() {
-        for name in ["main", "feature/load-command", "v1.2", "a_b-c", "fix/FORK-17"] {
+        for name in ["main", "mainline", "feature/load-command", "v1.2", "a_b-c", "fix/fork-17", ".hidden", "a.b.c"] {
             assert!(validate_pallet_name(name).is_ok(), "expected valid: {}", name);
         }
     }
@@ -863,6 +933,99 @@ mod tests {
         for name in ["", "/", "a/", "/a", "a//b", ".", "..", "a/../b", "-main", "fix/-x", "with space", "emoji📦", "new\nline", "@office"] {
             assert!(validate_pallet_name(name).is_err(), "expected invalid: {}", name);
         }
+    }
+
+    /// The portable grammar: no uppercase, no trailing `.`, no Windows device stem, in any
+    /// component. Each refusal is pinned to its own reason, so a rule that stops firing cannot
+    /// hide behind another one.
+    #[test]
+    fn names_that_are_not_portable_are_refused_for_their_own_reason() {
+        let cases = [
+            ("Main", "only lowercase ASCII letters"),
+            ("feature/X", "only lowercase ASCII letters"),
+            ("LPT1", "only lowercase ASCII letters"),
+            ("main.", "must not end with \".\""),
+            ("a./b", "must not end with \".\""),
+            ("nul", "\"nul\" is a reserved device name"),
+            ("con.txt", "\"con\" is a reserved device name"),
+            ("com1.x", "\"com1\" is a reserved device name"),
+            ("a/lpt9", "\"lpt9\" is a reserved device name"),
+        ];
+
+        for (name, reason) in cases {
+            let error = validate_pallet_name(name).expect_err(name);
+            assert!(error.contains(reason), "{}: expected the reason {:?}, got {}", name, reason, error);
+        }
+    }
+
+    /// The other side of the device-name rule: only the exact stem before the first `.` is
+    /// reserved, so longer or numbered-out names and a device name as an extension stay valid.
+    #[test]
+    fn names_that_only_resemble_a_device_name_are_accepted() {
+        for name in ["console", "null", "com10", "com0", "lpt0", "aux_x", "x.con", "nul-x", "prnt", "a/con-b"] {
+            assert!(validate_pallet_name(name).is_ok(), "expected valid: {}", name);
+        }
+    }
+
+    /// The refusal suggests the lowercase spelling exactly when lowercasing alone makes the name
+    /// valid; it never applies it.
+    #[test]
+    fn a_refusal_suggests_the_lowercase_spelling_only_when_that_alone_is_valid() {
+        let error = validate_pallet_name("Feature/X").unwrap_err();
+        assert!(error.contains("the lowercase \"feature/x\" is valid"), "{}", error);
+
+        for name in ["MAIN.", "CON", "With Space"] {
+            let error = validate_pallet_name(name).unwrap_err();
+            assert!(!error.contains("the lowercase"), "{}: lowercasing does not make it valid: {}", name, error);
+        }
+
+        let error = validate_pallet_name("main.").unwrap_err();
+        assert!(!error.contains("the lowercase"), "an already lowercase name gets no suggestion: {}", error);
+    }
+
+    #[test]
+    fn every_built_in_pallet_name_is_valid_and_round_trips() {
+        let built_in = [
+            DEFAULT_PALLET_NAME,
+            crate::util::office_utils::OFFICE_PALLET_NAME,
+            crate::util::haul_utils::HAUL_PALLET_NAME,
+            crate::util::kv_utils::KV_PALLET_NAME,
+            crate::util::manifest_utils::MANIFEST_PALLET_NAME,
+            crate::util::tag_utils::TAGS_PALLET_NAME,
+        ];
+
+        for name in built_in {
+            assert!(validate_pallet_name(name).is_ok(), "built-in name refused: {}", name);
+
+            for wire in [name.to_string(), format!("{}{}", META_QUALIFIER, name)] {
+                assert_eq!(PalletRef::parse(&wire).unwrap().to_wire(), wire);
+            }
+        }
+
+        for wire in ["feature/x", "v1.2", "@x.con"] {
+            assert_eq!(PalletRef::parse(wire).unwrap().to_wire(), wire);
+        }
+    }
+
+    /// A ref file under a name the grammar refuses is never listed as a pallet: the listing fails
+    /// naming it. Valid neighbours that share a prefix list as before.
+    #[test]
+    fn a_ref_file_with_an_invalid_name_fails_the_listing_naming_it() {
+        let (root, _scope) = scratch("invalid-ref-entry");
+        update_pallet_head("main", None, &hash('a')).unwrap();
+        update_pallet_head("mainline", None, &hash('b')).unwrap();
+        assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["main", "mainline"]);
+
+        let folder = get_pallets_folder().join("feature");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("X"), format!("{}\n", hash('c'))).unwrap();
+
+        let error = list_pallets_in(PalletNamespace::User).unwrap_err();
+        assert!(error.contains("\"feature/X\" is not a valid pallet name") && error.contains("does not name a valid pallet"),
+            "{}", error);
+        assert!(all_pallet_refs().is_err(), "the reachable-ref set must not skip the entry either");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
