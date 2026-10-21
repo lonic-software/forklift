@@ -1411,30 +1411,10 @@ fn param(params: &PathParams, key: &str) -> Result<String, HandlerError> {
         .ok_or_else(|| internal(format!("The \"{}\" path parameter is missing.", key)))
 }
 
-/// Validate a warehouse id: a single safe path component. Stricter than pallet names
-/// (no `/`, no leading `.`): the id names a folder directly under the served base.
+/// Validate a warehouse id (the one shared rule, [`warehouse_utils::validate_warehouse_id`]); a
+/// refusal is a `422`.
 fn validate_warehouse_id(id: &str) -> Result<(), HandlerError> {
-    let error = |reason: &str| Err(unprocessable(format!(
-        "\"{}\" is not a valid warehouse id: {}.", id, reason
-    )));
-
-    if id.is_empty() {
-        return error("it is empty");
-    }
-
-    if id.len() > 100 {
-        return error("it is longer than 100 characters");
-    }
-
-    if id.starts_with('.') || id.starts_with('-') {
-        return error("it must not start with \".\" or \"-\"");
-    }
-
-    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
-        return error("only ASCII letters, digits, \".\", \"_\" and \"-\" are allowed");
-    }
-
-    Ok(())
+    forklift_core::util::warehouse_utils::validate_warehouse_id(id).map_err(unprocessable)
 }
 
 /// Resolve the warehouse a request addresses: the served one in single mode, the one
@@ -3507,6 +3487,8 @@ mod tests {
         assert!(validate_warehouse_id("-flag").is_err(), "leading dash");
         assert!(validate_warehouse_id("tenant/a").is_err(), "path separator");
         assert!(validate_warehouse_id("tenant a").is_err(), "space");
+        assert!(validate_warehouse_id("Acme").is_err(), "uppercase");
+        assert!(validate_warehouse_id("nul").is_err(), "reserved device name");
     }
 
     #[test]
@@ -3733,6 +3715,21 @@ mod tests {
 
         let error = resolve_warehouse(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn multi_mode_422s_for_a_mixed_case_warehouse_id() {
+        let base = scratch_dir("resolve-multi-422-case");
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let mut params = PathParams::new();
+        params.insert("warehouse".to_string(), "Acme".to_string());
+
+        let error = resolve_warehouse(&state, &params).err().unwrap();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("the lowercase \"acme\" is valid"), "{}", error.1);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4514,6 +4511,33 @@ mod tests {
         let status = response.into_response().status();
         assert_ne!(status, StatusCode::FORBIDDEN, "an in-grant writer must clear the auth gate");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "it must instead fail on the missing object");
+    }
+
+    /// FORK-77: a pallet name outside the portable grammar never reaches the store. `Main`
+    /// would alias `main` on a case-folding disk, so the ref update is refused by name before
+    /// authorization or object presence is even consulted.
+    #[tokio::test]
+    async fn a_ref_update_to_a_mixed_case_pallet_is_refused() {
+        let fixture = OfficeFixture::genesis("post-ref-mixed-case");
+        fixture.admit(
+            "frank", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
+        );
+
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-frank".to_string(), "frank".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64) };
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-frank"), Path(ref_update_params("Main")), Json(body)
+        ).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = error["error"].as_str().unwrap_or_default();
+        assert!(message.contains("\"Main\" is not a valid pallet name"), "{}", message);
+        assert!(message.contains("the lowercase \"main\" is valid"), "{}", message);
     }
 
     /// Lift an office parcel promoting "bob" (a writer) to admin, signed by `signer`'s key and

@@ -269,7 +269,7 @@ a program reads specific content by hash when it needs it. `diff` also accepts t
 reserved token `:empty` as either revision, meaning the empty tree — the base for
 comparing a root parcel (which has no real "before") against a clean slate, so every
 file it introduces lists as `Added`. `:empty` can never collide with a real revision:
-a pallet/meta-pallet name is restricted to ASCII letters, digits, `.`, `_`, `-` and
+a pallet/meta-pallet name is restricted to lowercase ASCII letters, digits, `.`, `_`, `-` and
 `/`, and a hash prefix is hex digits only — neither grammar can contain `:`.
 
 ### `show --json`

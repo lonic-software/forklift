@@ -34,7 +34,9 @@ single warehouse at `/v1/…` (`--root`) or a folder of warehouses at
 administrative operation outside the `/v1` protocol surface: idempotent (`201`
 created, `200` already present), refused with `403` on servers without authentication
 configured (an open server must not be a junk farm), `422` for invalid ids (a single
-safe path component: ASCII letters, digits, `.`, `_`, `-`; no leading `.` or `-`), and `409`
+safe path component of at most 100 characters: lowercase ASCII letters, digits, `.`, `_`, `-`;
+no leading `.` or `-`, no trailing `.`, and no Windows device name as its stem, the same
+portable rules a pallet-name component follows), and `409`
 when something that is not a warehouse already holds the id. Of concurrent creations of one new
 id, exactly one answers `201`.
 

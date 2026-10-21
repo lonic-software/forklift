@@ -54,7 +54,13 @@ forklift import-git .
 
 One-way migration of a git repo's history into the warehouse: git commits become
 parcels, trees become trees, blobs become blobs, and each **local branch becomes a
-pallet** (git's author/committer split maps onto forklift's author/stack). Git's HEAD
+pallet** (git's author/committer split maps onto forklift's author/stack). A branch's pallet
+name is its name lowercased, with every character a pallet name does not allow replaced by `-`,
+and any part that would then start with `-` prefixed with `branch` (`@wip` becomes `branch-wip`).
+Before anything is converted, the import refuses, naming the branches, when a mapped name is
+still not a valid pallet name (a branch `con`, or a part ending in `.`), when two branches map to
+one name (`Feature` and `feature`), when one mapped name would be a folder of another (`a+b` and
+`a-b/x`), or when the name is already a pallet here or nests with one. Git's HEAD
 branch is checked out, and `.git/` is added to `.forkliftignore` (creating the file if
 there is none) so a colocated repo reads clean, unless a rule there already matches `.git`, which
 it then names. An ignore file Forklift refuses to read is left as it is, with a warning. The edit is left in the working tree,
@@ -908,7 +914,11 @@ forklift palletize hotfix 1a2b3c   # create "hotfix" at a revision and shift to 
 
 The list shows user pallets only by default; `--all` adds the meta pallets (the office
 and other tracked metadata), each in its `@`-qualified form — the address you reach it
-with. Pallet names may contain `/` (mapped to subfolders). Creating one at a revision
+with. Pallet names may contain `/` (mapped to subfolders). Each part is lowercase ASCII
+letters, digits, `.`, `_` and `-`, does not start with `-` or end with `.`, and is not a Windows
+device name such as `con` or `nul` (also with an extension, as in `con.txt`). So a name means
+the same pallet on every file system: `Feature` is refused, with `feature` suggested, rather
+than silently sharing a ref file with `feature` on macOS or Windows. Creating one at a revision
 materializes that state (and refuses on a dirty warehouse); creating one at the
 current head just moves refs.
 
@@ -1070,6 +1080,15 @@ of the warehouse); `cd` into it and it behaves like any warehouse — `load`, `s
 all operate on the bay's pallet against the shared object store. The bay's directory holds
 a `.forklift` *file* (a redirect back to the warehouse), and its local state lives under
 `.forklift/bays/<name>/`.
+
+A bay name follows the pallet-name rules (see `palletize`) and is one folder, so it has no `/`.
+`bay remove <name>` matches the
+name exactly against the folders under `.forklift/bays/`, so it also removes a bay whose name
+the rules refuse (one an older version created), and it never treats `.`, `..` or a path as a
+bay. `bay list` refuses a bay folder whose name breaks the rules, and a bay whose position
+cannot be read, naming it, instead of listing it; for a folder it gives the `bay remove` command
+that removes it. A command run inside a bay whose redirect names a bay outside the rules refuses
+too, naming the redirect file: remove the bay from the warehouse, or delete that file.
 
 Because the refs are shared, two bays can reach for the same pallet — say both are on `main`.
 Each bay records the parcel its files stand on. When another bay stacks on the pallet, this bay

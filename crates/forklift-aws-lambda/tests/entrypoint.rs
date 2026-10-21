@@ -296,6 +296,23 @@ fn the_untrusted_lift_walk_maps_every_status() {
     assert!(error.get("error").and_then(|value| value.as_str()).is_some(), "a JSON error body");
 }
 
+/// FORK-77: a ref update naming a pallet outside the portable grammar is a 422 naming it, and
+/// no ref moves — `Main` never becomes a second spelling of `main`.
+#[test]
+fn a_ref_update_to_a_mixed_case_pallet_is_a_422() {
+    let fixture = Fixture::direct();
+
+    let request = RefUpdateRequest { old_head: None, new_head: "b".repeat(64) };
+    let response = fixture.call(post_json("/v1/pallets/Main", &request));
+    assert_eq!(status(&response), 422);
+    let error: serde_json::Value = body_json(&response);
+    let message = error.get("error").and_then(|value| value.as_str()).unwrap_or_default().to_string();
+    assert!(message.contains("\"Main\" is not a valid pallet name"), "{}", message);
+
+    let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
+    assert!(info.pallets.is_empty(), "no ref moved: {:?}", info.pallets);
+}
+
 /// A wrong-hash upload is refused with a 422 — nothing unverified enters the store.
 #[test]
 fn a_tampered_upload_is_a_422() {
@@ -789,6 +806,10 @@ fn multi_warehouse_routing_resolves_the_path_id() {
     assert!(resolved.is_none());
     // A dotted-leading id is likewise rejected.
     assert_eq!(status(&fixture.call(get("/warehouses/.hidden/v1/warehouse"))), 422);
+    // A mixed-case id would alias its lowercase spelling on a case-folding store: 422, unrouted.
+    let (response, resolved) = fixture.call_capturing(get("/warehouses/Acme/v1/warehouse"));
+    assert_eq!(status(&response), 422);
+    assert!(resolved.is_none());
 
     // Without the prefix, multi mode has no warehouse to serve: 404.
     assert_eq!(status(&fixture.call(get("/v1/warehouse"))), 404);

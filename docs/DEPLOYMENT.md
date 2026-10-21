@@ -610,9 +610,9 @@ binaries share it) or the AWS SDK's own default provider chain:
 |---|---|---|---|
 | `FORKLIFT_S3_BUCKET` | **Required** | Both | The object-plane bucket name. |
 | `FORKLIFT_DYNAMODB_TABLE` | **Required** | Both (verifier builds but never calls the resulting client) | The ref/trust table name. |
-| `FORKLIFT_WAREHOUSE_ID` | Optional | Control plane | Set (non-empty) → single-warehouse mode, serving fixed `/v1/…`. Unset or empty → multi-warehouse mode, `/warehouses/{id}/v1/…`. An empty string is treated as unset. |
+| `FORKLIFT_WAREHOUSE_ID` | Optional | Control plane | Set (non-empty) → single-warehouse mode, serving fixed `/v1/…`. Unset or empty → multi-warehouse mode, `/warehouses/{id}/v1/…`. An empty string is treated as unset. A set id must be a valid warehouse id (see `REMOTE_PROTOCOL.md`, warehouse creation), or the function refuses to start. |
 | `FORKLIFT_AWS_ENDPOINT_URL` | Optional | Both | Endpoint override for LocalStack/MinIO; switches the S3 client to path-style addressing. An empty string is treated as unset. |
-| `FORKLIFT_DEFAULT_PALLET` | Optional | Control plane | The pallet a franchise checks out by default. Defaults to `main`. An empty string is treated as unset. |
+| `FORKLIFT_DEFAULT_PALLET` | Optional | Control plane | The pallet a franchise checks out by default. Defaults to `main`. An empty string is treated as unset. A set value must be a valid pallet name (lowercase; see `format/PALLET_REFS.md`), or the function refuses to start. |
 | `AWS_REGION` | Effectively required | The AWS SDK's provider chain (not this crate directly) | Lambda's own execution environment sets this automatically; no operator action needed in the ordinary case. |
 | `FORKLIFT_TOKEN` | See below | Control plane only | The bearer token every request must present (`Authorization: Bearer <token>`). |
 | `FORKLIFT_OPEN_ACCESS` | See below | Control plane only | Set to `1` to run with no token at all (LocalStack/local dev only). |

@@ -74,6 +74,10 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         return Err(format!("\"{}\" has no local branches to import.", path));
     }
 
+    // Every branch is mapped and checked before anything is converted or written, so a branch
+    // that cannot become a pallet refuses the import with the warehouse untouched.
+    let pallets = map_branches(&branches)?;
+
     let progress = events::progress();
     let mut converter = Converter::new(path, !no_compact)?;
 
@@ -108,15 +112,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     // Each local branch becomes a pallet.
     let mut imported: Vec<(String, String)> = Vec::new();
 
-    for (branch, commit) in &branches {
-        let pallet = sanitize_pallet_name(branch);
-
-        if pallet_utils::does_pallet_exist(&pallet) {
-            return Err(format!(
-                "Pallet \"{}\" already exists; import into a fresh warehouse.", pallet
-            ));
-        }
-
+    for ((branch, commit), pallet) in branches.iter().zip(pallets) {
         let head = converter.commits.get(commit).cloned().ok_or(format!(
             "Branch \"{}\" points at a commit that was not imported.", branch
         ))?;
@@ -817,18 +813,29 @@ fn git_str(path: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// The local branches, as `(branch name, commit hash)`.
+///
+/// Read as full ref names with the `refs/heads/` prefix taken off here, never as git's short
+/// names: git shortens a branch to `heads/<name>` whenever it finds the name ambiguous (a tag of
+/// the same name, or on Windows a device name it probes as a file).
 fn branches(path: &str) -> Result<Vec<(String, String)>, String> {
-    let text = git_str(path, &["for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads/"])?;
+    let text = git_str(path, &["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"])?;
 
-    Ok(text.lines()
+    text.lines()
         .filter_map(|line| line.split_once(' '))
-        .map(|(commit, branch)| (branch.to_string(), commit.to_string()))
-        .collect())
+        .map(|(commit, refname)| Ok((branch_name(refname)?, commit.to_string())))
+        .collect()
 }
 
-/// Git's HEAD branch name (the default checkout).
+/// Git's HEAD branch name (the default checkout), read like [`branches`].
 fn default_branch(path: &str) -> Result<String, String> {
-    Ok(git_str(path, &["symbolic-ref", "--short", "HEAD"])?.trim().to_string())
+    branch_name(git_str(path, &["symbolic-ref", "HEAD"])?.trim())
+}
+
+/// A branch's name from its full ref name.
+fn branch_name(refname: &str) -> Result<String, String> {
+    refname.strip_prefix("refs/heads/")
+        .map(str::to_string)
+        .ok_or(format!("Git reported \"{}\", which is not a local branch.", refname))
 }
 
 /// Every commit reachable from the local branches, oldest first (so parents precede
@@ -974,19 +981,107 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Turn a git branch name into a valid forklift pallet name, replacing characters forklift
-/// does not allow (it keeps `/`, so `feature/x` survives).
+/// Map every branch to its pallet name (see [`sanitize_pallet_name`]), in branch order, and refuse
+/// the import naming the branch or branches when a mapped name is not a valid pallet name, when
+/// two branches map to one name, or when the name is already a pallet in this warehouse.
+fn map_branches(branches: &[(String, String)]) -> Result<Vec<String>, String> {
+    let pallets: Vec<String> = branches.iter().map(|(branch, _)| sanitize_pallet_name(branch)).collect();
+
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        if let Err(e) = pallet_utils::validate_pallet_name(pallet) {
+            return Err(format!(
+                "Branch \"{}\" cannot be imported: it maps to {}. Rename the branch in git and import again.",
+                branch, e
+            ));
+        }
+    }
+
+    let mut by_pallet: HashMap<&str, Vec<&str>> = HashMap::new();
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        by_pallet.entry(pallet.as_str()).or_default().push(branch.as_str());
+    }
+
+    for pallet in &pallets {
+        let sharing = &by_pallet[pallet.as_str()];
+
+        if sharing.len() > 1 {
+            let names: Vec<String> = sharing.iter().map(|branch| format!("\"{}\"", branch)).collect();
+            return Err(format!(
+                "Branches {} all map to pallet \"{}\"; rename all but one in git and import again.",
+                names.join(", "), pallet
+            ));
+        }
+    }
+
+    // A pallet is a ref file and a "/" nests it in folders, so no name can also be a folder of
+    // another: git keeps `Feature` and `feature/x` apart on a case-sensitive disk, but mapped they
+    // are `feature` and `feature/x`.
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        for folder in folders_of(pallet) {
+            if let Some(owners) = by_pallet.get(folder) {
+                return Err(format!(
+                    "Branches \"{}\" and \"{}\" map to pallets \"{}\" and \"{}\", and a pallet name \
+                    cannot also be a folder of another; rename one in git and import again.",
+                    owners[0], branch, folder, pallet
+                ));
+            }
+        }
+    }
+
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        if pallet_utils::does_pallet_exist(pallet) {
+            return Err(format!(
+                "Branch \"{}\" maps to pallet \"{}\", which already exists in this warehouse. Import \
+                into a warehouse without that pallet, or rename the branch in git.",
+                branch, pallet
+            ));
+        }
+    }
+
+    for existing in pallet_utils::list_pallets()? {
+        let nested = folders_of(&existing)
+            .find_map(|folder| by_pallet.get(folder).map(|owners| (owners[0], folder.to_string())))
+            .or_else(|| branches.iter().zip(&pallets).find_map(|((branch, _), pallet)| {
+                folders_of(pallet).any(|folder| folder == existing).then(|| (branch.as_str(), pallet.clone()))
+            }));
+
+        if let Some((branch, pallet)) = nested {
+            return Err(format!(
+                "Branch \"{}\" maps to pallet \"{}\", which nests with the pallet \"{}\" this \
+                warehouse already has (a pallet name cannot also be a folder of another). Import into a \
+                warehouse without that pallet, or rename the branch in git.",
+                branch, pallet, existing
+            ));
+        }
+    }
+
+    Ok(pallets)
+}
+
+/// Every folder a pallet name nests in, outermost first: `a/b/c` is in `a` and `a/b`.
+fn folders_of(pallet: &str) -> impl Iterator<Item = &str> {
+    pallet.match_indices('/').map(move |(at, _)| &pallet[..at])
+}
+
+/// Turn a git branch name into a pallet name: lowercased, with the characters forklift does not
+/// allow replaced (it keeps `/`, so `feature/x` survives). The result may still be refused (a
+/// component ending in `.`, or a device name such as `con`); [`map_branches`] checks it.
 fn sanitize_pallet_name(branch: &str) -> String {
     let sanitized: String = branch.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/') { c } else { '-' })
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '/') { c } else { '-' })
         .collect();
 
-    // A leading '-' (or an empty result) would be rejected; anchor it.
-    if sanitized.is_empty() || sanitized.starts_with('-') {
-        format!("branch-{}", sanitized.trim_start_matches('-'))
-    } else {
-        sanitized
-    }
+    // A component starting with '-' (or an empty result) would be refused; anchor it, in every
+    // component alike, so `@wip` and `feature/@wip` map the same way.
+    sanitized.split('/')
+        .map(|component| if component.is_empty() || component.starts_with('-') {
+            format!("branch-{}", component.trim_start_matches('-'))
+        } else {
+            component.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The result of a git import.

@@ -207,9 +207,82 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
     Ok(created)
 }
 
+/// Validate a warehouse id, the one rule both server heads apply: a single portable component
+/// (see [`pallet_utils::portable_component_problem`]) of at most 100 characters that does not
+/// start with `.`. The id names a folder directly under forklift-server's served base and keys
+/// the AWS head's ref partition, so it is stricter than a pallet name.
+///
+/// # Arguments
+/// * `id` - The warehouse id.
+///
+/// # Returns
+/// * `Ok(())`      - If the id is valid.
+/// * `Err(String)` - The refusal, shaped `"<id>" is not a valid warehouse id: <reason>.`.
+pub fn validate_warehouse_id(id: &str) -> Result<(), String> {
+    match warehouse_id_problem(id) {
+        None => Ok(()),
+        Some(reason) => {
+            let reason = pallet_utils::with_lowercase_hint(reason, id, |lowered| warehouse_id_problem(lowered).is_none());
+            Err(format!("\"{}\" is not a valid warehouse id: {}.", id, reason))
+        }
+    }
+}
+
+/// The reason `id` is not a valid warehouse id, if it is not (see [`validate_warehouse_id`]).
+fn warehouse_id_problem(id: &str) -> Option<String> {
+    if id.is_empty() {
+        return Some("it is empty".to_string());
+    }
+
+    if id.len() > 100 {
+        return Some("it is longer than 100 characters".to_string());
+    }
+
+    if id.starts_with('.') || id.starts_with('-') {
+        return Some("it must not start with \".\" or \"-\"".to_string());
+    }
+
+    pallet_utils::portable_component_problem(id, "\".\", \"_\" and \"-\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one warehouse-id rule both heads apply: the portable component grammar plus the id's
+    /// own limits (one component, at most 100 characters, no leading `.`).
+    #[test]
+    fn a_warehouse_id_follows_the_portable_grammar_and_its_own_limits() {
+        for id in ["tenant-a", "tenant_a.1", "console", "x.con", "com10"] {
+            assert!(validate_warehouse_id(id).is_ok(), "expected valid: {}", id);
+        }
+        assert!(validate_warehouse_id(&"a".repeat(100)).is_ok(), "exactly 100 is fine");
+
+        let cases = [
+            ("", "it is empty"),
+            (&*"a".repeat(101), "longer than 100 characters"),
+            (".hidden", "must not start with"),
+            ("-flag", "must not start with"),
+            ("tenant/a", "only lowercase ASCII letters"),
+            ("tenant a", "only lowercase ASCII letters"),
+            ("Acme", "only lowercase ASCII letters"),
+            ("acme.", "must not end with \".\""),
+            ("aux", "reserved device name"),
+            ("nul.tar.gz", "reserved device name"),
+        ];
+
+        for (id, reason) in cases {
+            let error = validate_warehouse_id(id).expect_err(id);
+            assert!(error.starts_with(&format!("\"{}\" is not a valid warehouse id: ", id)) && error.ends_with('.')
+                && error.contains(reason), "{:?}: expected the reason {:?}, got {}", id, reason, error);
+        }
+
+        assert_eq!(
+            validate_warehouse_id("Acme").unwrap_err(),
+            "\"Acme\" is not a valid warehouse id: only lowercase ASCII letters, digits, \".\", \"_\" and \"-\" are \
+            allowed; the lowercase \"acme\" is valid."
+        );
+    }
 
     /// A component the parent lists exactly is kept; one it lists under another spelling of the
     /// same entry takes the listed spelling; one it lists under no spelling is refused.

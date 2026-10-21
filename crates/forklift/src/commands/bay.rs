@@ -37,7 +37,7 @@ pub fn handle_command(action: Option<BayAction>) -> Result<(), String> {
 /// warehouse fetch scope. The scope is recorded bay-locally and drives the materialize, and
 /// every later stack copies the out-of-scope siblings forward by hash.
 fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(), String> {
-    pallet_utils::validate_pallet_name(name)?;
+    bay_utils::validate_bay_name(name)?;
 
     // A bay is its own line of work: it checks out a new pallet named after it.
     if pallet_utils::does_pallet_exist(name) {
@@ -228,11 +228,16 @@ fn list() -> Result<(), String> {
     let bays = bay_utils::list_bays()?
         .into_iter()
         .map(|name| {
+            // A folder whose name is not a valid bay name is refused, never listed as a bay.
+            // `bay remove` addresses it by its exact folder name, which is the way out.
+            bay_utils::validate_bay_name(&name).map_err(|e| invalid_bay_folder(&name, &e))?;
+
             // A bay whose creation failed before recording its directory lists with none.
             let path = bay_utils::read_bay_path(&name)?
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let pallet = bay_utils::read_bay_current_pallet(&name);
+            let pallet = bay_utils::read_bay_current_pallet(&name)
+                .map_err(|e| format!("Bay \"{}\" could not be listed: {}", name, e))?;
 
             Ok(BayEntry { name, path, pallet })
         })
@@ -243,10 +248,32 @@ fn list() -> Result<(), String> {
     Ok(())
 }
 
+/// The refusal for a bays-folder entry whose name the grammar refuses. The listing just read the
+/// entry, and `bay remove` resolves the exact folder name, so its command line is the way out
+/// wherever one can spell the name (see [`bay_utils::remove_command`]).
+fn invalid_bay_folder(name: &str, error: &str) -> String {
+    let folder = std::path::absolute(bay_utils::bay_state_dir(name)).unwrap_or_else(|_| bay_utils::bay_state_dir(name));
+
+    match bay_utils::remove_command(name) {
+        Some(command) => format!(
+            "The bay folder \"{}\" does not hold a valid bay: {}. Remove it with \"{}\".",
+            folder.to_string_lossy(), error, command
+        ),
+        None => format!(
+            "The bay folder \"{}\" does not hold a valid bay: {}. Remove that folder by hand.",
+            folder.to_string_lossy(), error
+        ),
+    }
+}
+
 /// Remove a bay: de-register it (its local state and the redirect in its working tree).
 /// The bay's pallet is a normal ref and is kept; the materialized files are left in place.
+///
+/// The name is matched byte for byte against the bay folders (see
+/// [`bay_utils::is_listed_bay`]), not against the name grammar: a bay whose name the grammar now
+/// refuses can still be removed, and `.`, `..` or a path never resolve to another folder.
 fn remove(name: &str) -> Result<(), String> {
-    if !bay_utils::does_bay_exist(name) {
+    if !bay_utils::is_listed_bay(name)? {
         return Err(format!("There is no bay named \"{}\".", name));
     }
 
