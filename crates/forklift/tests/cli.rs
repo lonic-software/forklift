@@ -12045,10 +12045,12 @@ fn naming_commands_refuse_a_name_outside_the_grammar_and_suggest_the_lowercase_o
     }
     assert!(stderr(&warehouse.run(&["palletize", "Main"])).contains("the lowercase \"main\" is valid"));
 
-    let bay_dir = warehouse.home.join("bay-upper");
-    let added = warehouse.run(&["bay", "add", "Review", bay_dir.to_str().unwrap()]);
-    assert!(!added.status.success(), "an uppercase bay name must be refused");
-    assert!(!bay_dir.join(".forklift").exists(), "the refused bay wrote no redirect");
+    for name in ["Review", "feature/x"] {
+        let bay_dir = warehouse.home.join("bay-refused");
+        let added = warehouse.run(&["bay", "add", name, bay_dir.to_str().unwrap()]);
+        assert!(!added.status.success(), "bay name \"{}\" must be refused", name);
+        assert!(!bay_dir.join(".forklift").exists(), "the refused bay \"{}\" wrote no redirect", name);
+    }
 
     assert_eq!(metadata_listing(&warehouse, "pallets"), pallets_before, "no ref was written");
     assert!(stdout(&warehouse.run(&["stocktake"])).contains("main"), "the warehouse stays on main");
@@ -12138,6 +12140,17 @@ fn a_bay_redirect_naming_an_invalid_bay_refuses_to_enter_it() {
     let output = warehouse.run_at(&bay_dir, &["stocktake"]);
     assert!(!output.status.success(), "an invalid bay name must not be entered");
     assert!(stderr(&output).contains("names an invalid bay"), "{}", stderr(&output));
+    assert!(stderr(&output).contains("forklift bay remove B1"), "{}", stderr(&output));
+    assert!(stderr(&output).contains("delete this redirect file"), "{}", stderr(&output));
+
+    // The named ways out: the warehouse lists no bay "B1" (its folder is "b1"), so removal refuses
+    // and leaves b1 alone; deleting the redirect file stops treating the folder as a bay.
+    let removed = warehouse.run(&["bay", "remove", "B1"]);
+    assert!(!removed.status.success());
+    assert!(warehouse.root.join(".forklift/bays/b1").is_dir());
+    std::fs::remove_file(&redirect).unwrap();
+    let output = warehouse.run_at(&bay_dir, &["stocktake"]);
+    assert!(!stderr(&output).contains("names an invalid bay"), "{}", stderr(&output));
 }
 
 /// A bay with no position yet still lists, on no pallet: absence is the one read that is not an
@@ -12173,9 +12186,11 @@ fn import_git_refuses_an_unmappable_branch_set_before_writing_anything() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
 
-    let cases: [(&str, &[&str], &[&str]); 2] = [
+    let cases: [(&str, &[&str], &[&str]); 3] = [
         ("repo-collide", &["a+b", "a-b"], &["\"a+b\"", "\"a-b\"", "all map to pallet \"a-b\""]),
         ("repo-device", &["con"], &["Branch \"con\" cannot be imported", "reserved device name"]),
+        // Distinct names that nest once mapped: `a-b` would be both a ref file and a folder.
+        ("repo-nested", &["a+b", "a-b/x"], &["\"a+b\"", "\"a-b/x\"", "cannot also be a folder of another"]),
     ];
     for (repo, branches, expected) in cases {
         let dir = warehouse.home.join(repo);
@@ -12204,6 +12219,18 @@ fn import_git_refuses_an_unmappable_branch_set_before_writing_anything() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("maps to pallet \"main\", which already exists"), "{}", stderr(&output));
     assert_eq!(metadata_listing(&warehouse, "objects"), objects_before, "no object written");
+
+    // A branch that maps to a name nesting in an existing pallet (`main/x` inside `main`).
+    let dir = warehouse.home.join("repo-nests-existing");
+    git_repo_with_branches(&dir, &[]);
+    // Through another name: on a case-folding disk git's own `main` ref file blocks `Main/X`.
+    git_in(&dir, &["branch", "-m", "main", "tmp"]);
+    git_in(&dir, &["branch", "-m", "tmp", "Main/X"]);
+    let output = warehouse.run(&["import-git", dir.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("Branch \"Main/X\" maps to pallet \"main/x\", which nests with the pallet \"main\""),
+        "{}", stderr(&output));
+    assert_eq!(metadata_listing(&warehouse, "objects"), objects_before, "no object written");
 }
 
 /// Lowercasing is part of the mapping, so a mixed-case branch imports under its lowercase name,
@@ -12215,11 +12242,12 @@ fn import_git_lowercases_a_branch_and_keeps_a_lowercase_one() {
     configure_operator(&warehouse);
 
     let dir = warehouse.home.join("repo");
-    git_repo_with_branches(&dir, &["Feature/Login", "fix/fork-17"]);
+    git_repo_with_branches(&dir, &["Feature/Login", "fix/fork-17", "@wip", "feature/@wip"]);
     assert_success(&warehouse.run(&["import-git", dir.to_str().unwrap()]));
 
+    // A component that would start with "-" is anchored alike at every level.
     let pallets = stdout(&warehouse.run(&["palletize"]));
-    for name in ["main", "feature/login", "fix/fork-17"] {
+    for name in ["main", "feature/login", "fix/fork-17", "branch-wip", "feature/branch-wip"] {
         assert!(pallets.lines().any(|line| line.trim_start_matches('*').trim() == name), "{}: {}", name, pallets);
     }
     assert!(!pallets.contains("Feature"), "{}", pallets);

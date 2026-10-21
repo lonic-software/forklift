@@ -755,6 +755,10 @@ pub fn all_pallet_refs() -> Result<Vec<(PalletRef, String)>, String> {
 /// * `Ok(())`      - If the folder was processed.
 /// * `Err(String)` - If a folder or entry could not be read, or a ref file's name is not a
 ///                   valid pallet name.
+/// Files an operating system leaves in any folder a file browser opens. None is a valid pallet
+/// name, so none can be a ref file, and skipping them hides no pallet.
+const OS_LITTER_FILE_NAMES: [&str; 2] = [".DS_Store", "Thumbs.db"];
+
 fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) -> Result<(), String> {
     for entry_result in file_utils::read_directory(&folder.to_path_buf())? {
         let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
@@ -770,12 +774,15 @@ fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) ->
 
         if metadata.is_dir() {
             collect_pallet_names(&entry.path(), &full_name, names)?;
+        } else if OS_LITTER_FILE_NAMES.iter().any(|litter| full_name.rsplit('/').next() == Some(*litter)) {
+            continue;
         } else {
             // A ref file is a pallet only under a valid name. One that is not was written by
             // hand or by an older grammar, and listing it would hand every reader a name it
             // refuses (or, on a case-folding volume, an alias of another pallet).
             validate_pallet_name(&full_name).map_err(|e| format!(
-                "The ref file \"{}\" does not name a valid pallet: {}.",
+                "The ref file \"{}\" does not name a valid pallet: {}. Rename it to a valid pallet \
+                name, or move it out of the pallets folder, and run the command again.",
                 std::path::absolute(entry.path()).unwrap_or_else(|_| entry.path()).to_string_lossy(), e
             ))?;
             names.push(full_name);
@@ -1024,6 +1031,28 @@ mod tests {
         assert!(error.contains("\"feature/X\" is not a valid pallet name") && error.contains("does not name a valid pallet"),
             "{}", error);
         assert!(all_pallet_refs().is_err(), "the reachable-ref set must not skip the entry either");
+        assert!(error.contains("Rename it to a valid pallet name"), "the way out is named: {}", error);
+
+        // The named way out: renamed to a valid name, the entry lists as that pallet.
+        std::fs::rename(folder.join("X"), folder.join("x2")).unwrap();
+        assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["feature/x2", "main", "mainline"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The files a file browser leaves in any folder it opens are not ref files and never valid
+    /// pallet names, so the listing passes over them at every level instead of failing on them.
+    #[test]
+    fn os_litter_in_the_pallets_folder_is_not_a_pallet() {
+        let (root, _scope) = scratch("pallet-os-litter");
+        update_pallet_head("feature/x", None, &hash('a')).unwrap();
+
+        let folder = get_pallets_folder();
+        for litter in [folder.join(".DS_Store"), folder.join("feature").join(".DS_Store"), folder.join("Thumbs.db")] {
+            std::fs::write(litter, b"\0\0\0\x01Bud1").unwrap();
+        }
+
+        assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["feature/x"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

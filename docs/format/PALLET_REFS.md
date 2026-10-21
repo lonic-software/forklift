@@ -34,7 +34,10 @@ used verbatim as a path, so `Main` and `main` would be one file on a case-foldin
 Windows), and Windows strips a trailing `.` and opens a device for a reserved stem. A name
 outside the rules is refused, never folded to a valid spelling; the refusal suggests the
 lowercase spelling when that alone would make it valid. A ref file whose name breaks the rules
-(written by hand or by an older version) makes the pallet listing fail, naming the file.
+(written by hand or by an older version) makes the pallet listing fail, naming the file; rename
+or move it and the listing reads again. The only files skipped are `.DS_Store` and `Thumbs.db`,
+which file browsers leave in folders they open. Neither is a valid name, so skipping them hides no
+pallet.
 
 ### Content
 

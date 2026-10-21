@@ -74,6 +74,46 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
     file_utils::write_file_atomically(&bay_dir.join(FOLDER_NAME_FORKLIFT_ROOT), &content)
 }
 
+/// Validate a bay name: a valid pallet name (a bay checks out the pallet of its name) that is one
+/// folder, since bays are listed one level deep under the bays folder.
+///
+/// # Returns
+/// * `Ok(())`      - If the name is a valid bay name.
+/// * `Err(String)` - Why it is not.
+pub fn validate_bay_name(name: &str) -> Result<(), String> {
+    pallet_utils::validate_pallet_name(name)?;
+
+    if name.contains('/') {
+        return Err(format!(
+            "\"{}\" is not a valid bay name: a bay name is one folder, so it must not contain \"/\"", name
+        ));
+    }
+
+    Ok(())
+}
+
+/// The `forklift bay remove` command line that addresses the bay folder `name` exactly, quoted so
+/// it can be pasted into a shell, or `None` when no command line can: `bay remove` refuses a name
+/// ending in "." or a space (see [`is_listed_bay`]), and a name holding a quote or a control
+/// character has no safe spelling here.
+pub fn remove_command(name: &str) -> Option<String> {
+    if name.is_empty() || name.ends_with('.') || name.ends_with(' ') {
+        return None;
+    }
+
+    let word = if name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')) {
+        name.to_string()
+    } else if name.chars().any(|c| c == '\'' || c == '"' || c.is_control()) {
+        return None;
+    } else {
+        format!("'{}'", name)
+    };
+
+    // A leading '-' would be read as an option, so the name follows "--".
+    let separator = if name.starts_with('-') { "-- " } else { "" };
+    Some(format!("forklift bay remove {}{}", separator, word))
+}
+
 /// Read and validate a bay's `.forklift` redirect file.
 ///
 /// # Arguments
@@ -104,9 +144,16 @@ pub fn read_bay_redirect(forklift_path: &Path) -> Result<BayRedirect, String> {
     if name.is_empty() {
         return Err("The bay redirect has no bay name.".to_string());
     }
-    pallet_utils::validate_pallet_name(&name).map_err(|e| format!(
-        "The bay redirect \"{}\" names an invalid bay: {}", forklift_path.to_string_lossy(), e
-    ))?;
+    validate_bay_name(&name).map_err(|e| {
+        let way_out = match remove_command(&name) {
+            Some(command) => format!(
+                "Run \"{}\" in the warehouse at \"{}\" if it lists that bay, or delete this redirect \
+                file to stop treating this folder as a bay.", command, warehouse_root
+            ),
+            None => "Delete this redirect file to stop treating this folder as a bay.".to_string(),
+        };
+        format!("The bay redirect \"{}\" names an invalid bay: {}. {}", forklift_path.to_string_lossy(), e, way_out)
+    })?;
 
     Ok(BayRedirect {
         warehouse_root: PathBuf::from(warehouse_root),
@@ -554,6 +601,30 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bay_name_is_one_folder_of_the_pallet_grammar() {
+        assert!(validate_bay_name("b1").is_ok());
+        assert!(validate_bay_name("review.2").is_ok());
+
+        let error = validate_bay_name("feature/x").unwrap_err();
+        assert!(error.contains("must not contain \"/\""), "{}", error);
+        assert!(validate_bay_name("Review").unwrap_err().contains("is not a valid pallet name"));
+    }
+
+    /// The way-out command line spells the exact folder name for a shell, or is withheld where
+    /// `bay remove` would refuse the name or no safe spelling exists.
+    #[test]
+    fn the_remove_command_spells_the_folder_name_for_a_shell() {
+        assert_eq!(remove_command("Main").as_deref(), Some("forklift bay remove Main"));
+        assert_eq!(remove_command("My Bay").as_deref(), Some("forklift bay remove 'My Bay'"));
+        assert_eq!(remove_command("a$b;c").as_deref(), Some("forklift bay remove 'a$b;c'"));
+        assert_eq!(remove_command("-x").as_deref(), Some("forklift bay remove -- -x"));
+
+        for name in ["", "b1.", "b1 ", "it's", "say\"hi\"", "tab\there"] {
+            assert_eq!(remove_command(name), None, "{:?}", name);
+        }
     }
 
     #[test]

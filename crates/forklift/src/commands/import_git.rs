@@ -1002,6 +1002,21 @@ fn map_branches(branches: &[(String, String)]) -> Result<Vec<String>, String> {
         }
     }
 
+    // A pallet is a ref file and a "/" nests it in folders, so no name can also be a folder of
+    // another: git keeps `Feature` and `feature/x` apart on a case-sensitive disk, but mapped they
+    // are `feature` and `feature/x`.
+    for ((branch, _), pallet) in branches.iter().zip(&pallets) {
+        for folder in folders_of(pallet) {
+            if let Some(owners) = by_pallet.get(folder) {
+                return Err(format!(
+                    "Branches \"{}\" and \"{}\" map to pallets \"{}\" and \"{}\", and a pallet name \
+                    cannot also be a folder of another; rename one in git and import again.",
+                    owners[0], branch, folder, pallet
+                ));
+            }
+        }
+    }
+
     for ((branch, _), pallet) in branches.iter().zip(&pallets) {
         if pallet_utils::does_pallet_exist(pallet) {
             return Err(format!(
@@ -1012,7 +1027,29 @@ fn map_branches(branches: &[(String, String)]) -> Result<Vec<String>, String> {
         }
     }
 
+    for existing in pallet_utils::list_pallets()? {
+        let nested = folders_of(&existing)
+            .find_map(|folder| by_pallet.get(folder).map(|owners| (owners[0], folder.to_string())))
+            .or_else(|| branches.iter().zip(&pallets).find_map(|((branch, _), pallet)| {
+                folders_of(pallet).any(|folder| folder == existing).then(|| (branch.as_str(), pallet.clone()))
+            }));
+
+        if let Some((branch, pallet)) = nested {
+            return Err(format!(
+                "Branch \"{}\" maps to pallet \"{}\", which nests with the pallet \"{}\" this \
+                warehouse already has (a pallet name cannot also be a folder of another). Import into a \
+                warehouse without that pallet, or rename the branch in git.",
+                branch, pallet, existing
+            ));
+        }
+    }
+
     Ok(pallets)
+}
+
+/// Every folder a pallet name nests in, outermost first: `a/b/c` is in `a` and `a/b`.
+fn folders_of(pallet: &str) -> impl Iterator<Item = &str> {
+    pallet.match_indices('/').map(move |(at, _)| &pallet[..at])
 }
 
 /// Turn a git branch name into a pallet name: lowercased, with the characters forklift does not
@@ -1024,12 +1061,16 @@ fn sanitize_pallet_name(branch: &str) -> String {
         .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '/') { c } else { '-' })
         .collect();
 
-    // A leading '-' (or an empty result) would be rejected; anchor it.
-    if sanitized.is_empty() || sanitized.starts_with('-') {
-        format!("branch-{}", sanitized.trim_start_matches('-'))
-    } else {
-        sanitized
-    }
+    // A component starting with '-' (or an empty result) would be refused; anchor it, in every
+    // component alike, so `@wip` and `feature/@wip` map the same way.
+    sanitized.split('/')
+        .map(|component| if component.is_empty() || component.starts_with('-') {
+            format!("branch-{}", component.trim_start_matches('-'))
+        } else {
+            component.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The result of a git import.
