@@ -36,8 +36,8 @@ outside the rules is refused, never folded to a valid spelling; the refusal sugg
 lowercase spelling when that alone would make it valid. A ref file whose name breaks the rules
 (written by hand or by an older version) makes the pallet listing fail, naming the file; rename
 or move it and the listing reads again. The only files skipped are `.DS_Store` and `Thumbs.db`,
-which file browsers leave in folders they open. Neither is a valid name, so skipping them hides no
-pallet.
+which file browsers leave in folders they open, and a ref write's temp file (below). None is a
+valid name, so skipping them hides no pallet.
 
 ### Content
 
@@ -48,7 +48,13 @@ characters), terminated by a single new line byte:
 9028a15ad613bcd9853a3e780cfe3c78361b56ce95a2430484ba75ade5198cdc\n
 ```
 
-Ref files are updated atomically (temp file + rename).
+Ref files are updated atomically: the new content is written to a temp file beside the ref,
+named `<name>.tmp~<pid>-<n>` (`<pid>` the writing process, `<n>` a per-process counter), which is
+then renamed onto the ref. The `~` puts every temp name outside the name rules, so a temp is never
+a pallet: one left by a write that was killed before its rename is skipped by the listing, not
+counted as a ref, and no pallet's ref file can share a temp's name. Only a temp whose name before
+`.tmp~` is a valid pallet name is skipped; any other file spelled like a temp (`Main.tmp~1-2`)
+fails the listing like any other invalid name.
 
 ## The current pallet
 

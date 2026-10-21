@@ -993,11 +993,11 @@ pub fn store_object_stream(claimed_hash: &str,
     // (`file_utils.rs`) names its own temp files unique-per-write the same way (a process-wide
     // atomic counter plus the pid), off its own independent `TEMP_FILE_COUNTER` — two
     // independent counters can coincidentally reach the same numeric value, so if this path used
-    // the identical `"{name}.tmp{pid}-{id}"` infix, a write here and a concurrent
+    // the identical `"{name}.tmp~{pid}-{id}"` infix, a write here and a concurrent
     // `write_file_atomically` write for the *same* hash (e.g. one thread streaming a large
     // duplicate-hash bundle record while another fetches the same hash loose) could collide on
     // one temp path — precisely the hazard `write_file_atomically`'s own per-write-uniqueness
-    // comment exists to prevent. A distinct infix (`.stream.tmp` here, `.tmp` there) rules the
+    // comment exists to prevent. A distinct infix (`.stream.tmp` here, `.tmp~` there) rules the
     // collision out structurally: the two paths can never match regardless of either counter's
     // value, which is stronger than relying on the counters staying apart.
     static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1939,7 +1939,7 @@ mod tests {
     }
 
     /// `store_object_stream`'s temp file must never collide with `write_file_atomically`'s (the
-    /// review's W2 finding): both name a temp file `"{name}.tmp{pid}-{id}"`-style off their own
+    /// review's W2 finding): both name a temp file `"{name}.tmp~{pid}-{id}"`-style off their own
     /// independent process-wide counter, so two concurrent writes of the *same* hash — one via
     /// each path — could reach the identical (pid, id) pair by coincidence if the infixes matched.
     /// Firing several of each concurrently at the same hash proves the fix: every writer converges
