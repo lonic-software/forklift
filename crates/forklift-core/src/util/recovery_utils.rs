@@ -1657,9 +1657,14 @@ fn walk_shard_data_files(inventory_root: &Path, found: &mut Vec<PathBuf>) -> Res
 
 /// Which checkout's staging area `inventory_root` is, for a remedy that must be run there: a walk
 /// covers every bay's, and a reset run in another checkout would unstage that checkout's work.
+///
+/// Made absolute first: the main tree's state folder is the relative `.forklift` when no storage
+/// root is set, and its parent would name no checkout at all.
 fn staging_area_owner(inventory_root: &Path) -> String {
-    let state = inventory_root.parent().unwrap_or(inventory_root);
-    let checkout = if state == forklift_root() {
+    let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let inventory_root = absolute(inventory_root);
+    let state = inventory_root.parent().unwrap_or(&inventory_root);
+    let checkout = if state == absolute(&forklift_root()) {
         state.parent().map(Path::to_path_buf)
     } else {
         state.file_name().and_then(|name| name.to_str())
@@ -6374,6 +6379,16 @@ mod tests {
         assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{error}");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Without a storage root, as in the main tree's CLI, the state folder is the relative
+    /// `.forklift`, and the checkout a refusal names is still the absolute folder holding it.
+    #[test]
+    fn a_relative_main_tree_names_its_checkout_absolutely() {
+        let owner = staging_area_owner(&forklift_root().join(FOLDER_NAME_INVENTORY_ROOT));
+
+        let checkout = std::env::current_dir().unwrap();
+        assert!(owner.contains(&format!("belongs to the checkout \"{}\"", checkout.to_string_lossy())), "{owner}");
     }
 
     /// A link in the store stops a walk rather than be followed, whether it stands in for a shard's
