@@ -334,6 +334,21 @@ pub fn behind_refusal(pallet: &str, base: Option<&str>, head: Option<&str>, oper
     )
 }
 
+/// A [`RefusalCode::RemoteAhead`] refusal saying `message`: `lower` brings the remote's parcels in.
+pub fn remote_ahead_refusal(message: String) -> CoreError {
+    CoreError::refusal(RefusalCode::RemoteAhead, message, "forklift lower")
+}
+
+/// The refusal a remote head answers a ref update with when the pallet's head is `current`, not
+/// the `expected` the client sent: the remote moved since the client read it.
+pub fn pallet_moved_refusal(current: Option<&str>, expected: Option<&str>) -> CoreError {
+    remote_ahead_refusal(format!(
+        "The pallet moved: its head is {}, not {}. Lower and retry.",
+        current.unwrap_or("unborn"),
+        expected.unwrap_or("unborn")
+    ))
+}
+
 /// The next step of a [`RefusalCode::Behind`] refusal with nothing in progress: catch up.
 fn catch_up_step(pallet: &str) -> String {
     format!("forklift shift {}", pallet)

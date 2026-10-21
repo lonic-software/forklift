@@ -964,20 +964,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// The `409` for a ref that is not where the client expected it.
     fn moved(&self, current: &Option<String>, expected: &Option<String>) -> HeadError {
-        HeadError::conflict(remote_ahead(format!(
-            "The pallet moved: its head is {}, not {}. Lower and retry.",
-            current.as_deref().unwrap_or("unborn"),
-            expected.as_deref().unwrap_or("unborn")
-        )))
+        HeadError::conflict(
+            forklift_core::util::pallet_utils::pallet_moved_refusal(current.as_deref(), expected.as_deref()).into()
+        )
     }
 
     /// The `409` for an office lift landing between the audit and the commit: the pallet
     /// itself did not move, but the office state the audit trusted did.
     fn office_moved(&self, current: &Option<String>) -> HeadError {
-        HeadError::conflict(remote_ahead(format!(
+        HeadError::conflict(forklift_core::util::pallet_utils::remote_ahead_refusal(format!(
             "The office pallet moved during the audit: its head is now {}. Lower and retry.",
             current.as_deref().unwrap_or("unborn")
-        )))
+        )).into())
     }
 
     /// The `409` for the trust anchor changing between the audit and the commit (established,
@@ -1079,12 +1077,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 .to_string(),
         )
     }
-}
-
-/// A `RemoteAhead` refusal saying `message`, framed so the entrypoint threads its code onto the
-/// wire: the client branches to `lower`.
-fn remote_ahead(message: String) -> String {
-    forklift_core::error::CoreError::refusal(forklift_core::error::RefusalCode::RemoteAhead, message, "forklift lower").into()
 }
 
 /// The `422` for a client-sent hash spelled any way but the store's own, 64 lowercase hex

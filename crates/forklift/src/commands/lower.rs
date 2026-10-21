@@ -209,10 +209,17 @@ pub(crate) struct MetaPalletFailure {
 }
 
 impl MetaPalletFailure {
-    /// A failure carrying the human message only: a refusal's frame never reaches the `--json`
-    /// report or the joined error, which carries no code of its own.
+    /// A failure carrying a refusal's human message, and its next step when the message does not
+    /// already say it: the frame never reaches the `--json` report or the joined error, which
+    /// carries no code of its own.
     pub(crate) fn new(pallet: String, error: String) -> MetaPalletFailure {
-        MetaPalletFailure { pallet, error: forklift_core::error::CoreError::from(error).to_string() }
+        let error = match forklift_core::error::CoreError::from(error) {
+            forklift_core::error::CoreError::Refusal { message, next_step, .. }
+                if !next_step.is_empty() && !message.contains(&next_step) => format!("{} {}", message, next_step),
+            other => other.to_string(),
+        };
+
+        MetaPalletFailure { pallet, error }
     }
 }
 

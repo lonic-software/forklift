@@ -1339,8 +1339,8 @@ retries** on its own — so a fleet of agents stacking to one pallet stops
 serializing through a human. It reports how many times it auto-merged. Only a
 clean warehouse qualifies (the merge materializes), and a **true overlap** (both
 sides edited the same file) still stops with the diverged error (`diverged`, exit 5), leaving
-the warehouse untouched: palletize the fetched remote head, consolidate it, and lift the
-result. A remote that is simply ahead — it holds parcels you lack and you hold none it lacks —
+the warehouse untouched: palletize the fetched remote head, shift back to your pallet,
+consolidate the new one, and lift the result. A remote that is simply ahead — it holds parcels you lack and you hold none it lacks —
 is a different refusal, `remote_ahead` (exit 28): `lower` first. A bay another bay left behind
 its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this auto-merge alike:
 `shift` to the pallet to catch up.
