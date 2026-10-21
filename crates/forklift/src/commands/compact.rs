@@ -26,7 +26,7 @@ pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
         );
     }
 
-    let stats = pack_utils::compact(all, redelta, &events::progress())?;
+    let stats = pack_utils::compact(all, redelta, all, &events::progress())?;
 
     output::emit(&Compacted {
         all,
@@ -37,7 +37,12 @@ pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
         bytes_packed: stats.bytes_packed,
         corrupt_skipped: stats.corrupt_skipped,
         over_ceiling_skipped: stats.over_ceiling_skipped,
-        unvalidated_packs: stats.unvalidated_packs,
+        damaged_packs_dropped: stats.damaged_packs_dropped,
+        damaged_packs_kept: stats.damaged_packs_kept.into_iter().map(|kept| KeptDamagedPack {
+            index_path: kept.index_path,
+            error: kept.error,
+            unaccounted: kept.unaccounted,
+        }).collect(),
     });
 
     Ok(())
@@ -74,10 +79,29 @@ pub(crate) struct Compacted {
     /// rather than packed or removed.
     over_ceiling_skipped: usize,
 
-    /// Packs a full repack left exactly as found because their index failed validation: nothing
-    /// was copied out of them and they were not deleted. Each entry is the validation error, which
-    /// names the index file. Always empty without `--all`.
-    unvalidated_packs: Vec<String>,
+    /// Damaged packs (an index that failed validation) a full repack salvaged and removed: every
+    /// live object they might have held reads verified from another copy. Each entry is the
+    /// index file's path. Always empty without `--all`.
+    damaged_packs_dropped: Vec<String>,
+
+    /// Damaged packs a full repack salvaged what it could from but kept, because some live
+    /// object they might hold has no other verified copy. Always empty without `--all`.
+    damaged_packs_kept: Vec<KeptDamagedPack>,
+}
+
+/// A damaged pack a full repack kept.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct KeptDamagedPack {
+    /// The pack's index file.
+    index_path: String,
+
+    /// Why the index failed validation.
+    error: String,
+
+    /// The live objects the pack might hold that no other copy serves verified: they cannot be
+    /// recovered from this store.
+    unaccounted: Vec<String>,
 }
 
 impl Compacted {
@@ -93,14 +117,25 @@ impl Compacted {
         }
     }
 
-    /// Warn about packs a repack left in place because their index failed validation — shared by
-    /// both render paths.
-    fn print_unvalidated_packs_note(&self) {
-        for error in &self.unvalidated_packs {
+    /// Report the damaged packs a repack salvaged, removed or kept — shared by both render paths.
+    fn print_damaged_packs_note(&self) {
+        for index_path in &self.damaged_packs_dropped {
             println!(
-                "Left a pack in place, not repacked: {} Its sound parts are still read; an object in a \
-                damaged part reads as unverifiable until it is stored again.",
-                error
+                "Salvaged and removed the damaged pack \"{}\": every live object it held reads from \
+                another copy.",
+                index_path
+            );
+        }
+        for kept in &self.damaged_packs_kept {
+            println!(
+                "Kept the damaged pack \"{}\" ({}). No other copy serves {} live object{} it may \
+                hold, so {} cannot be recovered from this store: {}",
+                kept.index_path,
+                kept.error,
+                kept.unaccounted.len(),
+                if kept.unaccounted.len() == 1 { "" } else { "s" },
+                if kept.unaccounted.len() == 1 { "it" } else { "they" },
+                kept.unaccounted.join(", "),
             );
         }
     }
@@ -130,7 +165,7 @@ impl CommandOutput for Compacted {
             println!("{}", nothing);
             self.print_corrupt_skipped_note();
             self.print_over_ceiling_skipped_note();
-            self.print_unvalidated_packs_note();
+            self.print_damaged_packs_note();
             return;
         }
 
@@ -155,7 +190,7 @@ impl CommandOutput for Compacted {
 
         self.print_corrupt_skipped_note();
         self.print_over_ceiling_skipped_note();
-        self.print_unvalidated_packs_note();
+        self.print_damaged_packs_note();
     }
 }
 

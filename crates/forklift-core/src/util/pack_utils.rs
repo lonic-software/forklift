@@ -254,8 +254,9 @@ pub struct StoreStatus {
     pub quarantined_packs: Vec<PackIndexProblem>,
     /// Packs that load but whose index fails full validation (a corrupt bucket, or records that
     /// do not tile the data file). Reads keep serving their sound buckets; an object in a corrupt
-    /// bucket reads `Unverifiable` until it is stored again. Not counted among `packs`. Empty on a
-    /// healthy store.
+    /// bucket reads `Unverifiable`. A full repack ([`compact`]) salvages what the data file still
+    /// holds and removes the pack when every live object it may hold reads from another copy. Not
+    /// counted among `packs`. Empty on a healthy store.
     pub damaged_packs: Vec<PackIndexProblem>,
     /// Pack index files that could not even be parsed (FORK-47, DESIGN.html §3.1.1) — their hash
     /// set is unknown, so they are inert (never gate a read verdict) but worth fixing: move the
@@ -456,12 +457,35 @@ pub struct CompactStats {
     /// fully readable.
     pub over_ceiling_skipped: usize,
 
-    /// Packs a full repack left exactly as found because their index failed full validation (a
-    /// corrupt bucket, or records that do not tile the data file): nothing was copied out of them
-    /// and they were not deleted, so the objects a sound bucket still serves stay readable. Each
-    /// entry is the validation error, which names the index file. Always empty for an incremental
-    /// compaction, which never reads existing packs.
-    pub unvalidated_packs: Vec<String>,
+    /// Damaged packs (an index that fails full validation: a corrupt bucket, or records that do
+    /// not tile the data file) a full repack salvaged and deleted: every live object they might
+    /// hold reads verified from another copy. Each entry is the index file's path. Always empty
+    /// for an incremental compaction, which never reads existing packs.
+    pub damaged_packs_dropped: Vec<String>,
+
+    /// Damaged packs a full repack salvaged what it could from but kept, because some live object
+    /// they might hold has no other copy that reads verified. Always empty for an incremental
+    /// compaction.
+    pub damaged_packs_kept: Vec<KeptDamagedPack>,
+
+    /// Damaged packs a full repack run without salvage (auto-maintenance) left exactly as found:
+    /// not salvaged, copied from or deleted. Each entry is the validation error, which names the
+    /// index file. Always empty for a run with salvage, and for an incremental compaction.
+    pub damaged_packs_skipped: Vec<String>,
+}
+
+/// A damaged pack a full repack kept (see [`CompactStats::damaged_packs_kept`]).
+#[derive(Debug)]
+pub struct KeptDamagedPack {
+    /// The pack's index file.
+    pub index_path: String,
+
+    /// Why the index fails full validation.
+    pub error: String,
+
+    /// The live objects the pack might hold that no other copy serves verified, sorted. The pack
+    /// is the only place their bytes could still be.
+    pub unaccounted: Vec<String>,
 }
 
 /// The pack index format (version 3, FORK-118, DESIGN.html §4.5), and the only code that knows
@@ -487,6 +511,7 @@ pub struct CompactStats {
 /// for its prefix, that a hit is in bounds and that a miss is real. Whole-index consumers
 /// validate every bucket first ([`CheckedIndex::all_records`]).
 mod index_format {
+    use std::collections::HashSet;
     use std::ops::Range;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -566,6 +591,13 @@ mod index_format {
         }
         let top = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
         (top >> (32 - bits)) as usize
+    }
+
+    /// The bucket `hash` falls in, in the index the writer produces for `count` records, so a test
+    /// can place a hash inside or outside one before the pack exists.
+    #[cfg(test)]
+    pub(super) fn bucket_in_index_of(count: usize, hash: &[u8]) -> usize {
+        bucket_of(hash, fanout_bits_for(count))
     }
 
     /// Build an index over `records`, which must already be sorted by hash.
@@ -887,6 +919,26 @@ mod index_format {
             Ok(AllRecords { index: self })
         }
 
+        /// The records of every bucket that passes validation, in index order: what a damaged
+        /// index still vouches for.
+        pub(super) fn valid_bucket_records(&self) -> Vec<Record<'_>> {
+            (0..self.buckets())
+                .filter(|&bucket| self.bucket_is_valid(bucket))
+                .flat_map(|bucket| self.bucket_span(bucket).map(|position| self.record_at(position)))
+                .collect()
+        }
+
+        /// Every hash the record table names, read as raw entries without consulting the fanout
+        /// table or any bucket's verdict: every hash a damaged index could be naming, whatever
+        /// its corruption.
+        pub(super) fn raw_record_hashes(&self) -> HashSet<[u8; HASH_LEN]> {
+            (0..self.count()).map(|position| {
+                let mut hash = [0u8; HASH_LEN];
+                hash.copy_from_slice(self.record_at(position).hash);
+                hash
+            }).collect()
+        }
+
         /// Where record `position` starts in the file, so a test can corrupt it.
         #[cfg(test)]
         pub(super) fn record_byte_position(&self, position: usize) -> usize {
@@ -987,9 +1039,22 @@ impl LoadedPack {
         self.data_path.with_extension(PACK_INDEX_EXTENSION)
     }
 
-    /// The error a reader reports for an index bucket that failed validation.
+    /// The error a reader reports for an index bucket that failed validation. While a full repack
+    /// reads objects (target collection and packing), a pack its salvage could not completely
+    /// recover also says so, because no in-store remedy remains for what only its damaged part
+    /// held (see [`SALVAGE_REGISTRY`]).
     fn corrupt_bucket_error(&self, bucket: usize) -> String {
-        index_format::corrupt_bucket_message(&self.index_path(), bucket)
+        let index_path = self.index_path();
+        let message = index_format::corrupt_bucket_message(&index_path, bucket);
+        if !is_incompletely_salvaged(&index_path) {
+            return message;
+        }
+        format!(
+            "{} This full repack could not completely salvage that pack, so an object read through \
+            its damaged part may be held nowhere else and cannot be recovered from this store. \
+            Nothing was deleted.",
+            message
+        )
     }
 
     /// Validate the whole index: every bucket, and that the records tile the data body exactly
@@ -999,7 +1064,10 @@ impl LoadedPack {
     fn validate_full(&self) -> Result<(), String> {
         self.full.get_or_init(|| {
             PACK_FULL_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let records = self.index.all_records().map_err(|bucket| self.corrupt_bucket_error(bucket))?;
+            // The plain message, never the salvage context: this verdict is memoized for the life
+            // of the loaded pack, and the context holds only while a repack is collecting.
+            let records = self.index.all_records()
+                .map_err(|bucket| index_format::corrupt_bucket_message(&self.index_path(), bucket))?;
             if !records.tile(self.data.len() as u64) {
                 return Err(format!(
                     "Pack index \"{}\" is corrupt: its records do not cover the data file exactly once.",
@@ -1013,7 +1081,7 @@ impl LoadedPack {
     /// Every record, after [`Self::validate_full`] passes.
     fn records(&self) -> Result<index_format::AllRecords<'_, memmap2::Mmap>, String> {
         self.validate_full()?;
-        self.index.all_records().map_err(|bucket| self.corrupt_bucket_error(bucket))
+        self.index.all_records().map_err(|bucket| index_format::corrupt_bucket_message(&self.index_path(), bucket))
     }
 
     /// A borrowed slice of `length` bytes at `offset` in this pack's mapped data file — no copy,
@@ -1596,6 +1664,9 @@ pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, Stri
 
     for pack in pack_set.packs.iter() {
         if let Located::CorruptBucket(bucket) = pack.locate(&hash_bytes) {
+            if is_exonerated_by_salvage(&pack.index_path(), &hash_bytes) {
+                continue;
+            }
             return Ok(Some(pack.corrupt_bucket_error(bucket)));
         }
     }
@@ -1610,6 +1681,67 @@ pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, Stri
     }
 
     Ok(None)
+}
+
+/// What the running full repack's salvage ([`salvage_damaged_packs`]) concluded about each damaged
+/// pack, keyed by index path. Registered and cleared by [`SalvageRegistration`], which lives only
+/// as long as the repack reads objects (target collection and packing), under its locks and
+/// before anything is deleted.
+static SALVAGE_REGISTRY: Mutex<Vec<(PathBuf, Salvaged)>> = Mutex::new(Vec::new());
+
+/// One damaged pack's salvage verdict (see [`SALVAGE_REGISTRY`]).
+#[derive(Clone)]
+enum Salvaged {
+    /// Every record the pack's data file holds now reads verified from another copy, so a hash
+    /// its raw record table (held here) does not name was never in it, whatever bucket it falls
+    /// in: [`sweep_unreadable_reason`] does not answer for it.
+    Complete(Arc<HashSet<[u8; HASH_LEN]>>),
+    /// Some record could not be recovered: an object read through the pack's damaged part may
+    /// have no other copy, and [`LoadedPack::corrupt_bucket_error`] says so.
+    Incomplete,
+}
+
+/// Whether a completely salvaged pack's index at `index_path` is exonerated from holding
+/// `hash_bytes` (see [`SALVAGE_REGISTRY`]).
+fn is_exonerated_by_salvage(index_path: &Path, hash_bytes: &[u8; HASH_LEN]) -> bool {
+    let registry = SALVAGE_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.iter().any(|(path, salvaged)| {
+        path == index_path && matches!(salvaged, Salvaged::Complete(raw_table) if !raw_table.contains(hash_bytes))
+    })
+}
+
+/// Whether the running full repack could not completely salvage the pack at `index_path` (see
+/// [`SALVAGE_REGISTRY`]).
+fn is_incompletely_salvaged(index_path: &Path) -> bool {
+    let registry = SALVAGE_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.iter().any(|(path, salvaged)| path == index_path && matches!(salvaged, Salvaged::Incomplete))
+}
+
+/// The registration of a full repack's salvage verdicts in [`SALVAGE_REGISTRY`], removed again on
+/// drop, so neither the exoneration nor the salvage context outlives the repack's reading phase
+/// (and the locks) it was established under.
+struct SalvageRegistration {
+    index_paths: Vec<PathBuf>,
+}
+
+impl SalvageRegistration {
+    fn register(packs: Vec<(PathBuf, Salvaged)>) -> SalvageRegistration {
+        let index_paths = packs.iter().map(|(path, _)| path.clone()).collect();
+        let mut registry = SALVAGE_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.extend(packs);
+        SalvageRegistration { index_paths }
+    }
+}
+
+impl Drop for SalvageRegistration {
+    fn drop(&mut self) {
+        let mut registry = SALVAGE_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for index_path in &self.index_paths {
+            if let Some(at) = registry.iter().position(|(path, _)| path == index_path) {
+                registry.remove(at);
+            }
+        }
+    }
 }
 
 /// [`pack_health_snapshot`]'s result: every quarantined index's `(path, load error)` and every
@@ -3021,6 +3153,10 @@ struct WindowEntry {
 /// # Arguments
 /// * `all` - Repack existing packs too (drop packed garbage, consolidate), not just the loose set.
 /// * `redelta` - Re-delta every live packed object instead of copying it verbatim (see above).
+/// * `salvage` - With `all`, recover what damaged packs still hold and remove the ones whose live
+///   objects are all accounted for (FORK-194, [`salvage_damaged_packs`]); without it they are left
+///   exactly as found. Only an explicitly requested repack sets it, never auto-maintenance, which
+///   runs unasked, reports nothing and would repeat the salvage after every command.
 /// * `progress` - Where to report the run's phases and how far packing has got.
 ///
 /// # Returns
@@ -3038,7 +3174,7 @@ struct WindowEntry {
 ///                        ever runs. A later `heal_utils::heal_if_tainted` call restages exactly
 ///                        the affected paths and clears the taint once they are durable again —
 ///                        `compact`'s own destructive sweep stays refused until then either way.
-pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactStats, String> {
+pub fn compact(all: bool, redelta: bool, salvage: bool, progress: &Progress) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
     file_utils::create_folder_if_not_exists(&pack_folder)?;
 
@@ -3094,10 +3230,14 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
     // whole reachability phase, which collapses those (~5 per parcel) re-reads to one decode each
     // and is dropped before the parallel batch loop below. `source_packs` are the existing packs,
     // kept mapped for the run so a `CopyRecord` copies its bytes straight from the mmap.
-    let (targets, old_packs, source_packs, depth_packs, path_bases, unvalidated_packs) = {
+    let (targets, old_packs, source_packs, depth_packs, path_bases, damaged_packs_dropped, damaged_packs_kept,
+        damaged_packs_skipped, salvage_registration) = {
         let _parcel_memo = object_utils::ParcelReadMemo::activate();
 
-        let CollectedTargets { targets, old_packs, source_packs, unvalidated_packs } = collect_targets(all, redelta)?;
+        let CollectedTargets {
+            targets, old_packs, source_packs, damaged_packs_dropped, damaged_packs_kept, damaged_packs_skipped,
+            salvage_registration,
+        } = collect_targets(all, redelta, salvage)?;
 
         // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
         // objects and for the rare object whose base is dropped. A repack that only copies existing
@@ -3141,12 +3281,14 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
         root_targets.extend(chain_targets);
         let targets = root_targets;
 
-        (targets, old_packs, source_packs, depth_packs, path_bases, unvalidated_packs)
+        (targets, old_packs, source_packs, depth_packs, path_bases, damaged_packs_dropped, damaged_packs_kept,
+            damaged_packs_skipped, salvage_registration)
     };
 
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
-        corrupt_skipped: 0, over_ceiling_skipped: 0, unvalidated_packs,
+        corrupt_skipped: 0, over_ceiling_skipped: 0, damaged_packs_dropped, damaged_packs_kept,
+        damaged_packs_skipped,
     };
     let mut writer: Option<PackWriter> = None;
 
@@ -3428,6 +3570,10 @@ pub fn compact(all: bool, redelta: bool, progress: &Progress) -> Result<CompactS
     // hold on every supported platform, not just the one this was measured on.)
     drop(source_packs);
 
+    // A corrupt-bucket error from here on could no longer say that nothing was deleted, and
+    // nothing past this point reads an object: end the salvage registration.
+    drop(salvage_registration);
+
     // Each pack's data and index bytes were fsynced in `finalize`, but the *directory entries*
     // that the renames created are themselves only durable once the pack folder is fsynced. Do it
     // once here (a single sync covers every rename this run made) before anything is deleted, so a
@@ -3704,6 +3850,232 @@ fn prepare_target(target: &PackTarget,
     Ok(PrepSlot::Ready(Prepared { raw, compressed, deltable, path_delta }))
 }
 
+/// Recover what a full repack can from every loaded pack whose index fails full validation
+/// (FORK-194), before the liveness walk reads anything: each such pack's data file is walked
+/// record by record ([`walk_pack_records`]) and every record that decodes is stored loose through
+/// the ordinary store path ([`object_utils::force_store_object_bytes`], ceilings included), named
+/// by the hash of its bytes, so an object only a corrupt bucket held reads verified again. A record
+/// that already reads verified is not written again.
+/// Salvage writes every record that decodes, garbage included; what the walk leaves unmarked
+/// waits for the loose collector.
+///
+/// A pack is *completely* salvaged when the walk covered its whole data body with no gap, every
+/// record decoded and was stored (none refused by the object ceilings, which salvage never
+/// bypasses), as many records decoded as the index header counts, and every decoded object now
+/// reads verified through the uncached classified read. Its data file then holds nothing that is
+/// not readable elsewhere, so a hash outside its raw record table was never in it: the returned
+/// guard registers that exoneration for [`sweep_unreadable_reason`] for as long as it lives. It
+/// registers every other damaged pack as incompletely salvaged, so a corrupt-bucket error naming
+/// one says that salvage could not recover it.
+///
+/// # Returns
+/// * `Ok((complete, guard))` - The index paths of the completely salvaged packs, and the guard
+///   holding every damaged pack's verdict.
+/// * `Err(String)`           - A salvaged object could not be written, or the store could not be
+///   consulted; nothing has been deleted.
+fn salvage_damaged_packs(packs: &PackSet) -> Result<(HashSet<PathBuf>, SalvageRegistration), String> {
+    let mut salvages: Vec<PackSalvage> = packs.packs.iter()
+        .filter(|pack| pack.validate_full().is_err())
+        .map(|pack| PackSalvage::walk(pack))
+        .collect();
+
+    // A delta can only decode once its base is readable, and its base may be a later record of
+    // its own pack or a record of another damaged pack (incremental compaction deltas a loose
+    // object against a packed base): retry what is still waiting, across every damaged pack,
+    // until a whole pass makes no progress.
+    loop {
+        let mut progress = false;
+        for salvage in salvages.iter_mut() {
+            progress |= salvage.decode_pending()?;
+        }
+        if !progress {
+            break;
+        }
+    }
+
+    let mut verdicts = Vec::new();
+    let mut complete = HashSet::new();
+    for salvage in &salvages {
+        let index_path = salvage.pack.index_path();
+        if salvage.is_complete()? {
+            complete.insert(index_path.clone());
+            verdicts.push((index_path, Salvaged::Complete(Arc::new(salvage.pack.index.raw_record_hashes()))));
+        } else {
+            verdicts.push((index_path, Salvaged::Incomplete));
+        }
+    }
+
+    Ok((complete, SalvageRegistration::register(verdicts)))
+}
+
+/// One damaged pack's salvage in progress (see [`salvage_damaged_packs`]).
+struct PackSalvage<'a> {
+    pack: &'a LoadedPack,
+    /// Records walked whose delta base does not read yet.
+    pending: Vec<&'a [u8]>,
+    /// Hashes of the records decoded and stored so far.
+    decoded: Vec<String>,
+    /// False once anything rules complete salvage out: a gap in the walk, a record count short of
+    /// the index header's, or a record that does not decode or that the ceilings refuse.
+    complete: bool,
+}
+
+impl<'a> PackSalvage<'a> {
+    fn walk(pack: &'a LoadedPack) -> Self {
+        let data: &[u8] = &pack.data;
+
+        // A walk that loses sync resumes only where a sound bucket says a record starts.
+        let mut resync: Vec<u64> = pack.index.valid_bucket_records().iter().map(|record| record.offset).collect();
+        resync.sort_unstable();
+        resync.dedup();
+
+        let (records, gap) = walk_pack_records(data, &resync);
+        PackSalvage {
+            pack,
+            complete: !gap && records.len() == pack.index.count(),
+            pending: records.into_iter().map(|range| &data[range]).collect(),
+            decoded: Vec::new(),
+        }
+    }
+
+    /// Try every pending record once; `Ok(true)` when at least one decoded.
+    fn decode_pending(&mut self) -> Result<bool, String> {
+        let mut progress = false;
+        let mut waiting = Vec::new();
+
+        for record in std::mem::take(&mut self.pending) {
+            match decode_salvaged_record(record) {
+                SalvagedRecord::Decoded(bytes) => {
+                    progress = true;
+                    let hash = object_utils::hash_object_bytes(&bytes);
+                    // Checked before the store so a ceiling refusal (an object this store may not
+                    // take in) leaves the salvage incomplete instead of failing the run; a failed
+                    // write still fails it.
+                    if object_utils::validate_imported_object(&hash, &bytes).is_err() {
+                        self.complete = false;
+                        continue;
+                    }
+                    // Written unless a copy already reads verified. A presence check would skip
+                    // the write whenever some unreadable copy is listed (a corrupt loose file, a
+                    // bad record in another pack), leaving the object unrecovered with its bytes
+                    // in hand; the forced write supersedes a corrupt loose file in one rename.
+                    if !matches!(file_utils::read_object_classified(&hash)?, file_utils::StoreReadOutcome::Verified(_)) {
+                        object_utils::force_store_object_bytes(&hash, &bytes)?;
+                    }
+                    self.decoded.push(hash);
+                }
+                SalvagedRecord::BaseUnreadable => waiting.push(record),
+                SalvagedRecord::Undecodable => self.complete = false,
+            }
+        }
+
+        self.pending = waiting;
+        Ok(progress)
+    }
+
+    /// Whether this pack was completely salvaged, once no damaged pack makes progress.
+    fn is_complete(&self) -> Result<bool, String> {
+        if !self.complete || !self.pending.is_empty() {
+            return Ok(false);
+        }
+        for hash in &self.decoded {
+            if !matches!(file_utils::read_object_classified(hash)?, file_utils::StoreReadOutcome::Verified(_)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Walk a pack's data body record by record from its header, without consulting the index: a
+/// record's extent is its kind byte, for a delta the base hash and the target length, and then
+/// one zstd frame. Where a record does not parse (an unknown kind byte, a frame that does not
+/// parse, a length past the end), the walk resumes at the next offset in `resync` (sorted) past
+/// it, or stops when there is none.
+///
+/// # Returns
+/// The byte range of every record walked, and whether any byte of the body was left uncovered.
+fn walk_pack_records(data: &[u8], resync: &[u64]) -> (Vec<std::ops::Range<usize>>, bool) {
+    let mut records = Vec::new();
+    let mut gap = false;
+    let mut at = PACK_DATA_HEADER_LEN as usize;
+
+    while at < data.len() {
+        if let Some(end) = record_end_at(data, at) {
+            records.push(at..end);
+            at = end;
+            continue;
+        }
+
+        gap = true;
+        match resync.iter().find(|&&offset| offset as usize > at) {
+            Some(&offset) => at = offset as usize,
+            None => break,
+        }
+    }
+
+    (records, gap)
+}
+
+/// Where the record starting at `at` ends, if its framing parses (see [`walk_pack_records`]).
+fn record_end_at(data: &[u8], at: usize) -> Option<usize> {
+    let frame_start = match *data.get(at)? {
+        RECORD_FULL => at + 1,
+        RECORD_DELTA => {
+            let body = data.get(at + 1..)?;
+            if body.len() < HASH_LEN {
+                return None;
+            }
+            let (_, read) = byte_utils::number_from_vlq_bytes(HASH_LEN, body).ok()?;
+            at + 1 + HASH_LEN + read
+        }
+        _ => return None,
+    };
+
+    let length = zstd::zstd_safe::find_frame_compressed_size(data.get(frame_start..)?).ok()?;
+    let end = frame_start.checked_add(length)?;
+    (end <= data.len()).then_some(end)
+}
+
+/// What decoding one walked record gave (see [`decode_salvaged_record`]).
+enum SalvagedRecord {
+    /// The object's bytes, not yet hashed.
+    Decoded(Vec<u8>),
+    /// A delta whose base does not read yet; a later pass may find it salvaged.
+    BaseUnreadable,
+    /// The record does not decode: corrupt, or above the object ceilings.
+    Undecodable,
+}
+
+/// Decode a record [`walk_pack_records`] found. The bytes are as untrusted as a damaged pack's
+/// are, so a full record decodes under the bounded decoder and a delta under its own target
+/// ceiling; a delta's base is read through the ordinary verified read.
+fn decode_salvaged_record(record: &[u8]) -> SalvagedRecord {
+    let Some((&kind, body)) = record.split_first() else {
+        return SalvagedRecord::Undecodable;
+    };
+
+    match kind {
+        RECORD_FULL => match object_utils::decode_object_bounded(body) {
+            Ok(bytes) => SalvagedRecord::Decoded(bytes),
+            Err(_) => SalvagedRecord::Undecodable,
+        },
+        RECORD_DELTA if body.len() >= HASH_LEN => {
+            let Ok((target_len, read)) = byte_utils::number_from_vlq_bytes(HASH_LEN, body) else {
+                return SalvagedRecord::Undecodable;
+            };
+            let Ok(base) = file_utils::retrieve_object_by_hash_shared(&sign_utils::to_hex(&body[..HASH_LEN])) else {
+                return SalvagedRecord::BaseUnreadable;
+            };
+            match delta_utils::decompress_delta(&base, &body[HASH_LEN + read..], target_len as usize) {
+                Ok(bytes) => SalvagedRecord::Decoded(bytes),
+                Err(_) => SalvagedRecord::Undecodable,
+            }
+        }
+        _ => SalvagedRecord::Undecodable,
+    }
+}
+
 /// The result of [`collect_targets`]: what to pack, what a repack supersedes, and the packs a
 /// `Source::CopyRecord` among `targets` borrows its bytes from.
 struct CollectedTargets {
@@ -3715,9 +4087,15 @@ struct CollectedTargets {
     /// .. }` in `targets` can borrow its record straight from `source_packs.packs[pack_index]`'s
     /// mmap (empty for an incremental `compact`, which has no `CopyRecord` targets).
     source_packs: Arc<PackSet>,
-    /// The validation errors of packs a repack leaves untouched (see
-    /// [`CompactStats::unvalidated_packs`]).
-    unvalidated_packs: Vec<String>,
+    /// The damaged packs scheduled for deletion (see [`CompactStats::damaged_packs_dropped`]).
+    damaged_packs_dropped: Vec<String>,
+    /// The damaged packs kept (see [`CompactStats::damaged_packs_kept`]).
+    damaged_packs_kept: Vec<KeptDamagedPack>,
+    /// The damaged packs left alone unsalvaged (see [`CompactStats::damaged_packs_skipped`]).
+    damaged_packs_skipped: Vec<String>,
+    /// Every damaged pack's salvage verdict, registered for the rest of the reading phase:
+    /// `compact` holds it while it reads targets and drops it before anything is deleted.
+    salvage_registration: Option<SalvageRegistration>,
 }
 
 /// The objects to pack and the old pack files a repack supersedes.
@@ -3748,15 +4126,30 @@ struct CollectedTargets {
 /// length: an import-produced store is mostly deltas, so using their on-disk length here would
 /// sort (and so window-batch) objects by how well they happened to already compress, not by how
 /// big they are, which is close to meaningless for grouping similar-sized objects together.
-fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String> {
+fn collect_targets(all: bool, redelta: bool, salvage: bool) -> Result<CollectedTargets, String> {
     if !all {
         return Ok(CollectedTargets {
             targets: enumerate_loose_objects()?,
             old_packs: Vec::new(),
             source_packs: Arc::new(PackSet::empty()),
-            unvalidated_packs: Vec::new(),
+            damaged_packs_dropped: Vec::new(),
+            damaged_packs_kept: Vec::new(),
+            damaged_packs_skipped: Vec::new(),
+            salvage_registration: None,
         });
     }
+
+    // Salvage runs before the liveness walk, so a tree only a corrupt bucket held is read from
+    // its salvaged copy, and a completely salvaged pack stops counting as a pack that might hold
+    // a hash its record table does not name. The registration outlives this function: `compact`
+    // holds it while it reads the targets, and ends it before anything is deleted.
+    let packs = loaded_packs()?;
+    let (completely_salvaged, salvage_registration) = if salvage {
+        let (complete, registration) = salvage_damaged_packs(&packs)?;
+        (complete, Some(registration))
+    } else {
+        (HashSet::new(), None)
+    };
 
     let live = crate::util::gc_utils::collect_live_set()?;
     let mut targets = Vec::new();
@@ -3783,19 +4176,33 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
     // its bytes as a zero-copy slice out of the mmap (addressed by `pack_index`), never a fresh
     // per-record file read.
     //
-    // Each pack's index is validated in full before any record is copied out of it. One that
-    // fails is left exactly as found — not copied from and not deleted — so a repack never
-    // carries forward a record no lookup would have trusted, and never destroys the objects its
-    // sound buckets still serve.
-    let packs = loaded_packs()?;
+    // Each pack's index is validated in full before any record is copied out of it. A damaged
+    // one is never copied from: its live records are read through the verified read instead,
+    // and it is deleted only when every live object it might hold is accounted for (see
+    // `collect_damaged_pack`).
     let mut old_packs = Vec::new();
-    let mut unvalidated_packs = Vec::new();
+    let mut damaged_packs_dropped = Vec::new();
+    let mut damaged_packs_kept = Vec::new();
+    let mut damaged_packs_skipped = Vec::new();
 
     for (pack_index, pack) in packs.packs.iter().enumerate() {
         let records = match pack.records() {
             Ok(records) => records,
+            Err(error) if !salvage => {
+                damaged_packs_skipped.push(error);
+                continue;
+            }
             Err(error) => {
-                unvalidated_packs.push(error);
+                let complete = completely_salvaged.contains(&pack.index_path());
+                let unaccounted = collect_damaged_pack(pack, complete, &live, &mut targets, &mut seen)?;
+                let index_path = pack.index_path().to_string_lossy().into_owned();
+                if unaccounted.is_empty() {
+                    old_packs.push(pack.data_path.clone());
+                    old_packs.push(pack.index_path());
+                    damaged_packs_dropped.push(index_path);
+                } else {
+                    damaged_packs_kept.push(KeptDamagedPack { index_path, error, unaccounted });
+                }
                 continue;
             }
         };
@@ -3903,7 +4310,91 @@ fn collect_targets(all: bool, redelta: bool) -> Result<CollectedTargets, String>
         }
     }
 
-    Ok(CollectedTargets { targets, old_packs, source_packs: packs, unvalidated_packs })
+    Ok(CollectedTargets {
+        targets, old_packs, source_packs: packs, damaged_packs_dropped, damaged_packs_kept, damaged_packs_skipped,
+        salvage_registration,
+    })
+}
+
+/// A full repack's handling of one damaged pack (FORK-194), after salvage: make each live object
+/// its sound buckets serve a target, and decide whether the pack may be deleted. Returns the live
+/// hashes the pack might hold that no other copy serves verified, sorted; the pack may be deleted
+/// only when there are none.
+///
+/// Each live record of a sound bucket is first read through the verified read. One that reads
+/// becomes a `Source::Reconstruct` target, never a verbatim copy, since the pack is not trusted
+/// whole. One that does not is no target at all and keeps the pack: a target that cannot be read
+/// would fail the whole run, and a healthy pack's verbatim delta against it would be demoted and
+/// fail with it, where leaving it alone keeps every copy as it is. The probe runs before the
+/// duplicate check, so a copy selected earlier is never demoted on behalf of a failed read.
+///
+/// Then the drop gate: every live hash the pack locates in a corrupt bucket must either read
+/// verified through the uncached classified read, or the pack must have been completely salvaged
+/// (`complete`) and its raw record table not name the hash. The liveness walk passing is not
+/// enough, since it never reads a blob or a chunk.
+fn collect_damaged_pack(
+    pack: &LoadedPack,
+    complete: bool,
+    live: &HashSet<String>,
+    targets: &mut Vec<PackTarget>,
+    seen: &mut HashMap<[u8; HASH_LEN], usize>,
+) -> Result<Vec<String>, String> {
+    use crate::util::file_utils::StoreReadOutcome;
+
+    let mut unaccounted = Vec::new();
+
+    for record in pack.index.valid_bucket_records() {
+        let mut hash = [0u8; HASH_LEN];
+        hash.copy_from_slice(record.hash);
+        let hex = sign_utils::to_hex(&hash);
+
+        if !live.contains(&hex) {
+            continue;
+        }
+
+        if !matches!(file_utils::read_object_classified(&hex)?, StoreReadOutcome::Verified(_)) {
+            unaccounted.push(hex);
+            continue;
+        }
+
+        if let Some(&existing_index) = seen.get(&hash) {
+            let loose_source = match &targets[existing_index].source {
+                Source::Reconstruct { .. } => continue,
+                Source::Loose(path) => Some(path.clone()),
+                Source::CopyRecord { .. } => None,
+            };
+            targets[existing_index].source = Source::Reconstruct { loose_source };
+            continue;
+        }
+
+        // The size is only a sort key; a header that does not parse falls back to the on-disk
+        // length rather than failing a record that has just read verified.
+        let size = read_record_header(pack, record.offset, record.length).ok()
+            .and_then(|header| header.raw_len)
+            .unwrap_or(record.length);
+
+        seen.insert(hash, targets.len());
+        targets.push(PackTarget { hash, size, source: Source::Reconstruct { loose_source: None } });
+    }
+
+    let raw_table = complete.then(|| pack.index.raw_record_hashes());
+    for hex in live {
+        let Some(hash) = hash_to_bytes(hex) else {
+            continue;
+        };
+        if !matches!(pack.locate(&hash), Located::CorruptBucket(_)) {
+            continue;
+        }
+        if raw_table.as_ref().is_some_and(|raw_table| !raw_table.contains(&hash)) {
+            continue;
+        }
+        if !matches!(file_utils::read_object_classified(hex)?, StoreReadOutcome::Verified(_)) {
+            unaccounted.push(hex.clone());
+        }
+    }
+
+    unaccounted.sort();
+    Ok(unaccounted)
 }
 
 /// A record's kind and, for a delta, its base hash and the raw (decompressed) length of the
@@ -5225,7 +5716,7 @@ pub(crate) mod tests {
 
         // Compaction relocates the bytes (loose → pack), but the content for a hash is
         // immutable, so the cached value stays valid — no stale reads.
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
         assert_eq!(file_utils::retrieve_object_by_hash(&hash).unwrap(), content);
 
         std::fs::remove_dir_all(&temp).ok();
@@ -5275,7 +5766,7 @@ pub(crate) mod tests {
         // Packs it; loose is removed, so the only path to this hash is now through a pack.
         // `compact`'s own trailing `invalidate_cache()` leaves the registry empty afterward —
         // nothing is mapped yet.
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
 
         // A read through the real (uncached-content) path: this is what actually populates
         // `PACK_REGISTRY` with a live `Mmap` for the pack just written.
@@ -5566,7 +6057,7 @@ pub(crate) mod tests {
             store_loose(hash, content);
         }
 
-        let stats = compact(false, false, &Progress::NONE).unwrap();
+        let stats = compact(false, false, false, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 3);
         assert_eq!(stats.packs_written, 1);
         assert_eq!(stats.loose_removed, 3);
@@ -5619,7 +6110,7 @@ pub(crate) mod tests {
         let loose = file_utils::does_object_exist(&upper);
         assert!(loose.is_err(), "loose: an uppercase spelling is refused, got {:?}", loose);
 
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
         assert!(!Path::new(&folder).join(&file_name).exists(), "the object is now packed only");
         assert!(file_utils::does_object_exist(&hash).unwrap(), "the packed object is present");
@@ -5656,7 +6147,7 @@ pub(crate) mod tests {
         std::fs::rename(&folder, &upper).unwrap();
         let folds = Path::new(&folder).join(&file_name).exists();
 
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
 
         assert_eq!(is_in_packs(&hash).unwrap(), folds, "packed exactly where reads reach it (folds: {})", folds);
         assert_eq!(upper.join(&file_name).exists(), !folds, "the loose entry goes once packed");
@@ -5695,7 +6186,7 @@ pub(crate) mod tests {
         let genuine_hash = blake3::hash(&genuine_content).to_hex().to_string();
         store_loose(&genuine_hash, &genuine_content);
 
-        let stats = compact(false, false, &Progress::NONE).unwrap();
+        let stats = compact(false, false, false, &Progress::NONE).unwrap();
 
         assert!(corrupt_path.exists(), "a corrupt loose object must be left in place, never deleted");
         assert!(!is_in_packs(&good_hash).unwrap(),
@@ -5735,7 +6226,7 @@ pub(crate) mod tests {
         let genuine_hash = blake3::hash(&genuine_content).to_hex().to_string();
         store_loose(&genuine_hash, &genuine_content);
 
-        let result = compact(false, false, &Progress::NONE);
+        let result = compact(false, false, false, &Progress::NONE);
         assert!(result.is_ok(), "one corrupt loose object must not abort the whole compact, got {:?}", result);
         let stats = result.unwrap();
         assert_eq!(stats.corrupt_skipped, 1);
@@ -5767,7 +6258,7 @@ pub(crate) mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&giant_hash).unwrap();
         let giant_path = Path::new(&folder).join(&file_name);
 
-        let stats = compact(false, false, &Progress::NONE).unwrap();
+        let stats = compact(false, false, false, &Progress::NONE).unwrap();
 
         assert_eq!(stats.over_ceiling_skipped, 1);
         assert_eq!(stats.corrupt_skipped, 0, "a grandfathered giant is not corruption");
@@ -5827,7 +6318,7 @@ pub(crate) mod tests {
         // this test corrupts below must be the blob: the one object in this fixture the graph
         // build never reads, so the read cache is never warmed with its pre-corruption bytes and
         // the corruption below is guaranteed to actually reach disk on the next read.
-        let stats = compact(false, false, &Progress::NONE).unwrap();
+        let stats = compact(false, false, false, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 3);
 
         let pack_path = std::fs::read_dir(pack_folder()).unwrap()
@@ -5858,7 +6349,7 @@ pub(crate) mod tests {
         // `--all --redelta` forces every live packed object through `Source::Reconstruct` (see
         // `collect_targets`) -- the same path a dropped-base repack already uses -- never
         // `Source::Loose`, so this can never become `CorruptLoose`.
-        let result = compact(true, true, &Progress::NONE);
+        let result = compact(true, true, true, &Progress::NONE);
         assert!(result.is_err(), "a corrupt packed record reached via Reconstruct must abort, not skip");
         assert!(pack_path.exists(), "abort must precede old-pack removal -- the corrupt pack must survive");
 
@@ -5975,7 +6466,7 @@ pub(crate) mod tests {
         // genuine pack -- pack A. No existing packs yet, so nothing here is a `CopyRecord`; this
         // just gets X (and its tree/parcel) off loose and into a real pack the way any first
         // `compact --all` would.
-        let first = compact(true, false, &Progress::NONE).unwrap();
+        let first = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
         assert!(!is_stored_as_delta(&x_hash),
             "sanity: X must land as a full record for this fixture -- a delta would exercise a \
@@ -6054,7 +6545,7 @@ pub(crate) mod tests {
         // enumerates first) and copies it verbatim -- never reconstructed, never hash-checked on
         // this path. Every old pack (the duplicate *and* pack A, the good copy) is deleted once
         // this repack completes.
-        let second = compact(true, false, &Progress::NONE).unwrap();
+        let second = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(second.objects_packed, 3, "sanity: the repack still carries all three live objects forward");
 
         // The repack did happen: the duplicate's own (distinctly-named) files are gone, and only
@@ -6166,7 +6657,7 @@ pub(crate) mod tests {
 
         // First `compact --all`: X is packed good into pack A. No existing packs yet, so nothing
         // here is a `CopyRecord` -- this is a genuine, verified pack.
-        let first = compact(true, false, &Progress::NONE).unwrap();
+        let first = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
 
         let (folder, file_name) = file_utils::get_path_for_object(&x_hash).unwrap();
@@ -6181,7 +6672,7 @@ pub(crate) mod tests {
 
         // Second `compact --all`: X is live and present both loose (corrupt) and packed (good,
         // in pack A). Must consolidate to the good copy and delete the corrupt loose duplicate.
-        let second = compact(true, false, &Progress::NONE).unwrap();
+        let second = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(second.objects_packed, 3, "sanity: the repack still carries all three live objects forward");
 
         assert!(!corrupt_loose_path.exists(),
@@ -6274,7 +6765,7 @@ pub(crate) mod tests {
             &parcel_object.hash,
         ).unwrap();
 
-        let first = compact(true, false, &Progress::NONE).unwrap();
+        let first = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
         assert!(!is_stored_as_delta(&x_hash),
             "sanity: X must land as a full record for this fixture, see T1a's doc comment above");
@@ -6336,7 +6827,7 @@ pub(crate) mod tests {
             "fixture defect: X is still servable (warm read cache or corruption did not take) -- \
             the compact under test would be rescued, not exercised");
 
-        let result = compact(true, false, &Progress::NONE);
+        let result = compact(true, false, true, &Progress::NONE);
         let error = match result {
             Err(e) => e,
             Ok(_) => panic!("compact must abort when no copy of a duplicated live hash verifies, got Ok"),
@@ -6424,7 +6915,7 @@ pub(crate) mod tests {
             &parcel_object.hash,
         ).unwrap();
 
-        let first = compact(true, false, &Progress::NONE).unwrap();
+        let first = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
         assert!(!is_stored_as_delta(&x_hash),
             "sanity: X must land as a full record for this fixture, see T1a's doc comment above");
@@ -6476,7 +6967,7 @@ pub(crate) mod tests {
             "fixture defect: X is still servable (warm read cache or corruption did not take) -- \
             the compact under test would be rescued, not exercised");
 
-        let result = compact(true, false, &Progress::NONE);
+        let result = compact(true, false, true, &Progress::NONE);
         assert!(result.is_ok(),
             "a byte-identical duplicate (even a corrupt one) must keep the verbatim CopyRecord \
             fast path and never abort the repack, got {:?}", result);
@@ -6532,7 +7023,7 @@ pub(crate) mod tests {
             &parcel_object.hash,
         ).unwrap();
 
-        let first = compact(true, false, &Progress::NONE).unwrap();
+        let first = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(first.objects_packed, 3, "sanity: blob + tree + parcel all packed");
 
         let folder = pack_folder();
@@ -6561,7 +7052,7 @@ pub(crate) mod tests {
             assert_eq!(loaded.packs[0].data_path, dup_data, "sanity: the duplicate must enumerate first");
         }
 
-        let second = compact(true, false, &Progress::NONE).unwrap();
+        let second = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(second.objects_packed, 3, "sanity: the repack still carries all three live objects forward");
 
         let packs_remaining: Vec<PathBuf> = std::fs::read_dir(&folder).unwrap()
@@ -6669,7 +7160,7 @@ pub(crate) mod tests {
         assert_eq!(pre_repack, giant, "the pre-repack read must return the giant's real bytes");
 
         let folder = pack_folder();
-        let stats = compact(true, false, &Progress::NONE).unwrap();
+        let stats = compact(true, false, true, &Progress::NONE).unwrap();
 
         assert_eq!(stats.objects_packed, 3, "sanity: giant + tree + parcel all carried forward");
         assert_eq!(stats.over_ceiling_skipped, 0,
@@ -6723,7 +7214,7 @@ pub(crate) mod tests {
         assert!(loose_path.exists(), "sanity: the loose source exists before compacting");
 
         let _guard = SyncDirFaultGuard::failing("pack");
-        let error = match compact(false, false, &Progress::NONE) {
+        let error = match compact(false, false, false, &Progress::NONE) {
             Err(e) => e,
             Ok(_) => panic!("a blocked pack directory must fail compact's new-pack sync"),
         };
@@ -6764,7 +7255,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let error = match compact(false, false, &Progress::NONE) {
+        let error = match compact(false, false, false, &Progress::NONE) {
             Err(e) => e,
             Ok(_) => panic!("a standing taint must fail compact's re-check even with a clean sync"),
         };
@@ -6806,7 +7297,7 @@ pub(crate) mod tests {
 
         let full_size: u64 = contents.iter().map(|c| c.len() as u64).sum();
 
-        let stats = compact(false, false, &Progress::NONE).unwrap();
+        let stats = compact(false, false, false, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 30);
         assert!(stats.deltas > 0, "similar objects should be stored as deltas (got {})", stats.deltas);
 
@@ -7143,7 +7634,7 @@ pub(crate) mod tests {
         assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
             "the fixture's target must read before the repack");
 
-        match compact(true, false, &Progress::NONE) {
+        match compact(true, false, true, &Progress::NONE) {
             Ok(_) => {
                 invalidate_cache();
                 assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
@@ -7391,7 +7882,7 @@ pub(crate) mod tests {
         store_loose(&hash, &content);
 
         // Pack it (loose -> pack, loose file deleted). In-process this also invalidated the cache.
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
 
         // Simulate the stale peer: poison this process's registry back to "no packs" even though
         // the pack is on disk and the loose file is gone. A naive read now misses on both paths.
@@ -7420,9 +7911,9 @@ pub(crate) mod tests {
         store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
 
         let held = lock_utils::StoreLock::acquire().expect("hold the store lock");
-        assert!(compact(false, false, &Progress::NONE).is_err(), "compact must refuse while the shared store lock is held");
+        assert!(compact(false, false, false, &Progress::NONE).is_err(), "compact must refuse while the shared store lock is held");
         drop(held);
-        assert!(compact(false, false, &Progress::NONE).is_ok(), "compact runs once the store lock is free");
+        assert!(compact(false, false, false, &Progress::NONE).is_ok(), "compact runs once the store lock is free");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -7450,11 +7941,11 @@ pub(crate) mod tests {
         // Two separate incremental packs, so the repack has more than one old pack to supersede.
         let content_a = b"first pack content".to_vec();
         store_loose(&blake3::hash(&content_a).to_hex().to_string(), &content_a);
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
 
         let content_b = b"second pack content".to_vec();
         store_loose(&blake3::hash(&content_b).to_hex().to_string(), &content_b);
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
 
         let pack_paths_before: Vec<PathBuf> = std::fs::read_dir(pack_folder()).unwrap()
             .filter_map(|e| e.ok())
@@ -7465,7 +7956,7 @@ pub(crate) mod tests {
 
         // No pallet refs exist in this bare store, so the live set is empty: a repack must drop
         // every packed object as garbage and remove both old packs entirely.
-        let stats = compact(true, false, &Progress::NONE).unwrap();
+        let stats = compact(true, false, true, &Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 0, "nothing is reachable, so nothing should be repacked");
 
         for old_pack in &pack_paths_before {
@@ -7558,7 +8049,7 @@ pub(crate) mod tests {
         let wrong_bytes = zstd::encode_all(b"not the bytes that belong at this address".as_slice(), 0).unwrap();
         file_utils::write_object_to_file(Path::new(&folder), &file_name, wrong_bytes).unwrap();
 
-        let stats = compact(false, false, &Progress::NONE).unwrap();
+        let stats = compact(false, false, false, &Progress::NONE).unwrap();
 
         // v1's blob is corrupt and is skipped, not packed — same invariant clause (a)/(b) pin,
         // just reached as someone else's delta base this time.
@@ -7661,7 +8152,7 @@ pub(crate) mod tests {
             &parcel_v2_obj.hash,
         ).unwrap();
 
-        let stats = compact(false, false, &Progress::NONE).unwrap();
+        let stats = compact(false, false, false, &Progress::NONE).unwrap();
 
         // The giant is skipped, not corrupt, and left loose exactly as INV-5 already pins in
         // isolation.
@@ -7983,22 +8474,19 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
-    /// (FORK-118) A full repack validates each pack in full before copying from it. A pack whose
-    /// index fails is reported, neither copied from nor deleted, and the objects its sound buckets
-    /// hold stay readable; the other packs are repacked as usual.
+    /// (FORK-194) A full repack run without salvage, as auto-maintenance runs it, leaves a pack
+    /// whose index fails full validation exactly as found: reported as skipped, neither copied
+    /// from, salvaged nor deleted, and the objects its sound buckets hold stay readable; the other
+    /// packs are repacked as usual.
     ///
-    /// Mutations: make `collect_targets` schedule a pack that fails `records()` for deletion instead
-    /// of reporting it → `unvalidated_packs` is empty (red). Make a census load a pack that fails
-    /// full validation instead of listing it as damaged → `store_status` fails on it (red).
+    /// Mutations: salvage regardless of the switch → a salvaged loose copy appears and the pack is
+    /// dropped (red). Make a census load a pack that fails full validation instead of listing it
+    /// as damaged → `store_status` fails on it (red).
     #[test]
-    fn a_full_repack_leaves_a_pack_whose_index_fails_validation_in_place() {
+    fn a_full_repack_without_salvage_leaves_a_damaged_pack_in_place() {
         use crate::util::file_utils::StoreReadOutcome;
 
-        let temp = std::env::temp_dir().join(format!("forklift-repack-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
-        let _scope = StorageRootScope::enter(&temp);
-        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        let (temp, _scope) = salvage_root("repack-no-salvage");
         let folder = pack_folder();
 
         let mut pairs = Vec::new();
@@ -8027,13 +8515,16 @@ pub(crate) mod tests {
         assert!(census.quarantined_packs.is_empty(), "a damaged pack's data file loads, so it is not quarantined");
         assert_eq!(census.packs.len(), 1, "only the sound pack is counted");
 
-        let stats = compact(true, false, &Progress::NONE).unwrap();
+        let stats = compact(true, false, false, &Progress::NONE).unwrap();
 
-        assert_eq!(stats.unvalidated_packs.len(), 1, "{:?}", stats.unvalidated_packs);
+        let (loose_folder, loose_name) = file_utils::get_path_for_object(&objects[1][0].2).unwrap();
+        assert!(!Path::new(&loose_folder).join(&loose_name).exists(), "a run without salvage must write no salvaged copy");
+        assert_eq!(stats.damaged_packs_skipped.len(), 1, "{:?}", stats.damaged_packs_skipped);
         let index_name = corrupt_pair.index_path.file_name().unwrap().to_str().unwrap();
-        assert!(stats.unvalidated_packs[0].contains(index_name), "{:?}", stats.unvalidated_packs);
+        assert!(stats.damaged_packs_skipped[0].contains(index_name), "{:?}", stats.damaged_packs_skipped);
+        assert!(stats.damaged_packs_dropped.is_empty() && stats.damaged_packs_kept.is_empty(), "{:?}", stats);
         assert!(corrupt_pair.index_path.exists() && corrupt_pair.data_path.exists(),
-            "a pack whose index failed validation must not be deleted");
+            "a damaged pack must not be deleted without salvage");
         // Nothing is reachable in this fixture, so the sound pack is dropped as garbage — the
         // repack ran for it as usual.
         assert!(!sound_pair.index_path.exists(), "the sound pack must be repacked as usual");
@@ -8041,6 +8532,777 @@ pub(crate) mod tests {
             StoreReadOutcome::Verified(bytes) => assert_eq!(bytes, survivor.0),
             other => panic!("an object in a sound bucket of the kept pack must stay readable, got {}", outcome_name(&other)),
         }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A salvage fixture's warehouse: a fresh storage root with a bay position, entered.
+    fn salvage_root(name: &str) -> (PathBuf, StorageRootScope) {
+        let temp = fresh_root(name);
+        let scope = StorageRootScope::enter(&temp);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        (temp, scope)
+    }
+
+    /// A blob built for a salvage fixture but not stored.
+    fn salvage_blob(content: &[u8]) -> crate::model::object::loose_object::LooseObject {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::blob::Blob;
+
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() });
+        assert_eq!(object_utils::hash_object_bytes(&blob.content), blob.hash, "a built object is named by its bytes");
+        blob
+    }
+
+    /// A blob built for a salvage fixture, `prefix` followed by a counter, whose hash satisfies
+    /// `wanted` for the bucket it falls in, in the index the writer produces for `count` records.
+    fn salvage_blob_where(prefix: &[u8], count: usize, wanted: impl Fn(usize) -> bool)
+        -> crate::model::object::loose_object::LooseObject {
+        (0..).map(|i| salvage_blob(&[prefix, format!("\nvariant {}\n", i).as_bytes()].concat()))
+            .find(|blob| wanted(salvage_bucket(count, &blob.hash)))
+            .unwrap()
+    }
+
+    /// The bucket `hash` falls in, in the index the writer produces for `count` records.
+    fn salvage_bucket(count: usize, hash: &str) -> usize {
+        index_format::bucket_in_index_of(count, &hash_to_bytes(hash).unwrap())
+    }
+
+    /// A root tree built for a salvage fixture but not stored, naming each `(name, hash, kind)`.
+    fn salvage_tree(entries: &[(&str, &str, crate::enums::dir_entry_type::DirEntryType)])
+        -> crate::model::object::loose_object::LooseObject {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::tree_item::TreeItem;
+
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        for (name, hash, kind) in entries {
+            tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *kind));
+        }
+        LooseObjectBuilder::build_tree(&tree)
+    }
+
+    /// Point `main` at a parentless parcel over `tree_hash`, stored loose, so a full repack's
+    /// liveness walk keeps the tree and everything it names.
+    fn commit_salvage_tree(tree_hash: &str) {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+
+        let parcel = Parcel {
+            tree_hash: tree_hash.to_string(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("salvage fixture".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::update_pallet_head("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &parcel_object.hash)
+            .unwrap();
+    }
+
+    /// Write the raw pack `<stem>` holding `records` in the given order (see [`write_raw_pack`]).
+    /// Returns its index path and each record's offset in its data file.
+    fn write_salvage_pack(stem: &str, records: &[(String, Vec<u8>)]) -> (PathBuf, Vec<usize>) {
+        let borrowed: Vec<(&str, Vec<u8>)> = records.iter().map(|(hash, record)| (hash.as_str(), record.clone())).collect();
+        write_raw_pack(&pack_folder(), stem, &borrowed);
+
+        let mut offsets = Vec::new();
+        let mut at = PACK_DATA_HEADER_LEN as usize;
+        for (_, record) in records {
+            offsets.push(at);
+            at += record.len();
+        }
+        (pack_folder().join(format!("{}.{}", stem, PACK_INDEX_EXTENSION)), offsets)
+    }
+
+    /// The full records of `count` numbered objects that nothing names, to spread a pack over
+    /// several index buckets.
+    fn salvage_fillers(tag: &str, count: usize) -> Vec<(String, Vec<u8>)> {
+        numbered_objects(tag, count).into_iter().map(|(content, _, hex)| (hex, full_record(&content))).collect()
+    }
+
+    /// Destroy the record at `offset` of pack `<stem>`'s data file: its kind byte becomes one no
+    /// record has, so the record neither reads nor walks.
+    fn destroy_salvage_record(stem: &str, offset: usize) {
+        let path = pack_folder().join(format!("{}.{}", stem, PACK_DATA_EXTENSION));
+        let mut data = std::fs::read(&path).unwrap();
+        assert!(data[offset] == RECORD_FULL || data[offset] == RECORD_DELTA, "offset {} must start a record", offset);
+        data[offset] = 0xEE;
+        std::fs::write(&path, data).unwrap();
+        invalidate_cache();
+    }
+
+    /// Fail validation of the index bucket `hash` falls in, at `index_path`.
+    fn corrupt_salvage_bucket(index_path: &Path, hash: &str) {
+        corrupt_record_of(index_path, &hash_to_bytes(hash).unwrap());
+        invalidate_cache();
+    }
+
+    /// The variant of `hash`'s uncached classified read.
+    fn salvage_read(hash: &str) -> String {
+        outcome_name(&file_utils::read_object_classified(hash).unwrap())
+    }
+
+    /// Whether a loose file is stored under `hash`.
+    fn is_loose(hash: &str) -> bool {
+        let (folder, file_name) = file_utils::get_path_for_object(hash).unwrap();
+        Path::new(&folder).join(file_name).exists()
+    }
+
+    fn salvage_compact() -> Result<CompactStats, String> {
+        compact(true, false, true, &Progress::NONE)
+    }
+
+    /// (FORK-194, T1) A pack whose index has a corrupt bucket but whose data is intact is
+    /// salvaged by a full repack: every live object, those in the corrupt bucket included, reads
+    /// verified afterwards, the damaged pack is gone, and the census reports no damaged pack.
+    ///
+    /// Revert: salvage nothing → the liveness walk refuses on the tree in the corrupt bucket (red).
+    #[test]
+    fn a_full_repack_salvages_a_pack_with_a_corrupt_bucket_and_drops_it() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-recovers");
+        let blob = salvage_blob(b"salvage recovers this file\n");
+        let tree = salvage_tree(&[("file.txt", &blob.hash, DirEntryType::Normal)]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (blob.hash.clone(), full_record(&blob.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        corrupt_salvage_bucket(&index, &blob.hash);
+        commit_salvage_tree(&tree.hash);
+        assert!(salvage_read(&blob.hash).starts_with("Unverifiable"), "{}", salvage_read(&blob.hash));
+
+        let stats = salvage_compact().unwrap();
+
+        assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
+        assert!(stats.damaged_packs_dropped[0].contains("a-crafted.idx"), "{:?}", stats.damaged_packs_dropped);
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert!(!index.exists(), "a completely recovered damaged pack must be deleted");
+        for hash in [&blob.hash, &tree.hash] {
+            assert_eq!(salvage_read(hash), "Verified", "{}", hash);
+        }
+        assert!(store_status().unwrap().damaged_packs.is_empty(), "no damaged pack may remain");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T2) A live blob in the corrupt bucket whose record is destroyed has no copy
+    /// salvage can recover: the repack keeps the pack, names the blob, and the blob still reads
+    /// unverifiable, never absent.
+    ///
+    /// Revert: drop the gate → the pack is deleted and the blob reads absent (red).
+    #[test]
+    fn a_full_repack_keeps_a_damaged_pack_holding_the_only_copy_of_a_live_object() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-gate");
+        let blob = salvage_blob(b"only the damaged pack held this file\n");
+        let tree = salvage_tree(&[("file.txt", &blob.hash, DirEntryType::Normal)]);
+        let (index, offsets) = write_salvage_pack("a-crafted", &[
+            (tree.hash.clone(), full_record(&tree.content)),
+            (blob.hash.clone(), full_record(&blob.content)),
+        ]);
+        destroy_salvage_record("a-crafted", offsets[1]);
+        corrupt_salvage_bucket(&index, &tree.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_dropped.is_empty(), "{:?}", stats.damaged_packs_dropped);
+        assert_eq!(stats.damaged_packs_kept.len(), 1, "{:?}", stats);
+        assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![blob.hash.clone()]);
+        assert!(stats.damaged_packs_kept[0].index_path.contains("a-crafted.idx"), "{:?}", stats.damaged_packs_kept);
+        assert!(index.exists(), "the damaged pack holds the only copy and must be kept");
+        assert!(salvage_read(&blob.hash).starts_with("Unverifiable"), "{}", salvage_read(&blob.hash));
+        assert_eq!(salvage_read(&tree.hash), "Verified", "the tree was salvaged");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T3) A delta chain inside the corrupt bucket whose records precede their bases
+    /// is recovered over several salvage passes, and the pack is dropped.
+    ///
+    /// Revert: allow a single pass → the pack is kept naming the waiting deltas (red).
+    #[test]
+    fn salvage_recovers_a_delta_chain_whose_records_precede_their_bases() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-chain");
+        let [c, b, t] = chain_contents("salvage chain").map(|(content, _)| salvage_blob(&content));
+        let tree = salvage_tree(&[
+            ("b.txt", &b.hash, DirEntryType::Normal),
+            ("c.txt", &c.hash, DirEntryType::Normal),
+            ("t.txt", &t.hash, DirEntryType::Normal),
+        ]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (t.hash.clone(), delta_record(&b.hash, &b.content, &t.content)),
+            (b.hash.clone(), delta_record(&c.hash, &c.content, &b.content)),
+            (c.hash.clone(), full_record(&c.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        corrupt_salvage_bucket(&index, &t.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
+        for hash in [&t.hash, &b.hash, &c.hash] {
+            assert_eq!(salvage_read(hash), "Verified", "{}", hash);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T3b) A delta in one damaged pack whose base only another damaged pack holds is
+    /// recovered even when its own pack is salvaged first, and both packs are dropped.
+    ///
+    /// Revert: retry pending deltas only within their own pack → the first pack is kept naming the
+    /// delta (red).
+    #[test]
+    fn salvage_recovers_a_delta_whose_base_another_damaged_pack_holds() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-cross-pack");
+        let [_, b, t] = chain_contents("salvage cross pack").map(|(content, _)| salvage_blob(&content));
+        let tree = salvage_tree(&[("b.txt", &b.hash, DirEntryType::Normal), ("t.txt", &t.hash, DirEntryType::Normal)]);
+        let (dependent, _) = write_salvage_pack("a-dependent", &[
+            (t.hash.clone(), delta_record(&b.hash, &b.content, &t.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        let (base, _) = write_salvage_pack("b-base", &[(b.hash.clone(), full_record(&b.content))]);
+        corrupt_salvage_bucket(&dependent, &t.hash);
+        corrupt_salvage_bucket(&base, &b.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let order: Vec<PathBuf> = loaded_packs().unwrap().packs.iter().map(|pack| pack.index_path()).collect();
+        assert_eq!(order, vec![dependent.clone(), base.clone()], "the dependent pack must be salvaged first");
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert_eq!(stats.damaged_packs_dropped.len(), 2, "{:?}", stats);
+        assert!(!dependent.exists() && !base.exists(), "both damaged packs must be deleted");
+        for hash in [&t.hash, &b.hash] {
+            assert_eq!(salvage_read(hash), "Verified", "{}", hash);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T4) A live delta in a sound bucket whose base lay in the corrupt bucket survives
+    /// the repack: salvage recovers the base before the delta is probed.
+    ///
+    /// Revert: salvage nothing → the delta fails its probe and the pack is kept naming it (red).
+    #[test]
+    fn a_sound_bucket_delta_survives_when_its_base_lay_in_the_corrupt_bucket() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-sound-delta");
+        let count = 203;
+        let base = salvage_blob(&[b"salvage sound delta base\n".as_slice(), &deterministic_fill(4000)].concat());
+        let base_bucket = salvage_bucket(count, &base.hash);
+        let delta = salvage_blob_where(&base.content[8..], count, |bucket| bucket != base_bucket);
+        let tree = salvage_tree(&[("delta.txt", &delta.hash, DirEntryType::Normal)]);
+        let mut records = salvage_fillers("salvage sound delta", 200);
+        records.push((base.hash.clone(), full_record(&base.content)));
+        records.push((delta.hash.clone(), delta_record(&base.hash, &base.content, &delta.content)));
+        records.push((tree.hash.clone(), full_record(&tree.content)));
+        assert_eq!(records.len(), count);
+        let (index, _) = write_salvage_pack("a-crafted", &records);
+        corrupt_salvage_bucket(&index, &base.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
+        assert_eq!(salvage_read(&delta.hash), "Verified");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T5) A pack whose buckets are all sound but whose records do not tile its data
+    /// file (junk appended) fails full validation; with every live record readable, the repack
+    /// drops it and every live object it served survives.
+    #[test]
+    fn a_full_repack_drops_a_pack_that_fails_only_the_tile_check() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-tile");
+        let blob = salvage_blob(b"a tile-only damaged pack serves this file\n");
+        let tree = salvage_tree(&[("file.txt", &blob.hash, DirEntryType::Normal)]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (blob.hash.clone(), full_record(&blob.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        let data_path = index.with_extension(PACK_DATA_EXTENSION);
+        let mut data = std::fs::read(&data_path).unwrap();
+        data.extend_from_slice(b"\xEEtrailing junk");
+        std::fs::write(&data_path, data).unwrap();
+        invalidate_cache();
+        commit_salvage_tree(&tree.hash);
+        assert_eq!(store_status().unwrap().damaged_packs.len(), 1, "the pack must fail full validation");
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
+        assert!(!index.exists());
+        for hash in [&blob.hash, &tree.hash] {
+            assert_eq!(salvage_read(hash), "Verified", "{}", hash);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T6) A live blob that was never fetched hashes into the corrupt bucket of a
+    /// completely salvaged pack. Every record the pack held is recovered and its raw table does
+    /// not name the blob, so the pack never held it and is dropped.
+    ///
+    /// Revert: remove arm (b) of the drop gate → the pack is kept naming the blob (red).
+    #[test]
+    fn a_completely_salvaged_pack_is_dropped_despite_a_live_hash_it_never_held() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-sparse");
+        let blob = salvage_blob(b"a stored file\n");
+        let never_fetched = salvage_blob(b"a file this store never fetched\n");
+        let tree = salvage_tree(&[
+            ("file.txt", &blob.hash, DirEntryType::Normal),
+            ("sparse.txt", &never_fetched.hash, DirEntryType::Normal),
+        ]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (blob.hash.clone(), full_record(&blob.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        corrupt_salvage_bucket(&index, &blob.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
+        assert_eq!(salvage_read(&never_fetched.hash), "Absent");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T7) As T6, but the damaged index names the never-fetched hash at another record's
+    /// bytes, so the pack's raw table claims it: salvage recovers every record and the record
+    /// count matches, yet the pack is kept naming the hash.
+    ///
+    /// Revert: remove the raw-table condition from arm (b) → the pack is dropped (red).
+    #[test]
+    fn a_completely_salvaged_pack_is_kept_while_its_raw_table_names_a_live_hash() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-raw-table");
+        let blob = salvage_blob(b"a stored file, recorded twice\n");
+        let claimed = salvage_blob(b"a file the index claims\n");
+        let tree = salvage_tree(&[
+            ("file.txt", &blob.hash, DirEntryType::Normal),
+            ("claimed.txt", &claimed.hash, DirEntryType::Normal),
+        ]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (blob.hash.clone(), full_record(&blob.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+            (claimed.hash.clone(), full_record(&blob.content)),
+        ]);
+        corrupt_salvage_bucket(&index, &blob.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_dropped.is_empty(), "{:?}", stats.damaged_packs_dropped);
+        assert_eq!(stats.damaged_packs_kept.len(), 1, "{:?}", stats);
+        assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![claimed.hash.clone()]);
+        assert!(index.exists());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T9) A legitimately absent subtree (a shallow or narrowed store) hashes into the
+    /// corrupt bucket of a completely salvaged pack: the liveness walk accepts its absence, and the
+    /// repack succeeds and drops the pack.
+    ///
+    /// Revert: remove the exoneration from the sweep predicate → the walk refuses on the subtree
+    /// (red).
+    #[test]
+    fn the_liveness_walk_accepts_an_absent_tree_a_completely_salvaged_pack_never_held() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-absent-tree");
+        let blob = salvage_blob(b"a file beside a narrowed-away directory\n");
+        let absent = salvage_tree(&[("elsewhere.txt", &blob.hash, DirEntryType::Normal)]);
+        let tree = salvage_tree(&[
+            ("file.txt", &blob.hash, DirEntryType::Normal),
+            ("narrowed", &absent.hash, DirEntryType::Tree),
+        ]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (blob.hash.clone(), full_record(&blob.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        corrupt_salvage_bucket(&index, &blob.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T10) An over-ceiling object sits behind a damaged hash entry: the index names it
+    /// under a hash one bit off, so only its decoded bytes could say what it is, and the bounded
+    /// decode refuses to produce them. Salvage is incomplete, so the pack is kept naming the live
+    /// object.
+    ///
+    /// Revert: let a refused record leave the salvage complete → the pack is dropped and the
+    /// object reads absent (red).
+    #[test]
+    fn a_record_the_bounded_decode_refuses_leaves_the_salvage_incomplete() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-over-ceiling");
+        let giant = vec![0u8; object_utils::MAX_OBJECT_BYTES + 1];
+        let giant_hash = object_utils::hash_object_bytes(&giant);
+        let mut damaged_entry = hash_to_bytes(&giant_hash).unwrap();
+        damaged_entry[HASH_LEN - 1] ^= 0x01;
+        let damaged_entry = sign_utils::to_hex(&damaged_entry);
+        let tree = salvage_tree(&[("giant.bin", &giant_hash, DirEntryType::Normal)]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (damaged_entry.clone(), full_record(&giant)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        corrupt_salvage_bucket(&index, &damaged_entry);
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_dropped.is_empty(), "{:?}", stats.damaged_packs_dropped);
+        assert_eq!(stats.damaged_packs_kept.len(), 1, "{:?}", stats);
+        assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![giant_hash.clone()]);
+        assert!(salvage_read(&giant_hash).starts_with("Unverifiable"), "{}", salvage_read(&giant_hash));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// An eight-bucket damaged pack `<stem>` for the probe tests: 200 fillers, then `base` (whose
+    /// record is destroyed and whose bucket is corrupted), then `delta` against it in another
+    /// bucket. Every record in the pack is written after the fillers, so the walk resumes at the
+    /// delta past the destroyed base. Returns the index path.
+    fn write_probe_pack(stem: &str, base: &crate::model::object::loose_object::LooseObject,
+        delta: &crate::model::object::loose_object::LooseObject) -> PathBuf {
+        let mut records = salvage_fillers(stem, 200);
+        records.push((base.hash.clone(), full_record(&base.content)));
+        records.push((delta.hash.clone(), delta_record(&base.hash, &base.content, &delta.content)));
+        let (index, offsets) = write_salvage_pack(stem, &records);
+        destroy_salvage_record(stem, offsets[200]);
+        corrupt_salvage_bucket(&index, &base.hash);
+        index
+    }
+
+    /// A base and a delta for [`write_probe_pack`], the delta in a different bucket of its
+    /// 202-record index.
+    fn probe_pair(tag: &str) -> (crate::model::object::loose_object::LooseObject, crate::model::object::loose_object::LooseObject) {
+        let base = salvage_blob(&[tag.as_bytes(), &deterministic_fill(4000)].concat());
+        let base_bucket = salvage_bucket(202, &base.hash);
+        let delta = salvage_blob_where(&base.content[8..], 202, |bucket| bucket != base_bucket);
+        (base, delta)
+    }
+
+    /// (FORK-194, T11) A sound-bucket delta whose base is unrecoverable fails the up-front probe:
+    /// the pack is kept naming it, and the run succeeds rather than failing on a target it cannot
+    /// read.
+    ///
+    /// Revert: make a failed probe a target → `compact --all` fails (red).
+    #[test]
+    fn a_sound_bucket_record_that_fails_its_probe_keeps_the_pack_without_failing_the_run() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-probe");
+        let (base, delta) = probe_pair("salvage probe base");
+        let index = write_probe_pack("a-damaged", &base, &delta);
+        let mut tree = salvage_tree(&[("delta.txt", &delta.hash, DirEntryType::Normal)]);
+        tree.store().unwrap();
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+        assert_eq!(stats.damaged_packs_kept.len(), 1, "{:?}", stats);
+        assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![delta.hash.clone()]);
+        assert!(index.exists());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T11, a corrupt loose copy) As T11, with a corrupt loose copy of the failing
+    /// delta: the loose copy stays a skipped target and the run still succeeds.
+    ///
+    /// Revert: probe after the duplicate check → the loose target is demoted to a reconstruction
+    /// that cannot read, and the run aborts (red).
+    #[test]
+    fn a_failed_probe_does_not_demote_a_corrupt_loose_copy() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-probe-loose");
+        let (base, delta) = probe_pair("salvage probe loose base");
+        let index = write_probe_pack("a-damaged", &base, &delta);
+        store_loose(&delta.hash, b"not the delta's bytes");
+        let mut tree = salvage_tree(&[("delta.txt", &delta.hash, DirEntryType::Normal)]);
+        tree.store().unwrap();
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+        assert_eq!(stats.damaged_packs_kept.len(), 1, "{:?}", stats);
+        assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![delta.hash.clone()]);
+        assert!(index.exists());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T11, a healthy copy) As T11, with a verbatim copy of the failing delta in a
+    /// healthy pack that sorts first, and its base live: that copy stays verbatim and the run
+    /// still succeeds.
+    ///
+    /// Revert: probe after the duplicate check → the healthy copy is demoted to a reconstruction
+    /// that cannot read, and the run aborts (red).
+    #[test]
+    fn a_failed_probe_does_not_demote_a_healthy_packs_verbatim_copy() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-probe-healthy");
+        let (base, delta) = probe_pair("salvage probe healthy base");
+        let healthy_delta = delta_record(&base.hash, &base.content, &delta.content);
+        let (healthy, _) = write_salvage_pack("a-healthy", &[(delta.hash.clone(), healthy_delta)]);
+        let damaged = write_probe_pack("b-damaged", &base, &delta);
+        let mut tree = salvage_tree(&[
+            ("base.txt", &base.hash, DirEntryType::Normal),
+            ("delta.txt", &delta.hash, DirEntryType::Normal),
+        ]);
+        tree.store().unwrap();
+        commit_salvage_tree(&tree.hash);
+
+        let order: Vec<PathBuf> = loaded_packs().unwrap().packs.iter().map(|pack| pack.index_path()).collect();
+        assert_eq!(order, vec![healthy.clone(), damaged.clone()], "the healthy pack must be collected first");
+
+        let stats = salvage_compact().unwrap();
+        assert_eq!(stats.damaged_packs_kept.len(), 1, "{:?}", stats);
+        let mut unaccounted = vec![base.hash.clone(), delta.hash.clone()];
+        unaccounted.sort();
+        assert_eq!(stats.damaged_packs_kept[0].unaccounted, unaccounted);
+        assert!(damaged.exists());
+        assert!(is_stored_as_delta(&delta.hash), "the healthy copy must be carried verbatim");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T12) A healthy pack's live delta whose base fails the probe in a damaged pack's
+    /// sound bucket is copied verbatim, the run succeeds, and the kept damaged pack still holds
+    /// the base.
+    ///
+    /// Revert: make the failed base a reconstruction target → the run aborts (red).
+    #[test]
+    fn a_healthy_delta_on_a_base_that_fails_its_probe_is_copied_verbatim() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-healthy-dependent");
+        let count = 201;
+        let base = salvage_blob(&[b"salvage healthy dependent base\n".as_slice(), &deterministic_fill(4000)].concat());
+        let base_bucket = salvage_bucket(count, &base.hash);
+        let dependent = salvage_blob(&[base.content.as_slice(), b"\nthe dependent adds a line\n"].concat());
+        let dependent_bucket = salvage_bucket(count, &dependent.hash);
+        let mut records = salvage_fillers("salvage healthy dependent", 200);
+        // The corrupt bucket holds neither the base nor the dependent, so the base fails only its
+        // probe and the dependent is not named.
+        let corrupted = records.iter()
+            .find(|(hash, _)| ![base_bucket, dependent_bucket].contains(&salvage_bucket(count, hash)))
+            .unwrap().0.clone();
+        records.push((base.hash.clone(), full_record(&base.content)));
+        let (damaged, offsets) = write_salvage_pack("a-damaged", &records);
+        destroy_salvage_record("a-damaged", offsets[200]);
+        corrupt_salvage_bucket(&damaged, &corrupted);
+        write_salvage_pack("b-healthy", &[(dependent.hash.clone(), delta_record(&base.hash, &base.content, &dependent.content))]);
+        let mut tree = salvage_tree(&[
+            ("base.txt", &base.hash, DirEntryType::Normal),
+            ("dependent.txt", &dependent.hash, DirEntryType::Normal),
+        ]);
+        tree.store().unwrap();
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+        assert_eq!(stats.damaged_packs_kept.len(), 1, "{:?}", stats);
+        assert_eq!(stats.damaged_packs_kept[0].unaccounted, vec![base.hash.clone()]);
+        assert!(damaged.exists(), "the damaged pack still holds the base");
+        assert!(is_stored_as_delta(&dependent.hash), "the dependent must be carried verbatim");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T13) A live object in the corrupt bucket that also has a corrupt loose copy is
+    /// recovered over that copy: it reads verified afterwards and the pack is dropped.
+    ///
+    /// Revert: store through the presence-gated `store_object_bytes` → the write is skipped, the
+    /// object stays unverifiable and the pack is kept (red).
+    #[test]
+    fn salvage_writes_over_an_unreadable_loose_copy() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-corrupt-loose");
+        let blob = salvage_blob(b"a file with a corrupt loose copy\n");
+        let tree = salvage_tree(&[("file.txt", &blob.hash, DirEntryType::Normal)]);
+        let (index, _) = write_salvage_pack("a-crafted", &[
+            (blob.hash.clone(), full_record(&blob.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        corrupt_salvage_bucket(&index, &blob.hash);
+        store_loose(&blob.hash, b"not the blob's bytes");
+        commit_salvage_tree(&tree.hash);
+
+        let stats = salvage_compact().unwrap();
+
+        assert!(stats.damaged_packs_kept.is_empty(), "{:?}", stats.damaged_packs_kept);
+        assert_eq!(stats.damaged_packs_dropped.len(), 1, "{:?}", stats);
+        assert_eq!(salvage_read(&blob.hash), "Verified");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T14) A live tree in the corrupt bucket whose record is destroyed: the liveness
+    /// walk refuses, its error names the pack as not completely salvaged and says nothing was
+    /// deleted, and the pack and the salvaged copies are all still on disk.
+    ///
+    /// Revert: register no incompletely salvaged pack → the error does not name the salvage (red).
+    #[test]
+    fn a_walk_refusal_on_an_incompletely_salvaged_pack_says_so() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-refusal");
+        let blob = salvage_blob(b"a file beside a destroyed tree\n");
+        let tree = salvage_tree(&[("file.txt", &blob.hash, DirEntryType::Normal)]);
+        let (index, offsets) = write_salvage_pack("a-crafted", &[
+            (blob.hash.clone(), full_record(&blob.content)),
+            (tree.hash.clone(), full_record(&tree.content)),
+        ]);
+        destroy_salvage_record("a-crafted", offsets[1]);
+        corrupt_salvage_bucket(&index, &blob.hash);
+        commit_salvage_tree(&tree.hash);
+
+        let error = salvage_compact().unwrap_err();
+
+        assert!(error.contains("could not completely salvage"), "{}", error);
+        assert!(error.contains("Nothing was deleted"), "{}", error);
+        assert!(error.contains("a-crafted.idx"), "{}", error);
+        assert!(index.exists() && index.with_extension(PACK_DATA_EXTENSION).exists(), "nothing may be deleted");
+        assert!(is_loose(&blob.hash), "the salvaged copy must stay on disk");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T14b) The walk refuses on an unparseable index while an incompletely salvaged pack
+    /// also exists: the error carries the unparseable index's own reason and no salvage context.
+    ///
+    /// Revert: add the salvage context to every walk error while an incompletely salvaged pack
+    /// exists → it appears here (red).
+    #[test]
+    fn an_unrelated_walk_refusal_carries_no_salvage_context() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-unrelated-refusal");
+        let mut records = salvage_fillers("salvage unrelated refusal", 200);
+        let corrupted = records[0].0.clone();
+        let corrupt_bucket = salvage_bucket(200, &corrupted);
+        let (damaged, offsets) = write_salvage_pack("a-damaged", &records);
+        destroy_salvage_record("a-damaged", offsets[0]);
+        corrupt_salvage_bucket(&damaged, &corrupted);
+
+        let blob = salvage_blob(b"a file beside an unparseable index\n");
+        let absent = salvage_blob_where(b"an absent subtree's stand-in", 200, |bucket| bucket != corrupt_bucket);
+        let mut tree = salvage_tree(&[
+            ("file.txt", &blob.hash, DirEntryType::Normal),
+            ("narrowed", &absent.hash, DirEntryType::Tree),
+        ]);
+        tree.store().unwrap();
+        commit_salvage_tree(&tree.hash);
+
+        // Written last: while an index does not parse, nothing can be stored.
+        records = salvage_fillers("salvage unrelated unparseable", 1);
+        let (unparseable, _) = write_salvage_pack("b-unparseable", &records);
+        let mut index = std::fs::read(&unparseable).unwrap();
+        index[..8].copy_from_slice(b"NOTAPACK");
+        std::fs::write(&unparseable, index).unwrap();
+        invalidate_cache();
+
+        let error = salvage_compact().unwrap_err();
+
+        assert!(error.contains("could not be parsed"), "{}", error);
+        assert!(!error.contains("could not completely salvage"), "{}", error);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T14c) A live tree is a sound-bucket delta of a damaged pack whose base sits,
+    /// destroyed, in the corrupt bucket: the walk fails while loading the tree, and the load
+    /// error carries the salvage context.
+    ///
+    /// Revert: add the context only to the sweep predicate's answer → the load error lacks it (red).
+    #[test]
+    fn a_load_through_an_incompletely_salvaged_corrupt_bucket_says_so() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-load");
+        let blob = salvage_blob(b"a file named by both trees\n");
+        let base = salvage_tree(&[("file.txt", &blob.hash, DirEntryType::Normal)]);
+        let base_bucket = salvage_bucket(202, &base.hash);
+        let tree = (0..).map(|i| salvage_tree(&[
+                ("file.txt", &blob.hash, DirEntryType::Normal),
+                (&format!("copy-{}.txt", i), &blob.hash, DirEntryType::Normal),
+            ]))
+            .find(|tree| salvage_bucket(202, &tree.hash) != base_bucket)
+            .unwrap();
+        let index = write_probe_pack("a-damaged", &base, &tree);
+        commit_salvage_tree(&tree.hash);
+
+        let error = salvage_compact().unwrap_err();
+
+        assert!(error.contains("could not completely salvage"), "{}", error);
+        assert!(index.exists());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (FORK-194, T14d) A healthy pack's live delta has a dead base whose only copy sits, destroyed,
+    /// in a damaged pack's corrupt bucket: the repack fails while packing reads the delta, the
+    /// error carries the salvage context, and the damaged pack and the salvaged copies are still
+    /// on disk.
+    ///
+    /// Revert: end the salvage registration with target collection → the packing error lacks the
+    /// context (red).
+    #[test]
+    fn a_packing_read_through_an_incompletely_salvaged_corrupt_bucket_says_so() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        let (temp, _scope) = salvage_root("salvage-packing");
+        let [_, base, dependent] = chain_contents("salvage packing").map(|(content, _)| salvage_blob(&content));
+        let salvaged = salvage_blob(b"a record salvage recovers\n");
+        let (damaged, offsets) = write_salvage_pack("a-damaged", &[
+            (salvaged.hash.clone(), full_record(&salvaged.content)),
+            (base.hash.clone(), full_record(&base.content)),
+        ]);
+        destroy_salvage_record("a-damaged", offsets[1]);
+        corrupt_salvage_bucket(&damaged, &base.hash);
+        write_salvage_pack("b-healthy", &[(dependent.hash.clone(), delta_record(&base.hash, &base.content, &dependent.content))]);
+        let mut tree = salvage_tree(&[("dependent.txt", &dependent.hash, DirEntryType::Normal)]);
+        tree.store().unwrap();
+        commit_salvage_tree(&tree.hash);
+
+        let error = salvage_compact().unwrap_err();
+
+        assert!(error.contains(&dependent.hash), "{}", error);
+        assert!(error.contains("could not completely salvage"), "{}", error);
+        assert!(damaged.exists(), "nothing may be deleted");
+        assert!(is_loose(&salvaged.hash), "the salvaged copy must stay on disk");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -8433,11 +9695,11 @@ pub(crate) mod tests {
         store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
 
         let served = lock_utils::ServeLock::acquire().expect("hold the serve lock, as a live server does");
-        let error = compact(true, false, &Progress::NONE).expect_err("a repack must refuse while the root is served");
+        let error = compact(true, false, true, &Progress::NONE).expect_err("a repack must refuse while the root is served");
         assert!(error.contains("being served"), "the refusal should say the root is served: {}", error);
-        assert!(compact(false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a server");
+        assert!(compact(false, false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a server");
         drop(served);
-        assert!(compact(true, false, &Progress::NONE).is_ok(), "a repack runs once the root is no longer served");
+        assert!(compact(true, false, true, &Progress::NONE).is_ok(), "a repack runs once the root is no longer served");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -8459,18 +9721,18 @@ pub(crate) mod tests {
         let content = b"unreachable, packed, and found present by another bay's dedup".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
         store_loose(&hash, &content);
-        compact(false, false, &Progress::NONE).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
         assert!(is_in_packs(&hash).unwrap(), "sanity: the object is packed before the repack");
 
         let writer = lock_utils::StoreAccessLock::shared(|| panic!("nothing holds the store exclusively"))
             .expect("hold the store shared, as a writer in another bay does");
-        let error = compact(true, false, &Progress::NONE).expect_err("a repack must refuse beside a writer");
+        let error = compact(true, false, true, &Progress::NONE).expect_err("a repack must refuse beside a writer");
         assert!(error.contains("using the object store"), "the refusal should say the store is in use: {}", error);
         assert!(is_in_packs(&hash).unwrap(), "the refused repack must leave the unreachable object packed");
-        assert!(compact(false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a writer");
+        assert!(compact(false, false, false, &Progress::NONE).is_ok(), "incremental compaction runs beside a writer");
         drop(writer);
 
-        compact(true, false, &Progress::NONE).expect("a repack runs once no writer holds the store");
+        compact(true, false, true, &Progress::NONE).expect("a repack runs once no writer holds the store");
         assert!(!is_in_packs(&hash).unwrap(), "with no writer, the repack drops the unreachable object");
 
         std::fs::remove_dir_all(&temp).ok();
@@ -8494,13 +9756,13 @@ pub(crate) mod tests {
 
         let deleter = lock_utils::StoreAccessLock::try_exclusive()
             .expect("hold the store exclusively, as a scope-prune in another bay does");
-        let error = compact(false, false, &Progress::NONE)
+        let error = compact(false, false, false, &Progress::NONE)
             .expect_err("incremental compaction must refuse beside a deleter");
         assert!(error.contains("maintenance"), "the refusal should name the maintenance: {}", error);
         assert!(!is_in_packs(&hash).unwrap(), "the refused compaction must leave the object loose");
         drop(deleter);
 
-        compact(false, false, &Progress::NONE).expect("incremental compaction runs once the deleter is done");
+        compact(false, false, false, &Progress::NONE).expect("incremental compaction runs once the deleter is done");
         assert!(is_in_packs(&hash).unwrap(), "with no deleter, the object is packed");
 
         std::fs::remove_dir_all(&temp).ok();

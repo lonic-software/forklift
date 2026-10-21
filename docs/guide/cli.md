@@ -1613,10 +1613,20 @@ hard-killed leaves its `serve.lock` behind, which blocks repacks (automatic ones
 it is removed, exactly as it blocks `gc`.
 
 A full repack checks each pack's whole index before copying anything out of it. A pack whose
-index fails that check is **left in place, untouched**, and named in a `Left a pack in place, not
-repacked:` note (`--json`: `unvalidated_packs`, the list of those errors). Its sound parts are still
-read; an object in a damaged part reads as unverifiable until it is stored again. Ordinary commands never pay that
-whole-index check: they verify only the slice of an index they actually read.
+index fails that check (a **damaged** pack, as `store` lists it) is **salvaged** instead of copied:
+before anything else, the repack reads the pack's data file record by record without trusting the
+index, and stores every object it can decode as an ordinary loose object, so an object only a
+damaged part of the index named reads again. Nothing is copied out of a damaged pack verbatim; each
+live object it serves is read and verified first. The pack is then **removed** only when every live
+object it might hold reads from another copy (`Salvaged and removed the damaged pack …`; `--json`:
+`damaged_packs_dropped`, the index paths). Otherwise it is **kept**, and the note names the live
+objects no other copy serves (`--json`: `damaged_packs_kept`, `[{index_path, error, unaccounted}]`):
+this store cannot recover those (a good copy of the pack's files, or of the objects from
+elsewhere, can). Salvage writes every object it decodes, garbage included; the garbage is collected
+later by `gc`, and until then it can need up to the pack's decompressed size in free space. Only an
+explicit `compact --all` salvages: the automatic repack leaves a damaged pack exactly as it found it.
+Ordinary commands never pay that whole-index check: they verify only the slice of an index they
+actually read.
 
 Telling garbage from live content means reading every parcel, tree and large-file recipe still
 in use. If one of those is missing but a broken pack might hold it (a damaged part of a pack, a
@@ -1624,7 +1634,12 @@ pack whose data file is missing, or a pack index that cannot be read at all), th
 **refuses and deletes nothing**, naming the object: what it refers to cannot be told apart from
 garbage. `scope-prune` and `forklift-server gc` refuse the same way. `forklift store` lists the
 pack under `quarantined_packs`, `damaged_packs`, `unenumerable_indexes` or
-`foreign_version_indexes`; once the pack is restored or moved aside, the sweep can run.
+`foreign_version_indexes`; once the pack is restored or moved aside, the sweep can run. A full
+repack salvages a damaged pack before this walk, so it refuses only on what salvage could not
+recover, and then says that the pack could not be completely salvaged: nothing was deleted, but an
+object read through the pack's damaged part may be held nowhere else, and this store cannot recover
+it. A damaged pack it salvaged completely (every record of its data file decoded and readable
+again) no longer blocks the walk on an object its index never named.
 
 For the same reason a full repack is **refused while a mutating command is running in another
 bay** of the same warehouse: that command may have just decided to reuse an object the repack
@@ -1698,8 +1713,8 @@ failing the census: the objects it named are not lost, only unreachable through 
 `heal` can refetch from a configured remote any of them still under a durability taint (for the
 rest, restore the pack's data file). `store` checks every index in full: a pack whose
 index is damaged in places is listed under `damaged_packs` (same shape) and left out of the counts.
-Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable until
-it is stored again. `unenumerable_indexes` — the same `[{index_path,
+Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable.
+`forklift compact --all` salvages it (see [`compact`](#compact--pack-the-object-store)). `unenumerable_indexes` — the same `[{index_path,
 error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
 is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
 aside and re-run. `foreign_version_indexes` (same shape) lists an index written by a build with a
@@ -1787,7 +1802,7 @@ above) and prints a warning line for each one it finds — unconditionally, whet
 else was tainted this run, and whether or not that index is what caused the taint. A quarantined
 index's objects are left recoverable (`heal` refetches those under a durability taint, and
 restoring the pack's data file recovers the rest); a damaged pack still serves its
-sound parts; an index of another format means re-creating the warehouse; an unenumerable one names
+sound parts, and once no taint is standing `forklift compact --all` salvages it; an index of another format means re-creating the warehouse; an unenumerable one names
 the file to move aside. This appears even when `heal` still has to refuse — as a
 clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
 index the refusal itself names (see the bullet above) is part of its cause; the time one coincides

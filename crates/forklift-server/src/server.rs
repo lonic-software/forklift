@@ -3922,7 +3922,7 @@ mod tests {
             let bytes = b"an object only a pack holds";
             let hash = object_utils::hash_object_bytes(bytes);
             object_utils::store_object_bytes(&hash, bytes).unwrap();
-            pack_utils::compact(false, false, &forklift_core::util::progress_utils::Progress::NONE)
+            pack_utils::compact(false, false, false, &forklift_core::util::progress_utils::Progress::NONE)
                 .unwrap();
             hash
         };

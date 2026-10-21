@@ -490,6 +490,34 @@ A command not listed here either reports only the generic human-message shape `{
 
 ```json
 {
+  "$defs": {
+    "KeptDamagedPack": {
+      "description": "A damaged pack a full repack kept.",
+      "properties": {
+        "error": {
+          "description": "Why the index failed validation.",
+          "type": "string"
+        },
+        "index_path": {
+          "description": "The pack's index file.",
+          "type": "string"
+        },
+        "unaccounted": {
+          "description": "The live objects the pack might hold that no other copy serves verified: they cannot be\nrecovered from this store.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "index_path",
+        "error",
+        "unaccounted"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a compaction.",
   "properties": {
@@ -508,6 +536,20 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "damaged_packs_dropped": {
+      "description": "Damaged packs (an index that failed validation) a full repack salvaged and removed: every\nlive object they might have held reads verified from another copy. Each entry is the\nindex file's path. Always empty without `--all`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "damaged_packs_kept": {
+      "description": "Damaged packs a full repack salvaged what it could from but kept, because some live\nobject they might hold has no other verified copy. Always empty without `--all`.",
+      "items": {
+        "$ref": "#/$defs/KeptDamagedPack"
+      },
+      "type": "array"
     },
     "deltas": {
       "description": "Of the packed objects, how many were stored as deltas against a similar base.",
@@ -538,13 +580,6 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
-    },
-    "unvalidated_packs": {
-      "description": "Packs a full repack left exactly as found because their index failed validation: nothing\nwas copied out of them and they were not deleted. Each entry is the validation error, which\nnames the index file. Always empty without `--all`.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
     }
   },
   "required": [
@@ -556,7 +591,8 @@ A command not listed here either reports only the generic human-message shape `{
     "bytes_packed",
     "corrupt_skipped",
     "over_ceiling_skipped",
-    "unvalidated_packs"
+    "damaged_packs_dropped",
+    "damaged_packs_kept"
   ],
   "title": "Compacted",
   "type": "object"
@@ -4187,7 +4223,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The object-store census. The `Serialize` shape is the public `--json` schema; byte counts\nare exact integers there (the human view renders them in binary units).",
   "properties": {
     "damaged_packs": {
-      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand an object in a damaged part reads as unverifiable until it is stored again. Empty on a\nhealthy store.",
+      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand an object in a damaged part reads as unverifiable. `forklift compact --all` salvages\nwhat the pack's data file still holds, and removes the pack when every live object it may\nhold reads from another copy. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },
