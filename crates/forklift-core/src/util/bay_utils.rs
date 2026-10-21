@@ -897,7 +897,8 @@ mod tests {
 
         remove_bay_redirect(&bay).unwrap();
 
-        assert_eq!(std::fs::read_to_string(elsewhere.join("precious")).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(elsewhere.join("precious")).ok().as_deref(), Some("keep me"),
+                   "what the link pointed at must be untouched");
         assert_eq!(std::fs::read_dir(&bay).unwrap().count(), 0, "the link and its renamed name are gone");
 
         // A bay whose working tree or .forklift is already gone is removed without complaint.
