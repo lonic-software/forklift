@@ -4234,6 +4234,24 @@ mod tests {
         assert_eq!(unproven.content_change_timestamp, UNPROVEN_MTIME);
     }
 
+    /// A file recorded from a stat is proven only against an anchor taken on its own device: an
+    /// anchor from any other volume says nothing about its clock.
+    #[test]
+    fn an_entry_recorded_from_a_stat_is_unproven_against_another_devices_anchor() {
+        let scratch = Scratch::new("anchor-other-device");
+        let file = scratch.root.join("a.txt");
+        std::fs::write(&file, "content").unwrap();
+        set_mtime(&file, std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+
+        let file_utils::StatAnchor::At { device, stamp } = anchor_proving_all_on(&file) else { unreachable!() };
+        let recorded = |device| build_inventory_item_from_stat(
+            &file, "a.txt", "hash".to_string(), DirEntryType::Normal,
+            file_utils::StatAnchor::At { device, stamp }).unwrap().content_change_timestamp;
+        assert_eq!(recorded(device.wrapping_add(1)), UNPROVEN_MTIME,
+                   "an anchor on another device must not prove the file");
+        assert_eq!(recorded(device), 1_000_000, "the file's own device's anchor proves it");
+    }
+
     /// A file whose bytes match its entry but whose executable bit does not is a change where a
     /// stat can see the bit. Where it cannot (Windows, or a volume without the bit), the entry's bit stands: the stat cache
     /// still hits, and nothing would record the file as plain.
