@@ -2179,31 +2179,64 @@ pub fn retrieve_inventory_by_key(key: &str) -> Result<(PathBuf, Vec<u8>), String
 ///    * `Some(Vec<u8>)` - The contents of the inventory file.
 /// * `Ok((PathBuf, None))` - If the inventory file was not found:
 ///    * `PathBuf` - The path where the inventory file should have been.
-/// * `Err(String)` - The error message if the inventory file exists, but there was an error while
-/// reading it.
+/// * `Err(String)` - If the inventory file exists but could not be read, or the shard's address is
+/// damaged (see [`judge_shard_address`]).
 pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
-    let file_path = get_inventory_data_path_for_key(key)?;
+    let (file_path, present) = judge_shard_address(key)?;
 
-    let display_key = load_guard_utils::display_path(key);
+    if !present {
+        return Ok((file_path, None));
+    }
 
-    // Only an absent shard is "no shard": anything else, such as a file where a shard folder
-    // belongs, would otherwise read as a directory with nothing staged.
     match std::fs::read(&file_path) {
         Ok(bytes) => Ok((file_path, Some(bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Windows reports a read through a regular file as not found, so a non-folder in the
-            // shard's folder chain is looked for explicitly.
-            match non_folder_in_shard_chain(&file_path) {
-                Some(folder) => Err(format!(
-                    "Error while reading the inventory of folder \"{}\": \"{}\" is not a folder.",
-                    display_key, folder.to_string_lossy()
-                )),
-                None => Ok((file_path, None)),
-            }
-        }
+        // Removed since it was judged: a concurrent writer unstaged it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, None)),
         Err(e) => Err(format!(
             "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
-            display_key, file_path.to_string_lossy(), e
+            load_guard_utils::display_path(key), file_path.to_string_lossy(), e
+        )),
+    }
+}
+
+/// The path of `key`'s shard, and whether a shard is there, once every level of its address has
+/// been judged without following a link.
+///
+/// Only an absent shard is "no shard": anything else, such as a file where a shard folder belongs,
+/// would otherwise read as a directory with nothing staged. And Forklift makes only real folders
+/// and a regular file on a shard's address, so a link at any level is damage: read through it,
+/// another folder's file would pass for this directory's staged state, and written through it, a
+/// shard would land outside the staging area.
+///
+/// # Arguments
+/// * `key` - The warehouse path key of the directory.
+///
+/// # Returns
+/// * `Ok((PathBuf, bool))` - The shard's path, and whether a shard file is there.
+/// * `Err(String)`         - If a level of the address is not what Forklift makes there, or could
+///                           not be read.
+pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
+    let file_path = get_inventory_data_path_for_key(key)?;
+
+    let damaged = |entry: &Path, expected: &str| Err(format!(
+        "Error while reading the inventory of folder \"{}\": \"{}\" is not a {} (a link is never followed). \
+        Remove it, then run \"forklift restore --staged .\" to reset the staging area to the pallet head.",
+        load_guard_utils::display_path(key), entry.to_string_lossy(), expected
+    ));
+
+    // The folders first: below a non-folder, the shard itself reads as not found on Windows and as
+    // not a directory elsewhere, and neither names the damage.
+    if let Some(folder) = non_folder_in_shard_chain(&file_path) {
+        return damaged(folder, "folder");
+    }
+
+    match std::fs::symlink_metadata(&file_path) {
+        Ok(metadata) if metadata.is_file() => Ok((file_path, true)),
+        Ok(_) => damaged(&file_path, "file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, false)),
+        Err(e) => Err(format!(
+            "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
+            load_guard_utils::display_path(key), file_path.to_string_lossy(), e
         )),
     }
 }

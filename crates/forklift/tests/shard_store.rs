@@ -277,3 +277,34 @@ fn restore_never_reads_a_shard_of_an_unregistered_directory() {
     assert!(!output.status.success(), "restore of an untracked file must fail");
     assert!(stderr(&output).contains("\"docs/a.txt\" is not in the inventory."), "{}", stderr(&output));
 }
+
+/// A link in the store is refused rather than followed, even with a valid shard behind it, and the
+/// way out the refusal names restores a clean staging area.
+#[test]
+fn a_linked_shard_folder_is_refused_and_the_named_way_out_works() {
+    let warehouse = Warehouse::new("linked-slot", &[("docs/a.txt", "a\n")]);
+
+    let inventory = warehouse.root.join(".forklift/inventory");
+    let slot = inventory.join(forklift_core::util::file_utils::shard_folder_relative("docs"));
+    let outside = warehouse.base.join("outside");
+    std::fs::rename(&slot, &outside).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &slot).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&outside, &slot).unwrap();
+
+    let output = warehouse.run(&["stocktake"]);
+    assert!(!output.status.success(), "stocktake read through the link: {}", stdout(&output));
+    assert!(stderr(&output).contains("a link is never followed") && stderr(&output).contains("restore --staged ."),
+            "{}", stderr(&output));
+
+    if cfg!(windows) {
+        std::fs::remove_dir(&slot).unwrap();
+    } else {
+        std::fs::remove_file(&slot).unwrap();
+    }
+    warehouse.run_ok(&["restore", "--staged", "."]);
+
+    warehouse.assert_clean();
+    assert!(std::fs::symlink_metadata(&slot).unwrap().is_dir(), "the shard is back in a real folder");
+}

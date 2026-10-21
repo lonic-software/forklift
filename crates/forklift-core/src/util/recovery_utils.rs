@@ -1664,7 +1664,23 @@ fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), 
         let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
         let path = entry.path();
 
-        if path.is_dir() {
+        // `DirEntry::file_type` does not follow a link. Forklift makes none below an inventory
+        // root, so one is damage: entering it would count another folder's files as staged
+        // shards, and passing over it would drop whatever the link stands in for from a walk that
+        // must see every shard, so the walk stops.
+        let kind = entry.file_type()
+            .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
+
+        if kind.is_symlink() {
+            return Err(format!(
+                "\"{}\" in the staging area is a link, which Forklift never makes there, so it is not followed. \
+                Remove it, then run \"forklift restore --staged .\" in its checkout to reset the staging area \
+                to the pallet head.",
+                path.to_string_lossy()
+            ));
+        }
+
+        if kind.is_dir() {
             walk_shard_data_files(&path, found)?;
             continue;
         }
@@ -6307,6 +6323,36 @@ mod tests {
         assert!(!error.contains("ghost"), "{}", error);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A link in the store stops a walk rather than be followed, whether it stands in for a shard's
+    /// folder or its data file: a valid shard behind it is never counted as staged.
+    #[test]
+    fn a_walker_never_follows_a_link_in_the_store() {
+        for level in ["slot", "data"] {
+            let (root, _scope) = staged_warehouse(&format!("walker-link-{level}"), &["", "docs"]);
+            let data = shard_data_path("docs");
+            let linked = if level == "slot" { data.parent().unwrap().to_path_buf() } else { data.clone() };
+
+            let outside = root.join("outside");
+            std::fs::rename(&linked, &outside).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, &linked).unwrap();
+            #[cfg(windows)]
+            if level == "slot" {
+                std::os::windows::fs::symlink_dir(&outside, &linked).unwrap();
+            } else {
+                std::os::windows::fs::symlink_file(&outside, &linked).unwrap();
+            }
+
+            let mut hashes = Vec::new();
+            let walked = walk_shard_files(&PathBuf::from(file_utils::get_path_inventory_root()), &mut hashes);
+
+            let error = walked.expect_err(level);
+            assert!(error.contains("is a link") && error.contains("restore --staged ."), "{level}: {error}");
+
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     #[cfg(unix)]

@@ -478,7 +478,7 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
         let Some(path) = new_path else { continue };
 
         // A tracked file cannot collide (tracked paths were verified clean).
-        if alias_utils::tracked_file(path)? {
+        if check.tracked_file(path)? {
             continue;
         }
 
@@ -605,9 +605,12 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
 fn apply_merge_actions_to(actions: &[MergeAction],
                           batch: &mut inventory_utils::ShardMutationBatch,
                           conflict_paths: &mut Vec<String>) -> Result<(), String> {
+    // The batch writes nothing before it publishes, so this stays the registered set throughout.
+    let ledger = inventory_utils::ShardLedger::read()?;
+
     for action in actions {
         if matches!(action, MergeAction::Delete { .. }) {
-            apply_merge_action(action, None, batch, conflict_paths)?;
+            apply_merge_action(&ledger, action, None, batch, conflict_paths)?;
         }
     }
 
@@ -617,7 +620,7 @@ fn apply_merge_actions_to(actions: &[MergeAction],
     shift_utils::write_in_order(&writes, |action| match action {
         MergeAction::TakeTheirs { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
         _ => None,
-    }, |action, content| apply_merge_action(action, content, batch, conflict_paths))
+    }, |action, content| apply_merge_action(&ledger, action, content, batch, conflict_paths))
 }
 
 /// Apply one merge action to the working directory, and stage its inventory change into
@@ -626,7 +629,8 @@ fn apply_merge_actions_to(actions: &[MergeAction],
 /// `content` is a `TakeTheirs` blob already loaded by [`shift_utils::write_in_order`]'s
 /// prefetch, or `None` to load it here. A written file is statted right after its write, as the
 /// batch requires.
-fn apply_merge_action(action: &MergeAction,
+fn apply_merge_action(ledger: &inventory_utils::ShardLedger,
+                      action: &MergeAction,
                       content: Option<Result<Vec<u8>, String>>,
                       batch: &mut inventory_utils::ShardMutationBatch,
                       conflict_paths: &mut Vec<String>) -> Result<(), String> {
@@ -677,7 +681,7 @@ fn apply_merge_action(action: &MergeAction,
         MergeAction::Conflict { path, content, entry_hash, item_type } => {
             // A conflict on a path the inventory does not hold re-creates a file we deleted, so
             // it is new to the working directory, like `ensure_no_untracked_collisions` judged it.
-            let create = conflict_writes(action) && !alias_utils::tracked_file(path)?;
+            let create = conflict_writes(action) && !alias_utils::tracked_file(ledger, path)?;
 
             if let Some(content) = content {
                 shift_utils::write_working_file(path, content, *item_type, create)?;
