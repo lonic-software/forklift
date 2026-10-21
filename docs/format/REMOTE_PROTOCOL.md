@@ -122,6 +122,11 @@ new meta pallets need no protocol change. Bare names never start with `@`.
 
 Clients must refuse to talk to a remote whose `protocol` they do not know.
 
+**Object hashes on the wire.** Every `{hash}` in an object or signature path, and every entry of
+the `hashes` list of `missing`, `upload-targets` and `batch`, is an object hash in its canonical
+spelling, 64 lowercase hex characters. A head refuses any other spelling with `422` and does not
+repeat it back. The object store answers for that spelling alone.
+
 ### `POST /v1/objects/missing`
 
 Body: `{"hashes": ["<hash>", …]}` (at most 10 000 per request — batch larger sets).

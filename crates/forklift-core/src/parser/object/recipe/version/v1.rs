@@ -84,7 +84,8 @@ pub fn parse(offset: usize, input: &[u8]) -> Result<Recipe, String> {
 }
 
 /// Read one 64-character ASCII-hex hash at `*cursor`, advancing the cursor past it. Rejects a
-/// truncated or non-hex hash (nothing but lowercase/uppercase hex digits is legal).
+/// truncated or non-hex hash. Only the canonical spelling, lowercase hex, is legal: the chunk is
+/// looked up by this string, and the store answers for no other spelling.
 fn read_hash(cursor: &mut usize, input: &[u8]) -> Result<String, String> {
     let end = cursor.checked_add(HASH_HEX_LEN)
         .filter(|end| *end <= input.len())
@@ -92,8 +93,8 @@ fn read_hash(cursor: &mut usize, input: &[u8]) -> Result<String, String> {
 
     let bytes = &input[*cursor..end];
 
-    if !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
-        return Err("Recipe hash is not valid ASCII hex.".to_string());
+    if !bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err("Recipe hash is not lowercase hex.".to_string());
     }
 
     // Every byte is an ASCII hex digit, so this is always valid UTF-8.
@@ -172,7 +173,18 @@ mod tests {
         let bad_hash = "zzzz1111111111111111111111111111111111111111111111111111111111111";
         let bytes = payload(CONTENT_HASH, 100, &[(bad_hash, 100)]);
         let err = parse_payload(&bytes).expect_err("a non-hex chunk hash must be rejected");
-        assert!(err.contains("ASCII hex"), "unexpected error: {}", err);
+        assert!(err.contains("lowercase hex"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn an_uppercase_hash_is_rejected() {
+        // The chunk is looked up by this string, and the store answers for the lowercase spelling
+        // alone; an uppercase one would be found or missed depending on the file system.
+        let upper = CONTENT_HASH.to_ascii_uppercase();
+        assert!(parse_payload(&payload(CONTENT_HASH, 100, &[(CONTENT_HASH, 100)])).is_ok(), "the control parses");
+        let bytes = payload(CONTENT_HASH, 100, &[(&upper, 100)]);
+        let err = parse_payload(&bytes).expect_err("an uppercase chunk hash must be rejected");
+        assert!(err.contains("lowercase hex"), "unexpected error: {}", err);
     }
 
     #[test]

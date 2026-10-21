@@ -1226,8 +1226,7 @@ fn walk_loose_object_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), St
         let prefix = folder.file_name().to_string_lossy().to_string();
         // The pack folder (and anything else that is not a 2-hex fan-out folder) is skipped —
         // it holds packed objects, not loose ones.
-        if prefix.len() != file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS
-            || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !file_utils::is_fan_out_folder_name(&prefix) {
             continue;
         }
 

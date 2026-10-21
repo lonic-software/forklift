@@ -1387,6 +1387,40 @@ fn synthetic_objects(count: usize, seed: &str) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+/// The hash-taking endpoints refuse a hash spelled any way but the store's own, 64 lowercase hex
+/// characters, with a 422 that does not repeat it: the same answer the self-hosted server gives,
+/// rather than a miss decided by S3's key casing (or, for `batch`, an internal error from the
+/// scratch store's presence check).
+#[test]
+fn hash_taking_endpoints_refuse_an_uppercase_hash_as_unprocessable() {
+    let store = MemoryObjectStore::new();
+    let (hash, bytes) = synthetic_objects(1, "uppercase").remove(0);
+    store.put_verified(&hash, &bytes).expect("seed");
+    let head = Head::new(store, MemoryRefStore::new());
+
+    let upper = hash.to_ascii_uppercase();
+    assert_ne!(upper, hash, "the hash must carry a letter for the probe to mean anything");
+
+    // The control: the canonical spelling is accepted, and present.
+    assert!(head.missing(std::slice::from_ref(&hash)).expect("missing").is_empty());
+    assert!(head.object_get(&hash).is_ok(), "the canonical spelling reads back");
+
+    let batch = [upper.clone()];
+    let errors = [
+        ("missing", head.missing(&batch).expect_err("missing")),
+        ("upload-targets", head.upload_targets("lift-1", &batch).err().expect("upload-targets")),
+        ("batch", head.batch(&batch).err().expect("batch")),
+        ("object get", head.object_get(&upper).err().expect("object get")),
+        ("object put", head.object_put(None, &upper, &bytes).err().expect("object put")),
+        ("signature get", head.signature_get(&upper).err().expect("signature get")),
+        ("signature put", head.signature_put(&upper, b"sig").err().expect("signature put")),
+    ];
+    for (endpoint, err) in errors {
+        assert_eq!(err.status, Status::Unprocessable, "{}: {}", endpoint, err.message);
+        assert!(!err.message.contains(&upper), "{}: the value is not repeated: {}", endpoint, err.message);
+    }
+}
+
 /// `Head::missing` now answers via one bulk `ObjectStore::objects_missing` probe instead of a
 /// serial `exists` loop (the fix for the same 29 s-ceiling pattern the ref-update chunk descent
 /// had). Over a batch of hundreds of hashes with a scattered few absent — including a duplicate

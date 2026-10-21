@@ -917,8 +917,8 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         let mut hash_bytes = [0u8; 64];
         reader.read_exact(&mut hash_bytes)
             .map_err(|e| format!("The bundle is truncated while reading a signature hash: {}", e))?;
-        if !hash_bytes.iter().all(u8::is_ascii_hexdigit) {
-            return Err("A bundle signature hash is not hexadecimal ASCII.".to_string());
+        if !hash_bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err("A bundle signature hash is not lowercase hexadecimal ASCII.".to_string());
         }
         let hash = String::from_utf8(hash_bytes.to_vec())
             .map_err(|_| "A bundle signature hash is not valid ASCII.".to_string())?;

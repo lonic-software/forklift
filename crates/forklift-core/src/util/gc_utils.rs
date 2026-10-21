@@ -78,9 +78,11 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 
         // The pack folder holds packed objects, not loose ones; it is not a hash fan-out
         // folder, so skip it — its `.pack`/`.idx` files are not garbage. (Collecting inside
-        // packs is a repack concern, not this loose sweep.)
-        if prefix.len() != file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS
-            || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // packs is a repack concern, not this loose sweep.) So is a folder spelled any other way
+        // (uppercase `AB`): its candidate hashes could never match the lowercase live set, so on a
+        // case-insensitive file system, where reads do reach it, sweeping it would delete live
+        // objects.
+        if !file_utils::is_fan_out_folder_name(&prefix) {
             continue;
         }
 
@@ -540,6 +542,57 @@ pub(crate) mod tests {
         let stats = collect_garbage(0).expect("gc runs once no writer holds the store");
         assert_eq!(stats.deleted, 1, "with no writer, the sweep deletes the unreachable object");
         assert!(!loose_path(&garbage).exists(), "the unreachable object is gone");
+    }
+
+    /// gc takes its candidate hashes from the fan-out folders' names, and the live set holds only
+    /// lowercase hashes, so a folder spelled `AB` would have every file in it judged garbage. On a
+    /// case-insensitive file system reads do reach such a folder, so the object is live and readable
+    /// there, and the sweep would delete it. Such a folder is never swept.
+    ///
+    /// Revert: `file_utils::is_fan_out_folder_name` accepts either case → the live blob in the
+    /// uppercase folder is deleted → red.
+    #[test]
+    fn gc_never_sweeps_a_fan_out_folder_spelled_in_uppercase() {
+        let _scratch = Scratch::new("gc-uppercase-folder");
+
+        // A live blob whose fan-out folder has an uppercase spelling distinct from its own (two
+        // letters), sharing that folder with neither its tree nor its parcel.
+        let letters = |hash: &str| hash[..2].bytes().all(|b| b.is_ascii_alphabetic());
+        let (blob, tree, parcel) = (0..)
+            .find_map(|i| {
+                let blob = LooseObjectBuilder::build_blob(&Blob { content: format!("blob {}\n", i).into_bytes() });
+                if !letters(&blob.hash) {
+                    return None;
+                }
+                let mut item = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+                item.add_child(TreeItem::new("a.txt".to_string(), blob.hash.clone(), DirEntryType::Normal));
+                let tree = LooseObjectBuilder::build_tree(&item);
+                let parcel = LooseObjectBuilder::build_parcel(&Parcel {
+                    tree_hash: tree.hash.clone(),
+                    parents: Vec::new(),
+                    actions: Vec::new(),
+                    description: Some("base".to_string()),
+                });
+                let apart = |other: &str| other[..2] != blob.hash[..2];
+                (apart(&tree.hash) && apart(&parcel.hash)).then_some((blob, tree, parcel))
+            })
+            .unwrap();
+        let (mut blob, mut tree, mut parcel) = (blob, tree, parcel);
+        blob.store().unwrap();
+        tree.store().unwrap();
+        parcel.store().unwrap();
+        let main = pallet_utils::get_pallet_head("main").unwrap();
+        pallet_utils::update_pallet_head("main", main.as_deref(), &parcel.hash).unwrap();
+
+        let lower_folder = loose_path(&blob.hash).parent().unwrap().to_path_buf();
+        let upper_folder = lower_folder.with_file_name(blob.hash[..2].to_ascii_uppercase());
+        std::fs::rename(&lower_folder, &upper_folder).unwrap();
+        let moved = upper_folder.join(&blob.hash[2..]);
+        assert!(moved.exists(), "the blob sits in the uppercase folder");
+
+        collect_garbage(0).expect("gc runs");
+
+        assert!(moved.exists(), "gc must not sweep a folder the path builder never spells");
     }
 
     #[test]

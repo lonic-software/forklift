@@ -479,7 +479,7 @@ pub(crate) fn parse_local_blob_bytes(hash: &str, bytes: &[u8]) -> Result<Blob, S
 
 /// Load and parse the recipe object with the given hash from the object store. The recipe's
 /// structural invariants are enforced by the parser at this point (`sum(chunk_sizes)` equals
-/// the declared total, every chunk hash is valid ASCII hex, no chunk exceeds the per-chunk
+/// the declared total, every chunk hash is lowercase hex, no chunk exceeds the per-chunk
 /// ceiling) — a lying `content_hash` is *not* caught here (only a real assembly re-derives it).
 ///
 /// # Arguments

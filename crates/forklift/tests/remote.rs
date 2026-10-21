@@ -816,6 +816,51 @@ fn upload_targets_rejects_an_invalid_hash_as_client_error() {
 }
 
 #[test]
+fn every_hash_taking_endpoint_refuses_an_uppercase_spelling_as_client_error() {
+    // Loose objects live under the lowercase spelling, so a case-sensitive file system missed an
+    // uppercase one that a case-insensitive file system or a pack index found. The store now
+    // answers for no other spelling, and the server refuses one with a 422 before it gets there,
+    // the same answer on every platform, without repeating the value back.
+    let area = TestArea::new("uppercase-hash-refused");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/doc.txt", "content\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    let stacked = area.forklift("a", &["stack", "first"]);
+    assert_success(&stacked);
+    let head = stdout(&stacked)
+        .split_whitespace()
+        .find(|word| word.len() == 64)
+        .expect("the stack output carries the parcel hash")
+        .to_string();
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let upper = head.to_ascii_uppercase();
+    assert_ne!(upper, head, "the parcel hash must carry a letter for the probe to mean anything");
+
+    // The control: the canonical spelling is present, so the refusals below are about spelling.
+    let (status, body) = http_post_json(&server.url, "/v1/objects/missing",
+        &format!("{{\"hashes\":[\"{}\"]}}", head));
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+    assert!(!body.contains(&head), "the lifted parcel is present: {}", body);
+
+    let batch = format!("{{\"hashes\":[\"{}\"]}}", upper);
+    let targets = format!("{{\"session\":\"lift-x\",\"hashes\":[\"{}\"]}}", upper);
+    let responses = [
+        ("missing", http_post_json(&server.url, "/v1/objects/missing", &batch)),
+        ("upload-targets", http_post_json(&server.url, "/v1/objects/upload-targets", &targets)),
+        ("batch", http_post_json(&server.url, "/v1/objects/batch", &batch)),
+        ("object", http_get(&server.url, &format!("/v1/objects/{}", upper))),
+        ("signature", http_get(&server.url, &format!("/v1/signatures/{}", upper))),
+    ];
+    for (endpoint, (status, body)) in responses {
+        assert!(status.starts_with("HTTP/1.1 422"), "{}: {} / {}", endpoint, status, body);
+        assert!(!body.contains(&upper), "{}: the client's value is not repeated: {}", endpoint, body);
+    }
+}
+
+#[test]
 fn diverged_pallets_are_refused_not_merged() {
     let area = TestArea::new("diverged");
     let server = Server::start(&area, None);

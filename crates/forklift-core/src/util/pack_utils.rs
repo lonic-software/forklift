@@ -4373,8 +4373,7 @@ fn enumerate_loose_objects() -> Result<Vec<PackTarget>, String> {
 
         // The object store fans out on the first two hex characters of the hash; the pack
         // folder (and any other non-fan-out entry) is not one of those, so it is skipped.
-        if prefix.len() != file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS
-            || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !file_utils::is_fan_out_folder_name(&prefix) {
             continue;
         }
 
@@ -4963,7 +4962,16 @@ fn is_chunk(raw: &[u8]) -> bool {
 
 /// Decode a 64-character hex object hash into its 32 raw bytes, or `None` if it is not a
 /// valid Blake3 hex hash. Non-hashes never match a pack, so they map to `None` (not an error).
+///
+/// Lowercase only, like the loose path ([`file_utils::is_object_hash_or_prefix`]): decoding an
+/// uppercase spelling would find a packed object that the same spelling misses while it is loose
+/// on a case-sensitive file system, so presence would depend on the platform and on whether a
+/// `compact` had run.
 fn hash_to_bytes(hash: &str) -> Option<[u8; HASH_LEN]> {
+    if !object_utils::is_object_hash(hash) {
+        return None;
+    }
+
     let bytes = sign_utils::from_hex(hash).ok()?;
     if bytes.len() != HASH_LEN {
         return None;
@@ -5581,6 +5589,43 @@ pub(crate) mod tests {
         let absent = blake3::hash(b"absent").to_hex().to_string();
         assert!(!is_in_packs(&absent).unwrap());
         assert!(matches!(retrieve_from_packs(&absent).unwrap(), PackRetrieval::NotLocated));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// An uppercase spelling of a real hash gets the same answer whether the object is loose or
+    /// packed, on every file system: refused, because the store answers for the lowercase
+    /// spelling alone. Before, the pack index decoded it case-insensitively (present), and the
+    /// loose path used its characters as-is (present on a case-insensitive file system, absent on
+    /// a case-sensitive one).
+    ///
+    /// Revert: `file_utils::is_object_hash_or_prefix` accepts uppercase → the loose probe answers
+    /// `Ok` (true on macOS, false on Linux) → red at the loose assertion. Revert: `hash_to_bytes`
+    /// decodes uppercase → the packed probe answers `Ok(true)` → red at the packed assertion.
+    #[test]
+    fn an_uppercase_hash_is_refused_alike_loose_and_packed() {
+        let temp = std::env::temp_dir().join(format!("forklift-pack-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = b"a hash spelled two ways".to_vec();
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let upper = hash.to_ascii_uppercase();
+        assert_ne!(upper, hash, "the hash must carry a letter for the probe to mean anything");
+
+        store_loose(&hash, &content);
+        assert!(file_utils::does_object_exist(&hash).unwrap(), "the loose object is present");
+        let loose = file_utils::does_object_exist(&upper);
+        assert!(loose.is_err(), "loose: an uppercase spelling is refused, got {:?}", loose);
+
+        compact(false, false, &Progress::NONE).unwrap();
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        assert!(!Path::new(&folder).join(&file_name).exists(), "the object is now packed only");
+        assert!(file_utils::does_object_exist(&hash).unwrap(), "the packed object is present");
+        assert!(!is_in_packs(&upper).unwrap(), "the pack index does not decode an uppercase spelling");
+        let packed = file_utils::does_object_exist(&upper);
+        assert!(packed.is_err(), "packed: an uppercase spelling is refused, got {:?}", packed);
 
         std::fs::remove_dir_all(&temp).ok();
     }

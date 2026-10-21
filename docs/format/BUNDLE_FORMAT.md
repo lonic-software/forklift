@@ -22,7 +22,7 @@ pack_count       u32
 pack table       pack_count × (data_length u64, index_length u64)
 pack sections    for each table row: data bytes, then index bytes
 signature_count  u64
-signatures       signature_count × (parcel_hash[64 ASCII hex], length u64, bytes[length])
+signatures       signature_count × (parcel_hash[64 lowercase ASCII hex], length u64, bytes[length])
 EOF
 ```
 

@@ -150,8 +150,14 @@ pub fn get_path_graph_root() -> String {
 }
 
 /// Whether `hash` is shaped like an object hash *or a prefix of one*: long enough to carve a
-/// fan-out folder off of, and every character an ASCII hex digit of either case. A full hash in
-/// its canonical spelling is [`crate::util::object_utils::is_object_hash`]. This is the one rule
+/// fan-out folder off of, and every character a lowercase hex digit. A full hash is
+/// [`crate::util::object_utils::is_object_hash`].
+///
+/// Lowercase only, because loose objects are written under the lowercase spelling: an uppercase
+/// path would find the object on a case-insensitive file system and miss it on a case-sensitive
+/// one, while the pack index decodes the hash to bytes and finds it on both. Refusing every other
+/// spelling here keeps the two stores agreeing. A caller holding a user-typed hash lowercases it
+/// at that boundary (`pallet_utils::resolve_revision`). This is the one rule
 /// [`get_path_for_object`] enforces (and the only one — it does not check length against any
 /// particular digest's width), pulled out so a caller that needs to know *whether* a string is
 /// hash-shaped, without wanting the path or the error string, has something to call instead of
@@ -162,9 +168,22 @@ pub fn get_path_graph_root() -> String {
 ///
 /// # Returns
 /// * `true`  - If `hash` is shaped like an object hash or a prefix of one.
-/// * `false` - Otherwise (too short, or not all hex digits).
+/// * `false` - Otherwise (too short, or not all lowercase hex digits).
 pub fn is_object_hash_or_prefix(hash: &str) -> bool {
-    hash.len() > OBJECT_HASH_FOLDER_PATH_CHARACTERS && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    hash.len() > OBJECT_HASH_FOLDER_PATH_CHARACTERS && is_lowercase_hex(hash)
+}
+
+/// Whether `name` is an object fan-out folder's name, as [`get_path_for_object`] spells it: two
+/// lowercase hex digits. The loose-store sweeps (`gc`, `compact`, a heal's restage listing) take
+/// their candidate hashes from these folders, so they share this rule with the path builder: a
+/// folder it would never produce holds nothing they should pack, delete or restage.
+pub fn is_fan_out_folder_name(name: &str) -> bool {
+    name.len() == OBJECT_HASH_FOLDER_PATH_CHARACTERS && is_lowercase_hex(name)
+}
+
+/// Every byte of `text` is `0-9` or `a-f`.
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Get the path and file name for an object.
@@ -223,7 +242,7 @@ pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
 ///
 /// # Returns
 /// * `Some(String)` - The hash, if `path`'s last two components have the `<2 hex chars>/<rest>`
-///                     fan-out shape [`get_path_for_object`] produces.
+///                     fan-out shape [`get_path_for_object`] produces (lowercase hex only).
 /// * `None`         - `path` does not have that shape (not an object path, or corrupt).
 pub fn hash_from_object_path(path: &Path) -> Option<String> {
     let file_name = path.file_name()?.to_str()?;
@@ -235,7 +254,7 @@ pub fn hash_from_object_path(path: &Path) -> Option<String> {
 
     let candidate = format!("{}{}", folder_name, file_name);
 
-    candidate.bytes().all(|b| b.is_ascii_hexdigit()).then_some(candidate)
+    is_lowercase_hex(&candidate).then_some(candidate)
 }
 
 /// Whether writes fsync for durability. Durable by default; set `FORKLIFT_FSYNC` to `0`, `off`,
@@ -4154,6 +4173,8 @@ mod tests {
             PathBuf::from("/some/warehouse/.forklift/objects/abc/def"), // 3-char folder, not 2
             PathBuf::from("/some/warehouse/.forklift/objects/zz/cdef"), // non-hex folder
             PathBuf::from("/some/warehouse/.forklift/objects/ab/cdeg"), // non-hex filename
+            PathBuf::from("/some/warehouse/.forklift/objects/AB/cdef"), // uppercase folder
+            PathBuf::from("/some/warehouse/.forklift/objects/ab/cDef"), // uppercase filename
             PathBuf::from("no-parent-at-all"),
             PathBuf::from("/"),
         ];
