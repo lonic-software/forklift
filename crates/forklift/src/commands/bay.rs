@@ -292,10 +292,12 @@ fn remove(name: &str) -> Result<(), String> {
     // Drop the bay's `.forklift` folder so the directory is no longer a bay (a working tree that
     // is already gone is fine). While it still redirects, the state is kept: dropping it would
     // leave the directory naming a bay that no longer exists.
-    let left = match bay_dir.map(|bay_dir| bay_utils::remove_bay_redirect(&bay_dir)) {
+    let left = match bay_dir.as_ref().map(|bay_dir| bay_utils::remove_bay_redirect(bay_dir, &globals::forklift_root(), name)) {
         None | Some(Ok(())) => None,
         Some(Err(bay_utils::RedirectRemoval::Kept(e))) => return Err(format!(
-            "{} The bay \"{}\" was kept, since its working directory still redirects to it.", e, name
+            "{} The bay \"{}\" was kept, since its working directory still redirects to it. To remove it \
+            anyway, delete the folder \"{}\" by hand, then run this command again.",
+            e, name, bay_dir.unwrap_or_default().join(globals::FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
         )),
         Some(Err(bay_utils::RedirectRemoval::Left(e))) => Some(e),
     };

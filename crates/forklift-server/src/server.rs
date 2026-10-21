@@ -976,9 +976,11 @@ fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
 
 /// Whether `root` holds a warehouse. A bay's working directory holds a `.forklift` folder too, so
 /// the shared classifier decides, never the folder's mere presence: a bay is never served,
-/// adopted or reported as an existing warehouse.
-fn holds_warehouse(root: &std::path::Path) -> Result<bool, String> {
-    Ok(bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT))? == bay_utils::ForkliftKind::Warehouse)
+/// adopted or reported as an existing warehouse. A `.forklift` that cannot be classified (a
+/// broken redirect, an unreadable entry) is not a warehouse either: it is never served, and a
+/// creation finds the name taken.
+fn holds_warehouse(root: &std::path::Path) -> bool {
+    matches!(bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), Ok(bay_utils::ForkliftKind::Warehouse))
 }
 
 /// Map an internal storage error to a 500.
@@ -1467,7 +1469,7 @@ fn resolve_warehouse(state: &AppState,
 
     let root = base.join(&id);
 
-    if !holds_warehouse(&root).map_err(internal)? {
+    if !holds_warehouse(&root) {
         return Err((
             StatusCode::NOT_FOUND,
             format!(
@@ -1554,7 +1556,7 @@ fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, Handle
 fn create_warehouse_numbered(base: &std::path::Path, id: &str,
                              counter: &std::sync::atomic::AtomicU64) -> Result<Creation, HandlerError> {
     let target = base.join(id);
-    if holds_warehouse(&target).map_err(internal)? {
+    if holds_warehouse(&target) {
         return Ok(Creation::Existed);
     }
 
@@ -1610,7 +1612,7 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
         Err(rename_error) => {
             let _ = std::fs::remove_dir_all(&staging);
 
-            if holds_warehouse(&target).map_err(internal)? {
+            if holds_warehouse(&target) {
                 Ok(Creation::Existed)
             } else if std::fs::symlink_metadata(&target).is_ok() {
                 Err(conflict())
@@ -4120,6 +4122,14 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
         assert_eq!(std::fs::read_dir(&forklift).unwrap().count(), 1, "the bay's folder is left as it was");
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
+
+        // A `.forklift` that is neither (a redirect that is a folder) is a client-side name
+        // clash, not a server fault: not found to a lookup, taken to a creation.
+        std::fs::create_dir_all(base.join("broken").join(FOLDER_NAME_FORKLIFT_ROOT).join(bay_utils::FILE_NAME_BAY_REDIRECT)).unwrap();
+        let error = resolve_warehouse(&state, &warehouse_params("broken")).err().expect("a broken entry must not be served");
+        assert_eq!(error.0, StatusCode::NOT_FOUND, "{}", error.1);
+        let error = create_warehouse(&base, "broken").err().expect("a broken entry must not read as a warehouse");
+        assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
 
         let _ = std::fs::remove_dir_all(&base);
     }

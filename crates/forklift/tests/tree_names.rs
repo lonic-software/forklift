@@ -287,6 +287,36 @@ fn a_hashed_short_name_of_the_metadata_folder_is_refused() {
     assert_refused(&warehouse, &warehouse.root.join(".forklift").join("escaped.txt"), &format!("{:?}", short));
 }
 
+#[test]
+fn a_bay_refuses_entries_that_name_its_own_metadata_folder() {
+    // A bay's `.forklift` is a folder holding its redirect and its volume's probes: a parcel naming
+    // it, in any case, is refused there and writes nothing into it, and nothing inside it loads.
+    let warehouse = Warehouse::new("bay-metadata");
+    let bay = warehouse.base.join("bay");
+    warehouse.run_ok(&["bay", "add", "linked", bay.to_str().unwrap()]);
+    let metadata = bay.join(".forklift");
+    let run = |args: &[&str]| forklift_command()
+        .args(args)
+        .current_dir(&bay)
+        .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
+        .output()
+        .unwrap();
+
+    for name in [".forklift", ".ForkLift"] {
+        warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
+        let shifted = run(&["shift", "evil"]);
+        let stderr = String::from_utf8_lossy(&shifted.stderr);
+        assert!(!metadata.join("escaped.txt").exists(), "the parcel wrote into the bay's metadata folder");
+        assert!(!shifted.status.success(), "shift accepted {:?}; stderr: {}", name, stderr);
+        assert!(stderr.contains(&format!("{:?}", name)), "the refusal must name {:?}; stderr: {}", name, stderr);
+    }
+
+    let loaded = run(&["load", ".forklift/redirect"]);
+    assert!(!loaded.status.success(), "the bay's redirect was loaded");
+    assert!(metadata.join("redirect").is_file(), "the bay's redirect is untouched");
+}
+
 /// Whether the warehouse's file system treats names differently by case.
 fn is_case_insensitive(warehouse: &Warehouse) -> bool {
     warehouse.root.join("APP.TXT").exists()

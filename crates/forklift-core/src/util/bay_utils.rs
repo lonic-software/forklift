@@ -116,24 +116,36 @@ pub fn classify_forklift(forklift_path: &Path) -> Result<ForkliftKind, String> {
             "\"{}\" is not a regular file, so \"{}\" is neither a warehouse nor a valid bay.",
             redirect.to_string_lossy(), forklift_path.to_string_lossy()
         )),
+        // A link to nothing is still a redirect entry, broken: never a warehouse.
+        Err(e) if absent(&e) && std::fs::symlink_metadata(&redirect).is_ok() => Err(format!(
+            "\"{}\" is a link to nothing, so \"{}\" is neither a warehouse nor a valid bay.",
+            redirect.to_string_lossy(), forklift_path.to_string_lossy()
+        )),
         Err(e) if absent(&e) => Ok(ForkliftKind::Warehouse),
         Err(e) => Err(format!("Error while checking \"{}\": {}", redirect.to_string_lossy(), e)),
     }
 }
 
 /// The refusal for a bay whose `.forklift` is a redirect file in the older format, with the
-/// conversion that makes it current. The remedy moves the file into a fresh `.forklift.new` folder
-/// rather than beside it, so it never touches a name the bay's own tree may hold.
+/// conversion that makes it current. The remedy stages the conversion in a new folder whose name
+/// nothing in the directory holds when the refusal is written; the bay's tree may hold any name,
+/// so the remedy says to create that folder, which fails rather than reuse one taken since.
 ///
 /// # Arguments
 /// * `root` - The directory holding the old-format `.forklift` file.
 pub fn old_format_bay_error(root: &Path) -> String {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
-    let staging = root.join(FOLDER_NAME_FORKLIFT_NEW);
+    let staging = (0..)
+        .map(|n| root.join(match n {
+            0 => FOLDER_NAME_FORKLIFT_NEW.to_string(),
+            n => format!("{}-{}", FOLDER_NAME_FORKLIFT_NEW, n),
+        }))
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_err())
+        .unwrap_or_else(|| root.join(FOLDER_NAME_FORKLIFT_NEW));
 
     format!(
         "\"{}\" is a bay redirect file written by an older version of Forklift; a bay now keeps it \
-        in a folder. Convert it in place: create the folder \"{}\", move the file \"{}\" to \"{}\", \
+        in a folder. Convert it in place: create the new folder \"{}\" (stop if that name is taken), move the file \"{}\" to \"{}\", \
         then rename \"{}\" to \"{}\".",
         forklift.to_string_lossy(), staging.to_string_lossy(), forklift.to_string_lossy(),
         staging.join(FILE_NAME_BAY_REDIRECT).to_string_lossy(), staging.to_string_lossy(),
@@ -187,6 +199,11 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
 /// Remove a bay's `.forklift` folder from its working directory, so the directory is no longer a
 /// bay.
 ///
+/// Only this bay's own entry is removed: a real folder (or, from an older version, a regular
+/// file) whose redirect names this bay of this warehouse. Anything else at that path (another
+/// warehouse, another bay, a link, something unreadable) is left alone, since the directory no
+/// longer redirects to this bay and the entry is not this bay's to delete.
+///
 /// The entry is first renamed to a fresh, absent-checked sibling name: that one step ends the bay,
 /// and nothing re-creates a `.forklift` folder on demand, so a bay command running meanwhile
 /// cannot leave one behind that would read as a warehouse. The renamed entry is then deleted
@@ -196,18 +213,30 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
 /// # Returns
 /// * `Ok(())`                    - The directory is no longer a bay, and nothing is left behind.
 /// * `Err(RedirectRemoval::Kept)` - The rename failed: the directory is still a bay.
-/// * `Err(RedirectRemoval::Left)` - The directory is no longer a bay, but the renamed entry could
-///                                  not be deleted; the message names it.
-pub fn remove_bay_redirect(bay_dir: &Path) -> Result<(), RedirectRemoval> {
+/// * `Err(RedirectRemoval::Left)` - The directory no longer redirects to this bay, but an entry
+///                                  was left behind (one that is not this bay's, or the renamed
+///                                  one that could not be deleted); the message names it.
+///
+/// # Arguments
+/// * `bay_dir`        - The bay's recorded working directory.
+/// * `shared_forklift` - The `.forklift` folder of the warehouse the bay belongs to.
+/// * `name`           - The bay's name.
+pub fn remove_bay_redirect(bay_dir: &Path, shared_forklift: &Path, name: &str) -> Result<(), RedirectRemoval> {
     use std::io::ErrorKind;
 
     let forklift = bay_dir.join(FOLDER_NAME_FORKLIFT_ROOT);
     let gone = |e: &std::io::Error| matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory);
 
-    match std::fs::symlink_metadata(&forklift) {
-        Ok(_) => (),
+    let record = match std::fs::symlink_metadata(&forklift) {
+        Ok(metadata) if metadata.is_dir() => forklift.join(FILE_NAME_BAY_REDIRECT),
+        Ok(metadata) if metadata.is_file() => forklift.clone(),
+        Ok(_) => return Err(not_this_bays(&forklift, name, "it is a link or special file")),
         Err(e) if gone(&e) => return Ok(()),
         Err(e) => return Err(RedirectRemoval::Kept(format!("Error while checking \"{}\": {}", forklift.to_string_lossy(), e))),
+    };
+
+    if let Err(why) = names_this_bay(&record, shared_forklift, name) {
+        return Err(not_this_bays(&forklift, name, &why));
     }
 
     let retired = file_utils::temp_path_for(&forklift).map_err(RedirectRemoval::Kept)?;
@@ -241,13 +270,51 @@ pub fn remove_bay_redirect(bay_dir: &Path) -> Result<(), RedirectRemoval> {
     )))
 }
 
+/// Whether the redirect record at `record`, read without following a link, names the bay `name`
+/// of the warehouse whose `.forklift` folder is `shared_forklift`.
+///
+/// # Returns
+/// * `Ok(())`      - It does.
+/// * `Err(String)` - Why it does not.
+fn names_this_bay(record: &Path, shared_forklift: &Path, name: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(record) {
+        Ok(metadata) if metadata.is_file() => (),
+        Ok(_) => return Err("its redirect is not a regular file".to_string()),
+        Err(e) => return Err(format!("its redirect could not be read: {}", e)),
+    }
+
+    let redirect = read_redirect_record(record)?;
+    if redirect.name != name {
+        return Err(format!("it redirects to the bay \"{}\"", redirect.name));
+    }
+
+    let same = match (std::fs::canonicalize(redirect.warehouse_root.join(FOLDER_NAME_FORKLIFT_ROOT)),
+                      std::fs::canonicalize(shared_forklift)) {
+        (Ok(named), Ok(shared)) => named == shared,
+        _ => false,
+    };
+    if !same {
+        return Err(format!("it redirects to the warehouse at \"{}\"", redirect.warehouse_root.to_string_lossy()));
+    }
+
+    Ok(())
+}
+
+/// The [`RedirectRemoval::Left`] for an entry at a bay's path that is not that bay's.
+fn not_this_bays(forklift: &Path, name: &str, why: &str) -> RedirectRemoval {
+    RedirectRemoval::Left(format!(
+        "\"{}\" was left in place, since it is not the bay \"{}\"'s folder: {}.",
+        forklift.to_string_lossy(), name, why
+    ))
+}
+
 /// How [`remove_bay_redirect`] failed.
 #[derive(Debug)]
 pub enum RedirectRemoval {
     /// Nothing was moved: the directory is still a bay.
     Kept(String),
 
-    /// The directory is no longer a bay, but an entry was left behind.
+    /// The directory no longer redirects to this bay, but an entry was left behind.
     Left(String),
 }
 
@@ -302,19 +369,8 @@ pub fn remove_command(name: &str) -> Option<String> {
 pub fn read_bay_redirect(forklift_path: &Path) -> Result<BayRedirect, String> {
     let folder = forklift_path;
     let forklift_path = &folder.join(FILE_NAME_BAY_REDIRECT);
-    let bytes = std::fs::read(forklift_path)
-        .map_err(|e| format!("Error while reading the bay redirect \"{}\": {}", forklift_path.to_string_lossy(), e))?;
-
-    let fields = record_utils::from_bytes(&bytes, BAY_REDIRECT_RECORD, BAY_REDIRECT_VERSION).map_err(|e| match e {
-        RecordError::Unversioned => format!(
-            "\"{}\" is not a valid forklift bay redirect (or an older version of Forklift wrote it).",
-            forklift_path.to_string_lossy()
-        ),
-        _ => format!("The bay redirect \"{}\" {}", forklift_path.to_string_lossy(), e.describe()),
-    })?;
-
-    let [warehouse_root, name] = <[String; 2]>::try_from(fields)
-        .map_err(|_| format!("The bay redirect \"{}\" is malformed.", forklift_path.to_string_lossy()))?;
+    let BayRedirect { warehouse_root, name } = read_redirect_record(forklift_path)?;
+    let warehouse_root = warehouse_root.to_string_lossy();
 
     if warehouse_root.is_empty() {
         return Err("The bay redirect has no warehouse path.".to_string());
@@ -334,6 +390,34 @@ pub fn read_bay_redirect(forklift_path: &Path) -> Result<BayRedirect, String> {
         };
         format!("The bay redirect \"{}\" names an invalid bay: {}. {}", forklift_path.to_string_lossy(), e, way_out)
     })?;
+
+    Ok(BayRedirect {
+        warehouse_root: PathBuf::from(warehouse_root.into_owned()),
+        name,
+    })
+}
+
+/// Read a bay redirect record's two fields, unvalidated: the `redirect` file in a bay's
+/// `.forklift` folder, or the `.forklift` file itself of a bay from an older version, whose
+/// record is the same.
+///
+/// # Returns
+/// * `Ok(BayRedirect)` - The recorded warehouse root and bay name, either possibly empty or invalid.
+/// * `Err(String)`     - If the file is not a bay redirect record.
+fn read_redirect_record(forklift_path: &Path) -> Result<BayRedirect, String> {
+    let bytes = std::fs::read(forklift_path)
+        .map_err(|e| format!("Error while reading the bay redirect \"{}\": {}", forklift_path.to_string_lossy(), e))?;
+
+    let fields = record_utils::from_bytes(&bytes, BAY_REDIRECT_RECORD, BAY_REDIRECT_VERSION).map_err(|e| match e {
+        RecordError::Unversioned => format!(
+            "\"{}\" is not a valid forklift bay redirect (or an older version of Forklift wrote it).",
+            forklift_path.to_string_lossy()
+        ),
+        _ => format!("The bay redirect \"{}\" {}", forklift_path.to_string_lossy(), e.describe()),
+    })?;
+
+    let [warehouse_root, name] = <[String; 2]>::try_from(fields)
+        .map_err(|_| format!("The bay redirect \"{}\" is malformed.", forklift_path.to_string_lossy()))?;
 
     Ok(BayRedirect {
         warehouse_root: PathBuf::from(warehouse_root),
@@ -865,6 +949,14 @@ mod tests {
         let error = classify_forklift(&forklift).unwrap_err();
         assert!(error.contains("is not a regular file"), "{}", error);
         std::fs::remove_dir(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("nowhere"), forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
+            let error = classify_forklift(&forklift).map(|kind| format!("{:?}", kind)).unwrap_or_else(|e| e);
+            assert!(error.contains("is a link to nothing"), "a dangling redirect must not read as a warehouse: {}", error);
+            std::fs::remove_file(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
+        }
         std::fs::remove_dir(&forklift).unwrap();
 
         write_bay_redirect(&dir, Path::new("/srv/warehouse"), "review").unwrap();
@@ -881,29 +973,74 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Removing a bay's `.forklift` never follows a link planted in its place: the link goes, and
-    /// what it pointed at is untouched.
-    #[cfg(unix)]
+    /// Removing a bay's `.forklift` deletes only this bay's own entry: its folder, or its file
+    /// from an older version. Another warehouse's metadata, another bay's or another warehouse's
+    /// bay folder, and a link (even to this bay's own folder) are left in place and named, and
+    /// what a link points at is never touched.
     #[test]
-    fn removing_the_bay_folder_never_follows_a_link() {
-        let dir = std::env::temp_dir().join(format!("forklift-bay-utils-remove-link-{}", std::process::id()));
+    fn removing_a_bay_deletes_only_its_own_folder() {
+        let dir = std::env::temp_dir().join(format!("forklift-bay-utils-remove-own-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let bay = dir.join("bay");
-        let elsewhere = dir.join("elsewhere");
-        std::fs::create_dir_all(&bay).unwrap();
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::fs::write(elsewhere.join("precious"), "keep me").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, bay.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let warehouse = dir.join("warehouse");
+        let shared = warehouse.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&shared).unwrap();
+        let other_warehouse = dir.join("other-warehouse");
+        std::fs::create_dir_all(other_warehouse.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let bay = |name: &str| { let bay = dir.join(name); std::fs::create_dir_all(&bay).unwrap(); bay };
+        let left = |result: Result<(), RedirectRemoval>| match result {
+            Err(RedirectRemoval::Left(e)) => e,
+            other => panic!("the entry must be left in place and named, got {:?}", other),
+        };
 
-        remove_bay_redirect(&bay).unwrap();
+        let own = bay("own");
+        write_bay_redirect(&own, &warehouse, "review").unwrap();
+        remove_bay_redirect(&own, &shared, "review").unwrap();
+        assert!(std::fs::symlink_metadata(own.join(FOLDER_NAME_FORKLIFT_ROOT)).is_err(), "this bay's folder is removed");
+        assert_eq!(std::fs::read_dir(&own).unwrap().count(), 0, "nothing renamed is left behind");
 
-        assert_eq!(std::fs::read_to_string(elsewhere.join("precious")).ok().as_deref(), Some("keep me"),
-                   "what the link pointed at must be untouched");
-        assert_eq!(std::fs::read_dir(&bay).unwrap().count(), 0, "the link and its renamed name are gone");
+        let old = bay("old");
+        write_bay_redirect(&old, &warehouse, "review").unwrap();
+        let folder = old.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::rename(folder.join(FILE_NAME_BAY_REDIRECT), old.join("record")).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
+        std::fs::rename(old.join("record"), &folder).unwrap();
+        remove_bay_redirect(&old, &shared, "review").unwrap();
+        assert!(std::fs::symlink_metadata(&folder).is_err(), "this bay's old-format file is removed");
+
+        let reused = bay("reused");
+        std::fs::create_dir_all(reused.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
+        let error = left(remove_bay_redirect(&reused, &shared, "review"));
+        assert!(reused.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects").is_dir(), "a warehouse's metadata is left alone");
+        assert!(error.contains("not the bay \"review\"'s folder"), "{}", error);
+
+        let another = bay("another");
+        write_bay_redirect(&another, &warehouse, "other").unwrap();
+        let error = left(remove_bay_redirect(&another, &shared, "review"));
+        assert!(another.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_BAY_REDIRECT).is_file(), "another bay is left alone");
+        assert!(error.contains("the bay \"other\""), "{}", error);
+
+        let foreign = bay("foreign");
+        write_bay_redirect(&foreign, &other_warehouse, "review").unwrap();
+        left(remove_bay_redirect(&foreign, &shared, "review"));
+        assert!(foreign.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_BAY_REDIRECT).is_file(),
+                "another warehouse's bay of the same name is left alone");
+
+        #[cfg(unix)]
+        {
+            let target = bay("target");
+            write_bay_redirect(&target, &warehouse, "review").unwrap();
+            let linked = bay("linked");
+            std::os::unix::fs::symlink(target.join(FOLDER_NAME_FORKLIFT_ROOT), linked.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            left(remove_bay_redirect(&linked, &shared, "review"));
+            assert!(std::fs::symlink_metadata(linked.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap().file_type().is_symlink(),
+                    "the link is left in place");
+            assert!(target.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_BAY_REDIRECT).is_file(),
+                    "what the link pointed at must be untouched");
+        }
 
         // A bay whose working tree or .forklift is already gone is removed without complaint.
-        remove_bay_redirect(&bay).unwrap();
-        remove_bay_redirect(&dir.join("missing")).unwrap();
+        remove_bay_redirect(&own, &shared, "review").unwrap();
+        remove_bay_redirect(&dir.join("missing"), &shared, "review").unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
     }

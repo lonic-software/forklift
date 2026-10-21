@@ -12450,23 +12450,30 @@ fn an_old_format_bay_redirect_is_refused_with_a_conversion_that_works() {
     std::fs::remove_dir_all(&forklift).unwrap();
     std::fs::write(&forklift, &content).unwrap();
     std::fs::write(bay_dir.join("redirect"), "the bay's own file\n").unwrap();
+    // The bay's tree holds the remedy's first-choice name, so the remedy names another.
+    std::fs::create_dir(bay_dir.join(".forklift.new")).unwrap();
+    std::fs::write(bay_dir.join(".forklift.new").join("keep.txt"), "the bay's own folder\n").unwrap();
 
     let bay = TestWarehouse { root: bay_dir.clone(), home: warehouse.home.clone() };
     let refused = bay.run(&["stocktake"]);
     let message = stderr(&refused);
     assert!(message.contains("older version of Forklift")
-        && message.contains("create the folder") && message.contains(".forklift.new\"")
-        && message.contains(&format!(".forklift.new{}redirect\"", std::path::MAIN_SEPARATOR))
+        && message.contains("create the new folder") && message.contains(".forklift.new-1\"")
+        && message.contains(&format!(".forklift.new-1{}redirect\"", std::path::MAIN_SEPARATOR))
         && message.contains("then rename"), "the refusal must name the conversion: {}", message);
+    assert!(!message.contains(".forklift.new\""), "the remedy must not name a folder the tree holds: {}", message);
     assert!(!refused.status.success());
 
-    let staging = bay_dir.join(".forklift.new");
+    let staging = bay_dir.join(".forklift.new-1");
     std::fs::create_dir(&staging).unwrap();
     std::fs::rename(&forklift, staging.join("redirect")).unwrap();
     std::fs::rename(&staging, &forklift).unwrap();
 
-    assert_eq!(changes(&bay, "unstaged"), vec![("untracked".to_string(), "redirect".to_string())]);
+    let untracked = changes(&bay, "unstaged");
+    assert!(untracked.contains(&("untracked".to_string(), "redirect".to_string()))
+        && untracked.iter().all(|(kind, _)| kind == "untracked"), "{:?}", untracked);
     assert_eq!(std::fs::read_to_string(bay_dir.join("redirect")).unwrap(), "the bay's own file\n");
+    assert_eq!(std::fs::read_to_string(bay_dir.join(".forklift.new").join("keep.txt")).unwrap(), "the bay's own folder\n");
 }
 
 /// `bay remove` first moves the bay's `.forklift` folder aside: while that fails, the directory
@@ -12492,8 +12499,13 @@ fn a_bay_whose_folder_cannot_be_moved_aside_is_kept() {
     assert!(warehouse.root.join(".forklift/bays/b1").is_dir(), "the bay's state must be kept");
     assert!(bay_dir.join(".forklift").join("redirect").is_file(), "the directory must still be the bay");
     assert!(stderr(&removed).contains("was kept"), "{}", stderr(&removed));
+    let way_out = format!("delete the folder \"{}\" by hand, then run this command again",
+                          bay_dir.join(".forklift").to_string_lossy());
+    assert!(stderr(&removed).contains(&way_out), "the refusal must name the way out: {}", stderr(&removed));
     assert!(!removed.status.success());
 
+    // Followed literally, the way out removes the bay.
+    std::fs::remove_dir_all(bay_dir.join(".forklift")).unwrap();
     assert_success(&warehouse.run(&["bay", "remove", "b1"]));
     assert!(!warehouse.root.join(".forklift/bays/b1").exists());
     let left: Vec<String> = std::fs::read_dir(&bay_dir).unwrap()
@@ -12501,6 +12513,26 @@ fn a_bay_whose_folder_cannot_be_moved_aside_is_kept() {
         .filter(|name| name.starts_with(".forklift"))
         .collect();
     assert!(left.is_empty(), "left behind: {:?}", left);
+}
+
+/// `bay remove` deletes only the bay's own `.forklift`: once its directory holds another
+/// warehouse, that warehouse is left whole and named, and the bay's state is still removed.
+#[test]
+fn removing_a_bay_whose_directory_now_holds_a_warehouse_leaves_that_warehouse_alone() {
+    let (warehouse, bay_dir) = warehouse_with_a_bay("bay-remove-reused");
+    std::fs::remove_dir_all(&bay_dir).unwrap();
+    std::fs::create_dir_all(&bay_dir).unwrap();
+    let reused = TestWarehouse { root: bay_dir.clone(), home: warehouse.home.clone() };
+    assert_success(&reused.run(&["prepare"]));
+    let before = metadata_listing(&reused, "");
+
+    let removed = warehouse.run(&["bay", "remove", "b1"]);
+
+    assert_eq!(metadata_listing(&reused, ""), before, "the other warehouse must be left whole");
+    assert!(!warehouse.root.join(".forklift/bays/b1").exists(), "the bay's state is removed");
+    assert!(stderr(&removed).contains("was left in place") && stderr(&removed).contains("was removed"),
+            "the entry must be named: {}", stderr(&removed));
+    assert!(!removed.status.success());
 }
 
 /// `prepare` in a bay's working directory refuses, and adds nothing to the bay's `.forklift`

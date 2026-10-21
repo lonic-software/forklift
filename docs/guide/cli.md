@@ -1108,10 +1108,13 @@ the bay's volume even when the warehouse lives on another one. `prepare` in a ba
 refuses rather than turn it into a warehouse.
 
 A bay made by an older version of Forklift has a `.forklift` *file* instead, which is refused,
-naming the conversion: create a folder `.forklift.new`, move the `.forklift` file into it as
-`redirect`, then rename `.forklift.new` to `.forklift`. `bay remove` first moves the bay's
-`.forklift` folder aside, which is the step that ends the bay; if that fails, the bay is kept
-and the error says why.
+naming the conversion: create a new folder (the error names one nothing in the directory
+holds, such as `.forklift.new`), move the `.forklift` file into it as `redirect`, then rename
+the folder to `.forklift`. `bay remove` deletes only the bay's own `.forklift`, one whose
+redirect names that bay of that warehouse; anything else found at the bay's path (another
+warehouse, another bay, a link) is left in place and named. It first moves the folder aside,
+which is the step that ends the bay; if that fails, the bay is kept and the error says how to
+remove it by hand.
 
 A bay name follows the pallet-name rules (see `palletize`) and is one folder, so it has no `/`.
 `bay remove <name>` matches the
