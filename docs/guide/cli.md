@@ -846,7 +846,8 @@ forklift lower --keep kv:<parcel-hash>/ci=ours     # keep yours, lifted over the
 
 `theirs` on a bare `kv:<parcel-hash>` takes the remote's side for every key on that parcel.
 `theirs` also discards a local change nobody else made, even when the remote never moved: that is
-the way out when `lift` reports a change the remote refuses to admit.
+the way out when `lift` reports a change the remote refuses to admit. It needs the pallet on the
+remote already, since a pallet never lifted has no remote side to keep.
 
 ### `tag` — signed tags / releases
 
@@ -866,7 +867,7 @@ revision, `tag create` tags the current pallet's head. If two admins cut the sam
 concurrently, `lower` reports the conflict: `--keep tags:<name>=theirs` drops your tag, and
 keeping yours is refused, since that would move theirs. An admin demoted before lifting a tag
 they cut is left holding a tag the remote refuses; `lift` says so, and
-`lower --keep tags:<name>=theirs` drops it the same way.
+`lower --keep tags:<name>=theirs` drops it the same way, once `@tags` is on the remote.
 
 A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
 or was collected because nothing else referenced it (e.g. after an `undo` moved the only

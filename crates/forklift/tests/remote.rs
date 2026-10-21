@@ -6488,6 +6488,18 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     let stale = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=theirs", subject)]);
     assert!(!stale.status.success(), "a keep with nothing to resolve must be refused");
 
+    // On a pallet only this side moved, theirs drops the change it names and replays the rest.
+    assert_success(&area.forklift("a", &["kv", "set", "main", "drop", "x"]));
+    assert_success(&area.forklift("a", &["kv", "set", "main", "stay", "y"]));
+    let kept = area.forklift("a", &["lower", "--keep", &format!("kv:{}/drop=theirs", subject)]);
+    assert_success(&kept);
+    assert!(stdout(&kept).contains("Replayed"), "{}", stdout(&kept));
+    assert!(!area.forklift("a", &["kv", "get", "main", "drop"]).status.success(), "the named change is dropped");
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(stdout(&area.forklift("b", &["kv", "get", "main", "stay"])).trim(), "y",
+               "the rest is replayed onto the remote");
+    assert!(!area.forklift("b", &["kv", "get", "main", "drop"]).status.success());
+
     // Unset removes the key; the log shows every change, newest first.
     assert_success(&area.forklift("a", &["kv", "unset", "main", "ci"]));
     assert!(!area.forklift("a", &["kv", "get", "main", "ci"]).status.success());

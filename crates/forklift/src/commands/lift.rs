@@ -130,19 +130,20 @@ pub async fn handle_command() -> Result<(), String> {
     }
 }
 
-/// A meta pallet's lift failure, naming the way out when the pallet is only ahead of the remote:
-/// a change the remote refuses to admit (a tag whose tagger was demoted before lifting it) is
-/// dropped by lowering with "theirs" at its path. A diverged pallet's failure already says to
-/// lower.
+/// A meta pallet's lift failure, naming the way out when the remote refuses a local change in it
+/// (a tag whose tagger was demoted before lifting it): lowering with "theirs" at its path drops
+/// the change. Only a failure the local office would refuse too gets the hint — a lost race or a
+/// transport error is not one, and a diverged pallet's failure already says to lower.
 fn with_drop_hint(error: String, info: &forklift_core::model::remote::WarehouseInfo, wire: &str) -> String {
     let name = wire.strip_prefix(pallet_utils::META_QUALIFIER).unwrap_or(wire);
 
-    match lower::local_ahead_of(info, name) {
-        Ok(lower::LocalSide::Ahead(_)) => forklift_core::error::append_to_message(error, &format!(
-            "If the remote refuses a local change, \"lower --keep {}:<path>=theirs\" drops it.", name
-        )),
-        _ => error,
+    if !remote_utils::lift_refused_by_content(name, info.pallets.get(wire).map(String::as_str)) {
+        return error;
     }
+
+    forklift_core::error::append_to_message(error, &format!(
+        "If the remote refuses a local change, \"lower --keep {}:<path>=theirs\" drops it.", name
+    ))
 }
 
 /// Refuse a lift from a sparse workspace to a remote other than the one it fetched against.

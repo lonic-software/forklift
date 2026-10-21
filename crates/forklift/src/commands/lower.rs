@@ -478,9 +478,14 @@ async fn sync_meta(client: &RemoteClient,
         ..MetaSync::default()
     };
 
+    // A pallet only this side moved needs no reconciling, so lower leaves it for lift — unless a
+    // resolution names it. Then it replays onto the remote head like a diverged one, which is
+    // how "theirs" drops a local change the remote will not admit (a tag cut by an admin who
+    // was demoted before lifting it).
+    let named_ahead = adopt.ahead.iter().filter(|(name, _)| keeps.contains_key(name));
     let no_keeps = BTreeMap::new();
 
-    for (name, remote_head) in &adopt.diverged {
+    for (name, remote_head) in adopt.diverged.iter().chain(named_ahead) {
         let wire = pallet_utils::PalletRef::meta(name).to_wire();
         let keep = keeps.get(name).unwrap_or(&no_keeps);
 
@@ -497,75 +502,33 @@ async fn sync_meta(client: &RemoteClient,
         }
     }
 
-    // A pallet only this side moved needs no reconciling, so lower leaves it for lift — unless a
-    // resolution names it. Then it replays onto the remote head like a diverged one, which is
-    // how "theirs" drops a local change the remote will not admit (a tag cut by an admin who
-    // was demoted before lifting it). Any other pallet a resolution names has nothing to
-    // resolve; say so, unless it already failed for a reason of its own.
-    for (pallet, keep) in keeps {
+    // Any other pallet a resolution names has nothing to resolve; say so, unless it already
+    // failed for a reason of its own.
+    for pallet in keeps.keys() {
         let wire = pallet_utils::PalletRef::meta(pallet).to_wire();
+        let replayed = adopt.diverged.iter().chain(&adopt.ahead).any(|(name, _)| name == pallet);
 
-        if adopt.diverged.iter().any(|(name, _)| name == pallet)
-            || sync.failed.iter().any(|failure| failure.pallet == wire) {
+        if replayed || sync.failed.iter().any(|failure| failure.pallet == wire) {
             continue;
         }
 
-        let reconciled = match local_ahead_of(info, pallet) {
-            Ok(LocalSide::Ahead(remote_head)) => match meta_tree::meta_rules(pallet) {
-                Some(rules) => replay(client, info, pallet, rules, &remote_head, keep, &mut sync.restamped).await,
-                None => Err(format!("The @{} pallet has no rules to replay it.", pallet)),
-            },
-            Ok(LocalSide::NotOnRemote) => Err(format!(
+        let error = match pallet_utils::get_meta_pallet_head(pallet) {
+            Err(error) => error,
+            Ok(Some(_)) if !info.pallets.contains_key(&wire) => format!(
                 "{} is not on the remote yet, so there is no remote side for --keep to keep.",
                 wire
-            )),
-            Ok(LocalSide::NothingAhead) => Err(format!(
+            ),
+            Ok(_) => format!(
                 "{} holds no local change the remote lacks, so there is nothing for --keep to \
                 resolve.",
                 wire
-            )),
-            Err(error) => Err(error),
+            ),
         };
 
-        match reconciled {
-            Ok(Reconciled::Replayed) => sync.replayed.push(wire),
-            Ok(Reconciled::Adopted) => sync.adopted.push(wire),
-            Ok(Reconciled::Conflicts(conflicts)) => sync.conflicts.push(conflicts),
-            Err(error) => sync.failed.push(MetaPalletFailure { pallet: wire, error }),
-        }
+        sync.failed.push(MetaPalletFailure { pallet: wire, error });
     }
 
     sync
-}
-
-/// Where a meta pallet's local head stands against the remote's, as the handshake listed it.
-pub(crate) enum LocalSide {
-    /// The local head descends from the remote one (named here) and holds parcels it lacks.
-    Ahead(String),
-
-    /// The remote holds no such pallet, and this side does.
-    NotOnRemote,
-
-    /// No local head, the same head, or one that does not descend from the remote's.
-    NothingAhead,
-}
-
-/// Where the local head of the meta pallet `name` stands against the head `info` lists.
-pub(crate) fn local_ahead_of(info: &forklift_core::model::remote::WarehouseInfo,
-                             name: &str) -> Result<LocalSide, String> {
-    let Some(local) = pallet_utils::get_meta_pallet_head(name)? else {
-        return Ok(LocalSide::NothingAhead);
-    };
-
-    let Some(remote) = info.pallets.get(&pallet_utils::PalletRef::meta(name).to_wire()) else {
-        return Ok(LocalSide::NotOnRemote);
-    };
-
-    if *remote != local && merge_utils::is_ancestor(remote, &local)? {
-        return Ok(LocalSide::Ahead(remote.clone()));
-    }
-
-    Ok(LocalSide::NothingAhead)
 }
 
 /// Replay a meta pallet's local net change onto the remote head and lift the result. The
@@ -582,16 +545,30 @@ async fn replay(client: &RemoteClient,
     let local = pallet_utils::get_meta_pallet_head(name)?
         .ok_or(format!("{} has no local head to replay.", wire))?;
 
+    let base = meta_tree::linear_common_ancestor(&local, remote_head)?;
+
+    let plan = match meta_tree::plan_replay(name, rules, base.as_deref(), &local, remote_head, keep) {
+        Ok(plan) => plan,
+        Err(ReplayError::Conflicts(conflicts)) => {
+            return Ok(Reconciled::Conflicts(describe_conflicts(&wire, rules, &conflicts)?));
+        }
+        Err(ReplayError::Refused(why)) => return Err(why),
+    };
+
+    // Every local change is on the remote already or dropped by a resolution. Nothing is signed,
+    // so an operator the office no longer lets sign can still drop what the remote refuses.
+    if plan.is_empty() {
+        pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head)?;
+        return Ok(Reconciled::Adopted);
+    }
+
     let actor = config_utils::get_operator()?;
     let (office, signing_key_id) = verified_signing_office(&actor)?;
-    let base = meta_tree::linear_common_ancestor(&local, remote_head)?;
 
     let description = format!("Replayed the local {} onto the remote's.", wire);
     let signer = MetaSigner::local(&signing_key_id);
 
-    let replayed = meta_tree::replay_meta_pallet(
-        name, rules, &office, base.as_deref(), &local, remote_head, keep, &actor, &description, &signer
-    );
+    let replayed = meta_tree::replay_meta_pallet(name, rules, &office, &plan, &actor, &description, &signer);
 
     let parcel = match replayed {
         Ok(Some(parcel)) => parcel,

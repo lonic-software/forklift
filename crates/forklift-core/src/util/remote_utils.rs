@@ -6011,6 +6011,37 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
     Ok(lifts)
 }
 
+/// Whether the local head of a meta pallet is ahead of the remote's: it descends from it and is
+/// not it. Decided from the local ancestry alone, so the remote head need not be fetched.
+pub fn is_local_ahead(remote_head: &str, local_head: &str) -> Result<bool, String> {
+    Ok(local_head != remote_head && merge_utils::is_ancestor(remote_head, local_head)?)
+}
+
+/// Whether the content check this store can run itself refuses a meta pallet's lift: its local
+/// head is ahead of `remote_head` and a new parcel breaks the pallet's rules against the local
+/// verified office (an admission the office no longer grants, say). `false` when the check
+/// passes, when the pallet is not ahead, or when it cannot be run here, so a failed lift for
+/// any other reason (a transfer, a remote that moved) is never taken for a refusal.
+pub fn lift_refused_by_content(name: &str, remote_head: Option<&str>) -> bool {
+    let (Some(remote_head), Some(rules)) = (remote_head, meta_tree::meta_rules(name)) else {
+        return false;
+    };
+
+    let refused = || -> Result<bool, String> {
+        let Some(local) = pallet_utils::get_meta_pallet_head(name)? else { return Ok(false) };
+
+        if !is_local_ahead(remote_head, &local)? {
+            return Ok(false);
+        }
+
+        let office = crate::util::audit_utils::verified_local_office()?;
+
+        Ok(meta_tree::verify_meta_content(name, rules, &office, meta_tree::Admission::Admit, Some(remote_head), &local).is_err())
+    };
+
+    refused().unwrap_or(false)
+}
+
 /// The outcome of adopting the remote's meta pallets.
 #[derive(Default)]
 pub struct MetaAdoptResult {
@@ -6022,6 +6053,10 @@ pub struct MetaAdoptResult {
     /// two chains' common ancestor — and the caller applies the pallet's sync policy.
     pub diverged: Vec<(String, String)>,
 
+    /// Meta pallets only this side moved: the local head descends from the remote one. As
+    /// `(bare name, remote head)`. Nothing was fetched or moved for them.
+    pub ahead: Vec<(String, String)>,
+
     /// Meta pallets that could not be adopted, as `(wire ref, why)`. One pallet failing never
     /// stops the others.
     pub failed: Vec<(String, String)>,
@@ -6029,8 +6064,11 @@ pub struct MetaAdoptResult {
 
 /// What adopting one meta pallet did.
 enum MetaAdoptStep {
-    /// Nothing to do: up to date, or the local side is ahead.
-    Unchanged,
+    /// Nothing to do: the local head is the remote's.
+    UpToDate,
+
+    /// Nothing to adopt: the local head descends from the remote's.
+    Ahead,
 
     /// The local ref moved to the remote head.
     Adopted,
@@ -6069,7 +6107,8 @@ pub async fn adopt_meta_pallets(client: &RemoteClient, info: &WarehouseInfo) -> 
         }
 
         match adopt_meta_pallet(client, name, remote_head).await {
-            Ok(MetaAdoptStep::Unchanged) => {}
+            Ok(MetaAdoptStep::UpToDate) => {}
+            Ok(MetaAdoptStep::Ahead) => result.ahead.push((name.to_string(), remote_head.clone())),
             Ok(MetaAdoptStep::Adopted) => result.adopted.push(key.clone()),
             Ok(MetaAdoptStep::Diverged) => result.diverged.push((name.to_string(), remote_head.clone())),
             Err(why) => result.failed.push((key.clone(), why)),
@@ -6087,8 +6126,12 @@ async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str)
     // Up to date, or local is ahead — both decidable from the *local* ancestry alone (these
     // walks never load the not-yet-fetched remote head).
     if let Some(local) = &local {
-        if local == remote_head || merge_utils::is_ancestor(remote_head, local)? {
-            return Ok(MetaAdoptStep::Unchanged);
+        if local == remote_head {
+            return Ok(MetaAdoptStep::UpToDate);
+        }
+
+        if is_local_ahead(remote_head, local)? {
+            return Ok(MetaAdoptStep::Ahead);
         }
     }
 
