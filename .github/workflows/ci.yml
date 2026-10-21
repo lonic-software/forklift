@@ -19,10 +19,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Set but empty on purpose: a RUSTFLAGS variable, even an empty one, replaces the rustflags in
-  # .cargo/config.toml. Its macOS split-debuginfo setting stops a local incremental build from
-  # piling up object files. CI cannot pile them up (rust-cache turns incremental off), and there
-  # the setting cost ~13 s of dsymutil per macOS job, and its cache grew from 553 MB to 1015 MB.
+  # Set but empty on purpose: a RUSTFLAGS variable, even an empty one, replaces every rustflags
+  # entry in .cargo/config.toml, on every OS. Today the only entry is the macOS split-debuginfo
+  # setting, which stops a local incremental build from piling up object files. CI cannot pile them
+  # up (rust-cache turns incremental off), and with the setting on, one warm macOS rerun took about
+  # 13 s longer and its cache grew from 553 MB to 1015 MB. A rustflags entry added to the config
+  # later is not used here either: give it to CI in this variable too. The macOS leg's "Split
+  # debuginfo guard" step checks the setting itself, with this variable unset.
   RUSTFLAGS: ""
 
 jobs:
@@ -142,6 +145,23 @@ jobs:
           esac
           echo "cores=$cores test-threads=$(( cores * 2 ))"
           cargo nextest run --workspace --no-fail-fast --profile ci --test-threads "$(( cores * 2 ))"
+
+      # CI builds with the config's rustflags switched off (see RUSTFLAGS above), so this checks
+      # what developers get on macOS: a throwaway crate built under .cargo/config.toml must leave no
+      # object files in its deps directory. It fails if a toolchain stops honouring the setting,
+      # for instance by putting cargo's own "-Csplit-debuginfo=unpacked" after it.
+      - name: Split debuginfo guard
+        if: env.SKIP_TESTS != 'true' && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          probe="$RUNNER_TEMP/split-debuginfo-probe"
+          cargo new --quiet --lib "$probe"
+          mkdir "$probe/.cargo"
+          cp .cargo/config.toml "$probe/.cargo/"
+          (cd "$probe" && env -u RUSTFLAGS cargo build --quiet)
+          objects=$(find "$probe/target/debug/deps" -name '*.rcgu.o' | wc -l)
+          echo "object files left in deps: $objects"
+          [ "$objects" -eq 0 ]
 
       # nextest does not run doc-tests.
       - name: Doc-tests

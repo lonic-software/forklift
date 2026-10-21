@@ -106,7 +106,8 @@ Notes:
     before it needs one `cargo clean`.
   - Cargo takes rustflags from only one place. A `RUSTFLAGS` or
     `CARGO_ENCODED_RUSTFLAGS` environment variable replaces this setting, and the
-    objects pile up again. This setting in turn replaces `[build] rustflags` from
+    objects pile up again; if you need one, include `-Csplit-debuginfo=packed` in
+    it. This setting in turn replaces `[build] rustflags` from
     your own `~/.cargo/config.toml`. Put personal flags under
     `[target.'cfg(target_os = "macos")'] rustflags` instead: cargo joins those
     lists across config files.

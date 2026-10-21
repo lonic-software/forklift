@@ -8,11 +8,12 @@
 # 10 s more per touched-core rebuild; it overtakes the default at roughly 250,000 stale files.
 # CI cannot accumulate these: Swatinem/rust-cache exports CARGO_INCREMENTAL=0, and without
 # incremental the object names are stable and get overwritten. ci.yml sets an empty RUSTFLAGS,
-# which switches this off there: on a macOS runner it cost ~13 s of dsymutil, for nothing.
+# which switches every rustflags entry in this file off there (on a macOS runner this one only
+# added time, about 13 s in one warm rerun); an entry CI needs must go into that variable too.
 # This relies on cargo placing config rustflags after its own "-Csplit-debuginfo=unpacked" and on
-# rustc taking the last value given (both seen with cargo/rustc 1.94.1); the guide's check in
-# docs/guide/contributing.md shows if that ever stops holding. Cargo reads rustflags from one
-# source only: RUSTFLAGS in the environment replaces this, and this replaces a [build] rustflags
-# from a personal config.
+# rustc taking the last value given (both seen with cargo/rustc 1.94.1); the macOS leg of ci.yml
+# checks it on every run with a throwaway crate. Cargo reads rustflags from one source only:
+# RUSTFLAGS in the environment replaces this, and this replaces a [build] rustflags from a personal
+# config.
 [target.'cfg(target_os = "macos")']
 rustflags = ["-Csplit-debuginfo=packed"]
