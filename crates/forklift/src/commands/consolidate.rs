@@ -586,8 +586,8 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
     let mut conflict_paths: Vec<String> = Vec::new();
     let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    // The batch may already have published some shards early (see its doc comment), so a failure
-    // claims only that some or all of the changes are unstaged.
+    // The batch publishes nothing before `publish`, but a publish that fails partway may still have
+    // written some shards, so a failure claims only that some or all of the changes are unstaged.
     apply_merge_actions_to(actions, &mut batch, &mut conflict_paths)
         .and_then(|()| batch.publish())
         .map_err(|e| format!(
