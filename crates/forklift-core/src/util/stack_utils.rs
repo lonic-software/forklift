@@ -225,6 +225,20 @@ pub async fn stack_parcel(description: Option<String>,
         None => None,
     };
 
+    // A pick completes with its source's authors, read here, before the tree build. A pick in
+    // progress roots its source, but `undo` can bring back a pick whose source was collected while
+    // no pick named it.
+    let pick_authors = match &cherry_pick {
+        Some(state) => Some(cherry_pick_utils::collect_source_authors(&state.source, &operator).map_err(|e| {
+            StackError::Other(format!(
+                "The cherry-pick in progress cannot be completed: its source parcel {} cannot be \
+                read ({}). Nothing was stacked. Abort the pick ({}).",
+                state.source, e, cherry_pick_utils::abort_hint()
+            ))
+        })?),
+        None => None,
+    };
+
     // Every shard the tree build can need is read and parsed exactly once here, and shared by the
     // conflict check, the tree build and the post-stack cleanup. The read happens before anything
     // is written, so the conflict check below still runs strictly before any warehouse mutation.
@@ -389,10 +403,8 @@ pub async fn stack_parcel(description: Option<String>,
     // source parcel's Author actions and adds this operator's Stack action.
     let timestamp = Utc::now();
 
-    let actions = match &cherry_pick {
-        Some(state) => {
-            let authors = cherry_pick_utils::collect_source_authors(&state.source, &operator)?;
-
+    let actions = match pick_authors {
+        Some(authors) => {
             let mut actions: Vec<ParcelAction> = authors.into_iter()
                 .map(|author| ParcelAction {
                     operator: author,

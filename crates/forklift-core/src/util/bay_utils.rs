@@ -295,8 +295,8 @@ pub enum BayReadPolicy {
 
 /// [`collect_bay_scoped_parcel_roots`]'s result.
 pub struct BayScopeOutcome {
-    /// Every listed dir's base, parked-parcel hashes plus in-progress-consolidation `their_head`, from
-    /// every bay this call could actually read.
+    /// Every listed dir's base, parked-parcel hashes and the parcels an in-progress consolidation
+    /// or cherry-pick records, from every bay this call could actually read.
     pub roots: Vec<String>,
     /// One plain-language note per bay skipped this call because its state could not be read —
     /// only ever populated under [`BayReadPolicy::Tolerate`] (always empty under `FailClosed`,
@@ -348,8 +348,8 @@ pub struct BayScopeOutcome {
 /// * `policy` - What to do with a bay whose state cannot be read — see [`BayReadPolicy`].
 ///
 /// # Returns
-/// * `Ok(BayScopeOutcome)` - Every readable dir's base, parked-parcel hashes plus in-progress-
-///                           consolidation `their_head`, in `dirs` order, plus (under `Tolerate`)
+/// * `Ok(BayScopeOutcome)` - Every readable dir's base, parked-parcel hashes and the parcels an
+///                           in-progress consolidation or cherry-pick records, in `dirs` order, plus (under `Tolerate`)
 ///                           a note for every bay that had to be skipped.
 /// * `Err(String)`         - Under `FailClosed`, some bay's `position`, `parked` or `consolidation` file
 ///                           could not be read or was malformed — see above.
@@ -375,10 +375,11 @@ pub fn collect_bay_scoped_parcel_roots(
 
 /// One bay's own contribution to [`collect_bay_scoped_parcel_roots`] — the single read (the
 /// bay's base, parked parcels, then an in-progress consolidation's `their_head` and `our_head`,
-/// then an in-progress cherry-pick's `our_head`) both [`BayReadPolicy`] variants perform
-/// identically; only what happens to its `Err` differs, in the caller above. A recorded
+/// then an in-progress cherry-pick's `source` and `our_head`) both [`BayReadPolicy`] variants
+/// perform identically; only what happens to its `Err` differs, in the caller above. A recorded
 /// `our_head` is the completing parcel's parent, and the pallet may have moved off it since, so
-/// it is rooted in its own right. So is the base: an undo in another bay on the same pallet can
+/// it is rooted in its own right. A pick's `source` is no parent of anything, yet the completing
+/// `stack` reads its authors, and no ref need still reach it. So is the base: an undo in another bay on the same pallet can
 /// put the ref back behind it, leaving the tree this bay holds reachable from no ref.
 fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
     let mut roots: Vec<String> = pallet_utils::read_position_in(dir)?.base.into_iter().collect();
@@ -391,6 +392,7 @@ fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
     }
 
     if let Some(pick) = cherry_pick_utils::read_state_in(dir)? {
+        roots.push(pick.source);
         roots.push(pick.our_head);
     }
 
@@ -527,8 +529,9 @@ mod tests {
         let bay_c_dir = bay_state_dir("c");
         std::fs::create_dir_all(&bay_c_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_c_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        let pick_source = "6".repeat(64);
         let pick = cherry_pick_utils::CherryPickState {
-            source: "6".repeat(64), description: None, our_head: pick_base.clone(), our_pallet: "main".to_string(),
+            source: pick_source.clone(), description: None, our_head: pick_base.clone(), our_pallet: "main".to_string(),
         };
         std::fs::write(bay_c_dir.join("cherry-pick"), serde_json::to_string(&pick).unwrap()).unwrap();
 
@@ -543,6 +546,8 @@ mod tests {
             "a non-active bay's consolidation our_head must be in the shared roots");
         assert!(roots.contains(&pick_base),
             "a non-active bay's cherry-pick our_head must be in the shared roots");
+        assert!(roots.contains(&pick_source),
+            "a non-active bay's cherry-pick source must be in the shared roots");
 
         std::fs::remove_dir_all(&dir).ok();
     }

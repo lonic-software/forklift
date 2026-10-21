@@ -14,16 +14,16 @@
 //! | --- | --- | --- |
 //! | revocation `distrust_boundary` | verifying | **FIXED (FORK-81)** — rooted; the two `a_boundary_pin_*`/`a_distrust_boundary_pin_*` legs (FORK-63/64 spike) |
 //! | `audit`'s boundary head | verifying | **FIXED (FORK-81)** — rooted; `an_undone_boundary_head_*`, `a_boundary_head_and_the_legacy_parcel_*`. The residual gap a *rooted* pin can still reach — never fetched, or genuinely lost, since gc can no longer produce it — is a separate finding with its own legs (not gc-driven, no canary): `an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accused_of_tampering`, `a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refuses_instead_of_accusing`, `the_accusation_still_fires_with_no_gap_at_all`. **PR #121 round 1 narrowed the tolerance to interior-only gaps; round 2 reverted that narrowing** — an absent boundary HEAD, exactly like an absent interior ancestor, un-resolves the boundary walk's negative for anything the present portion cannot itself settle, because there is no such thing as an "unrelated" absent reference: relatedness to the parcel under test is precisely the question the walk exists to answer (see `audit_utils::verify_pallet_history`'s `boundary_gap` doc). Reproduced end to end against a real origin server, from ordinary commands, in `tests/remote.rs`'s two Construction T/D legs. |
-//! | `CherryPickState.source` | **acting** | `a_collected_cherry_pick_source_*` (FORK-82) |
+//! | `CherryPickState.source` | **acting** | **FIXED (FORK-82)** — rooted while the pick is in progress; `a_cherry_pick_in_progress_roots_its_source_*`. A pick `undo` restores from the journal is no root, so its source can still be gone: `an_undone_pick_whose_source_was_collected_*` pins the attributed refusal |
 //! | `Tag.subject` under a taint | **healing** | **FIXED (FORK-83)** — a tag's own reference never counts, an absent subject is noted; `a_torn_taint_over_an_absent_tag_subject_heals_*`, `a_recorded_taint_over_a_collected_tag_subject_clears`, and `a_lost_tagged_parcel_that_is_also_an_ancestor_*` for the other direction |
 //! | staged inventory shard | **healing**, then acting | **FIXED (FORK-156)** — rooted; `staged_content_survives_collection_*`, `a_full_repack_keeps_staged_content_*`. Found as FORK-83's widened half: unrooted, collection deleted staged work, a torn taint then wedged the store, and a full repack lost it silently |
 //!
 //! `Tag.subject`'s *rendering* reader is pinned separately in `tag_subject_gc.rs` (FORK-79).
 //!
-//! **Four legs carry a canary** — a parcel pinned by nothing — and assert it was collected, so
+//! **Five legs carry a canary** — a parcel pinned by nothing — and assert it was collected, so
 //! "the pin survived" can never be satisfied by a collector that swept nothing. The canary check
-//! holds both before and after any fix; it is the legs' own assertions that invert. (**Nine** of
-//! the ten legs drive collection — seven call `collect_garbage`, and
+//! holds both before and after any fix; it is the legs' own assertions that invert. (**Ten** of
+//! the eleven legs drive collection — eight call `collect_garbage`, and
 //! `an_undone_boundary_head_survives_the_sweep_and_audit_passes` and
 //! `a_full_repack_keeps_staged_content_and_the_next_stack_restores_it` drive the same live set
 //! through `compact --all` — so "gc-driven" is not the dividing line. Only the torn-taint control
@@ -797,152 +797,116 @@ fn the_accusation_still_fires_with_no_gap_at_all() {
     );
 }
 
-/// FORK-82 — THE ACTING READER. `CherryPickState.source` is a durable parcel hash with no GC
-/// root, and unlike the rendering members of this class its reader *acts* on the hash rather
-/// than printing it.
-///
-/// The pin: `CherryPickState.source` (`cherry_pick_utils.rs:33`) is written to disk by
-/// `write_state` (`:88-90`). It is not rooted — `gc_utils::collect_live_set` roots pallet heads,
-/// bay-scoped parcels and every trust-pin root (`anchor.adopts`, its `boundary` snapshot, and
-/// every key's `distrust_boundary` — `office_utils::collect_trust_pin_roots`), and a `grep` for
-/// "cherry" in `gc_utils.rs`/`bay_utils.rs`/`office_utils.rs` returns nothing.
-///
-/// The reader: the completing `stack` calls `collect_source_authors` (`stack_utils.rs:233`),
-/// which calls `object_utils::load_parcel(source)?` (`cherry_pick_utils.rs:120`) and propagates
-/// whatever that returns.
-///
-/// The ticket reached this by reading and explicitly owed an execution. This is it. Note the
-/// orphaning uses `undo`, not `delete_pallet_ref` — so, as with the anchor leg above, this needs
-/// no deletion verb and is live today rather than a hazard the verb would introduce.
-#[test]
-fn a_collected_cherry_pick_source_makes_the_completing_stack_fail_unattributed() {
-    let warehouse = Warehouse::new("pick");
-
+/// Builds FORK-82's fixture up to a conflicted pick: `source` sits on no pallet (an `undo` moved
+/// `feature` back off it, but the object is still on disk), `main` touched the same file, and the
+/// pick is left in progress with its state on disk. Returns `(canary, source)`; the canary is
+/// pinned by nothing, so its collection witnesses that a sweep ran.
+fn warehouse_with_a_pick_of_an_orphaned_source(warehouse: &Warehouse) -> (String, String) {
     warehouse.stack("app.txt", "base\n", "base");
 
-    // The canary, as in every other leg: pinned by nothing, so its collection witnesses that the
-    // sweep actually ran rather than bailing early.
     warehouse.run_ok(&["palletize", "canary"]);
     let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
     warehouse.run_ok(&["shift", "main"]);
     warehouse.delete_pallet_ref("canary");
 
-    // The source, on its own pallet, touching the file `main` is about to touch so the pick
-    // conflicts and a state file is written.
+    // No shift between the stack and the undo: `shift` is journaled, and one here would make
+    // `undo` revert the shift instead. `undo` is soft, so the feature content is discarded before
+    // the shift back.
     warehouse.run_ok(&["palletize", "feature"]);
     let source = warehouse.stack("app.txt", "from-feature\n", "feature work");
-
-    // Orphan the source with a shipped command. `undo` moves the head back to `pre_head`
-    // (`journal_utils.rs:191`), so nothing reachable from a ref names `source` — but the object
-    // is still on disk, so the pick below can still resolve it. No shift between the stack and
-    // the undo: `shift` is journaled, and one here would make `undo` revert the shift instead.
     warehouse.run_ok(&["undo"]);
-
-    // `undo` is soft: the head moves back but the feature content stays in the working tree, so
-    // `shift` would refuse over local changes. Unstage, then discard, so the shift is clean.
     warehouse.run_ok(&["restore", "--staged", "."]);
     warehouse.run_ok(&["restore", "."]);
     warehouse.run_ok(&["shift", "main"]);
 
     warehouse.stack("app.txt", "from-main\n", "main work");
 
-    // 1. The pick conflicts, so the state file is written and the pick is left in progress.
     let pick = warehouse.run(&["cherry-pick", &source]);
-    println!(
-        "PICK: `cherry-pick` exit = {:?}\n  stdout: {}\n  stderr: {}",
-        pick.status.code(),
-        String::from_utf8_lossy(&pick.stdout).trim(),
-        String::from_utf8_lossy(&pick.stderr).trim()
-    );
-
-    let state_file = warehouse.root.join(".forklift").join("cherry-pick");
-    println!("PICK: state file present = {}", state_file.exists());
-
     assert!(
-        state_file.exists(),
-        "the pick must be left in progress with its state on disk — that durable `source` hash is \
-         the pin under test. If this fails the pick did not conflict and the fixture is wrong."
+        pick_state_file(warehouse).exists(),
+        "the pick must be left in progress with its state on disk; it did not conflict, so the \
+         fixture is wrong. cherry-pick stderr: {}",
+        String::from_utf8_lossy(&pick.stderr)
     );
 
-    // 2. Collect. Nothing roots the source.
+    (canary, source)
+}
+
+fn pick_state_file(warehouse: &Warehouse) -> PathBuf {
+    warehouse.root.join(".forklift").join("cherry-pick")
+}
+
+/// FORK-82 — THE ACTING READER, fixed by rooting. `CherryPickState.source` is a durable parcel
+/// hash the completing `stack` acts on (`collect_source_authors` loads it), and no ref need reach
+/// it. Unrooted, a collection between the conflicted pick and its completion deleted it, and the
+/// completing `stack` died on a raw object-read error naming neither the pick nor a way out. A pick
+/// in progress now roots its source (`bay_utils::read_one_bay_scoped_roots`), so it survives a
+/// collection that sweeps the canary beside it, and the pick completes.
+#[test]
+fn a_cherry_pick_in_progress_roots_its_source_and_the_completing_stack_succeeds() {
+    let warehouse = Warehouse::new("pick");
+    let (canary, source) = warehouse_with_a_pick_of_an_orphaned_source(&warehouse);
+
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
-    let present = warehouse.scoped(|| file_utils::does_object_exist(&source).unwrap());
-
-    println!(
-        "PICK: gc deleted {} object(s); source {} present = {}",
-        stats.deleted, source, present
-    );
-
     assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
     assert!(
-        !present,
-        "the pick source survived collection, so this leg is not testing what it says. The \
-         fixture knows which of the two causes that is; do not make the assertion below guess."
+        warehouse.scoped(|| file_utils::does_object_exist(&source).unwrap()),
+        "the source of the pick in progress was collected: a pick must root its source"
     );
 
-    // 3. Resolve the conflict and complete the pick, which is where the acting read happens.
     std::fs::write(warehouse.root.join("app.txt"), "resolved\n").unwrap();
     warehouse.run_ok(&["load", "."]);
     let completing = warehouse.run(&["stack", "completed pick"]);
 
+    assert!(
+        completing.status.success(),
+        "the completing stack failed over a rooted source; stderr: {}",
+        String::from_utf8_lossy(&completing.stderr)
+    );
+    assert!(!pick_state_file(&warehouse).exists(), "the completing stack must clear the pick state");
+}
+
+/// FORK-82's residue: rooting covers a pick while it is in progress, but `undo` of the stack that
+/// completed a pick puts the pick back from the journal, which is no root. Between the completion
+/// and the undo nothing names the source, so a collection there deletes it, and the restored pick
+/// cannot complete. The completing `stack` refuses, naming the pick, its source and the abort,
+/// instead of the raw object-read error that named none of them.
+#[test]
+fn an_undone_pick_whose_source_was_collected_refuses_naming_the_pick_and_its_abort() {
+    let warehouse = Warehouse::new("pick-undone");
+    let (canary, source) = warehouse_with_a_pick_of_an_orphaned_source(&warehouse);
+
+    std::fs::write(warehouse.root.join("app.txt"), "resolved\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "completed pick"]);
+    assert!(!pick_state_file(&warehouse).exists(), "the completing stack must clear the pick state");
+
+    let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
+    assert_the_sweep_ran(&warehouse, &canary, stats.deleted);
+    assert!(
+        !warehouse.scoped(|| file_utils::does_object_exist(&source).unwrap()),
+        "the source survived a collection while no pick named it, so this leg tests nothing"
+    );
+
+    warehouse.run_ok(&["undo"]);
+    assert!(pick_state_file(&warehouse).exists(), "undo of the completing stack must restore the pick");
+    let head = warehouse.head("main");
+
+    let completing = warehouse.run(&["stack", "completed pick"]);
     let err = String::from_utf8_lossy(&completing.stderr).to_string();
 
-    println!(
-        "PICK: completing `stack` exit = {:?}\n  stdout: {}\n  stderr: {}",
-        completing.status.code(),
-        String::from_utf8_lossy(&completing.stdout).trim(),
-        err.trim()
-    );
-
-    // THE DEFECT, asserted rather than printed. FOUR claims, and the inversion map matters
-    // because the candidate fixes invert different subsets:
-    //
-    //   * root the pick source     -> `stack` SUCCEEDS. Claims 1 and 2 invert. Claims 3 and 4
-    //                                 do NOT: stderr is empty, so both negative substring tests
-    //                                 stay trivially true. That is why they are gated below.
-    //   * presence check + remedy  -> `stack` still fails. Claim 1 holds; claim 2 ALSO inverts,
-    //                                 because a presence check is precisely what replaces the
-    //                                 raw propagated string; claims 3/4 invert.
-    //   * abort path only          -> `stack` still fails; claims 3 AND 4 invert. Not just 4:
-    //                                 the abort text the code already prints is `or remove
-    //                                 ".forklift/cherry-pick" to abort it`
-    //                                 (`commands/cherry_pick.rs:224`), and that PATH contains the
-    //                                 substring "cherry-pick", so an error advertising the abort
-    //                                 BY THAT PATH also trips the attribution claim. Not every
-    //                                 possible wording does: "remove the in-progress pick state"
-    //                                 would invert claim 4 alone.
+    assert!(!completing.status.success(), "the stack completed a pick whose source is gone");
     assert!(
-        !completing.status.success(),
-        "the completing `stack` succeeded, so the source survived collection — either the pick \
-         source became a GC root (FORK-82 fixed by rooting) or the fixture stopped orphaning it"
-    );
-    assert!(
-        err.contains("Error while reading object from file"),
-        "expected the raw object-read error `load_parcel` propagates from \
-         `collect_source_authors` (cherry_pick_utils.rs:120); got: {}",
-        err
-    );
-
-    // Claims 3 and 4 are about the CONTENT of a failure, so they are only meaningful while there
-    // is one. What makes them non-trivial is assertion 2 above, not any guard here: in a world
-    // where `stack` succeeds, stderr is empty and both negatives hold vacuously — but assertions
-    // 1 and 2 have already failed by then, so the leg is red for the right reason regardless.
-    // (Round 1 added an `err.is_empty()` gate here for this; it was unreachable for exactly that
-    // reason and has been removed rather than left as reassuring dead weight.)
-    assert!(
-        !err.to_lowercase().contains("cherry-pick"),
-        "the error now names the cherry-pick, so it is no longer unattributed — invert this leg. \
-         stderr: {}",
+        err.contains("The cherry-pick in progress cannot be completed") && err.contains(&source),
+        "the refusal must name the pick and its source; stderr: {}",
         err
     );
     assert!(
-        !err.to_lowercase().contains("abort"),
-        "the completing error now advertises the abort path — invert this leg. Note the narrow \
-         claim: an abort path EXISTS and `cherry-pick` itself printed it (\"or remove \
-         \\\".forklift/cherry-pick\\\" to abort it\"). The defect is that the error the operator \
-         actually hits, possibly days later, does not repeat it. stderr: {}",
+        err.contains(&format!("Abort the pick (remove \"{}\")", PathBuf::from(".forklift").join("cherry-pick").display())),
+        "the refusal must name the abort; stderr: {}",
         err
     );
+    assert_eq!(warehouse.head("main"), head, "a refused stack must leave the pallet where it was");
 }
 
 /// FORK-83 — THE HEALING READER, fixed: an absent tag subject no longer wedges the warehouse.
