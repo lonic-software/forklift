@@ -776,6 +776,11 @@ fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) ->
             collect_pallet_names(&entry.path(), &full_name, names)?;
         } else if OS_LITTER_FILE_NAMES.iter().any(|litter| full_name.rsplit('/').next() == Some(*litter)) {
             continue;
+        } else if file_utils::is_staged_temp_name(full_name.rsplit('/').next().unwrap_or_default()) {
+            // An atomic ref write's temp: a write in flight, or litter from one that was killed
+            // before its rename. Its spelling is never a valid pallet name, and this listing holds
+            // no ref lock, so it is neither listed nor refused.
+            continue;
         } else {
             // A ref file is a pallet only under a valid name. One that is not was written by
             // hand or by an older grammar, and listing it would hand every reader a name it
@@ -1055,6 +1060,99 @@ mod tests {
         assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["feature/x"]);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The temp an atomic ref write stages beside the ref is never a pallet name, in either
+    /// namespace or under a nested name, and the recognizer the listing skips by accepts exactly
+    /// that spelling.
+    #[test]
+    fn a_ref_write_temp_is_never_a_pallet_name() {
+        let (root, _scope) = scratch("temp-spelling");
+        for (namespace, name) in [(PalletNamespace::User, "main"), (PalletNamespace::User, "a-b/x"),
+                                  (PalletNamespace::Meta, "office")] {
+            let temp = file_utils::temp_path_for(&get_pallet_ref_path(namespace, name)).unwrap();
+            let temp_name = temp.file_name().unwrap().to_str().unwrap().to_string();
+            let sibling = match name.rsplit_once('/') {
+                Some((parent, _)) => format!("{}/{}", parent, temp_name),
+                None => temp_name.clone(),
+            };
+            assert!(validate_pallet_name(&sibling).is_err(), "a temp must never be a pallet name: {}", sibling);
+            assert!(file_utils::is_staged_temp_name(&temp_name), "the recognizer must accept {}", temp_name);
+        }
+
+        for not_a_temp in ["main", "main.tmp1-2", "main.tmp~", "main.tmp~1-", "main.tmp~-2", ".tmp~1-2",
+                           "main.tmp~1-2x", "main.tmp~1"] {
+            assert!(!file_utils::is_staged_temp_name(not_a_temp), "the recognizer must refuse {}", not_a_temp);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a ref write killed between its temp write and its rename leaves beside the ref, at the
+    /// top level and under a nested name, is neither listed as a pallet nor counted as a ref.
+    #[test]
+    fn a_killed_ref_write_leaves_no_pallet_behind() {
+        let (root, _scope) = scratch("temp-litter");
+        update_pallet_head("main", None, &hash('a')).unwrap();
+        update_pallet_head("a-b/x", None, &hash('b')).unwrap();
+
+        for name in ["main", "a-b/x"] {
+            let temp = file_utils::temp_path_for(&get_pallet_ref_path(PalletNamespace::User, name)).unwrap();
+            std::fs::write(&temp, format!("{}\n", hash('c'))).unwrap();
+        }
+
+        assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["a-b/x", "main"]);
+        let refs = all_pallet_refs().unwrap();
+        assert!(refs.iter().all(|(_, head)| *head != hash('c')), "a temp's head must not be a ref: {:?}", refs);
+        assert_eq!(refs.len(), 2, "{:?}", refs);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pallet whose name is a temp name under the old `.tmp<pid>-<n>` spelling survives a write
+    /// to its sibling: the write's temp can no longer be that pallet's ref file. The victims cover a
+    /// window of counter values, because other tests in this process draw from the same counter.
+    #[test]
+    fn a_ref_write_never_consumes_a_neighbouring_pallet() {
+        let (root, _scope) = scratch("temp-clobber");
+        update_pallet_head("x", None, &hash('a')).unwrap();
+
+        let probe = file_utils::temp_path_for(&get_pallet_ref_path(PalletNamespace::User, "x")).unwrap();
+        let probe_name = probe.file_name().unwrap().to_str().unwrap().to_string();
+        let next = probe_name.rsplit_once('-').unwrap().1.parse::<u64>().unwrap() + 1;
+        let victims: Vec<String> = (next..next + 64).map(|n| format!("x.tmp{}-{}", std::process::id(), n)).collect();
+        for victim in &victims {
+            validate_pallet_name(victim).unwrap();
+            std::fs::write(get_pallet_ref_path(PalletNamespace::User, victim), format!("{}\n", hash('c'))).unwrap();
+        }
+
+        update_pallet_head("x", Some(&hash('a')), &hash('b')).unwrap();
+
+        let listed = list_pallets_in(PalletNamespace::User).unwrap();
+        for victim in &victims {
+            assert!(listed.contains(victim), "the pallet {} must survive a write to x", victim);
+            assert_eq!(get_pallet_head(victim).unwrap().as_deref(), Some(hash('c').as_str()));
+        }
+        assert_eq!(get_pallet_head("x").unwrap().as_deref(), Some(hash('b').as_str()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The listing skips only the exact temp spelling: a ref file whose name merely contains `~`,
+    /// or looks like a temp without being one, still fails the listing naming it.
+    #[test]
+    fn a_name_that_only_resembles_a_temp_still_fails_the_listing() {
+        for impostor in ["x~", "main.tmp~1-"] {
+            let (root, _scope) = scratch("temp-impostor");
+            update_pallet_head("main", None, &hash('a')).unwrap();
+            std::fs::write(get_pallets_folder().join(impostor), format!("{}\n", hash('c'))).unwrap();
+
+            let error = list_pallets_in(PalletNamespace::User).unwrap_err();
+            assert!(error.contains(&format!("\"{}\" is not a valid pallet name", impostor))
+                && error.contains("does not name a valid pallet"), "{}", error);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

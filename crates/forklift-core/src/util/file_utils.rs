@@ -580,6 +580,13 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 ///
 /// The name can already exist, as litter from a dead process that had this same process id; a
 /// caller opening it `create_new` steps past that through [`create_fresh_temp`].
+///
+/// The name is `<file name>.tmp~<pid>-<n>`. The `~` is outside the pallet-name grammar, so a temp
+/// staged in a ref folder is never a pallet name: litter a killed write leaves there cannot list
+/// as a pallet, and no pallet's ref file can be the temp a write to its sibling opens and renames
+/// away. `~` has no case, so no case-folding volume aliases it onto a valid name either. The
+/// `.tmp` the object-store readers match on is kept. [`is_staged_temp_name`] recognises exactly
+/// this form.
 pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
     static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -589,8 +596,25 @@ pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
 
     let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut temporary_file_path = PathBuf::from(file_path);
-    temporary_file_path.set_file_name(format!("{}.tmp{}-{}", file_name, std::process::id(), write_id));
+    temporary_file_path.set_file_name(format!("{}{}{}-{}", file_name, TEMP_INFIX, std::process::id(), write_id));
     Ok(temporary_file_path)
+}
+
+/// What [`temp_path_for`] puts between a file's name and its `<pid>-<n>` suffix.
+const TEMP_INFIX: &str = ".tmp~";
+
+/// Whether `file_name` (one path component) is a temp [`temp_path_for`] names: a non-empty base,
+/// then `.tmp~<digits>-<digits>`. A ref-folder listing skips exactly these: the file may be the
+/// temp of a write in flight in another process, and it is never a pallet.
+pub(crate) fn is_staged_temp_name(file_name: &str) -> bool {
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match file_name.rsplit_once(TEMP_INFIX) {
+        Some((base, suffix)) if !base.is_empty() => matches!(
+            suffix.split_once('-'),
+            Some((pid, write_id)) if all_digits(pid) && all_digits(write_id)
+        ),
+        _ => false,
+    }
 }
 
 /// Create a fresh temporary file for replacing `file_path`, opened `create_new`, with names drawn
@@ -3832,7 +3856,7 @@ mod tests {
 
     #[test]
     fn a_stale_temp_file_from_a_dead_process_with_the_same_id_does_not_block_a_write() {
-        // A process killed mid-write leaves `<name>.tmp<pid>-<n>` behind, and on Windows a later
+        // A process killed mid-write leaves `<name>.tmp~<pid>-<n>` behind, and on Windows a later
         // process can reuse that pid. The name source hands out three litter names first; the
         // create must step past them to the fourth, rather than fail with "file exists", and must
         // leave the litter alone.
@@ -3840,7 +3864,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("metadata");
-        let names: Vec<PathBuf> = (0..4).map(|id| dir.join(format!("metadata.tmp1-{}", id))).collect();
+        let names: Vec<PathBuf> = (0..4).map(|id| dir.join(format!("metadata.tmp~1-{}", id))).collect();
         for litter in &names[..3] {
             std::fs::write(litter, b"litter").unwrap();
         }
@@ -3854,7 +3878,7 @@ mod tests {
         }
 
         // Any other failure returns rather than retrying forever.
-        let missing = dir.join("absent").join("metadata.tmp1-0");
+        let missing = dir.join("absent").join("metadata.tmp~1-0");
         let mut asked = 0;
         let result = create_fresh_temp(&target, |_| { asked += 1; Ok(missing.clone()) });
         assert!(result.is_err() && asked == 1, "a missing folder must fail at once, asked {} times", asked);
@@ -4220,7 +4244,7 @@ mod tests {
         create_folder_if_not_exists(Path::new(&folder)).unwrap();
 
         // Simulate a crashed write: only the temporary file exists, the real object never landed.
-        let debris = Path::new(&folder).join(format!("{}.tmp99999-0", file_name));
+        let debris = Path::new(&folder).join(format!("{}.tmp~99999-0", file_name));
         std::fs::write(&debris, b"half-written, never renamed").unwrap();
 
         assert!(!does_object_exist(&hash).unwrap(), "temp debris must not read as an object");
