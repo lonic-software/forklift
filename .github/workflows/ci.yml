@@ -146,23 +146,6 @@ jobs:
           echo "cores=$cores test-threads=$(( cores * 2 ))"
           cargo nextest run --workspace --no-fail-fast --profile ci --test-threads "$(( cores * 2 ))"
 
-      # CI builds with the config's rustflags switched off (see RUSTFLAGS above), so this checks
-      # what developers get on macOS: a throwaway crate built under .cargo/config.toml must leave no
-      # object files in its deps directory. It fails if a toolchain stops honouring the setting,
-      # for instance by putting cargo's own "-Csplit-debuginfo=unpacked" after it.
-      - name: Split debuginfo guard
-        if: env.SKIP_TESTS != 'true' && matrix.os == 'macos-latest'
-        shell: bash
-        run: |
-          probe="$RUNNER_TEMP/split-debuginfo-probe"
-          cargo new --quiet --lib "$probe"
-          mkdir "$probe/.cargo"
-          cp .cargo/config.toml "$probe/.cargo/"
-          (cd "$probe" && env -u RUSTFLAGS cargo build --quiet)
-          objects=$(find "$probe/target/debug/deps" -name '*.rcgu.o' | wc -l)
-          echo "object files left in deps: $objects"
-          [ "$objects" -eq 0 ]
-
       # nextest does not run doc-tests.
       - name: Doc-tests
         if: env.SKIP_TESTS != 'true'
@@ -173,3 +156,28 @@ jobs:
         # Style-level lint debt is tracked separately; deny only warnings that indicate
         # correctness issues once the doc-comment cleanup lands. For now, report-only.
         run: cargo clippy
+
+      # CI builds with the config's rustflags switched off (see RUSTFLAGS above), so this checks
+      # what developers get on macOS. A throwaway crate is built twice, as a developer would build
+      # it (RUSTFLAGS unset, incremental on): with cargo's default it must leave object files in its
+      # deps directory, which shows the probe can see them, and under .cargo/config.toml it must
+      # leave none. It fails if a toolchain stops honouring the setting, for instance by putting
+      # cargo's own "-Csplit-debuginfo=unpacked" after it. It runs last so a failure here does not
+      # hide what the doc-tests and Clippy would report, and after a failed step too.
+      - name: Split debuginfo guard
+        if: ${{ !cancelled() && env.SKIP_TESTS != 'true' && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          probe="$RUNNER_TEMP/split-debuginfo-probe"
+          cargo new --quiet --lib "$probe"
+          count() {
+            (cd "$probe" && env -u RUSTFLAGS -u CARGO_INCREMENTAL cargo build --quiet) || return 1
+            find "$probe/target/debug/deps" -name '*.rcgu.o' | wc -l
+          }
+          default=$(count)
+          rm -rf "$probe/target"
+          mkdir "$probe/.cargo"
+          cp .cargo/config.toml "$probe/.cargo/"
+          packed=$(count)
+          echo "object files left in deps: $default with cargo's default, $packed with the config"
+          [ "$default" -gt 0 ] && [ "$packed" -eq 0 ]
