@@ -883,6 +883,13 @@ fn diverged_pallets_are_refused_not_merged() {
     assert_success(&area.forklift("a", &["stack", "a work"]));
     assert_success(&area.forklift("a", &["lift"]));
 
+    // B has nothing of its own yet: the remote is strictly ahead, which is not a divergence.
+    let behind = area.forklift("b", &["--json", "lift"]);
+    assert_eq!(behind.status.code(), Some(28), "{}{}", stdout(&behind), stderr(&behind));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&behind)).unwrap();
+    assert_eq!(value["error"]["code"], "remote_ahead", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift lower", "{}", value);
+
     area.write_file("b/base.txt", "b's version\n");
     assert_success(&area.forklift("b", &["load", "base.txt"]));
     assert_success(&area.forklift("b", &["stack", "b work"]));
@@ -890,12 +897,55 @@ fn diverged_pallets_are_refused_not_merged() {
     // B's lift must be refused: the remote moved. Nothing may be overwritten.
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success());
-    assert!(stderr(&refused).contains("lower"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("palletize"), "{}", stderr(&refused));
+
+    let refused = area.forklift("b", &["--json", "lift"]);
+    assert_eq!(refused.status.code(), Some(5), "{}{}", stdout(&refused), stderr(&refused));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(value["error"]["code"], "diverged", "{}", value);
+    assert!(value["error"]["next_step"].as_str().unwrap().starts_with("forklift palletize "), "{}", value);
 
     // B's lower reports the divergence (with the parcels fetched for a consolidate).
     let diverged = area.forklift("b", &["lower"]);
     assert!(!diverged.status.success());
     assert!(stderr(&diverged).contains("diverged"), "{}", stderr(&diverged));
+
+    let diverged = area.forklift("b", &["--json", "lower"]);
+    assert_eq!(diverged.status.code(), Some(5), "{}{}", stdout(&diverged), stderr(&diverged));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&diverged)).unwrap();
+    assert_eq!(value["error"]["code"], "diverged", "{}", value);
+}
+
+// Revert: pallet_moved back to an unclassified 409 → the body carries no code.
+#[test]
+fn a_stale_ref_update_is_a_remote_ahead_refusal_on_the_wire() {
+    let area = TestArea::new("stale-ref-update");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/f.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let first = area.read_file("a/.forklift/pallets/main").trim().to_string();
+
+    area.write_file("a/f.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let second = area.read_file("a/.forklift/pallets/main").trim().to_string();
+    assert_ne!(first, second);
+
+    // A client one parcel behind: it expects "first" while the pallet is at "second".
+    let request = format!("{{\"old_head\":\"{}\",\"new_head\":\"{}\"}}", first, first);
+    let (status, body) = http_post_json(&server.url, "/v1/pallets/main", &request);
+    assert!(status.starts_with("HTTP/1.1 409"), "{} / {}", status, body);
+
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["code"], "remote_ahead", "{}", body);
+    assert_eq!(value["next_step"], "forklift lower", "{}", body);
+    let message = value["error"].as_str().unwrap();
+    assert!(message.contains(&second) && !message.contains('\u{1f}'), "the de-framed message: {}", body);
 }
 
 #[test]
@@ -1111,7 +1161,7 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     assert_success(&area.forklift("b", &["stack", "b edits shared"]));
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "an overlapping divergence must not auto-merge");
-    assert!(stderr(&refused).contains("lower"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("palletize"), "{}", stderr(&refused));
     assert_eq!(area.read_file("b/shared.txt"), "from b\n"); // untouched — no half-merge
 }
 

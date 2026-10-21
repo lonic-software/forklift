@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals::bay_root;
 use forklift_core::util::pallet_utils::RefUpdateError;
 use forklift_core::util::stack_utils::{self, StackError};
@@ -29,7 +30,7 @@ pub async fn handle_command(description: Option<String>) -> Result<(), String> {
         Err(StackError::HeadWrite { error: RefUpdateError::Moved(moved), .. }) => {
             let pallet = moved.reference.to_wire();
 
-            return Err(moved_under_merge(&pallet, moved.found.as_deref()).await?.unwrap_or(moved.to_string()));
+            return Err(moved_under_merge(&pallet, moved.found.as_deref()).await?.unwrap_or(moved.behind_refusal().into()));
         }
         Err(StackError::Behind { pallet, base, head }) => {
             if let Some(refusal) = moved_under_merge(&pallet, head.as_deref()).await? {
@@ -85,22 +86,32 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
         ),
     };
 
-    Ok(Some(format!(
-        "Another bay or process moved pallet \"{}\" since this {} started: it was built on {}, and \
-        the pallet is now at {}. Nothing was stacked, and the {} is kept: stacking it on the new \
-        head would revert what was stacked there. To redo it on the new head: abort it ({}); \
-        discard its output with \"restore --staged .\" and then \"restore .\";{} catch up with \
-        \"forklift shift {}\"; then {}.",
-        pallet,
-        what,
-        base,
-        found.unwrap_or("no head"),
-        what,
+    let way_out = format!(
+        "To redo it on the new head: abort it ({}); discard its output with \"restore --staged .\" \
+        and then \"restore .\";{} catch up with \"forklift shift {}\"; then {}.",
         abort,
         left,
         pallet,
         again
-    )))
+    );
+
+    // The bay is behind its pallet, as for any stack; the way out starts with the abort, since
+    // catching up refuses while the merge is recorded.
+    Ok(Some(CoreError::refusal(
+        RefusalCode::Behind,
+        format!(
+            "Another bay or process moved pallet \"{}\" since this {} started: it was built on {}, \
+            and the pallet is now at {}. Nothing was stacked, and the {} is kept: stacking it on the \
+            new head would revert what was stacked there. {}",
+            pallet,
+            what,
+            base,
+            found.unwrap_or("no head"),
+            what,
+            way_out
+        ),
+        way_out,
+    ).into()))
 }
 
 /// The staged paths `base`'s tree does not hold: once `restore --staged .` resets the inventory

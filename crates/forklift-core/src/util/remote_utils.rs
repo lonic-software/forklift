@@ -4715,19 +4715,25 @@ async fn lift_pallet_inner(client: &RemoteClient,
 
     if let Some(remote_head) = remote_head {
         if !file_utils::does_object_exist(remote_head)? {
-            return Err(format!(
+            return Err(remote_ahead_refusal(format!(
                 "The remote's pallet \"{}\" has parcels this warehouse does not know \
                 (head {}). \"lower\" first.",
                 pallet, remote_head
-            ));
+            )).into());
         }
 
         if !adopted_reset && !merge_utils::is_ancestor(remote_head, local_head)? {
-            return Err(format!(
-                "The local pallet \"{}\" and the remote have diverged. \"lower\" the \
-                remote parcels and consolidate before lifting.",
-                pallet
-            ));
+            // Known locally but not lowered: the remote is ahead when it already holds everything
+            // here, and diverged otherwise.
+            if merge_utils::is_ancestor(local_head, remote_head)? {
+                return Err(remote_ahead_refusal(format!(
+                    "The remote's pallet \"{}\" is ahead of this warehouse's (head {}). \"lower\" \
+                    first.",
+                    pallet, remote_head
+                )).into());
+            }
+
+            return Err(diverged_refusal(pallet, remote_head).into());
         }
     }
 
@@ -4742,6 +4748,42 @@ async fn lift_pallet_inner(client: &RemoteClient,
         uploaded_signatures,
         old_head: remote_head.map(|hash| hash.to_string()),
     }))
+}
+
+/// A [`RefusalCode::RemoteAhead`] refusal saying `message`: `lower` brings the remote's parcels in.
+fn remote_ahead_refusal(message: String) -> CoreError {
+    CoreError::refusal(RefusalCode::RemoteAhead, message, "forklift lower")
+}
+
+/// The [`RefusalCode::Diverged`] refusal for `pallet` (its wire name), whose local head and the
+/// remote's `remote_head` both hold parcels the other lacks; the remote's are already local. A
+/// working pallet merges the remote head in through a pallet of its own, which `lower` refuses to
+/// do implicitly; a meta pallet is reconciled by `lower` itself.
+pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
+    let short = &remote_head[..12.min(remote_head.len())];
+
+    if pallet.starts_with(pallet_utils::META_QUALIFIER) {
+        return CoreError::refusal(
+            RefusalCode::Diverged,
+            format!(
+                "The local pallet \"{}\" and the remote have diverged. \"lower\" reconciles it; \
+                then lift again.",
+                pallet
+            ),
+            "forklift lower",
+        );
+    }
+
+    CoreError::refusal(
+        RefusalCode::Diverged,
+        format!(
+            "The local pallet \"{}\" and the remote have diverged. The remote parcels are \
+            fetched; palletize the remote head into its own pallet (\"palletize <name> {}\"), \
+            consolidate it, and lift the result.",
+            pallet, short
+        ),
+        format!("forklift palletize <name> {}; then forklift consolidate <name>; then forklift lift", short),
+    )
 }
 
 /// Upload the history `local_head` reaches and the remote does not — every parcel past

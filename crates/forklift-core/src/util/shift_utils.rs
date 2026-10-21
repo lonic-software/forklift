@@ -1584,12 +1584,15 @@ pub fn settle_head_write(pallet: &str,
     // Wherever the tree is kept at `new`, the bay now stands on it.
     let stands_on_new = || pallet_utils::record_landed(pallet, new);
 
-    let error = match error {
+    let (error, rolled_back_error) = match error {
         RefUpdateError::Moved(moved) if moved.found.as_deref() == Some(new) => {
             stands_on_new()?;
             return Ok(HeadWrite::Stands);
         }
-        error => error.to_string(),
+        // Every caller moves the pallet its bay stands on, so once the tree is back at the start,
+        // another writer's move has left the bay behind it.
+        RefUpdateError::Moved(moved) => (moved.to_string(), moved.behind_refusal().into()),
+        RefUpdateError::Failed(error) => (error.clone(), error),
     };
 
     match pallet_utils::get_pallet_head(pallet) {
@@ -1615,7 +1618,7 @@ pub fn settle_head_write(pallet: &str,
     });
 
     match rolled_back {
-        Ok(()) => Ok(HeadWrite::RolledBack(error)),
+        Ok(()) => Ok(HeadWrite::RolledBack(rolled_back_error)),
         Err(err) => Err(format!(
             "{} The working tree could not be put back ({}): it holds tree {}, not the pallet's \
             head; shift or restore to bring it back in line.",

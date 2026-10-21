@@ -193,6 +193,25 @@ refusal_codes! {
     /// deletion. A parcel naming it would pass `audit` and fail only at a later `restore`, so no
     /// parcel is made. The remedy is to unstage the path and load it again from its working copy.
     StagedContentMissing => "staged_content_missing",
+
+    /// This bay stands on a parcel its pallet has since moved past: another bay or process
+    /// stacked, lowered or merged onto the pallet, before this command or while it ran. Nothing
+    /// was moved. The next step catches the bay up (`shift <pallet>`), or, with a consolidation or
+    /// cherry-pick in progress, names how to abort it first.
+    Behind => "behind",
+
+    /// `deliver` was aimed at a target holding changes the draft has not seen; delivering would
+    /// undo them. The next step consolidates the target into the draft.
+    TargetNotCovered => "target_not_covered",
+
+    /// The remote's pallet holds parcels this warehouse has not lowered yet: found before a lift,
+    /// or the remote's compare-and-set refused one because the pallet moved while it ran. The next
+    /// step is `lower`, which fast-forwards, or reports `Diverged` when both sides moved.
+    RemoteAhead => "remote_ahead",
+
+    /// The local pallet and the remote's both hold parcels the other lacks. Nothing was lifted or
+    /// lowered; the next step names how to merge the two.
+    Diverged => "diverged",
 }
 
 impl RefusalCode {
@@ -203,6 +222,12 @@ impl RefusalCode {
     /// method — a bad code is expected, not an error to propagate.)
     pub fn from_code(code: &str) -> Option<RefusalCode> {
         ALL_CODES.iter().copied().find(|candidate| candidate.as_str() == code)
+    }
+
+    /// Every variant, generated with the enum (see [`refusal_codes!`]): what a head's own
+    /// exhaustiveness tests iterate, so a new code cannot slip past them.
+    pub fn all() -> &'static [RefusalCode] {
+        ALL_CODES
     }
 }
 

@@ -1046,8 +1046,8 @@ target, and because the delivered tree equals the draft's, the working directory
 change. A second delivery of an already-delivered draft is refused.
 
 The squash replaces the target's tree with the draft's, so `deliver` refuses a target that
-moved after the draft forked from it: those changes would be silently undone. Consolidate the
-target into the draft first, then deliver. A target whose head is an earlier
+moved after the draft forked from it: those changes would be silently undone
+(`target_not_covered`, exit 27). Consolidate the target into the draft first, then deliver. A target whose head is an earlier
 delivery of a state the draft has been through is fine, so a draft (or a pallet branched
 from it) can keep working and deliver again.
 
@@ -1338,8 +1338,12 @@ mergeable (they touch different files), `lift` **auto-lowers, consolidates and
 retries** on its own — so a fleet of agents stacking to one pallet stops
 serializing through a human. It reports how many times it auto-merged. Only a
 clean warehouse qualifies (the merge materializes), and a **true overlap** (both
-sides edited the same file) still stops with the diverged error, leaving the
-warehouse untouched — resolve it with `lower` + `consolidate`.
+sides edited the same file) still stops with the diverged error (`diverged`, exit 5), leaving
+the warehouse untouched: palletize the fetched remote head, consolidate it, and lift the
+result. A remote that is simply ahead — it holds parcels you lack and you hold none it lacks —
+is a different refusal, `remote_ahead` (exit 28): `lower` first. A bay another bay left behind
+its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this auto-merge alike:
+`shift` to the pallet to catch up.
 
 **Origin-only lift from a sparse workspace.** A sparse (`franchise --only`) warehouse only
 ever proved its out-of-scope content present on the remote it fetched from — its origin. Lifting

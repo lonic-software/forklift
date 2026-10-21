@@ -340,7 +340,8 @@ error_codes! {
     /// The working state blocks the operation: unresolved conflicts, a dirty tree.
     Conflict,
 
-    /// A remote ref moved under a lift (the CAS failed): lower, consolidate, retry.
+    /// The local pallet and the remote's both hold parcels the other lacks; nothing was lifted
+    /// or lowered. The next step names how to merge the two.
     Diverged,
 
     /// Another forklift process holds the warehouse lock.
@@ -430,6 +431,17 @@ error_codes! {
     /// `stack` or `park` found a staged file whose content the object store no longer holds (its
     /// recipe or a chunk, for a large file), and made no parcel.
     StagedContentMissing,
+
+    /// This bay stands on a parcel its pallet has since moved past (another bay or process moved
+    /// it); nothing was moved. The next step catches the bay up.
+    Behind,
+
+    /// `deliver` was aimed at a target holding changes the draft has not seen.
+    TargetNotCovered,
+
+    /// The remote's pallet holds parcels this warehouse has not lowered yet, found before a lift
+    /// or by the remote refusing one.
+    RemoteAhead,
 }
 
 impl ErrorCode {
@@ -441,7 +453,7 @@ impl ErrorCode {
             ErrorCode::NotAWarehouse        => "not_a_warehouse",
             ErrorCode::WarehouseLocked      => "warehouse_locked",
             ErrorCode::Conflict             => "conflict",
-            ErrorCode::Diverged             => "diverged",
+            ErrorCode::Diverged             => RefusalCode::Diverged.as_str(),
             ErrorCode::OutOfScope           => scope_utils::CODE_OUT_OF_SCOPE,
             ErrorCode::OutOfScopeConflict   => scope_utils::CODE_OUT_OF_SCOPE_CONFLICT,
             ErrorCode::ScopePathTypeChanged => scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED,
@@ -460,6 +472,9 @@ impl ErrorCode {
             ErrorCode::RemoteProtocolViolation => RefusalCode::RemoteProtocolViolation.as_str(),
             ErrorCode::MetaConflict => RefusalCode::MetaConflict.as_str(),
             ErrorCode::StagedContentMissing => RefusalCode::StagedContentMissing.as_str(),
+            ErrorCode::Behind => RefusalCode::Behind.as_str(),
+            ErrorCode::TargetNotCovered => RefusalCode::TargetNotCovered.as_str(),
+            ErrorCode::RemoteAhead => RefusalCode::RemoteAhead.as_str(),
         }
     }
 
@@ -493,6 +508,9 @@ impl ErrorCode {
             ErrorCode::RemoteProtocolViolation => 23,
             ErrorCode::MetaConflict => 24,
             ErrorCode::StagedContentMissing => 25,
+            ErrorCode::Behind => 26,
+            ErrorCode::TargetNotCovered => 27,
+            ErrorCode::RemoteAhead => 28,
         }
     }
 
@@ -507,7 +525,9 @@ impl ErrorCode {
                  argument)",
             ErrorCode::NotAWarehouse => "The command needs a warehouse; this directory is none",
             ErrorCode::Conflict => "Working state blocks the operation (unresolved / dirty)",
-            ErrorCode::Diverged => "A remote ref moved under a lift — lower, retry",
+            ErrorCode::Diverged =>
+                "The local pallet and the remote's both hold parcels the other lacks; nothing was \
+                 lifted or lowered",
             ErrorCode::WarehouseLocked => "Another forklift process holds the warehouse lock",
             ErrorCode::OutOfScope => "A path argument is outside a scoped (sparse) bay's scope",
             ErrorCode::ScopePathTypeChanged =>
@@ -552,6 +572,15 @@ impl ErrorCode {
             ErrorCode::StagedContentMissing =>
                 "\"stack\" or \"park\" found a staged file whose content the object store no \
                  longer holds; no parcel was made",
+            ErrorCode::Behind =>
+                "Another bay or process moved the pallet past the parcel this bay stands on; \
+                 nothing was moved, and \"shift\" catches the bay up",
+            ErrorCode::TargetNotCovered =>
+                "\"deliver\" was aimed at a target holding changes the draft has not seen; \
+                 consolidating the target into the draft comes first",
+            ErrorCode::RemoteAhead =>
+                "The remote's pallet holds parcels this warehouse has not lowered yet; \
+                 \"lower\" comes first",
         }
     }
 
@@ -580,6 +609,10 @@ impl ErrorCode {
             RefusalCode::RemoteProtocolViolation => ErrorCode::RemoteProtocolViolation,
             RefusalCode::MetaConflict => ErrorCode::MetaConflict,
             RefusalCode::StagedContentMissing => ErrorCode::StagedContentMissing,
+            RefusalCode::Behind => ErrorCode::Behind,
+            RefusalCode::TargetNotCovered => ErrorCode::TargetNotCovered,
+            RefusalCode::RemoteAhead => ErrorCode::RemoteAhead,
+            RefusalCode::Diverged => ErrorCode::Diverged,
         }
     }
 }
@@ -928,21 +961,7 @@ mod tests {
     /// String shim → `ForkliftError`), the message and next step stay clean.
     #[test]
     fn no_refusal_ever_renders_the_sentinel_frame_byte() {
-        for code in [
-            RefusalCode::OutOfScope,
-            RefusalCode::OutOfScopeConflict,
-            RefusalCode::ScopePathTypeChanged,
-            RefusalCode::SparseWorkspace,
-            RefusalCode::NonOriginLift,
-            RefusalCode::NarrowUnclean,
-            RefusalCode::ScopePruneBlocked,
-            RefusalCode::ChunkedTransportUnsupported,
-            RefusalCode::OversizedTransportUnsupported,
-            RefusalCode::CommitPaginationUnsupported,
-            RefusalCode::IncompleteLoad,
-            RefusalCode::DurabilityTaint,
-            RefusalCode::StagedContentMissing,
-        ] {
+        for &code in RefusalCode::all() {
             // Hostile interpolated text, carried across a String segment (the shim), then classified.
             let framed: String = CoreError::refusal(code, "a\u{1f}path", "a\u{1f}step").into();
             let error: ForkliftError = framed.into();
@@ -978,7 +997,14 @@ mod tests {
             (RefusalCode::RemoteProtocolViolation, "remote_protocol_violation", 23),
             (RefusalCode::MetaConflict, "meta_conflict", 24),
             (RefusalCode::StagedContentMissing, "staged_content_missing", 25),
+            (RefusalCode::Diverged, "diverged", 5),
+            (RefusalCode::Behind, "behind", 26),
+            (RefusalCode::TargetNotCovered, "target_not_covered", 27),
+            (RefusalCode::RemoteAhead, "remote_ahead", 28),
         ];
+
+        // The table covers every code, so a new one cannot ship without its row.
+        assert_eq!(table.len(), RefusalCode::all().len(), "a refusal code has no row in the table");
 
         for (code, code_str, exit) in table {
             let mapped = ErrorCode::from_refusal(code);

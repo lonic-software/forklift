@@ -962,15 +962,20 @@ fn error_body(message: String) -> ErrorResponse {
     }
 }
 
-/// The refusal for a ref update whose old head is not the pallet's head.
+/// The refusal for a ref update whose old head is not the pallet's head: classified, so the client
+/// can branch to `lower`.
 fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
     (
         StatusCode::CONFLICT,
-        format!(
-            "The pallet moved: its head is {}, not {}. Lower and retry.",
-            current.unwrap_or("unborn"),
-            expected.unwrap_or("unborn")
-        )
+        forklift_core::error::CoreError::refusal(
+            forklift_core::error::RefusalCode::RemoteAhead,
+            format!(
+                "The pallet moved: its head is {}, not {}. Lower and retry.",
+                current.unwrap_or("unborn"),
+                expected.unwrap_or("unborn")
+            ),
+            "forklift lower",
+        ).into()
     )
 }
 

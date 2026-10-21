@@ -5774,6 +5774,13 @@ fn a_stale_bays_stack_is_refused_and_catching_up_keeps_the_other_bays_parcel() {
         && refusal.contains("forklift shift main"), "{}", refusal);
     assert_eq!(pallet_head_hash(&warehouse, "main"), a_head, "the refusal moved nothing");
 
+    // A machine reads the condition from the code and the remedy from the next step.
+    let refused = warehouse.run_at(&bay, &["--json", "stack", "B changes g"]);
+    assert_eq!(refused.status.code(), Some(26), "{}", stdout(&refused));
+    assert_eq!(json(&refused)["error"]["code"], "behind", "{}", stdout(&refused));
+    assert_eq!(json(&refused)["error"]["next_step"], "forklift shift main", "{}", stdout(&refused));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), a_head, "the refusal moved nothing");
+
     // The way out the catch-up refusal names: park, catch up, pop.
     let catch_up = warehouse.run_at(&bay, &["shift", "main"]);
     assert!(!catch_up.status.success() && stderr(&catch_up).contains("park"), "{}", stderr(&catch_up));
@@ -5830,6 +5837,43 @@ fn deliver_from_a_bay_behind_its_draft_pallet_is_refused() {
     assert!(!delivered.status.success(), "{}", stdout(&delivered));
     assert!(stderr(&delivered).contains("behind pallet \"draft\""), "{}", stderr(&delivered));
     assert_eq!(pallet_head_hash(&warehouse, "main"), main_head);
+
+    let delivered = warehouse.run_at(&bay, &["--json", "deliver", "main", "-m", "stale"]);
+    assert_eq!(delivered.status.code(), Some(26), "{}", stdout(&delivered));
+    assert_eq!(json(&delivered)["error"]["code"], "behind", "{}", stdout(&delivered));
+    assert_eq!(json(&delivered)["error"]["next_step"], "forklift shift draft", "{}", stdout(&delivered));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), main_head);
+}
+
+// Revert: ensure_target_covered back to an unclassified error → the code is "error", exit 1.
+#[test]
+fn deliver_over_a_target_change_the_draft_has_not_seen_is_refused_with_its_code() {
+    let warehouse = TestWarehouse::new("deliver-target-not-covered");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    assert_success(&warehouse.run(&["palletize", "draft"]));
+
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "draft work"]));
+
+    // main moves on with a change the draft never consolidated.
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("other.txt", "main only\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "main moves on"]));
+    let main_head = pallet_head_hash(&warehouse, "main");
+    assert_success(&warehouse.run(&["shift", "draft"]));
+
+    let refused = warehouse.run(&["--json", "deliver", "main", "-m", "over"]);
+    assert_eq!(refused.status.code(), Some(27), "{}", stdout(&refused));
+    assert_eq!(json(&refused)["error"]["code"], "target_not_covered", "{}", stdout(&refused));
+    assert_eq!(json(&refused)["error"]["next_step"], "forklift consolidate main", "{}", stdout(&refused));
+    assert_eq!(pallet_head_hash(&warehouse, "main"), main_head, "the refusal moved nothing");
 }
 
 // T5. Stack's crash window between its ref write and its position write: the ref holds B's own

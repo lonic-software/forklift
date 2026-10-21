@@ -166,13 +166,7 @@ async fn lower_working_pallet(client: &RemoteClient,
         }
 
         if !merge_utils::is_ancestor(local, remote_head)? {
-            return Err(format!(
-                "The local pallet \"{}\" and the remote have diverged. The remote \
-                parcels are fetched; palletize the remote head into its own pallet \
-                (\"palletize <name> {}\"), consolidate it, and lift the result.",
-                pallet,
-                &remote_head[..12.min(remote_head.len())]
-            ));
+            return Err(remote_utils::diverged_refusal(&pallet, remote_head).into());
         }
     }
 
@@ -212,6 +206,14 @@ pub(crate) struct MetaPalletFailure {
     pub(crate) pallet: String,
 
     pub(crate) error: String,
+}
+
+impl MetaPalletFailure {
+    /// A failure carrying the human message only: a refusal's frame never reaches the `--json`
+    /// report or the joined error, which carries no code of its own.
+    pub(crate) fn new(pallet: String, error: String) -> MetaPalletFailure {
+        MetaPalletFailure { pallet, error: forklift_core::error::CoreError::from(error).to_string() }
+    }
 }
 
 /// One side's value at a conflicted path.
@@ -473,7 +475,7 @@ async fn sync_meta(client: &RemoteClient,
     let mut sync = MetaSync {
         adopted: adopt.adopted,
         failed: adopt.failed.into_iter()
-            .map(|(pallet, error)| MetaPalletFailure { pallet, error })
+            .map(|(pallet, error)| MetaPalletFailure::new(pallet, error))
             .collect(),
         ..MetaSync::default()
     };
@@ -498,7 +500,7 @@ async fn sync_meta(client: &RemoteClient,
             Ok(Reconciled::Replayed) => sync.replayed.push(wire),
             Ok(Reconciled::Adopted) => sync.adopted.push(wire),
             Ok(Reconciled::Conflicts(conflicts)) => sync.conflicts.push(conflicts),
-            Err(error) => sync.failed.push(MetaPalletFailure { pallet: wire, error }),
+            Err(error) => sync.failed.push(MetaPalletFailure::new(wire, error)),
         }
     }
 
@@ -525,7 +527,7 @@ async fn sync_meta(client: &RemoteClient,
             ),
         };
 
-        sync.failed.push(MetaPalletFailure { pallet: wire, error });
+        sync.failed.push(MetaPalletFailure::new(wire, error));
     }
 
     sync
