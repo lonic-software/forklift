@@ -80,7 +80,11 @@
 //! whether an absence is *reported*, never what is reachable — an absent object is outside gc's
 //! live set too. So any target this walk calls unreferenced is unreferenced under gc's smaller
 //! root set too — gc is already entitled to collect it, so a heal that instead kept it tainted
-//! forever would brick every command over an object the store's own collector calls garbage. A **present**-but-unloadable object still fails
+//! forever would brick every command over an object the store's own collector calls garbage.
+//! The argument stops at a node only an unreadable pack index might hold. gc refuses there rather
+//! than collect beneath it (FORK-193), so the walk records such a node as unwalked instead of
+//! absent, and heal clears no target on a run that has one (FORK-217, [`descent_presence`]).
+//! A **present**-but-unloadable object still fails
 //! loud (the ordinary `?` after the presence check returns `true`) — tolerance is for absence only,
 //! never for corruption.
 //!
@@ -434,8 +438,9 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
     for (index_path, error) in &snapshot.quarantined {
         lines.push(format!(
             "pack index \"{}\" could not be loaded ({}); the objects it names are quarantined — \
-            \"forklift heal\" can refetch them from a configured remote, and they will be reported \
-            dangling if they are still referenced and none is configured",
+            \"forklift heal\" can refetch any of them still under a durability taint from a \
+            configured remote, and such ones will be reported dangling if they are still referenced \
+            and none is configured; for the rest, restore the pack's data file",
             index_path.to_string_lossy(), error
         ));
     }
@@ -466,7 +471,9 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
 }
 
 /// Fold [`pack_health_warning_lines`] into an outgoing refusal, in a section that names itself
-/// clearly enough it can never be mistaken for the refusal's own cause. A no-op when there is
+/// clearly enough it is not mistaken for the refusal's own cause. An index can be part of the
+/// cause (a dangling hash it names, or a node the walk could not descend, FORK-217), and then the
+/// refusal itself names it, so the heading disclaims only what the refusal does not name. A no-op when there is
 /// nothing to add (the overwhelmingly common case: a healthy pack registry) or the error carries
 /// no structured place to put it (`CoreError::Other`, never produced by this module's own refusal
 /// constructors). Reuses [`CoreError::refusal`] to re-sanitize the assembled message rather than
@@ -488,7 +495,7 @@ fn with_pack_warnings(error: CoreError, pack_warnings: &[String]) -> CoreError {
             CoreError::Refusal {
                 code,
                 message: crate::error::sanitize(&format!(
-                    "{} Pack index problems (unrelated to this refusal — clear them separately): {}",
+                    "{} Pack index problems in this store (clear each as its line says): {}",
                     message, block
                 )),
                 next_step,
@@ -714,7 +721,10 @@ async fn resolve_the_rest(
     // positively find referenced still cannot be told apart from one whose only reference lived
     // in exactly the source that got skipped, so it stays in the remainder too, unproven rather
     // than resolved.
-    let roots_incomplete = !walk.degraded_sources.is_empty();
+    // An unwalked node (FORK-217) narrows the walk the same way: whatever it references is
+    // unknown, so a target the walk did not find may be referenced beneath it.
+    let incomplete_reasons: Vec<String> = walk.degraded_sources.iter().chain(&walk.unwalked).cloned().collect();
+    let roots_incomplete = !incomplete_reasons.is_empty();
 
     for hash in &truly_missing {
         if referenced.contains(hash) {
@@ -734,16 +744,15 @@ async fn resolve_the_rest(
             dangling_lines.push(match unverifiable_reasons.get(hash) {
                 Some(reason) => format!(
                     "cannot be read back verified, and this run could not confirm it is safe to \
-                    drop: \"{}\" ({}; a source of durable references could not be read this run, \
-                    so not every reference to it could be checked — see the note below for which \
-                    source and how to fix it, then re-run \"forklift heal\")",
+                    drop: \"{}\" ({}; not every reference to it could be checked this run — see \
+                    the note below for what could not be read and how to fix it, then re-run \
+                    \"forklift heal\")",
                     hash, reason
                 ),
                 None => format!(
-                    "vanished, and this run could not confirm it is safe to drop: \"{}\" (a source \
-                    of durable references could not be read this run, so not every reference to \
-                    it could be checked — see the note below for which source and how to fix it, \
-                    then re-run \"forklift heal\")",
+                    "vanished, and this run could not confirm it is safe to drop: \"{}\" (not \
+                    every reference to it could be checked this run — see the note below for what \
+                    could not be read and how to fix it, then re-run \"forklift heal\")",
                     hash
                 ),
             });
@@ -872,9 +881,10 @@ async fn resolve_the_rest(
     if let Some(error) = &walk.tags_unread {
         notes.push(tags_unread_note(error));
     }
-    // Any source `collect_walk_roots` had to skip can *never* reach here with `remainder`
-    // empty — `roots_incomplete` above forces every hash the walk could not positively clear into
-    // `remainder`, so a non-empty `walk.degraded_sources` always implies a non-empty `remainder`,
+    // Any source `collect_walk_roots` had to skip, or node the walk could not descend, can
+    // *never* reach here with `remainder` empty — `roots_incomplete` above forces every hash the
+    // walk could not positively clear into `remainder`, and a walk with no targets returns before
+    // reading any source, so a non-empty `incomplete_reasons` always implies a non-empty `remainder`,
     // i.e. the `Err` branch below. `notes` (the `Ok`-only outcome) therefore never needs the
     // degraded-source notes folded in here; the `Err` branch passes them to `dangling_refusal`
     // instead, since that is the only branch a degraded run can actually take.
@@ -895,7 +905,7 @@ async fn resolve_the_rest(
             notes,
         })
     } else {
-        Err(dangling_refusal(root, &dangling_lines, &walk.degraded_sources))
+        Err(dangling_refusal(root, &dangling_lines, &incomplete_reasons))
     }
 }
 
@@ -1086,13 +1096,16 @@ fn rescan_torn_taint(
     // that must be fixed before a rescan can honestly complete. Whatever step 1 already restaged
     // above is still durable on disk regardless — restaging never depends on these roots — only
     // the taint record's own scope decision waits for a clean rescan.
-    if !walk.degraded_sources.is_empty() {
+    // An unwalked node (FORK-217) hides what lies beneath it just as a skipped source does, so
+    // it refuses the same way.
+    let incomplete_reasons: Vec<String> = walk.degraded_sources.iter().chain(&walk.unwalked).cloned().collect();
+    if !incomplete_reasons.is_empty() {
         report(
             "torn durability taint: the rescan could not finish verifying every reference \
-            because a source of durable references could not be read; the torn record is left \
-            standing.".to_string()
+            because a source of durable references, or an object they reach, could not be read; \
+            the torn record is left standing.".to_string()
         );
-        return Err(torn_rescan_degraded_refusal(root, restaged.len(), &walk.degraded_sources));
+        return Err(torn_rescan_degraded_refusal(root, restaged.len(), &incomplete_reasons));
     }
 
     for hash in referenced_absent {
@@ -1749,6 +1762,11 @@ pub(crate) struct ClosureWalkResult {
     pub hashes: BTreeSet<String>,
     /// Plain-language notes, one per degraded source — see [`collect_walk_roots`]'s doc comment.
     pub degraded_sources: Vec<String>,
+    /// Plain-language notes, one per node the walk could not descend because only an unreadable
+    /// pack index might hold it (FORK-217) — see [`WalkClosureOutcome::unwalked`]. Like
+    /// `degraded_sources`, a non-empty list makes `hashes` conservative: a target missing from it
+    /// may still be referenced beneath one of these nodes.
+    pub unwalked: Vec<String>,
     /// Every `Gap`-policy trust-pin root (F6, PR #120 round 2) this run could confirm is
     /// genuinely never held locally: absent, and never resolved by any genuine ancestry edge
     /// either — see [`walk_closure_for`]'s own doc comment for exactly what "confirm" means here.
@@ -1778,8 +1796,8 @@ pub(crate) struct ClosureWalkResult {
 pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<ClosureWalkResult, String> {
     if targets.is_empty() {
         return Ok(ClosureWalkResult {
-            hashes: BTreeSet::new(), degraded_sources: Vec::new(), never_held_pins: BTreeSet::new(),
-            never_held_tags: Vec::new(), tags_unread: None,
+            hashes: BTreeSet::new(), degraded_sources: Vec::new(), unwalked: Vec::new(),
+            never_held_pins: BTreeSet::new(), never_held_tags: Vec::new(), tags_unread: None,
         });
     }
 
@@ -1794,6 +1812,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     Ok(ClosureWalkResult {
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
+        unwalked: unwalked_notes(&outcome.unwalked),
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
@@ -1839,6 +1858,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     Ok(ClosureWalkResult {
         hashes: absent,
         degraded_sources: roots.degraded_sources,
+        unwalked: unwalked_notes(&outcome.unwalked),
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
@@ -1937,11 +1957,12 @@ fn walk_closure_for(
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
+    let mut unwalked: BTreeMap<String, String> = BTreeMap::new();
     let mut visited_trees: HashSet<String> = HashSet::new();
     let mut visited_parcels: HashSet<String> = HashSet::new();
 
     for (hash, item_type) in &roots.shard_referenced {
-        check_leaf(hash, *item_type, targets, corrupt, &mut referenced, reborrow_sink(&mut sink))?;
+        check_leaf(hash, *item_type, targets, corrupt, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
     }
 
     // One combined queue, ordinary and pin roots alike — see this function's own doc comment for
@@ -1954,7 +1975,8 @@ fn walk_closure_for(
         .collect();
 
     drain_parcel_queue(
-        &mut queue, targets, corrupt, &mut referenced, &mut visited_parcels, &mut visited_trees, sink,
+        &mut queue, targets, corrupt, &mut referenced, &mut unwalked, &mut visited_parcels, &mut visited_trees,
+        sink,
     )?;
 
     // F6: every declared pin root this run can positively confirm is genuinely never held — see
@@ -1988,12 +2010,67 @@ fn walk_closure_for(
         })
         .collect();
 
-    Ok(WalkClosureOutcome { referenced, never_held_pins, never_held_tags })
+    Ok(WalkClosureOutcome { referenced, unwalked, never_held_pins, never_held_tags })
+}
+
+/// What a descent guard of [`walk_closure_for`] finds at one node it would otherwise load.
+enum Descent {
+    Present,
+    /// Neither a pack nor the loose store holds it, and no unreadable index might.
+    Absent,
+    /// Absent to a read, but an unreadable pack index might hold it, with this reason
+    /// ([`pack_utils::sweep_unreadable_reason`]).
+    Unwalkable(String),
+}
+
+/// One plain-language note per distinct reason among the unwalked nodes — see
+/// [`ClosureWalkResult::unwalked`]. Grouped by reason and capped at [`MAX_NAMED_DANGLING`] names
+/// each, since one stray index can hold back every absent boundary of a sparse warehouse.
+fn unwalked_notes(unwalked: &BTreeMap<String, String>) -> Vec<String> {
+    let mut by_reason: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (hash, reason) in unwalked {
+        by_reason.entry(reason.as_str()).or_default().push(hash.as_str());
+    }
+
+    by_reason.into_iter()
+        .map(|(reason, hashes)| {
+            let named: Vec<String> = hashes.iter().take(MAX_NAMED_DANGLING).map(|hash| format!("\"{}\"", hash)).collect();
+            let more = match hashes.len().saturating_sub(MAX_NAMED_DANGLING) {
+                0 => String::new(),
+                rest => format!(" and {} more", rest),
+            };
+            format!(
+                "{} object(s) may be in the store but cannot be read ({}), so the objects they \
+                reference could not be checked: {}{}.",
+                hashes.len(), reason, named.join(", "), more
+            )
+        })
+        .collect()
+}
+
+/// The presence check behind every descent guard. A node only an unreadable index might hold is
+/// not absent (FORK-217): its bytes may still be on disk, and what it references may be present
+/// elsewhere. The sweeps refuse at such a node (FORK-193), so gc is not entitled to collect what
+/// lies beneath it, and the module doc comment's argument for clearing on "unreferenced" does not
+/// reach that far. The walk records it in [`WalkClosureOutcome::unwalked`] instead of descending.
+fn descent_presence(hash: &str) -> Result<Descent, String> {
+    if file_utils::raw_object_present(hash)? {
+        return Ok(Descent::Present);
+    }
+
+    Ok(match pack_utils::sweep_unreadable_reason(hash)? {
+        None => Descent::Absent,
+        Some(reason) => Descent::Unwalkable(reason),
+    })
 }
 
 /// [`walk_closure_for`]'s full result — see that function's own doc comment.
 struct WalkClosureOutcome {
     referenced: BTreeSet<String>,
+    /// Every node the walk reached but could not descend, because only an unreadable pack index
+    /// might hold it, mapped to why ([`descent_presence`]). Whatever lies beneath one is unknown,
+    /// so a target the walk did not find may still be referenced.
+    unwalked: BTreeMap<String, String>,
     never_held_pins: BTreeSet<String>,
     /// Every tag `(name, subject, why)` whose subject this store does not hold and no genuine
     /// root reached — the tag counterpart of `never_held_pins` (FORK-83).
@@ -2059,6 +2136,7 @@ fn drain_parcel_queue(
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
+    unwalked: &mut BTreeMap<String, String>,
     visited_parcels: &mut HashSet<String>,
     visited_trees: &mut HashSet<String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
@@ -2089,25 +2167,37 @@ fn drain_parcel_queue(
             if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
             continue;
         }
-        if !file_utils::raw_object_present(&hash)? {
-            match policy {
-                AbsencePolicy::Report => {
-                    visited_parcels.insert(hash.clone());
-                    if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
+        match descent_presence(&hash)? {
+            Descent::Present => {}
+            Descent::Absent => {
+                match policy {
+                    AbsencePolicy::Report => {
+                        visited_parcels.insert(hash.clone());
+                        if let Some(s) = reborrow_sink(&mut sink) { s(&hash); }
+                    }
+                    // Deliberately does NOT mark `hash` visited — see `AbsencePolicy::Gap`'s own
+                    // doc comment for why leaving it open is exactly what lets a genuine ancestry
+                    // edge discovered elsewhere in this same walk still resolve and report it.
+                    AbsencePolicy::Gap => {}
                 }
-                // Deliberately does NOT mark `hash` visited — see `AbsencePolicy::Gap`'s own doc
-                // comment for why leaving it open is exactly what lets a genuine ancestry edge
-                // discovered elsewhere in this same walk still resolve and report it.
-                AbsencePolicy::Gap => {}
+                continue;
             }
-            continue;
+            // Under either policy: a pin root an unreadable index might hold is not known to be
+            // never held, and its ancestry is unknown either way.
+            Descent::Unwalkable(reason) => {
+                visited_parcels.insert(hash.clone());
+                unwalked.insert(hash, reason);
+                continue;
+            }
         }
 
         // Present: never ambiguous, regardless of which policy found it — mark visited and
         // descend, exactly like before F1's fix.
         visited_parcels.insert(hash.clone());
         let parcel = object_utils::load_parcel(&hash)?;
-        walk_tree(&parcel.tree_hash, targets, corrupt, referenced, visited_trees, reborrow_sink(&mut sink))?;
+        walk_tree(
+            &parcel.tree_hash, targets, corrupt, referenced, unwalked, visited_trees, reborrow_sink(&mut sink),
+        )?;
 
         for parent in parcel.parents {
             // An ancestry edge is always a genuine local reference — see `AbsencePolicy::Report`'s
@@ -2132,6 +2222,7 @@ fn walk_tree(
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
+    unwalked: &mut BTreeMap<String, String>,
     visited_trees: &mut HashSet<String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
@@ -2160,15 +2251,23 @@ fn walk_tree(
         // corrupt reachable tree would instead hit `load_tree`'s bare `?` below and abort the
         // whole rescan (I5) — see
         // [`tests::a_corrupt_reachable_tree_is_a_recorded_boundary_not_a_walk_abort`].
-        if corrupt.contains(&tree_hash) || !file_utils::raw_object_present(&tree_hash)? {
-            if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
-            continue;
+        let descent = if corrupt.contains(&tree_hash) { Descent::Absent } else { descent_presence(&tree_hash)? };
+        match descent {
+            Descent::Present => {}
+            Descent::Absent => {
+                if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
+                continue;
+            }
+            Descent::Unwalkable(reason) => {
+                unwalked.insert(tree_hash, reason);
+                continue;
+            }
         }
 
         let tree = object_utils::load_tree(&tree_hash)?;
 
         for (_, file) in tree.get_files() {
-            check_leaf(&file.hash, file.item_type, targets, corrupt, referenced, reborrow_sink(&mut sink))?;
+            check_leaf(&file.hash, file.item_type, targets, corrupt, referenced, unwalked, reborrow_sink(&mut sink))?;
         }
 
         for (_, subtree) in tree.get_subtrees() {
@@ -2202,6 +2301,7 @@ fn check_leaf(
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
+    unwalked: &mut BTreeMap<String, String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     if targets.contains(hash) {
@@ -2214,9 +2314,17 @@ fn check_leaf(
         // parcel/subtree guards above): a recipe already known corrupt is never loaded either,
         // since `recipe_chunk_hashes` below would otherwise fail loud on it exactly like
         // `load_tree`/`load_parcel` would.
-        if corrupt.contains(hash) || !file_utils::raw_object_present(hash)? {
-            if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
-            return Ok(());
+        let descent = if corrupt.contains(hash) { Descent::Absent } else { descent_presence(hash)? };
+        match descent {
+            Descent::Present => {}
+            Descent::Absent => {
+                if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
+                return Ok(());
+            }
+            Descent::Unwalkable(reason) => {
+                unwalked.insert(hash.to_string(), reason);
+                return Ok(());
+            }
         }
         for chunk in object_utils::recipe_chunk_hashes(hash)? {
             // Targets-check first (same reasoning as every other node): a target chunk is
@@ -2467,8 +2575,8 @@ fn rescan_failure_refusal(root: &Path, error: &str) -> CoreError {
 }
 
 /// The store-wide rescan ran and restaged whatever it legitimately could, but at least one
-/// source of durable references (a bay's saved state, or the office record) could not be read,
-/// so step 2's enumeration cannot be trusted to have found every reference — see
+/// source of durable references (a bay's saved state, or the office record), or a node the walk
+/// could not descend (FORK-217), could not be read, so step 2's enumeration cannot be trusted to have found every reference — see
 /// [`rescan_torn_taint`]'s own comment at its degraded-source guard for the full reasoning. The
 /// torn record is left completely untouched, distinct from [`rescan_failure_refusal`] (an
 /// operational failure of the rescan's own machinery) even though both leave the record standing
@@ -2485,9 +2593,12 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix the source(s) named above (a bay's state, or restage the office record), then run \
+        "Fix what is named above (a bay's state, the office record, or a pack index: restore its \
+        pack files from a good copy, move an index that does not parse out of the pack folder only \
+        if it holds nothing this warehouse needs, or \
+        re-create the warehouse for one of another format version), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
-        can only replace the torn record once every source is readable.",
+        can only replace the torn record once everything it walks is readable.",
     )
 }
 
@@ -2524,7 +2635,8 @@ fn torn_rescan_dangling_refusal(root: &Path, lines: &[String]) -> CoreError {
 
 /// `degraded`: the plain-language notes for every source `collect_walk_roots` had to skip this
 /// run — a bay (see [`bay_utils::BayReadPolicy::Tolerate`]) or the office record (see
-/// [`office_utils::TrustPinReadPolicy::Tolerate`]) — empty on the common path. When non-empty, at
+/// [`office_utils::TrustPinReadPolicy::Tolerate`]) — and for every node the walk could not descend
+/// ([`ClosureWalkResult::unwalked`]); empty on the common path. When non-empty, at
 /// least one line in `lines` may be there only because this run could not prove it unreferenced
 /// (not because it definitely still is), so the message says so plainly and points at the actual
 /// fix (repair the named source) rather than only the heavyweight exits, which do not apply to a
@@ -2557,10 +2669,13 @@ fn dangling_refusal(root: &Path, lines: &[String], degraded: &[String]) -> CoreE
     } else {
         format!(
             "At least one of these could not be conclusively checked because a source of durable \
-            references (a bay's saved state, or the office record) could not be read this run — \
-            fix it (see above), then re-run \"forklift heal\"; it may resolve on its own once \
-            every source is readable. Whatever is still dangling after that needs a heavyweight \
-            resolution: {}",
+            references (a bay's saved state, or the office record), or a pack index holding \
+            objects they reach, could not be read this run — fix it (for a pack index: restore its pack files from a good \
+            copy, move an index that does not parse out of the pack folder only if it holds \
+            nothing this warehouse needs, or re-create the \
+            warehouse for one of another format version), then re-run \
+            \"forklift heal\"; it may resolve on its own once everything is readable. Whatever \
+            is still dangling after that needs a heavyweight resolution: {}",
             HEAVYWEIGHT_EXITS
         )
     };
@@ -6291,7 +6406,7 @@ mod tests {
         assert!(message.contains("stray-corrupt.idx"),
             "the refusal must also name the unrelated stray index — pack-health warnings must \
             survive a refusal, not only a clean Ok: {}", message);
-        assert!(message.contains("unrelated to this refusal"),
+        assert!(message.contains("Pack index problems in this store (clear each as its line says): "),
             "the pack-health warning must be in a clearly-separated section, never read as the \
             refusal's own cause: {}", message);
 
@@ -6517,5 +6632,218 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- FORK-217: a node only an unreadable pack index might hold ----
+
+    /// A fresh, empty scratch root for one arm of an unreadable-index test.
+    fn unreadable_scratch(name: &str, how: pack_utils::tests::Unreadable) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-{}-{:?}-{}", name, how, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What is wrong with a targeted walk over a node only an unreadable index holds, if anything:
+    /// the target beneath it must not read referenced (the walk cannot see it), and the node must
+    /// be named in `unwalked`, which is what keeps heal from calling the target unreferenced.
+    fn unwalked_outcome(how: pack_utils::tests::Unreadable, unreadable: &str, target: &str) -> Option<String> {
+        let targets: BTreeSet<String> = [target.to_string()].into_iter().collect();
+        match closure_references_any(&targets) {
+            Err(error) => Some(format!("{:?}: the walk must not fail on an unreadable node: {}", how, error)),
+            Ok(walk) if walk.hashes.contains(target) => {
+                Some(format!("{:?}: sanity: the target is beneath the unreadable node, out of sight", how))
+            }
+            Ok(walk) if !walk.unwalked.iter().any(|note| note.contains(unreadable)) => {
+                Some(format!("{:?}: the walk must name {} as unwalked, got {:?}", how, unreadable, walk.unwalked))
+            }
+            Ok(_) => None,
+        }
+    }
+
+    /// One stray index can hold back every absent boundary of a sparse warehouse, so the notes are
+    /// one per reason, each naming at most `MAX_NAMED_DANGLING` objects.
+    ///
+    /// Mutation: one note per node (the pre-grouping shape) → 21 notes, not 2 (red).
+    #[test]
+    fn unwalked_notes_are_one_per_reason_and_capped() {
+        let mut unwalked = BTreeMap::new();
+        for n in 0..20 {
+            unwalked.insert(format!("{:064x}", n), "possibly held by pack index \"a.idx\"".to_string());
+        }
+        unwalked.insert("f".repeat(64), "named by pack index \"b.idx\"".to_string());
+
+        let notes = unwalked_notes(&unwalked);
+        assert_eq!(notes.len(), 2, "{:?}", notes);
+        let a = notes.iter().find(|note| note.contains("a.idx")).unwrap();
+        assert!(a.starts_with("20 object(s)") && a.contains(&format!("{:064x}", MAX_NAMED_DANGLING - 1)), "{}", a);
+        assert!(!a.contains(&format!("{:064x}", MAX_NAMED_DANGLING)) && a.ends_with(" and 4 more."), "{}", a);
+        let b = notes.iter().find(|note| note.contains("b.idx")).unwrap();
+        assert!(b.starts_with("1 object(s)") && b.ends_with(&format!("\"{}\".", "f".repeat(64))), "{}", b);
+    }
+
+    /// Mutation: in `drain_parcel_queue`, read `Descent::Unwalkable` as `Absent` → the head parcel
+    /// is skipped silently and `unwalked` stays empty (red).
+    #[test]
+    fn the_walk_names_a_parcel_only_an_unreadable_index_holds_as_unwalked() {
+        use crate::globals::StorageRootScope;
+        use crate::util::gc_utils::tests::{store_root_parcel, store_tree};
+        use crate::util::pack_utils::tests::{for_each_unreadable, pack_as_unreadable};
+
+        for_each_unreadable(|how| {
+            let dir = unreadable_scratch("walk-unreadable-parcel", how);
+            let failure = {
+                let _scope = StorageRootScope::enter(&dir);
+                let target = "9".repeat(64);
+                let root_tree = store_tree(&[("x.bin", &target, DirEntryType::Normal)]);
+                let parcel = store_root_parcel(&root_tree);
+                pack_as_unreadable(&parcel, how);
+
+                unwalked_outcome(how, &parcel, &target)
+            };
+            std::fs::remove_dir_all(&dir).ok();
+            failure
+        });
+    }
+
+    /// Mutation: in `check_leaf`, read `Descent::Unwalkable` as `Absent` → the recipe is skipped
+    /// silently and `unwalked` stays empty (red).
+    #[test]
+    fn the_walk_names_a_recipe_only_an_unreadable_index_holds_as_unwalked() {
+        use crate::globals::StorageRootScope;
+        use crate::util::gc_utils::tests::{store_chunk, store_recipe, store_root_parcel, store_tree};
+        use crate::util::pack_utils::tests::{for_each_unreadable, pack_as_unreadable};
+
+        for_each_unreadable(|how| {
+            let dir = unreadable_scratch("walk-unreadable-recipe", how);
+            let failure = {
+                let _scope = StorageRootScope::enter(&dir);
+                let chunk = store_chunk(b"chunk under an unreadable recipe");
+                let recipe = store_recipe(&[(chunk.clone(), 32)]);
+                let root_tree = store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]);
+                store_root_parcel(&root_tree);
+                pack_as_unreadable(&recipe, how);
+
+                unwalked_outcome(how, &recipe, &chunk)
+            };
+            std::fs::remove_dir_all(&dir).ok();
+            failure
+        });
+    }
+
+    /// Store `main` → root tree → `web` subtree → `x.bin` = `target`, and leave the subtree held
+    /// only by an unreadable index. Returns the subtree's hash. The bay gets a position file, so
+    /// its saved state reads cleanly and the unreadable subtree is the only gap in the walk.
+    fn plant_target_beneath_an_unreadable_tree(how: pack_utils::tests::Unreadable, target: &str) -> String {
+        use crate::util::gc_utils::tests::{store_root_parcel, store_tree};
+
+        let web_tree = store_tree(&[("x.bin", target, DirEntryType::Normal)]);
+        let root_tree = store_tree(&[("web", &web_tree, DirEntryType::Tree)]);
+        store_root_parcel(&root_tree);
+        crate::util::pallet_utils::write_position(&crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        pack_utils::tests::pack_as_unreadable(&web_tree, how);
+        web_tree
+    }
+
+    /// FORK-217: a vanished object whose only reference lies beneath a tree only an unreadable
+    /// index holds must stay tainted. gc refuses at that tree rather than collect beneath it, so
+    /// the walk has not shown the object unreferenced. The record is checked first, since clearing
+    /// it is the loss the refusal exists to prevent.
+    ///
+    /// Mutations, each red on its own: in `walk_tree`, read `Descent::Unwalkable` as `Absent` (the
+    /// tree is skipped silently); or drop `walk.unwalked` from `resolve_the_rest`'s
+    /// `incomplete_reasons` (the unwalked tree no longer blocks the clear). Either way heal clears
+    /// the taint.
+    #[test]
+    fn heal_keeps_a_taint_whose_only_reference_lies_beneath_an_unreadable_tree() {
+        use crate::globals::StorageRootScope;
+        use crate::util::pack_utils::tests::for_each_unreadable;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        for_each_unreadable(|how| {
+            let dir = unreadable_scratch("heal-unreadable-tree", how);
+            let failure = {
+                let _scope = StorageRootScope::enter(&dir);
+                let forklift = forklift_root();
+                let vanished_hash = "9".repeat(64);
+                let web_tree = plant_target_beneath_an_unreadable_tree(how, &vanished_hash);
+
+                let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
+                plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
+
+                let result = run_heal();
+                let state = taint_utils::read_taints(&forklift).unwrap();
+                if !state.recorded.contains(&vanished_path) {
+                    Some(format!("{:?}: heal cleared {}, which the unreadable tree references", how, vanished_hash))
+                } else {
+                    match result {
+                        Ok(_) => Some(format!("{:?}: heal must refuse while the tree is unreadable", how)),
+                        Err(CoreError::Refusal { code, message, .. }) => {
+                            if message.contains("saved state could not be read") {
+                                Some(format!("{:?}: sanity: the bay's saved state must read cleanly: {}", how, message))
+                            } else if code != RefusalCode::DurabilityTaint {
+                                Some(format!("{:?}: wrong code {:?}: {}", how, code, message))
+                            } else if !(message.contains(&vanished_hash) && message.contains(&web_tree)
+                                && message.contains("could not confirm it is safe to drop")) {
+                                Some(format!("{:?}: the refusal must name the object, the unreadable tree and \
+                                    that it is unconfirmed: {}", how, message))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(other) => Some(format!("{:?}: expected a refusal, got {:?}", how, other)),
+                    }
+                }
+            };
+            std::fs::remove_dir_all(&dir).ok();
+            failure
+        });
+    }
+
+    /// FORK-217, the torn rescan: an enumeration that could not descend a node is no more complete
+    /// than one that skipped a bay, so the torn record must be left standing.
+    ///
+    /// Mutation: drop `walk.unwalked` from `rescan_torn_taint`'s `incomplete_reasons` → the rescan
+    /// finds nothing absent (the tree is unwalked, not absent) and replaces the torn record with an
+    /// empty one (red).
+    #[test]
+    fn torn_rescan_leaves_the_record_standing_over_an_unreadable_tree() {
+        use crate::globals::StorageRootScope;
+        use crate::util::pack_utils::tests::for_each_unreadable;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        for_each_unreadable(|how| {
+            let dir = unreadable_scratch("torn-unreadable-tree", how);
+            let failure = {
+                let _scope = StorageRootScope::enter(&dir);
+                let forklift = forklift_root();
+                let web_tree = plant_target_beneath_an_unreadable_tree(how, &"9".repeat(64));
+                plant_torn_taint(&forklift, &[]);
+
+                let result = run_heal();
+                let state = taint_utils::read_taints(&forklift).unwrap();
+                if !state.torn {
+                    Some(format!("{:?}: the torn record must be left standing, got {:?}", how, state.recorded))
+                } else {
+                    match result {
+                        Ok(_) => Some(format!("{:?}: the rescan must refuse while the tree is unreadable", how)),
+                        Err(CoreError::Refusal { message, .. }) if message.contains("saved state could not be read") => {
+                            Some(format!("{:?}: sanity: the bay's saved state must read cleanly: {}", how, message))
+                        }
+                        Err(CoreError::Refusal { message, .. }) if !(message.contains(&web_tree) && message.contains("torn")) => {
+                            Some(format!("{:?}: the refusal must name the unreadable tree: {}", how, message))
+                        }
+                        Err(_) => None,
+                    }
+                }
+            };
+            std::fs::remove_dir_all(&dir).ok();
+            failure
+        });
     }
 }

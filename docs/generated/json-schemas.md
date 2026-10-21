@@ -4252,7 +4252,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "quarantined_packs": {
-      "description": "Pack indexes that parsed but whose data file could not be loaded — their\nobjects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a\nhealthy store.",
+      "description": "Pack indexes that parsed but whose data file could not be loaded — their\nobjects are quarantined, not lost: `forklift heal` can still refetch any of them under a\ndurability taint, and restoring the data file recovers the rest. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },

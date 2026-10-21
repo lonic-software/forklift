@@ -1695,7 +1695,8 @@ The four problem lists are ordinarily all empty. A pack pair loses its
 data file only in unusual circumstances (a file removed by hand, a partial restore); when that
 happens, `store` lists it under `quarantined_packs` — `[{index_path, error}]` — rather than
 failing the census: the objects it named are not lost, only unreachable through that copy, and
-`heal` can refetch them from a configured remote. `store` checks every index in full: a pack whose
+`heal` can refetch from a configured remote any of them still under a durability taint (for the
+rest, restore the pack's data file). `store` checks every index in full: a pack whose
 index is damaged in places is listed under `damaged_packs` (same shape) and left out of the counts.
 Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable until
 it is stored again. `unenumerable_indexes` — the same `[{index_path,
@@ -1766,6 +1767,16 @@ refusal before ever reaching its own fetch):
   Re-run once the named source is fixed. A run that has nothing to look up — every recorded entry
   resolved on its own, so no reachability question was ever asked — clears without consulting
   these sources at all, and so never reports on them.
+- **An object the check walks through could not be read** — one that only a damaged pack index
+  might hold (its data file missing, a corrupt part of the index, another format version, or an
+  index that does not parse). What that object references is unknown, so `heal` clears no vanished
+  object on that run: every one it could not confirm is safe to drop keeps its taint, not only those
+  beneath the object (paths it restaged or read back verified still clear). The note names the
+  objects and the index. `heal` does not refetch these objects itself, so fix the index by hand:
+  restore its pack files from a good copy (a missing data file or a damaged index); move an index
+  that does not parse out of the pack folder if it holds nothing this warehouse needs; or, for an
+  index of another format version, re-create the warehouse — never move that one aside, which would
+  make its objects read as missing. Then re-run `heal`. A torn record is likewise left standing.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of
@@ -1774,13 +1785,13 @@ unproven state.
 Every `heal` run also checks the pack folder for the same problem indexes `store` reports (see
 above) and prints a warning line for each one it finds — unconditionally, whether or not anything
 else was tainted this run, and whether or not that index is what caused the taint. A quarantined
-index's objects are left recoverable (`heal` can refetch them); a damaged pack still serves its
+index's objects are left recoverable (`heal` refetches those under a durability taint, and
+restoring the pack's data file recovers the rest); a damaged pack still serves its
 sound parts; an index of another format means re-creating the warehouse; an unenumerable one names
-the file to move aside. This appears even when `heal` still has to refuse
-on an unrelated dangling reference — as a clearly-separated "Pack index problems (unrelated to
-this refusal, clear them separately)" section, never as though it were the cause of the refusal —
-since a broken pack index is inert on its own and the only time it coincides with a refusal is
-exactly when an operator most needs to be told about it.
+the file to move aside. This appears even when `heal` still has to refuse — as a
+clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
+index the refusal itself names (see the bullet above) is part of its cause; the time one coincides
+with a refusal is exactly when an operator most needs to be told about it.
 
 ---
 
