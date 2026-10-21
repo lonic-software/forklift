@@ -6637,7 +6637,19 @@ fn the_server_neither_prepares_nor_serves_a_bay() {
     assert!(stderr(&prepared).contains("belongs to a bay"), "{}", stderr(&prepared));
     assert!(!prepared.status.success());
 
-    let served = server_command().args(["serve", "--root", bay_str, "--addr", "127.0.0.1:0", "--open"]).output().unwrap();
+    // Waited on with a deadline: a server that took the bay for a warehouse would serve it forever.
+    let mut serving = server_command().args(["serve", "--root", bay_str, "--addr", "127.0.0.1:0", "--open"])
+        .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while serving.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = serving.kill();
+            let _ = serving.wait();
+            panic!("forklift-server served a bay as a warehouse");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let served = serving.wait_with_output().unwrap();
     assert!(stderr(&served).contains("is a bay's working directory"), "{}", stderr(&served));
     assert!(!served.status.success());
 }
