@@ -1,7 +1,7 @@
 use serde::Serialize;
 use forklift_core::util::cherry_pick_utils::{self, CherryPickState};
 use forklift_core::util::{
-    file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
+    file_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
 };
 use crate::commands::consolidate;
 use crate::output::{self, CommandOutput};
@@ -125,11 +125,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     }
 
     consolidate::keep_aliased_files(&mut actions, &our_tree, &scope)?;
-
-    // Read once for the check and the apply: neither writes the metadata before the batch
-    // publishes.
-    let ledger = inventory_utils::ShardLedger::read()?;
-    consolidate::ensure_no_untracked_collisions(&ledger, &actions, &source_label)?;
+    let ledger = consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
 
     let mut conflicts = consolidate::apply_merge_actions(&ledger, &actions)?;
 

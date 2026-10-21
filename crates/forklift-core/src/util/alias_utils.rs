@@ -226,8 +226,13 @@ impl<'l> AliasCheck<'l> {
         AliasCheck { listings: HashMap::new(), directories: HashMap::new(), ledger }
     }
 
+    /// The registered set this check judges by (read on first use, or lent by the caller).
+    pub(crate) fn ledger(&mut self) -> Result<&inventory_utils::ShardLedger, String> {
+        self.ledger.get()
+    }
+
     /// Whether the inventory holds a live file entry at `key` (see [`tracked_file`]), against the
-    /// registered set as this check first read it.
+    /// check's ledger (read on first use, or lent by the caller).
     pub fn tracked_file(&mut self, key: &str) -> Result<bool, String> {
         tracked_file(self.ledger.get()?, key)
     }

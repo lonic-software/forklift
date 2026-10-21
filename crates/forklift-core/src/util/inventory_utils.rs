@@ -1070,8 +1070,8 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 
 /// Many shard edits from one single-threaded operation, published together as one
 /// [`publish_shard_outcomes`] call — the third producer of [`ShardOutcome`]s, beside `load`'s walk
-/// and `park`'s refresh — instead of one [`ShardLedger::update_shard`] (and so one ancestor-clear barrier, one
-/// shard write and one metadata rewrite) per edited entry.
+/// and `park`'s refresh — instead of one [`ShardLedger::update_shard`] (and so one ancestor-clear
+/// barrier, one shard write and one metadata rewrite) per edited entry.
 ///
 /// [`update`](Self::update) reads a shard on its first touch and applies every later change for
 /// the same key to the same in-memory copy; nothing reaches disk before [`publish`](Self::publish).
@@ -1580,18 +1580,19 @@ pub fn build_inventory_item_from_stat(path: &Path,
 /// for a plain untracked file at the path.
 ///
 /// # Arguments
-/// * `path` - The warehouse path of the directory (assumed to exist on disk).
+/// * `ledger` - The registered directory keys, read by the caller.
+/// * `path`   - The warehouse path of the directory (assumed to exist on disk).
 ///
 /// # Returns
 /// * `Ok(true)`    - The directory is tracked and has no untracked content beneath it.
 /// * `Ok(false)`   - The directory is untracked, or has untracked content beneath it.
 /// * `Err(String)` - If a directory entry or a shard could not be read or parsed.
-pub fn directory_is_safe_to_replace(path: &str) -> Result<bool, String> {
-    let registered = registered_keys()?;
-
-    if !registered.contains(path) {
+pub fn directory_is_safe_to_replace(ledger: &ShardLedger, path: &str) -> Result<bool, String> {
+    if !ledger.holds(path) {
         return Ok(false);
     }
+
+    let registered: BTreeSet<String> = ledger.keys().map(str::to_string).collect();
 
     let ignore_rules = file_utils::get_ignore_rules()?;
 
@@ -2725,8 +2726,9 @@ fn unregister_inventory_keys(keys_to_remove: &BTreeSet<String>) -> Result<(), St
 /// The set is closed under ancestors before it is written: every ancestor of a registered key is
 /// registered too, so every directory between the root and a tracked file is tracked (see
 /// [`ShardLedger::holds`]). Every metadata write passes through here, so no writer can break
-/// that, whether it registers only the directory it wrote (single-file load, [`ShardLedger::update_shard`]) or
-/// drops a key a registered descendant still needs (the removal paths).
+/// that, whether it registers only the directory it wrote (single-file load,
+/// [`ShardLedger::update_shard`]) or drops a key a registered descendant still needs (the removal
+/// paths).
 ///
 /// # Arguments
 /// * `path`     - The path of the file where the metadata should be saved.
@@ -2823,10 +2825,22 @@ pub struct ShardLedger {
     entries: BTreeSet<String>,
 }
 
+thread_local! {
+    /// How many times this thread has read the ledger: a cheap, always-on observability hook the
+    /// tests use to prove a command reads it once, not once per path — see [`ledger_read_count`].
+    static LEDGER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has read the ledger ([`ShardLedger::read`]). Per thread, so a test
+/// counts only its own command's reads while other tests run beside it.
+pub fn ledger_read_count() -> u64 {
+    LEDGER_READS.with(std::cell::Cell::get)
+}
+
 /// A [`ShardLedger`] for a holder that may never need one: read on first use, or lent by a caller
 /// that already read it, so one command reads the metadata once however many holders it passes
 /// the registered set through.
-pub enum LazyLedger<'l> {
+pub(crate) enum LazyLedger<'l> {
     /// Not read yet.
     Unread,
     /// Read by this holder.
@@ -2841,7 +2855,7 @@ impl LazyLedger<'_> {
     /// # Returns
     /// * `Ok(&ShardLedger)` - The registered set.
     /// * `Err(String)`      - If the metadata could not be read or parsed.
-    pub fn get(&mut self) -> Result<&ShardLedger, String> {
+    pub(crate) fn get(&mut self) -> Result<&ShardLedger, String> {
         if let LazyLedger::Unread = self {
             *self = LazyLedger::Read(ShardLedger::read()?);
         }
@@ -2862,6 +2876,8 @@ impl ShardLedger {
     /// * `Ok(ShardLedger)` - The registered set.
     /// * `Err(String)`     - If the metadata could not be read or parsed.
     pub fn read() -> Result<ShardLedger, String> {
+        LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
+
         let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
         Ok(ShardLedger { entries: metadata_opt.unwrap_or_default() })

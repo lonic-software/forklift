@@ -412,7 +412,8 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
         None => None,
     };
 
-    // Read once: each branch below writes the metadata only as its last step, through this ledger.
+    // Read once: nothing below writes the metadata before its one write — `update_shard` or
+    // `replace_subtree` through this ledger, or the batch's publish, which reads its own.
     let mut ledger = inventory_utils::ShardLedger::read()?;
 
     let treat_as_directory = path.is_root()
@@ -750,4 +751,38 @@ fn resolve_head_entry(root_tree_hash: &str, key: &str) -> Result<Option<HeadEntr
     }
 
     Ok(Some(HeadEntry::Tree { tree: current, hash: current_hash }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{self, Warehouse};
+
+    /// How many times `run` reads the ledger on this thread.
+    fn ledger_reads(run: impl FnOnce()) -> u64 {
+        let before = inventory_utils::ledger_read_count();
+        run();
+        inventory_utils::ledger_read_count() - before
+    }
+
+    #[test]
+    fn a_restore_reads_the_ledger_once_whatever_the_path_names() {
+        let warehouse = Warehouse::with_working_tree("restore-ledger-reads");
+        forklift_core::util::pallet_utils::write_position(&forklift_core::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        std::fs::create_dir_all(warehouse.root.join("dir/sub")).unwrap();
+        std::fs::write(warehouse.root.join("dir/a.txt"), b"a\n").unwrap();
+        std::fs::write(warehouse.root.join("dir/sub/b.txt"), b"b\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+
+        // One read by the command, and one by its batch's publish, which re-reads under the lock.
+        for target in ["dir/a.txt", "dir", "."] {
+            std::fs::write(warehouse.root.join("dir/a.txt"), b"changed\n").unwrap();
+            assert_eq!(ledger_reads(|| handle_command(false, target).unwrap()), 2, "restore {}", target);
+        }
+
+        // One read, which the unstage's own metadata write goes through.
+        for target in ["dir/sub/b.txt", "dir"] {
+            assert_eq!(ledger_reads(|| handle_command(true, target).unwrap()), 1, "restore --staged {}", target);
+        }
+    }
 }
