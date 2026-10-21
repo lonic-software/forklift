@@ -3862,8 +3862,9 @@ fn prepare_target(target: &PackTarget,
 /// A pack is *completely* salvaged when the walk covered its whole data body with no gap, every
 /// record decoded and was stored (none refused by the object ceilings, which salvage never
 /// bypasses), as many records decoded as the index header counts, and every decoded object now
-/// reads verified through the uncached classified read. Its data file then holds nothing that is
-/// not readable elsewhere, so a hash outside its raw record table was never in it: the returned
+/// reads verified through the uncached classified read. Every record its data file holds then has
+/// a copy outside it, or is one of its sound-bucket records the drop gate probes before the pack
+/// goes, so a hash outside its raw record table was never in it: the returned
 /// guard registers that exoneration for [`sweep_unreadable_reason`] for as long as it lives. It
 /// registers every other damaged pack as incompletely salvaged, so a corrupt-bucket error naming
 /// one says that salvage could not recover it.
@@ -3944,7 +3945,7 @@ impl<'a> PackSalvage<'a> {
         let mut waiting = Vec::new();
 
         for record in std::mem::take(&mut self.pending) {
-            match decode_salvaged_record(record) {
+            match decode_salvaged_record(record)? {
                 SalvagedRecord::Decoded(bytes) => {
                     progress = true;
                     let hash = object_utils::hash_object_bytes(&bytes);
@@ -4008,7 +4009,7 @@ fn walk_pack_records(data: &[u8], resync: &[u64]) -> (Vec<std::ops::Range<usize>
         }
 
         gap = true;
-        match resync.iter().find(|&&offset| offset as usize > at) {
+        match resync.get(resync.partition_point(|&offset| offset as usize <= at)) {
             Some(&offset) => at = offset as usize,
             None => break,
         }
@@ -4049,23 +4050,30 @@ enum SalvagedRecord {
 
 /// Decode a record [`walk_pack_records`] found. The bytes are as untrusted as a damaged pack's
 /// are, so a full record decodes under the bounded decoder and a delta under its own target
-/// ceiling; a delta's base is read through the ordinary verified read.
-fn decode_salvaged_record(record: &[u8]) -> SalvagedRecord {
+/// ceiling; a delta's base is read through the uncached classified read.
+///
+/// # Returns
+/// * `Ok(record)`  - What decoding gave; a base with no copy that reads verified (yet) is
+///   `BaseUnreadable`.
+/// * `Err(String)` - The store could not be consulted for the base: never taken as the base being
+///   unreadable, which would rule the pack's salvage incomplete on an unknown.
+fn decode_salvaged_record(record: &[u8]) -> Result<SalvagedRecord, String> {
     let Some((&kind, body)) = record.split_first() else {
-        return SalvagedRecord::Undecodable;
+        return Ok(SalvagedRecord::Undecodable);
     };
 
-    match kind {
+    Ok(match kind {
         RECORD_FULL => match object_utils::decode_object_bounded(body) {
             Ok(bytes) => SalvagedRecord::Decoded(bytes),
             Err(_) => SalvagedRecord::Undecodable,
         },
         RECORD_DELTA if body.len() >= HASH_LEN => {
             let Ok((target_len, read)) = byte_utils::number_from_vlq_bytes(HASH_LEN, body) else {
-                return SalvagedRecord::Undecodable;
+                return Ok(SalvagedRecord::Undecodable);
             };
-            let Ok(base) = file_utils::retrieve_object_by_hash_shared(&sign_utils::to_hex(&body[..HASH_LEN])) else {
-                return SalvagedRecord::BaseUnreadable;
+            let base = match file_utils::read_object_classified(&sign_utils::to_hex(&body[..HASH_LEN]))? {
+                file_utils::StoreReadOutcome::Verified(base) => base,
+                _ => return Ok(SalvagedRecord::BaseUnreadable),
             };
             match delta_utils::decompress_delta(&base, &body[HASH_LEN + read..], target_len as usize) {
                 Ok(bytes) => SalvagedRecord::Decoded(bytes),
@@ -4073,7 +4081,7 @@ fn decode_salvaged_record(record: &[u8]) -> SalvagedRecord {
             }
         }
         _ => SalvagedRecord::Undecodable,
-    }
+    })
 }
 
 /// The result of [`collect_targets`]: what to pack, what a repack supersedes, and the packs a
@@ -4357,6 +4365,8 @@ fn collect_damaged_pack(
             continue;
         }
 
+        // The selected copy is unproven and the verified read above may have been served by this
+        // pack, which is about to go: reconstruct from a verified read rather than trust it.
         if let Some(&existing_index) = seen.get(&hash) {
             let loose_source = match &targets[existing_index].source {
                 Source::Reconstruct { .. } => continue,
