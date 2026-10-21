@@ -129,6 +129,16 @@ jobs:
         if: env.SKIP_TESTS != 'true'
         run: cargo build --verbose
 
+      - name: Test build timings (EXPERIMENT, FORK-225)
+        if: env.SKIP_TESTS != 'true'
+        run: cargo test --workspace --no-run --timings
+
+      - uses: actions/upload-artifact@v4
+        if: env.SKIP_TESTS != 'true'
+        with:
+          name: cargo-timings-${{ runner.os }}
+          path: target/cargo-timings/cargo-timing.html
+
       # nextest runs every test in its own process and the test binaries in parallel, so one
       # slow binary no longer holds up the rest.
       - name: Test
