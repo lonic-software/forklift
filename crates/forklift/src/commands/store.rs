@@ -47,8 +47,9 @@ pub(crate) struct StoreReport {
     /// durability taint, and restoring the data file recovers the rest. Empty on a healthy store.
     quarantined_packs: Vec<PackIndexIssue>,
     /// Packs that load but whose index is damaged in places: their sound parts are still read,
-    /// and an object in a damaged part reads as unverifiable until it is stored again. Empty on a
-    /// healthy store.
+    /// and an object in a damaged part reads as unverifiable. `forklift compact --all` salvages
+    /// what the pack's data file still holds, and removes the pack when every live object it may
+    /// hold reads from another copy. Empty on a healthy store.
     damaged_packs: Vec<PackIndexIssue>,
     /// Pack index files that could not even be parsed — move the file aside and
     /// re-run. Empty on a healthy store.
@@ -208,8 +209,10 @@ impl CommandOutput for StoreReport {
             }
             println!(
                 "    quarantined objects are recoverable via \"forklift heal\"; a damaged pack's \
-                sound parts are still read, and an object in a damaged part reads as unverifiable \
-                until it is stored again; an unenumerable index should be moved aside, then re-run; \
+                sound parts are still read, and \"forklift compact --all\" salvages it, recovering \
+                what its data file still holds (if it keeps the pack, or refuses because the pack \
+                could not be completely salvaged, the objects it reports cannot be recovered from \
+                this store); an unenumerable index should be moved aside, then re-run; \
                 an index of another format means re-creating the warehouse with this build (moving \
                 it aside would make its objects read as missing)."
             );

@@ -1151,7 +1151,10 @@ pub(crate) mod tests {
             let child_pack = pack_alone(&f.web_blob);
             pack_as_unreadable(&f.web_tree, how);
 
-            let result = pack_utils::compact(true, false, &crate::util::progress_utils::Progress::NONE);
+            // Without salvage, as auto-maintenance repacks: salvage would recover a corrupt-bucket
+            // tree whose data is intact, and this hazard is the walk's. A refusal salvage could not
+            // prevent is covered beside the salvage tests in `pack_utils`.
+            let result = pack_utils::compact(true, false, false, &crate::util::progress_utils::Progress::NONE);
 
             if !file_utils::does_object_exist(&f.web_blob).unwrap() {
                 return Some(format!("{:?}: compact --all lost {}, a child of the unreadable tree", how, f.web_blob));

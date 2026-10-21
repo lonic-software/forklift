@@ -9399,6 +9399,61 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
     );
 }
 
+/// (FORK-194) A pack whose index has a corrupt bucket but whose data is intact: `store` lists it as
+/// damaged and names `forklift compact --all` as the remedy, saying what a kept pack or a refusal
+/// means; `compact --all` salvages it, lists it as dropped in `--json`, and the history still
+/// reads in full.
+#[test]
+fn compact_all_salvages_a_pack_with_a_corrupt_index_bucket() {
+    let warehouse = TestWarehouse::new("salvage-damaged-pack");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    for v in 0..3 {
+        warehouse.write_file("f.txt", &format!("salvaged content {}\n", v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+    }
+    assert_success(&warehouse.run(&["compact"]));
+
+    // Flip one bit of the first record's offset: its bucket's crc fails, the header and fanout
+    // table still parse, and the data file is untouched. The layout: a 24-byte header whose byte
+    // 16 holds the fanout bits, 8 bytes per fanout entry, then 48-byte records (hash, offset,
+    // length).
+    let objects = warehouse.root.join(".forklift/objects");
+    let index_path = std::fs::read_dir(objects.join("pack")).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|x| x == "idx"))
+        .unwrap();
+    let mut index = std::fs::read(&index_path).unwrap();
+    let first_record = 24 + 8 * (1usize << index[16]);
+    index[first_record + 32] ^= 0x01;
+    std::fs::write(&index_path, &index).unwrap();
+    let index_name = index_path.file_name().unwrap().to_string_lossy().to_string();
+
+    let store = warehouse.run(&["store"]);
+    assert_success(&store);
+    let text = stdout(&store);
+    assert!(text.contains("damaged:") && text.contains(&index_name), "{}", text);
+    assert!(text.contains("\"forklift compact --all\" salvages it"), "{}", text);
+    assert!(text.contains("refuses because the pack could not be completely salvaged"), "{}", text);
+    assert_eq!(json(&warehouse.run(&["--json", "store"]))["data"]["damaged_packs"].as_array().unwrap().len(), 1);
+
+    let repack = warehouse.run(&["--json", "compact", "--all"]);
+    assert_success(&repack);
+    let dropped = json(&repack)["data"]["damaged_packs_dropped"].as_array().unwrap().clone();
+    assert_eq!(dropped.len(), 1, "{:?}", dropped);
+    assert!(dropped[0].as_str().unwrap().contains(&index_name), "{:?}", dropped);
+    assert!(json(&repack)["data"]["damaged_packs_kept"].as_array().unwrap().is_empty());
+    // The repack's own pack may take the same content-derived name, but never the damaged bytes.
+    assert_ne!(std::fs::read(&index_path).ok(), Some(index), "the salvaged pack must be removed");
+
+    assert!(json(&warehouse.run(&["--json", "store"]))["data"]["damaged_packs"].as_array().unwrap().is_empty());
+    assert_eq!(
+        json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
+        3, "every parcel must survive the salvage"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // `compact --all --redelta`: the opt-in densification pass. Cross-path similarity (renames,
 // moved files) that a per-object copy structurally cannot see.

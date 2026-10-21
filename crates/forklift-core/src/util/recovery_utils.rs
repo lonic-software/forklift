@@ -447,7 +447,11 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
     for (index_path, error) in &snapshot.damaged {
         lines.push(format!(
             "pack index \"{}\" is damaged ({}); its sound parts are still read, but an object in a \
-            damaged part reads as unverifiable until it is stored again",
+            damaged part reads as unverifiable; once no durability taint is standing, \
+            \"forklift compact --all\" salvages what the pack's data file still holds and removes \
+            the pack when every live object it may hold reads from another copy; if it keeps the \
+            pack, or refuses because the pack could not be completely salvaged, the objects it \
+            reports cannot be recovered from this store",
             index_path.to_string_lossy(), error
         ));
     }
@@ -5898,7 +5902,7 @@ mod tests {
         // (`collect_targets` only calls `collect_live_set` under `all` — an incremental compact
         // never repacks against the live set at all, so it would not exercise this fail-closed
         // path). This is `compact --all`'s own fail-closed check, unweakened by this fix.
-        let compact_all_result = pack_utils::compact(true, false, &Progress::NONE);
+        let compact_all_result = pack_utils::compact(true, false, true, &Progress::NONE);
         assert!(compact_all_result.is_err(),
             "compact --all must still fail closed on an unreadable bay's parked file");
 
@@ -6681,6 +6685,32 @@ mod tests {
         assert!(!a.contains(&format!("{:064x}", MAX_NAMED_DANGLING)) && a.ends_with(" and 4 more."), "{}", a);
         let b = notes.iter().find(|note| note.contains("b.idx")).unwrap();
         assert!(b.starts_with("1 object(s)") && b.ends_with(&format!("\"{}\".", "f".repeat(64))), "{}", b);
+    }
+
+    /// (FORK-194) The warning for a damaged pack names `forklift compact --all` as the repack that
+    /// salvages it, and says what it means when that repack keeps the pack or refuses.
+    ///
+    /// Revert: restore the wording that named no salvage → red.
+    #[test]
+    fn the_damaged_pack_warning_names_the_salvaging_repack() {
+        use crate::globals::StorageRootScope;
+        use crate::util::gc_utils::tests::store_chunk;
+        use crate::util::pack_utils::tests::{pack_as_unreadable, Unreadable};
+
+        let dir = unreadable_scratch("damaged-pack-warning", Unreadable::CorruptBucket);
+        let lines = {
+            let _scope = StorageRootScope::enter(&dir);
+            let chunk = store_chunk(b"a chunk in a damaged pack");
+            pack_as_unreadable(&chunk, Unreadable::CorruptBucket);
+            pack_health_warning_lines().unwrap()
+        };
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert!(lines[0].contains("is damaged"), "{}", lines[0]);
+        assert!(lines[0].contains("\"forklift compact --all\" salvages what the pack's data file still holds"), "{}", lines[0]);
+        assert!(lines[0].contains("refuses because the pack could not be completely salvaged"), "{}", lines[0]);
+        assert!(lines[0].contains("cannot be recovered from this store"), "{}", lines[0]);
     }
 
     /// Mutation: in `drain_parcel_queue`, read `Descent::Unwalkable` as `Absent` → the head parcel

@@ -766,8 +766,10 @@ pub fn store_object_bytes(claimed_hash: &str, bytes: &[u8]) -> Result<bool, Stri
 /// A sibling entry point, not a flag on [`store_object_bytes`] itself: every existing caller of
 /// that function keeps its current dedup-on-presence behavior unchanged.
 ///
-/// This exists for exactly one caller: the D4 corrupt-candidate refetch (DESIGN.html §3.1.1,
-/// [`remote_utils::fetch_corrupt_replacements`](crate::util::remote_utils::fetch_corrupt_replacements)).
+/// This exists for two callers. The D4 corrupt-candidate refetch (DESIGN.html §3.1.1,
+/// [`remote_utils::fetch_corrupt_replacements`](crate::util::remote_utils::fetch_corrupt_replacements)),
+/// and a full repack's salvage of a damaged pack (FORK-194), which writes a recovered object over
+/// an unreadable copy the presence gate would count as present.
 /// A corrupt loose dentry is never deleted before its replacement is fetched — deleting it would
 /// create a window with no copy at all if the fetch then failed. Instead, once a verified good
 /// copy is in hand, this function's call into [`file_utils::write_object_to_file`] (→

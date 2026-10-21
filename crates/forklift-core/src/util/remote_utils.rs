@@ -8428,7 +8428,7 @@ mod tests {
             std::path::Path::new(&resident_folder), &resident_file_name,
             zstd::encode_all(pack_resident_content.as_slice(), 0).unwrap()
         ).unwrap();
-        let stats = pack_utils::compact(false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
+        let stats = pack_utils::compact(false, false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
         assert_eq!(stats.objects_packed, 1, "the fixture object must actually land in a pack");
         assert!(pack_utils::is_in_packs(&pack_resident_hash).unwrap(), "fixture precondition: packed");
         let (pack_folder, pack_file_name) = file_utils::get_path_for_object(&pack_resident_hash).unwrap();

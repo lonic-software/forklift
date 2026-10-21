@@ -64,8 +64,8 @@ pub fn run_if_due() {
     };
 
     let result = match action {
-        AutoCompaction::Incremental => pack_utils::compact(false, false, &Progress::NONE).map(|_| ()),
-        AutoCompaction::Repack => pack_utils::compact(true, false, &Progress::NONE).map(|_| ()),
+        AutoCompaction::Incremental => pack_utils::compact(false, false, false, &Progress::NONE).map(|_| ()),
+        AutoCompaction::Repack => pack_utils::compact(true, false, false, &Progress::NONE).map(|_| ()),
         AutoCompaction::None => return,
     };
 
