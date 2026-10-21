@@ -81,27 +81,27 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
 /// * `Ok(())`      - If the name is a valid bay name.
 /// * `Err(String)` - Why it is not.
 pub fn validate_bay_name(name: &str) -> Result<(), String> {
-    pallet_utils::validate_pallet_name(name)?;
-
+    // Checked first, so the pallet grammar's lowercase hint never suggests a name that is still
+    // not a bay name.
     if name.contains('/') {
         return Err(format!(
             "\"{}\" is not a valid bay name: a bay name is one folder, so it must not contain \"/\"", name
         ));
     }
 
-    Ok(())
+    pallet_utils::validate_pallet_name(name)
 }
 
 /// The `forklift bay remove` command line that addresses the bay folder `name` exactly, quoted so
-/// it can be pasted into a shell, or `None` when no command line can: `bay remove` refuses a name
-/// ending in "." or a space (see [`is_listed_bay`]), and a name holding a quote or a control
-/// character has no safe spelling here.
+/// it can be pasted into a shell, or `None` when no command line can: `bay remove` matches one
+/// listed folder, so never a name holding "/", and refuses a name ending in "." or a space (see
+/// [`is_listed_bay`]); a name holding a quote or a control character has no safe spelling here.
 pub fn remove_command(name: &str) -> Option<String> {
-    if name.is_empty() || name.ends_with('.') || name.ends_with(' ') {
+    if name.is_empty() || name.contains('/') || name.ends_with('.') || name.ends_with(' ') {
         return None;
     }
 
-    let word = if name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')) {
+    let word = if name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
         name.to_string()
     } else if name.chars().any(|c| c == '\'' || c == '"' || c.is_control()) {
         return None;
@@ -610,6 +610,9 @@ mod tests {
 
         let error = validate_bay_name("feature/x").unwrap_err();
         assert!(error.contains("must not contain \"/\""), "{}", error);
+        let error = validate_bay_name("Feature/X").unwrap_err();
+        assert!(error.contains("not a valid bay name") && !error.contains("lowercase"),
+            "no hint toward a name that is still refused: {}", error);
         assert!(validate_bay_name("Review").unwrap_err().contains("is not a valid pallet name"));
     }
 
@@ -622,7 +625,7 @@ mod tests {
         assert_eq!(remove_command("a$b;c").as_deref(), Some("forklift bay remove 'a$b;c'"));
         assert_eq!(remove_command("-x").as_deref(), Some("forklift bay remove -- -x"));
 
-        for name in ["", "b1.", "b1 ", "it's", "say\"hi\"", "tab\there"] {
+        for name in ["", "b1.", "b1 ", "it's", "say\"hi\"", "tab\there", "feature/x"] {
             assert_eq!(remove_command(name), None, "{:?}", name);
         }
     }
