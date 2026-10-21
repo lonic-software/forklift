@@ -585,7 +585,7 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 /// staged in a ref folder is never a pallet name: litter a killed write leaves there cannot list
 /// as a pallet, and no pallet's ref file can be the temp a write to its sibling opens and renames
 /// away. `~` has no case, so no case-folding volume aliases it onto a valid name either. The
-/// `.tmp` the object-store readers match on is kept. [`is_staged_temp_name`] recognises exactly
+/// `.tmp` the object-store readers match on is kept. [`staged_temp_base`] recognises exactly
 /// this form.
 pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
     static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -603,18 +603,16 @@ pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
 /// What [`temp_path_for`] puts between a file's name and its `<pid>-<n>` suffix.
 const TEMP_INFIX: &str = ".tmp~";
 
-/// Whether `file_name` (one path component) is a temp [`temp_path_for`] names: a non-empty base,
-/// then `.tmp~<digits>-<digits>`. A ref-folder listing skips exactly these: the file may be the
-/// temp of a write in flight in another process, and it is never a pallet.
-pub(crate) fn is_staged_temp_name(file_name: &str) -> bool {
+/// The file name a temp [`temp_path_for`] names stands in for, if `file_name` (one path component)
+/// is one: a non-empty base, then `.tmp~<digits>-<digits>`. A name with folders before it
+/// yields the base with them. The pallet listing skips a temp whose
+/// base is a valid ref name: the file may be the temp of a write in flight in another process,
+/// and it is never a pallet.
+pub(crate) fn staged_temp_base(file_name: &str) -> Option<&str> {
     let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    match file_name.rsplit_once(TEMP_INFIX) {
-        Some((base, suffix)) if !base.is_empty() => matches!(
-            suffix.split_once('-'),
-            Some((pid, write_id)) if all_digits(pid) && all_digits(write_id)
-        ),
-        _ => false,
-    }
+    let (base, suffix) = file_name.rsplit_once(TEMP_INFIX)?;
+    let (pid, write_id) = suffix.split_once('-')?;
+    (!base.is_empty() && all_digits(pid) && all_digits(write_id)).then_some(base)
 }
 
 /// Create a fresh temporary file for replacing `file_path`, opened `create_new`, with names drawn
