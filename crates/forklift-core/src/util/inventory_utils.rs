@@ -5145,13 +5145,9 @@ mod tests {
         let metadata = file_utils::get_inventory_metadata_path();
         let outside = scratch.root.join("other-metadata");
         std::fs::rename(&metadata, &outside).unwrap();
-        std::fs::write(&outside, "/forklift-inventory-metadata 999\n").unwrap();
         link_to(&outside, &metadata, false);
 
-        // Not even the format-version gate opens it, so the refusal names the link, not a version.
-        let store_root = file_utils::get_inventory_store_root();
         let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
-        assert!(store_root.is_ok(), "{store_root:?}");
         assert!(error.contains("is not a file (a link is never followed)") && error.contains("restore --staged ."), "{error}");
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).
@@ -5159,6 +5155,26 @@ mod tests {
         replace_subtree_inventories("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
         update_shard("a/b", add_new_txt).unwrap();
         assert_eq!(registered_names("a/b"), ["new.txt"]);
+    }
+
+    /// The format-version gate never opens a linked metadata file, so what is refused is the link,
+    /// not the version of whatever it points at. The gate runs once per inventory root, so nothing
+    /// may reach a shard path before the link is in place.
+    #[test]
+    fn the_format_version_gate_never_opens_a_linked_metadata_file() {
+        let scratch = Scratch::new("gate-linked-metadata");
+
+        let metadata = file_utils::get_inventory_metadata_path();
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        let outside = scratch.root.join("other-version-metadata");
+        std::fs::write(&outside, "/forklift-inventory-metadata 999\n").unwrap();
+        link_to(&outside, &metadata, false);
+
+        let store_root = file_utils::get_inventory_store_root();
+        let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
+
+        assert!(store_root.is_ok(), "{store_root:?}");
+        assert!(error.contains("is not a file (a link is never followed)"), "{error}");
     }
 
     fn link_to(target: &Path, link: &Path, is_dir: bool) {
