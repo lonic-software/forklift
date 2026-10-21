@@ -12165,16 +12165,28 @@ fn a_bay_without_a_position_still_lists() {
     assert!(stdout(&listed).contains("b1"), "{}", stdout(&listed));
 }
 
-/// A git repo at `dir` with one commit on `main` and a branch per name in `branches`.
+/// A git repo at `dir` with one commit on `main` and a branch per name in `branches`. The branches
+/// are written to `packed-refs`, never as loose ref files, so any name git allows can be made on
+/// any host: Windows cannot create a file named `con`, and a case-folding disk cannot hold both
+/// `ab` and `AB/x` as files.
 fn git_repo_with_branches(dir: &std::path::Path, branches: &[&str]) {
     std::fs::create_dir_all(dir).unwrap();
     git_in(dir, &["init", "-q", "-b", "main"]);
     std::fs::write(dir.join("a.txt"), "a\n").unwrap();
     git_in(dir, &["add", "-A"]);
     git_in(dir, &["commit", "-qm", "first"]);
-    for branch in branches {
-        git_in(dir, &["branch", branch]);
-    }
+    git_in(dir, &["pack-refs", "--all"]);
+
+    let head = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap();
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+    // The file declares itself sorted (git binary-searches it), so it is kept sorted by ref name.
+    let packed = std::fs::read_to_string(dir.join(".git").join("packed-refs")).unwrap();
+    let (header, refs): (Vec<&str>, Vec<&str>) = packed.lines().partition(|line| line.starts_with('#'));
+    let mut refs: Vec<String> = refs.iter().map(|line| line.to_string()).collect();
+    refs.extend(branches.iter().map(|branch| format!("{} refs/heads/{}", head, branch)));
+    refs.sort_by(|a, b| a.split(' ').nth(1).cmp(&b.split(' ').nth(1)));
+    let lines: Vec<String> = header.iter().map(|line| line.to_string()).chain(refs).collect();
+    std::fs::write(dir.join(".git").join("packed-refs"), format!("{}\n", lines.join("\n"))).unwrap();
 }
 
 /// import-git maps and checks every branch before converting anything: a branch that maps outside
