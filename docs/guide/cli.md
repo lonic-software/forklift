@@ -1101,8 +1101,17 @@ lock: N bays, N pallets, one warehouse. `bay add <name>` checks out a new pallet
 after the bay (branched from the current head) into a fresh directory (default: a sibling
 of the warehouse); `cd` into it and it behaves like any warehouse — `load`, `stack`, `lift`
 all operate on the bay's pallet against the shared object store. The bay's directory holds
-a `.forklift` *file* (a redirect back to the warehouse), and its local state lives under
-`.forklift/bays/<name>/`.
+its own `.forklift` folder, whose `redirect` file names the warehouse back, and its local state
+lives under the warehouse's `.forklift/bays/<name>/`. That folder sits on the bay's own volume,
+so the probes that learn how a volume stamps file times and keeps the executable bit measure
+the bay's volume even when the warehouse lives on another one. `prepare` in a bay's directory
+refuses rather than turn it into a warehouse.
+
+A bay made by an older version of Forklift has a `.forklift` *file* instead, which is refused,
+naming the conversion: create a folder `.forklift.new`, move the `.forklift` file into it as
+`redirect`, then rename `.forklift.new` to `.forklift`. `bay remove` first moves the bay's
+`.forklift` folder aside, which is the step that ends the bay; if that fails, the bay is kept
+and the error says why.
 
 A bay name follows the pallet-name rules (see `palletize`) and is one folder, so it has no `/`.
 `bay remove <name>` matches the
@@ -1111,7 +1120,8 @@ the rules refuse (one an older version created), and it never treats `.`, `..` o
 bay. `bay list` refuses a bay folder whose name breaks the rules, and a bay whose position
 cannot be read, naming it, instead of listing it; for a folder it gives the `bay remove` command
 that removes it. A command run inside a bay whose redirect names a bay outside the rules refuses
-too, naming the redirect file: remove the bay from the warehouse, or delete that file.
+too, naming the bay's `.forklift` folder: remove the bay from the warehouse, or delete that
+folder.
 
 Because the refs are shared, two bays can reach for the same pallet — say both are on `main`.
 Each bay records the parcel its files stand on. When another bay stacks on the pallet, this bay
