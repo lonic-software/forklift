@@ -1766,6 +1766,12 @@ refusal before ever reaching its own fetch):
   Re-run once the named source is fixed. A run that has nothing to look up — every recorded entry
   resolved on its own, so no reachability question was ever asked — clears without consulting
   these sources at all, and so never reports on them.
+- **An object the check walks through could not be read** — one that only a damaged pack index
+  might hold (its data file missing, a corrupt part of the index, another format version, or an
+  index that does not parse). What that object references is unknown, so `heal` keeps the taint
+  on everything it could not confirm is safe to drop, naming the object and the index. Restore the
+  index's pack, or move a stray index out of the pack folder if it holds nothing this warehouse
+  needs, then re-run `heal`.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of
@@ -1778,9 +1784,9 @@ index's objects are left recoverable (`heal` can refetch them); a damaged pack s
 sound parts; an index of another format means re-creating the warehouse; an unenumerable one names
 the file to move aside. This appears even when `heal` still has to refuse
 on an unrelated dangling reference — as a clearly-separated "Pack index problems (unrelated to
-this refusal, clear them separately)" section, never as though it were the cause of the refusal —
-since a broken pack index is inert on its own and the only time it coincides with a refusal is
-exactly when an operator most needs to be told about it.
+this refusal, clear them separately)" section. An index the refusal itself names (see the bullet
+above) is part of its cause; any other listed there is unrelated, and the only time it coincides
+with a refusal is exactly when an operator most needs to be told about it.
 
 ---
 

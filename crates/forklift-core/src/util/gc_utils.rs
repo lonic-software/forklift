@@ -377,14 +377,14 @@ pub(crate) mod tests {
     }
 
     /// Store a blob and return its hash.
-    fn store_blob(content: &str) -> String {
+    pub(crate) fn store_blob(content: &str) -> String {
         let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
         object.store().unwrap();
         object.hash
     }
 
     /// Store a chunk object and return its hash.
-    fn store_chunk(content: &[u8]) -> String {
+    pub(crate) fn store_chunk(content: &[u8]) -> String {
         use crate::model::chunk::Chunk;
         let mut object = LooseObjectBuilder::build_chunk(&Chunk { content: content.to_vec() });
         object.store().unwrap();
@@ -393,7 +393,7 @@ pub(crate) mod tests {
 
     /// Store a recipe over the given chunks (its `total_size` is the sum of the sizes, so it
     /// passes the structural check at load) and return its hash.
-    fn store_recipe(chunks: &[(String, u64)]) -> String {
+    pub(crate) fn store_recipe(chunks: &[(String, u64)]) -> String {
         use crate::model::recipe::{Recipe, RecipeChunk};
         let total_size = chunks.iter().map(|(_, size)| *size).sum();
         let recipe = Recipe {
@@ -408,7 +408,7 @@ pub(crate) mod tests {
     }
 
     /// Build a one-level tree from `(name, hash, type)` entries, store it, return its hash.
-    fn store_tree(entries: &[(&str, &str, DirEntryType)]) -> String {
+    pub(crate) fn store_tree(entries: &[(&str, &str, DirEntryType)]) -> String {
         let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         for (name, hash, item_type) in entries {
             tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *item_type));
@@ -419,7 +419,7 @@ pub(crate) mod tests {
     }
 
     /// Store a parentless parcel over `tree_hash` and point `main` at it. Returns its hash.
-    fn store_root_parcel(tree_hash: &str) -> String {
+    pub(crate) fn store_root_parcel(tree_hash: &str) -> String {
         let parcel = Parcel {
             tree_hash: tree_hash.to_string(),
             parents: Vec::new(),
