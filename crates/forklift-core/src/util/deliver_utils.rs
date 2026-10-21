@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 use chrono::Utc;
+use crate::error::{CoreError, RefusalCode};
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::parcel_action_type::ParcelActionType;
 use crate::model::operator::Operator;
@@ -256,11 +257,15 @@ fn ensure_target_covered(target: &str,
         }
     }
 
-    Err(format!(
-        "\"{target}\" holds changes \"{source}\" has not seen, and delivering would undo them. \
-        Consolidate \"{target}\" into \"{source}\" first (\"forklift consolidate {target}\"), \
-        then deliver."
-    ))
+    Err(CoreError::refusal(
+        RefusalCode::TargetNotCovered,
+        format!(
+            "\"{target}\" holds changes \"{source}\" has not seen, and delivering would undo them. \
+            Consolidate \"{target}\" into \"{source}\" first (\"forklift consolidate {target}\"), \
+            then deliver."
+        ),
+        format!("forklift consolidate {target}"),
+    ).into())
 }
 
 /// The distinct authors of the trail parcels, in first-seen order (by identifier). Falls

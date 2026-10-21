@@ -4715,19 +4715,33 @@ async fn lift_pallet_inner(client: &RemoteClient,
 
     if let Some(remote_head) = remote_head {
         if !file_utils::does_object_exist(remote_head)? {
-            return Err(format!(
+            return Err(pallet_utils::remote_ahead_refusal(format!(
                 "The remote's pallet \"{}\" has parcels this warehouse does not know \
                 (head {}). \"lower\" first.",
                 pallet, remote_head
-            ));
+            )).into());
         }
 
         if !adopted_reset && !merge_utils::is_ancestor(remote_head, local_head)? {
-            return Err(format!(
-                "The local pallet \"{}\" and the remote have diverged. \"lower\" the \
-                remote parcels and consolidate before lifting.",
-                pallet
-            ));
+            // Known locally but not lowered: the remote is ahead when it already holds everything
+            // here, and diverged otherwise. The walk runs through the remote's history, which may
+            // be only partly here (a head fetched before its ancestors) — or a local object may be
+            // unreadable. The two cannot be told apart, so a walk that cannot finish classifies
+            // nothing: it says what it could not decide, and that lowering brings the history in.
+            return Err(match merge_utils::is_ancestor(local_head, remote_head) {
+                Ok(true) => pallet_utils::remote_ahead_refusal(format!(
+                    "The remote's pallet \"{}\" is ahead of this warehouse's (head {}). \"lower\" \
+                    first.",
+                    pallet, remote_head
+                )),
+                Ok(false) => diverged_refusal(pallet, remote_head),
+                Err(e) => CoreError::Other(format!(
+                    "Could not tell whether the remote's pallet \"{}\" (head {}) is ahead of this \
+                    warehouse's or diverged from it: {}. \"lower\" brings in the remote's history, \
+                    if that is what is missing.",
+                    pallet, remote_head, e
+                )),
+            }.into());
         }
     }
 
@@ -4742,6 +4756,51 @@ async fn lift_pallet_inner(client: &RemoteClient,
         uploaded_signatures,
         old_head: remote_head.map(|hash| hash.to_string()),
     }))
+}
+
+/// The [`RefusalCode::Diverged`] refusal for `pallet` (its wire name), whose local head and the
+/// remote's `remote_head` both hold parcels the other lacks; the remote's are already local. A
+/// working pallet merges the remote head in through a pallet of its own, which `lower` refuses to
+/// do implicitly; a meta pallet with replay rules is reconciled by `lower` itself. The office and
+/// any other meta pallet have no merge, so theirs is an unclassified error: no command fixes it.
+pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
+    let short = &remote_head[..12.min(remote_head.len())];
+
+    if let Some(name) = pallet.strip_prefix(pallet_utils::META_QUALIFIER) {
+        if meta_tree::meta_rules(name).is_none() {
+            return CoreError::Other(format!(
+                "The local pallet \"{}\" and the remote have diverged, and it has no automatic \
+                merge: reconcile the two histories by hand before lifting.",
+                pallet
+            ));
+        }
+
+        return CoreError::refusal(
+            RefusalCode::Diverged,
+            format!(
+                "The local pallet \"{}\" and the remote have diverged. \"lower\" reconciles it; \
+                then lift again.",
+                pallet
+            ),
+            "forklift lower",
+        );
+    }
+
+    CoreError::refusal(
+        RefusalCode::Diverged,
+        format!(
+            "The local pallet \"{p}\" and the remote have diverged. The remote parcels are \
+            fetched; palletize the remote head into its own pallet (\"palletize {p}-remote-{s} {s}\", \
+            which moves this bay onto it), shift back (\"shift {p}\"), consolidate it \
+            (\"consolidate {p}-remote-{s}\"), and lift the result.",
+            p = pallet, s = short
+        ),
+        format!(
+            "forklift palletize {p}-remote-{s} {s}; then forklift shift {p}; then forklift \
+            consolidate {p}-remote-{s}; then forklift lift",
+            p = pallet, s = short
+        ),
+    )
 }
 
 /// Upload the history `local_head` reaches and the remote does not — every parcel past
@@ -6198,6 +6257,22 @@ pub async fn resolve_office_display_names() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Revert: drop the no-rules arm of `diverged_refusal` → "@office" is classified, its remedy
+    // "lower", which refuses it.
+    #[test]
+    fn only_a_pallet_with_a_merge_classifies_its_divergence() {
+        let head = "a".repeat(64);
+        let code = |pallet: &str| match diverged_refusal(pallet, &head) {
+            CoreError::Refusal { code, next_step, .. } => Some((code, next_step)),
+            CoreError::Other(_) => None,
+        };
+
+        assert_eq!(code("@office"), None);
+        assert_eq!(code("@kv"), Some((RefusalCode::Diverged, "forklift lower".to_string())));
+        assert!(code("main").is_some_and(|(code, step)| code == RefusalCode::Diverged
+            && step.starts_with("forklift palletize main-remote-aaaaaaaaaaaa aaaaaaaaaaaa; then forklift shift main;")));
+    }
     use std::path::PathBuf;
     use std::sync::Mutex;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;

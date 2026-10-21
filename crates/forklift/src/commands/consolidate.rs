@@ -371,10 +371,10 @@ pub(crate) async fn stack_completion(description: Option<String>,
             merge_utils::OutOfScopeSkeleton::clear()?;
             cherry_pick_utils::clear_state()?;
 
-            Err(format!(
-                "{} Nothing was changed: the working tree and inventory are back at the pallet's \
+            Err(forklift_core::error::append_to_message(
+                error,
+                "Nothing was changed: the working tree and inventory are back at the pallet's \
                 previous head, and nothing is left in progress.",
-                error
             ))
         }
     }

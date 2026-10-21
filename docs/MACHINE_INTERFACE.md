@@ -386,6 +386,22 @@ A first-contact adoption is not a refusal: the command succeeds, reports the gen
 `data.adopted_genesis`, and writes a `trust_adopted` warning (below) with the same `details`
 shape, `what_changed: "first_contact"` and no `previous`.
 
+### Catching up: `behind`, `remote_ahead`, `diverged`, `target_not_covered`
+
+Four codes name what has to be caught up with before an operation can go through. The code names
+the condition; `next_step` describes the remedy at this site, so an agent branches on the code
+and follows the step.
+
+| code | exit | condition | `next_step` |
+|---|---|---|---|
+| `behind` | 26 | this bay's base is behind its pallet's head: another bay or process moved the pallet. Raised by every command that moves the bay's pallet (`stack`, `deliver`, `consolidate`, `cherry-pick`, `haul merge`, `lower`, `lift`'s auto-merge, a consolidation's completion) | `forklift shift <pallet>`; a refusal mid-merge names aborting the merge first |
+| `remote_ahead` | 28 | the remote's pallet holds parcels this warehouse has not lowered: its head is unknown here, descends from the local head, or moved since this client read it (the `409` of a ref update). It does not promise this side holds nothing new; `lower` then fast-forwards or reports `diverged` | `forklift lower` |
+| `diverged` | 5 | the local pallet and the remote's each hold parcels the other lacks. `lower` never merges them; `lift` reports it when it did not auto-merge (an overlap, an unclean warehouse, or its retry bound) | for a working pallet: palletize the remote head (as `<pallet>-remote-<short hash>`, unique per remote head), shift back, consolidate it, lift; for a meta pallet with replay rules: `forklift lower`. The office and other meta pallets diverge as an unclassified error, reconciled by hand |
+| `target_not_covered` | 27 | `deliver` would undo changes on the target that the draft never consolidated | `forklift consolidate <target>` |
+
+`diverged` used to be described as a remote ref moving under a lift. That case is now
+`remote_ahead`, and `diverged` means only a true divergence.
+
 ### Custom metadata that changed on both sides: `meta_conflict`
 
 `lower` reconciles a diverged `@kv` path by path: changes to different keys replay onto the

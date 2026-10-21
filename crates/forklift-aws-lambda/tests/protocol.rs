@@ -299,6 +299,9 @@ fn untrusted_lift_and_the_cas_guards() {
     // A replay with the same `old_head: None` now conflicts (the pallet exists).
     let err = head.ref_update("main", &request).expect_err("stale replay");
     assert_eq!(err.status, Status::Conflict);
+    // Framed, so the entrypoint threads the code onto the wire for the client to branch on.
+    let (code, _, next_step) = forklift_core::error::deframe(&err.message).expect("a classified refusal");
+    assert_eq!((code, next_step), ("remote_ahead", "forklift lower"), "{}", err.message);
 
     // A stale `old_head` conflicts too.
     let stale = RefUpdateRequest {
@@ -2077,6 +2080,8 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
         })
         .expect_err("the office moved between the audit and the commit");
     assert_eq!(err.status, Status::Conflict);
+    let (code, _, _) = forklift_core::error::deframe(&err.message).expect("a classified refusal");
+    assert_eq!(code, "remote_ahead", "{}", err.message);
     assert!(
         err.message.to_lowercase().contains("office"),
         "the refusal must name the office: {}",

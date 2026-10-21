@@ -58,7 +58,7 @@ pub async fn handle_command() -> Result<(), String> {
                 Ok(LiftResult::UpToDate) => {}
                 Err(why) => {
                     let error = with_drop_hint(why, &info, &lift.pallet);
-                    meta_failed.push(MetaPalletFailure { pallet: lift.pallet, error });
+                    meta_failed.push(MetaPalletFailure::new(lift.pallet, error));
                 }
             }
         }
@@ -208,9 +208,9 @@ async fn try_auto_merge(client: &RemoteClient,
     // The merge materializes into this bay and moves the pallet from the tree it holds, so a bay
     // another bay or process left behind its pallet is told so instead of attempting it.
     if base != Some(head) {
-        return Err(pallet_utils::behind_message(
+        return Err(pallet_utils::behind_refusal(
             pallet, base, Some(head), "lifted: the remote diverged, and only a bay at its pallet's head can merge it in",
-        ));
+        ).into());
     }
 
     // Merging materializes into the working directory, so only a clean warehouse qualifies.

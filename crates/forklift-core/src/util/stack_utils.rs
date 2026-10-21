@@ -58,7 +58,7 @@ impl From<StackError> for String {
         match error {
             StackError::HeadWrite { error, .. } => error.to_string(),
             StackError::Behind { pallet, base, head } => {
-                pallet_utils::behind_message(&pallet, base.as_deref(), head.as_deref(), "stacked")
+                pallet_utils::behind_refusal(&pallet, base.as_deref(), head.as_deref(), "stacked").into()
             },
             StackError::Other(error) => error,
         }

@@ -310,8 +310,8 @@ check.
 
 `old_head: null` means "the pallet must not exist yet". Checks, in order:
 
-1. **CAS**: the current head equals `old_head`, else `409` (the client lowers/rebases
-   and retries).
+1. **CAS**: the current head equals `old_head`, else `409` with `code` `remote_ahead` and
+   `next_step` `forklift lower` (the client lowers/rebases and retries).
 2. **Presence**: `new_head` is an object hash in its canonical spelling (64 lowercase hex
    characters), and the `new_head` parcel and the full closure of every parcel between
    `new_head` and `old_head` (parents, trees, blobs) are present, else `422` — a ref

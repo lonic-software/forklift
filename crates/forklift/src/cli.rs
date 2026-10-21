@@ -440,7 +440,9 @@ pub enum Command {
                       (\"remote.url\") and move the remote's ref. When trust is established, the \
                       office pallet and the trust anchor are lifted first — the remote verifies \
                       every signature before it accepts the update. A remote that is ahead or has \
-                      diverged is never overwritten: lower first."
+                      diverged is never overwritten: lower first when it is ahead; when both \
+                      sides moved and the changes do not auto-merge, the refusal names how to \
+                      merge the remote head in."
     )]
     Lift,
 

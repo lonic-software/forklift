@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 
@@ -310,23 +311,47 @@ impl BayPosition {
             return Ok(());
         }
 
-        Err(behind_message(&self.pallet, self.base.as_deref(), head.as_deref(), operation))
+        Err(behind_refusal(&self.pallet, self.base.as_deref(), head.as_deref(), operation).into())
     }
 }
 
 /// Why a bay standing on `base` may not move `pallet`, whose head is `head`: see
 /// [`BayPosition::require_current`].
-pub fn behind_message(pallet: &str, base: Option<&str>, head: Option<&str>, operation: &str) -> String {
-    format!(
-        "This bay is behind pallet \"{}\": its files stand on {}, but the pallet is at {}, moved \
-        since by another bay or process. Nothing was {}. Run \"forklift shift {}\" to catch up, \
-        then try again.",
-        pallet,
-        base.map(|base| format!("parcel {}", base)).unwrap_or("no parcel".to_string()),
-        head.map(|head| format!("parcel {}", head)).unwrap_or("no parcel".to_string()),
-        operation,
-        pallet
+pub fn behind_refusal(pallet: &str, base: Option<&str>, head: Option<&str>, operation: &str) -> CoreError {
+    CoreError::refusal(
+        RefusalCode::Behind,
+        format!(
+            "This bay is behind pallet \"{}\": its files stand on {}, but the pallet is at {}, moved \
+            since by another bay or process. Nothing was {}. Run \"forklift shift {}\" to catch up, \
+            then try again.",
+            pallet,
+            base.map(|base| format!("parcel {}", base)).unwrap_or("no parcel".to_string()),
+            head.map(|head| format!("parcel {}", head)).unwrap_or("no parcel".to_string()),
+            operation,
+            pallet
+        ),
+        catch_up_step(pallet),
     )
+}
+
+/// A [`RefusalCode::RemoteAhead`] refusal saying `message`: `lower` brings the remote's parcels in.
+pub fn remote_ahead_refusal(message: String) -> CoreError {
+    CoreError::refusal(RefusalCode::RemoteAhead, message, "forklift lower")
+}
+
+/// The refusal a remote head answers a ref update with when the pallet's head is `current`, not
+/// the `expected` the client sent: the remote moved since the client read it.
+pub fn pallet_moved_refusal(current: Option<&str>, expected: Option<&str>) -> CoreError {
+    remote_ahead_refusal(format!(
+        "The pallet moved: its head is {}, not {}. Lower and retry.",
+        current.unwrap_or("unborn"),
+        expected.unwrap_or("unborn")
+    ))
+}
+
+/// The next step of a [`RefusalCode::Behind`] refusal with nothing in progress: catch up.
+fn catch_up_step(pallet: &str) -> String {
+    format!("forklift shift {}", pallet)
 }
 
 /// The [`record_utils`] kind and version of a bay's position file: the pallet name, then the base
@@ -503,6 +528,21 @@ pub struct RefMoved {
 
     /// The head the ref held instead (`None`: it no longer exists).
     pub found: Option<String>,
+}
+
+impl RefMoved {
+    /// This move as a [`RefusalCode::Behind`] refusal, for a writer moving the pallet its bay
+    /// stands on: the bay is now behind it. Only such a writer may use it; a move of any other ref
+    /// (a delivery's target) is retried, not caught up with.
+    pub fn behind_refusal(&self) -> CoreError {
+        let pallet = self.reference.to_wire();
+
+        CoreError::refusal(
+            RefusalCode::Behind,
+            format!("{} Run \"forklift shift {}\" to catch up, then try again.", self, pallet),
+            catch_up_step(&pallet),
+        )
+    }
 }
 
 impl std::fmt::Display for RefMoved {
