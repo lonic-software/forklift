@@ -373,7 +373,7 @@ fn a_narrowed_sparse_bay_still_produces_correct_stocktake_and_stack_with_skips_a
     // The scoped bay's pallet's tree at "scope/deep" must match the full bay's — a scoped
     // stack with the skip active is still byte-identical to a full stack of the same content.
     // Pallets live in the *shared* warehouse root, not a bay's own working directory (a bay's
-    // own ".forklift" is a redirect file, not a directory).
+    // own ".forklift" holds only its redirect and probes).
     let scoped_head = std::fs::read_to_string(trunk.root.join(".forklift").join("pallets").join("scoped"))
         .unwrap().trim().to_string();
     let full_head = std::fs::read_to_string(trunk.root.join(".forklift").join("pallets").join("full"))

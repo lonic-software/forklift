@@ -4,6 +4,7 @@ use crate::model::inventory::Inventory;
 const CODE_VERSION_2024_09_04: u64 = 1;
 const CODE_VERSION_2026_07_15: u64 = 2;
 const CODE_VERSION_2026_10_19: u64 = 3;
+const CODE_VERSION_2026_10_21: u64 = 4;
 
 /// Versions of the inventory object format.
 pub enum InventoryVersion {
@@ -18,6 +19,12 @@ pub enum InventoryVersion {
     /// anchor read before it, or recorded as unproven. Older versions' entries were trusted
     /// against the shard file's mtime, so they parse with every entry unproven.
     V2026_10_19,
+
+    /// Same bytes as `V2026_10_19`, but a proven entry was proven against an anchor stamped on
+    /// the entry's own device. `V2026_10_19` took one anchor for every device, so an entry on
+    /// another volume could be proven against a clock that never stamped it; its entries parse
+    /// unproven too.
+    V2026_10_21,
 }
 
 impl InventoryVersion {
@@ -30,6 +37,7 @@ impl InventoryVersion {
             InventoryVersion::V2024_09_04 => CODE_VERSION_2024_09_04,
             InventoryVersion::V2026_07_15 => CODE_VERSION_2026_07_15,
             InventoryVersion::V2026_10_19 => CODE_VERSION_2026_10_19,
+            InventoryVersion::V2026_10_21 => CODE_VERSION_2026_10_21,
         }
     }
 
@@ -46,6 +54,7 @@ impl InventoryVersion {
             CODE_VERSION_2024_09_04 => Ok(InventoryVersion::V2024_09_04),
             CODE_VERSION_2026_07_15 => Ok(InventoryVersion::V2026_07_15),
             CODE_VERSION_2026_10_19 => Ok(InventoryVersion::V2026_10_19),
+            CODE_VERSION_2026_10_21 => Ok(InventoryVersion::V2026_10_21),
             _ => Err(format!("Inventory version code {} not found.", code)),
         }
     }
@@ -59,6 +68,7 @@ impl InventoryVersion {
             InventoryVersion::V2024_09_04 => builder::inventory::version::v2024_09_04::build,
             InventoryVersion::V2026_07_15 => builder::inventory::version::v2026_07_15::build,
             InventoryVersion::V2026_10_19 => builder::inventory::version::v2026_10_19::build,
+            InventoryVersion::V2026_10_21 => builder::inventory::version::v2026_10_21::build,
         };
 
         move |inventory| builder_fn(inventory)
@@ -73,6 +83,7 @@ impl InventoryVersion {
             InventoryVersion::V2024_09_04 => parser::inventory::version::v2024_09_04::parse,
             InventoryVersion::V2026_07_15 => parser::inventory::version::v2026_07_15::parse,
             InventoryVersion::V2026_10_19 => parser::inventory::version::v2026_10_19::parse,
+            InventoryVersion::V2026_10_21 => parser::inventory::version::v2026_10_21::parse,
         };
 
         move |offset, content| parser_fn(offset, content)
@@ -88,6 +99,7 @@ impl InventoryVersion {
             InventoryVersion::V2024_09_04 => builder::inventory::version::v2024_09_04::build_header,
             InventoryVersion::V2026_07_15 => builder::inventory::version::v2026_07_15::build_header,
             InventoryVersion::V2026_10_19 => builder::inventory::version::v2026_10_19::build_header,
+            InventoryVersion::V2026_10_21 => builder::inventory::version::v2026_10_21::build_header,
         };
 
         move |inventory| builder_fn(inventory)
@@ -104,6 +116,7 @@ impl InventoryVersion {
             InventoryVersion::V2024_09_04 => parser::inventory::version::v2024_09_04::parse_header,
             InventoryVersion::V2026_07_15 => parser::inventory::version::v2026_07_15::parse_header,
             InventoryVersion::V2026_10_19 => parser::inventory::version::v2026_10_19::parse_header,
+            InventoryVersion::V2026_10_21 => parser::inventory::version::v2026_10_21::parse_header,
         };
 
         move |offset, content| parser_fn(offset, content)
@@ -114,6 +127,6 @@ impl InventoryVersion {
     /// # Returns
     /// * `InventoryVersion` - The latest inventory version.
     pub fn latest() -> InventoryVersion {
-        InventoryVersion::V2026_10_19
+        InventoryVersion::V2026_10_21
     }
 }

@@ -26,10 +26,12 @@ pub fn parse(offset: usize, content: &[u8]) -> Result<Inventory, String> {
 /// # Arguments
 /// * `offset`  - The offset to start parsing at (the byte *after* the inventory header).
 /// * `content` - The bytes of the inventory file.
-/// * `unproven` - Whether the shard's version predates entries that prove themselves (versions
-///   before `V2026_10_19`). Such an entry's stat was trusted against the shard file's own
-///   mtime, an anchor this parser no longer has, so its `content_change_timestamp` is replaced
-///   with [`UNPROVEN_MTIME`] and the file is hashed until a directory load re-proves it.
+/// * `unproven` - Whether the shard's version predates entries proven on their own device
+///   (versions before `V2026_10_21`). Before `V2026_10_19` an entry's stat was trusted against
+///   the shard file's own mtime; at `V2026_10_19` it was proven against one probe whatever the
+///   entry's device. Neither anchor is one this parser can trust, so the entry's
+///   `content_change_timestamp` is replaced with [`UNPROVEN_MTIME`] and the file is hashed until
+///   a directory load re-proves it.
 ///
 /// # Returns
 /// * `Ok(Inventory)` - The parsed inventory.

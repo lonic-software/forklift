@@ -2780,11 +2780,11 @@ fn type_of_dir_entry_when(metadata: &Metadata, executable_bit_is_observable: boo
     }
 }
 
-/// The name prefix of the probe files [`executable_bit_is_observable`] creates under the bay's
-/// metadata root, each removed again once measured.
+/// The name prefix of the probe files [`executable_bit_is_observable`] creates in the working
+/// tree's metadata folder, each removed again once measured.
 pub const FILE_NAME_PREFIX_EXECUTABLE_BIT_PROBE: &str = "exec-probe-";
 
-/// The answers [`executable_bit_is_observable`] has given, keyed by device.
+/// The answers [`executable_bit_is_observable`] has measured, keyed by device.
 #[cfg(unix)]
 type ExecutableBitProbes = std::sync::RwLock<std::collections::HashMap<u64, bool>>;
 
@@ -2797,24 +2797,24 @@ static EXECUTABLE_BIT_PROBES: std::sync::LazyLock<ExecutableBitProbes> =
 /// Whether a `stat` of the entry `metadata` was read from reports its executable bit, which git
 /// records as `core.fileMode`. Windows has no bit. On Unix a volume may not keep one either (exFAT,
 /// FAT, some SMB and FUSE mounts report every file with the same mode and ignore a `chmod`), so the
-/// volume is asked: a probe file under the bay's metadata root ([`bay_root`]) is set to `0o644` and
-/// then to `0o755`, through the same path calls the walks and materializers use, and the bit is
-/// observable only if both modes read back. Asked once per process and device; nothing is
-/// recorded, so a warehouse copied onto another volume is measured there.
+/// volume is asked: a probe file in the working tree's metadata folder ([`working_forklift`], a
+/// bay's own) is set to `0o644` and then to `0o755`, through the same path calls the walks and
+/// materializers use, and the bit is observable only if both modes read back. Asked once per
+/// process; nothing is recorded, so a warehouse copied onto another volume is measured there.
 ///
-/// The probe can only measure the metadata root's volume, the working tree's own for the main
-/// tree. An entry on another device (a bay whose working directory sits on another volume than its
-/// warehouse, or a mount inside the working tree) gets the metadata root's answer, as a bay does
-/// for the clock (see [`StatAnchor`]).
+/// The probe measures only the metadata folder's device, and its answer is kept for that device
+/// alone. An entry on any other device (a mount inside the working tree, or a working tree whose
+/// metadata folder links to another volume) reads as the platform's default (Unix keeps the bit),
+/// never as another volume's answer: on a blind volume that default can show a `chmod` that is not
+/// there, never miss one.
 ///
-/// A metadata root this process cannot create a file in (no permission, a read-only mount, a full
-/// volume or quota) cannot be measured, and reads as the platform's default (Unix keeps the bit),
-/// so a command that only reads still runs there. On a blind volume what it can then show is a
-/// `chmod` that is not there, never a missed one; a command that writes to the metadata root fails
-/// on that write. Any other failure fails the caller, and is not kept: the next caller probes again,
-/// so a passing one (a descriptor limit, an interrupted call) costs one command nothing but a retry.
+/// A metadata folder this process cannot create a file in (no permission, a read-only mount, a full
+/// volume or quota) cannot be measured, and reads as the platform's default too, so a command that
+/// only reads still runs there; a command that writes to the metadata folder fails on that write.
+/// Any other failure fails the caller, and is not kept: the next caller probes again, so a passing
+/// one (a descriptor limit, an interrupted call) costs one command nothing but a retry.
 ///
-/// [`bay_root`]: crate::globals::bay_root
+/// [`working_forklift`]: crate::globals::working_forklift
 ///
 /// # Arguments
 /// * `metadata` - The (symlink) metadata of an entry in the working tree.
@@ -2824,17 +2824,18 @@ static EXECUTABLE_BIT_PROBES: std::sync::LazyLock<ExecutableBitProbes> =
 /// * `Err(String)` - If the probe could not be created, set or read for any other reason.
 #[cfg(unix)]
 pub fn executable_bit_is_observable(metadata: &Metadata) -> Result<bool, String> {
-    executable_bit_is_observable_in(&EXECUTABLE_BIT_PROBES, metadata, crate::globals::bay_root)
+    executable_bit_is_observable_in(&EXECUTABLE_BIT_PROBES, std::os::unix::fs::MetadataExt::dev(metadata),
+                                    crate::globals::working_forklift)
 }
 
-/// [`executable_bit_is_observable`] with its answers kept in `probes`, probing under `root()`.
+/// [`executable_bit_is_observable`] for an entry on `device`, with the answers kept in `probes`,
+/// probing in `root()`.
 #[cfg(unix)]
 fn executable_bit_is_observable_in(probes: &ExecutableBitProbes,
-                                   metadata: &Metadata,
+                                   device: u64,
                                    root: impl FnOnce() -> PathBuf) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
 
-    let device = metadata.dev();
     if let Some(observable) = probes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&device) {
         return Ok(*observable);
     }
@@ -2848,12 +2849,14 @@ fn executable_bit_is_observable_in(probes: &ExecutableBitProbes,
     let root_device = std::fs::metadata(&root)
         .map_err(|err| format!("Could not probe {} for the executable bit: {}", root.display(), err))?
         .dev();
-    let observable = match probes.get(&root_device) {
-        Some(observable) => *observable,
-        None => probe_executable_bit(&root)?,
-    };
+    if root_device != device {
+        // Only the metadata folder's volume can be measured; another device's answer would be a
+        // guess, so this one gets the platform's default.
+        return Ok(true);
+    }
+
+    let observable = probe_executable_bit(&root)?;
     probes.insert(root_device, observable);
-    probes.insert(device, observable);
 
     Ok(observable)
 }
@@ -3002,12 +3005,15 @@ pub fn get_content_modification_timestamp_for_file(file_metadata: &Metadata) -> 
         ).map(|time| time.as_secs())
 }
 
-/// The name of the probe file, directly under the warehouse's metadata root, whose mtime is the
-/// anchor every stat is proven against (see [`StatAnchor`]).
+/// The name of the probe file, directly under the working tree's metadata folder
+/// ([`working_forklift`]), whose mtime is the anchor every stat is proven against (see
+/// [`StatAnchor`]).
+///
+/// [`working_forklift`]: crate::globals::working_forklift
 pub const FILE_NAME_CLOCK_PROBE: &str = "clock";
 
 /// What an entry's stat is proven against when it is taken: the whole-second mtime of a probe
-/// file stamped *before* the stat, on the metadata root's file system.
+/// file stamped *before* the stat, and the device the probe lives on.
 ///
 /// A stat proves the content it is recorded with only if no later edit could leave the same
 /// mtime behind. An edit after the probe gets an mtime of at least the probe's, so an entry whose
@@ -3017,44 +3023,59 @@ pub const FILE_NAME_CLOCK_PROBE: &str = "clock";
 /// anchored stat proves it. The trust decision therefore lives in the entry's own bytes, and no
 /// later write of its shard, whatever mtime that write leaves, can raise it.
 ///
-/// Both anchors are file-system timestamps, so the process clock never enters the comparison.
+/// Both anchors are file-system timestamps, so the process clock never enters the comparison. They
+/// are comparable only where one clock stamped both, which is assumed of one device and of nothing
+/// wider: an entry on another device than the probe (a mount inside the working tree, a working
+/// tree whose metadata folder links to another volume) is never proven, and is hashed by every
+/// command instead. The device is in the identity space of [`get_device_and_inode`], the one an
+/// entry records.
 ///
 /// [`UNPROVEN_MTIME`]: crate::model::inventory::UNPROVEN_MTIME
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatAnchor {
-    /// The probe's whole-second mtime.
-    At(u64),
+    /// The probe's device and whole-second mtime.
+    At {
+        /// The device the probe lives on.
+        device: u64,
+        /// The probe's whole-second mtime.
+        stamp: u64,
+    },
     /// No anchor: every stat is recorded as unproven. For callers whose entries are never
     /// persisted, so they never write the probe.
     Unproven,
 }
 
 impl StatAnchor {
-    /// Whether a stat with content mtime `mtime` (whole seconds), taken after this anchor, proves
-    /// the content it is recorded with.
-    pub fn proves(self, mtime: u64) -> bool {
+    /// Whether a stat of an entry on `device` with content mtime `mtime` (whole seconds), taken
+    /// after this anchor, proves the content it is recorded with. Never on another device than
+    /// the probe's.
+    pub fn proves(self, device: u64, mtime: u64) -> bool {
         match self {
-            StatAnchor::At(anchor) => mtime.saturating_add(1) < anchor,
+            StatAnchor::At { device: probed, stamp } => device == probed && mtime.saturating_add(1) < stamp,
             StatAnchor::Unproven => false,
         }
     }
 
-    /// The `content_change_timestamp` to record for a stat with content mtime `mtime`: the mtime
-    /// itself when this anchor proves it, [`UNPROVEN_MTIME`] otherwise.
+    /// The `content_change_timestamp` to record for a stat of an entry on `device` with content
+    /// mtime `mtime`: the mtime itself when this anchor proves it, [`UNPROVEN_MTIME`] otherwise.
     ///
     /// [`UNPROVEN_MTIME`]: crate::model::inventory::UNPROVEN_MTIME
-    pub fn record(self, mtime: u64) -> u64 {
-        if self.proves(mtime) { mtime } else { crate::model::inventory::UNPROVEN_MTIME }
+    pub fn record(self, device: u64, mtime: u64) -> u64 {
+        if self.proves(device, mtime) { mtime } else { crate::model::inventory::UNPROVEN_MTIME }
     }
 }
 
 /// The last stamp of each probe file this process has written: when (monotonic) and the anchor
-/// it produced. Keyed by the probe's absolute path, as one process can work several warehouses.
-static CLOCK_PROBE_STAMPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, u64)>>> =
+/// it produced, device included. Keyed by the probe's absolute path, as one process can work
+/// several warehouses.
+static CLOCK_PROBE_STAMPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, StatAnchor)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Take a [`StatAnchor`] for a stat about to be made in this warehouse: stamp the clock probe
-/// under the metadata root and read its mtime from the open handle.
+/// Take a [`StatAnchor`] for a stat about to be made in this working tree: stamp the clock probe
+/// in its metadata folder ([`working_forklift`], on the working tree's own volume, a bay's too)
+/// and read its mtime and device from the open handle.
+///
+/// [`working_forklift`]: crate::globals::working_forklift
 ///
 /// The anchor is cached and the probe re-stamped at most once a second of monotonic time; an
 /// older anchor is only ever smaller, so reusing one trusts fewer entries, never more. An anchor
@@ -3065,7 +3086,7 @@ static CLOCK_PROBE_STAMPS: std::sync::LazyLock<std::sync::Mutex<std::collections
 /// * `Err(String)`    - The probe could not be stamped or read. Proceeding without an anchor
 ///   would mean recording stats as proofs nothing backs, so the command must fail.
 pub fn take_stat_anchor() -> Result<StatAnchor, String> {
-    take_stat_anchor_at(&forklift_root().join(FILE_NAME_CLOCK_PROBE))
+    take_stat_anchor_at(&crate::globals::working_forklift().join(FILE_NAME_CLOCK_PROBE))
 }
 
 /// [`take_stat_anchor`] against an explicit probe path.
@@ -3076,7 +3097,7 @@ pub fn take_stat_anchor_at(probe: &Path) -> Result<StatAnchor, String> {
 
     if let Some((stamped, anchor)) = stamps.get(&key) {
         if stamped.elapsed() < std::time::Duration::from_secs(1) {
-            return Ok(StatAnchor::At(*anchor));
+            return Ok(*anchor);
         }
     }
 
@@ -3084,11 +3105,12 @@ pub fn take_stat_anchor_at(probe: &Path) -> Result<StatAnchor, String> {
     let anchor = stamp_clock_probe(&key)?;
     stamps.insert(key, (stamped, anchor));
 
-    Ok(StatAnchor::At(anchor))
+    Ok(anchor)
 }
 
-/// Write the clock probe and return its whole-second mtime, read from the handle that wrote it.
-fn stamp_clock_probe(probe: &Path) -> Result<u64, String> {
+/// Write the clock probe and return the anchor it gives: its whole-second mtime and its device,
+/// both read from the handle that wrote it.
+fn stamp_clock_probe(probe: &Path) -> Result<StatAnchor, String> {
     use std::io::Write;
 
     let failed = |err: std::io::Error| format!("Could not stamp the clock probe {}: {}", probe.display(), err);
@@ -3097,7 +3119,12 @@ fn stamp_clock_probe(probe: &Path) -> Result<u64, String> {
     file.write_all(b"x").map_err(failed)?;
     let metadata = file.metadata().map_err(failed)?;
 
-    get_content_modification_timestamp_for_file(&metadata)
+    #[cfg(unix)]
+    let device = std::os::unix::fs::MetadataExt::dev(&metadata);
+    #[cfg(windows)]
+    let (device, _) = get_device_and_inode_of(&file)?;
+
+    Ok(StatAnchor::At { device, stamp: get_content_modification_timestamp_for_file(&metadata)? })
 }
 
 /// Get the (device, inode) identity of a directory entry, without following a symlink.
@@ -3808,13 +3835,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The answer is kept per device: an entry on the metadata root's volume is measured there,
-    /// one on another device (`/dev/null` stands in for a mount inside the working tree) gets the
-    /// metadata root's answer rather than a probe of a volume nothing may write to, and a failure
-    /// is not kept, so one that passes (a descriptor limit) is retried by the next caller.
+    /// The answer is kept per device: an entry on the metadata folder's volume is measured there,
+    /// and one on another device (`/dev/null` stands in for a mount inside the working tree) gets
+    /// the platform's default, never the metadata folder's answer, even a blind one. A failure is
+    /// not kept, so one that passes (a descriptor limit) is retried by the next caller.
     #[cfg(unix)]
     #[test]
-    fn the_answer_is_kept_per_device_and_another_device_gets_the_metadata_root_s() {
+    fn the_answer_is_kept_per_device_and_another_device_gets_the_default() {
         use std::os::unix::fs::MetadataExt;
 
         let dir = std::env::temp_dir().join(format!("forklift-exec-probe-device-{}", std::process::id()));
@@ -3822,23 +3849,29 @@ mod tests {
         let root = dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(dir.join("note.txt"), "note\n").unwrap();
-        let note = std::fs::symlink_metadata(dir.join("note.txt")).unwrap();
-        let elsewhere = std::fs::symlink_metadata("/dev/null").unwrap();
-        assert_ne!(note.dev(), elsewhere.dev());
+        let note = std::fs::symlink_metadata(dir.join("note.txt")).unwrap().dev();
+        let elsewhere = std::fs::symlink_metadata("/dev/null").unwrap().dev();
+        assert_ne!(note, elsewhere);
 
         let probes = ExecutableBitProbes::default();
-        assert!(executable_bit_is_observable_in(&probes, &elsewhere, || root.clone()).unwrap());
-        assert_eq!(probes.read().unwrap().get(&note.dev()), Some(&true), "the root's volume was measured");
-        assert_eq!(probes.read().unwrap().get(&elsewhere.dev()), Some(&true));
+        assert!(executable_bit_is_observable_in(&probes, note, || root.clone()).unwrap());
+        assert_eq!(probes.read().unwrap().get(&note), Some(&true), "the root's volume was measured");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the probe file was left behind");
-        assert!(executable_bit_is_observable_in(&probes, &note, || unreachable!("answered from the cache")).unwrap());
+        assert!(executable_bit_is_observable_in(&probes, note, || unreachable!("answered from the cache")).unwrap());
+
+        // The metadata folder's volume measured blind: another device still gets the default.
+        let blind = ExecutableBitProbes::default();
+        blind.write().unwrap().insert(note, false);
+        assert!(executable_bit_is_observable_in(&blind, elsewhere, || root.clone()).unwrap(),
+                "another device must get the platform default, not the metadata folder's answer");
+        assert_eq!(blind.read().unwrap().get(&elsewhere), None, "a device nothing measured keeps no answer");
 
         let failing = ExecutableBitProbes::default();
         let absent = dir.join("absent");
-        let error = executable_bit_is_observable_in(&failing, &note, || absent.clone()).unwrap_err();
+        let error = executable_bit_is_observable_in(&failing, note, || absent.clone()).unwrap_err();
         assert!(error.contains("Could not probe"), "{}", error);
         assert!(failing.read().unwrap().is_empty(), "a failure is not kept");
-        assert!(executable_bit_is_observable_in(&failing, &note, || root.clone()).unwrap(),
+        assert!(executable_bit_is_observable_in(&failing, note, || root.clone()).unwrap(),
                 "the next caller probes again");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3875,14 +3908,18 @@ mod tests {
         let probe = dir.join(FILE_NAME_CLOCK_PROBE);
 
         let stamped = std::time::Instant::now();
-        let StatAnchor::At(anchor) = take_stat_anchor_at(&probe).unwrap() else {
+        let first = take_stat_anchor_at(&probe).unwrap();
+        let StatAnchor::At { device, stamp: anchor } = first else {
             panic!("a stamped probe must give an anchor");
         };
         let written = dir.join("written");
         std::fs::write(&written, b"after").unwrap();
-        let mtime = get_content_modification_timestamp_for_file(&std::fs::metadata(&written).unwrap()).unwrap();
+        let written_metadata = std::fs::symlink_metadata(&written).unwrap();
+        let mtime = get_content_modification_timestamp_for_file(&written_metadata).unwrap();
         assert!(anchor <= mtime, "a write after the anchor must not predate it: {} > {}", anchor, mtime);
-        assert!(!StatAnchor::At(anchor).proves(mtime), "a write after the anchor must not be proven");
+        assert_eq!(get_device_and_inode(&written, &written_metadata).unwrap().0, device,
+            "the anchor records its probe's device as an entry beside it records its own");
+        assert!(!first.proves(device, mtime), "a write after the anchor must not be proven");
 
         // Within the second, the cached anchor is handed out without touching the probe. A host
         // stalled past most of that second could legitimately re-stamp, so the check only runs
@@ -3890,12 +3927,12 @@ mod tests {
         std::fs::remove_file(&probe).unwrap();
         let reused = take_stat_anchor_at(&probe).unwrap();
         if stamped.elapsed() < std::time::Duration::from_millis(900) {
-            assert!(matches!(reused, StatAnchor::At(cached) if cached == anchor));
+            assert_eq!(reused, first);
             assert!(!probe.exists(), "the probe must not be re-stamped within a second");
         }
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let StatAnchor::At(later) = take_stat_anchor_at(&probe).unwrap() else { unreachable!() };
+        let StatAnchor::At { stamp: later, .. } = take_stat_anchor_at(&probe).unwrap() else { unreachable!() };
         assert!(probe.exists(), "the probe must be re-stamped once a second has passed");
         assert!(later >= anchor);
 
@@ -3903,6 +3940,18 @@ mod tests {
         assert!(take_stat_anchor_at(&dir.join("absent").join(FILE_NAME_CLOCK_PROBE)).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An anchor proves only entries on its own device: a stat on any other device is unproven,
+    /// however old its mtime, since nothing shows one clock stamped both.
+    #[test]
+    fn an_anchor_proves_nothing_on_another_device() {
+        let anchor = StatAnchor::At { device: 7, stamp: 1_000_000 };
+
+        assert!(anchor.proves(7, 1_000), "an old mtime on the probe's device is proven");
+        assert_eq!(anchor.record(7, 1_000), 1_000);
+        assert!(!anchor.proves(8, 1_000), "an old mtime on another device must not be proven");
+        assert_eq!(anchor.record(8, 1_000), crate::model::inventory::UNPROVEN_MTIME);
     }
 
     #[test]

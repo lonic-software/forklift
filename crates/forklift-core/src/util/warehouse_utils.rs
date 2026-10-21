@@ -20,8 +20,8 @@ pub fn find_warehouse_root() -> Result<PathBuf, String> {
     let mut dir = cwd.as_path();
 
     loop {
-        // A `.forklift` folder is a warehouse; a `.forklift` file is a bay redirect
-        // (§7.5) — both mark the root of a working tree.
+        // A warehouse and a bay (§7.5) both mark the root of their working tree with a
+        // `.forklift` folder; `enter_warehouse` tells them apart.
         if dir.join(FOLDER_NAME_FORKLIFT_ROOT).exists() {
             return Ok(dir.to_path_buf());
         }
@@ -37,8 +37,8 @@ pub fn find_warehouse_root() -> Result<PathBuf, String> {
     }
 }
 
-/// Whether `dir` is the root of a working tree: it holds a `.forklift` entry, folder (a warehouse)
-/// or file (a bay redirect), which [`find_warehouse_root`] stops at from anywhere inside it. Below
+/// Whether `dir` is the root of a working tree: it holds a `.forklift` entry (a warehouse's or a
+/// bay's folder, or an old-format bay file), which [`find_warehouse_root`] stops at from anywhere inside it. Below
 /// the warehouse's own root, such a directory is another working tree, never content of this one.
 ///
 /// Stricter than discovery, which follows a symlink: an entry of any kind counts, so a dangling
@@ -76,12 +76,16 @@ pub fn enter_warehouse() -> Result<(), String> {
     let root = find_warehouse_root()?;
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
 
-    // Inside a bay, the `.forklift` is a redirect to the shared warehouse: shared storage
+    // Inside a bay, the `.forklift` folder redirects to the shared warehouse: shared storage
     // (objects, refs, trust, config) resolves there, while the working directory, the
-    // inventory, the current pallet and the lock stay in this bay.
-    if bay_utils::is_bay_redirect(&forklift) {
-        let redirect = bay_utils::read_bay_redirect(&forklift)?;
-        globals::set_bay_context(redirect.warehouse_root.join(FOLDER_NAME_FORKLIFT_ROOT), redirect.name);
+    // inventory, the current pallet, the lock and the probes of this bay's volume stay here.
+    match bay_utils::classify_forklift(&forklift)? {
+        bay_utils::ForkliftKind::Bay => {
+            let redirect = bay_utils::read_bay_redirect(&forklift)?;
+            globals::set_bay_context(redirect.warehouse_root.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
+        }
+        bay_utils::ForkliftKind::OldFormatBay => return Err(bay_utils::old_format_bay_error(&root)),
+        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => (),
     }
 
     let relative = cwd.strip_prefix(&root).unwrap_or(Path::new(""));
@@ -164,9 +168,19 @@ pub fn cwd_relative_to_root() -> PathBuf {
 /// # Returns
 /// * `Ok(Vec<String>)` - One note per created piece; empty if the warehouse was already
 ///                       fully prepared.
-/// * `Err(String)`     - If a folder or file could not be created.
+/// * `Err(String)`     - If the folder is a bay's, or a folder or file could not be created.
 pub fn prepare_warehouse() -> Result<Vec<String>, String> {
     let mut created: Vec<String> = Vec::new();
+
+    // A bay's `.forklift` is a folder too: filling it with warehouse pieces would report success
+    // while leaving a directory that is neither.
+    match bay_utils::classify_forklift(&forklift_root())? {
+        bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => return Err(format!(
+            "\"{}\" belongs to a bay, so a warehouse cannot be prepared there. Remove the bay from its \
+            warehouse first.", forklift_root().to_string_lossy()
+        )),
+        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => (),
+    }
 
     if file_utils::create_folder_if_not_exists(&forklift_root())? {
         created.push(format!("Created folder \"{}\".", FOLDER_NAME_FORKLIFT_ROOT));

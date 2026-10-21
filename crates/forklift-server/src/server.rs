@@ -38,7 +38,7 @@ use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::RefUpdateError;
 use forklift_core::util::lock_utils::{self, BaseServeLock, ServeLock, StoreAccessLock};
 use forklift_core::util::{
-    audit_utils, body_utils, bundle_utils, file_utils, hook_utils, merge_utils, meta_tree,
+    audit_utils, body_utils, bay_utils, bundle_utils, file_utils, hook_utils, merge_utils, meta_tree,
     object_utils, office_utils, pack_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
@@ -637,12 +637,18 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
             let root = std::fs::canonicalize(&root)
                 .map_err(|e| format!("Error while resolving \"{}\": {}", root, e))?;
 
-            if !root.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir() {
-                return Err(format!(
+            match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT))? {
+                bay_utils::ForkliftKind::Warehouse => (),
+                bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => return Err(format!(
+                    "\"{}\" is a bay's working directory, not a forklift warehouse. Serve the warehouse \
+                    the bay belongs to instead.",
+                    root.to_string_lossy()
+                )),
+                bay_utils::ForkliftKind::Absent => return Err(format!(
                     "\"{}\" is not a forklift warehouse. Prepare it first: \
                     forklift-server prepare --root {}",
                     root.to_string_lossy(), root.to_string_lossy()
-                ));
+                )),
             }
 
             // Hold the serve lock for the served root for the process lifetime: a second
@@ -966,6 +972,13 @@ fn error_body(message: String) -> ErrorResponse {
 /// can branch to `lower`.
 fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
     (StatusCode::CONFLICT, pallet_utils::pallet_moved_refusal(current, expected).into())
+}
+
+/// Whether `root` holds a warehouse. A bay's working directory holds a `.forklift` folder too, so
+/// the shared classifier decides, never the folder's mere presence: a bay is never served,
+/// adopted or reported as an existing warehouse.
+fn holds_warehouse(root: &std::path::Path) -> Result<bool, String> {
+    Ok(bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT))? == bay_utils::ForkliftKind::Warehouse)
 }
 
 /// Map an internal storage error to a 500.
@@ -1454,7 +1467,7 @@ fn resolve_warehouse(state: &AppState,
 
     let root = base.join(&id);
 
-    if !root.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir() {
+    if !holds_warehouse(&root).map_err(internal)? {
         return Err((
             StatusCode::NOT_FOUND,
             format!(
@@ -1541,7 +1554,7 @@ fn create_warehouse(base: &std::path::Path, id: &str) -> Result<Creation, Handle
 fn create_warehouse_numbered(base: &std::path::Path, id: &str,
                              counter: &std::sync::atomic::AtomicU64) -> Result<Creation, HandlerError> {
     let target = base.join(id);
-    if target.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir() {
+    if holds_warehouse(&target).map_err(internal)? {
         return Ok(Creation::Existed);
     }
 
@@ -1597,7 +1610,7 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
         Err(rename_error) => {
             let _ = std::fs::remove_dir_all(&staging);
 
-            if target.join(FOLDER_NAME_FORKLIFT_ROOT).is_dir() {
+            if holds_warehouse(&target).map_err(internal)? {
                 Ok(Creation::Existed)
             } else if std::fs::symlink_metadata(&target).is_ok() {
                 Err(conflict())
@@ -4085,6 +4098,27 @@ mod tests {
         assert_eq!(create_warehouse(&base, "file").err().expect("a file is refused").0, StatusCode::CONFLICT);
         assert_eq!(std::fs::read(base.join("file")).unwrap(), b"not a folder", "never replaced");
 
+        assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A bay's working directory holds a `.forklift` folder too. The multi-mode lookup does not
+    /// serve it, and creation neither reports it as an existing warehouse nor adopts it.
+    #[test]
+    fn a_bay_under_the_base_is_neither_served_nor_taken_for_a_warehouse() {
+        let base = scratch_dir("bay-under-base");
+        let forklift = base.join("bay").join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+        std::fs::write(forklift.join(bay_utils::FILE_NAME_BAY_REDIRECT), b"redirect").unwrap();
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let error = resolve_warehouse(&state, &warehouse_params("bay")).err().expect("a bay must not be served");
+        assert_eq!(error.0, StatusCode::NOT_FOUND, "{}", error.1);
+
+        let error = create_warehouse(&base, "bay").err().expect("a bay must not read as an existing warehouse");
+        assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
+        assert_eq!(std::fs::read_dir(&forklift).unwrap().count(), 1, "the bay's folder is left as it was");
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
 
         let _ = std::fs::remove_dir_all(&base);
