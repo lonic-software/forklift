@@ -80,11 +80,13 @@ file), or under `text` with `core.eol=crlf`; an `ident` expansion; a smudge `fil
 LFS; a `working-tree-encoding`; and, under `core.symlinks=false`, a symlink written as a plain
 file. Such a file does not hold its imported content. The import checks every working file
 against the imported tree, so such a file reads `modified` from the first `stocktake`, the same
-way an uncommitted edit does, and the import warns, naming the files. Like any unstaged change,
-it must be settled before a command that needs a clean working tree, in one of two ways: `restore` the path to write the imported content back
-(a colocated git checkout may then list it as modified), or `load` and stack it to track the
-file as checked out. Under `core.autocrlf=true` that second way stacks every text file with CRLF
-line endings. The import does not refuse such a repository: git.git itself converts its `.bat`
+way an uncommitted edit does, and the import warns, naming the files (`--json` lists them all as
+`unheld`). Like any unstaged change, it must be settled before a command that needs a clean
+working tree, in one of two ways: `load` and stack it to track the file as checked out (under
+`core.autocrlf=true` that stacks every text file with CRLF line endings), or, for a file nobody
+edited, `restore` it to write the imported content back, discarding what the file holds (a
+colocated git checkout may then list it as modified; a symlink is restored only where one can be
+created). The import does not refuse such a repository: git.git itself converts its `.bat`
 files.
 
 A large history lands hundreds of thousands of objects at once — the case the loose store

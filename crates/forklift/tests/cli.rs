@@ -2346,12 +2346,14 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    let imported = warehouse.run(&["import-git", "."]);
-    assert_success(&imported);
-    assert!(stdout(&imported).contains(
-        "warning: 4 file(s) do not hold the content imported for them, so they read as modified: \
+    let imported = json(&warehouse.run(&["--json", "import-git", "."]));
+    assert_eq!(imported["data"]["unheld"], serde_json::json!(["auto.txt", "id.txt", "run.bat", "shout.up"]),
+        "{}", imported);
+    let warnings = imported["data"]["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| warning.as_str().unwrap().starts_with(
+        "4 file(s) do not hold the content imported for them, so they read as changed: \
         \"auto.txt\", \"id.txt\", \"run.bat\", \"shout.up\"."
-    ), "{}", stdout(&imported));
+    )), "{}", imported);
 
     let ignore = ("untracked".to_string(), ".forkliftignore".to_string());
     let modified = |name: &str| ("modified".to_string(), name.to_string());

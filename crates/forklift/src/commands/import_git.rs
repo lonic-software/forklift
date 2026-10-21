@@ -195,6 +195,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         },
         compacted: packed,
         warnings,
+        unheld,
     });
 
     Ok(())
@@ -204,9 +205,10 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
 const UNHELD_NAMED: usize = 5;
 
 /// The warning for the working files that do not hold the content imported for them, which
-/// read as unstaged changes from the first stocktake: forklift converts nothing on checkout, so
-/// a file git converted reads as changed although nobody edited it, and saying so here is what
-/// keeps that from looking like an unexplained edit.
+/// read as unstaged changes from the first stocktake. Forklift converts nothing on checkout, so a
+/// file git converted reads as changed although nobody edited it, and saying so here is what keeps
+/// that from looking like an unexplained edit. It offers `load` first: a listed file may hold an
+/// uncommitted edit, which `restore` would discard.
 ///
 /// # Arguments
 /// * `unheld` - The keys of those files, in tree order.
@@ -225,10 +227,11 @@ fn unheld_warning(unheld: &[String]) -> Option<String> {
     }
 
     Some(format!(
-        "{} file(s) do not hold the content imported for them, so they read as modified: {}. \
-        An uncommitted edit does this, and so does git converting a file as it checks it out \
-        (line endings, \"ident\", a filter). Run \"restore\" on a path to write its imported \
-        content back, or \"load\" it to keep the file as it is.",
+        "{} file(s) do not hold the content imported for them, so they read as changed: {}. \
+        An uncommitted edit or deletion does this, and so does git converting a file as it checks \
+        it out (line endings, \"ident\", a filter). \"load\" a path to keep it as it is; for a \
+        file nobody changed, \"restore\" writes its imported content back instead, discarding \
+        what the file holds.",
         unheld.len(), named
     ))
 }
@@ -1158,6 +1161,12 @@ pub(crate) struct ImportReport {
     /// Anything skipped or worth flagging (e.g. submodules).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+
+    /// Every checked-out file that does not hold the content imported for it (an uncommitted
+    /// edit or deletion, or a file git converted as it checked it out), in tree order. Each reads
+    /// as an unstaged change. The warning names only the first few.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unheld: Vec<String>,
 }
 
 /// A rule of the ignore file, by where it stands.
