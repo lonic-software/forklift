@@ -2718,33 +2718,36 @@ fn an_edit_in_the_second_of_a_shift_survives_a_sibling_load() {
     panic!("no attempt edited a.txt within the second shift wrote it");
 }
 
-/// A shard written before entries proved themselves (format v2) parses with every entry
-/// unproven, and the next directory load rewrites it as v3 with real stat data.
+/// A shard written before entries proved themselves (format v2), or before a proof named the
+/// device it was taken on (v3), parses with every entry unproven, and the next directory load
+/// rewrites it as v4 with real stat data.
 #[test]
-fn a_load_rewrites_a_v2_shard_with_proven_entries() {
-    let warehouse = TestWarehouse::new("v2-shard-rewrite");
-    warehouse.write_file("a.txt", "one\n");
-    backdate(&warehouse.root.join("a.txt"), 3600);
-    assert_success(&warehouse.run(&["prepare"]));
-    assert_success(&warehouse.run(&["load", "."]));
+fn a_load_rewrites_an_older_shard_with_proven_entries() {
+    for older in [2u8, 3] {
+        let warehouse = TestWarehouse::new(&format!("v{}-shard-rewrite", older));
+        warehouse.write_file("a.txt", "one\n");
+        backdate(&warehouse.root.join("a.txt"), 3600);
+        assert_success(&warehouse.run(&["prepare"]));
+        assert_success(&warehouse.run(&["load", "."]));
 
-    let shard = {
-        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-        forklift_core::util::file_utils::get_inventory_data_path_for_key("").unwrap()
-    };
-    let mut bytes = std::fs::read(&shard).unwrap();
-    assert_eq!(bytes[0], 3, "sanity: a fresh shard is v3");
-    bytes[0] = 2;
-    std::fs::write(&shard, bytes).unwrap();
-    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp,
-        forklift_core::model::inventory::UNPROVEN_MTIME, "a v2 entry must parse unproven");
-    assert_only_the_ignore_file_is_untracked_or_clean(&warehouse);
+        let shard = {
+            let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+            forklift_core::util::file_utils::get_inventory_data_path_for_key("").unwrap()
+        };
+        let mut bytes = std::fs::read(&shard).unwrap();
+        assert_eq!(bytes[0], 4, "sanity: a fresh shard is v4");
+        bytes[0] = older;
+        std::fs::write(&shard, bytes).unwrap();
+        assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp,
+            forklift_core::model::inventory::UNPROVEN_MTIME, "a v{} entry must parse unproven", older);
+        assert_only_the_ignore_file_is_untracked_or_clean(&warehouse);
 
-    assert_success(&warehouse.run(&["load", "."]));
-    assert_eq!(std::fs::read(&shard).unwrap()[0], 3, "the load must rewrite the shard as v3");
-    let mtime = file_identity(&warehouse.root.join("a.txt")).0
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime);
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_eq!(std::fs::read(&shard).unwrap()[0], 4, "the load must rewrite a v{} shard as v4", older);
+        let mtime = file_identity(&warehouse.root.join("a.txt")).0
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime);
+    }
 }
 
 fn assert_only_the_ignore_file_is_untracked_or_clean(warehouse: &TestWarehouse) {
