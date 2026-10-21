@@ -6496,6 +6496,7 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success(), "a diverged @kv lift must be refused");
     assert!(stderr(&refused).contains("lower"), "{}", stderr(&refused));
+    assert!(!stderr(&refused).contains('\u{1f}'), "a meta failure carries no refusal frame: {:?}", stderr(&refused));
 
     let lowered = area.forklift("a", &["lower"]);
     assert_success(&lowered);
