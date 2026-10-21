@@ -56,7 +56,10 @@ pub async fn handle_command() -> Result<(), String> {
             match lift.result {
                 Ok(LiftResult::Lifted(_)) => meta_pallets.push(lift.pallet),
                 Ok(LiftResult::UpToDate) => {}
-                Err(why) => meta_failed.push(MetaPalletFailure { pallet: lift.pallet, error: why }),
+                Err(why) => {
+                    let error = with_drop_hint(why, &info, &lift.pallet);
+                    meta_failed.push(MetaPalletFailure { pallet: lift.pallet, error });
+                }
             }
         }
 
@@ -124,6 +127,21 @@ pub async fn handle_command() -> Result<(), String> {
         output::emit(&report);
 
         return Ok(());
+    }
+}
+
+/// A meta pallet's lift failure, naming the way out when the pallet is only ahead of the remote:
+/// a change the remote refuses to admit (a tag whose tagger was demoted before lifting it) is
+/// dropped by lowering with "theirs" at its path. A diverged pallet's failure already says to
+/// lower.
+fn with_drop_hint(error: String, info: &forklift_core::model::remote::WarehouseInfo, wire: &str) -> String {
+    let name = wire.strip_prefix(pallet_utils::META_QUALIFIER).unwrap_or(wire);
+
+    match lower::local_ahead_of(info, name) {
+        Ok(lower::LocalSide::Ahead(_)) => forklift_core::error::append_to_message(error, &format!(
+            "If the remote refuses a local change, \"lower --keep {}:<path>=theirs\" drops it.", name
+        )),
+        _ => error,
     }
 }
 

@@ -24,7 +24,9 @@ use crate::output::{self, CommandOutput};
 ///
 /// The meta pallets sync next, each on its own: a meta pallet that diverged has its
 /// local net change replayed onto the remote head and lifted, unless both sides changed the
-/// same path differently — a conflict, which `keep` resolves path by path. A pallet that
+/// same path differently — a conflict, which `keep` resolves path by path. A pallet only this
+/// side moved is left for lift, unless `keep` names it: then it replays the same way, so
+/// "theirs" can drop a local change the remote refuses to admit. A pallet that
 /// conflicts or fails stops only itself; the working pallet still lowers, and the command
 /// then fails with the most severe outcome.
 ///
@@ -495,24 +497,75 @@ async fn sync_meta(client: &RemoteClient,
         }
     }
 
-    // A resolution for a pallet that did not diverge has nothing to resolve; say so, unless
-    // the pallet already failed for a reason of its own.
-    for pallet in keeps.keys() {
+    // A pallet only this side moved needs no reconciling, so lower leaves it for lift — unless a
+    // resolution names it. Then it replays onto the remote head like a diverged one, which is
+    // how "theirs" drops a local change the remote will not admit (a tag cut by an admin who
+    // was demoted before lifting it). Any other pallet a resolution names has nothing to
+    // resolve; say so, unless it already failed for a reason of its own.
+    for (pallet, keep) in keeps {
         let wire = pallet_utils::PalletRef::meta(pallet).to_wire();
 
-        if !adopt.diverged.iter().any(|(name, _)| name == pallet)
-            && !sync.failed.iter().any(|failure| failure.pallet == wire) {
-            sync.failed.push(MetaPalletFailure {
-                pallet: wire.clone(),
-                error: format!(
-                    "{} has not diverged from the remote, so there is nothing for --keep to resolve.",
-                    wire
-                ),
-            });
+        if adopt.diverged.iter().any(|(name, _)| name == pallet)
+            || sync.failed.iter().any(|failure| failure.pallet == wire) {
+            continue;
+        }
+
+        let reconciled = match local_ahead_of(info, pallet) {
+            Ok(LocalSide::Ahead(remote_head)) => match meta_tree::meta_rules(pallet) {
+                Some(rules) => replay(client, info, pallet, rules, &remote_head, keep, &mut sync.restamped).await,
+                None => Err(format!("The @{} pallet has no rules to replay it.", pallet)),
+            },
+            Ok(LocalSide::NotOnRemote) => Err(format!(
+                "{} is not on the remote yet, so there is no remote side for --keep to keep.",
+                wire
+            )),
+            Ok(LocalSide::NothingAhead) => Err(format!(
+                "{} holds no local change the remote lacks, so there is nothing for --keep to \
+                resolve.",
+                wire
+            )),
+            Err(error) => Err(error),
+        };
+
+        match reconciled {
+            Ok(Reconciled::Replayed) => sync.replayed.push(wire),
+            Ok(Reconciled::Adopted) => sync.adopted.push(wire),
+            Ok(Reconciled::Conflicts(conflicts)) => sync.conflicts.push(conflicts),
+            Err(error) => sync.failed.push(MetaPalletFailure { pallet: wire, error }),
         }
     }
 
     sync
+}
+
+/// Where a meta pallet's local head stands against the remote's, as the handshake listed it.
+pub(crate) enum LocalSide {
+    /// The local head descends from the remote one (named here) and holds parcels it lacks.
+    Ahead(String),
+
+    /// The remote holds no such pallet, and this side does.
+    NotOnRemote,
+
+    /// No local head, the same head, or one that does not descend from the remote's.
+    NothingAhead,
+}
+
+/// Where the local head of the meta pallet `name` stands against the head `info` lists.
+pub(crate) fn local_ahead_of(info: &forklift_core::model::remote::WarehouseInfo,
+                             name: &str) -> Result<LocalSide, String> {
+    let Some(local) = pallet_utils::get_meta_pallet_head(name)? else {
+        return Ok(LocalSide::NothingAhead);
+    };
+
+    let Some(remote) = info.pallets.get(&pallet_utils::PalletRef::meta(name).to_wire()) else {
+        return Ok(LocalSide::NotOnRemote);
+    };
+
+    if *remote != local && merge_utils::is_ancestor(remote, &local)? {
+        return Ok(LocalSide::Ahead(remote.clone()));
+    }
+
+    Ok(LocalSide::NothingAhead)
 }
 
 /// Replay a meta pallet's local net change onto the remote head and lift the result. The
