@@ -19,7 +19,7 @@
 //! record) and, for the object-shaped ones, checks whether the object it names is genuinely absent
 //! (present elsewhere — another pack, or loose — is not a loss) and, if so, whether *any* durable
 //! ref source still reaches it: pallet heads (both namespaces), every bay's parked parcels,
-//! every bay's in-progress consolidation (its `their_head`), the trust anchor's adopted
+//! every parcel a bay's in-progress consolidation or cherry-pick records, the trust anchor's adopted
 //! head (a re-genesis pin, §8.7), and every bay's staged inventory shards **enumerated from the
 //! files on disk**, never the registration ledger (`inventory_utils::ShardLedger`), which is blind
 //! to a shard sitting in the store unregistered — a walk that trusted it could silently miss a

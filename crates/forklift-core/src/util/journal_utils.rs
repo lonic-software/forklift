@@ -376,7 +376,11 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     let now = BayState::read()?;
     let after = entry.after.bay_state();
 
-    if now == after || is_half_undone(entry, &now)? {
+    if now == after {
+        return refuse_a_pick_without_its_source(entry);
+    }
+
+    if is_half_undone(entry, &now)? {
         return Ok(());
     }
 
@@ -442,6 +446,26 @@ fn is_half_undone(entry: &JournalEntry, now: &BayState) -> Result<bool, String> 
     }
 
     Ok(pallet_utils::get_pallet_head(&before.current_pallet)? != before.current_head)
+}
+
+/// Refuses an undo that would put back a cherry-pick whose source this store no longer holds. The
+/// journal is no gc root, and the stack that completed a pick is single-parent, so once the pick
+/// is complete nothing need reach its source. A pick put back without it could never complete.
+/// A consolidation's `their_head` needs no such check: the completing stack made it a parent of
+/// the head this undo starts from.
+fn refuse_a_pick_without_its_source(entry: &JournalEntry) -> Result<(), String> {
+    let Some(pick) = &entry.before.cherry_pick else { return Ok(()) };
+
+    if entry.after.cherry_pick.is_some() || file_utils::does_object_exist(&pick.source)? {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Undoing \"{}\" would put the cherry-pick of {} back in progress, but this warehouse no \
+        longer holds that parcel, so the pick could never be completed again. Nothing was undone. \
+        The parcel that completed the pick stays; to change it, stack another on top.",
+        entry.op, pick.source
+    ))
 }
 
 /// The refusal for an undo whose current pallet moved after the operation it would reverse.

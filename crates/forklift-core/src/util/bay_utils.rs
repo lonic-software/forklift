@@ -307,8 +307,8 @@ pub struct BayScopeOutcome {
 /// The bay-scoped parcel roots shared by **both**
 /// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots) and
 /// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set): across every entry of
-/// `dirs`, that bay's parked parcels ([`park_utils::read_parked_in`]) plus its in-progress
-/// consolidation's `their_head` ([`merge_utils::read_consolidation_state_in`]), if any.
+/// `dirs`, that bay's base, its parked parcels ([`park_utils::read_parked_in`]) and the parcels an
+/// in-progress consolidation or cherry-pick records — see [`read_one_bay_scoped_roots`].
 ///
 /// Takes the already-enumerated `dirs` — normally the caller's own [`all_bay_state_dirs`] call —
 /// rather than calling [`all_bay_state_dirs`] itself: both callers need at least one *other*
@@ -499,8 +499,8 @@ mod tests {
 
     /// Pins that `collect_bay_scoped_parcel_roots` — the helper both
     /// `recovery_utils::collect_walk_roots` and `gc_utils::collect_live_set` call for their
-    /// shared portion — actually surfaces a **non-active** bay's parked parcel *and* its
-    /// in-progress consolidation `their_head` in one pass. Neither caller has its own test
+    /// shared portion — actually surfaces a **non-active** bay's parked parcel and the parcels
+    /// its in-progress consolidation and cherry-pick record, in one pass. Neither caller has its own test
     /// exercising both sources through this exact function, so this is the one place that would
     /// go red if a future edit accidentally dropped either source from the shared helper (which
     /// would then silently starve both callers, not just one — the F3 extraction's whole point).
