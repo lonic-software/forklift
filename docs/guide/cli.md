@@ -1768,10 +1768,11 @@ refusal before ever reaching its own fetch):
   these sources at all, and so never reports on them.
 - **An object the check walks through could not be read** — one that only a damaged pack index
   might hold (its data file missing, a corrupt part of the index, another format version, or an
-  index that does not parse). What that object references is unknown, so `heal` keeps the taint
-  on everything it could not confirm is safe to drop, naming the object and the index. Restore the
-  index's pack, or move a stray index out of the pack folder if it holds nothing this warehouse
-  needs, then re-run `heal`.
+  index that does not parse). What that object references is unknown, so `heal` clears nothing on
+  that run: every taint it could not confirm is safe to drop stays, not only those beneath the
+  object. The note names the objects and the index; fix that index as its line under "Pack index
+  problems" says (an index of another format version means re-creating the warehouse, not moving
+  the file aside), then re-run `heal`. A torn record is likewise left standing.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of
@@ -1782,10 +1783,9 @@ above) and prints a warning line for each one it finds — unconditionally, whet
 else was tainted this run, and whether or not that index is what caused the taint. A quarantined
 index's objects are left recoverable (`heal` can refetch them); a damaged pack still serves its
 sound parts; an index of another format means re-creating the warehouse; an unenumerable one names
-the file to move aside. This appears even when `heal` still has to refuse
-on an unrelated dangling reference — as a clearly-separated "Pack index problems (unrelated to
-this refusal, clear them separately)" section. An index the refusal itself names (see the bullet
-above) is part of its cause; any other listed there is unrelated, and the only time it coincides
+the file to move aside. This appears even when `heal` still has to refuse — as a
+clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
+index the refusal itself names (see the bullet above) is part of its cause; the time one coincides
 with a refusal is exactly when an operator most needs to be told about it.
 
 ---

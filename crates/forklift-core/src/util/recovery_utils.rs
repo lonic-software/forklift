@@ -494,8 +494,7 @@ fn with_pack_warnings(error: CoreError, pack_warnings: &[String]) -> CoreError {
             CoreError::Refusal {
                 code,
                 message: crate::error::sanitize(&format!(
-                    "{} Pack index problems (any not named above are unrelated to this refusal — clear \
-                    them separately): {}",
+                    "{} Pack index problems in this store (clear each as its line says): {}",
                     message, block
                 )),
                 next_step,
@@ -2023,14 +2022,28 @@ enum Descent {
     Unwalkable(String),
 }
 
-/// One plain-language note per unwalked node — see [`ClosureWalkResult::unwalked`].
+/// One plain-language note per distinct reason among the unwalked nodes — see
+/// [`ClosureWalkResult::unwalked`]. Grouped by reason and capped at [`MAX_NAMED_DANGLING`] names
+/// each, since one stray index can hold back every absent boundary of a sparse warehouse.
 fn unwalked_notes(unwalked: &BTreeMap<String, String>) -> Vec<String> {
-    unwalked.iter()
-        .map(|(hash, reason)| format!(
-            "Object \"{}\" may be in the store but cannot be read ({}), so the objects it \
-            references could not be checked.",
-            hash, reason
-        ))
+    let mut by_reason: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (hash, reason) in unwalked {
+        by_reason.entry(reason.as_str()).or_default().push(hash.as_str());
+    }
+
+    by_reason.into_iter()
+        .map(|(reason, hashes)| {
+            let named: Vec<String> = hashes.iter().take(MAX_NAMED_DANGLING).map(|hash| format!("\"{}\"", hash)).collect();
+            let more = match hashes.len().saturating_sub(MAX_NAMED_DANGLING) {
+                0 => String::new(),
+                rest => format!(" and {} more", rest),
+            };
+            format!(
+                "{} object(s) may be in the store but cannot be read ({}), so the objects they \
+                reference could not be checked: {}{}.",
+                hashes.len(), reason, named.join(", "), more
+            )
+        })
         .collect()
 }
 
@@ -2579,7 +2592,8 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix what is named above (a bay's state, the office record, or a pack index), then run \
+        "Fix what is named above (a bay's state, the office record, or a pack index, as its own \
+        line says), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )
@@ -2653,7 +2667,7 @@ fn dangling_refusal(root: &Path, lines: &[String], degraded: &[String]) -> CoreE
         format!(
             "At least one of these could not be conclusively checked because a source of durable \
             references (a bay's saved state, or the office record), or a pack index holding \
-            objects they reach, could not be read this run — fix it (see above), then re-run \
+            objects they reach, could not be read this run — fix it as its line above says, then re-run \
             \"forklift heal\"; it may resolve on its own once everything is readable. Whatever \
             is still dangling after that needs a heavyweight resolution: {}",
             HEAVYWEIGHT_EXITS
@@ -6386,7 +6400,7 @@ mod tests {
         assert!(message.contains("stray-corrupt.idx"),
             "the refusal must also name the unrelated stray index — pack-health warnings must \
             survive a refusal, not only a clean Ok: {}", message);
-        assert!(message.contains("unrelated to this refusal"),
+        assert!(message.contains("Pack index problems in this store (clear each as its line says): "),
             "the pack-health warning must be in a clearly-separated section, never read as the \
             refusal's own cause: {}", message);
 
@@ -6640,6 +6654,27 @@ mod tests {
             }
             Ok(_) => None,
         }
+    }
+
+    /// One stray index can hold back every absent boundary of a sparse warehouse, so the notes are
+    /// one per reason, each naming at most `MAX_NAMED_DANGLING` objects.
+    ///
+    /// Mutation: one note per node (the pre-grouping shape) → 21 notes, not 2 (red).
+    #[test]
+    fn unwalked_notes_are_one_per_reason_and_capped() {
+        let mut unwalked = BTreeMap::new();
+        for n in 0..20 {
+            unwalked.insert(format!("{:064x}", n), "possibly held by pack index \"a.idx\"".to_string());
+        }
+        unwalked.insert("f".repeat(64), "named by pack index \"b.idx\"".to_string());
+
+        let notes = unwalked_notes(&unwalked);
+        assert_eq!(notes.len(), 2, "{:?}", notes);
+        let a = notes.iter().find(|note| note.contains("a.idx")).unwrap();
+        assert!(a.starts_with("20 object(s)") && a.contains(&format!("{:064x}", MAX_NAMED_DANGLING - 1)), "{}", a);
+        assert!(!a.contains(&format!("{:064x}", MAX_NAMED_DANGLING)) && a.ends_with(" and 4 more."), "{}", a);
+        let b = notes.iter().find(|note| note.contains("b.idx")).unwrap();
+        assert!(b.starts_with("1 object(s)") && b.ends_with(&format!("\"{}\".", "f".repeat(64))), "{}", b);
     }
 
     /// Mutation: in `drain_parcel_queue`, read `Descent::Unwalkable` as `Absent` → the head parcel
