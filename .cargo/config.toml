@@ -7,8 +7,12 @@
 # "packed" gathers the debuginfo into a .dSYM per binary and leaves no objects behind, for about
 # 10 s more per touched-core rebuild; it overtakes the default at roughly 250,000 stale files.
 # CI cannot accumulate these: Swatinem/rust-cache exports CARGO_INCREMENTAL=0, and without
-# incremental the object names are stable and get overwritten. macOS CI still gets the flag and
-# pays dsymutil for nothing; at the time of writing the cost was small enough not to special-case.
-# A rustc flag given later wins, so this overrides the "unpacked" cargo passes.
+# incremental the object names are stable and get overwritten. ci.yml sets an empty RUSTFLAGS,
+# which switches this off there: on a macOS runner it cost ~13 s of dsymutil, for nothing.
+# This relies on cargo placing config rustflags after its own "-Csplit-debuginfo=unpacked" and on
+# rustc taking the last value given (both seen with cargo/rustc 1.94.1); the guide's check in
+# docs/guide/contributing.md shows if that ever stops holding. Cargo reads rustflags from one
+# source only: RUSTFLAGS in the environment replaces this, and this replaces a [build] rustflags
+# from a personal config.
 [target.'cfg(target_os = "macos")']
 rustflags = ["-Csplit-debuginfo=packed"]

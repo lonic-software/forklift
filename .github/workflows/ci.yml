@@ -19,6 +19,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Set but empty on purpose: a RUSTFLAGS variable, even an empty one, replaces the rustflags in
+  # .cargo/config.toml. Its macOS split-debuginfo setting stops a local incremental build from
+  # piling up object files. CI cannot pile them up (rust-cache turns incremental off), and there
+  # the setting cost ~13 s of dsymutil per macOS job, and its cache grew from 553 MB to 1015 MB.
+  RUSTFLAGS: ""
 
 jobs:
   # Docs-only pull requests skip the build and tests. This is decided here rather than with

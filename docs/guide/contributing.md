@@ -100,11 +100,20 @@ Notes:
   `target/debug/deps`. Under the default, every incremental rebuild leaves fresh
   objects there and nothing removes the old ones. rustc lists that directory to find
   crates, so builds slow down as it grows: with 2.9 million stale files, rebuilding
-  the server and the tests after a core edit took over 3 min instead of 6 s. The
-  setting stops the growth but does not remove existing files, so a target
-  directory built before it needs one `cargo clean`. If builds slow down for no
-  visible reason, count `ls -f target/debug/deps | wc -l`; a fresh workspace build
-  has about 1,100.
+  the server and the tests after a core edit took over 3 min. With the setting it
+  takes about 16 s on an 18-core Mac, and does not grow. Things to know:
+  - It does not remove objects that are already there, so a target directory built
+    before it needs one `cargo clean`.
+  - Cargo takes rustflags from only one place. A `RUSTFLAGS` or
+    `CARGO_ENCODED_RUSTFLAGS` environment variable replaces this setting, and the
+    objects pile up again. This setting in turn replaces `[build] rustflags` from
+    your own `~/.cargo/config.toml`. Put personal flags under
+    `[target.'cfg(target_os = "macos")'] rustflags` instead: cargo joins those
+    lists across config files.
+  - A debug binary copied away from `target/` leaves its `.dSYM` behind, so its
+    backtraces lose file and line.
+  - To check for the problem, `find target/debug/deps -name '*.rcgu.o' | head -1000 | wc -l`
+    should print 0. Listing the whole directory is itself slow once it is large.
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
 
