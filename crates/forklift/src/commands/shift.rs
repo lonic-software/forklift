@@ -247,7 +247,7 @@ fn move_files(from_tree: Option<&str>,
     // Repopulate the staging area from the target tree ("repopulate on shift"): entries
     // carry the just-materialized files' stat data and the hashes from the tree, so the
     // whole warehouse is "clean" without reading a single file back.
-    let shards = shift_utils::build_inventories_for_tree(to_tree, shift_utils::TreeProvenance::Written(anchor))?;
+    let shards = shift_utils::build_inventories_for_tree(to_tree, shift_utils::TreeProvenance::Written(anchor))?.shards;
     inventory_utils::replace_all_inventories(&shards)?;
 
     pallet_utils::write_position(position)

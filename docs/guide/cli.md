@@ -73,14 +73,19 @@ and its directory, rather than being imported under a different path; so does an
 depth that some file system opens as `.forklift` (`.Forklift`, `.forklift.`). For agents, this means a project can be moved onto
 forklift with one command.
 
-Forklift stores a file's bytes as they are and has no checkout conversion, so the history keeps
-the bytes git stored. A file git rewrote when it checked the file out (line endings from
-`eol=crlf`, `text` or `core.autocrlf`, an `ident` expansion, a smudge `filter` such as Git LFS)
-holds other bytes than its imported entry. The import checks every working file against the
-imported tree, so such a file reads `modified` from the first `stocktake`, the same way an
-uncommitted edit does. `load` and stack it to track the checked-out bytes, or check it out from
-git again without the conversion. The import does not refuse such a repository: git.git itself
-converts its `.bat` files.
+Forklift stores a file's bytes as they are and converts nothing on checkout, so the history
+keeps the bytes git stored. Git rewrites some files as it checks them out: LF to CRLF under
+`eol=crlf`, under `core.autocrlf=true` (Git for Windows' default, which converts every text
+file), or under `text` with `core.eol=crlf`; an `ident` expansion; a smudge `filter` such as Git
+LFS; a `working-tree-encoding`; and, under `core.symlinks=false`, a symlink written as a plain
+file. Such a file does not hold its imported content. The import checks every working file
+against the imported tree, so such a file reads `modified` from the first `stocktake`, the same
+way an uncommitted edit does, and the import warns, naming the files. Like any unstaged change,
+it must be settled before a command that needs a clean working tree, in one of two ways: `restore` the path to write the imported content back
+(a colocated git checkout may then list it as modified), or `load` and stack it to track the
+file as checked out. Under `core.autocrlf=true` that second way stacks every text file with CRLF
+line endings. The import does not refuse such a repository: git.git itself converts its `.bat`
+files.
 
 A large history lands hundreds of thousands of objects at once — the case the loose store
 is slowest and largest in — so the imported objects are written **straight into native

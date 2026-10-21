@@ -1218,6 +1218,18 @@ pub enum TreeProvenance {
     Verify,
 }
 
+/// A tree's inventory shards, and the files among them that did not hold their tree entries.
+pub struct TreeInventories {
+    /// Warehouse path key → inventory.
+    pub shards: BTreeMap<String, Inventory>,
+
+    /// Under [`TreeProvenance::Verify`], the keys of the files that did not hold their tree
+    /// entry's content (an edit, a missing file, a file git converted on checkout), each recorded
+    /// with the tree's hash and an unproven stat, in tree order. Empty under `Written`, which
+    /// presumes every file holds its entry.
+    pub unheld: Vec<String>,
+}
+
 /// Build the inventory shards for the given tree: one shard per directory, its entries built
 /// from the files' metadata, under the given provenance.
 ///
@@ -1230,11 +1242,11 @@ pub enum TreeProvenance {
 /// * `provenance`     - What makes the tree's hashes true of the working files.
 ///
 /// # Returns
-/// * `Ok(BTreeMap<String, Inventory>)` - Warehouse path key → inventory.
-/// * `Err(String)`                     - If a tree object could not be loaded, the clock probe
-///                                       stamped, or a file read or its metadata gathered.
+/// * `Ok(TreeInventories)` - The shards, and the files that did not hold their entries.
+/// * `Err(String)`         - If a tree object could not be loaded, the clock probe stamped, or a
+///                           file read or its metadata gathered.
 pub fn build_inventories_for_tree(root_tree_hash: &str,
-                                  provenance: TreeProvenance) -> Result<BTreeMap<String, Inventory>, String> {
+                                  provenance: TreeProvenance) -> Result<TreeInventories, String> {
     let root_tree = object_utils::load_tree(root_tree_hash)?;
 
     // In a scoped bay only the in-scope subtree(s) are inventoried; the spine is descended but
@@ -1254,7 +1266,8 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
         TreeProvenance::Verify => file_utils::take_stat_anchor()?,
     };
 
-    let record = |file: &TreeFile| -> Result<InventoryItem, String> {
+    // Each record says whether its file held the tree entry.
+    let record = |file: &TreeFile| -> Result<(InventoryItem, bool), String> {
         let path = Path::new(&file.key);
 
         match provenance {
@@ -1264,7 +1277,7 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
                 file.hash.clone(),
                 file.item_type,
                 anchor,
-            ),
+            ).map(|item| (item, true)),
             TreeProvenance::Verify => verified_tree_entry(
                 path,
                 file.name(),
@@ -1274,8 +1287,14 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
         }
     };
 
-    let gather = |file: &TreeFile, entry: Result<InventoryItem, String>| -> Result<(), String> {
-        shards[file.shard].1.add_item(entry?);
+    let mut unheld: Vec<String> = Vec::new();
+
+    let gather = |file: &TreeFile, entry: Result<(InventoryItem, bool), String>| -> Result<(), String> {
+        let (item, held) = entry?;
+        if !held {
+            unheld.push(file.key.clone());
+        }
+        shards[file.shard].1.add_item(item);
         Ok(())
     };
 
@@ -1295,7 +1314,7 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
         fanout_utils::prefetch_in_order(&files, usize::MAX, usize::MAX, record, |_| 1, gather)?;
     }
 
-    Ok(shards.into_iter().collect())
+    Ok(TreeInventories { shards: shards.into_iter().collect(), unheld })
 }
 
 /// Below this many files, a tree's written files are recorded on the calling thread. Each is a
@@ -1328,25 +1347,26 @@ impl TreeFile {
 
 /// Record one tree file the command did not write: re-proved against its tree entry under an
 /// anchor taken before its stat, or else recorded with the tree's hash and an unproven stat.
+/// Returns the entry, and whether the file held the tree entry's content.
 fn verified_tree_entry(file_path: &Path,
                        name: &str,
                        tree_entry: &InventoryItem,
-                       anchor: file_utils::StatAnchor) -> Result<InventoryItem, String> {
+                       anchor: file_utils::StatAnchor) -> Result<(InventoryItem, bool), String> {
     let Ok(metadata) = file_utils::get_symlink_metadata_for_path(file_path) else {
-        return Ok(tree_entry.clone());
+        return Ok((tree_entry.clone(), false));
     };
     let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
 
     if !item_type.is_file() {
-        return Ok(tree_entry.clone());
+        return Ok((tree_entry.clone(), false));
     }
 
     // A match keeps the tree's kind, not the file's: the working tree is the imported tree, so an
     // executable bit the tree does not record (a checkout under `core.fileMode=false`, or one on
     // a file system without the bit) is not this command's change to stage.
     match inventory_utils::reprove_file(tree_entry, item_type, file_path, name, anchor)? {
-        Some((item, _)) => Ok(InventoryItem { item_type: tree_entry.item_type, ..item }),
-        None => Ok(tree_entry.clone()),
+        Some((item, _)) => Ok((InventoryItem { item_type: tree_entry.item_type, ..item }, true)),
+        None => Ok((tree_entry.clone(), false)),
     }
 }
 
@@ -1498,7 +1518,7 @@ pub fn materialize_tree(from_tree: Option<&str>,
 
     progress.status("Rebuilding the inventory");
 
-    let shards = build_inventories_for_tree(to_tree, TreeProvenance::Written(anchor))?;
+    let shards = build_inventories_for_tree(to_tree, TreeProvenance::Written(anchor))?.shards;
 
     crate::util::inventory_utils::replace_all_inventories(&shards)?;
 

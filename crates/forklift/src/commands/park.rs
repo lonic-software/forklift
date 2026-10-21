@@ -189,7 +189,7 @@ pub async fn park_changes() -> Result<(), String> {
     // Reset the working directory and the inventory to the pallet head.
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
-    let shards = shift_utils::build_inventories_for_tree(&head_tree_hash, shift_utils::TreeProvenance::Written(anchor))?;
+    let shards = shift_utils::build_inventories_for_tree(&head_tree_hash, shift_utils::TreeProvenance::Written(anchor))?.shards;
     inventory_utils::replace_all_inventories(&shards)?;
 
     output::message(format!(

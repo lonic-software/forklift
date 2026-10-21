@@ -405,7 +405,7 @@ fn fast_forward(current: &str,
 
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
-    let shards = shift_utils::build_inventories_for_tree(their_tree_hash, shift_utils::TreeProvenance::Written(anchor))?;
+    let shards = shift_utils::build_inventories_for_tree(their_tree_hash, shift_utils::TreeProvenance::Written(anchor))?.shards;
     inventory_utils::replace_all_inventories(&shards)?;
 
     #[cfg(test)]

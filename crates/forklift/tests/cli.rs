@@ -2303,10 +2303,12 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
 }
 
-/// Forklift has no checkout conversion, so a file git rewrote on checkout (`eol=crlf`, `ident`)
-/// does not hold the bytes `import-git` imports for it. It reads as an unstaged change from the
-/// first stocktake, and still does once its stat no longer matches, rather than reading clean
-/// until then. A file git checked out unconverted reads clean throughout.
+/// Forklift has no checkout conversion, so a file git rewrote on checkout (`eol=crlf`, `ident`,
+/// `core.autocrlf=true`, a smudge filter) does not hold the bytes `import-git` imports for it. It
+/// reads as an unstaged change from the first stocktake, and still does once its stat no longer
+/// matches, rather than reading clean until then; the import warns, naming it; and both ways of
+/// settling it the warning names leave the file clean. A file git checked out unconverted reads
+/// clean throughout.
 #[test]
 fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
     let warehouse = TestWarehouse::new("import-git-converted");
@@ -2314,38 +2316,61 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
 
     git_in(&root, &["init", "-q", "-b", "main"]);
     git_in(&root, &["config", "core.autocrlf", "false"]);
-    warehouse.write_file(".gitattributes", "*.bat eol=crlf\nid.txt ident\n");
+    warehouse.write_file(".gitattributes", "*.bat eol=crlf\nid.txt ident\n*.up filter=up\nplain.txt -text\n");
     warehouse.write_file("run.bat", "echo one\necho two\n");
     warehouse.write_file("id.txt", "$Id$\n");
+    warehouse.write_file("auto.txt", "l1\nl2\n");
+    warehouse.write_file("shout.up", "shout\n");
     warehouse.write_file("plain.txt", "plain\n");
     git_in(&root, &["add", "-A"]);
     git_in(&root, &["commit", "-qm", "first commit"]);
 
-    // Checked out again, git writes the converted bytes; the plain file comes back as it was.
-    for name in ["run.bat", "id.txt", "plain.txt"] {
+    // Checked out again, git writes the converted bytes; the plain file, which git may not
+    // convert, comes back as it was. The filter is configured only now, so the commit stored its input unchanged.
+    let names = ["run.bat", "id.txt", "auto.txt", "shout.up", "plain.txt"];
+    for name in names {
         std::fs::remove_file(root.join(name)).unwrap();
     }
-    git_in(&root, &["checkout", "--", "run.bat", "id.txt", "plain.txt"]);
+    git_in(&root, &["config", "filter.up.smudge", "tr a-z A-Z"]);
+    git_in(&root, &["-c", "core.autocrlf=true", "checkout", "--", "run.bat", "id.txt", "auto.txt", "shout.up", "plain.txt"]);
     assert_eq!(std::fs::read(root.join("run.bat")).unwrap(), b"echo one\r\necho two\r\n");
     assert_ne!(std::fs::read(root.join("id.txt")).unwrap(), b"$Id$\n");
+    assert_eq!(std::fs::read(root.join("auto.txt")).unwrap(), b"l1\r\nl2\r\n");
+    assert_eq!(std::fs::read(root.join("shout.up")).unwrap(), b"SHOUT\r\n");
+    assert_eq!(std::fs::read(root.join("plain.txt")).unwrap(), b"plain\n");
+
+    // Old enough by import time for a stat to prove its file. Without this wait every file would
+    // be recorded unproven for being too recent, and recording a converted file as proven (the
+    // defect this test pins) would read the same as the fix.
     std::thread::sleep(std::time::Duration::from_millis(2100));
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", "."]));
+    let imported = warehouse.run(&["import-git", "."]);
+    assert_success(&imported);
+    assert!(stdout(&imported).contains(
+        "warning: 4 file(s) do not hold the content imported for them, so they read as modified: \
+        \"auto.txt\", \"id.txt\", \"run.bat\", \"shout.up\"."
+    ), "{}", stdout(&imported));
 
-    let expected = vec![
-        ("untracked".to_string(), ".forkliftignore".to_string()),
-        ("modified".to_string(), "id.txt".to_string()),
-        ("modified".to_string(), "run.bat".to_string()),
-    ];
+    let ignore = ("untracked".to_string(), ".forkliftignore".to_string());
+    let modified = |name: &str| ("modified".to_string(), name.to_string());
+    let expected = vec![ignore.clone(), modified("auto.txt"), modified("id.txt"), modified("run.bat"),
+        modified("shout.up")];
     assert_eq!(unstaged_changes(&warehouse), expected, "right after the import");
 
     // A new mtime makes every entry's stat miss, so each file is hashed again.
-    for name in ["run.bat", "id.txt", "plain.txt"] {
+    for name in names {
         backdate(&root.join(name), 60);
     }
     assert_eq!(unstaged_changes(&warehouse), expected, "once the stats miss");
+
+    // Restored, a file holds the imported content; loaded and stacked, the converted one is tracked.
+    assert_success(&warehouse.run(&["restore", "run.bat"]));
+    assert_eq!(std::fs::read(root.join("run.bat")).unwrap(), b"echo one\necho two\n");
+    assert_success(&warehouse.run(&["load", "id.txt"]));
+    assert_success(&warehouse.run(&["stack", "Track the expanded ident"]));
+    assert_eq!(unstaged_changes(&warehouse), vec![ignore, modified("auto.txt"), modified("shout.up")]);
 }
 
 /// A tree large enough for the inventory build to fan out (its files recorded on worker threads,

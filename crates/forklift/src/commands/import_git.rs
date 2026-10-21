@@ -31,7 +31,8 @@ use crate::output::{self, CommandOutput};
 /// boundary. Run it from the git repository's directory (`forklift import-git .`), so the
 /// checked-out working tree already holds the imported HEAD — except a file git converted on
 /// checkout (line endings, `ident`, a smudge filter), which reads as an unstaged change, since
-/// the history keeps the bytes git stored and forklift converts nothing.
+/// the history keeps the bytes git stored and forklift converts nothing. The import warns,
+/// naming them, about every file that does not hold its imported content.
 ///
 /// A large import lands hundreds of thousands of objects at once, which is exactly the case
 /// the loose object store is slowest in — writing (and later compacting away) one file per
@@ -131,6 +132,8 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         .or_else(|| imported.first())
         .map(|(_, pallet)| pallet.clone());
 
+    let mut unheld: Vec<String> = Vec::new();
+
     if let Some(pallet) = &current {
         let head = pallet_utils::get_pallet_head(pallet)?;
 
@@ -139,8 +142,9 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         if let Some(head) = head {
             progress.status("Building the inventory");
             let tree = object_utils::load_parcel(&head)?.tree_hash;
-            let shards = shift_utils::build_inventories_for_tree(&tree, shift_utils::TreeProvenance::Verify)?;
-            inventory_utils::replace_all_inventories(&shards)?;
+            let built = shift_utils::build_inventories_for_tree(&tree, shift_utils::TreeProvenance::Verify)?;
+            inventory_utils::replace_all_inventories(&built.shards)?;
+            unheld = built.unheld;
         }
     }
 
@@ -149,6 +153,9 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     // `.git` folder here to ignore. The history is already imported by now, so a failure to add
     // it is reported as a warning naming the rule, not as a failed import.
     let mut warnings = converter.warnings;
+    if let Some(warning) = unheld_warning(&unheld) {
+        warnings.push(warning);
+    }
     let git_rule = if forklift_core::globals::warehouse_root().join(".git").exists() {
         match ignore_git_directory() {
             Ok(GitRule::Refused(e)) => {
@@ -191,6 +198,39 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+/// How many of the files that do not hold their imported content the warning names.
+const UNHELD_NAMED: usize = 5;
+
+/// The warning for the working files that do not hold the content imported for them, which
+/// read as unstaged changes from the first stocktake: forklift converts nothing on checkout, so
+/// a file git converted reads as changed although nobody edited it, and saying so here is what
+/// keeps that from looking like an unexplained edit.
+///
+/// # Arguments
+/// * `unheld` - The keys of those files, in tree order.
+///
+/// # Returns
+/// * `Some(String)` - The warning, naming the first few files.
+/// * `None`         - Every file holds its imported content.
+fn unheld_warning(unheld: &[String]) -> Option<String> {
+    if unheld.is_empty() {
+        return None;
+    }
+
+    let mut named = unheld.iter().take(UNHELD_NAMED).map(|key| format!("\"{}\"", key)).collect::<Vec<_>>().join(", ");
+    if unheld.len() > UNHELD_NAMED {
+        named.push_str(&format!(" and {} more", unheld.len() - UNHELD_NAMED));
+    }
+
+    Some(format!(
+        "{} file(s) do not hold the content imported for them, so they read as modified: {}. \
+        An uncommitted edit does this, and so does git converting a file as it checks it out \
+        (line endings, \"ident\", a filter). Run \"restore\" on a path to write its imported \
+        content back, or \"load\" it to keep the file as it is.",
+        unheld.len(), named
+    ))
 }
 
 /// The ignore rule for a colocated git repository's metadata folder. It matches `.git`

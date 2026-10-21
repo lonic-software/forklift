@@ -417,7 +417,10 @@ pub enum Command {
                       local branch becomes a pallet. The imported history is unsigned (it predates \
                       trust), so import into a fresh warehouse and then run \"office enroll\" to \
                       anchor it. Run it from the git repo's directory (\"forklift import-git .\") so \
-                      the checked-out working tree matches the imported HEAD. Requires git on PATH."
+                      the checked-out working tree already holds the imported HEAD. Forklift \
+                      converts nothing on checkout, so a file git converted (line endings, ident, \
+                      a filter) reads as modified, and the import warns about it. Requires git \
+                      on PATH."
     )]
     ImportGit {
         /// The git repository to import from (e.g. \".\")
