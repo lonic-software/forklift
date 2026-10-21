@@ -438,8 +438,9 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
     for (index_path, error) in &snapshot.quarantined {
         lines.push(format!(
             "pack index \"{}\" could not be loaded ({}); the objects it names are quarantined — \
-            \"forklift heal\" can refetch them from a configured remote, and they will be reported \
-            dangling if they are still referenced and none is configured",
+            \"forklift heal\" can refetch any of them still under a durability taint from a \
+            configured remote, and such ones will be reported dangling if they are still referenced \
+            and none is configured; for the rest, restore the pack's data file",
             index_path.to_string_lossy(), error
         ));
     }
@@ -2593,7 +2594,8 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             degraded.join(" "),
         ),
         "Fix what is named above (a bay's state, the office record, or a pack index: restore its \
-        pack files from a good copy, move an index that does not parse out of the pack folder, or \
+        pack files from a good copy, move an index that does not parse out of the pack folder only \
+        if it holds nothing this warehouse needs, or \
         re-create the warehouse for one of another format version), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
@@ -2669,7 +2671,8 @@ fn dangling_refusal(root: &Path, lines: &[String], degraded: &[String]) -> CoreE
             "At least one of these could not be conclusively checked because a source of durable \
             references (a bay's saved state, or the office record), or a pack index holding \
             objects they reach, could not be read this run — fix it (for a pack index: restore its pack files from a good \
-            copy, move an index that does not parse out of the pack folder, or re-create the \
+            copy, move an index that does not parse out of the pack folder only if it holds \
+            nothing this warehouse needs, or re-create the \
             warehouse for one of another format version), then re-run \
             \"forklift heal\"; it may resolve on its own once everything is readable. Whatever \
             is still dangling after that needs a heavyweight resolution: {}",
