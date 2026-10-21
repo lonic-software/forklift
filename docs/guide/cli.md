@@ -247,6 +247,13 @@ the pallet head, unstaging everything staged there; the error names the exact co
 load the folder again, and load by name any file an ignore rule covers that you had loaded by
 name: a folder load never adds those.
 
+Forklift never makes a link inside the staging area (`.forklift/inventory` may itself be a link,
+for an inventory moved elsewhere). A link found inside it, at a folder's stored inventory or any
+folder above it, is treated as damage and is never followed, even when what it points at looks
+like a valid inventory: following it would take another folder's state for this one's, or write
+outside the staging area. Every command that reads the folder refuses and names the link. Remove
+the link, then run `restore --staged .` to reset the staging area to the pallet head.
+
 A folder below the warehouse root that holds its own `.forklift` (say you ran `prepare` in
 `vendor/lib`) is another working tree: commands run inside it use that warehouse, not this one.
 `load .` leaves it out entirely, `stocktake` lists it once as an untracked `vendor/lib/`, and
