@@ -477,9 +477,11 @@ pub fn tracked_kind(path: &WarehousePath) -> Result<TrackedKind, String> {
     };
 
     let (parent, file_name) = path.split_parent()?;
-    let (_, parent_inventory) = retrieve_inventory_or_empty(&parent)?;
+    // Read through the ledger, as the writer this picks does: an unregistered parent lists nothing.
+    let ledger = ShardLedger::read()?;
+    let parent_inventory = ledger.inventory(parent.as_key())?.unwrap_or_else(Inventory::new);
     let has_live_file_entry = has_live_entry(&parent_inventory, &file_name);
-    let registered = is_tracked_directory(path.as_key())?;
+    let registered = ledger.holds(path.as_key());
 
     Ok(match (is_directory_on_disk, registered, has_live_file_entry) {
         (true, true, _) => TrackedKind::Directory,
@@ -635,9 +637,7 @@ fn subtree_has_live_entry(key: &str, registered: &BTreeSet<String>) -> Result<bo
 /// * `Ok(bool)`    - Whether the key is registered.
 /// * `Err(String)` - If the metadata file could not be read.
 pub fn is_tracked_directory(key: &str) -> Result<bool, String> {
-    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
-
-    Ok(metadata_opt.is_some_and(|metadata| metadata.contains(&key_to_metadata_entry(key))))
+    Ok(ShardLedger::read()?.holds(key))
 }
 
 /// Every key registered in the inventory metadata (an empty set when there is no metadata file).
@@ -646,9 +646,7 @@ pub fn is_tracked_directory(key: &str) -> Result<bool, String> {
 /// * `Ok(BTreeSet<String>)` - The registered warehouse path keys.
 /// * `Err(String)`          - If the metadata file could not be read.
 fn registered_keys() -> Result<BTreeSet<String>, String> {
-    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
-
-    Ok(metadata_opt.unwrap_or_default().iter().map(|entry| metadata_entry_to_key(entry).to_string()).collect())
+    Ok(ShardLedger::read()?.keys().map(str::to_string).collect())
 }
 
 /// Create an inventory for the specified directory (and all subdirectories).
@@ -833,20 +831,21 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     if blob_batch_published {
         let new_inventory_paths = context.new_inventory_paths.lock().await.clone();
 
+        // A stale key's shard is already gone, so it is unregistered in the same write, before
+        // anything publishes. A failed write leaves it registered with no shard, which reads as an
+        // empty directory until the next load finds it stale again.
         let published = ShardLedger::read().and_then(|mut ledger| {
-            ledger.register(&new_inventory_paths)?;
+            ledger.update(&stale_keys, &new_inventory_paths)?;
             publish_shard_outcomes(&ledger, &clear_keys, &mut outcomes)
         });
 
         if let Err(e) = published {
             if result.is_ok() { result = Err(Some(e)); }
         }
-    }
-
-    // A stale key's shard is already gone, so unregistering it is safe whether or not anything
-    // above published. Stale keys are only ever populated by a dirty-path pass that ran (in full,
-    // or up to the point it failed) over a fully successful walk.
-    if !stale_keys.is_empty() {
+    } else if !stale_keys.is_empty() {
+        // Stale keys are only ever populated by a dirty-path pass that ran (in full, or up to the
+        // point it failed) over a fully successful walk; their shards are gone, so unregistering
+        // them is safe even though nothing publishes.
         unregister_inventory_keys(&stale_keys)?;
     }
 
@@ -922,8 +921,7 @@ fn stage_removal_for_directory(path: &WarehousePath) -> Result<(), String> {
     let ledger = ShardLedger::read()?;
 
     // Only registered keys hold staged content: an unregistered address is nobody's shard.
-    let keys: BTreeSet<String> = ledger.entries.iter()
-        .map(|entry| metadata_entry_to_key(entry))
+    let keys: BTreeSet<String> = ledger.keys()
         .filter(|key| path_utils::covers(path.as_key(), key))
         .map(str::to_string)
         .collect();
@@ -2355,8 +2353,7 @@ pub fn replace_subtree_inventories(key: &str,
 
     // `path_utils::covers("", _)` is always true, so this one predicate already subsumes the
     // former separate `key.is_empty()` case (drop everything) without a special-cased branch.
-    let replaced: BTreeSet<String> = ledger.entries.iter()
-        .map(|entry| metadata_entry_to_key(entry))
+    let replaced: BTreeSet<String> = ledger.keys()
         .filter(|entry_key| path_utils::covers(key, entry_key))
         .map(str::to_string)
         .collect();
@@ -2368,7 +2365,7 @@ pub fn replace_subtree_inventories(key: &str,
     // Unregister what was removed and register what is about to be published, in one metadata
     // write before any new shard lands. A key removed above and republished here is cleared and
     // synced again, so the removal is durable before the key is registered again.
-    ledger.register_replacing(&replaced, &shards.keys().cloned().collect())?;
+    ledger.update(&replaced, &shards.keys().cloned().collect())?;
 
     // One durability barrier for the whole replacement burst instead of one per shard
     // (DESIGN.html §5.0 D item 8, stage 2b) — every shard here carries a caller-computed,
@@ -2579,9 +2576,7 @@ pub fn remove_inventories_under(prefix: &str) -> Result<(), String> {
 
     let mut removed_keys: BTreeSet<String> = BTreeSet::new();
 
-    for entry in &ledger.entries {
-        let key = metadata_entry_to_key(entry);
-
+    for key in ledger.keys() {
         // The prefix directory itself, or a directory strictly under it.
         let under = key == prefix
             || (key.len() > prefix.len()
@@ -2901,54 +2896,43 @@ impl ShardLedger {
     /// * `Err(String)` - If an address could not be cleared or synced, or the metadata written;
     ///                   no key of `keys` this call would have added may then be published.
     pub fn register(&mut self, keys: &BTreeSet<String>) -> Result<(), String> {
-        let wanted = close_under_ancestors(&keys.iter().map(|key| key_to_metadata_entry(key)).collect());
-        let new_entries: BTreeSet<String> = wanted.difference(&self.entries).cloned().collect();
-
-        if new_entries.is_empty() {
-            return Ok(());
-        }
-
-        let mut entries = self.entries.clone();
-        entries.extend(new_entries.iter().cloned());
-
-        self.publish(&new_entries, entries)
+        self.update(&BTreeSet::new(), keys)
     }
 
-    /// Unregister `removed` and register `keys` in one durable metadata write, for a caller that
-    /// has just removed `removed`'s shards and is about to publish `keys`' (a subtree replacement).
+    /// Unregister `removed` and register `keys` (and their ancestors) in one durable metadata
+    /// write: for a caller that has removed `removed`'s shards and is about to publish `keys`'.
     ///
-    /// Unlike [`register`](Self::register), every key in `keys` counts as new even when this ledger
-    /// still holds it: a key the caller removed and is publishing again gets its address cleared
-    /// and synced like any other, so the caller's own unsynced removal is durable before the key
-    /// is registered again. An ancestor the closure adds counts as new only when it is not
-    /// registered once `removed` is gone.
+    /// A key counts as new, and has its address cleared and synced first, when it is not
+    /// registered once `removed` is gone. So a removed key published again is cleared like any
+    /// other, which makes the caller's own unsynced removal durable before the key is registered
+    /// again, while a key still registered and not removed is never cleared. When no key is new and
+    /// the registered set would not change, nothing is cleared, synced or written.
     ///
     /// # Arguments
-    /// * `removed` - Warehouse path keys whose shards the caller removed.
+    /// * `removed` - Warehouse path keys to unregister (whose shards are gone).
     /// * `keys`    - Warehouse path keys of the directories about to be published.
     ///
     /// # Returns
-    /// * `Ok(())`      - The metadata now registers exactly the old set minus `removed`, plus
-    ///                   `keys` and their ancestors.
-    /// * `Err(String)` - If an address could not be cleared or synced, or the metadata written.
-    pub fn register_replacing(&mut self,
-                              removed: &BTreeSet<String>,
-                              keys: &BTreeSet<String>) -> Result<(), String> {
-        let mut entries = self.entries.clone();
+    /// * `Ok(())`      - The metadata now registers the old set minus `removed`, plus `keys` and
+    ///                   their ancestors.
+    /// * `Err(String)` - If an address could not be cleared or synced, or the metadata written;
+    ///                   no key of `keys` this call would have added may then be published.
+    pub fn update(&mut self, removed: &BTreeSet<String>, keys: &BTreeSet<String>) -> Result<(), String> {
+        let mut kept = self.entries.clone();
 
         for key in removed {
-            entries.remove(&key_to_metadata_entry(key));
+            kept.remove(&key_to_metadata_entry(key));
         }
 
-        let key_entries: BTreeSet<String> = keys.iter().map(|key| key_to_metadata_entry(key)).collect();
-        let wanted = close_under_ancestors(&key_entries);
+        let wanted = close_under_ancestors(&keys.iter().map(|key| key_to_metadata_entry(key)).collect());
+        let new_entries: BTreeSet<String> = wanted.difference(&kept).cloned().collect();
 
-        let new_entries: BTreeSet<String> = wanted.iter()
-            .filter(|entry| key_entries.contains(*entry) || !entries.contains(*entry))
-            .cloned()
-            .collect();
+        kept.extend(wanted);
+        let entries = close_under_ancestors(&kept);
 
-        entries.extend(wanted);
+        if new_entries.is_empty() && entries == self.entries {
+            return Ok(());
+        }
 
         self.publish(&new_entries, entries)
     }
@@ -3525,29 +3509,6 @@ fn stage_removal_for_file(path: &WarehousePath) -> Result<(), String> {
     write_shard_mutation(&ledger, parent.as_key(), &mut inventory)?;
 
     Ok(())
-}
-
-/// Retrieve the associated inventory for the given directory
-/// (or an empty inventory, if it does not have one yet).
-///
-/// # Arguments
-/// * `parent` - The warehouse path of the directory.
-///
-/// # Returns
-/// * `Ok((PathBuf, Inventory))`:
-///    * `PathBuf`   - The path to the inventory file (if the inventory file was not found, this is
-///                    the path where it should have been).
-///    * `Inventory` - The inventory found (or an empty inventory otherwise).
-/// * `Err(String)` - If there was an error.
-fn retrieve_inventory_or_empty(parent: &WarehousePath) -> Result<(std::path::PathBuf, Inventory), String> {
-    let (inventory_path, inventory_bytes) = file_utils::retrieve_inventory_or_none_by_key(parent.as_key())?;
-
-    let inventory = match inventory_bytes {
-        Some(bytes) => parser::inventory::inventory_parser::parse_inventory(&bytes)?,
-        None => Inventory::new(),
-    };
-
-    Ok((inventory_path, inventory))
 }
 
 /// Save the given inventory as the shard of `key`.
@@ -5126,5 +5087,34 @@ mod tests {
         assert!(file_utils::retrieve_inventory_or_none_by_key(&key).unwrap().1.is_none(),
             "no shard is published before its address is synced");
         assert!(result.unwrap_err().contains("injected directory-sync failure"));
+    }
+
+    /// The kind a load, removal or restore picks is read through the ledger too, so a shard at an
+    /// unregistered parent cannot make a real folder look like a tracked file.
+    #[test]
+    fn tracked_kind_never_reads_an_unregistered_parent() {
+        let _scratch = Scratch::new("tracked-kind-ghost-parent");
+
+        let mut ghost = Inventory::new();
+        ghost.add_item(item("enums", 1, InventoryItemState::Normal));
+        plant_shard(&ghost, "src");
+        assert!(!is_tracked_directory("src").unwrap());
+
+        let kind = tracked_kind(&WarehousePath::from_user_input(LOADED_FOLDER).unwrap()).unwrap();
+
+        assert!(matches!(kind, TrackedKind::UntrackedDirectory), "a folder on disk the ledger does not hold");
+    }
+
+    /// A key still registered and not removed is not new, so an update never clears its shard.
+    #[test]
+    fn a_ledger_update_never_clears_a_registered_key_it_keeps() {
+        let _scratch = Scratch::new("ledger-update-keeps");
+        stamped_chain_with_sibling();
+
+        let mut ledger = ShardLedger::read().unwrap();
+        ledger.update(&BTreeSet::from(["a/b".to_string()]), &BTreeSet::from(["a/b".to_string(), "x".to_string()])).unwrap();
+
+        assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "the kept key's shard is untouched");
+        assert!(file_utils::retrieve_inventory_or_none_by_key("a/b").unwrap().1.is_none(), "the removed key republished is cleared");
     }
 }

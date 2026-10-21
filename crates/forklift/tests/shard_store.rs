@@ -274,4 +274,6 @@ fn restore_never_reads_a_shard_of_an_unregistered_directory() {
 
     assert!(!warehouse.root.join("docs/a.txt").exists(),
         "restore read the shard of an unregistered directory: {}", stdout(&output));
+    assert!(!output.status.success(), "restore of an untracked file must fail");
+    assert!(stderr(&output).contains("\"docs/a.txt\" is not in the inventory."), "{}", stderr(&output));
 }
