@@ -43,8 +43,8 @@ pub(crate) struct StoreReport {
     /// Additive field; never acted on automatically.
     densify_suggested: bool,
     /// Pack indexes that parsed but whose data file could not be loaded — their
-    /// objects are quarantined, not lost: `forklift heal` can still refetch them. Empty on a
-    /// healthy store.
+    /// objects are quarantined, not lost: `forklift heal` can still refetch any of them under a
+    /// durability taint, and restoring the data file recovers the rest. Empty on a healthy store.
     quarantined_packs: Vec<PackIndexIssue>,
     /// Packs that load but whose index is damaged in places: their sound parts are still read,
     /// and an object in a damaged part reads as unverifiable until it is stored again. Empty on a

@@ -1785,7 +1785,8 @@ unproven state.
 Every `heal` run also checks the pack folder for the same problem indexes `store` reports (see
 above) and prints a warning line for each one it finds — unconditionally, whether or not anything
 else was tainted this run, and whether or not that index is what caused the taint. A quarantined
-index's objects are left recoverable (`heal` can refetch them); a damaged pack still serves its
+index's objects are left recoverable (`heal` refetches those under a durability taint, and
+restoring the pack's data file recovers the rest); a damaged pack still serves its
 sound parts; an index of another format means re-creating the warehouse; an unenumerable one names
 the file to move aside. This appears even when `heal` still has to refuse — as a
 clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
