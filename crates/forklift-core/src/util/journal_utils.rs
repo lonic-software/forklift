@@ -456,7 +456,7 @@ fn is_half_undone(entry: &JournalEntry, now: &BayState) -> Result<bool, String> 
 fn refuse_a_pick_without_its_source(entry: &JournalEntry) -> Result<(), String> {
     let Some(pick) = &entry.before.cherry_pick else { return Ok(()) };
 
-    if entry.after.cherry_pick.is_some() || file_utils::does_object_exist(&pick.source)? {
+    if file_utils::does_object_exist(&pick.source)? {
         return Ok(());
     }
 
