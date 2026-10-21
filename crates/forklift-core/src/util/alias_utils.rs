@@ -219,12 +219,11 @@ impl AliasCheck {
     /// Whether the inventory holds a live file entry at `key` (see [`tracked_file`]), against the
     /// registered set as this check first read it.
     pub fn tracked_file(&mut self, key: &str) -> Result<bool, String> {
-        let ledger = match self.ledger.take() {
-            Some(ledger) => ledger,
-            None => inventory_utils::ShardLedger::read()?,
-        };
+        if self.ledger.is_none() {
+            self.ledger = Some(inventory_utils::ShardLedger::read()?);
+        }
 
-        tracked_file(self.ledger.insert(ledger), key)
+        tracked_file(self.ledger.as_ref().unwrap(), key)
     }
 
     /// The names a directory lists (`None` when it cannot be read as a directory).

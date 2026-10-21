@@ -198,11 +198,11 @@ fn write_shard_mutation_with_extra(ledger: &ShardLedger,
 
     inventory.set_rollup_hash(None);
 
-    let Some((extra_path, extra_content)) = extra else {
-        return save_inventory(ledger, key, inventory);
-    };
-
     let bytes = ensure_inventory_folder_and_build(inventory, &shard_path)?;
+
+    let Some((extra_path, extra_content)) = extra else {
+        return file_utils::write_file_atomically(&shard_path, &bytes);
+    };
 
     let batch = file_utils::WriteBatch::new();
     batch.stage(&shard_path, &bytes)?;
@@ -5104,6 +5104,57 @@ mod tests {
             update_shard("a/b", add_new_txt).unwrap();
             assert_eq!(registered_names("a/b"), ["new.txt"], "{level}");
         }
+    }
+
+    /// An inventory root moved behind a link whose target is out of reach is not read as a staging
+    /// area with nothing in it, and the refusal sends the user to the target, not to a reset that
+    /// would abandon what is staged there.
+    #[test]
+    fn an_inventory_root_out_of_reach_is_refused_with_its_own_way_out() {
+        let scratch = Scratch::new("inventory-root-out-of-reach");
+        stamped_chain_with_sibling();
+
+        let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
+        let moved = scratch.root.join("drive");
+        std::fs::rename(&inventory_root, &moved).unwrap();
+        link_to(&scratch.root.join("unmounted"), &inventory_root, true);
+
+        let ledger = ShardLedger::read();
+        let shard = file_utils::retrieve_inventory_or_none_by_key("a/b");
+
+        for (what, result) in [("ledger", ledger.map(|_| ())), ("shard", shard.map(|_| ()))] {
+            let error = result.expect_err(what);
+            assert!(error.contains("does not resolve to a folder") && error.contains("make its target available"),
+                    "{what}: {error}");
+            assert!(!error.contains("a link is never followed"), "{what}: {error}");
+        }
+
+        // The way out: bring the target back.
+        unlink(&inventory_root, true);
+        link_to(&moved, &inventory_root, true);
+        assert_eq!(registered_names("a/b"), ["file.txt"]);
+    }
+
+    /// The registered set decides what every writer may touch, so it is never read through a link,
+    /// and the way out the refusal names works.
+    #[test]
+    fn a_linked_inventory_metadata_is_refused_unfollowed() {
+        let scratch = Scratch::new("linked-metadata");
+        stamped_chain_with_sibling();
+
+        let metadata = file_utils::get_inventory_metadata_path();
+        let outside = scratch.root.join("other-metadata");
+        std::fs::rename(&metadata, &outside).unwrap();
+        link_to(&outside, &metadata, false);
+
+        let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
+        assert!(error.contains("is not a file (a link is never followed)") && error.contains("restore --staged ."), "{error}");
+
+        // The way out: remove the link, then reset the staging area to the head (here, empty).
+        unlink(&metadata, false);
+        replace_subtree_inventories("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
+        update_shard("a/b", add_new_txt).unwrap();
+        assert_eq!(registered_names("a/b"), ["new.txt"]);
     }
 
     fn link_to(target: &Path, link: &Path, is_dir: bool) {

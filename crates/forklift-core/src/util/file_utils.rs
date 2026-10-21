@@ -2219,14 +2219,16 @@ pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
     let file_path = get_inventory_data_path_for_key(key)?;
 
     let damaged = |entry: &Path, expected: &str| Err(format!(
-        "Error while reading the inventory of folder \"{}\": \"{}\" is not a {} (a link is never followed). \
-        Remove it, then run \"forklift restore --staged .\" to reset the staging area to the pallet head.",
-        load_guard_utils::display_path(key), entry.to_string_lossy(), expected
+        "The inventory of folder \"{}\" cannot be used: \"{}\" is not a {} (a link is never followed). {}",
+        load_guard_utils::display_path(key), entry.to_string_lossy(), expected, STAGING_DAMAGE_REMEDY
     ));
 
     // The folders first: below a non-folder, the shard itself reads as not found on Windows and as
     // not a directory elsewhere, and neither names the damage.
     if let Some(folder) = non_folder_in_shard_chain(&file_path) {
+        if file_path.ancestors().nth(4) == Some(folder) {
+            return Err(unresolved_inventory_root(folder));
+        }
         return damaged(folder, "folder");
     }
 
@@ -2239,6 +2241,22 @@ pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
             load_guard_utils::display_path(key), file_path.to_string_lossy(), e
         )),
     }
+}
+
+/// What a user does about damage Forklift never makes in the staging area, such as a link: remove
+/// the entry, then reset the staging area to the pallet head.
+pub const STAGING_DAMAGE_REMEDY: &str =
+    "Remove it, then run \"forklift restore --staged .\" to reset the staging area to the pallet head.";
+
+/// The refusal for an inventory root that is there but does not resolve to a folder. It may be a
+/// link to an inventory moved elsewhere whose target is out of reach, such as an unmounted drive:
+/// then the way out is to bring the target back, since a reset would abandon what is staged there.
+pub fn unresolved_inventory_root(inventory_root: &Path) -> String {
+    format!(
+        "The inventory folder \"{}\" does not resolve to a folder. If it is a link to an inventory moved \
+        elsewhere, make its target available again (a drive that is not mounted, say); otherwise {}",
+        inventory_root.to_string_lossy(), STAGING_DAMAGE_REMEDY.replacen("Remove", "remove", 1)
+    )
 }
 
 /// The first entry, from a shard's own folder up to the inventory root, that exists and is not a
@@ -2270,12 +2288,31 @@ pub fn get_inventory_metadata_path() -> PathBuf {
 /// * `Ok((PathBuf, None))` - If the inventory metadata file does not exist:
 ///    * `PathBuf` - The path where the inventory metadata file should have been.
 /// * `Err(String)` - The error message if the inventory metadata file exists, but there was an
-/// error while reading it.
+/// error while reading it, or it is not a regular file, or the inventory root does not resolve to
+/// a folder.
 pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet<String>>), String> {
     let metadata_store_path = get_inventory_metadata_path();
 
-    if !metadata_store_path.exists() {
-        return Ok((metadata_store_path, None));
+    // The registered set decides what every writer may touch, so it is never read through a link,
+    // and an inventory root that is out of reach is not taken for one with nothing registered.
+    match std::fs::symlink_metadata(&metadata_store_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(format!(
+            "The inventory metadata \"{}\" is not a file (a link is never followed). {}",
+            metadata_store_path.to_string_lossy(), STAGING_DAMAGE_REMEDY
+        )),
+        Err(e) => {
+            let inventory_root = PathBuf::from(get_path_inventory_root());
+            if std::fs::symlink_metadata(&inventory_root).is_ok() && !std::fs::metadata(&inventory_root).is_ok_and(|meta| meta.is_dir()) {
+                return Err(unresolved_inventory_root(&inventory_root));
+            }
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok((metadata_store_path, None));
+            }
+            return Err(format!(
+                "Error while reading inventory metadata from file \"{}\": {}", metadata_store_path.to_string_lossy(), e
+            ));
+        }
     }
 
     let metadata_bytes = std::fs::read(&metadata_store_path)

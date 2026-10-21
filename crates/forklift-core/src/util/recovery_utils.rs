@@ -1653,10 +1653,16 @@ fn describe_shard(shard_path: &Path) -> String {
 /// written; the two callers differ only in what they do with the paths this returns.
 fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
     // A folder absent from the start, or removed while the walk descends (its last shard
-    // unstaged concurrently), holds no shards.
+    // unstaged concurrently), holds no shards. An inventory root that is a link to a folder out of
+    // reach is not absent: what it stages is unknown, so it cannot count as nothing.
     let entries = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(folder).is_ok() {
+                return Err(file_utils::unresolved_inventory_root(folder));
+            }
+            return Ok(());
+        }
         Err(e) => return Err(format!("Error while reading directory \"{}\": {}", folder.to_string_lossy(), e)),
     };
 
@@ -1673,10 +1679,8 @@ fn walk_shard_data_files(folder: &Path, found: &mut Vec<PathBuf>) -> Result<(), 
 
         if kind.is_symlink() {
             return Err(format!(
-                "\"{}\" in the staging area is a link, which Forklift never makes there, so it is not followed. \
-                Remove it, then run \"forklift restore --staged .\" in its checkout to reset the staging area \
-                to the pallet head.",
-                path.to_string_lossy()
+                "\"{}\" in the staging area is a link, which Forklift never makes there, so it is not followed. {}",
+                path.to_string_lossy(), file_utils::STAGING_DAMAGE_REMEDY
             ));
         }
 
@@ -6321,6 +6325,24 @@ mod tests {
         let error = walk_shard_files(&inventory_root, &mut Vec::new()).unwrap_err();
         assert!(error.contains("which matches no registered directory"), "{}", error);
         assert!(!error.contains("ghost"), "{}", error);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An inventory root that is a link to a folder out of reach holds an unknown set of shards, so
+    /// a walk that must see every one of them fails rather than find none.
+    #[test]
+    fn a_walk_over_an_inventory_root_out_of_reach_fails() {
+        let (root, _scope) = staged_warehouse("walker-root-out-of-reach", &["", "docs"]);
+        let inventory_root = PathBuf::from(file_utils::get_path_inventory_root());
+        std::fs::rename(&inventory_root, root.join("drive")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("unmounted"), &inventory_root).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(root.join("unmounted"), &inventory_root).unwrap();
+
+        let error = walk_shard_files(&inventory_root, &mut Vec::new()).expect_err("an unreachable root");
+        assert!(error.contains("does not resolve to a folder"), "{error}");
 
         std::fs::remove_dir_all(&root).ok();
     }
