@@ -1454,8 +1454,8 @@ impl WriteBatch {
     /// reclaims regardless, see [`BulkStoreSession::finish`]'s doc comment), a temp staged into
     /// some other directory (an inventory folder, via [`stage`](Self::stage))
     /// has no *dedicated* sweeper of its own — it survives until whatever incidentally clears that
-    /// directory wholesale (e.g. `inventory_utils::replace_subtree_inventories`'s `remove_dir_all`
-    /// of the whole staging folder), not on any schedule this crate guarantees.
+    /// directory wholesale (e.g. `inventory_utils::ShardLedger::replace`'s removal of the whole
+    /// store), not on any schedule this crate guarantees.
     ///
     /// # Returns
     /// * `Ok(())`      - If the write was staged.

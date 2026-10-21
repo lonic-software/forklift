@@ -35,8 +35,8 @@
 //! The marker lives beside the inventory metadata file — directly under
 //! [`file_utils::get_path_inventory_root`] (the bay-local staging root), a **sibling** of the
 //! `inv_` shard store, never inside it. Every operation that replaces staging wholesale or by
-//! subtree (`inventory_utils::replace_all_inventories`, `inventory_utils::
-//! replace_subtree_inventories`) removes shards only inside that `inv_` store — never the
+//! subtree (`inventory_utils::replace_all_inventories`, `inventory_utils::ShardLedger::
+//! replace_subtree`) removes shards only inside that `inv_` store — never the
 //! inventory root folder itself — so none of them can delete the marker in passing; those same
 //! two functions are also where this module's clearing side of the contract is wired in (see
 //! [`clear_recorded_under`] and [`clear_all_recorded`]).
@@ -99,7 +99,7 @@
 //!   answer with no separate function needed. `shift`, `park`'s post-push reset, a `consolidate`
 //!   fast-forward, `import-git`'s initial checkout, and `lower`/`franchise`'s materialization all
 //!   replace the *entire* staging area from a known-good tree — call [`clear_all_recorded`]. Both
-//!   are wired once, inside `inventory_utils::replace_subtree_inventories` and `inventory_utils::
+//!   are wired once, inside `inventory_utils::ShardLedger::replace_subtree` and `inventory_utils::
 //!   replace_all_inventories` respectively, so every caller of either gets this for free.
 //!
 //! Removal is always best-effort (`marker_utils::remove_covered_by`/`clear` swallow every error):
