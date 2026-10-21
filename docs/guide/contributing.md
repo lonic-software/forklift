@@ -95,6 +95,16 @@ Notes:
   for a shared core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
   reproduces that load locally (the `ci` profile gives the crash suite's kill
   tests two slots each, which only pays at that thread count).
+- On macOS, `.cargo/config.toml` builds with `-Csplit-debuginfo=packed`: debuginfo
+  goes into a `.dSYM` beside each binary instead of object files left in
+  `target/debug/deps`. Under the default, every incremental rebuild leaves fresh
+  objects there and nothing removes the old ones. rustc lists that directory to find
+  crates, so builds slow down as it grows: with 2.9 million stale files, rebuilding
+  the server and the tests after a core edit took over 3 min instead of 6 s. The
+  setting stops the growth but does not remove existing files, so a target
+  directory built before it needs one `cargo clean`. If builds slow down for no
+  visible reason, count `ls -f target/debug/deps | wc -l`; a fresh workspace build
+  has about 1,100.
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
 

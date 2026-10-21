@@ -1,0 +1,14 @@
+# macOS builds (FORK-224). Cargo's default on macOS, split-debuginfo = "unpacked",
+# leaves each crate's object files in target/debug/deps for the debugger to read, and under
+# incremental compilation every rebuilt codegen unit gets a fresh file name. Nothing deletes the
+# old ones: a core edit added ~4,400 files, a working tree reached 2.9 million, and since rustc
+# lists that directory to find crates, rebuilding the server and the tests after a core edit grew
+# from 6 s to over 3 min.
+# "packed" gathers the debuginfo into a .dSYM per binary and leaves no objects behind, for about
+# 10 s more per touched-core rebuild; it overtakes the default at roughly 250,000 stale files.
+# CI cannot accumulate these: Swatinem/rust-cache exports CARGO_INCREMENTAL=0, and without
+# incremental the object names are stable and get overwritten. macOS CI still gets the flag and
+# pays dsymutil for nothing; at the time of writing the cost was small enough not to special-case.
+# A rustc flag given later wins, so this overrides the "unpacked" cargo passes.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-Csplit-debuginfo=packed"]
