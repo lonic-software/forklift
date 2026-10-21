@@ -22,8 +22,9 @@
 //! parcel that last wrote that path.
 //!
 //! Divergence is reconciled without merge parcels: [`detect_conflicts`] walks base, ours and
-//! theirs and names every path both sides changed differently, and [`replay_meta_pallet`]
-//! applies the local side's *net* change since base onto the remote head as one new parcel.
+//! theirs and names every path both sides changed differently, [`plan_replay`] plans the local
+//! side's *net* change since base, and [`replay_meta_pallet`] stacks that plan onto the remote
+//! head as one new parcel.
 //!
 //! Enforcement and sync dispatch on [`meta_rules`], a code-level list of meta pallet names,
 //! never on whether a pallet happens to carry a format marker. A name not on the list has no
@@ -1622,25 +1623,35 @@ pub fn restamp_for_replay(changes: &[CellChange],
     Ok(edits)
 }
 
-/// Replay the local net change since `base` (the chains' common ancestor, `None` when they
-/// share none) onto the remote head `theirs`, as one parcel signed by `signer` whose only
-/// parent is `theirs`. The local parcels themselves never leave the clone. The new parcel
-/// passes [`verify_meta_content`] against `theirs` before it is returned; no head moves.
+/// What a replay of the local net change onto a remote head would apply, planned before
+/// anything is signed.
+pub struct ReplayPlan {
+    theirs: String,
+    theirs_cells: Option<String>,
+    changes: Vec<CellChange>,
+}
+
+impl ReplayPlan {
+    /// Whether the remote head already holds everything the replay would apply, so there is
+    /// nothing to sign: the local side can simply move to it.
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
+/// Plan the replay of the local net change since `base` (the chains' common ancestor, `None`
+/// when they share none) onto the remote head `theirs` (see [`plan_net_changes`]). Needs no
+/// signing key, so a resolution that drops every local change never needs one.
 ///
 /// # Returns
-/// * `Ok(Some(hash))` - The replayed parcel.
-/// * `Ok(None)`       - `theirs` already holds the local net change; nothing to replay.
+/// * `Ok(ReplayPlan)` - The changes to apply, possibly none.
 /// * `Err(..)`        - Unresolved conflicts, or a refusal.
-pub fn replay_meta_pallet(pallet: &str,
-                          rules: &dyn PalletRules,
-                          office: &OfficeState,
-                          base: Option<&str>,
-                          ours: &str,
-                          theirs: &str,
-                          keep: &BTreeMap<String, KeepSide>,
-                          actor: &Operator,
-                          description: &str,
-                          signer: &MetaSigner) -> Result<Option<String>, ReplayError> {
+pub fn plan_replay(pallet: &str,
+                   rules: &dyn PalletRules,
+                   base: Option<&str>,
+                   ours: &str,
+                   theirs: &str,
+                   keep: &BTreeMap<String, KeepSide>) -> Result<ReplayPlan, ReplayError> {
     let base_cells = match base {
         Some(base) => read_pallet_spine(pallet, base, rules.kind())?.cells,
         None => None,
@@ -1649,10 +1660,32 @@ pub fn replay_meta_pallet(pallet: &str,
     let theirs_cells = read_pallet_spine(pallet, theirs, rules.kind())?.cells;
 
     let changes = plan_net_changes(base_cells.as_deref(), ours_cells.as_deref(), theirs_cells.as_deref(), keep)?;
-    let edits = restamp_for_replay(&changes, office, &signer.key_id)?;
+
+    Ok(ReplayPlan { theirs: theirs.to_string(), theirs_cells, changes })
+}
+
+/// Stack a planned replay onto its remote head as one parcel signed by `signer` whose only
+/// parent is that head. The local parcels themselves never leave the clone. The new parcel
+/// passes [`verify_meta_content`] against the head before it is returned; no head moves.
+///
+/// # Returns
+/// * `Ok(Some(hash))` - The replayed parcel.
+/// * `Ok(None)`       - The remote head already holds the local net change; nothing to replay.
+/// * `Err(..)`        - A refusal.
+pub fn replay_meta_pallet(pallet: &str,
+                          rules: &dyn PalletRules,
+                          office: &OfficeState,
+                          plan: &ReplayPlan,
+                          actor: &Operator,
+                          description: &str,
+                          signer: &MetaSigner) -> Result<Option<String>, ReplayError> {
+    let theirs = plan.theirs.as_str();
+    let theirs_cells = &plan.theirs_cells;
+
+    let edits = restamp_for_replay(&plan.changes, office, &signer.key_id)?;
     let new_cells = apply_edits(theirs_cells.as_deref(), &edits)?;
 
-    if new_cells == theirs_cells {
+    if new_cells == *theirs_cells {
         return Ok(None);
     }
 
@@ -2731,11 +2764,9 @@ mod tests {
               keep: &[(&str, KeepSide)],
               signer: &Key) -> Result<Option<String>, ReplayError> {
         let base = linear_common_ancestor(ours, theirs).unwrap();
+        let plan = plan_replay(PALLET, &TestRules, base.as_deref(), ours, theirs, &keep_of(keep))?;
 
-        replay_meta_pallet(
-            PALLET, &TestRules, office, base.as_deref(), ours, theirs, &keep_of(keep),
-            &actor(&signer.record.operator), "replay", &signer.signer(),
-        )
+        replay_meta_pallet(PALLET, &TestRules, office, &plan, &actor(&signer.record.operator), "replay", &signer.signer())
     }
 
     fn refusal(result: Result<Option<String>, ReplayError>) -> String {

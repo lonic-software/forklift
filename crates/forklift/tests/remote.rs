@@ -1259,6 +1259,12 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", worker_id]));
     assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main", "-m", "release"]));
+
+    // Before its first lift the remote has no @tags at all, so there is no side to keep.
+    let unlifted = area.forklift("b", &["lower", "--keep", "tags:v1.0=theirs"]);
+    assert!(!unlifted.status.success(), "{}", stdout(&unlifted));
+    assert!(stderr(&unlifted).contains("@tags is not on the remote yet"), "{}", stderr(&unlifted));
+
     let lifted = area.forklift("b", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the @tags pallet"), "{}", stdout(&lifted));
@@ -1298,10 +1304,49 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "a demoted tagger's tag must not be admitted");
     assert!(stderr(&refused).contains("not an admin"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("\"lower --keep tags:<path>=theirs\" drops it"), "{}", stderr(&refused));
+
+    // The way out: lower with theirs at the refused tag. Ours is refused, since nothing on the
+    // remote conflicts with it, and so is theirs at a path with no local change.
+    let remote_tags = area.read_file("c/.forklift/meta/tags").trim().to_string();
+    assert_ne!(area.read_file("b/.forklift/meta/tags").trim(), remote_tags, "b's @tags must start ahead");
+
+    let kept_ours = area.forklift("b", &["lower", "--keep", "tags:v1.1=ours"]);
+    assert!(!kept_ours.status.success(), "{}", stdout(&kept_ours));
+    assert!(stderr(&kept_ours).contains("v1.1 is not in conflict"), "{}", stderr(&kept_ours));
+
+    let stale = area.forklift("b", &["lower", "--keep", "tags:v9.9=theirs"]);
+    assert!(!stale.status.success(), "{}", stdout(&stale));
+    assert!(stderr(&stale).contains("v9.9 has no local change"), "{}", stderr(&stale));
 
     let refused = area.forklift("b", &["tag", "create", "v2.0", "main"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("is not an admin"), "{}", stderr(&refused));
+
+    // With its key retired as well the worker can sign nothing, and theirs still drops the tag:
+    // a drop signs no parcel.
+    let list = stdout(&area.forklift("a", &["office", "list"]));
+    let worker_key_id = list.lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("key "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("office list shows the worker's key")
+        .to_string();
+    assert_success(&area.forklift("a", &["office", "retire", &worker_key_id]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+
+    assert_success(&area.forklift("b", &["lower", "--keep", "tags:v1.1=theirs"]));
+    assert_eq!(area.read_file("b/.forklift/meta/tags").trim(), remote_tags, "theirs returns @tags to the remote's head");
+    assert!(!area.forklift("b", &["tag", "show", "v1.1"]).status.success(), "the refused tag is dropped");
+    assert!(stdout(&area.forklift("b", &["tag", "show", "v1.0"])).contains("release"), "the admitted tag stays");
+    assert_success(&area.forklift("b", &["lift"]));
+
+    // In sync again, a resolution has nothing to resolve.
+    let in_sync = area.forklift("b", &["lower", "--keep", "tags:v1.1=theirs"]);
+    assert!(!in_sync.status.success(), "{}", stdout(&in_sync));
+    assert!(stderr(&in_sync).contains("@tags holds no local change the remote lacks"), "{}", stderr(&in_sync));
+
 }
 
 #[test]
@@ -1349,6 +1394,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
         .as_str().unwrap().to_string();
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success(), "a diverged @haul lift must be refused");
+    assert!(!stderr(&refused).contains("drops it"), "a diverged pallet is lowered, not dropped: {}", stderr(&refused));
 
     // Keeping theirs at a haul A opened locally drops it whole; A's comment, under a different
     // path from B's, replays onto the remote's and lifts.
@@ -6455,6 +6501,18 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     // A keep for a pallet that did not diverge is refused rather than silently ignored.
     let stale = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=theirs", subject)]);
     assert!(!stale.status.success(), "a keep with nothing to resolve must be refused");
+
+    // On a pallet only this side moved, theirs drops the change it names and replays the rest.
+    assert_success(&area.forklift("a", &["kv", "set", "main", "drop", "x"]));
+    assert_success(&area.forklift("a", &["kv", "set", "main", "stay", "y"]));
+    let kept = area.forklift("a", &["lower", "--keep", &format!("kv:{}/drop=theirs", subject)]);
+    assert_success(&kept);
+    assert!(stdout(&kept).contains("Replayed"), "{}", stdout(&kept));
+    assert!(!area.forklift("a", &["kv", "get", "main", "drop"]).status.success(), "the named change is dropped");
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(stdout(&area.forklift("b", &["kv", "get", "main", "stay"])).trim(), "y",
+               "the rest is replayed onto the remote");
+    assert!(!area.forklift("b", &["kv", "get", "main", "drop"]).status.success());
 
     // Unset removes the key; the log shows every change, newest first.
     assert_success(&area.forklift("a", &["kv", "unset", "main", "ci"]));
