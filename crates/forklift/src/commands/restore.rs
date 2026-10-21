@@ -83,12 +83,15 @@ pub fn handle_unstage(target: &str) -> Result<(), String> {
 /// * `Ok(())`      - If the restore completed.
 /// * `Err(String)` - If the path is not in the inventory or a write failed.
 fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
+    // Read once: nothing below writes the metadata before the batch publishes.
+    let ledger = inventory_utils::ShardLedger::read()?;
+
     if path.is_root() {
-        return restore_worktree_directory(path.as_key());
+        return restore_worktree_directory(&ledger, path.as_key());
     }
 
-    match inventory_utils::tracked_kind(path)? {
-        TrackedKind::Directory => return restore_worktree_directory(path.as_key()),
+    match inventory_utils::tracked_kind(&ledger, path)? {
+        TrackedKind::Directory => return restore_worktree_directory(&ledger, path.as_key()),
         TrackedKind::UntrackedDirectory => return Err(format!("No inventory found for folder \"{}\".", path.as_key())),
         TrackedKind::File => {}
     }
@@ -104,7 +107,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
     let (parent, file_name) = path.split_parent()?;
 
-    let Some(inventory) = inventory_utils::ShardLedger::read()?.inventory(parent.as_key())? else {
+    let Some(inventory) = ledger.inventory(parent.as_key())? else {
         return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
     };
 
@@ -121,7 +124,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
     }
 
     // Through a batch rather than `update_shard`: recording only stat data keeps the rollups.
-    let mut batch = inventory_utils::ShardMutationBatch::new();
+    let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
 
     let message = match restore_entry(parent.as_key(), &item)? {
         Restored::Untouched => format!("\"{}\" already matches the inventory.", path.as_key()),
@@ -144,18 +147,17 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 /// Restore every tracked file of a directory (and its subdirectories) from the inventory.
 ///
 /// # Arguments
-/// * `key` - The warehouse path key of the directory.
+/// * `ledger` - The registered set.
+/// * `key`    - The warehouse path key of the directory.
 ///
 /// # Returns
 /// * `Ok(())`      - If the restore completed.
 /// * `Err(String)` - If the directory has no inventory or a write failed.
-fn restore_worktree_directory(key: &str) -> Result<(), String> {
-    let ledger = inventory_utils::ShardLedger::read()?;
-
+fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<(), String> {
     let mut restored_any = false;
     let mut restored_count = 0usize;
     let mut matched_count = 0usize;
-    let mut batch = inventory_utils::ShardMutationBatch::new();
+    let mut batch = inventory_utils::ShardMutationBatch::over(ledger);
     let mut result: Result<(), String> = Ok(());
 
     for shard_key in ledger.keys() {
@@ -410,8 +412,12 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
         None => None,
     };
 
+    // Read once: nothing below writes the metadata before its one write — `update_shard` or
+    // `replace_subtree` through this ledger, or the batch's publish, which reads its own.
+    let mut ledger = inventory_utils::ShardLedger::read()?;
+
     let treat_as_directory = path.is_root()
-        || inventory_utils::is_tracked_directory(path.as_key())?
+        || ledger.holds(path.as_key())
         || matches!(head_entry, Some(HeadEntry::Tree { .. }));
 
     if treat_as_directory {
@@ -426,12 +432,10 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
             // written to this bay's working directory.
             let scope = scope_utils::current_scope()?;
 
-            let ledger = inventory_utils::ShardLedger::read()?;
-
             build_unstaged_shards(&ledger, tree, path.as_key(), hash, &mut shards, &scope)?;
         }
 
-        inventory_utils::replace_subtree_inventories(path.as_key(), &shards)?;
+        ledger.replace_subtree(path.as_key(), &shards)?;
 
         output::message(format!(
             "Unstaged \"{}\" (inventory reset to the pallet head).",
@@ -447,14 +451,12 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
     match head_entry {
         Some(HeadEntry::File { hash, item_type }) => {
             // As in `build_unstaged_shards`, an unreadable shard only costs the shortcut.
-            let current = inventory_utils::ShardLedger::read()
-                .and_then(|ledger| ledger.inventory(parent.as_key()))
-                .unwrap_or(None);
+            let current = ledger.inventory(parent.as_key()).unwrap_or(None);
             let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref())?;
 
             // Through a batch rather than `update_shard`: an entry that already matched the head
             // changes only its stat data, which keeps the rollups.
-            let mut batch = inventory_utils::ShardMutationBatch::new();
+            let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
             batch.update(parent.as_key(), |inventory| inventory.add_item(entry))?;
             batch.publish()?;
         }
@@ -473,7 +475,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
             // paying even when no marker turns out to be involved (`healed` then comes back empty
             // and this falls through to the unchanged ordinary path below) — it is a metadata
             // scan plus, at most, a few small shard reads, not proportional to warehouse size.
-            if nothing_staged_under(path)? {
+            if nothing_staged_under(&ledger, path)? {
                 let healed = load_guard_utils::clear_recorded_under(path.as_key());
 
                 if !healed.is_empty() {
@@ -493,7 +495,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
 
             let mut removed = false;
 
-            inventory_utils::update_shard(parent.as_key(), |inventory| {
+            ledger.update_shard(parent.as_key(), |inventory| {
                 removed = inventory.remove_item_by_name(&file_name);
                 Ok(())
             })?;
@@ -517,14 +519,16 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
 /// (its own shard, or any nested one) carries at least one entry (of *any* state, including
 /// `Deleted` — a staged removal is still real staged content, not nothing).
 ///
+/// # Arguments
+/// * `ledger` - The registered set.
+/// * `path`   - The path to check.
+///
 /// # Returns
 /// * `Ok(true)`    - Nothing is staged under `path`, in either sense.
 /// * `Ok(false)`   - A parent-shard file entry, or at least one entry in some covered shard,
 ///                   exists.
 /// * `Err(String)` - A shard could not be read or parsed.
-fn nothing_staged_under(path: &WarehousePath) -> Result<bool, String> {
-    let ledger = inventory_utils::ShardLedger::read()?;
-
+fn nothing_staged_under(ledger: &inventory_utils::ShardLedger, path: &WarehousePath) -> Result<bool, String> {
     if !path.is_root() {
         let (parent, file_name) = path.split_parent()?;
 
@@ -747,4 +751,38 @@ fn resolve_head_entry(root_tree_hash: &str, key: &str) -> Result<Option<HeadEntr
     }
 
     Ok(Some(HeadEntry::Tree { tree: current, hash: current_hash }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{self, Warehouse};
+
+    /// How many times `run` reads the ledger on this thread.
+    fn ledger_reads(run: impl FnOnce()) -> u64 {
+        let before = inventory_utils::ledger_read_count();
+        run();
+        inventory_utils::ledger_read_count() - before
+    }
+
+    #[test]
+    fn a_restore_reads_the_ledger_once_whatever_the_path_names() {
+        let warehouse = Warehouse::with_working_tree("restore-ledger-reads");
+        forklift_core::util::pallet_utils::write_position(&forklift_core::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        std::fs::create_dir_all(warehouse.root.join("dir/sub")).unwrap();
+        std::fs::write(warehouse.root.join("dir/a.txt"), b"a\n").unwrap();
+        std::fs::write(warehouse.root.join("dir/sub/b.txt"), b"b\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+
+        // One read by the command, and one by its batch's publish, which re-reads under the lock.
+        for target in ["dir/a.txt", "dir", "."] {
+            std::fs::write(warehouse.root.join("dir/a.txt"), b"changed\n").unwrap();
+            assert_eq!(ledger_reads(|| handle_command(false, target).unwrap()), 2, "restore {}", target);
+        }
+
+        // One read, which the unstage's own metadata write goes through.
+        for target in ["dir/sub/b.txt", "dir"] {
+            assert_eq!(ledger_reads(|| handle_command(true, target).unwrap()), 1, "restore --staged {}", target);
+        }
+    }
 }

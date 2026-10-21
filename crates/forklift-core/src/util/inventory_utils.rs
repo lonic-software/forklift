@@ -300,7 +300,7 @@ fn inventory_content_matches(a: &Inventory, b: &Inventory) -> bool {
 /// # Returns
 /// * `Ok(())`      - If the operation was successful.
 /// * `Err(String)` - If there was an error.
-pub async fn add_changes_to_inventory(path: &WarehousePath, check: &mut alias_utils::AliasCheck) -> Result<(), String> {
+pub async fn add_changes_to_inventory(path: &WarehousePath, check: &mut alias_utils::AliasCheck<'_>) -> Result<(), String> {
     // The walk skips the metadata folder by its exact name, but a named path is loaded whatever
     // the rules say, so refuse it here. Every spelling some file system opens as a metadata
     // folder (`.Forklift`, `.forklift.`, `FORKLI~1`) is refused, in any component, and so is a
@@ -430,13 +430,15 @@ fn live_file_paths() -> Result<BTreeSet<String>, String> {
 /// * `Ok(())`      - If the operation was successful.
 /// * `Err(String)` - If there was an error.
 pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
+    let ledger = ShardLedger::read()?;
+
     if path.is_root() {
-        return stage_removal_for_directory(path);
+        return stage_removal_for_directory(&ledger, path);
     }
 
-    match tracked_kind(path)? {
-        TrackedKind::Directory => stage_removal_for_directory(path),
-        TrackedKind::File => stage_removal_for_file(path),
+    match tracked_kind(&ledger, path)? {
+        TrackedKind::Directory => stage_removal_for_directory(&ledger, path),
+        TrackedKind::File => stage_removal_for_file(&ledger, path),
         TrackedKind::UntrackedDirectory => Err(format!("No inventory found for folder \"{}\".", path.as_key())),
     }
 }
@@ -462,12 +464,13 @@ pub enum TrackedKind {
 ///   reports the path as not in the inventory).
 ///
 /// # Arguments
-/// * `path` - The warehouse path.
+/// * `ledger` - The registered set.
+/// * `path`   - The warehouse path.
 ///
 /// # Returns
 /// * `Ok(TrackedKind)` - What to treat the path as.
-/// * `Err(String)`     - If the path, the parent's shard or the metadata could not be read.
-pub fn tracked_kind(path: &WarehousePath) -> Result<TrackedKind, String> {
+/// * `Err(String)`     - If the path or the parent's shard could not be read.
+pub fn tracked_kind(ledger: &ShardLedger, path: &WarehousePath) -> Result<TrackedKind, String> {
     let is_directory_on_disk = match std::fs::symlink_metadata(path.to_fs_path()) {
         Ok(metadata) => metadata.is_dir(),
         // A file where a component of the path should be: nothing is at the path itself, and
@@ -478,7 +481,6 @@ pub fn tracked_kind(path: &WarehousePath) -> Result<TrackedKind, String> {
 
     let (parent, file_name) = path.split_parent()?;
     // Read through the ledger, as the writer this picks does: an unregistered parent lists nothing.
-    let ledger = ShardLedger::read()?;
     let parent_inventory = ledger.inventory(parent.as_key())?.unwrap_or_else(Inventory::new);
     let has_live_file_entry = has_live_entry(&parent_inventory, &file_name);
     let registered = ledger.holds(path.as_key());
@@ -621,23 +623,6 @@ fn subtree_has_live_entry(key: &str, registered: &BTreeSet<String>) -> Result<bo
     }
 
     Ok(false)
-}
-
-/// Whether the directory with the given key is tracked: registered in the inventory metadata.
-///
-/// Registration is the one definition of a tracked directory. Every ancestor of a registered key
-/// is registered too (see [`write_metadata_to_file`]), so every directory between the root and a
-/// tracked file is tracked. A registered key need not have a shard file: a directory that holds
-/// only subdirectories has none, and reads as an empty inventory.
-///
-/// # Arguments
-/// * `key` - The warehouse path key of the directory.
-///
-/// # Returns
-/// * `Ok(bool)`    - Whether the key is registered.
-/// * `Err(String)` - If the metadata file could not be read.
-pub fn is_tracked_directory(key: &str) -> Result<bool, String> {
-    Ok(ShardLedger::read()?.holds(key))
 }
 
 /// Every key registered in the inventory metadata (an empty set when there is no metadata file).
@@ -909,14 +894,13 @@ fn key_to_metadata_entry(key: &str) -> String {
 /// metadata entries are kept — they are the record of the staged removals.
 ///
 /// # Arguments
-/// * `path` - The path of the folder in the working dir.
+/// * `ledger` - The registered set.
+/// * `path`   - The path of the folder in the working dir.
 ///
 /// # Returns
 /// * `Ok(())`      - If the removals were staged successfully.
 /// * `Err(String)` - If no inventory exists for the folder, or there was an error.
-fn stage_removal_for_directory(path: &WarehousePath) -> Result<(), String> {
-    let ledger = ShardLedger::read()?;
-
+fn stage_removal_for_directory(ledger: &ShardLedger, path: &WarehousePath) -> Result<(), String> {
     // Only registered keys hold staged content: an unregistered address is nobody's shard.
     let keys: BTreeSet<String> = ledger.keys()
         .filter(|key| path_utils::covers(path.as_key(), key))
@@ -926,7 +910,7 @@ fn stage_removal_for_directory(path: &WarehousePath) -> Result<(), String> {
     let mut found_any_shard = false;
 
     for key in &keys {
-        if mark_shard_entries_deleted(&ledger, key)? {
+        if mark_shard_entries_deleted(ledger, key)? {
             found_any_shard = true;
         }
     }
@@ -1086,8 +1070,8 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 
 /// Many shard edits from one single-threaded operation, published together as one
 /// [`publish_shard_outcomes`] call — the third producer of [`ShardOutcome`]s, beside `load`'s walk
-/// and `park`'s refresh — instead of one [`update_shard`] (and so one ancestor-clear barrier, one
-/// shard write and one metadata rewrite) per edited entry.
+/// and `park`'s refresh — instead of one [`ShardLedger::update_shard`] (and so one ancestor-clear
+/// barrier, one shard write and one metadata rewrite) per edited entry.
 ///
 /// [`update`](Self::update) reads a shard on its first touch and applies every later change for
 /// the same key to the same in-memory copy; nothing reaches disk before [`publish`](Self::publish).
@@ -1106,19 +1090,32 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 /// [`publish_shard_outcomes`] requires: either stored before the change, or staged through
 /// [`stage_file_storing_blob`](Self::stage_file_storing_blob), whose blobs every publish makes
 /// durable first, in one barrier.
-pub struct ShardMutationBatch {
+pub struct ShardMutationBatch<'l> {
     shards: BTreeMap<String, TouchedShard>,
     blobs: file_utils::WriteBatch,
-    /// The registered set every first touch reads its baseline through, read on the first one.
-    ledger: Option<ShardLedger>,
+    /// The registered set every first touch reads its baseline through.
+    ledger: LazyLedger<'l>,
 }
 
-impl ShardMutationBatch {
-    pub fn new() -> ShardMutationBatch {
+impl ShardMutationBatch<'static> {
+    /// A batch that reads the registered set on its first touch.
+    pub fn new() -> ShardMutationBatch<'static> {
+        ShardMutationBatch::over_ledger(LazyLedger::Unread)
+    }
+}
+
+impl<'l> ShardMutationBatch<'l> {
+    /// A batch whose first touches read through `ledger`, for a caller that already holds the
+    /// registered set and writes no metadata before [`publish`](Self::publish).
+    pub fn over(ledger: &'l ShardLedger) -> ShardMutationBatch<'l> {
+        ShardMutationBatch::over_ledger(LazyLedger::Lent(ledger))
+    }
+
+    fn over_ledger(ledger: LazyLedger<'l>) -> ShardMutationBatch<'l> {
         ShardMutationBatch {
             shards: BTreeMap::new(),
             blobs: file_utils::WriteBatch::new(),
-            ledger: None,
+            ledger,
         }
     }
 
@@ -1137,12 +1134,8 @@ impl ShardMutationBatch {
                   key: &str,
                   change: impl FnOnce(&mut Inventory)) -> Result<(), String> {
         if !self.shards.contains_key(key) {
-            if self.ledger.is_none() {
-                self.ledger = Some(ShardLedger::read()?);
-            }
-
             // Through the ledger: an unregistered key starts empty, whatever its address holds.
-            let original_bytes = self.ledger.as_ref().unwrap().retrieve(key)?;
+            let original_bytes = self.ledger.get()?.retrieve(key)?;
 
             let inventory = match &original_bytes {
                 Some(bytes) => parser::inventory::inventory_parser::parse_inventory(bytes)
@@ -1580,25 +1573,26 @@ pub fn build_inventory_item_from_stat(path: &Path,
 
 /// Whether the directory at `path` may be safely replaced (by a file, or cleared to make
 /// way for one) without losing data: it is tracked — its key is registered, see
-/// [`is_tracked_directory`] — and every entry beneath it, recursively, is tracked too, so
+/// [`ShardLedger::holds`] — and every entry beneath it, recursively, is tracked too, so
 /// removing the tracked files leaves it empty. Called for a path a merge or shift
 /// wants to write a new file to that already exists as a directory on disk (a tracked
 /// dir→file flip); the caller still refuses when this returns `false`, exactly as it does
 /// for a plain untracked file at the path.
 ///
 /// # Arguments
-/// * `path` - The warehouse path of the directory (assumed to exist on disk).
+/// * `ledger` - The registered directory keys, read by the caller.
+/// * `path`   - The warehouse path of the directory (assumed to exist on disk).
 ///
 /// # Returns
 /// * `Ok(true)`    - The directory is tracked and has no untracked content beneath it.
 /// * `Ok(false)`   - The directory is untracked, or has untracked content beneath it.
 /// * `Err(String)` - If a directory entry or a shard could not be read or parsed.
-pub fn directory_is_safe_to_replace(path: &str) -> Result<bool, String> {
-    let registered = registered_keys()?;
-
-    if !registered.contains(path) {
+pub fn directory_is_safe_to_replace(ledger: &ShardLedger, path: &str) -> Result<bool, String> {
+    if !ledger.holds(path) {
         return Ok(false);
     }
+
+    let registered: BTreeSet<String> = ledger.keys().map(str::to_string).collect();
 
     let ignore_rules = file_utils::get_ignore_rules()?;
 
@@ -2297,90 +2291,90 @@ pub fn build_stale_inventory_item(name: &str, hash: String, item_type: DirEntryT
     }
 }
 
-/// Load the inventory shard for the given key (or an empty one), apply the given change,
-/// and save it back.
-///
-/// # Arguments
-/// * `key`    - The warehouse path key of the directory.
-/// * `change` - The change to apply to the inventory.
-///
-/// # Returns
-/// * `Ok(())`      - If the shard was updated.
-/// * `Err(String)` - If the shard could not be read, parsed or written.
-pub fn update_shard(key: &str,
-                    change: impl FnOnce(&mut Inventory) -> Result<(), String>) -> Result<(), String> {
-    let mut ledger = ShardLedger::read()?;
+impl ShardLedger {
+    /// Load the inventory shard for the given key (or an empty one), apply the given change,
+    /// and save it back, registering the key first if it is not yet.
+    ///
+    /// # Arguments
+    /// * `key`    - The warehouse path key of the directory.
+    /// * `change` - The change to apply to the inventory.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If the shard was updated.
+    /// * `Err(String)` - If the shard could not be read, parsed or written.
+    pub fn update_shard(&mut self,
+                        key: &str,
+                        change: impl FnOnce(&mut Inventory) -> Result<(), String>) -> Result<(), String> {
+        let mut inventory = self.inventory(key)?.unwrap_or_else(Inventory::new);
 
-    let mut inventory = ledger.inventory(key)?.unwrap_or_else(Inventory::new);
+        change(&mut inventory)?;
 
-    change(&mut inventory)?;
+        self.register(&BTreeSet::from([key.to_string()]))?;
 
-    ledger.register(&BTreeSet::from([key.to_string()]))?;
-
-    write_shard_mutation(&ledger, key, &mut inventory)
-}
-
-/// Replace the staging area below the given directory with the given shards: the existing
-/// inventory folders under the key are removed, the given shards are written, and the
-/// metadata file is updated accordingly. Used by `restore --staged` (and `unload`) to reset a
-/// subtree of the inventory to the pallet head.
-///
-/// The subtree at `key` is now rebuilt wholesale from `shards` — a known-good source — so any
-/// incomplete-load marker `key` covers no longer describes a real gap; see
-/// `load_guard_utils::clear_recorded_under`'s doc comment. A marker only partially overlapping
-/// `key` is left alone (conservative — part of that region may still be genuinely incomplete).
-///
-/// # Arguments
-/// * `key`    - The warehouse path key of the subtree to replace (`""` for everything).
-/// * `shards` - Warehouse path key → inventory for the new state of the subtree.
-///
-/// # Returns
-/// * `Ok(())`      - If the subtree was replaced.
-/// * `Err(String)` - If a folder or file operation failed.
-pub fn replace_subtree_inventories(key: &str,
-                                   shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
-    // The subtree at `key` is about to be replaced wholesale — a content change from any
-    // ancestor's point of view — so their rollups (if any) must be cleared before the new
-    // content lands, exactly as `write_shard_mutation` orders it. `shards` itself carries
-    // correctly-stamped rollups already (the caller builds them from a known tree), so nothing
-    // further is needed for `key` and below.
-    let mut ledger = ShardLedger::read()?;
-
-    clear_ancestor_rollups(&ledger, key)?;
-
-    // `path_utils::covers("", _)` is always true, so this one predicate already subsumes the
-    // former separate `key.is_empty()` case (drop everything) without a special-cased branch.
-    let replaced: BTreeSet<String> = ledger.keys()
-        .filter(|entry_key| path_utils::covers(key, entry_key))
-        .map(str::to_string)
-        .collect();
-
-    for replaced_key in &replaced {
-        remove_shard_folder(replaced_key)?;
+        write_shard_mutation(self, key, &mut inventory)
     }
 
-    // Unregister what was removed and register what is about to be published, in one metadata
-    // write before any new shard lands. A key removed above and republished here is cleared and
-    // synced again, so the removal is durable before the key is registered again.
-    ledger.update(&replaced, &shards.keys().cloned().collect())?;
+    /// Replace the staging area below the given directory with the given shards: the existing
+    /// inventory folders under the key are removed, the given shards are written, and the
+    /// metadata file is updated accordingly. Used by `restore --staged` (and `unload`) to reset a
+    /// subtree of the inventory to the pallet head.
+    ///
+    /// The subtree at `key` is now rebuilt wholesale from `shards` — a known-good source — so any
+    /// incomplete-load marker `key` covers no longer describes a real gap; see
+    /// `load_guard_utils::clear_recorded_under`'s doc comment. A marker only partially overlapping
+    /// `key` is left alone (conservative — part of that region may still be genuinely incomplete).
+    ///
+    /// # Arguments
+    /// * `key`    - The warehouse path key of the subtree to replace (`""` for everything).
+    /// * `shards` - Warehouse path key → inventory for the new state of the subtree.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - If the subtree was replaced.
+    /// * `Err(String)` - If a folder or file operation failed.
+    pub fn replace_subtree(&mut self,
+                           key: &str,
+                           shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
+        // The subtree at `key` is about to be replaced wholesale — a content change from any
+        // ancestor's point of view — so their rollups (if any) must be cleared before the new
+        // content lands, exactly as `write_shard_mutation` orders it. `shards` itself carries
+        // correctly-stamped rollups already (the caller builds them from a known tree), so nothing
+        // further is needed for `key` and below.
+        clear_ancestor_rollups(self, key)?;
 
-    // One durability barrier for the whole replacement burst instead of one per shard
-    // (DESIGN.html §5.0 D item 8, stage 2b) — every shard here carries a caller-computed,
-    // already-correct rollup (or none), so these writes have no ordering requirement against
-    // each other, only against the ancestor clear above (already durable by the time this runs).
-    let batch = file_utils::WriteBatch::new();
+        // `path_utils::covers("", _)` is always true, so this one predicate already subsumes the
+        // former separate `key.is_empty()` case (drop everything) without a special-cased branch.
+        let replaced: BTreeSet<String> = self.keys()
+            .filter(|entry_key| path_utils::covers(key, entry_key))
+            .map(str::to_string)
+            .collect();
 
-    for (shard_key, inventory) in shards {
-        save_inventory_deferred(&ledger, shard_key, inventory, &batch)?;
+        for replaced_key in &replaced {
+            remove_shard_folder(replaced_key)?;
+        }
+
+        // Unregister what was removed and register what is about to be published, in one metadata
+        // write before any new shard lands. A key removed above and republished here is cleared and
+        // synced again, so the removal is durable before the key is registered again.
+        self.update(&replaced, &shards.keys().cloned().collect())?;
+
+        // One durability barrier for the whole replacement burst instead of one per shard
+        // (DESIGN.html §5.0 D item 8, stage 2b) — every shard here carries a caller-computed,
+        // already-correct rollup (or none), so these writes have no ordering requirement against
+        // each other, only against the ancestor clear above (already durable by the time this runs).
+        let batch = file_utils::WriteBatch::new();
+
+        for (shard_key, inventory) in shards {
+            save_inventory_deferred(self, shard_key, inventory, &batch)?;
+        }
+
+        batch.finish()?;
+
+        load_guard_utils::clear_recorded_under(key);
+
+        sweep_unregistered_shards();
+
+        Ok(())
     }
-
-    batch.finish()?;
-
-    load_guard_utils::clear_recorded_under(key);
-
-    sweep_unregistered_shards();
-
-    Ok(())
 }
 
 /// Replace the whole staging area with the given shards: the existing inventory folders
@@ -2731,9 +2725,10 @@ fn unregister_inventory_keys(keys_to_remove: &BTreeSet<String>) -> Result<(), St
 ///
 /// The set is closed under ancestors before it is written: every ancestor of a registered key is
 /// registered too, so every directory between the root and a tracked file is tracked (see
-/// [`is_tracked_directory`]). Every metadata write passes through here, so no writer can break
-/// that, whether it registers only the directory it wrote (single-file load, `update_shard`) or
-/// drops a key a registered descendant still needs (the removal paths).
+/// [`ShardLedger::holds`]). Every metadata write passes through here, so no writer can break
+/// that, whether it registers only the directory it wrote (single-file load,
+/// [`ShardLedger::update_shard`]) or drops a key a registered descendant still needs (the removal
+/// paths).
 ///
 /// # Arguments
 /// * `path`     - The path of the file where the metadata should be saved.
@@ -2830,6 +2825,49 @@ pub struct ShardLedger {
     entries: BTreeSet<String>,
 }
 
+thread_local! {
+    /// How many times this thread has read the ledger: a cheap, always-on observability hook the
+    /// tests use to prove a command reads it once, not once per path — see [`ledger_read_count`].
+    static LEDGER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has read the ledger ([`ShardLedger::read`]). Per thread, so a test
+/// counts only its own command's reads while other tests run beside it.
+pub fn ledger_read_count() -> u64 {
+    LEDGER_READS.with(std::cell::Cell::get)
+}
+
+/// A [`ShardLedger`] for a holder that may never need one: read on first use, or lent by a caller
+/// that already read it, so one command reads the metadata once however many holders it passes
+/// the registered set through.
+pub(crate) enum LazyLedger<'l> {
+    /// Not read yet.
+    Unread,
+    /// Read by this holder.
+    Read(ShardLedger),
+    /// Lent by the caller.
+    Lent(&'l ShardLedger),
+}
+
+impl LazyLedger<'_> {
+    /// The registered set, read now if it has not been.
+    ///
+    /// # Returns
+    /// * `Ok(&ShardLedger)` - The registered set.
+    /// * `Err(String)`      - If the metadata could not be read or parsed.
+    pub(crate) fn get(&mut self) -> Result<&ShardLedger, String> {
+        if let LazyLedger::Unread = self {
+            *self = LazyLedger::Read(ShardLedger::read()?);
+        }
+
+        Ok(match self {
+            LazyLedger::Read(ledger) => ledger,
+            LazyLedger::Lent(ledger) => ledger,
+            LazyLedger::Unread => unreachable!("read above"),
+        })
+    }
+}
+
 impl ShardLedger {
     /// Read the registered set from the inventory metadata. A missing metadata file is an empty
     /// set.
@@ -2838,6 +2876,8 @@ impl ShardLedger {
     /// * `Ok(ShardLedger)` - The registered set.
     /// * `Err(String)`     - If the metadata could not be read or parsed.
     pub fn read() -> Result<ShardLedger, String> {
+        LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
+
         let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
         Ok(ShardLedger { entries: metadata_opt.unwrap_or_default() })
@@ -2848,7 +2888,11 @@ impl ShardLedger {
         self.entries.iter().map(|entry| metadata_entry_to_key(entry))
     }
 
-    /// Whether `key` is registered.
+    /// Whether `key` is registered, which is the one definition of a tracked directory. Every
+    /// ancestor of a registered key is registered too (see [`write_metadata_to_file`]), so every
+    /// directory between the root and a tracked file is tracked. A registered key need not have a
+    /// shard file: a directory that holds only subdirectories has none, and reads as an empty
+    /// inventory.
     pub fn holds(&self, key: &str) -> bool {
         self.entries.contains(&key_to_metadata_entry(key))
     }
@@ -3486,15 +3530,14 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
 /// still succeeds.
 ///
 /// # Arguments
-/// * `path` - The path of the file whose removal should be staged.
+/// * `ledger` - The registered set.
+/// * `path`   - The path of the file whose removal should be staged.
 ///
 /// # Returns
 /// * `Ok(())`      - If the removal was staged successfully.
 /// * `Err(String)` - If the file is not in the inventory, or there was an error.
-fn stage_removal_for_file(path: &WarehousePath) -> Result<(), String> {
+fn stage_removal_for_file(ledger: &ShardLedger, path: &WarehousePath) -> Result<(), String> {
     let (parent, file_name) = path.split_parent()?;
-
-    let ledger = ShardLedger::read()?;
 
     let Some(mut inventory) = ledger.inventory(parent.as_key())? else {
         return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
@@ -3504,7 +3547,7 @@ fn stage_removal_for_file(path: &WarehousePath) -> Result<(), String> {
         return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
     }
 
-    write_shard_mutation(&ledger, parent.as_key(), &mut inventory)?;
+    write_shard_mutation(ledger, parent.as_key(), &mut inventory)?;
 
     Ok(())
 }
@@ -3570,6 +3613,11 @@ fn ensure_inventory_folder_and_build(inventory: &Inventory, inventory_path: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `key` is registered, as a fresh read of the metadata finds it.
+    fn is_registered(key: &str) -> bool {
+        ShardLedger::read().unwrap().holds(key)
+    }
 
     fn item(name: &str, inode: u64, state: InventoryItemState) -> InventoryItem {
         InventoryItem {
@@ -3895,7 +3943,7 @@ mod tests {
 
         assert!(item_in("dir") == Some((InventoryItemState::Deleted, 1)), "the old spelling keeps its removal");
         assert!(item_in("Dir") == Some((InventoryItemState::Normal, 2)), "the new spelling keeps its write");
-        assert!(is_tracked_directory("dir").unwrap() && is_tracked_directory("Dir").unwrap(),
+        assert!(is_registered("dir") && is_registered("Dir"),
             "both spellings are registered");
     }
 
@@ -3929,7 +3977,7 @@ mod tests {
         }).unwrap();
         batch.publish().unwrap();
 
-        assert!(is_tracked_directory("a/b/new").unwrap(), "a shard the batch created must be registered");
+        assert!(is_registered("a/b/new"), "a shard the batch created must be registered");
         assert_eq!(read_rollup("a"), None, "a new shard is a content change for its ancestors");
     }
 
@@ -3947,7 +3995,7 @@ mod tests {
         }).unwrap();
 
         // Someone else rewrites a touched shard before the batch publishes.
-        update_shard("a/b", |inventory| {
+        ShardLedger::read().unwrap().update_shard("a/b", |inventory| {
             inventory.add_item(item("other.txt", 9, InventoryItemState::Normal));
             Ok(())
         }).unwrap();
@@ -4006,7 +4054,7 @@ mod tests {
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
         // A content-changing mutation three levels deep.
-        update_shard("a/b/c", |inventory| {
+        ShardLedger::read().unwrap().update_shard("a/b/c", |inventory| {
             inventory.add_item(item("new.txt", 99, InventoryItemState::Normal));
             Ok(())
         }).unwrap();
@@ -4040,7 +4088,7 @@ mod tests {
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
-        update_shard("a", |inventory| {
+        ShardLedger::read().unwrap().update_shard("a", |inventory| {
             inventory.add_item(item("new.txt", 1, InventoryItemState::Normal));
             Ok(())
         }).unwrap();
@@ -4089,8 +4137,8 @@ mod tests {
         // A remover that drops an ancestor while a descendant stays registered does not unregister it.
         unregister_inventory_keys(&BTreeSet::from(["a".to_string()])).unwrap();
         registered(&["", "a", "a/b"]);
-        assert!(is_tracked_directory("a").unwrap());
-        assert!(!is_tracked_directory("a/b/c").unwrap());
+        assert!(is_registered("a"));
+        assert!(!is_registered("a/b/c"));
     }
 
     #[test]
@@ -4147,10 +4195,10 @@ mod tests {
                                                    DirEntryType::Normal, anchor).unwrap();
         assert_eq!(entry.content_change_timestamp, UNPROVEN_MTIME,
             "a stat taken in the same second as the write must record the unproven sentinel");
-        update_shard("", |inventory| { inventory.add_item(entry); Ok(()) }).unwrap();
+        ShardLedger::read().unwrap().update_shard("", |inventory| { inventory.add_item(entry); Ok(()) }).unwrap();
         assert!(!root_entry_is_trusted(&file), "a racy entry must not be trusted");
 
-        update_shard("", |inventory| { inventory.add_item(item("b.txt", 9, InventoryItemState::Normal)); Ok(()) }).unwrap();
+        ShardLedger::read().unwrap().update_shard("", |inventory| { inventory.add_item(item("b.txt", 9, InventoryItemState::Normal)); Ok(()) }).unwrap();
         assert!(!root_entry_is_trusted(&file), "a sibling's republish must not make the racy entry trusted");
     }
 
@@ -4427,7 +4475,7 @@ mod tests {
 
         let mut replacement = Inventory::new();
         replacement.add_item(item("new.txt", 9, InventoryItemState::Normal));
-        replace_subtree_inventories("a", &BTreeMap::from([("a".to_string(), replacement)])).unwrap();
+        ShardLedger::read().unwrap().replace_subtree("a", &BTreeMap::from([("a".to_string(), replacement)])).unwrap();
 
         assert!(!file_utils::get_inventory_folder_for_key("a/b").unwrap().exists(), "a/b was replaced away");
         assert_only_registered_shards_remain();
@@ -4465,7 +4513,7 @@ mod tests {
         let prepared = prepare_stack_inventory(None).unwrap();
         cleanup_after_stack_with(&prepared, &BTreeMap::new()).unwrap();
 
-        assert!(!is_tracked_directory("a").unwrap(), "the emptied directory is unregistered");
+        assert!(!is_registered("a"), "the emptied directory is unregistered");
         assert_only_registered_shards_remain();
     }
 
@@ -4518,7 +4566,7 @@ mod tests {
 
         let mut replacement = Inventory::new();
         replacement.add_item(item("new.txt", 9, InventoryItemState::Normal));
-        let result = replace_subtree_inventories("a", &BTreeMap::from([("a".to_string(), replacement)]));
+        let result = ShardLedger::read().unwrap().replace_subtree("a", &BTreeMap::from([("a".to_string(), replacement)]));
 
         let ghost_survived = fan_out.join("ghost").exists();
         make_writable(&fan_out);
@@ -4541,7 +4589,7 @@ mod tests {
         make_writable(&fan_out);
 
         result.expect("a sweep failure must not fail a removal that has landed");
-        assert!(!is_tracked_directory("a").unwrap());
+        assert!(!is_registered("a"));
         assert!(ghost_survived || unsafe { libc::geteuid() } == 0, "the sweep was really blocked");
     }
 
@@ -4700,7 +4748,7 @@ mod tests {
     /// An unregistered shard at `key` listing `file.txt`, which no working directory holds.
     fn plant_ghost_at(key: &str) {
         write_stamped_shard(key, None);
-        assert!(!is_tracked_directory(key).unwrap(), "a ghost is not registered");
+        assert!(!is_registered(key), "a ghost is not registered");
     }
 
     fn add_new_txt(inventory: &mut Inventory) -> Result<(), String> {
@@ -4738,7 +4786,7 @@ mod tests {
         let _scratch = Scratch::new("adopt-update-shard");
         plant_ghost_at("ghost");
 
-        update_shard("ghost", add_new_txt).unwrap();
+        ShardLedger::read().unwrap().update_shard("ghost", add_new_txt).unwrap();
 
         assert_eq!(registered_names("ghost"), ["new.txt"]);
     }
@@ -4770,10 +4818,10 @@ mod tests {
         let _scratch = Scratch::new("adopt-file-removal");
         plant_ghost_at("ghost");
 
-        let error = stage_removal_for_file(&WarehousePath::from_user_input("ghost/file.txt").unwrap()).unwrap_err();
+        let error = stage_removal_for_file(&ShardLedger::read().unwrap(), &WarehousePath::from_user_input("ghost/file.txt").unwrap()).unwrap_err();
 
         assert!(error.contains("is not in the inventory"), "{error}");
-        assert!(!is_tracked_directory("ghost").unwrap());
+        assert!(!is_registered("ghost"));
     }
 
     /// The ancestors a load registers with its folder are new keys too, so a shard left at one is
@@ -4785,7 +4833,7 @@ mod tests {
 
         load_file(LOADED_FILE).unwrap();
 
-        assert!(is_tracked_directory("src").unwrap(), "the load registers its folder's ancestors");
+        assert!(is_registered("src"), "the load registers its folder's ancestors");
         assert_eq!(registered_names("src"), Vec::<String>::new());
     }
 
@@ -4801,7 +4849,7 @@ mod tests {
         stamped_chain_with_sibling();
         let fault = MetadataWriteFaultGuard::failing();
 
-        let error = update_shard("new", add_new_txt).unwrap_err();
+        let error = ShardLedger::read().unwrap().update_shard("new", add_new_txt).unwrap_err();
 
         drop(fault);
         assert!(error.contains("injected metadata-write failure"), "{error}");
@@ -4846,7 +4894,7 @@ mod tests {
             inventory
         };
         let shards = BTreeMap::from([("a".to_string(), replacement()), ("a/c".to_string(), replacement())]);
-        let error = replace_subtree_inventories("a", &shards).unwrap_err();
+        let error = ShardLedger::read().unwrap().replace_subtree("a", &shards).unwrap_err();
 
         drop(fault);
         assert!(error.contains("injected metadata-write failure"), "{error}");
@@ -4878,7 +4926,7 @@ mod tests {
             inventory.add_item(item("new.txt", 2, InventoryItemState::Normal));
         }).unwrap();
 
-        update_shard("late", |inventory| {
+        ShardLedger::read().unwrap().update_shard("late", |inventory| {
             inventory.add_item(item("other.txt", 9, InventoryItemState::Normal));
             Ok(())
         }).unwrap();
@@ -4920,7 +4968,7 @@ mod tests {
         let key = key_where(|key| !fan_out_of(key).exists());
         std::fs::write(fan_out_of(&key), b"not a folder").unwrap();
 
-        update_shard(&key, add_new_txt).unwrap();
+        ShardLedger::read().unwrap().update_shard(&key, add_new_txt).unwrap();
 
         assert_eq!(registered_names(&key), ["new.txt"]);
     }
@@ -4941,7 +4989,7 @@ mod tests {
         std::fs::write(outside.join("notes.txt"), b"kept").unwrap();
         std::os::unix::fs::symlink(&outside, fan_out_of(&key)).unwrap();
 
-        update_shard(&key, add_new_txt).unwrap();
+        ShardLedger::read().unwrap().update_shard(&key, add_new_txt).unwrap();
 
         let fan_out = std::fs::symlink_metadata(fan_out_of(&key)).unwrap();
         assert!(fan_out.is_dir() && !fan_out.is_symlink(), "the link is replaced by a fan-out folder");
@@ -4972,10 +5020,10 @@ mod tests {
         assert!(folder.is_dir(), "{} exists", folder.display());
 
         let fault = file_utils::DirSyncFaultGuard::failing_exactly(folder);
-        let result = update_shard(key, add_new_txt);
+        let result = ShardLedger::read().unwrap().update_shard(key, add_new_txt);
         drop(fault);
 
-        assert!(!is_tracked_directory(key).unwrap(), "\"{key}\" was registered before {} was synced", folder.display());
+        assert!(!is_registered(key), "\"{key}\" was registered before {} was synced", folder.display());
         assert!(result.unwrap_err().contains("injected directory-sync failure"));
     }
 
@@ -4999,7 +5047,7 @@ mod tests {
         stamped_chain_with_sibling();
 
         let key = key_where(|key| key != "x" && fan_out_of(key) == fan_out_of("x"));
-        update_shard(&key, add_new_txt).unwrap();
+        ShardLedger::read().unwrap().update_shard(&key, add_new_txt).unwrap();
         remove_inventories_under(&key).unwrap();
         assert!(!file_utils::get_inventory_folder_for_key(&key).unwrap().exists());
 
@@ -5045,19 +5093,19 @@ mod tests {
         std::fs::remove_dir_all(&store_root).unwrap();
         std::os::unix::fs::symlink(&outside, &store_root).unwrap();
 
-        let result = update_shard("new", add_new_txt);
+        let result = ShardLedger::read().unwrap().update_shard("new", add_new_txt);
 
         assert_eq!(std::fs::read(outside.join(&fan_out_name).join(&slot_name).join("kept")).unwrap(), b"kept",
             "nothing behind the link is cleared");
         assert!(!outside.join(&fan_out_name).join(&slot_name).join("data").exists(), "nothing behind the link is written");
-        assert!(!is_tracked_directory("new").unwrap());
+        assert!(!is_registered("new"));
         let error = result.unwrap_err();
         assert!(error.contains("is not a folder") && error.contains("restore --staged ."), "{error}");
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).
         std::fs::remove_file(&store_root).unwrap();
-        replace_subtree_inventories("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
-        update_shard("new", add_new_txt).unwrap();
+        ShardLedger::read().unwrap().replace_subtree("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
+        ShardLedger::read().unwrap().update_shard("new", add_new_txt).unwrap();
         assert_eq!(registered_names("new"), ["new.txt"]);
     }
 
@@ -5090,7 +5138,7 @@ mod tests {
 
             let read = ledger.retrieve("a/b");
             let written = save_inventory(&ledger, "a/b", &Inventory::new());
-            let updated = update_shard("a/b", add_new_txt);
+            let updated = ShardLedger::read().unwrap().update_shard("a/b", add_new_txt);
 
             assert_eq!(std::fs::read(&behind).unwrap(), shard_behind, "{level}: nothing is written behind the link");
             assert!(written.is_err(), "{level}: a write through the link is refused");
@@ -5100,8 +5148,8 @@ mod tests {
 
             // The way out: remove the link, then reset the staging area to the head (here, empty).
             unlink(&linked, is_dir);
-            replace_subtree_inventories("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
-            update_shard("a/b", add_new_txt).unwrap();
+            ShardLedger::read().unwrap().replace_subtree("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
+            ShardLedger::read().unwrap().update_shard("a/b", add_new_txt).unwrap();
             assert_eq!(registered_names("a/b"), ["new.txt"], "{level}");
         }
     }
@@ -5152,8 +5200,8 @@ mod tests {
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).
         unlink(&metadata, false);
-        replace_subtree_inventories("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
-        update_shard("a/b", add_new_txt).unwrap();
+        ShardLedger::read().unwrap().replace_subtree("", &BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
+        ShardLedger::read().unwrap().update_shard("a/b", add_new_txt).unwrap();
         assert_eq!(registered_names("a/b"), ["new.txt"]);
     }
 
@@ -5210,13 +5258,13 @@ mod tests {
         stamped_chain_with_sibling();
 
         let key = key_where(|key| key != "x" && fan_out_of(key) == fan_out_of("x") && fan_out_of(key) != fan_out_of(""));
-        update_shard(&key, add_new_txt).unwrap();
+        ShardLedger::read().unwrap().update_shard(&key, add_new_txt).unwrap();
 
         let mut replacement = Inventory::new();
         replacement.add_item(item("replaced.txt", 9, InventoryItemState::Normal));
 
         let fault = file_utils::DirSyncFaultGuard::failing_exactly(&fan_out_of(&key));
-        let result = replace_subtree_inventories(&key, &BTreeMap::from([(key.clone(), replacement)]));
+        let result = ShardLedger::read().unwrap().replace_subtree(&key, &BTreeMap::from([(key.clone(), replacement)]));
         drop(fault);
 
         assert!(file_utils::retrieve_inventory_or_none_by_key(&key).unwrap().1.is_none(),
@@ -5233,9 +5281,9 @@ mod tests {
         let mut ghost = Inventory::new();
         ghost.add_item(item("enums", 1, InventoryItemState::Normal));
         plant_shard(&ghost, "src");
-        assert!(!is_tracked_directory("src").unwrap());
+        assert!(!is_registered("src"));
 
-        let kind = tracked_kind(&WarehousePath::from_user_input(LOADED_FOLDER).unwrap()).unwrap();
+        let kind = tracked_kind(&ShardLedger::read().unwrap(), &WarehousePath::from_user_input(LOADED_FOLDER).unwrap()).unwrap();
 
         assert!(matches!(kind, TrackedKind::UntrackedDirectory), "a folder on disk the ledger does not hold");
     }

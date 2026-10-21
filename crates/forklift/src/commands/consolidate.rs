@@ -306,9 +306,9 @@ pub(crate) async fn merge_head_into_current(current: &str,
     }
 
     keep_aliased_files(&mut actions, &our_tree_hash, &scope)?;
-    ensure_no_untracked_collisions(&actions, their_label)?;
+    let ledger = ensure_no_untracked_collisions(&actions, their_label)?;
 
-    let mut conflict_paths = apply_merge_actions(&actions)?;
+    let mut conflict_paths = apply_merge_actions(&ledger, &actions)?;
 
     // Record the out-of-scope skeleton BEFORE the consolidation state, and unconditionally
     // — even when it is empty (a full-bay merge, or one that resolved nothing out of scope): the
@@ -446,7 +446,11 @@ async fn ensure_warehouse_is_clean(our_tree_hash: &str) -> Result<(), String> {
 /// Every action that touches the working directory first has its path checked by
 /// `shift_utils::check_planned_paths`, so a path that names a metadata folder, or lies inside
 /// another working tree, refuses the whole merge before its first file changes.
-pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &str) -> Result<(), String> {
+///
+/// Returns the shard ledger the check judged by, for the apply to reuse: neither writes the
+/// metadata before the apply's batch publishes.
+pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
+                                             target: &str) -> Result<inventory_utils::ShardLedger, String> {
     shift_utils::check_planned_paths(actions.iter().filter_map(|action| match action {
         MergeAction::TakeTheirs { path, .. }
         | MergeAction::Delete { path }
@@ -463,7 +467,8 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
         })
         .collect());
 
-    let mut check = alias_utils::AliasCheck::new();
+    let ledger = inventory_utils::ShardLedger::read()?;
+    let mut check = alias_utils::AliasCheck::over(&ledger);
     let mut collisions = Vec::new();
     let mut created = Vec::new();
 
@@ -495,7 +500,7 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
                 // checked separately.
                 let fs_path = std::path::Path::new(path);
 
-                if !(fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(path)?) {
+                if !(fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(&ledger, path)?) {
                     collisions.push(alias_utils::Collision::Untracked(path.clone()));
                 }
             }
@@ -504,7 +509,9 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction], target: &s
 
     collisions.extend(check.created_pairs(created, &removals)?);
 
-    alias_utils::refuse_collisions(&format!("Consolidating \"{}\"", target), &collisions)
+    alias_utils::refuse_collisions(&format!("Consolidating \"{}\"", target), &collisions)?;
+
+    Ok(ledger)
 }
 
 /// The files a merge deletes before it writes (its `Delete` actions).
@@ -582,15 +589,16 @@ fn conflict_writes(action: &MergeAction) -> bool {
 /// inventory. An action that fails leaves the batch unpublished: a half-applied merge staged with
 /// nothing in progress could leave conflict entries staged with no merge to complete or abort.
 /// The caller has recorded nothing as in progress yet, and the error says so.
-pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>, String> {
+pub(crate) fn apply_merge_actions(ledger: &inventory_utils::ShardLedger,
+                                  actions: &[MergeAction]) -> Result<Vec<String>, String> {
     let mut conflict_paths: Vec<String> = Vec::new();
-    let mut batch = inventory_utils::ShardMutationBatch::new();
+    let mut batch = inventory_utils::ShardMutationBatch::over(ledger);
 
     // The batch publishes nothing before `publish`: an action that fails stages nothing, and a
     // publish that fails may have written some shards, or every shard but not the metadata that
     // registers a new one. So either failure claims only that some or all of the changes are
     // unstaged.
-    apply_merge_actions_to(actions, &mut batch, &mut conflict_paths)
+    apply_merge_actions_to(ledger, actions, &mut batch, &mut conflict_paths)
         .and_then(|()| batch.publish())
         .map_err(|e| format!(
             "{}\nThe working directory holds the changes applied so far, but some or all of them \
@@ -602,15 +610,14 @@ pub(crate) fn apply_merge_actions(actions: &[MergeAction]) -> Result<Vec<String>
 }
 
 /// The body of [`apply_merge_actions`]: every deletion, then every write, staged into `batch`.
-fn apply_merge_actions_to(actions: &[MergeAction],
+fn apply_merge_actions_to(ledger: &inventory_utils::ShardLedger,
+                          actions: &[MergeAction],
                           batch: &mut inventory_utils::ShardMutationBatch,
                           conflict_paths: &mut Vec<String>) -> Result<(), String> {
-    // The batch writes nothing before it publishes, so this stays the registered set throughout.
-    let ledger = inventory_utils::ShardLedger::read()?;
-
+    // The batch writes nothing before it publishes, so `ledger` stays the registered set throughout.
     for action in actions {
         if matches!(action, MergeAction::Delete { .. }) {
-            apply_merge_action(&ledger, action, None, batch, conflict_paths)?;
+            apply_merge_action(ledger, action, None, batch, conflict_paths)?;
         }
     }
 
@@ -620,7 +627,7 @@ fn apply_merge_actions_to(actions: &[MergeAction],
     shift_utils::write_in_order(&writes, |action| match action {
         MergeAction::TakeTheirs { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
         _ => None,
-    }, |action, content| apply_merge_action(&ledger, action, content, batch, conflict_paths))
+    }, |action, content| apply_merge_action(ledger, action, content, batch, conflict_paths))
 }
 
 /// Apply one merge action to the working directory, and stage its inventory change into
@@ -738,6 +745,37 @@ mod tests {
         /// Runs once just before a clean merge's parcel is stacked.
         pub(super) static BEFORE_MERGE_STACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             std::cell::Cell::new(None);
+    }
+
+    #[test]
+    fn the_collision_check_reads_the_ledger_once_however_many_directories_flip_to_files() {
+        let warehouse = Warehouse::with_working_tree("consolidate-ledger-reads");
+        let flips = ["d1", "d2", "d3"];
+        for dir in flips {
+            std::fs::create_dir_all(warehouse.root.join(dir)).unwrap();
+            std::fs::write(warehouse.root.join(dir).join("f.txt"), b"f\n").unwrap();
+        }
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+
+        // Their side replaces each tracked directory with a file of the same name.
+        let blob = test_support::store_tree("x", b"x\n");
+        let mut actions = Vec::new();
+        for dir in flips {
+            actions.push(MergeAction::Delete { path: format!("{}/f.txt", dir) });
+            actions.push(MergeAction::TakeTheirs {
+                path: dir.to_string(),
+                hash: blob.clone(),
+                item_type: forklift_core::enums::dir_entry_type::DirEntryType::Normal,
+                is_new: true,
+            });
+        }
+
+        let before = inventory_utils::ledger_read_count();
+        ensure_no_untracked_collisions(&actions, "theirs")
+            .expect("a tracked directory holding only tracked files may become a file");
+
+        assert_eq!(inventory_utils::ledger_read_count() - before, 1,
+            "one read serves the check and every directory it judges");
     }
 
     #[test]

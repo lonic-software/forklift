@@ -501,7 +501,7 @@ pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec
             alias_utils::Verdict::Exists => {
                 let fs_path = Path::new(path);
 
-                if fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(path)? {
+                if fs_path.is_dir() && inventory_utils::directory_is_safe_to_replace(check.ledger()?, path)? {
                     continue;
                 }
 

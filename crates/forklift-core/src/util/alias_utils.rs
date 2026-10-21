@@ -203,27 +203,38 @@ pub enum Verdict {
 /// and so is each aliased directory's verdict (whether it is tracked, and whether the run vacates
 /// it), so a renamed directory of many files is walked once. One check therefore serves one
 /// operation's set of removals.
-#[derive(Default)]
-pub struct AliasCheck {
+pub struct AliasCheck<'l> {
     listings: HashMap<String, Option<BTreeSet<String>>>,
     directories: HashMap<String, (bool, bool)>,
-    ledger: Option<inventory_utils::ShardLedger>,
+    ledger: inventory_utils::LazyLedger<'l>,
 }
 
-impl AliasCheck {
-    /// A check with nothing read yet.
-    pub fn new() -> AliasCheck {
-        AliasCheck::default()
+impl AliasCheck<'static> {
+    /// A check with nothing read yet: the registered set is read on first use.
+    pub fn new() -> AliasCheck<'static> {
+        AliasCheck::over_ledger(inventory_utils::LazyLedger::Unread)
+    }
+}
+
+impl<'l> AliasCheck<'l> {
+    /// A check that reads the registered set through `ledger`, for a caller that already holds it.
+    pub fn over(ledger: &'l inventory_utils::ShardLedger) -> AliasCheck<'l> {
+        AliasCheck::over_ledger(inventory_utils::LazyLedger::Lent(ledger))
+    }
+
+    fn over_ledger(ledger: inventory_utils::LazyLedger<'l>) -> AliasCheck<'l> {
+        AliasCheck { listings: HashMap::new(), directories: HashMap::new(), ledger }
+    }
+
+    /// The registered set this check judges by (read on first use, or lent by the caller).
+    pub(crate) fn ledger(&mut self) -> Result<&inventory_utils::ShardLedger, String> {
+        self.ledger.get()
     }
 
     /// Whether the inventory holds a live file entry at `key` (see [`tracked_file`]), against the
-    /// registered set as this check first read it.
+    /// check's ledger (read on first use, or lent by the caller).
     pub fn tracked_file(&mut self, key: &str) -> Result<bool, String> {
-        if self.ledger.is_none() {
-            self.ledger = Some(inventory_utils::ShardLedger::read()?);
-        }
-
-        tracked_file(self.ledger.as_ref().unwrap(), key)
+        tracked_file(self.ledger.get()?, key)
     }
 
     /// The names a directory lists (`None` when it cannot be read as a directory).
@@ -568,7 +579,7 @@ impl AliasCheck {
             return Ok(known);
         }
 
-        let tracked = inventory_utils::is_tracked_directory(key)?;
+        let tracked = self.ledger.get()?.holds(key);
         let known = (tracked, tracked && vacated(key, removals)?);
         self.directories.insert(key.to_string(), known);
         Ok(known)
