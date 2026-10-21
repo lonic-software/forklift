@@ -229,9 +229,9 @@ fn unheld_warning(unheld: &[String]) -> Option<String> {
     Some(format!(
         "{} file(s) do not hold the content imported for them, so they read as changed: {}. \
         An uncommitted edit or deletion does this, and so does git converting a file as it checks \
-        it out (line endings, \"ident\", a filter). \"load\" a path to keep it as it is; for a \
-        file nobody changed, \"restore\" writes its imported content back instead, discarding \
-        what the file holds.",
+        it out (line endings, \"ident\", a filter). \"load\" and stack a path to keep it as it is; \
+        for a file you did not edit, \"restore\" writes its imported content back instead, \
+        discarding what the file holds.",
         unheld.len(), named
     ))
 }
