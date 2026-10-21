@@ -5015,11 +5015,11 @@ mod tests {
         assert!(folder.is_dir(), "{} exists", folder.display());
 
         let fault = file_utils::DirSyncFaultGuard::failing_exactly(folder);
-        let error = update_shard(key, add_new_txt).unwrap_err();
+        let result = update_shard(key, add_new_txt);
         drop(fault);
 
-        assert!(error.contains("injected directory-sync failure"), "{error}");
         assert!(!is_tracked_directory(key).unwrap(), "\"{key}\" was registered before {} was synced", folder.display());
+        assert!(result.unwrap_err().contains("injected directory-sync failure"));
     }
 
     #[cfg(unix)]
@@ -5088,13 +5088,14 @@ mod tests {
         std::fs::remove_dir_all(&store_root).unwrap();
         std::os::unix::fs::symlink(&outside, &store_root).unwrap();
 
-        let error = update_shard("new", add_new_txt).unwrap_err();
+        let result = update_shard("new", add_new_txt);
 
-        assert!(error.contains("is not a folder") && error.contains("restore --staged ."), "{error}");
-        assert!(!is_tracked_directory("new").unwrap());
         assert_eq!(std::fs::read(outside.join(&fan_out_name).join(&slot_name).join("kept")).unwrap(), b"kept",
             "nothing behind the link is cleared");
         assert!(!outside.join(&fan_out_name).join(&slot_name).join("data").exists(), "nothing behind the link is written");
+        assert!(!is_tracked_directory("new").unwrap());
+        let error = result.unwrap_err();
+        assert!(error.contains("is not a folder") && error.contains("restore --staged ."), "{error}");
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).
         std::fs::remove_file(&store_root).unwrap();
@@ -5119,11 +5120,11 @@ mod tests {
         replacement.add_item(item("replaced.txt", 9, InventoryItemState::Normal));
 
         let fault = file_utils::DirSyncFaultGuard::failing_exactly(&fan_out_of(&key));
-        let error = replace_subtree_inventories(&key, &BTreeMap::from([(key.clone(), replacement)])).unwrap_err();
+        let result = replace_subtree_inventories(&key, &BTreeMap::from([(key.clone(), replacement)]));
         drop(fault);
 
-        assert!(error.contains("injected directory-sync failure"), "{error}");
         assert!(file_utils::retrieve_inventory_or_none_by_key(&key).unwrap().1.is_none(),
             "no shard is published before its address is synced");
+        assert!(result.unwrap_err().contains("injected directory-sync failure"));
     }
 }
