@@ -22,8 +22,9 @@
 //! parcel that last wrote that path.
 //!
 //! Divergence is reconciled without merge parcels: [`detect_conflicts`] walks base, ours and
-//! theirs and names every path both sides changed differently, and [`replay_meta_pallet`]
-//! applies the local side's *net* change since base onto the remote head as one new parcel.
+//! theirs and names every path both sides changed differently, [`plan_replay`] plans the local
+//! side's *net* change since base, and [`replay_meta_pallet`] stacks that plan onto the remote
+//! head as one new parcel.
 //!
 //! Enforcement and sync dispatch on [`meta_rules`], a code-level list of meta pallet names,
 //! never on whether a pallet happens to carry a format marker. A name not on the list has no
