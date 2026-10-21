@@ -6692,13 +6692,15 @@ mod tests {
     }
 
     /// Store `main` → root tree → `web` subtree → `x.bin` = `target`, and leave the subtree held
-    /// only by an unreadable index. Returns the subtree's hash.
+    /// only by an unreadable index. Returns the subtree's hash. The bay gets a position file, so
+    /// its saved state reads cleanly and the unreadable subtree is the only gap in the walk.
     fn plant_target_beneath_an_unreadable_tree(how: pack_utils::tests::Unreadable, target: &str) -> String {
         use crate::util::gc_utils::tests::{store_root_parcel, store_tree};
 
         let web_tree = store_tree(&[("x.bin", target, DirEntryType::Normal)]);
         let root_tree = store_tree(&[("web", &web_tree, DirEntryType::Tree)]);
         store_root_parcel(&root_tree);
+        crate::util::pallet_utils::write_position(&crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         pack_utils::tests::pack_as_unreadable(&web_tree, how);
         web_tree
     }
@@ -6739,7 +6741,9 @@ mod tests {
                     match result {
                         Ok(_) => Some(format!("{:?}: heal must refuse while the tree is unreadable", how)),
                         Err(CoreError::Refusal { code, message, .. }) => {
-                            if code != RefusalCode::DurabilityTaint {
+                            if message.contains("saved state could not be read") {
+                                Some(format!("{:?}: sanity: the bay's saved state must read cleanly: {}", how, message))
+                            } else if code != RefusalCode::DurabilityTaint {
                                 Some(format!("{:?}: wrong code {:?}: {}", how, code, message))
                             } else if !(message.contains(&vanished_hash) && message.contains(&web_tree)
                                 && message.contains("could not confirm it is safe to drop")) {
@@ -6787,6 +6791,9 @@ mod tests {
                 } else {
                     match result {
                         Ok(_) => Some(format!("{:?}: the rescan must refuse while the tree is unreadable", how)),
+                        Err(CoreError::Refusal { message, .. }) if message.contains("saved state could not be read") => {
+                            Some(format!("{:?}: sanity: the bay's saved state must read cleanly: {}", how, message))
+                        }
                         Err(CoreError::Refusal { message, .. }) if !(message.contains(&web_tree) && message.contains("torn")) => {
                             Some(format!("{:?}: the refusal must name the unreadable tree: {}", how, message))
                         }
