@@ -822,6 +822,33 @@ mod tests {
         std::fs::read(get_pallet_ref_path(PalletNamespace::User, name)).unwrap()
     }
 
+    /// A loose file whose name is respelled in uppercase resolves, by prefix, to its lowercase hash
+    /// where reads open it under that hash, and is not a match where they do not. Matching the
+    /// listed name, it was missed on a case-insensitive file system (`CD…` never starts with `cd`),
+    /// and a digit-only prefix would have returned the listed spelling.
+    ///
+    /// Revert: match the listed name (skip `file_utils::canonical_loose_entry`) → red on macOS
+    /// and Windows.
+    #[test]
+    fn a_prefix_resolves_a_respelled_loose_file_to_its_lowercase_hash_where_reads_reach_it() {
+        let (root, _scope) = scratch("respelled-prefix");
+        let hash = "ab".to_string() + &"cd".repeat(31);
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        let listed = Path::new(&folder).join(&file_name);
+        std::fs::rename(&listed, listed.with_file_name(file_name.to_ascii_uppercase())).unwrap();
+        let folds = listed.exists();
+
+        let resolved = resolve_object_hash_prefix("abcd");
+        if folds {
+            assert_eq!(resolved, Ok(hash.clone()));
+        } else {
+            assert!(resolved.is_err(), "no read opens it, so it is no match: {:?}", resolved);
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_position_that_cannot_be_recorded_after_the_ref_moved_says_the_parcel_stands() {
         let (root, _scope) = scratch("record-landed");
@@ -1275,8 +1302,14 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
                 continue;
             }
 
+            // A name spelled other than in lowercase is matched under the spelling a read opens
+            // it by, or not at all, so a match is always a hash the store answers for.
+            let Some((folder_name, file_name)) = file_utils::canonical_loose_entry(&folder, &file_name) else {
+                continue;
+            };
+
             if file_name.starts_with(rest) {
-                matches.push(format!("{}{}", &prefix[0..2], file_name));
+                matches.push(format!("{}{}", folder_name, file_name));
             }
         }
     }

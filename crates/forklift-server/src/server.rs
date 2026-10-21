@@ -32,7 +32,7 @@ use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
-    distinct_resolve_identifiers, resolve_answer_cap,
+    REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::RefUpdateError;
@@ -1411,6 +1411,26 @@ fn param(params: &PathParams, key: &str) -> Result<String, HandlerError> {
         .ok_or_else(|| internal(format!("The \"{}\" path parameter is missing.", key)))
 }
 
+/// Get the `hash` path parameter, refused with a `422` unless it is an object hash
+/// ([`require_object_hashes`]).
+fn hash_param(params: &PathParams) -> Result<String, HandlerError> {
+    let hash = param(params, "hash")?;
+    require_object_hashes(std::slice::from_ref(&hash))?;
+    Ok(hash)
+}
+
+/// Refuse a request naming anything but object hashes, with a `422`. The object store answers
+/// for one spelling only, 64 lowercase hex characters, so a client-sent string is checked here
+/// rather than reaching a presence check that fails on it as an internal error. The value is not
+/// repeated back.
+fn require_object_hashes(hashes: &[String]) -> Result<(), HandlerError> {
+    if hashes.iter().all(|hash| object_utils::is_object_hash(hash)) {
+        return Ok(());
+    }
+
+    Err(unprocessable(REFUSAL_NOT_AN_OBJECT_HASH.to_string()))
+}
+
 /// Validate a warehouse id (the one shared rule, [`warehouse_utils::validate_warehouse_id`]); a
 /// refusal is a `422`.
 fn validate_warehouse_id(id: &str) -> Result<(), HandlerError> {
@@ -1794,6 +1814,10 @@ async fn post_missing(State(state): State<Arc<AppState>>,
         )));
     }
 
+    if let Err(error) = require_object_hashes(&request.hashes) {
+        return error_response(error);
+    }
+
     let result = blocking(warehouse, move || {
         let mut missing: Vec<String> = Vec::new();
 
@@ -1836,6 +1860,10 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
             "At most {} hashes per upload-targets request; batch larger sets.",
             MAX_UPLOAD_TARGETS_BATCH
         )));
+    }
+
+    if let Err(error) = require_object_hashes(&request.hashes) {
+        return error_response(error);
     }
 
     let result = blocking(warehouse, move || {
@@ -1892,6 +1920,10 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
             "At most {} hashes per request; batch larger sets.",
             MAX_MISSING_BATCH
         )));
+    }
+
+    if let Err(error) = require_object_hashes(&request.hashes) {
+        return error_response(error);
     }
 
     let result = blocking(warehouse, move || {
@@ -2041,7 +2073,7 @@ async fn get_object(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let hash = match param(&params, "hash") {
+    let hash = match hash_param(&params) {
         Ok(hash) => hash,
         Err(error) => return error_response(error),
     };
@@ -2076,14 +2108,14 @@ async fn put_object(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let hash = match param(&params, "hash") {
-        Ok(hash) => hash,
-        Err(error) => return error_response(error),
-    };
-
     if let Err(error) = check_admission(&state, &params, &principal, "upload", None).await {
         return error_response(error);
     }
+
+    let hash = match hash_param(&params) {
+        Ok(hash) => hash,
+        Err(error) => return error_response(error),
+    };
 
     let result = blocking(warehouse, move || {
         require_uploader(&principal)?;
@@ -2111,7 +2143,7 @@ async fn get_signature(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let hash = match param(&params, "hash") {
+    let hash = match hash_param(&params) {
         Ok(hash) => hash,
         Err(error) => return error_response(error),
     };
@@ -2144,14 +2176,14 @@ async fn put_signature(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let hash = match param(&params, "hash") {
-        Ok(hash) => hash,
-        Err(error) => return error_response(error),
-    };
-
     if let Err(error) = check_admission(&state, &params, &principal, "upload", None).await {
         return error_response(error);
     }
+
+    let hash = match hash_param(&params) {
+        Ok(hash) => hash,
+        Err(error) => return error_response(error),
+    };
 
     let result = blocking(warehouse, move || {
         require_uploader(&principal)?;

@@ -1226,8 +1226,7 @@ fn walk_loose_object_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), St
         let prefix = folder.file_name().to_string_lossy().to_string();
         // The pack folder (and anything else that is not a 2-hex fan-out folder) is skipped —
         // it holds packed objects, not loose ones.
-        if prefix.len() != file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS
-            || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !file_utils::is_fan_out_folder_name(&prefix) {
             continue;
         }
 
@@ -1242,7 +1241,14 @@ fn walk_loose_object_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), St
                 continue;
             }
 
-            if let Ok(relative) = file.path().strip_prefix(root) {
+            // Listed under the path builder's spelling, which `restage_object` reads the hash to
+            // verify from, and only where that spelling reaches the entry.
+            let Some((prefix, name)) = file_utils::canonical_loose_entry(&folder.path(), &name) else {
+                continue;
+            };
+            let path = folder.path().with_file_name(prefix).join(name);
+
+            if let Ok(relative) = path.strip_prefix(root) {
                 out.push(relative.to_path_buf());
             }
         }
@@ -2605,6 +2611,48 @@ mod tests {
     use super::*;
     use crate::util::file_utils;
     use std::collections::HashMap;
+
+    /// The store-wide restage listing names a respelled loose entry by the path builder's
+    /// spelling, which `restage_object` reads its hash to verify from, wherever that spelling
+    /// reaches the entry, and leaves it out wherever it does not. Listed under its own spelling, it
+    /// would carry no hash and be restaged unverified; filtered out by name, an object that reads
+    /// do open would never be restaged.
+    ///
+    /// Revert: the walk drops respelled entries → red on macOS and Windows. Revert: the walk lists
+    /// the entry as named on disk → red on both.
+    #[test]
+    fn the_store_wide_walk_lists_a_respelled_object_under_its_canonical_path() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir().join(format!("forklift-recovery-respelled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let hash = "ab".to_string() + &"cd".repeat(31);
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        let upper = Path::new(&folder).with_file_name("AB");
+        std::fs::rename(&folder, &upper).unwrap();
+        let canonical = Path::new(&folder).join(&file_name);
+        let folds = canonical.exists();
+
+        let root = forklift_root();
+        let mut listed = Vec::new();
+        walk_loose_object_paths(&root, &mut listed).unwrap();
+
+        let expected: Vec<PathBuf> = if folds {
+            vec![canonical.strip_prefix(&root).unwrap().to_path_buf()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(listed, expected, "folds: {}", folds);
+        if let Some(path) = listed.first() {
+            assert_eq!(file_utils::hash_from_object_path(path), Some(hash.clone()), "the listing carries the hash");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn closure_walk_never_touches_a_barrier_or_a_dir_sync() {

@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use forklift_core::model::remote::{
     RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo,
-    LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION,
+    LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
@@ -180,7 +180,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// *input* `hashes` in order and keeping every one the probe reported absent — identical
     /// to what the old per-hash loop returned (order and duplicate hashes both preserved).
     pub fn missing(&self, hashes: &[String]) -> HeadResult<Vec<String>> {
-        self.reject_oversized_batch(hashes.len())?;
+        self.reject_malformed_batch(hashes)?;
 
         let absent: HashSet<String> =
             self.objects.objects_missing(hashes).map_err(HeadError::internal)?.into_iter().collect();
@@ -204,7 +204,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         session: &str,
         hashes: &[String],
     ) -> HeadResult<UploadTargetsResponse> {
-        self.reject_oversized_batch(hashes.len())?;
+        self.reject_malformed_batch(hashes)?;
 
         let mut response = UploadTargetsResponse {
             present: Vec::new(),
@@ -256,6 +256,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// `GET /v1/objects/{hash}` — the raw object bytes, or a redirect to storage.
     pub fn object_get(&self, hash: &str) -> HeadResult<ObjectReadResult> {
+        require_object_hash(hash)?;
+
         match self.objects.access(hash).map_err(HeadError::internal)? {
             Some(ObjectAccess::Direct(bytes)) => Ok(ObjectReadResult::Bytes(bytes)),
             Some(ObjectAccess::Redirect(url)) => Ok(ObjectReadResult::Redirect(url)),
@@ -277,6 +279,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         hash: &str,
         bytes: &[u8],
     ) -> HeadResult<ObjectWriteResult> {
+        require_object_hash(hash)?;
+
         match self.objects.put_target(session, hash).map_err(HeadError::internal)? {
             PutTarget::Staged(url) => Ok(ObjectWriteResult::Redirect(url)),
             PutTarget::SessionRequired => Err(HeadError::unprocessable(
@@ -298,6 +302,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// `GET /v1/signatures/{hash}` — a parcel's signature sidecar.
     pub fn signature_get(&self, parcel_hash: &str) -> HeadResult<Vec<u8>> {
+        require_object_hash(parcel_hash)?;
+
         self.objects
             .get_signature(parcel_hash)
             .map_err(HeadError::internal)?
@@ -308,6 +314,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// here (`422` when malformed); whether it *verifies* is decided at ref-update time.
     /// A conflicting sidecar for an already-signed parcel is refused (`409`).
     pub fn signature_put(&self, parcel_hash: &str, bytes: &[u8]) -> HeadResult<SignatureOutcome> {
+        require_object_hash(parcel_hash)?;
+
         sign_utils::validate_raw_parcel_signature(bytes, parcel_hash)
             .map_err(HeadError::unprocessable)?;
 
@@ -804,7 +812,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// upload path, in the other direction — except the router answers `303`, not `307`, since
     /// this request is a `POST` and the presigned target only ever accepts `GET`.
     pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
-        self.reject_oversized_batch(hashes.len())?;
+        self.reject_malformed_batch(hashes)?;
 
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
@@ -941,16 +949,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(())
     }
 
-    /// The `422` for a batch request over the protocol cap.
-    fn reject_oversized_batch(&self, count: usize) -> HeadResult<()> {
-        if count > MAX_MISSING_BATCH {
+    /// The `422` for a batch request over the protocol cap, or naming anything but object hashes
+    /// ([`require_object_hash`]).
+    fn reject_malformed_batch(&self, hashes: &[String]) -> HeadResult<()> {
+        if hashes.len() > MAX_MISSING_BATCH {
             return Err(HeadError::unprocessable(format!(
                 "At most {} hashes per request; batch larger sets.",
                 MAX_MISSING_BATCH
             )));
         }
 
-        Ok(())
+        hashes.iter().try_for_each(|hash| require_object_hash(hash))
     }
 
     /// The `409` for a ref that is not where the client expected it.
@@ -1070,4 +1079,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 .to_string(),
         )
     }
+}
+
+/// The `422` for a client-sent hash spelled any way but the store's own, 64 lowercase hex
+/// characters: the same refusal the self-hosted server gives, rather than a miss decided by S3's
+/// key casing. The value is not repeated back.
+fn require_object_hash(hash: &str) -> HeadResult<()> {
+    if object_utils::is_object_hash(hash) {
+        return Ok(());
+    }
+
+    Err(HeadError::unprocessable(REFUSAL_NOT_AN_OBJECT_HASH))
 }

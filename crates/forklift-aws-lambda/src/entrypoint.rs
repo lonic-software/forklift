@@ -471,7 +471,7 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> Op
 }
 
 /// The `422` for an `upload-targets` request over [`MAX_UPLOAD_TARGETS_BATCH`] — reads exactly
-/// like `Head::reject_oversized_batch`, just against the smaller, response-shaped ceiling this
+/// like `Head::reject_malformed_batch`, just against the smaller, response-shaped ceiling this
 /// endpoint needs (see the constant's docs).
 fn reject_oversized_upload_targets(count: usize) -> HeadResult<()> {
     if count > MAX_UPLOAD_TARGETS_BATCH {
@@ -488,7 +488,7 @@ fn reject_oversized_upload_targets(count: usize) -> HeadResult<()> {
 /// The `422` for a `commit_lift` request whose `control_plane` and `blobs` lists together
 /// exceed the protocol's shared batch cap. `Head::commit_lift` carries no such guard itself
 /// (unlike `missing`/`upload_targets`/`batch`, each capped inside `Head` via its own
-/// `reject_oversized_batch`), so the router enforces it here — combined across both lists,
+/// `reject_malformed_batch`), so the router enforces it here — combined across both lists,
 /// since a request naming this many hashes at all is the failure mode worth capping, not
 /// either list in isolation.
 fn reject_oversized_commit(control_plane: usize, blobs: usize) -> HeadResult<()> {

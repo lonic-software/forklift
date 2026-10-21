@@ -31,7 +31,8 @@ Where:
 ## Structural checks at load
 The parser enforces these before returning the recipe (cheap, `O(chunk_count)`, zero bytes
 fetched):
-- every hash is exactly 64 ASCII-hex characters;
+- every hash is exactly 64 lowercase ASCII-hex characters, the one spelling the object store
+  answers for;
 - no chunk's declared size exceeds the per-chunk ceiling (`MAX_CHUNK_BYTES`, 4 MiB);
 - `sum(chunk_size)` equals `total_size`;
 - no bytes trail the last chunk.

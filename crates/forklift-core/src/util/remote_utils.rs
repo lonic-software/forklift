@@ -508,7 +508,7 @@ const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// wrong: it said that endpoint "stays fully unbounded for exactly this reason: it has no such
 /// per-call ceiling." **It has one.** Both heads reject an over-cap batch at `MAX_MISSING_BATCH` —
 /// the same protocol constant this file already imports (`forklift-server`'s `post_objects_batch`,
-/// `forklift-aws-lambda`'s `Head::reject_oversized_batch`) — so that ceiling is a protocol
+/// `forklift-aws-lambda`'s `Head::reject_malformed_batch`) — so that ceiling is a protocol
 /// property, client-known, exactly like `MAX_OBJECT_BYTES`. What actually differs is its size: the
 /// implied worst case is a *count* cap times the per-object byte ceiling, 10,000 × 64MiB, which
 /// bounds the space and is useless as a budget. No flat silence budget over the *build* is honest —

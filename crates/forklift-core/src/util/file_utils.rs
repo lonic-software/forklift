@@ -150,8 +150,14 @@ pub fn get_path_graph_root() -> String {
 }
 
 /// Whether `hash` is shaped like an object hash *or a prefix of one*: long enough to carve a
-/// fan-out folder off of, and every character an ASCII hex digit of either case. A full hash in
-/// its canonical spelling is [`crate::util::object_utils::is_object_hash`]. This is the one rule
+/// fan-out folder off of, and every character a lowercase hex digit. A full hash is
+/// [`crate::util::object_utils::is_object_hash`].
+///
+/// Lowercase only, because loose objects are written under the lowercase spelling: an uppercase
+/// path would find the object on a case-insensitive file system and miss it on a case-sensitive
+/// one, while the pack index decodes the hash to bytes and finds it on both. Refusing every other
+/// spelling here keeps the two stores agreeing. A caller holding a user-typed hash lowercases it
+/// at that boundary (`pallet_utils::resolve_revision`). This is the one rule
 /// [`get_path_for_object`] enforces (and the only one — it does not check length against any
 /// particular digest's width), pulled out so a caller that needs to know *whether* a string is
 /// hash-shaped, without wanting the path or the error string, has something to call instead of
@@ -162,9 +168,56 @@ pub fn get_path_graph_root() -> String {
 ///
 /// # Returns
 /// * `true`  - If `hash` is shaped like an object hash or a prefix of one.
-/// * `false` - Otherwise (too short, or not all hex digits).
+/// * `false` - Otherwise (too short, or not all lowercase hex digits).
 pub fn is_object_hash_or_prefix(hash: &str) -> bool {
-    hash.len() > OBJECT_HASH_FOLDER_PATH_CHARACTERS && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    hash.len() > OBJECT_HASH_FOLDER_PATH_CHARACTERS && is_lowercase_hex(hash)
+}
+
+/// Whether `name`, as a listing of `objects/` returns it, may be an object fan-out folder: two hex
+/// digits in either case. The pack folder and anything else are not. The loose-store sweeps
+/// (`gc`, `compact`, a heal's restage listing) then pass each entry inside through
+/// [`canonical_loose_entry`], which decides what a spelling other than lowercase holds.
+pub fn is_fan_out_folder_name(name: &str) -> bool {
+    name.len() == OBJECT_HASH_FOLDER_PATH_CHARACTERS && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The spelling [`get_path_for_object`] gives a listed loose-store entry, `(folder, file)`, if
+/// that path opens this very entry; `None` if it does not.
+///
+/// The path builder writes lowercase, yet a folder or file spelled otherwise (`AB`, `CDEF…`) can
+/// turn up. On a case-insensitive file system the lowercase path opens it, so it *is* the object:
+/// gc must keep it while it is live, compact must pack it, and a store-wide heal must restage it,
+/// all under the lowercase hash. On a case-sensitive one the store never opens it, so a sweep
+/// leaves it alone. Which of the two holds is read from the entry's identity rather than guessed
+/// from the platform. An entry already spelled in lowercase is its own answer, at no cost.
+///
+/// # Arguments
+/// * `folder`    - The fan-out folder's path, as listed.
+/// * `file_name` - The entry's name inside it, as listed.
+///
+/// # Returns
+/// * `Some((String, String))` - The folder and file name the path builder spells.
+/// * `None`                   - The path builder's spelling does not reach this entry.
+pub fn canonical_loose_entry(folder: &Path, file_name: &str) -> Option<(String, String)> {
+    let folder_name = folder.file_name()?.to_str()?;
+    let lower_folder = folder_name.to_ascii_lowercase();
+    let lower_file = file_name.to_ascii_lowercase();
+
+    if lower_folder == folder_name && lower_file == file_name {
+        return Some((lower_folder, lower_file));
+    }
+
+    let identity = |path: &Path| std::fs::symlink_metadata(path).ok()
+        .and_then(|metadata| get_device_and_inode(path, &metadata).ok());
+    let listed = identity(&folder.join(file_name))?;
+    let spelled = identity(&folder.with_file_name(&lower_folder).join(&lower_file))?;
+
+    (listed == spelled).then_some((lower_folder, lower_file))
+}
+
+/// Every byte of `text` is `0-9` or `a-f`.
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Get the path and file name for an object.
@@ -223,7 +276,7 @@ pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
 ///
 /// # Returns
 /// * `Some(String)` - The hash, if `path`'s last two components have the `<2 hex chars>/<rest>`
-///                     fan-out shape [`get_path_for_object`] produces.
+///                     fan-out shape [`get_path_for_object`] produces (lowercase hex only).
 /// * `None`         - `path` does not have that shape (not an object path, or corrupt).
 pub fn hash_from_object_path(path: &Path) -> Option<String> {
     let file_name = path.file_name()?.to_str()?;
@@ -235,7 +288,7 @@ pub fn hash_from_object_path(path: &Path) -> Option<String> {
 
     let candidate = format!("{}{}", folder_name, file_name);
 
-    candidate.bytes().all(|b| b.is_ascii_hexdigit()).then_some(candidate)
+    is_lowercase_hex(&candidate).then_some(candidate)
 }
 
 /// Whether writes fsync for durability. Durable by default; set `FORKLIFT_FSYNC` to `0`, `off`,
@@ -4140,6 +4193,40 @@ mod tests {
         }
     }
 
+    /// A respelled entry resolves to the path builder's spelling exactly when that spelling opens
+    /// it: on a case-insensitive file system it does, on a case-sensitive one it does not, and
+    /// there even a real lowercase entry beside it is a different file, not this one.
+    ///
+    /// Revert: the identity comparison answers `Some` without checking → red on a case-sensitive
+    /// volume (Linux CI). Revert: a respelled entry answers `None` → red on a case-insensitive one
+    /// (macOS, Windows).
+    #[test]
+    fn a_respelled_loose_entry_resolves_only_where_the_lowercase_path_opens_it() {
+        let temp = std::env::temp_dir().join(format!("forklift-respelled-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join("ab")).unwrap();
+        std::fs::write(temp.join("ab").join("cdef"), b"object").unwrap();
+
+        let lower = Some(("ab".to_string(), "cdef".to_string()));
+        assert_eq!(canonical_loose_entry(&temp.join("ab"), "cdef"), lower, "lowercase is its own spelling");
+
+        std::fs::rename(temp.join("ab"), temp.join("AB")).unwrap();
+        std::fs::rename(temp.join("AB").join("cdef"), temp.join("AB").join("CdEf")).unwrap();
+        let folds = temp.join("ab").join("cdef").exists();
+
+        let resolved = canonical_loose_entry(&temp.join("AB"), "CdEf");
+        assert_eq!(resolved, if folds { lower.clone() } else { None }, "folds: {}", folds);
+
+        if !folds {
+            std::fs::create_dir_all(temp.join("ab")).unwrap();
+            std::fs::write(temp.join("ab").join("cdef"), b"another file").unwrap();
+            assert_eq!(canonical_loose_entry(&temp.join("AB"), "CdEf"), None,
+                "a lowercase entry beside it is not this entry");
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     #[test]
     fn hash_from_object_path_rejects_a_shape_get_path_for_object_never_produces() {
         // Any path that does not have the fan-out shape (a 2-hex-char folder, then the rest of
@@ -4154,6 +4241,8 @@ mod tests {
             PathBuf::from("/some/warehouse/.forklift/objects/abc/def"), // 3-char folder, not 2
             PathBuf::from("/some/warehouse/.forklift/objects/zz/cdef"), // non-hex folder
             PathBuf::from("/some/warehouse/.forklift/objects/ab/cdeg"), // non-hex filename
+            PathBuf::from("/some/warehouse/.forklift/objects/AB/cdef"), // uppercase folder
+            PathBuf::from("/some/warehouse/.forklift/objects/ab/cDef"), // uppercase filename
             PathBuf::from("no-parent-at-all"),
             PathBuf::from("/"),
         ];
