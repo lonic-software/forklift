@@ -701,7 +701,7 @@ impl Converter {
     }
 
     /// Convert one git blob — in pack-direct mode as a delta against the previous version at
-    /// the same path when that saves space, exactly like the bundle builder's `emit_blob`.
+    /// the same path when that saves space, exactly like the bundle builder's blob records.
     fn convert_blob(&mut self, git_hash: &str, path: &str) -> Result<String, String> {
         if let Some(hash) = self.blobs.get(git_hash) {
             // Already imported (the same content elsewhere in history) — nothing to store,

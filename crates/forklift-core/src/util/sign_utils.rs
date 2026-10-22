@@ -669,7 +669,15 @@ fn parse_parcel_signature(bytes: &[u8], parcel_hash: &str) -> Result<ParcelSigna
 
 /// Encode bytes as lowercase hex.
 pub fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        hex.push(DIGITS[(byte >> 4) as usize] as char);
+        hex.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+
+    hex
 }
 
 /// Decode a lowercase/uppercase hex string into bytes.

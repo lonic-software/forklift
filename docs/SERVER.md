@@ -231,7 +231,10 @@ revocation by more than about a day.
   filter (default `info`).
 - **Bundles:** `forklift-server bundle --root …` builds the snapshot served at
   `/v1/bundles/latest` (fast franchising); `rebuild_after_lifts` automates it. The
-  bundle is written atomically and streamed, so rebuilds never disturb serving.
+  bundle is written atomically and streamed, so rebuilds never interrupt serving. A build
+  does use every core while it runs, and memory grows with the warehouse: a git.git-sized
+  history peaks at 1.2–1.7 GB, plus up to one object per core in flight (a warehouse of
+  near-ceiling files can hold that many at once).
   Successive versions of a file are **delta-compressed** (`docs/format/BUNDLE_FORMAT.md`,
   §9.1 #1), so the bundle moves each change rather than every whole file; the reconstructed
   objects are hash-verified on import, and older clients fall back to loose objects.

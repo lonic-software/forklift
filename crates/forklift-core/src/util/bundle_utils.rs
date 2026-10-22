@@ -6,12 +6,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use crate::error::CoreError;
 use crate::globals::forklift_root;
 use crate::model::remote::MAX_MISSING_BATCH;
+use crate::model::tree_item::TreeItem;
 use crate::util::{
-    audit_utils, delta_utils, file_utils, object_utils, pack_utils, pallet_utils, scope_utils,
-    sign_utils,
+    audit_utils, delta_utils, fanout_utils, file_utils, object_utils, pack_utils, pallet_utils,
+    scope_utils, sign_utils,
 };
 
 /// The uncompressed ASCII header line (without the newline) that opens every whole-warehouse
@@ -41,6 +43,28 @@ const KIND_OBJECT: u8 = b'O';
 /// deltas, the next version is stored in full. This caps both the reconstruction cost of a
 /// blob and the blast radius of a missing base (git's pack chain limit is the same order).
 const MAX_DELTA_CHAIN: u32 = 50;
+
+/// How many records the build's workers may load ahead of the one being appended, and the
+/// compressed bytes held ahead at which they pause (see [`fanout_utils::prefetch_in_order`]). The
+/// same bounds `shift` prefetches blobs under: deep enough to keep every core busy, small next to
+/// the build's own working set.
+const EMIT_WINDOW: usize = 256;
+const EMIT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many parcels the build's workers may load trees for ahead of the walk, the entries of the
+/// parsed trees held ahead at which they pause, and the most trees loaded for any one parcel (the
+/// walk reads the rest itself). A parcel usually changes a handful of trees, so the window binds
+/// first; the caps bound a run of large merges or wide directories, and a first parcel over a
+/// tree of many directories.
+const PLAN_WINDOW: usize = 256;
+const PLAN_BUDGET_ENTRIES: usize = 256 * 1024;
+const PLAN_PARCEL_TREES: usize = 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// How many trees the plan walk read itself because no worker had loaded them.
+    static PLAN_WALK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The folder (inside the forklift root) where bundles live.
 const FOLDER_NAME_BUNDLES: &str = "bundles";
@@ -130,32 +154,26 @@ pub fn build_bundle() -> Result<BuildStats, String> {
     // deltas against it (the importer must have the base stored to reconstruct the delta).
     let order = topo_order_oldest_first(&parcels)?;
 
-    let mut seen_trees: HashSet<String> = HashSet::new();
-    // Every blob already emitted, mapped to its delta-chain depth (0 = stored in full).
-    let mut emitted_depth: HashMap<String, u32> = HashMap::new();
-    // The most recently emitted blob at each file path — the base a later version deltas against.
-    let mut latest_blob_at_path: HashMap<String, String> = HashMap::new();
+    let plan = plan_emission(&order, PLAN_PARCEL_TREES)?;
+    let mut depths: Vec<u32> = vec![0; plan.len()];
+    let mut next = 0usize;
 
-    for parcel_hash in &order {
-        let parcel_bytes = file_utils::retrieve_object_by_hash(parcel_hash)?;
-        refuse_if_transporting_over_ceiling(&format!("parcel {}", parcel_hash), parcel_bytes.len())?;
-
-        pack_builder.append_full(parcel_hash, &parcel_bytes)?;
-        stats.objects += 1;
-
-        if let Some(sidecar) = sign_utils::load_raw_parcel_signature(parcel_hash)? {
-            refuse_if_transporting_over_ceiling(
-                &format!("signature for parcel {}", parcel_hash), sidecar.len()
-            )?;
-            write_signature_record(&mut signature_writer, parcel_hash, &sidecar)?;
-            stats.signatures += 1;
-        }
-
-        let tree_hash = object_utils::load_parcel(parcel_hash)?.tree_hash;
-
-        write_tree_closure(&mut pack_builder, &tree_hash, "", &mut seen_trees,
-                           &mut emitted_depth, &mut latest_blob_at_path, &mut stats)?;
-    }
+    // Reading, verifying and compressing each record is independent of every other record, so it
+    // runs on worker threads; appending stays in plan order on this thread, where the delta-chain
+    // depth (which depends on earlier records' outcomes) is decided.
+    fanout_utils::prefetch_in_order(
+        &plan,
+        EMIT_WINDOW,
+        EMIT_BUDGET_BYTES,
+        |item| load_emission(&plan, item),
+        |loaded| loaded.as_ref().map_or(0, Loaded::size),
+        |_, loaded| {
+            let index = next;
+            next += 1;
+            write_emission(&mut pack_builder, &mut signature_writer, &plan, index, loaded?,
+                           &mut depths, &mut stats)
+        },
+    )?;
 
     let artifacts = pack_builder.finish()?;
     signature_writer.flush()
@@ -392,31 +410,153 @@ pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Write a tree's closure (trees and blobs, deduplicated) into the bundle, tracking the
-/// path to each blob so successive versions of a file can be delta-compressed. Trees and
+/// An object hash in binary form: the plan holds one per record, so a whole-history plan costs
+/// no allocation per record.
+type PlanHash = [u8; pack_utils::HASH_LEN];
+
+/// One record of a bundle build, in the order the bundle holds them.
+enum Emission {
+    /// A parcel, then its signature sidecar when it has one.
+    Parcel { hash: PlanHash },
+
+    /// A tree, stored in full. `directory` names it in a refusal.
+    Tree { hash: PlanHash, directory: Arc<str> },
+
+    /// A blob's first occurrence at `path`. `base` is the plan index of the version emitted
+    /// before it at that path: the blob is stored as a delta against it when the chain allows
+    /// that and it saves space.
+    Blob { hash: PlanHash, path: Arc<str>, base: Option<usize> },
+}
+
+impl Emission {
+    fn hash(&self) -> &PlanHash {
+        match self {
+            Emission::Parcel { hash } | Emission::Tree { hash, .. } | Emission::Blob { hash, .. } => hash,
+        }
+    }
+}
+
+fn plan_hash(hash: &str) -> Result<PlanHash, String> {
+    pack_utils::hash_to_bytes(hash)
+        .ok_or_else(|| format!("Cannot pack \"{}\": not a 64-character object hash.", hash))
+}
+
+/// The serial state of the walk: what is already planned, and the newest version at each path.
+#[derive(Default)]
+struct PlanWalk {
+    plan: Vec<Emission>,
+    seen_trees: HashSet<PlanHash>,
+    /// Each planned blob's plan index.
+    planned_blobs: HashMap<PlanHash, usize>,
+    /// The plan index of the most recently emitted blob at each file path — the base a later
+    /// version deltas against. Its keys are the paths the plan's blobs share.
+    latest_blob_at_path: HashMap<Arc<str>, usize>,
+    /// The directory names the plan's trees share.
+    directories: HashSet<Arc<str>>,
+}
+
+/// Walk every parcel's closure (trees and blobs, each once) into the records the bundle holds,
+/// in order: each parcel, then its tree, the tree's files, and its subtrees depth-first. Trees and
 /// parcels are always stored in full; only blobs (where the version redundancy lives) are
-/// considered for deltas.
-fn write_tree_closure(pack: &mut pack_utils::TransportPackBuilder,
-                                tree_hash: &str,
-                                path_prefix: &str,
-                                seen_trees: &mut HashSet<String>,
-                                emitted_depth: &mut HashMap<String, u32>,
-                                latest_blob_at_path: &mut HashMap<String, String>,
-                                stats: &mut BuildStats) -> Result<(), String> {
-    if !seen_trees.insert(tree_hash.to_string()) {
+/// considered for deltas, against the version most recently emitted at the same path.
+///
+/// The walk itself is serial (which trees and blobs are new depends on every parcel before), but
+/// the trees it reads are loaded ahead on worker threads: for each parcel, those that differ from
+/// its first parent's at the same path — a superset of the ones the walk will find unseen, since
+/// the parent is walked first. A tree the workers did not load (or failed to) is read by the walk.
+///
+/// Workers load at most `parcel_trees` trees for any one parcel ([`PLAN_PARCEL_TREES`] in a build).
+///
+/// A chunked file anywhere in the closure, or a tree that cannot be read, refuses the build here,
+/// before any record is written.
+fn plan_emission(order: &[String], parcel_trees: usize) -> Result<Vec<Emission>, String> {
+    let mut tree_of: HashMap<&str, String> = HashMap::new();
+    let mut walks: Vec<(&str, String, Option<String>)> = Vec::new();
+
+    for parcel_hash in order {
+        let parcel = object_utils::load_parcel(parcel_hash)?;
+        let parent_tree = parcel.parents.first().and_then(|parent| tree_of.get(parent.as_str())).cloned();
+        tree_of.insert(parcel_hash, parcel.tree_hash.clone());
+        walks.push((parcel_hash, parcel.tree_hash, parent_tree));
+    }
+
+    let mut walk = PlanWalk::default();
+
+    fanout_utils::prefetch_in_order(
+        &walks,
+        PLAN_WINDOW,
+        PLAN_BUDGET_ENTRIES,
+        |(_, tree_hash, parent_tree)| {
+            let mut changed: HashMap<String, TreeItem> = HashMap::new();
+            load_changed_trees(tree_hash, parent_tree.as_deref(), parcel_trees, &mut changed);
+            changed
+        },
+        |changed| changed.values().map(|tree| tree.get_files().len() + tree.get_subtrees().len()).sum(),
+        |(parcel_hash, tree_hash, _), mut prefetched| {
+            walk.plan.push(Emission::Parcel { hash: plan_hash(parcel_hash)? });
+
+            plan_tree_closure(&mut walk, tree_hash, "", &mut prefetched)
+        },
+    )?;
+
+    Ok(walk.plan)
+}
+
+/// Load, into `changed`, the trees under `tree_hash` that differ from `parent_hash` — the tree at
+/// the same path in the parcel's first parent (`None`: there is none), stopping at
+/// `limit` trees. Best-effort: a tree that cannot be read is left out, for the walk to
+/// read and refuse in order. Trees are parsed without the shared parsed-tree cache, as other
+/// one-shot walks do.
+fn load_changed_trees(tree_hash: &str,
+                      parent_hash: Option<&str>,
+                      limit: usize,
+                      changed: &mut HashMap<String, TreeItem>) {
+    if parent_hash == Some(tree_hash)
+        || changed.contains_key(tree_hash)
+        || changed.len() >= limit {
+        return;
+    }
+
+    let Ok(tree) = object_utils::load_tree(tree_hash) else { return };
+    let parent = parent_hash.and_then(|parent| object_utils::load_tree(parent).ok());
+
+    for (name, subtree) in tree.get_subtrees() {
+        let parent_subtree = parent.as_ref()
+            .and_then(|parent| parent.get_subtree(name))
+            .map(|parent_subtree| parent_subtree.hash.as_str());
+        load_changed_trees(&subtree.hash, parent_subtree, limit, changed);
+    }
+
+    changed.insert(tree_hash.to_string(), tree);
+}
+
+fn plan_tree_closure(walk: &mut PlanWalk,
+                     tree_hash: &str,
+                     path_prefix: &str,
+                     prefetched: &mut HashMap<String, TreeItem>) -> Result<(), String> {
+    if !walk.seen_trees.insert(plan_hash(tree_hash)?) {
         return Ok(());
     }
 
-    let tree_bytes = file_utils::retrieve_object_by_hash(tree_hash)?;
     let directory = if path_prefix.is_empty() { "/" } else { path_prefix };
-    refuse_if_transporting_over_ceiling(
-        &format!("the directory \"{}\" (object {})", directory, tree_hash), tree_bytes.len()
-    )?;
+    let directory = match walk.directories.get(directory) {
+        Some(directory) => Arc::clone(directory),
+        None => {
+            let directory: Arc<str> = Arc::from(directory);
+            walk.directories.insert(Arc::clone(&directory));
+            directory
+        }
+    };
+    walk.plan.push(Emission::Tree { hash: plan_hash(tree_hash)?, directory });
 
-    pack.append_full(tree_hash, &tree_bytes)?;
-    stats.objects += 1;
-
-    let tree = object_utils::load_tree(tree_hash)?;
+    let tree = match prefetched.remove(tree_hash) {
+        Some(tree) => tree,
+        None => {
+            #[cfg(test)]
+            PLAN_WALK_READS.with(|reads| reads.set(reads.get() + 1));
+            object_utils::load_tree(tree_hash)?
+        }
+    };
 
     for (name, file) in tree.get_files() {
         let path = join_path(path_prefix, name);
@@ -425,7 +565,7 @@ fn write_tree_closure(pack: &mut pack_utils::TransportPackBuilder,
         // plane, negotiated one hash at a time), and by design **no bundle ever carries a chunk**:
         // trees reference only recipes, so this closure walk never descends into a recipe, and a
         // chunk is therefore structurally absent from every bundle. A bundle could still carry a
-        // chunked file's *recipe* as bytes (`emit_blob` moves it undecoded), but the result would
+        // chunked file's *recipe* as bytes (a blob record moves it undecoded), but the result would
         // be a bundle over a file whose chunks it cannot contain — unmaterializable wherever it
         // lands. So this guard stays even now that chunk transport has shipped: a chunked file
         // reaches a peer over the wire per object (franchise/lower/expand fetch the recipe from the
@@ -437,74 +577,194 @@ fn write_tree_closure(pack: &mut pack_utils::TransportPackBuilder,
             return Err(scope_utils::chunked_transport_refusal(&path).into());
         }
 
-        emit_blob(pack, &file.hash, &path, emitted_depth, latest_blob_at_path, stats)?;
+        let path: Arc<str> = match walk.latest_blob_at_path.get_key_value(path.as_str()) {
+            Some((path, _)) => Arc::clone(path),
+            None => Arc::from(path),
+        };
+        let hash = plan_hash(&file.hash)?;
+
+        // Already in the bundle: don't re-emit, but let a later version at this path delta
+        // against it (it is the newest content seen here).
+        let index = match walk.planned_blobs.get(&hash) {
+            Some(index) => *index,
+            None => {
+                let index = walk.plan.len();
+                let base = walk.latest_blob_at_path.get(&path).copied();
+                walk.plan.push(Emission::Blob { hash, path: Arc::clone(&path), base });
+                walk.planned_blobs.insert(hash, index);
+                index
+            }
+        };
+
+        walk.latest_blob_at_path.insert(path, index);
     }
 
     for (name, subtree) in tree.get_subtrees() {
         let child = join_path(path_prefix, name);
-        write_tree_closure(pack, &subtree.hash, &child,
-                           seen_trees, emitted_depth, latest_blob_at_path, stats)?;
+        plan_tree_closure(walk, &subtree.hash, &child, prefetched)?;
     }
 
     Ok(())
 }
 
-/// Emit one blob — as a delta against the previous version at the same path when that saves
-/// space, otherwise in full. Records the blob's chain depth so the chain stays bounded and
-/// a later version chains from the right base.
-fn emit_blob(pack: &mut pack_utils::TransportPackBuilder,
-                       blob_hash: &str,
-                       path: &str,
-                       emitted_depth: &mut HashMap<String, u32>,
-                       latest_blob_at_path: &mut HashMap<String, String>,
-                       stats: &mut BuildStats) -> Result<(), String> {
-    // Already in the bundle: don't re-emit, but let a later version at this path delta
-    // against it (it is the newest content seen here).
-    if emitted_depth.contains_key(blob_hash) {
-        latest_blob_at_path.insert(path.to_string(), blob_hash.to_string());
-        return Ok(());
-    }
+/// One record, read, verified and compressed — everything a record needs that does not depend on
+/// the records before it.
+enum Loaded {
+    Parcel { compressed: Vec<u8>, sidecar: Option<Vec<u8>> },
+    Tree { compressed: Vec<u8> },
+    Blob {
+        target_len: usize,
 
-    let target_bytes = file_utils::retrieve_object_by_hash(blob_hash)?;
-    refuse_if_transporting_over_ceiling(
-        &format!("\"{}\" (object {})", path, blob_hash), target_bytes.len()
-    )?;
+        /// The delta against the blob's base, when it has one and is small enough to delta. An
+        /// error here (an unreadable base) fails the build only if the delta is the one taken.
+        delta: Option<Result<Vec<u8>, String>>,
 
-    let mut depth = 0u32;
-    let mut emitted_as_delta = false;
+        /// The full record, unless the delta is the smaller of the two. `None` with a delta
+        /// present means the delta is smaller; the record is compressed on the spot if the
+        /// chain turns out too deep for it.
+        full: Option<Vec<u8>>,
+    },
+}
 
-    if let Some(base_hash) = latest_blob_at_path.get(path).cloned() {
-        let base_depth = *emitted_depth.get(&base_hash).unwrap_or(&0);
-
-        // An over-large object is stored full, never delta'd — the same rule `pack_utils`
-        // applies, and the one that lets `decompress_delta` enforce a real bomb ceiling on
-        // the read side (`delta_utils::MAX_DELTA_TARGET_BYTES`).
-        let deltable = target_bytes.len() <= delta_utils::MAX_DELTA_TARGET_BYTES;
-
-        if deltable && base_depth < MAX_DELTA_CHAIN && base_hash != blob_hash {
-            let base_bytes = file_utils::retrieve_object_by_hash(&base_hash)?;
-            let delta = delta_utils::compress_delta(&base_bytes, &target_bytes)?;
-
-            // Only worth a delta record when it is actually smaller than the object it
-            // replaces (a wholly-rewritten file is cheaper stored in full).
-            if delta.len() < target_bytes.len() {
-                pack.append_delta(blob_hash, &base_hash, target_bytes.len() as u64, &delta)?;
-                stats.deltas += 1;
-                emitted_as_delta = true;
-                depth = base_depth + 1;
+impl Loaded {
+    fn size(&self) -> usize {
+        match self {
+            Loaded::Parcel { compressed, sidecar } => {
+                compressed.len() + sidecar.as_ref().map_or(0, Vec::len)
+            }
+            Loaded::Tree { compressed } => compressed.len(),
+            Loaded::Blob { delta, full, .. } => {
+                delta.as_ref().and_then(|delta| delta.as_ref().ok()).map_or(0, Vec::len)
+                    + full.as_ref().map_or(0, Vec::len)
             }
         }
     }
+}
 
-    if !emitted_as_delta {
-        pack.append_full(blob_hash, &target_bytes)?;
-        stats.objects += 1;
+/// Load one record on a worker. Each object's size is checked against the whole-object ceiling
+/// right after its bytes are read, before anything of it is compressed.
+fn load_emission(plan: &[Emission], item: &Emission) -> Result<Loaded, String> {
+    let hash = &sign_utils::to_hex(item.hash());
+
+    match item {
+        Emission::Parcel { .. } => {
+            // Parcels are stored full and read once: keep them out of the read cache the blobs'
+            // delta bases come from.
+            let bytes = file_utils::retrieve_object_by_hash_uncached(hash)?;
+            refuse_if_transporting_over_ceiling(&format!("parcel {}", hash), bytes.len())?;
+            let compressed = pack_utils::TransportPackBuilder::compress_full(hash, &bytes)?;
+
+            let sidecar = sign_utils::load_raw_parcel_signature(hash)?;
+            if let Some(sidecar) = &sidecar {
+                refuse_if_transporting_over_ceiling(
+                    &format!("signature for parcel {}", hash), sidecar.len()
+                )?;
+            }
+
+            Ok(Loaded::Parcel { compressed, sidecar })
+        }
+        Emission::Tree { directory, .. } => {
+            let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+            refuse_if_transporting_over_ceiling(
+                &format!("the directory \"{}\" (object {})", directory, hash), bytes.len()
+            )?;
+
+            Ok(Loaded::Tree { compressed: pack_utils::TransportPackBuilder::compress_full(hash, &bytes)? })
+        }
+        Emission::Blob { path, base, .. } => {
+            let target = file_utils::retrieve_object_by_hash_shared(hash)?;
+            refuse_if_transporting_over_ceiling(&format!("\"{}\" (object {})", path, hash), target.len())?;
+
+            // An over-large object is stored full, never delta'd — the same rule `pack_utils`
+            // applies, and the one that lets `decompress_delta` enforce a real bomb ceiling on
+            // the read side (`delta_utils::MAX_DELTA_TARGET_BYTES`).
+            let deltable = target.len() <= delta_utils::MAX_DELTA_TARGET_BYTES;
+            let delta = base.filter(|_| deltable).map(|base| {
+                file_utils::retrieve_object_by_hash_shared(&sign_utils::to_hex(plan[base].hash()))
+                    .and_then(|base| delta_utils::compress_delta(&base, &target))
+            });
+
+            // Only worth a delta record when it is actually smaller than the object it
+            // replaces (a wholly-rewritten file is cheaper stored in full).
+            let delta_is_smaller = matches!(&delta, Some(Ok(delta)) if delta.len() < target.len());
+            let full = if delta_is_smaller {
+                None
+            } else {
+                Some(pack_utils::TransportPackBuilder::compress_full(hash, &target)?)
+            };
+
+            Ok(Loaded::Blob { target_len: target.len(), delta, full })
+        }
+    }
+}
+
+/// Append the loaded record `plan[index]`, in plan order. A blob becomes a delta only while its
+/// base's chain is shorter than [`MAX_DELTA_CHAIN`]; its own depth is recorded in `depths` (0 =
+/// stored in full) so a later version at its path chains from it correctly.
+fn write_emission(pack: &mut pack_utils::TransportPackBuilder,
+                  signature_writer: &mut impl Write,
+                  plan: &[Emission],
+                  index: usize,
+                  loaded: Loaded,
+                  depths: &mut [u32],
+                  stats: &mut BuildStats) -> Result<(), String> {
+    let hash = &sign_utils::to_hex(plan[index].hash());
+
+    match (&plan[index], loaded) {
+        (Emission::Parcel { .. }, Loaded::Parcel { compressed, sidecar }) => {
+            pack.append_compressed_full(hash, &compressed)?;
+            stats.objects += 1;
+
+            if let Some(sidecar) = sidecar {
+                write_signature_record(signature_writer, hash, &sidecar)?;
+                stats.signatures += 1;
+            }
+        }
+        (Emission::Tree { .. }, Loaded::Tree { compressed }) => {
+            pack.append_compressed_full(hash, &compressed)?;
+            stats.objects += 1;
+        }
+        (Emission::Blob { base, .. }, Loaded::Blob { target_len, delta, full }) => {
+            match (*base, delta) {
+                (Some(base), Some(delta)) if depths[base] < MAX_DELTA_CHAIN => {
+                    let delta = delta?;
+
+                    if delta.len() < target_len {
+                        let base_hash = sign_utils::to_hex(plan[base].hash());
+                        pack.append_delta(hash, &base_hash, target_len as u64, &delta)?;
+                        stats.deltas += 1;
+                        depths[index] = depths[base] + 1;
+                    } else {
+                        append_full_blob(pack, hash, full)?;
+                        stats.objects += 1;
+                    }
+                }
+                _ => {
+                    append_full_blob(pack, hash, full)?;
+                    stats.objects += 1;
+                }
+            }
+        }
+        _ => unreachable!("a loaded record is always the kind of its plan item"),
     }
 
-    emitted_depth.insert(blob_hash.to_string(), depth);
-    latest_blob_at_path.insert(path.to_string(), blob_hash.to_string());
-
     Ok(())
+}
+
+/// Append a blob in full: its loaded full record, or — when the worker kept only the smaller
+/// delta and the chain was too deep for it — one compressed now.
+fn append_full_blob(pack: &mut pack_utils::TransportPackBuilder,
+                    hash: &str,
+                    full: Option<Vec<u8>>) -> Result<(), String> {
+    let compressed = match full {
+        Some(compressed) => compressed,
+        None => {
+            let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+            pack_utils::TransportPackBuilder::compress_full(hash, &bytes)?
+        }
+    };
+
+    pack.append_compressed_full(hash, &compressed)
 }
 
 /// Refuse to write a record above the whole-object ceiling into a bundle — the writer-side half
@@ -1568,6 +1828,155 @@ mod tests {
 
         let kept = sign_utils::load_raw_parcel_signature(&parcel_hash).unwrap().unwrap();
         assert_eq!(kept, local, "the local sidecar survives the import untouched");
+    }
+
+    /// Store a tree of `files` (name, blob hash) and `subtrees` (name, tree hash).
+    fn store_tree(files: &[(&str, &str)], subtrees: &[(&str, &str)]) -> String {
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        for (name, hash) in files {
+            tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), DirEntryType::Normal));
+        }
+        for (name, hash) in subtrees {
+            tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), DirEntryType::Tree));
+        }
+        let mut tree_object = LooseObjectBuilder::build_tree(&tree);
+        tree_object.store().unwrap();
+        tree_object.hash
+    }
+
+    fn store_blob(content: &[u8]) -> String {
+        let mut blob_object = LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() });
+        blob_object.store().unwrap();
+        blob_object.hash
+    }
+
+    /// Store a parcel of `tree_hash` on `parents` and make it `main`'s head.
+    fn store_head_parcel(tree_hash: &str, parents: &[&str]) -> String {
+        let parcel = Parcel {
+            tree_hash: tree_hash.to_string(),
+            parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            actions: Vec::new(),
+            description: None,
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+
+        parcel_object.hash
+    }
+
+    /// Each version of a file is stored as a delta against the version emitted before it at the
+    /// same path, until the chain reaches `MAX_DELTA_CHAIN`; the next version starts over in full.
+    /// A version seen again (a revert, in a tree that is itself new) is not stored twice, but
+    /// becomes the base the following version deltas against — here one at the end of a chain, so
+    /// that version is stored full.
+    /// The bundle imports, every version reading back.
+    #[test]
+    fn a_bundle_deltas_each_version_against_the_last_at_its_path_and_caps_the_chain() {
+        let source = Scratch::new("bundle-delta-chain");
+
+        let shared: Vec<u8> = (0..4096u32).map(|i| b'a' + (i.wrapping_mul(2654435761) >> 27) as u8).collect();
+        let version = |k: usize| [shared.as_slice(), format!("\nversion {}\n", k).as_bytes()].concat();
+
+        let unchanged = store_blob(b"never changes");
+        let dir = store_tree(&[("g.txt", &unchanged)], &[]);
+
+        let mut versions: Vec<usize> = (0..MAX_DELTA_CHAIN as usize + 3).collect();
+        // The revert to the chain's last delta (depth `MAX_DELTA_CHAIN`), then one new version.
+        versions.push(MAX_DELTA_CHAIN as usize);
+        versions.push(MAX_DELTA_CHAIN as usize + 3);
+
+        let revert = versions.len() - 2;
+        let note = store_blob(b"the revert parcel's own file");
+
+        let mut parent: Option<String> = None;
+        for (index, &k) in versions.iter().enumerate() {
+            let f = store_blob(&version(k));
+            // The revert's root differs from version 50's, so the walk visits it.
+            let files: Vec<(&str, &str)> = if index == revert {
+                vec![("f.txt", &f), ("note.txt", &note)]
+            } else {
+                vec![("f.txt", &f)]
+            };
+            let root = store_tree(&files, &[("dir", &dir)]);
+            let parents: Vec<&str> = parent.iter().map(String::as_str).collect();
+            parent = Some(store_head_parcel(&root, &parents));
+        }
+
+        PLAN_WALK_READS.with(|reads| reads.set(0));
+        let stats = build_bundle().unwrap();
+        // On a linear history the workers load every tree the walk reads.
+        assert_eq!(PLAN_WALK_READS.with(|reads| reads.get()), 0, "trees the walk read itself");
+
+        // Versions 0..=52 and 53: 0 full, 1..=50 deltas (depths 1..=50), 51 full (its base is 50
+        // deep), 52 a delta, the revert to 50 no record, and 53 full (its base, 50, is 50 deep).
+        assert_eq!(stats.deltas, MAX_DELTA_CHAIN as usize + 1, "deltas");
+        // 55 parcels, 55 roots and `dir`, and the full blobs: versions 0, 51 and 53, `g.txt` and
+        // `note.txt`.
+        assert_eq!(stats.objects, 55 + 56 + 5, "full records");
+
+        let bundle = std::fs::read(&stats.path).unwrap();
+        // The order records are loaded in never reaches the bytes.
+        build_bundle().unwrap();
+        assert!(std::fs::read(&stats.path).unwrap() == bundle, "a rebuild writes the same bundle");
+        drop(source);
+
+        let _destination = Scratch::new("bundle-delta-chain-dst");
+        let imported = import_bundle_bytes(&bundle).unwrap();
+        assert_eq!(imported.stored_objects, stats.objects + stats.deltas);
+        for k in 0..MAX_DELTA_CHAIN as usize + 4 {
+            let content = version(k);
+            let hash = LooseObjectBuilder::build_blob(&Blob { content: content.clone() }).hash;
+            assert_eq!(object_utils::load_blob(&hash).unwrap().content, content, "version {}", k);
+        }
+    }
+
+    /// A parcel whose changed trees exceed what the build loads ahead for one parcel still has
+    /// every tree in its plan: the walk reads the rest itself. (Run at a small cap, so the fixture
+    /// stays small: a build's own cap would need over a thousand stored trees.)
+    #[test]
+    fn a_bundle_carries_every_tree_of_a_parcel_past_the_prefetch_cap() {
+        let _source = Scratch::new("bundle-prefetch-cap");
+
+        const CAP: usize = 4;
+        let directories: Vec<(String, String, String)> = (0..3 * CAP)
+            .map(|i| {
+                let blob = store_blob(format!("file {}", i).as_bytes());
+                (format!("d{}", i), store_tree(&[("f.txt", &blob)], &[]), blob)
+            })
+            .collect();
+        let subtrees: Vec<(&str, &str)> = directories.iter()
+            .map(|(name, hash, _)| (name.as_str(), hash.as_str()))
+            .collect();
+        let root = store_tree(&[], &subtrees);
+        let parcel = store_head_parcel(&root, &[]);
+
+        PLAN_WALK_READS.with(|reads| reads.set(0));
+        let plan = plan_emission(&[parcel.clone()], CAP).unwrap();
+        assert!(PLAN_WALK_READS.with(|reads| reads.get()) > 0, "the walk read the trees past the cap");
+
+        let planned = |kind: fn(&Emission) -> bool| -> HashSet<PlanHash> {
+            plan.iter().filter(|item| kind(item)).map(|item| *item.hash()).collect()
+        };
+        let hashes = |hashes: &mut dyn Iterator<Item = &String>| -> HashSet<PlanHash> {
+            hashes.map(|hash| plan_hash(hash).unwrap()).collect()
+        };
+        assert_eq!(plan.len(), 2 + 2 * directories.len(), "the parcel, its root, each tree and file");
+        assert_eq!(planned(|item| matches!(item, Emission::Parcel { .. })), hashes(&mut std::iter::once(&parcel)));
+        assert_eq!(planned(|item| matches!(item, Emission::Tree { .. })),
+                   hashes(&mut std::iter::once(&root).chain(directories.iter().map(|(_, tree, _)| tree))));
+        assert_eq!(planned(|item| matches!(item, Emission::Blob { .. })),
+                   hashes(&mut directories.iter().map(|(_, _, blob)| blob)));
+
+        let stats = build_bundle().unwrap();
+        assert_eq!(stats.objects, plan.len());
+        assert_eq!(stats.deltas, 0);
     }
 
     /// A warehouse with a chunked file anywhere in reachable history refuses to bundle: chunk
