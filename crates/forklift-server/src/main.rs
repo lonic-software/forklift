@@ -103,11 +103,18 @@ enum Command {
     },
 }
 
-/// Every handler reads objects on the runtime's `spawn_blocking` threads, and a delta chain's
-/// reconstruction recurses, so the runtime's threads get core's
-/// [`WORKER_STACK_SIZE`](forklift_core::util::fanout_utils::WORKER_STACK_SIZE), not tokio's
-/// 2 MiB default.
+/// Every thread that reads objects needs core's
+/// [`WORKER_STACK_SIZE`](forklift_core::util::fanout_utils::WORKER_STACK_SIZE), because a delta
+/// chain's reconstruction recurses. The serve handlers read on the runtime's `spawn_blocking`
+/// threads, so those get it instead of tokio's 2 MiB default. `bundle`, `gc` and `prepare` run
+/// inline on the thread polling [`async_main`], so that is a worker thread with the same stack
+/// rather than the process's main thread (1 MiB on Windows).
 fn main() {
+    forklift_core::util::fanout_utils::run_on_worker_stack("forklift-server-main", run);
+}
+
+/// Build the async runtime and run [`async_main`] on it, on the worker thread `main` spawns.
+fn run() {
     tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(forklift_core::util::fanout_utils::WORKER_STACK_SIZE)
         .enable_all()

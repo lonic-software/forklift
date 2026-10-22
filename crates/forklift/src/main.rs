@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
-use forklift_core::util::fanout_utils::WORKER_STACK_SIZE;
+use forklift_core::util::fanout_utils::{run_on_worker_stack, WORKER_STACK_SIZE};
 use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
@@ -40,13 +40,7 @@ fn main() {
     // number is only sound while nothing of ours could have been given that number.
     events::init();
 
-    std::thread::Builder::new()
-        .name("forklift-main".to_string())
-        .stack_size(WORKER_STACK_SIZE)
-        .spawn(run)
-        .expect("failed to spawn the forklift worker thread")
-        .join()
-        .expect("the forklift worker thread panicked");
+    run_on_worker_stack("forklift-main", run);
 }
 
 /// Build the async runtime and run [`async_main`] on it, on the worker thread `main` spawns.
