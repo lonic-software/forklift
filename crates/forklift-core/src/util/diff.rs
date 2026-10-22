@@ -242,8 +242,13 @@ impl DiffState<'_> {
     ///
     /// A line's rarity is its occurrence count within the region (the larger of the two
     /// sides); lines above `MAX_ANCHOR_OCCURRENCES` never anchor. A run is as rare as its
-    /// rarest line. Ties are broken by run length. After a candidate run is measured, the scan skips past it (trying every
-    /// line inside a run it is part of would re-measure the same run).
+    /// rarest line. Ties are broken by run length.
+    ///
+    /// After a candidate run is measured, the scan skips past it, as JGit's HistogramDiff
+    /// does. A skipped line that occurs once on the old side could only re-measure the same
+    /// run; one that occurs more often could have aligned elsewhere, and that alignment is
+    /// not measured. The skip is what keeps repetitive input from costing every line times
+    /// every occurrence times the run length.
     fn find_anchor(&self, old: &Range<usize>, new: &Range<usize>) -> Option<(usize, usize, usize)> {
         let mut best: Option<(usize, usize, usize, usize)> = None; // (cost, old, new, len)
 
@@ -254,7 +259,8 @@ impl DiffState<'_> {
             let id = self.new_ids[j] as usize;
 
             let old_occurrences = occurrences_in_range(&self.old_positions[id], old);
-            let cost = self.line_cost(id, old, new);
+            let cost = old_occurrences.len()
+                .max(occurrences_in_range(&self.new_positions[id], new).len());
 
             let is_anchor_material = !old_occurrences.is_empty()
                 && cost <= MAX_ANCHOR_OCCURRENCES
@@ -298,7 +304,9 @@ impl DiffState<'_> {
                             break;
                         }
 
-                        run_cost = run_cost.min(self.line_cost(self.new_ids[run_new + offset] as usize, old, new));
+                        let line = self.new_ids[run_new + offset] as usize;
+
+                        run_cost = run_cost.min(self.line_cost(line, old, new));
                     }
 
                     let is_better = match best {

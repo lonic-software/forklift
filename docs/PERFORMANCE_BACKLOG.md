@@ -495,6 +495,9 @@ the cost. The second (per-version blob loads) was not.
   lines. It took the blame to 1.13 s, but it changed the attribution of 984 lines. One 2017
   parcel was credited with 312 lines where git's blame (Myers or histogram) and the exact LCS
   credit it with 9. A blame that credits lines git's does not is worse than a slow one.
+  (Measured before a later fix to the display diff's anchor ranking, which had ranked a run by
+  the line that found it rather than its rarest line and churned this same Makefile's diff;
+  the blame comparison was not re-run after that fix.)
 - **Fix:** `lcs::myers_matches`, Myers' O((n+m)·D) algorithm in linear space (common prefix and
   suffix first, then a middle-snake split). It finds a subsequence as long as the exact table's;
   a randomized test checks it against the table on 20,000 inputs. Then `lcs::slide_changes`, git's
