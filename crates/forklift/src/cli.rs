@@ -453,17 +453,24 @@ pub enum Command {
         path: String,
     },
 
-    /// Download the remote's new parcels and fast-forward the current pallet (pull)
+    /// Download the remote's new parcels and fast-forward the current pallet, or another (pull)
     #[command(
         visible_alias = "lo",
         alias = "pull",
         long_about = "Download the remote's new parcels for the current pallet from the configured \
                       remote (\"remote.url\") and fast-forward to them — working directory and \
-                      inventory included. On first contact with a trusted remote its trust anchor \
-                      is adopted (one-way, like \"office enroll\"), and the adopted genesis is \
-                      reported. A diverged pallet is reported, never merged implicitly."
+                      inventory included. Naming another pallet downloads the remote's history of \
+                      that pallet and creates or fast-forwards its ref alone: this bay, its files \
+                      and its inventory stay where they are, and \"shift\" moves onto it. On first \
+                      contact with a trusted remote its trust anchor is adopted (one-way, like \
+                      \"office enroll\"), and the adopted genesis is reported. A diverged pallet is \
+                      reported, never merged implicitly."
     )]
     Lower {
+        /// The pallet to lower (default: the current pallet); "palletize --remote" lists the
+        /// remote's
+        pallet: Option<String>,
+
         /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
         #[arg(
             long = "expect",
@@ -555,7 +562,8 @@ pub enum Command {
         alias = "branch",
         long_about = "Create a new pallet at the current head — or at the given revision (a pallet \
                       name or a parcel hash) — and shift to it. Without arguments, the pallets are \
-                      listed with the current one marked."
+                      listed with the current one marked; with \"--remote\", the remote's pallets \
+                      are listed instead, each with how it relates to the local one."
     )]
     Palletize {
         /// The name of the new pallet; omit it to list the pallets
@@ -569,6 +577,12 @@ pub enum Command {
         /// metadata; reach them with the "@" qualifier, e.g. "history @office")
         #[arg(short, long)]
         all: bool,
+
+        /// List the remote's pallets instead: each with its remote head, the local head, and
+        /// whether the two are the same, the local one is ahead, or they differ (lower decides).
+        /// Downloads and writes nothing
+        #[arg(long, conflicts_with_all = ["name", "revision"])]
+        remote: bool,
     },
 
     /// Park the work in progress and reset to the pallet head

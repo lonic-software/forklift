@@ -391,7 +391,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::ExportGit { path } => commands::export_git::handle_command(&path),
         Command::Lift => commands::lift::handle_command().await,
         Command::Load { path } => commands::load::handle_command(&path).await,
-        Command::Lower { expect, keep } => commands::lower::handle_command(expect, keep).await,
+        Command::Lower { pallet, expect, keep } => commands::lower::handle_command(pallet, expect, keep).await,
         Command::Manifest { action } => commands::manifest::handle_command(action),
         Command::Haul { action } => commands::haul::handle_command(action).await,
         Command::Mcp { root } => commands::mcp::handle_command(root),
@@ -427,7 +427,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
                 commands::office::accept_regenesis(confirm).await,
             Some(OfficeAction::List) | None => commands::office::list().await,
         },
-        Command::Palletize { name, revision, all } => commands::palletize::handle_command(name, revision, all).await,
+        Command::Palletize { name, revision, all, remote } => commands::palletize::handle_command(name, revision, all, remote).await,
         Command::Park { action } => match action {
             Some(ParkAction::Pop) => commands::park::pop_parked(),
             Some(ParkAction::List) => commands::park::list_parked(),

@@ -199,10 +199,7 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
     refuse_mid_merge("shifting")?;
 
     let Some(target_head) = pallet_utils::get_pallet_head(target)? else {
-        return Err(format!(
-            "No pallet named \"{}\" exists. Use the \"palletize\" command to create it.",
-            target
-        ));
+        return Err(pallet_utils::pallet_not_found_refusal(&pallet_utils::PalletRef::user(target)).into());
     };
 
     // The files move from the tree this bay holds, its base, whatever the pallet's ref says now.

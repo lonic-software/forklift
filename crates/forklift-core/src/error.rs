@@ -212,6 +212,10 @@ refusal_codes! {
     /// The local pallet and the remote's both hold parcels the other lacks. Nothing was lifted or
     /// lowered; the next step names how to merge the two.
     Diverged => "diverged",
+
+    /// A command named a pallet this warehouse holds no ref for. The next step is `lower <name>`
+    /// when a remote is configured (the remote may have it), else `palletize <name>`.
+    PalletNotFound => "pallet_not_found",
 }
 
 impl RefusalCode {

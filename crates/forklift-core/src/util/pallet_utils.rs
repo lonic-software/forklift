@@ -339,6 +339,45 @@ pub fn remote_ahead_refusal(message: String) -> CoreError {
     CoreError::refusal(RefusalCode::RemoteAhead, message, "forklift lower")
 }
 
+/// The [`RefusalCode::PalletNotFound`] refusal for `reference`, a pallet this warehouse holds no
+/// ref for. A user pallet may exist on the remote, so with a remote configured the next step is
+/// `lower <name>`, which brings it in; without one it is `palletize <name>`, which creates it. A
+/// meta pallet is never created by hand, so its next step lists the ones there are.
+pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
+    let wire = reference.to_wire();
+
+    if reference.namespace == PalletNamespace::Meta {
+        return CoreError::refusal(
+            RefusalCode::PalletNotFound,
+            format!("No meta pallet \"{}\" exists in this warehouse.", wire),
+            "forklift palletize --all",
+        );
+    }
+
+    if crate::util::remote_utils::RemoteClient::is_configured() {
+        return CoreError::refusal(
+            RefusalCode::PalletNotFound,
+            format!(
+                "No pallet named \"{p}\" exists in this warehouse (or it has nothing stacked). If the \
+                remote has one, \"forklift lower {p}\" brings it in; \"forklift palletize {p}\" \
+                creates a new one.",
+                p = wire
+            ),
+            format!("forklift lower {}", wire),
+        );
+    }
+
+    CoreError::refusal(
+        RefusalCode::PalletNotFound,
+        format!(
+            "No pallet named \"{p}\" exists in this warehouse (or it has nothing stacked). \
+            \"forklift palletize {p}\" creates it.",
+            p = wire
+        ),
+        format!("forklift palletize {}", wire),
+    )
+}
+
 /// The refusal a remote head answers a ref update with when the pallet's head is `current`, not
 /// the `expected` the client sent: the remote moved since the client read it.
 pub fn pallet_moved_refusal(current: Option<&str>, expected: Option<&str>) -> CoreError {

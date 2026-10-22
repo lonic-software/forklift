@@ -69,7 +69,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     };
 
     let Some(their_head) = pallet_utils::get_pallet_head(&target)? else {
-        return Err(format!("No pallet named \"{}\" exists (or it has nothing stacked).", target));
+        return Err(pallet_utils::pallet_not_found_refusal(&pallet_utils::PalletRef::user(target)).into());
     };
 
     let our_tree_hash = object_utils::load_parcel(&our_head)?.tree_hash;
