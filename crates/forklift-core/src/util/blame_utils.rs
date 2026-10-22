@@ -322,15 +322,16 @@ mod tests {
 
     #[test]
     fn a_long_file_edited_lightly_keeps_its_line_level_attribution() {
-        // 30,000 lines, a third of them a repeated `}`, and 4,000 more `}` inserted in the
-        // middle. The braces are shared, so they survive the drop of one-sided lines and the
-        // search must place them (D = 4,000): a cost of a few million steps, well inside the
-        // budget, so the file's length must not send the version to the whole-file fallback.
+        // 30,000 lines, a third of them a repeated `}`, and 4,000 more `}` inserted, one after
+        // every 7th line from the first to the last. The braces are shared, so they survive the
+        // drop of one-sided lines, and the edits span the file, so no common prefix or suffix
+        // settles it: the search must place them (D = 4,000), a cost of some millions of steps,
+        // inside the budget. The file's length must not send it to the whole-file fallback.
         let text = |i: usize| if i % 3 == 0 { "}\n".to_string() } else { format!("line {i}\n") };
         let previous: Vec<BlameLine> = (0..30_000).map(|i| line(&text(i), "P1")).collect();
-        let mut content: String = (0..15_000).map(text).collect();
-        content.push_str(&"}\n".repeat(4_000));
-        content.extend((15_000..30_000).map(text));
+        let content: String = (0..30_000)
+            .map(|i| if i % 7 == 0 && i / 7 < 4_000 { format!("{}}}\n", text(i)) } else { text(i) })
+            .collect();
 
         let result = attribute_version(&previous, content.as_bytes(), "P2");
 

@@ -68,10 +68,10 @@ pub fn myers_matches<T: Eq>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
 }
 
 /// [`myers_matches`], giving up once the search has taken `budget` steps: each diagonal visited
-/// and each equal pair walked along one costs a step, so the count is the work done. Two long inputs with little in common cost
-/// about the product of their lengths even under Myers; a caller with a fallback for that case
-/// bounds it here instead of by the inputs' lengths, which would also refuse a long input
-/// edited lightly.
+/// and each equal pair walked along one costs a step, so the count is the work done. Two long
+/// inputs with little in common cost about the product of their lengths even under Myers; a
+/// caller with a fallback for that case bounds it here instead of by the inputs' lengths, which
+/// would also refuse a long input edited lightly.
 ///
 /// # Arguments
 /// * `a` - The first slice (the returned vector has one entry per element).
