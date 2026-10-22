@@ -1,6 +1,7 @@
 use serde::Serialize;
-use forklift_core::error::CoreError;
+use forklift_core::error::{self, CoreError};
 use forklift_core::util::bay_utils;
+use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
@@ -18,7 +19,9 @@ use crate::output::{self, CommandOutput};
 /// checkout the next time it read the now-absent content). It is durable before destructive:
 /// the fetch scope is narrowed first, so a partly-finished deletion always leaves the store
 /// correct — freed objects read as sealed-but-unfetched, never as missing. Nothing is destroyed
-/// on the origin — the pruned content is re-fetchable with `expand`.
+/// on the origin, and nothing is freed that the origin does not hold: it asks the remote for its
+/// pallet heads first, and keeps whatever history they do not reach needs under the path — work
+/// stacked here and never lifted — so everything freed is re-fetchable with `expand` (FORK-251).
 ///
 /// It is also **resumable**: a path already outside the fetch scope — because an earlier prune
 /// narrowed it there but was killed before it finished freeing everything — is not refused as
@@ -36,8 +39,9 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - If the plan was reported (dry run) or carried out.
 /// * `Err(String)` - If the warehouse is not sparse, a path is a live spine ancestor or a
 ///   sub-path of what is still fetched, the last fetched path would be dropped, a checkout
-///   still materializes the path, or another process is using the object store.
-pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
+///   still materializes the path, another process is using the object store, or the remote cannot
+///   be reached or is not trusted.
+pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     // Exclusive store access first, before anything is read (FORK-150). The keep-set depends on
     // the fetch scope read just below and on every bay's materialization scope, not only on the
     // plan's walk, and the fetch scope is rewritten from that read; so no writer in another bay —
@@ -106,7 +110,8 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     // to check anyway, and a destructive verb is exactly where redundant defense earns its keep.
     guard_materialization_scopes(&to_reclaim, &post_prune)?;
 
-    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &store_access)?;
+    let remote_heads = remote_pallet_heads().await?;
+    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &store_access)?;
 
     if dry_run {
         output::emit(&PruneReport {
@@ -117,6 +122,8 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
             would_free: plan.to_free.len(),
             still_packed: plan.still_packed,
             retained_shared: plan.retained_shared,
+            kept_unlifted: plan.kept_unlifted,
+            unlifted_pallets: plan.unlifted_pallets.clone(),
             all_resumed,
         });
 
@@ -141,10 +148,31 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
         would_free: plan.to_free.len(),
         still_packed: plan.still_packed,
         retained_shared: plan.retained_shared,
+        kept_unlifted: plan.kept_unlifted,
+        unlifted_pallets: plan.unlifted_pallets,
         all_resumed,
     });
 
     Ok(())
+}
+
+/// The remote's pallet heads, from a handshake whose trust is judged as a lower would judge it but
+/// adopts nothing. The prune frees only what history these heads reach needs, so it never runs
+/// without them: an unreachable or untrusted remote refuses the prune before anything changes.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The head of every pallet the remote holds.
+/// * `Err(String)`     - If no remote is configured, it cannot be reached, or its trust state is
+///   refused; the message says nothing was changed.
+async fn remote_pallet_heads() -> Result<Vec<String>, String> {
+    let note = "\"scope-prune\" asks the remote which history it holds, so that it never frees work \
+        that exists only here; nothing was changed.";
+
+    let client = RemoteClient::from_config().map_err(|e| error::append_to_message(e, note))?;
+    let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
+    remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
+
+    Ok(info.pallets.into_values().collect())
 }
 
 /// Refuse the prune if the main tree or any bay still materializes a pruned path. Every
@@ -200,6 +228,15 @@ pub(crate) struct PruneReport {
     /// fetched, or with a meta pallet. Distinct from `still_packed`: this content stays by
     /// design, not pending a future repack.
     retained_shared: usize,
+
+    /// Candidates kept because history the remote does not hold needs them: work stacked here
+    /// and never lifted, or lifted to a remote head not lowered here since. Freeing them could
+    /// lose the only copy; a later prune of the same path frees them once that history is lifted.
+    kept_unlifted: usize,
+
+    /// The pallets whose head the remote does not hold, when `kept_unlifted` is non-zero; lifting
+    /// (or lowering) them is what lets a later prune free the rest.
+    unlifted_pallets: Vec<String>,
 
     /// Whether every requested path was already outside the fetch scope before this call — a
     /// pure resume of an earlier, interrupted prune, rather than a path pruned for the first
@@ -261,7 +298,27 @@ impl CommandOutput for PruneReport {
             );
         }
 
-        println!("The pruned content is re-fetchable from the origin with \"expand\".");
+        if self.kept_unlifted > 0 {
+            let pallets = if self.unlifted_pallets.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", self.unlifted_pallets.iter()
+                    .map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", "))
+            };
+
+            println!(
+                "{} object(s) were kept because history the remote does not hold yet needs them{}; \
+                freeing them could lose the only copy. Lift that work (or lower, if the remote is \
+                ahead), then run \"scope-prune {}\" again to free them.",
+                self.kept_unlifted, pallets, self.pruned.join(" ")
+            );
+        }
+
+        if self.dry_run {
+            println!("What it frees is re-fetchable from the origin with \"expand\".");
+        } else {
+            println!("What was freed is re-fetchable from the origin with \"expand\".");
+        }
     }
 }
 

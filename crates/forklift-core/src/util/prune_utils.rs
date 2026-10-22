@@ -15,6 +15,11 @@
 //! (office and the rest) are walked in full and never scoped — the carve-out this feature
 //! depends on.
 //!
+//! Sealed is only safe for what the remote holds, since a sealed object comes back only by
+//! fetching it. So the prune also keeps everything under the pruned path that history the
+//! remote's heads do not reach needs: work stacked here and never lifted, and the parents its
+//! lift compares against (FORK-251, [`retain_unlifted`]).
+//!
 //! A chunked large file (§9.4b) reaches one level deeper: its tree entry names a *recipe*, whose
 //! chunks are content-addressed objects reachable only through it. Freeing such a file frees its
 //! recipe *and* every chunk — the recipe is descended while still present to enumerate them, and
@@ -67,6 +72,16 @@ pub struct PrunePlan {
     /// not content a repack could someday reclaim — so a caller reporting "nothing was freed"
     /// can tell the two apart instead of leaving the reason unstated.
     pub retained_shared: usize,
+
+    /// Candidates kept because history the remote is not known to hold needs them: work stacked
+    /// here and never lifted, or lifted to a remote head this warehouse has not lowered since.
+    /// Freeing them could lose the only copy. A later prune of the same path frees them once
+    /// the remote's heads reach that history.
+    pub kept_unlifted: usize,
+
+    /// The user pallets whose head the remote is not known to hold, as wire names, when
+    /// `kept_unlifted` is non-zero; empty otherwise.
+    pub unlifted_pallets: Vec<String>,
 }
 
 /// What an executed prune deleted.
@@ -84,12 +99,16 @@ pub struct PruneStats {
 /// * `pruned_prefixes` - The warehouse path keys being pruned (each a current fetch-scope
 ///   prefix, validated by the caller).
 /// * `post_prune`      - The warehouse fetch scope that will remain after the prune.
+/// * `remote_heads`    - The remote's pallet heads, from a handshake whose trust was checked.
+///   History they reach is what the remote holds; every other parcel keeps its content under
+///   the pruned path (see [`retain_unlifted`]).
 /// * `_store_access`   - Exclusive store access, held from before the caller read the fetch scope
 ///   until `free_objects` returns: a writer in another bay must not dedup against a planned
 ///   object and publish a reference to it between the plan and the deletion (FORK-150).
 pub fn plan_prune(
     pruned_prefixes: &[String],
     post_prune: &MaterializationScope,
+    remote_heads: &[String],
     _store_access: &StoreAccessExclusive,
 ) -> Result<PrunePlan, String> {
     let (user_parcels, meta_parcels) = reachable_parcels()?;
@@ -97,6 +116,9 @@ pub fn plan_prune(
 
     let mut retained = collect_retained(&user_parcels, &meta_parcels, post_prune)?;
     retain_local_closure(&local, post_prune, &mut retained)?;
+
+    let unlifted = unlifted_parcels(&user_parcels, remote_heads)?;
+    let kept_for_unlifted = retain_unlifted(&unlifted, pruned_prefixes)?;
 
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
     // reordering it) preserves that property in `to_free`, which is what makes a partial
@@ -106,11 +128,18 @@ pub fn plan_prune(
     let mut to_free: Vec<String> = Vec::new();
     let mut still_packed = 0usize;
     let mut retained_shared = 0usize;
+    let mut kept_unlifted = 0usize;
 
     for hash in &targets {
         // Shared with a retained path by content-addressing (or with a meta pallet): must stay.
         if retained.contains(hash) {
             retained_shared += 1;
+            continue;
+        }
+
+        // History the remote is not known to hold needs it: it may be the only copy.
+        if kept_for_unlifted.contains(hash) {
+            kept_unlifted += 1;
             continue;
         }
 
@@ -128,7 +157,101 @@ pub fn plan_prune(
         }
     }
 
-    Ok(PrunePlan { to_free, still_packed, retained_shared })
+    let mut unlifted_pallets: Vec<String> = Vec::new();
+
+    if kept_unlifted > 0 {
+        for (pallet_ref, head) in pallet_utils::all_pallet_refs()? {
+            if pallet_ref.namespace == PalletNamespace::User && unlifted.contains(&head) {
+                unlifted_pallets.push(pallet_ref.to_wire());
+            }
+        }
+    }
+
+    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, unlifted_pallets })
+}
+
+/// The user-pallet parcels the remote is not known to hold: every one that no remote head
+/// present here reaches. A remote holds the full closure of each of its ref heads, since its
+/// commit gate checks the closure before a ref moves, and a ref only moves forward from there.
+/// So history those heads reach can be fetched again, and nothing else is known to be: a parcel
+/// stacked here and never lifted, or one lifted to a head the remote has since moved past and
+/// this warehouse has not lowered.
+///
+/// Presence-tolerant: a remote head or parent absent here reaches nothing, which only counts
+/// more parcels as unlifted, and that frees less, never more.
+///
+/// # Arguments
+/// * `user_parcels` - The parcels the user pallet heads reach.
+/// * `remote_heads` - The remote's pallet heads.
+fn unlifted_parcels(user_parcels: &[String], remote_heads: &[String]) -> Result<HashSet<String>, String> {
+    let mut on_remote: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<String> = remote_heads.to_vec();
+
+    while let Some(hash) = frontier.pop() {
+        if on_remote.contains(&hash) || !file_utils::does_object_exist(&hash)? {
+            continue;
+        }
+
+        frontier.extend(object_utils::load_parcel(&hash)?.parents);
+        on_remote.insert(hash);
+    }
+
+    Ok(user_parcels.iter().filter(|parcel| !on_remote.contains(*parcel)).cloned().collect())
+}
+
+/// Everything under the pruned path(s) that history the remote is not known to hold reads: the
+/// full closure there of each such parcel, and of each of its parents. The parents are kept too
+/// because lifting a parcel later compares its trees against its parents' along every changed
+/// path, so it reads both sides. With these kept, a prune never changes what lifting that
+/// history reads.
+///
+/// Presence-tolerant like [`retain_local_closure`], with the same exception for an object only
+/// an unreadable pack index might hold: an absent object has nothing left to keep.
+///
+/// # Arguments
+/// * `unlifted`        - The parcels from [`unlifted_parcels`].
+/// * `pruned_prefixes` - The warehouse path keys being pruned.
+fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String]) -> Result<HashSet<String>, String> {
+    let mut parcels: HashSet<String> = HashSet::new();
+
+    for parcel in unlifted {
+        parcels.extend(object_utils::load_parcel(parcel)?.parents);
+        parcels.insert(parcel.clone());
+    }
+
+    let mut kept: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<String> = Vec::new();
+
+    for parcel in &parcels {
+        let root = object_utils::load_parcel(parcel)?.tree_hash;
+
+        for prefix in pruned_prefixes {
+            if let Some(subtree) = tree_utils::resolve_subtree_hash(&root, prefix)? {
+                frontier.push(subtree);
+            }
+        }
+    }
+
+    while let Some(hash) = frontier.pop() {
+        if kept.contains(&hash) || !file_utils::is_present_for_sweep(&hash)? {
+            continue;
+        }
+
+        kept.insert(hash.clone());
+        let tree = object_utils::load_tree(&hash)?;
+
+        for (_, file) in tree.get_files() {
+            if kept.insert(file.hash.clone()) && file.item_type.is_chunked() {
+                retain_present_recipe_chunks(&file.hash, &mut kept)?;
+            }
+        }
+
+        for (_, subtree) in tree.get_subtrees() {
+            frontier.push(subtree.hash.clone());
+        }
+    }
+
+    Ok(kept)
 }
 
 /// Delete the planned loose objects, reclaiming their disk. Content objects (trees, blobs)
@@ -218,8 +341,9 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String]) -> Result<Local
     Ok(LocalRoots { parcels, staged: sources.shard_leaves })
 }
 
-/// Every object pallet history needs to survive the prune: exactly what a fresh franchise scoped
-/// to the post-prune fetch scope would hold. Local state is added by [`retain_local_closure`].
+/// Every object pallet history needs to survive the prune if the remote holds all of it: exactly
+/// what a fresh franchise scoped to the post-prune fetch scope would hold. Local state is added by
+/// [`retain_local_closure`], and history the remote does not hold by [`retain_unlifted`].
 ///
 /// User-pallet parcels are walked scoped — the spine and every in-scope subtree in full; at an
 /// out-of-scope subtree the walk keeps nothing and stops, so the boundary object itself becomes
@@ -327,8 +451,8 @@ fn collect_retained(
 /// Scoped is enough for the parcels, because a prune only ever frees its targets, and every
 /// target is pallet history under the pruned path. A local parcel's own work (an edit parked
 /// under that path) is a new object, never a target, so it survives whatever this walk does.
-/// What a local parcel shares with a target is history, sealed by hash and re-fetchable like
-/// the rest of it. The one thing at risk is a target a local parcel holds *in scope*, where
+/// What a local parcel shares with a target is history: re-fetchable when the remote holds it,
+/// and kept by [`retain_unlifted`] when it does not. The one thing at risk is a target a local parcel holds *in scope*, where
 /// absence would read as missing, and the scoped walk keeps exactly that. Walking the parcels in
 /// full instead would keep the whole pruned path whenever any bay has parked work, since a park
 /// snapshots the whole tree.
@@ -573,6 +697,14 @@ mod tests {
         crate::util::lock_utils::StoreAccessLock::try_exclusive().expect("no other holder in a test root")
     }
 
+    /// Remote heads under which every local user pallet is lifted: the pallet heads themselves.
+    fn lifted() -> Vec<String> {
+        pallet_utils::all_pallet_refs().unwrap().into_iter()
+            .filter(|(pallet_ref, _)| pallet_ref.namespace == PalletNamespace::User)
+            .map(|(_, head)| head)
+            .collect()
+    }
+
     /// A fresh warehouse root for one test, entered as the active storage-root scope for its
     /// lifetime (each test runs on its own thread, so scopes never collide).
     struct Scratch {
@@ -710,7 +842,7 @@ mod tests {
 
         // Prune src/web, keeping src/api in scope.
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         // Exactly the pruned subtree's closure is freed.
         assert_eq!(plan.to_free.len(), 2);
@@ -733,6 +865,66 @@ mod tests {
         // prune frees the pruned path, not every out-of-scope object.
         assert!(!plan.to_free.contains(&f.readme_blob),
             "prune must free only the pruned path, not all out-of-scope content");
+    }
+
+    #[test]
+    fn plan_prune_keeps_what_history_the_remote_lacks_needs() {
+        // Stacked and never lifted, the pruned path's content here is the only copy: the prune
+        // keeps it, counts it, and names the pallet whose head the remote lacks (FORK-251).
+        let _scratch = Scratch::new("keeps-unlifted");
+        let f = build_fixture();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[], &store_access()).unwrap();
+
+        assert!(plan.to_free.is_empty(), "unlifted content must not be freed: {:?}", plan.to_free);
+        assert_eq!(plan.kept_unlifted, 2, "the web tree and blob are kept for unlifted history");
+        assert_eq!(plan.unlifted_pallets, vec!["main".to_string()]);
+
+        // A remote head absent here reaches nothing, so it lifts nothing.
+        let absent = "0".repeat(64);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[absent], &store_access()).unwrap();
+        assert!(plan.to_free.is_empty(), "an absent remote head must not count as reaching history");
+        assert!(loose_exists(&f.web_blob));
+    }
+
+    #[test]
+    fn plan_prune_keeps_the_parent_side_of_an_unlifted_change() {
+        // The remote holds P1 (web v1); P2 (web v2) is stacked on it and never lifted. Lifting P2
+        // later reads both sides of the change under src/web, so neither side may be freed.
+        // Once the remote holds P2, both are freed.
+        let _scratch = Scratch::new("keeps-unlifted-parent");
+        let f = build_fixture();
+
+        let web_blob_v2 = store_blob("web v2\n");
+        let web_tree_v2 = store_tree(&[("w.txt", &web_blob_v2, DirEntryType::Normal)]);
+        let src_tree_v2 = store_tree(&[
+            ("api", &f.api_tree, DirEntryType::Tree),
+            ("web", &web_tree_v2, DirEntryType::Tree),
+        ]);
+        let root_tree_v2 = store_tree(&[
+            ("src", &src_tree_v2, DirEntryType::Tree),
+            ("README.md", &f.readme_blob, DirEntryType::Normal),
+        ]);
+        let child = store_parcel(&root_tree_v2, vec![f.parcel.clone()]);
+        pallet_utils::update_pallet_head(
+            "main", Some(f.parcel.as_str()), &child, &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &store_access())
+            .unwrap();
+
+        assert!(plan.to_free.is_empty(), "both sides of an unlifted change must stay: {:?}", plan.to_free);
+        assert_eq!(plan.kept_unlifted, 4);
+        assert_eq!(plan.unlifted_pallets, vec!["main".to_string()]);
+
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[child], &store_access()).unwrap();
+        for freed in [&f.web_tree, &f.web_blob, &web_tree_v2, &web_blob_v2] {
+            assert!(plan.to_free.contains(freed), "lifted history is freed: {}", freed);
+        }
+        assert_eq!(plan.kept_unlifted, 0);
+        assert!(plan.unlifted_pallets.is_empty());
     }
 
     #[test]
@@ -759,7 +951,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         // The shared blob stays (retained via src/api); only web's unique tree object is freed.
         assert!(!plan.to_free.contains(&shared_blob), "a blob shared with a retained path must not be freed");
@@ -779,7 +971,7 @@ mod tests {
         ]);
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob), "a blob a staged entry shares must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the pruned subtree's unique object is still freed");
@@ -812,7 +1004,7 @@ mod tests {
         plant_parked("b", &src_tree_with("api", "y.txt", &f.web_blob));
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob parked in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
     }
@@ -830,7 +1022,7 @@ mod tests {
         plant_parked("b", &snapshot);
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         // The parked work is no history, so never a target: it survives.
         for hash in [&edit, &web] {
@@ -855,7 +1047,7 @@ mod tests {
         plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
         assert!(plan.to_free.contains(&f.web_blob));
     }
 
@@ -881,7 +1073,7 @@ mod tests {
         std::fs::write(dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob the consolidation holds in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
     }
@@ -919,7 +1111,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         // Both versions of the pruned subtree — and both their blobs — are freed.
         for freed in [&web_v1_tree, &web_v1_blob, &web_v2_tree, &web_v2_blob] {
@@ -937,7 +1129,7 @@ mod tests {
         let f = build_fixture();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         assert!(loose_exists(&f.web_tree) && loose_exists(&f.web_blob), "the pruned objects start present");
 
@@ -982,7 +1174,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         assert_eq!(plan.to_free.len(), 3, "web_tree, inner_tree and deep_blob");
         let pos = |h: &str| plan.to_free.iter().position(|x| x == h).unwrap();
@@ -1001,7 +1193,7 @@ mod tests {
         let f = build_fixture();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 2, "src/web's tree and blob are the whole plan");
 
         // Simulate an interruption: free only the first item in plan order (a child, by
@@ -1013,7 +1205,7 @@ mod tests {
 
         // Re-planning over the exact same path must not error on the now-absent blob, and must
         // recompute exactly what the interruption left: just the parent tree.
-        let resumed_plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access())
+        let resumed_plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access())
             .expect("re-planning after a partial free must tolerate the absent object");
         assert_eq!(resumed_plan.to_free, rest, "the resumed plan is exactly what the interruption left");
 
@@ -1057,7 +1249,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         // The recipe and both chunks and the web tree are freed — nothing else.
         for freed in [&recipe, &c1, &c2, &web_tree] {
@@ -1118,7 +1310,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         // The shared chunk (and the api-only chunk and recipe) survive; web's unique chunk, its
         // recipe and its tree are freed.
@@ -1181,7 +1373,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
 
         // Nothing of the giant file is freed: the recipe and both its chunks are still needed by
         // src/api/giant.bin. Only web's own (unshared) tree and note blob are freed.
@@ -1230,7 +1422,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 4, "2 chunks + recipe + web tree");
 
         // Simulate an interruption after freeing just the first chunk (the plan's own leading
@@ -1241,7 +1433,7 @@ mod tests {
 
         // Re-planning must not error on the absent chunk, and must recompute exactly what is left:
         // the surviving chunk, the recipe (still present, still names its chunks) and the tree.
-        let resumed = plan_prune(&["src/web".to_string()], &post_prune, &store_access())
+        let resumed = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access())
             .expect("re-planning after a partial chunk free must tolerate the absent chunk");
         assert_eq!(resumed.to_free, plan.to_free[1..].to_vec(),
             "the resumed plan is exactly the interruption's remainder");
@@ -1261,7 +1453,7 @@ mod tests {
     fn plan_outcome(how: Unreadable, unreadable: &str, kept: &str) -> Option<String> {
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
 
-        match plan_prune(&["src/web".to_string()], &post_prune, &store_access()) {
+        match plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &store_access()) {
             Ok(plan) if plan.to_free.contains(&kept.to_string()) => {
                 Some(format!("{:?}: the plan frees {}, which the unreadable object references", how, kept))
             }

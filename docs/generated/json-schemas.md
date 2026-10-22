@@ -4239,6 +4239,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_unlifted": {
+      "description": "Candidates kept because history the remote does not hold needs them: work stacked here\nand never lifted, or lifted to a remote head not lowered here since. Freeing them could\nlose the only copy; a later prune of the same path frees them once that history is lifted.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "pruned": {
       "description": "The fetched path(s) pruned (forgotten) from the warehouse fetch scope.",
       "items": {
@@ -4265,6 +4271,13 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "unlifted_pallets": {
+      "description": "The pallets whose head the remote does not hold, when `kept_unlifted` is non-zero; lifting\n(or lowering) them is what lets a later prune free the rest.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "would_free": {
       "description": "Loose objects a prune would free (equals `freed` after a real run).",
       "format": "uint",
@@ -4280,6 +4293,8 @@ A command not listed here either reports only the generic human-message shape `{
     "would_free",
     "still_packed",
     "retained_shared",
+    "kept_unlifted",
+    "unlifted_pallets",
     "all_resumed"
   ],
   "title": "PruneReport",
