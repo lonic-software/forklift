@@ -879,8 +879,9 @@ pub fn describe_held(held: &[HeldMerge]) -> String {
 }
 
 /// The commands that drop each held merge record by keeping the remote's side of it: its state
-/// when the remote holds one, else the haul, which the remote does not hold yet. Each takes an
-/// empty replay, so no signature is needed and the hold never applies to it.
+/// when the remote holds one, else the haul, which the remote does not hold yet. Each takes a
+/// replay without the record, so the record is no longer held; a replay with nothing else to
+/// publish is empty, and needs no signature.
 pub fn drop_held(held: &[HeldMerge]) -> String {
     let drops: Vec<String> = held.iter().map(|merge| match merge.on_remote {
         true => format!("\"forklift lower --keep @{}:{}/state=theirs\"", HAUL_PALLET_NAME, merge.haul),
