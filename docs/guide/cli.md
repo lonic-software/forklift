@@ -984,11 +984,13 @@ special-case it):
 remote has, and more — `lift` from it publishes it) or `differs` (anything else: the remote moved
 on, or the two diverged — `lower <name>` fast-forwards it or reports the divergence). It fetches
 nothing and writes nothing. With `--json`, each entry carries `name`, `remote_head`, `local_head`
-(`null` when absent) and `relation`; with `--all` the meta pallets come under `meta`.
+(`null` when absent) and `relation`; with `--all` the meta pallets come under `meta`. A name the remote lists that this version cannot read (a server with other naming rules) is
+not compared, and is listed apart, under `unnamed`.
 
 A command naming a pallet this warehouse does not hold (`shift`, `consolidate`, `audit`,
 `haul open`) refuses with `pallet_not_found` (exit 29), and names `lower <name>` when a remote is
-configured, `palletize <name>` otherwise.
+configured, `palletize <name>` otherwise. `lower <name>` for a pallet the remote does not have
+refuses the same way, before it writes anything, naming `palletize --remote`.
 
 ### `shift` — switch pallets (`sh`)
 

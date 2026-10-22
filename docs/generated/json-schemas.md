@@ -2870,7 +2870,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The remote's pallets, each against the local pallet of that name.",
   "properties": {
     "meta": {
-      "description": "The remote's meta pallets in their qualified form (`@office`), present only when `--all`\nwas given.",
+      "description": "The remote's meta pallets in their qualified form (`@office`), listed only when `--all`\nwas given; omitted when empty.",
       "items": {
         "$ref": "#/$defs/RemotePalletEntry"
       },
@@ -2886,6 +2886,13 @@ A command not listed here either reports only the generic human-message shape `{
     "remote": {
       "description": "The remote's URL.",
       "type": "string"
+    },
+    "unnamed": {
+      "description": "Pallet names the remote lists that this build cannot read (another version's naming\nrules), so they are not compared; omitted when empty.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [
