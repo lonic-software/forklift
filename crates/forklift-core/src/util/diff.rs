@@ -240,10 +240,15 @@ impl DiffState<'_> {
     /// Find the best anchor of a region pair: the maximal common run around the rarest
     /// shared line. Returns the run as (old start, new start, length).
     ///
-    /// Rarity is the line's occurrence count within the region (the larger of the two
-    /// sides); lines above `MAX_ANCHOR_OCCURRENCES` never anchor. Ties are broken by run
-    /// length. After a candidate run is measured, the scan skips past it (trying every
-    /// line inside a run it is part of would re-measure the same run).
+    /// A line's rarity is its occurrence count within the region (the larger of the two
+    /// sides); lines above `MAX_ANCHOR_OCCURRENCES` never anchor. A run is as rare as its
+    /// rarest line. Ties are broken by run length.
+    ///
+    /// After a candidate run is measured, the scan skips past it, as JGit's HistogramDiff
+    /// does. A skipped line that occurs once on the old side could only re-measure the same
+    /// run; one that occurs more often could have aligned elsewhere, and that alignment is
+    /// not measured. The skip is what keeps repetitive input from costing every line times
+    /// every occurrence times the run length.
     fn find_anchor(&self, old: &Range<usize>, new: &Range<usize>) -> Option<(usize, usize, usize)> {
         let mut best: Option<(usize, usize, usize, usize)> = None; // (cost, old, new, len)
 
@@ -254,9 +259,8 @@ impl DiffState<'_> {
             let id = self.new_ids[j] as usize;
 
             let old_occurrences = occurrences_in_range(&self.old_positions[id], old);
-            let new_occurrences = occurrences_in_range(&self.new_positions[id], new);
-
-            let cost = old_occurrences.len().max(new_occurrences.len());
+            let cost = old_occurrences.len()
+                .max(occurrences_in_range(&self.new_positions[id], new).len());
 
             let is_anchor_material = !old_occurrences.is_empty()
                 && cost <= MAX_ANCHOR_OCCURRENCES
@@ -289,14 +293,30 @@ impl DiffState<'_> {
 
                     let len = end_old - run_old;
 
+                    // The run is as trustworthy as its rarest line, not the line that found
+                    // it: the scan skips past this run below, so a rarer line inside it is
+                    // never scanned on its own, and charging the run this line's cost would
+                    // let a stray common line elsewhere outrank it.
+                    let mut run_cost = cost;
+
+                    for offset in 0..len {
+                        if run_cost == 1 {
+                            break;
+                        }
+
+                        let line = self.new_ids[run_new + offset] as usize;
+
+                        run_cost = run_cost.min(self.line_cost(line, old, new));
+                    }
+
                     let is_better = match best {
                         None => true,
                         Some((best_cost, _, _, best_len)) =>
-                            cost < best_cost || (cost == best_cost && len > best_len),
+                            run_cost < best_cost || (run_cost == best_cost && len > best_len),
                     };
 
                     if is_better {
-                        best = Some((cost, run_old, run_new, len));
+                        best = Some((run_cost, run_old, run_new, len));
                     }
 
                     next_j = next_j.max(end_new);
@@ -307,6 +327,13 @@ impl DiffState<'_> {
         }
 
         best.map(|(_, anchor_old, anchor_new, len)| (anchor_old, anchor_new, len))
+    }
+
+    /// A line's occurrence count within a region pair: the larger of its counts on the two
+    /// sides.
+    fn line_cost(&self, id: usize, old: &Range<usize>, new: &Range<usize>) -> usize {
+        occurrences_in_range(&self.old_positions[id], old).len()
+            .max(occurrences_in_range(&self.new_positions[id], new).len())
     }
 
     /// Diff an anchor-less region pair exactly, with the shared LCS.
@@ -519,6 +546,22 @@ mod tests {
             changed_lines(&diffs, DiffType::Add),
             vec!["fn beta() {", "    three();", "}", ""],
         );
+    }
+
+    #[test]
+    fn a_run_found_through_a_common_line_keeps_the_rarity_of_its_rarest_line() {
+        // The scan reaches "}" first: it is common, and the run it finds (which holds the
+        // unique "one", "two", "three") is skipped past afterwards, so those lines are never
+        // scanned on their own. Charged the cost of "}", that run lost to the moved line —
+        // rarer than "}" — and anchoring on the moved line turned every other line into
+        // churn (git.git's Makefile at 58d1772c85: +382/-371 for a +12/-1 change).
+        let old = b"moved\n}\none\ntwo\nthree\n}\n}\nold tail\n";
+        let new = b"}\none\ntwo\nthree\n}\n}\nmoved\nnew tail\n";
+
+        let diffs = lines(old, new, false);
+
+        assert_eq!(changed_lines(&diffs, DiffType::Remove), vec!["moved", "old tail"]);
+        assert_eq!(changed_lines(&diffs, DiffType::Add), vec!["moved", "new tail"]);
     }
 
     #[test]

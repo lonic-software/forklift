@@ -168,8 +168,11 @@ fn present(line_ids: &[u32], count: usize) -> Vec<bool> {
 /// spent nearly all of a 13 s blame of git.git's 4,000-line Makefile. Where several
 /// subsequences are equally long, the changed runs are then slid to where git's diff puts them,
 /// so a repeated line (a blank, a closing brace) mostly keeps the parcel git's blame credits
-/// it to. The display diff's histogram match was measured too and rejected: on that file it credited
-/// one parcel with 312 lines where git and the longest subsequence credit it with 9.
+/// it to. The display diff's histogram match was measured too, and on that file credited one
+/// parcel with 312 lines where git and the longest subsequence credit it with 9. That measurement
+/// predates a fix to the histogram's anchor ranking (a run was ranked by the line that found it,
+/// not its rarest line) and was not re-run after it. The longest subsequence stays because it is
+/// what git's default (Myers) diff computes, which the slide above then places as git does.
 fn attribute_version(previous: &[BlameLine], content: &[u8], parcel: &str) -> Vec<BlameLine> {
     let new_lines = split_lines(content);
 
