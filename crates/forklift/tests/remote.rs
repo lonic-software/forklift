@@ -5187,13 +5187,14 @@ fn sparse_with_docs(area: &TestArea) -> Server {
 #[test]
 fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     // FORK-251: a change stacked under the pruned path and never lifted exists only here. The
-    // prune keeps it, and the parent side of the change its lift reads, names the pallet, and
-    // says how to free it. Lifting then works, a second prune frees both sides, and expand
+    // prune keeps it, and the parent tree its lift compares against, names the pallet, and says
+    // how to free it. The parent's blob, which that lift never reads, is freed. Lifting then works, a second prune frees both sides, and expand
     // fetches the lifted change back.
     let area = TestArea::new("scope-prune-unlifted");
     let _server = sparse_with_docs(&area);
 
     let base = pallet_head(&area, "sparse", "main");
+    let v1_tree = path_object_hash(&area, "sparse", &base, "docs");
     let v1_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
 
     std::fs::write(area.path("sparse/docs/guide.md"), "guide v2, never lifted\n").unwrap();
@@ -5209,13 +5210,14 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
     assert_success(&pruned);
     let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
-    assert_eq!(report["data"]["freed"], 0, "{}", stdout(&pruned));
-    assert_eq!(report["data"]["kept_unlifted"], 4, "{}", stdout(&pruned));
+    assert_eq!(report["data"]["freed"], 1, "{}", stdout(&pruned));
+    assert_eq!(report["data"]["kept_unlifted"], 3, "{}", stdout(&pruned));
     assert_eq!(report["data"]["unlifted_pallets"], serde_json::json!(["main"]), "{}", stdout(&pruned));
 
-    for kept in [&v1_blob, &v2_tree, &v2_blob] {
+    for kept in [&v1_tree, &v2_tree, &v2_blob] {
         assert!(object_present(&area, "sparse", kept), "unlifted work is kept: {}", kept);
     }
+    assert!(!object_present(&area, "sparse", &v1_blob), "the parent's blob is not read by the lift");
 
     // The fetch scope did narrow: docs is pruned, only its content stays until it is lifted.
     let rerun = area.forklift("sparse", &["scope-prune", "--dry-run", "docs"]);
@@ -5230,7 +5232,7 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     assert_success(&freed);
     let report: serde_json::Value = serde_json::from_str(&stdout(&freed)).unwrap();
     assert_eq!(report["data"]["kept_unlifted"], 0, "{}", stdout(&freed));
-    for gone in [&v1_blob, &v2_tree, &v2_blob] {
+    for gone in [&v1_tree, &v2_tree, &v2_blob] {
         assert!(!object_present(&area, "sparse", gone), "lifted history is freed: {}", gone);
     }
 

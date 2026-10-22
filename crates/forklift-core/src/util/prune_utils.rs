@@ -47,7 +47,7 @@
 //! children is present too, so an absent node can only mean its whole subtree was already
 //! freed — never a corrupt gap a resumed walk could misinterpret as newly-discovered garbage.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::util::pallet_utils::PalletNamespace;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
@@ -118,7 +118,7 @@ pub fn plan_prune(
     retain_local_closure(&local, post_prune, &mut retained)?;
 
     let unlifted = unlifted_parcels(&user_parcels, remote_heads)?;
-    let kept_for_unlifted = retain_unlifted(&unlifted, pruned_prefixes)?;
+    let (kept_for_unlifted, touching) = retain_unlifted(&unlifted, pruned_prefixes)?;
 
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
     // reordering it) preserves that property in `to_free`, which is what makes a partial
@@ -137,15 +137,16 @@ pub fn plan_prune(
             continue;
         }
 
-        // History the remote is not known to hold needs it: it may be the only copy.
-        if kept_for_unlifted.contains(hash) {
-            kept_unlifted += 1;
+        // A candidate present in a pack cannot be reclaimed by a loose delete; count it. Checked
+        // before the unlifted keep: lifting would not make a packed object freeable either.
+        if pack_utils::is_in_packs(hash)? {
+            still_packed += 1;
             continue;
         }
 
-        // A candidate present in a pack cannot be reclaimed by a loose delete; count it.
-        if pack_utils::is_in_packs(hash)? {
-            still_packed += 1;
+        // Lifting history the remote is not known to hold reads it: it may be the only copy.
+        if kept_for_unlifted.contains(hash) {
+            kept_unlifted += 1;
             continue;
         }
 
@@ -161,7 +162,7 @@ pub fn plan_prune(
 
     if kept_unlifted > 0 {
         for (pallet_ref, head) in pallet_utils::all_pallet_refs()? {
-            if pallet_ref.namespace == PalletNamespace::User && unlifted.contains(&head) {
+            if pallet_ref.namespace == PalletNamespace::User && reaches_any(&head, &unlifted, &touching)? {
                 unlifted_pallets.push(pallet_ref.to_wire());
             }
         }
@@ -177,18 +178,22 @@ pub fn plan_prune(
 /// stacked here and never lifted, or one lifted to a head the remote has since moved past and
 /// this warehouse has not lowered.
 ///
-/// Presence-tolerant: a remote head or parent absent here reaches nothing, which only counts
-/// more parcels as unlifted, and that frees less, never more.
+/// Conservative: a remote head absent here reaches nothing, which only counts more parcels as
+/// unlifted, and that frees less, never more.
 ///
 /// # Arguments
 /// * `user_parcels` - The parcels the user pallet heads reach.
 /// * `remote_heads` - The remote's pallet heads.
 fn unlifted_parcels(user_parcels: &[String], remote_heads: &[String]) -> Result<HashSet<String>, String> {
+    let user: HashSet<&String> = user_parcels.iter().collect();
     let mut on_remote: HashSet<String> = HashSet::new();
     let mut frontier: Vec<String> = remote_heads.to_vec();
 
+    // Walked only through user history, which is all that can be unlifted: a meta head, or a
+    // remote head held here only outside the user pallets, is skipped, which can only count
+    // more parcels as unlifted.
     while let Some(hash) = frontier.pop() {
-        if on_remote.contains(&hash) || !file_utils::does_object_exist(&hash)? {
+        if on_remote.contains(&hash) || !user.contains(&hash) || !file_utils::is_present_for_sweep(&hash)? {
             continue;
         }
 
@@ -199,59 +204,159 @@ fn unlifted_parcels(user_parcels: &[String], remote_heads: &[String]) -> Result<
     Ok(user_parcels.iter().filter(|parcel| !on_remote.contains(*parcel)).cloned().collect())
 }
 
-/// Everything under the pruned path(s) that history the remote is not known to hold reads: the
-/// full closure there of each such parcel, and of each of its parents. The parents are kept too
-/// because lifting a parcel later compares its trees against its parents' along every changed
-/// path, so it reads both sides. With these kept, a prune never changes what lifting that
-/// history reads.
+/// Everything under the pruned path(s) that lifting history the remote is not known to hold
+/// reads, so that a prune never changes what such a lift can do. This mirrors the lift's
+/// changed-closure walk (`remote_utils::collect_changed_closure`) below each pruned prefix: for
+/// each such parcel, its trees there that no parent's tree at the same path explains, the files
+/// (and a chunked file's recipe and chunks) in them that no parent explains, and each parent's
+/// tree at every such path, which the walk loads as a base. A subtree identical to a parent's is
+/// on the remote with that parent, or kept for it when the parent is unlifted too, so it is
+/// skipped, exactly as the lift skips it.
 ///
-/// Presence-tolerant like [`retain_local_closure`], with the same exception for an object only
-/// an unreadable pack index might hold: an absent object has nothing left to keep.
+/// Presence-tolerant like [`retain_local_closure`]: an absent object, parcel or base has nothing
+/// left to keep. An absent base explains nothing, so more is kept, never less.
 ///
 /// # Arguments
 /// * `unlifted`        - The parcels from [`unlifted_parcels`].
 /// * `pruned_prefixes` - The warehouse path keys being pruned.
-fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String]) -> Result<HashSet<String>, String> {
-    let mut parcels: HashSet<String> = HashSet::new();
+///
+/// # Returns
+/// * `Ok((kept, touching))` - The objects to keep, and the unlifted parcels that changed some
+///   pruned path, which are the ones whose lift needs any of them.
+/// * `Err(String)`          - If a present object cannot be read.
+fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String])
+    -> Result<(HashSet<String>, HashSet<String>), String> {
+    let mut kept: HashSet<String> = HashSet::new();
+    let mut walked: HashSet<(String, Vec<String>)> = HashSet::new();
+    let mut touching: HashSet<String> = HashSet::new();
 
     for parcel in unlifted {
-        parcels.extend(object_utils::load_parcel(parcel)?.parents);
-        parcels.insert(parcel.clone());
-    }
-
-    let mut kept: HashSet<String> = HashSet::new();
-    let mut frontier: Vec<String> = Vec::new();
-
-    for parcel in &parcels {
-        let root = object_utils::load_parcel(parcel)?.tree_hash;
-
-        for prefix in pruned_prefixes {
-            if let Some(subtree) = tree_utils::resolve_subtree_hash(&root, prefix)? {
-                frontier.push(subtree);
-            }
-        }
-    }
-
-    while let Some(hash) = frontier.pop() {
-        if kept.contains(&hash) || !file_utils::is_present_for_sweep(&hash)? {
+        if !file_utils::is_present_for_sweep(parcel)? {
             continue;
         }
 
-        kept.insert(hash.clone());
-        let tree = object_utils::load_tree(&hash)?;
+        let loaded = object_utils::load_parcel(parcel)?;
+        let mut parent_roots: Vec<String> = Vec::new();
 
-        for (_, file) in tree.get_files() {
-            if kept.insert(file.hash.clone()) && file.item_type.is_chunked() {
-                retain_present_recipe_chunks(&file.hash, &mut kept)?;
+        for parent in &loaded.parents {
+            if file_utils::is_present_for_sweep(parent)? {
+                parent_roots.push(object_utils::load_parcel(parent)?.tree_hash);
             }
         }
 
-        for (_, subtree) in tree.get_subtrees() {
-            frontier.push(subtree.hash.clone());
+        for prefix in pruned_prefixes {
+            let Some(subtree) = tree_utils::resolve_subtree_hash(&loaded.tree_hash, prefix)? else {
+                continue;
+            };
+
+            let mut bases: Vec<String> = Vec::new();
+            for root in &parent_roots {
+                if let Some(base) = tree_utils::resolve_subtree_hash(root, prefix)? {
+                    bases.push(base);
+                }
+            }
+
+            if !bases.contains(&subtree) {
+                touching.insert(parcel.clone());
+                retain_changed(&subtree, bases, &mut walked, &mut kept)?;
+            }
         }
     }
 
-    Ok(kept)
+    Ok((kept, touching))
+}
+
+/// One step of [`retain_unlifted`]'s walk: keep `tree_hash` unless a base explains it, keep each
+/// base tree, keep each file no base explains, and descend each subtree against the bases'
+/// subtrees of the same name. A (tree, bases) pair is walked once; the same tree under other
+/// bases is walked again, since what those bases explain differs.
+///
+/// # Arguments
+/// * `tree_hash`   - A tree of an unlifted parcel at some path.
+/// * `base_hashes` - The parents' trees at the same path.
+/// * `walked`      - The (tree, bases) pairs already walked.
+/// * `kept`        - The objects kept so far.
+fn retain_changed(tree_hash: &str,
+                  mut base_hashes: Vec<String>,
+                  walked: &mut HashSet<(String, Vec<String>)>,
+                  kept: &mut HashSet<String>) -> Result<(), String> {
+    if base_hashes.iter().any(|hash| hash == tree_hash) || !file_utils::is_present_for_sweep(tree_hash)? {
+        return Ok(());
+    }
+
+    base_hashes.sort();
+    base_hashes.dedup();
+
+    if !walked.insert((tree_hash.to_string(), base_hashes.clone())) {
+        return Ok(());
+    }
+
+    kept.insert(tree_hash.to_string());
+    let tree = object_utils::load_tree(tree_hash)?;
+
+    let mut base_files: HashMap<String, Vec<String>> = HashMap::new();
+    let mut base_subtrees: HashMap<String, Vec<String>> = HashMap::new();
+
+    for base in &base_hashes {
+        if !file_utils::is_present_for_sweep(base)? {
+            continue;
+        }
+
+        kept.insert(base.clone());
+        let base_tree = object_utils::load_tree(base)?;
+
+        for (name, file) in base_tree.get_files() {
+            base_files.entry(name.clone()).or_default().push(file.hash.clone());
+        }
+        for (name, subtree) in base_tree.get_subtrees() {
+            base_subtrees.entry(name.clone()).or_default().push(subtree.hash.clone());
+        }
+    }
+
+    for (name, file) in tree.get_files() {
+        let explained = base_files.get(name).is_some_and(|hashes| hashes.contains(&file.hash));
+
+        if !explained && kept.insert(file.hash.clone()) && file.item_type.is_chunked() {
+            retain_present_recipe_chunks(&file.hash, kept)?;
+        }
+    }
+
+    for (name, subtree) in tree.get_subtrees() {
+        let bases = base_subtrees.get(name).cloned().unwrap_or_default();
+        retain_changed(&subtree.hash, bases, walked, kept)?;
+    }
+
+    Ok(())
+}
+
+/// Whether `head`'s ancestry within `unlifted` contains a parcel in `touching`: whether lifting
+/// that pallet is part of what lets a later prune free what this one kept.
+///
+/// # Arguments
+/// * `head`     - A user pallet head.
+/// * `unlifted` - The parcels from [`unlifted_parcels`].
+/// * `touching` - The unlifted parcels that changed a pruned path.
+fn reaches_any(head: &str, unlifted: &HashSet<String>, touching: &HashSet<String>) -> Result<bool, String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<String> = vec![head.to_string()];
+
+    while let Some(hash) = frontier.pop() {
+        if !unlifted.contains(&hash) || !seen.insert(hash.clone()) {
+            continue;
+        }
+
+        if touching.contains(&hash) {
+            return Ok(true);
+        }
+
+        if !file_utils::is_present_for_sweep(&hash)? {
+            continue;
+        }
+
+        frontier.extend(object_utils::load_parcel(&hash)?.parents);
+    }
+
+    Ok(false)
 }
 
 /// Delete the planned loose objects, reclaiming their disk. Content objects (trees, blobs)
@@ -891,8 +996,9 @@ mod tests {
     #[test]
     fn plan_prune_keeps_the_parent_side_of_an_unlifted_change() {
         // The remote holds P1 (web v1); P2 (web v2) is stacked on it and never lifted. Lifting P2
-        // later reads both sides of the change under src/web, so neither side may be freed.
-        // Once the remote holds P2, both are freed.
+        // later uploads P2's new web tree and blob and loads P1's web tree as the base it compares
+        // against, so all three stay. P1's blob is never read by that lift, so it is freed.
+        // Once the remote holds P2, everything is freed.
         let _scratch = Scratch::new("keeps-unlifted-parent");
         let f = build_fixture();
 
@@ -915,8 +1021,8 @@ mod tests {
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &store_access())
             .unwrap();
 
-        assert!(plan.to_free.is_empty(), "both sides of an unlifted change must stay: {:?}", plan.to_free);
-        assert_eq!(plan.kept_unlifted, 4);
+        assert_eq!(plan.to_free, vec![f.web_blob.clone()], "only the parent's unread blob is freed");
+        assert_eq!(plan.kept_unlifted, 3);
         assert_eq!(plan.unlifted_pallets, vec!["main".to_string()]);
 
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[child], &store_access()).unwrap();
@@ -925,6 +1031,56 @@ mod tests {
         }
         assert_eq!(plan.kept_unlifted, 0);
         assert!(plan.unlifted_pallets.is_empty());
+    }
+
+    #[test]
+    fn plan_prune_keeps_nothing_for_unlifted_work_that_leaves_the_path_alone() {
+        // "main" has an unlifted change under src/api only: lifting it never reads src/web, so
+        // src/web is freed whole. "other" has an unlifted change under src/web, so only what its
+        // lift reads is kept, and only "other" is named as the pallet to lift.
+        let _scratch = Scratch::new("unlifted-elsewhere");
+        let f = build_fixture();
+
+        let api_blob_v2 = store_blob("api a v2\n");
+        let api_tree_v2 = store_tree(&[("a.txt", &api_blob_v2, DirEntryType::Normal)]);
+        let src_api_v2 = store_tree(&[
+            ("api", &api_tree_v2, DirEntryType::Tree),
+            ("web", &f.web_tree, DirEntryType::Tree),
+        ]);
+        let root_api_v2 = store_tree(&[
+            ("src", &src_api_v2, DirEntryType::Tree),
+            ("README.md", &f.readme_blob, DirEntryType::Normal),
+        ]);
+        let api_child = store_parcel(&root_api_v2, vec![f.parcel.clone()]);
+        pallet_utils::update_pallet_head(
+            "main", Some(f.parcel.as_str()), &api_child, &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &store_access())
+            .unwrap();
+        assert_eq!(plan.kept_unlifted, 0);
+        assert!(plan.unlifted_pallets.is_empty());
+        assert!(plan.to_free.contains(&f.web_tree) && plan.to_free.contains(&f.web_blob), "{:?}", plan.to_free);
+
+        let web_blob_v2 = store_blob("web v2\n");
+        let web_tree_v2 = store_tree(&[("w.txt", &web_blob_v2, DirEntryType::Normal)]);
+        let src_web_v2 = store_tree(&[
+            ("api", &f.api_tree, DirEntryType::Tree),
+            ("web", &web_tree_v2, DirEntryType::Tree),
+        ]);
+        let root_web_v2 = store_tree(&[
+            ("src", &src_web_v2, DirEntryType::Tree),
+            ("README.md", &f.readme_blob, DirEntryType::Normal),
+        ]);
+        let web_child = store_parcel(&root_web_v2, vec![f.parcel.clone()]);
+        pallet_utils::update_pallet_head("other", None, &web_child, &pallet_utils::RefPreconditions::NONE)
+            .unwrap();
+
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &store_access())
+            .unwrap();
+        assert_eq!(plan.kept_unlifted, 3, "other's new web tree and blob, and its base tree");
+        assert_eq!(plan.unlifted_pallets, vec!["other".to_string()], "main's lift frees nothing here");
     }
 
     #[test]

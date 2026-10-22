@@ -1501,7 +1501,7 @@ everywhere first. The pruned history is sealed by hash and re-fetchable from the
 `expand`, so the prune frees only history the origin holds. It asks the remote for its pallet
 heads first, and refuses, changing nothing, if the remote cannot be reached or is not trusted.
 History those heads do not reach (stacks never lifted, or a remote that has moved on since your
-last `lower`) keeps its content under the path. The report counts what was kept
+last `lower`) keeps whatever lifting it would read under the path. The report counts what was kept
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
 then run the same `scope-prune` again, which frees the rest. Other work that exists only here is
 never freed either, whatever its path: content loaded but not yet stacked, parked parcels, and an

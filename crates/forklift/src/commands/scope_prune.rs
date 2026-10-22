@@ -42,75 +42,26 @@ use crate::output::{self, CommandOutput};
 ///   still materializes the path, another process is using the object store, or the remote cannot
 ///   be reached or is not trusted.
 pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
-    // Exclusive store access first, before anything is read (FORK-150). The keep-set depends on
-    // the fetch scope read just below and on every bay's materialization scope, not only on the
-    // plan's walk, and the fetch scope is rewritten from that read; so no writer in another bay —
-    // a load that dedups against a planned object, an expand widening the fetch scope — may run
-    // anywhere between this read and the last deletion. A dry run takes it too, so it reports
+    // Judged once before the remote is asked, so a local refusal (a full warehouse, a path that is
+    // not fetched, a checkout that still needs it) is reported as itself rather than masked by a
+    // remote that cannot be reached, and again under the hold below, which is what the plan uses.
+    judge_request(&paths)?;
+
+    // The remote's heads are read next, outside the store hold, so a slow remote never keeps
+    // other bays' writers out. They cannot go stale against the plan in a way that frees more: a
+    // remote ref only moves forward, so what an earlier read reaches the remote still holds.
+    let remote_heads = remote_pallet_heads().await?;
+
+    // Exclusive store access before the judgement the plan uses (FORK-150). The keep-set depends
+    // on the fetch scope `judge_request` reads and on every bay's materialization scope, not only
+    // on the plan's walk, and the fetch scope is rewritten from that read; so no writer in another
+    // bay — a load that dedups against a planned object, an expand widening the fetch scope — may
+    // run anywhere between this read and the last deletion. A dry run takes it too, so it reports
     // exactly the plan a real run would carry out. Never waits: refused while any writer holds
     // the store. `main` takes no shared hold for this command, which would refuse this try.
     let store_access = StoreAccessLock::try_exclusive()?;
+    let PruneRequest { post_prune, to_reclaim, all_resumed } = judge_request(&paths)?;
 
-    let fetch = scope_utils::read_fetch_scope()?;
-
-    if fetch.is_full() {
-        return Err(
-            "This warehouse holds the full tree; there is nothing to prune. \"scope-prune\" \
-            reclaims disk from a sparse warehouse — one franchised with \"--only\", or widened \
-            with \"expand\" — by forgetting a fetched path.".to_string()
-        );
-    }
-
-    // Each path is either one of the warehouse's current fetch-scope prefixes (a fresh prune:
-    // it is dropped from `keep` and the fetch scope narrows this call) or already outside the
-    // fetch scope entirely (a resume: nothing to narrow, but there may be leftovers to free from
-    // an earlier, interrupted run — see the function doc). A path that is merely a sub-path or a
-    // still-needed spine ancestor of a live prefix classifies InScope/Spine, not OutOfScope, so
-    // it is refused rather than silently reinterpreted as either case.
-    let mut keep: Vec<String> = fetch.prefixes().to_vec();
-    let mut freshly_pruned: Vec<String> = Vec::new();
-    let mut resumed: Vec<String> = Vec::new();
-
-    for raw in &paths {
-        let key = WarehousePath::from_user_input(raw)?.as_key().to_string();
-
-        match keep.iter().position(|prefix| *prefix == key) {
-            Some(pos) => {
-                keep.remove(pos);
-                freshly_pruned.push(key);
-            }
-            None if fetch.classify(&key) == ScopeClass::OutOfScope => resumed.push(key),
-            None => return Err(format!(
-                "\"{}\" is not one of the warehouse's fetched paths, so it cannot be pruned. \
-                Fetched: {}.",
-                raw, fetch.prefixes().join(", ")
-            )),
-        }
-    }
-
-    // Whether every requested path was already outside the fetch scope (a pure resume of an
-    // earlier, interrupted prune) rather than newly dropped here — the human report needs this
-    // to tell "already pruned" apart from a fresh prune that simply found nothing loose to free.
-    let all_resumed = freshly_pruned.is_empty() && !resumed.is_empty();
-
-    if keep.is_empty() {
-        return Err(
-            "Pruning every fetched path would leave the warehouse with no content at all; keep \
-            at least one. To reclaim everything, remove the warehouse.".to_string()
-        );
-    }
-
-    let post_prune = MaterializationScope::from_prefixes(keep);
-    let to_reclaim: Vec<String> = freshly_pruned.iter().chain(resumed.iter()).cloned().collect();
-
-    // Multi-bay hazard, checked for every requested path, resumed ones included: a resumed path
-    // can never actually be in a checkout's scope today (a bay can only ever be scoped inside
-    // the CURRENT fetch scope, and this path is already outside it — `bay add --scope`/`narrow`
-    // enforce that at write time), so this is provably a no-op for `resumed`. It costs nothing
-    // to check anyway, and a destructive verb is exactly where redundant defense earns its keep.
-    guard_materialization_scopes(&to_reclaim, &post_prune)?;
-
-    let remote_heads = remote_pallet_heads().await?;
     let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &store_access)?;
 
     if dry_run {
@@ -154,6 +105,89 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     });
 
     Ok(())
+}
+
+/// A scope-prune request judged against the warehouse as it stands.
+struct PruneRequest {
+    /// The warehouse fetch scope after the prune.
+    post_prune: MaterializationScope,
+    /// The path keys to reclaim: the freshly pruned ones, then the resumed ones.
+    to_reclaim: Vec<String>,
+    /// Whether every requested path was already outside the fetch scope.
+    all_resumed: bool,
+}
+
+/// Judge the requested paths against the fetch scope and every checkout's scope, refusing as the
+/// handler documents: a full warehouse, a path that is not fetched, dropping the last fetched
+/// path, or a path a checkout still materializes.
+///
+/// # Arguments
+/// * `paths` - The paths as the user gave them.
+///
+/// # Returns
+/// * `Ok(PruneRequest)` - What the prune would do.
+/// * `Err(String)`      - The refusal.
+fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
+    let fetch = scope_utils::read_fetch_scope()?;
+
+    if fetch.is_full() {
+        return Err(
+            "This warehouse holds the full tree; there is nothing to prune. \"scope-prune\" \
+            reclaims disk from a sparse warehouse — one franchised with \"--only\", or widened \
+            with \"expand\" — by forgetting a fetched path.".to_string()
+        );
+    }
+
+    // Each path is either one of the warehouse's current fetch-scope prefixes (a fresh prune:
+    // it is dropped from `keep` and the fetch scope narrows this call) or already outside the
+    // fetch scope entirely (a resume: nothing to narrow, but there may be leftovers to free from
+    // an earlier, interrupted run — see the function doc). A path that is merely a sub-path or a
+    // still-needed spine ancestor of a live prefix classifies InScope/Spine, not OutOfScope, so
+    // it is refused rather than silently reinterpreted as either case.
+    let mut keep: Vec<String> = fetch.prefixes().to_vec();
+    let mut freshly_pruned: Vec<String> = Vec::new();
+    let mut resumed: Vec<String> = Vec::new();
+
+    for raw in paths {
+        let key = WarehousePath::from_user_input(raw)?.as_key().to_string();
+
+        match keep.iter().position(|prefix| *prefix == key) {
+            Some(pos) => {
+                keep.remove(pos);
+                freshly_pruned.push(key);
+            }
+            None if fetch.classify(&key) == ScopeClass::OutOfScope => resumed.push(key),
+            None => return Err(format!(
+                "\"{}\" is not one of the warehouse's fetched paths, so it cannot be pruned. \
+                Fetched: {}.",
+                raw, fetch.prefixes().join(", ")
+            )),
+        }
+    }
+
+    // Whether every requested path was already outside the fetch scope (a pure resume of an
+    // earlier, interrupted prune) rather than newly dropped here — the human report needs this
+    // to tell "already pruned" apart from a fresh prune that simply found nothing loose to free.
+    let all_resumed = freshly_pruned.is_empty() && !resumed.is_empty();
+
+    if keep.is_empty() {
+        return Err(
+            "Pruning every fetched path would leave the warehouse with no content at all; keep \
+            at least one. To reclaim everything, remove the warehouse.".to_string()
+        );
+    }
+
+    let post_prune = MaterializationScope::from_prefixes(keep);
+    let to_reclaim: Vec<String> = freshly_pruned.iter().chain(resumed.iter()).cloned().collect();
+
+    // Multi-bay hazard, checked for every requested path, resumed ones included: a resumed path
+    // can never actually be in a checkout's scope today (a bay can only ever be scoped inside
+    // the CURRENT fetch scope, and this path is already outside it — `bay add --scope`/`narrow`
+    // enforce that at write time), so this is provably a no-op for `resumed`. It costs nothing
+    // to check anyway, and a destructive verb is exactly where redundant defense earns its keep.
+    guard_materialization_scopes(&to_reclaim, &post_prune)?;
+
+    Ok(PruneRequest { post_prune, to_reclaim, all_resumed })
 }
 
 /// The remote's pallet heads, from a handshake whose trust is judged as a lower would judge it but
@@ -299,18 +333,18 @@ impl CommandOutput for PruneReport {
         }
 
         if self.kept_unlifted > 0 {
-            let pallets = if self.unlifted_pallets.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", self.unlifted_pallets.iter()
-                    .map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", "))
-            };
+            let pallets = self.unlifted_pallets.iter()
+                .map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", ");
+            let paths = self.pruned.iter()
+                .map(|path| if path.contains(char::is_whitespace) { format!("'{}'", path) } else { path.clone() })
+                .collect::<Vec<_>>().join(" ");
 
             println!(
-                "{} object(s) were kept because history the remote does not hold yet needs them{}; \
+                "{} object(s) were kept because history the remote does not hold yet needs them \
+                (pallets {}); \
                 freeing them could lose the only copy. Lift that work (or lower, if the remote is \
                 ahead), then run \"scope-prune {}\" again to free them.",
-                self.kept_unlifted, pallets, self.pruned.join(" ")
+                self.kept_unlifted, pallets, paths
             );
         }
 
