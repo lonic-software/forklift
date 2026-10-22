@@ -1516,7 +1516,16 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert!(!held.status.success(), "{}", stdout(&held));
     assert!(stderr(&held).contains("records a merge whose parcel the remote's target does not hold yet"), "{}", stderr(&held));
     assert!(stderr(&held).contains("run \"forklift lower\" again"), "{}", stderr(&held));
-    assert!(stderr(&held).contains(&format!("\"forklift lower --keep @haul:{}=theirs\"", id)), "{}", stderr(&held));
+    assert!(stderr(&held).contains(&format!("\"forklift lower --keep @haul:{}/state=theirs\"", id)), "{}", stderr(&held));
+
+    // Lifted from another pallet, the record would still wait, but @haul has diverged: the lift
+    // says so, rather than sending A to lift a target that would not clear it.
+    assert_success(&area.forklift("a", &["shift", "feat"]));
+    let diverged = area.forklift("a", &["lift"]);
+    assert!(!diverged.status.success(), "{}", stdout(&diverged));
+    assert!(stderr(&diverged).contains("\"@haul\" and the remote have diverged"), "{}", stderr(&diverged));
+    assert!(!stderr(&diverged).contains("was not lifted"), "{}", stderr(&diverged));
+    assert_success(&area.forklift("a", &["shift", "main"]));
 
     let lifted = area.forklift("a", &["lift"]);
     assert!(!lifted.status.success(), "@haul is still diverged: {}", stdout(&lifted));
@@ -1685,6 +1694,37 @@ fn a_haul_merge_waits_while_the_remote_target_lacks_its_parcel() {
     assert!(why.contains(&format!("haul {} merged as", &second[..12])) && why.contains("into \"main\""), "{}", why);
     assert_eq!(remote_pallet_head(&server, "@haul"), remote_haul, "the remote's @haul did not move");
     assert_eq!(remote_pallet_head(&server, "@tags"), Some(area.read_file("a/.forklift/meta/tags").trim().to_string()));
+}
+
+/// A held merge record names a way out for an operator who cannot lift the target: followed as
+/// printed, it drops only the record, and the rest of @haul (a comment) replays and lifts.
+#[test]
+fn a_held_haul_merge_names_a_drop_that_keeps_the_rest_of_the_haul() {
+    let area = TestArea::new("haul-held-drop");
+    let server = Server::start(&area, None);
+    haul_warehouse(&area, &server);
+
+    let id = open_haul(&area, "a", "First");
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("a", &["haul", "comment", &id, "-m", "kept"]));
+    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    assert_success(&area.forklift("a", &["shift", "feat"]));
+
+    let held = area.forklift("a", &["lift"]);
+    assert!(!held.status.success(), "{}", stdout(&held));
+    let why = stderr(&held);
+    let printed = format!("\"forklift lower --keep @haul:{}/state=theirs\"", id);
+    assert!(why.contains(&printed), "{}", why);
+
+    let command: Vec<&str> = printed.trim_matches('"').split(' ').skip(1).collect();
+    let dropped = area.forklift("a", &command);
+    assert_success(&dropped);
+    assert!(stdout(&dropped).contains("Replayed the local @haul"), "{}", stdout(&dropped));
+
+    let shown: serde_json::Value = serde_json::from_str(&stdout(&area.forklift("a", &["--json", "haul", "show", &id]))).unwrap();
+    assert_eq!(shown["data"]["status"], "open", "the merge record is dropped");
+    assert!(stdout(&area.forklift("a", &["haul", "show", &id])).contains("kept"), "the comment stays");
+    assert_eq!(remote_pallet_head(&server, "@haul"), Some(area.read_file("a/.forklift/meta/haul").trim().to_string()));
 }
 
 /// A fresh remote admits the whole @haul history against today's office, so a merge whose signer

@@ -3517,7 +3517,7 @@ mod tests {
             let target = |pallet: &str| (pallet == "main").then(|| remote_target.map(str::to_string)).flatten();
             haul_utils::held_by_lift(local, Some(&remote), &target).unwrap()
         };
-        let waiting = vec![HeldMerge { haul: id.clone(), parcel: merge.clone(), target: "main".to_string() }];
+        let waiting = vec![HeldMerge { haul: id.clone(), parcel: merge.clone(), target: "main".to_string(), on_remote: true }];
 
         // Through: waiting would not bring the parcel.
         assert!(held(&local, None).is_empty(), "the target is not held here");
@@ -3537,10 +3537,18 @@ mod tests {
         // Only a merge waits.
         assert!(held(&closed, None).is_empty());
 
-        // A remote @haul head not held here is a divergence the lift refuses on its own.
+        // A remote @haul head not held here, or held but off the local history, is a divergence
+        // the lift refuses on its own, naming "lower".
         let target = |_: &str| None;
         assert!(haul_utils::held_by_lift(&local, Some(&"cd".repeat(32)), &target).unwrap().is_empty());
-        assert_eq!(haul_utils::held_by_lift(&local, None, &target).unwrap(), waiting, "a remote with no @haul yet");
+        assert!(haul_utils::held_by_lift(&local, Some(&closed), &target).unwrap().is_empty(), "diverged");
+
+        let fresh = vec![HeldMerge { on_remote: false, ..waiting[0].clone() }];
+        assert_eq!(haul_utils::held_by_lift(&local, None, &target).unwrap(), fresh, "a remote with no @haul yet");
+
+        // Dropping keeps the remote's state where it has one, else the haul it lacks.
+        assert_eq!(haul_utils::drop_held(&waiting), format!("\"forklift lower --keep @haul:{}/state=theirs\"", id));
+        assert!(haul_utils::drop_held(&fresh).starts_with(&format!("\"forklift lower --keep @haul:{}=theirs\" (", id)));
     }
 
     #[test]

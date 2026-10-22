@@ -926,8 +926,11 @@ mark anything not verified — a warehouse behind its remote shows `unproven: no
 until it lowers the target. `lift` sends `@haul` after the working pallet, and holds back a
 merge whose parcel the remote's target does not hold yet; lifting the target (lowering it
 first if someone else moved it) lets it go. A `lower` that replays a diverged `@haul` holds it
-the same way: once the target is lifted and lowered here, `lower` again — or drop the record
-with `lower --keep @haul:<haul>=theirs`.
+the same way: once the target is lifted and lowered here, `lower` again. Either way, an
+operator who cannot lift the target drops the record instead, as the message names it:
+`lower --keep @haul:<haul>/state=theirs` puts back the remote's state of the haul and keeps
+its reviews and comments, or, for a haul the remote does not hold yet,
+`lower --keep @haul:<haul>=theirs` drops the haul.
 
 This release is **intra-warehouse** (pallet → pallet), and reviews are **recorded but not
 enforced** — any writer of the target can merge (approval-gating is a later policy layer).

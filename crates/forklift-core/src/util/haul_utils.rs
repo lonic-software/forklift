@@ -606,17 +606,17 @@ impl PalletRules for HaulRules {
                         }
                     }
 
-                    if matches!(status, HaulStatus::Merged(_))
-                        && change.admission == Admission::Admit
-                        && !may_record_merge(change.office, operator, &opened.target) {
-                        let why = match change.office.find_user(operator) {
-                            Some(_) => "who may not write it",
-                            None => "who has no user record in the office",
-                        };
+                    let refusal = match status {
+                        HaulStatus::Merged(_) if change.admission == Admission::Admit => {
+                            may_record_merge(change.office, operator, &opened.target).err()
+                        }
+                        _ => None,
+                    };
 
+                    if let Some(refusal) = refusal {
                         return Err(format!(
-                            "the state at {} records a merge into {}, but is signed by {}, {}",
-                            cell.path, opened.target, operator, why
+                            "the state at {} records a merge into {}, but is signed by {}, who {} it",
+                            cell.path, opened.target, operator, refusal.why()
                         ));
                     }
                 }
@@ -673,8 +673,31 @@ impl PalletRules for HaulRules {
 /// Whether `operator` may record a merge into the pallet `target`: their office record exists
 /// and may write it. A merge records that the target took the haul, so recording one is the
 /// target's writers' to do — the same predicate that authorizes moving the target itself.
-pub fn may_record_merge(office: &OfficeState, operator: &str, target: &str) -> bool {
-    office.find_user(operator).is_some_and(|user| user.may_write_pallet(target))
+pub fn may_record_merge(office: &OfficeState, operator: &str, target: &str) -> Result<(), MergeRefusal> {
+    match office.find_user(operator) {
+        Some(user) if user.may_write_pallet(target) => Ok(()),
+        Some(_) => Err(MergeRefusal::NotAWriter),
+        None => Err(MergeRefusal::NoUserRecord),
+    }
+}
+
+/// Why [`may_record_merge`] refused an operator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MergeRefusal {
+    /// Their office record may not write the target.
+    NotAWriter,
+    /// The office has no user record for them.
+    NoUserRecord,
+}
+
+impl MergeRefusal {
+    /// The refusal as a predicate on the operator, ending before the target: "may not write".
+    pub fn why(self) -> &'static str {
+        match self {
+            MergeRefusal::NotAWriter => "may not write",
+            MergeRefusal::NoUserRecord => "has no user record in the office, so may not write",
+        }
+    }
 }
 
 /// What the local warehouse proves about a merged haul's recorded merge. A record is a signed
@@ -767,6 +790,8 @@ pub struct HeldMerge {
     pub haul: String,
     pub parcel: String,
     pub target: String,
+    /// Whether the remote holds a state of the haul, which keeping theirs restores.
+    pub on_remote: bool,
 }
 
 /// The merge records among `changes` — the cells an `@haul` lift would publish over the remote's
@@ -797,17 +822,25 @@ pub fn held_merges(changes: &[CellChange],
 
         // A target this warehouse cannot name holds nothing here, so waiting brings nothing.
         let Ok(Some(local_target)) = pallet_utils::get_pallet_head(&opened.target) else { continue };
-        if !merge_utils::is_ancestor(&parcel, &local_target)? {
+        let unjudged = |why: String| format!(
+            "could not judge whether the merge of haul {} into \"{}\" waits for its parcel: {}",
+            short(haul), opened.target, why
+        );
+
+        if !merge_utils::is_ancestor(&parcel, &local_target).map_err(unjudged)? {
             continue;
         }
 
         let contained = match remote_target_head(&opened.target) {
-            Some(remote) if file_utils::does_object_exist(&remote)? => merge_utils::is_ancestor(&parcel, &remote)?,
+            Some(remote) if file_utils::does_object_exist(&remote).map_err(unjudged)? => {
+                merge_utils::is_ancestor(&parcel, &remote).map_err(unjudged)?
+            }
             _ => false,
         };
 
         if !contained {
-            held.push(HeldMerge { haul: haul.to_string(), parcel, target: opened.target });
+            let on_remote = change.before.is_some();
+            held.push(HeldMerge { haul: haul.to_string(), parcel, target: opened.target, on_remote });
         }
     }
 
@@ -815,13 +848,15 @@ pub fn held_merges(changes: &[CellChange],
 }
 
 /// The merge records a lift of the local `@haul` head `local_head` over the remote's head
-/// `remote_head` holds back ([`held_merges`]). None when the remote's head is not held here: that
-/// lift is a divergence, refused before anything is published.
+/// `remote_head` holds back ([`held_merges`]). None when the remote's head is not held here, or
+/// is held but not in the local head's history: that lift is a divergence, which the lift itself
+/// refuses (naming "lower") before anything is published.
 pub fn held_by_lift(local_head: &str,
                     remote_head: Option<&str>,
                     remote_target_head: &dyn Fn(&str) -> Option<String>) -> Result<Vec<HeldMerge>, String> {
     let before = match remote_head {
         Some(remote) if !file_utils::does_object_exist(remote)? => return Ok(Vec::new()),
+        Some(remote) if !merge_utils::is_ancestor(remote, local_head)? => return Ok(Vec::new()),
         Some(remote) => meta_tree::cells_at(HAUL_PALLET_NAME, remote, &HaulRules)?,
         None => None,
     };
@@ -841,6 +876,21 @@ pub fn describe_held(held: &[HeldMerge]) -> String {
         "@{} was not lifted: it records a merge whose parcel the remote's target does not hold yet ({})",
         HAUL_PALLET_NAME, records.join("; ")
     )
+}
+
+/// The commands that drop each held merge record by keeping the remote's side of it: its state
+/// when the remote holds one, else the haul, which the remote does not hold yet. Each takes an
+/// empty replay, so no signature is needed and the hold never applies to it.
+pub fn drop_held(held: &[HeldMerge]) -> String {
+    let drops: Vec<String> = held.iter().map(|merge| match merge.on_remote {
+        true => format!("\"forklift lower --keep @{}:{}/state=theirs\"", HAUL_PALLET_NAME, merge.haul),
+        false => format!(
+            "\"forklift lower --keep @{}:{}=theirs\" (which drops the haul, not on the remote yet)",
+            HAUL_PALLET_NAME, merge.haul
+        ),
+    }).collect();
+
+    drops.join(" and ")
 }
 
 /// Stack edits to the local `@haul` head as one signed parcel. `None` when they changed nothing.

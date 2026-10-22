@@ -6098,10 +6098,18 @@ pub async fn lift_haul_pallet(client: &RemoteClient,
 
     let result = match haul_utils::held_by_lift(&local_head, remote_head, &remote_target_head) {
         Err(why) => Err(why),
-        Ok(held) if !held.is_empty() => Err(format!(
-            "{}. It goes once the remote's target holds the parcel: an operator who may write the target lifts \
-             it (lowering it first when the remote's head is not held here), then lift again.",
-            haul_utils::describe_held(&held))),
+        Ok(held) if !held.is_empty() => {
+            // A remote with no @haul gives "lower --keep" no remote side to keep.
+            let drop = match remote_head {
+                Some(_) => format!("; or drop the record with {}", haul_utils::drop_held(&held)),
+                None => String::new(),
+            };
+
+            Err(format!(
+                "{}. It goes once the remote's target holds the parcel: an operator who may write the target \
+                 lifts it (lowering it first when the remote's head is not held here), then lift again{}.",
+                haul_utils::describe_held(&held), drop))
+        }
         Ok(_) => lift_pallet(client, &wire, &local_head, remote_head, info.chunking, &Progress::NONE).await,
     };
 

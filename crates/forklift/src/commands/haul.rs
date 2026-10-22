@@ -208,15 +208,10 @@ async fn merge(id: &str) -> Result<(), String> {
     // Refused before anything lands: every head that admits the record would refuse it anyway,
     // after the target already took the merge.
     let operator = haul_utils::signing_operator(&office, &signer)?;
-    if !haul_utils::may_record_merge(&office, &operator, &haul.opened.target) {
-        let why = match office.find_user(&operator) {
-            Some(_) => "may not write",
-            None => "has no user record in the office, so may not write",
-        };
-
+    if let Err(refusal) = haul_utils::may_record_merge(&office, &operator, &haul.opened.target) {
         return Err(format!(
             "Operator {} {} \"{}\", and only its writers record a merge into it. Nothing was merged.",
-            operator, why, haul.opened.target
+            operator, refusal.why(), haul.opened.target
         ));
     }
 
