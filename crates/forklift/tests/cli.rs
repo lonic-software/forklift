@@ -13186,6 +13186,8 @@ fn undo_of_a_delete_refuses_a_pallet_that_took_its_folder_and_names_undo_as() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["prepare"]));
     let base = stack_one(&warehouse, "a.txt", "one\n");
+    assert_success(&warehouse.run(&["palletize", "q/r"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
     assert_success(&warehouse.run(&["palletize", "a/b"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
@@ -13202,6 +13204,8 @@ fn undo_of_a_delete_refuses_a_pallet_that_took_its_folder_and_names_undo_as() {
 
     let refused = warehouse.run(&["undo", "--as", "a/c"]);
     assert!(stderr(&refused).contains("collides with pallet \"a\""), "{}", stderr(&refused));
+    let refused = warehouse.run(&["undo", "--as", "q"]);
+    assert!(stderr(&refused).contains("collides with pallet \"q/r\""), "{}", stderr(&refused));
 
     assert_success(&warehouse.run(&["undo", "--as", "a-b"]));
     assert!(pallet_heads(&warehouse).contains(&("a-b".to_string(), base)));
