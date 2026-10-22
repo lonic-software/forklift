@@ -1132,6 +1132,11 @@ pub fn remove_pallet_head_in(
         )));
     }
 
+    // Before anything is written, the ledger record included: an entry the journal would refuse.
+    crate::util::journal_utils::validate_entry(journal).map_err(|e| RefUpdateError::Failed(format!(
+        "Refusing to remove pallet \"{}\": its undo entry {}.", wire, e
+    )))?;
+
     // The journal entry must be durable before the unlink; a bulk session would only stage it.
     if file_utils::is_bulk_session_open() {
         return Err(RefUpdateError::Failed(

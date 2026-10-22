@@ -6,36 +6,52 @@ use crate::commands::shift;
 use crate::output::{self, CommandOutput};
 
 /// Handle the undo command (§7.8): reverse the last state-changing operation, using the
-/// undo journal. `undo` spans `stack`, `consolidate`, `cherry-pick` and `shift` — not just the
-/// last stack — because each of those journals the state on both sides of it.
+/// undo journal. `undo` spans `stack`, `consolidate`, `cherry-pick`, `shift` and a pallet delete —
+/// not just the last stack — because each of those journals the state on both sides of it.
 ///
 /// * Reversing a `stack`, `consolidate` or `cherry-pick` is a **soft reset**: the pallet head
 ///   moves back while the working directory and inventory are kept, so the undone changes end
 ///   up staged again (this is how a merge is reversed too).
 /// * Reversing a `shift` moves back to the previous pallet, re-materializing its tree
 ///   (it refuses if the working directory is dirty, exactly like a forward `shift`).
+/// * Reversing a pallet delete brings the pallet back at the head it was deleted at, without
+///   touching the bay (see `journal_utils::restore_deleted`); with `as_name`, under that name.
 ///
 /// An empty journal means there is nothing to undo. An entry is reversed only while the bay is
 /// still where its operation left it (`journal_utils::check_undoable`); otherwise an operation
 /// outside the journal ran since, and reversing the entry would undo an older operation than
-/// the user's last. Nor is one reversed that would put back a cherry-pick whose source is gone.
+/// the user's last. Nor is one reversed that would put back a cherry-pick whose source is gone. A
+/// delete changed no bay state, so nothing the bay did since stops its undo.
 ///
 /// The journal entry is only ever consumed (`journal_utils::pop`) once its undo has fully
 /// succeeded — `peek` looks at it first. A refused or failed undo must leave the journal exactly
 /// as it found it, so a retried `undo` sees the same entry rather than skipping straight past it.
 ///
+/// # Arguments
+/// * `as_name` - For `undo --as`: the name to bring a deleted pallet back under. Refused unless the
+///               last entry is a delete.
+///
 /// # Returns
 /// * `Ok(())`      - If an operation was undone.
 /// * `Err(String)` - If there is nothing to undo, the journal cannot be read, the bay has moved
 ///                   past the last entry, or the reversal failed.
-pub async fn handle_command() -> Result<(), String> {
+pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
     let Some(entry) = journal_utils::peek()? else {
         return Err(
             "There is nothing to undo: the undo journal is empty. Only stack, consolidate, \
-            cherry-pick and shift are journaled, and a pallet's first parcel cannot be undone."
+            cherry-pick, shift and a pallet delete are journaled, and a pallet's first parcel \
+            cannot be undone."
                 .to_string()
         );
     };
+
+    if as_name.is_some() && entry.op != journal_utils::DELETE_OP {
+        return Err(format!(
+            "\"undo --as\" brings a deleted pallet back under another name, but the last journaled \
+            operation is a \"{}\", not a pallet delete. Nothing was undone.",
+            entry.op
+        ));
+    }
 
     // Gate before mutating anything, for every kind of entry: refuse, leaving the journal
     // untouched, unless the bay is still exactly where the entry's operation left it.
@@ -43,6 +59,28 @@ pub async fn handle_command() -> Result<(), String> {
 
     #[cfg(test)]
     tests::AFTER_GATE.with(|seam| seam.take().map(|seam| seam()));
+
+    if entry.op == journal_utils::DELETE_OP {
+        // The bay is left alone: a delete changed none of its state. It is read first, so nothing
+        // after the pop can fail.
+        let position = pallet_utils::read_position()?;
+        let restored = journal_utils::restore_deleted(&entry, as_name)?;
+        journal_utils::pop()?;
+
+        output::emit(&Undone {
+            op: entry.op,
+            pallet: position.pallet,
+            left: String::new(),
+            undone: String::new(),
+            head: position.base.unwrap_or_default(),
+            description: String::new(),
+            restored: restored.deleted,
+            restored_as: restored.name,
+            restored_head: restored.head,
+        });
+
+        return Ok(());
+    }
 
     if entry.op == "shift" {
         // Move back to the pallet that was current before the shift, re-materializing it.
@@ -59,6 +97,9 @@ pub async fn handle_command() -> Result<(), String> {
             undone: String::new(),
             head,
             description: String::new(),
+            restored: String::new(),
+            restored_as: String::new(),
+            restored_head: String::new(),
         });
 
         return Ok(());
@@ -88,6 +129,9 @@ pub async fn handle_command() -> Result<(), String> {
         undone,
         head,
         description,
+        restored: String::new(),
+        restored_as: String::new(),
+        restored_head: String::new(),
     });
 
     Ok(())
@@ -97,7 +141,7 @@ pub async fn handle_command() -> Result<(), String> {
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct Undone {
-    /// The operation that was reversed (`stack`, `consolidate`, `cherry-pick`, `shift`).
+    /// The operation that was reversed (`stack`, `consolidate`, `cherry-pick`, `shift`, `delete`).
     op: String,
 
     /// The pallet that is current after the undo.
@@ -117,10 +161,39 @@ pub(crate) struct Undone {
     /// The undone parcel's description (for orientation), when there is one.
     #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
+
+    /// For a reversed `delete`, the pallet that was deleted.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    restored: String,
+
+    /// For a reversed `delete`, the name the pallet is back under: its own, or the one `--as` gave.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    restored_as: String,
+
+    /// For a reversed `delete`, the head the pallet is back at (the one it was deleted at).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    restored_head: String,
 }
 
 impl CommandOutput for Undone {
     fn render_human(&self) {
+        if self.op == journal_utils::DELETE_OP && self.restored_as == self.restored {
+            println!("Undid delete — pallet \"{}\" is back at {}.", self.restored, self.restored_head);
+            return;
+        }
+
+        if self.op == journal_utils::DELETE_OP {
+            println!(
+                "Undid delete — deleted pallet \"{}\" is back as \"{}\", at {}.",
+                self.restored, self.restored_as, self.restored_head
+            );
+            println!(
+                "Older undo entries still refer to \"{}\": undoing them acts on whatever that name holds then.",
+                self.restored
+            );
+            return;
+        }
+
         if self.op == "shift" {
             println!("Undid shift — back on pallet \"{}\" (head {}).", self.pallet, self.head);
             return;
@@ -195,7 +268,7 @@ mod tests {
             pallet_utils::update_pallet_head("zeta", Some(&on), &moved_to, &pallet_utils::RefPreconditions::NONE).unwrap();
         }))));
 
-        let error = test_support::block_on(handle_command()).expect_err("the undo must be refused");
+        let error = test_support::block_on(handle_command(None)).expect_err("the undo must be refused");
         assert!(error.contains("has moved since"), "{}", error);
 
         assert_eq!(pallet_utils::get_pallet_head("zeta").unwrap(), Some(three), "the other bay's head must stand");
@@ -203,5 +276,26 @@ mod tests {
         assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("zeta", Some(two)),
             "the bay still stands where the operation left it");
         assert!(journal_utils::peek().unwrap().is_some(), "a refused undo must keep its entry");
+    }
+    #[test]
+    fn undo_of_a_delete_whose_history_is_gone_refuses_and_keeps_its_entry() {
+        let _warehouse = Warehouse::storage_only("undo-delete-freed");
+        let none = pallet_utils::RefPreconditions::NONE;
+
+        let main = test_support::store_parcel(&test_support::store_tree("a.txt", b"a\n"), &[]);
+        pallet_utils::update_pallet_head("main", None, &main, &none).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
+
+        // A parcel whose tree this store no longer holds.
+        let freed = test_support::store_parcel(&hash('f'), &[]);
+        pallet_utils::update_pallet_head("side", None, &freed, &none).unwrap();
+        let entry = journal_utils::delete_entry("side", &freed).unwrap();
+        pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "side", &freed, &none, &entry).unwrap();
+
+        let error = test_support::block_on(handle_command(None)).expect_err("the undo must refuse");
+        assert!(error.contains("is no longer complete in this warehouse"), "{}", error);
+        assert!(error.contains("forklift lower side"), "{}", error);
+        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None, "nothing was created");
+        assert_eq!(journal_utils::peek().unwrap(), Some(entry), "a refused undo keeps its entry");
     }
 }

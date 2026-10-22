@@ -7516,3 +7516,75 @@ fn a_sparse_warehouse_lowers_another_pallet_within_scope_and_expand_widens_it() 
     assert_success(&area.forklift("sparse", &["expand", "src/web"]));
     assert!(object_present(&area, "sparse", &web_blob), "expand widens the lowered pallet's history too");
 }
+
+// Revert: skip the remote ask in the delete's containment → the lowered pallet refuses without
+// "--force".
+#[test]
+fn a_lowered_pallet_the_remote_holds_deletes_without_force() {
+    let area = TestArea::new("delete-remote-held");
+    let server = Server::start(&area, None);
+    let feat = remote_with_a_side_pallet(&area, &server);
+    assert_success(&area.forklift("b", &["lower", "feat"]));
+
+    let deleted = area.forklift("b", &["--json", "palletize", "--delete", "feat"]);
+    assert_success(&deleted);
+    let value = json_of(&deleted);
+    assert_eq!(value["data"]["contained_by"], "the remote", "{}", value);
+    assert_eq!(value["data"]["head"], feat.as_str(), "{}", value);
+    assert!(!area.path("b/.forklift/pallets/feat").exists());
+
+    // Work the remote does not hold is refused.
+    assert_success(&area.forklift("b", &["undo"]));
+    assert_success(&area.forklift("b", &["shift", "feat"]));
+    stack_file(&area, "b", "local.txt", "local\n");
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    let refused = area.forklift("b", &["palletize", "--delete", "feat"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("Neither does the remote"), "{}", stderr(&refused));
+}
+
+#[test]
+fn scope_prune_keeps_unlifted_history_behind_a_deleted_pallet_for_its_undo() {
+    let area = TestArea::new("scope-prune-deleted");
+    let _server = sparse_with_docs(&area);
+
+    assert_success(&area.forklift("sparse", &["palletize", "side"]));
+    std::fs::write(area.path("sparse/docs/guide.md"), "guide on side, never lifted\n").unwrap();
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "side docs edit"]));
+    let head = pallet_head(&area, "sparse", "side");
+    let blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
+    assert_success(&area.forklift("sparse", &["shift", "main"]));
+    assert_success(&area.forklift("sparse", &["palletize", "--delete", "side", "--force"]));
+
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&pruned);
+    let report = json_of(&pruned);
+    assert!(report["data"]["kept_for_deleted"].as_u64().unwrap() > 0, "{}", report);
+    assert!(object_present(&area, "sparse", &blob), "the deleted pallet's unlifted work is kept");
+
+    assert_success(&area.forklift("sparse", &["undo"]));
+    assert_eq!(pallet_head(&area, "sparse", "side"), head);
+}
+
+// A remote whose trust changed is not asked what it holds: the delete refuses before reading its
+// heads, which still name the pallet's head.
+#[test]
+fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
+    let area = TestArea::new("delete-remote-regenesis");
+    let _server = regenesis_on_remote(&area, |server| {
+        assert_success(&area.forklift("a", &["palletize", "feat"]));
+        stack_file(&area, "a", "feat.txt", "feat v1\n");
+        assert_success(&area.forklift("a", &["lift"]));
+        assert_success(&area.forklift("a", &["shift", "main"]));
+        assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "root"]));
+        assert_success(&area.forklift("b", &["lower", "feat"]));
+    });
+
+    let refused = area.forklift("b", &["palletize", "--delete", "feat"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("CHANGED"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("nothing was deleted"), "{}", stderr(&refused));
+    assert!(area.path("b/.forklift/pallets/feat").exists());
+}

@@ -563,7 +563,9 @@ pub enum Command {
         long_about = "Create a new pallet at the current head — or at the given revision (a pallet \
                       name or a parcel hash) — and shift to it. Without arguments, the pallets are \
                       listed with the current one marked; with \"--remote\", the remote's pallets \
-                      are listed instead, each with how it relates to the local one."
+                      are listed instead, each with how it relates to the local one. With \
+                      \"--delete\", the named pallet is deleted instead: its ref goes, its parcels \
+                      stay, and \"forklift undo\" brings it back."
     )]
     Palletize {
         /// The name of the new pallet; omit it to list the pallets
@@ -583,6 +585,17 @@ pub enum Command {
         /// Downloads and writes nothing
         #[arg(long, conflicts_with_all = ["name", "revision"])]
         remote: bool,
+
+        /// Delete the named pallet: remove its ref, keeping its parcels. Refused for the pallet a
+        /// bay stands on, one an open haul names, and — without "--force" — one whose work no
+        /// other pallet here or on the remote holds. Undo it with "forklift undo"
+        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all", "remote"])]
+        delete: bool,
+
+        /// With "--delete": delete even when no other pallet holds the pallet's work. It stays
+        /// recoverable by "forklift undo" only while the delete is in this bay's undo journal
+        #[arg(long, requires = "delete")]
+        force: bool,
     },
 
     /// Park the work in progress and reset to the pallet head
@@ -972,14 +985,22 @@ pub enum Command {
                       the inventory stay as they are (like git's \"reset --soft HEAD~1\"), so the \
                       undone changes are staged again and can be re-stacked — e.g. with a \
                       corrected message or author. A shift is reversed by shifting back. Undo \
-                      reverses only the user's last operation: if the current pallet has been \
+                      reverses only the user's last operation: except for a pallet delete, which \
+                      changed nothing in the bay, if the current pallet has been \
                       switched (e.g. by palletize or deliver), its head has moved, or a \
                       consolidation or cherry-pick was started or finished since the journaled \
                       operation, it refuses \
                       instead of reaching past that. An unreadable journal is reported by name, \
-                      never read as empty."
+                      never read as empty. A pallet delete is reversed by bringing the pallet \
+                      back at the head it was deleted at; if that name has been taken since, \
+                      \"--as <new-name>\" brings it back under another name."
     )]
-    Undo,
+    Undo {
+        /// When the last journaled operation is a pallet delete: bring the deleted pallet back
+        /// under this name instead of its own. The bay stays where it is
+        #[arg(long = "as", value_name = "NEW_NAME")]
+        as_name: Option<String>,
+    },
 
     /// Unstage a file or directory (keep your changes)
     #[command(
@@ -1701,7 +1722,7 @@ impl Command {
                 | Command::Stocktake { .. }
                 | Command::Store
                 | Command::Tag { .. }
-                | Command::Undo
+                | Command::Undo { .. }
                 | Command::Unload { .. }
         )
     }
@@ -1769,7 +1790,7 @@ impl Command {
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Tag { .. }
-                | Command::Undo
+                | Command::Undo { .. }
                 | Command::Unload { .. }
         )
     }
@@ -1837,6 +1858,8 @@ impl Command {
     /// journaled. Only state-changing operations `undo` knows how to reverse are listed;
     /// their pre-operation state is snapshotted so `undo` can restore it. Pure-staging
     /// (`load`/`remove`/`unload`/`restore`), trust and remote commands are intentionally excluded.
+    /// A pallet delete is journaled as well, but writes its own entry inside the removal's ref-lock
+    /// hold (`palletize --delete`), so it is not listed here.
     pub fn journal_op(&self) -> Option<&'static str> {
         match self {
             Command::Stack { .. } => Some("stack"),

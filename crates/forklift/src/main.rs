@@ -427,7 +427,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
                 commands::office::accept_regenesis(confirm).await,
             Some(OfficeAction::List) | None => commands::office::list().await,
         },
-        Command::Palletize { name, revision, all, remote } => commands::palletize::handle_command(name, revision, all, remote).await,
+        Command::Palletize { name, revision, all, remote, delete, force } => commands::palletize::handle_command(name, revision, all, remote, delete, force).await,
         Command::Park { action } => match action {
             Some(ParkAction::Pop) => commands::park::pop_parked(),
             Some(ParkAction::List) => commands::park::list_parked(),
@@ -445,7 +445,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Tag { action } => commands::tag::handle_command(action).await,
         Command::Kv { action } => commands::kv::handle_command(action),
         Command::Stocktake { summary } => commands::stocktake::handle_command(summary).await,
-        Command::Undo => commands::undo::handle_command().await,
+        Command::Undo { as_name } => commands::undo::handle_command(as_name.as_deref()).await,
         Command::Unload { path } => commands::unload::handle_command(&path),
         Command::Version => commands::version::handle_command(),
         Command::SelfSchema => commands::self_schema::handle_command(),

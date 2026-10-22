@@ -2740,6 +2740,46 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+### `Deleted`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A deleted pallet.",
+  "properties": {
+    "contained_by": {
+      "description": "What else holds that head (`pallet \"<name>\"` or `the remote`); `null` when the delete was\nforced without asking.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "head": {
+      "description": "The head it was deleted at; its parcels stay, and `undo` brings the pallet back here.",
+      "type": "string"
+    },
+    "merged_hauls": {
+      "description": "Merged hauls whose target this was: their proof now reads as unproven, since no pallet\nholds the target any more. Never a claim the record is false.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "pallet": {
+      "description": "The pallet that was deleted.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "pallet",
+    "head",
+    "contained_by"
+  ],
+  "title": "Deleted",
+  "type": "object"
+}
+```
+
 ### `PalletList`
 
 ```json
@@ -4731,11 +4771,23 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "op": {
-      "description": "The operation that was reversed (`stack`, `consolidate`, `cherry-pick`, `shift`).",
+      "description": "The operation that was reversed (`stack`, `consolidate`, `cherry-pick`, `shift`, `delete`).",
       "type": "string"
     },
     "pallet": {
       "description": "The pallet that is current after the undo.",
+      "type": "string"
+    },
+    "restored": {
+      "description": "For a reversed `delete`, the pallet that was deleted.",
+      "type": "string"
+    },
+    "restored_as": {
+      "description": "For a reversed `delete`, the name the pallet is back under: its own, or the one `--as` gave.",
+      "type": "string"
+    },
+    "restored_head": {
+      "description": "For a reversed `delete`, the head the pallet is back at (the one it was deleted at).",
       "type": "string"
     },
     "undone": {

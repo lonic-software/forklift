@@ -33,7 +33,7 @@ pub const DELETE_OP: &str = "delete";
 
 /// Cap the journal so it cannot grow without bound; the oldest entries fall off (undo is
 /// a recent-history convenience, not an audit trail — that is what `history`/`audit` are).
-const MAX_ENTRIES: usize = 100;
+pub const MAX_ENTRIES: usize = 100;
 
 /// The mutable warehouse state on one side of a journaled operation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -426,6 +426,252 @@ pub(crate) fn delete_entry_for_test(victim: &str, head: &str) -> JournalEntry {
     }
 }
 
+/// The undo entry for deleting user pallet `wire` at `head` from this bay: the bay's state on both
+/// sides (a delete changes none of it), with the pallet at `head` before and removed after. The
+/// delete passes it to [`pallet_utils::remove_pallet_head_in`], which writes it in the removal's
+/// own hold; [`push_if_changed`] never sees a delete.
+///
+/// # Returns
+/// * `Ok(JournalEntry)` - The entry.
+/// * `Err(String)`      - If the bay's position, consolidation or cherry-pick could not be read.
+pub fn delete_entry(wire: &str, head: &str) -> Result<JournalEntry, String> {
+    let position = pallet_utils::read_position()?;
+    let heads = position.base
+        .map(|base| BTreeMap::from([(position.pallet.clone(), Some(base))]))
+        .unwrap_or_default();
+
+    let mut after = Snapshot {
+        current_pallet: position.pallet,
+        heads,
+        consolidation: read_consolidation()?,
+        cherry_pick: read_cherry_pick()?,
+    };
+    let mut before = after.clone();
+    before.heads.insert(wire.to_string(), Some(head.to_string()));
+    after.heads.insert(wire.to_string(), None);
+
+    Ok(JournalEntry { op: DELETE_OP.to_string(), before, after })
+}
+
+/// How [`restore_deleted`] brought a deleted pallet back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restored {
+    /// The undo created the ref.
+    Created,
+
+    /// The name already held the deleted head: an undo interrupted before its pop, a write that
+    /// landed while reporting failure, or another writer creating the same head.
+    AlreadyThere,
+}
+
+/// A deleted pallet brought back by [`restore_deleted`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredPallet {
+    /// The pallet the delete removed.
+    pub deleted: String,
+
+    /// The name it now stands under: the deleted name, or the one `undo --as` gave.
+    pub name: String,
+
+    /// Its head, the one it was deleted at.
+    pub head: String,
+
+    pub outcome: Restored,
+}
+
+/// Bring back the pallet a delete entry removed, under its own name or, for `undo --as`, under
+/// `as_name`. The entry is not popped: the caller pops it once this succeeds.
+///
+/// What the name holds decides, in order:
+/// * absent: the ref is created at the deleted head, by compare-and-set from absent, once no bay
+///   stands on the name out of step with that head, the head's history is complete within the
+///   fetch scope, and the history passes the warehouse's trust check as it stands now (the anchor
+///   and office read for that check must still hold when the ref is written);
+/// * the deleted head: the pallet is back already, and that counts as restored;
+/// * any other head: the name was created again since, and the undo refuses, keeping the entry. A
+///   plain undo names `undo --as`; `undo --as` asks for another name.
+///
+/// A compare-and-set lost to a writer that created the name meanwhile is judged the same way from
+/// the head it found, never swallowed.
+///
+/// # Arguments
+/// * `entry`   - The delete entry `undo` is reversing.
+/// * `as_name` - The user pallet to create instead of the deleted one (`undo --as`).
+///
+/// # Returns
+/// * `Ok(RestoredPallet)` - The pallet is back.
+/// * `Err(String)`        - The refusal or failure; nothing was written, unless the write failed
+///                          after landing, which the next undo finds as restored.
+pub fn restore_deleted(entry: &JournalEntry, as_name: Option<&str>) -> Result<RestoredPallet, String> {
+    let [(wire, head)] = <[(String, String); 1]>::try_from(removed_by(entry)).map_err(|_| format!(
+        "The journal entry for \"{}\" removed no pallet, so there is no deleted pallet to bring back.",
+        entry.op
+    ))?;
+
+    let deleted = PalletRef::parse(&wire)?;
+    let name = match as_name {
+        Some(name) => {
+            pallet_utils::validate_pallet_name(name)?;
+            name.to_string()
+        }
+        None => deleted.name.clone(),
+    };
+
+    let restored = |outcome| RestoredPallet { deleted: wire.clone(), name: name.clone(), head: head.clone(), outcome };
+
+    // A read error is reported once no colliding pallet below explains it.
+    let exact = pallet_utils::get_pallet_head_in(PalletNamespace::User, &name);
+    if let Ok(Some(found)) = &exact {
+        return settle_on(&wire, &name, as_name.is_some(), &head, Some(found.clone())).map(restored);
+    }
+
+    // The delete pruned emptied ref folders, so a pallet created since can stand where the ref
+    // would go: a folder of the name, or under it.
+    let nested = |outer: &str, inner: &str| inner.starts_with(&format!("{}/", outer));
+    let users = pallet_utils::list_pallets_in(PalletNamespace::User)?;
+    if let Some(other) = users.iter().find(|other| nested(other, &name) || nested(&name, other)) {
+        return Err(match as_name {
+            Some(_) => format!(
+                "Pallet name \"{}\" collides with pallet \"{}\" (one name is a folder of the \
+                other); bring deleted pallet \"{}\" back under another name. Nothing was undone.",
+                name, other, wire
+            ),
+            None => format!(
+                "Pallet \"{}\" was deleted at {}, and pallet \"{}\" now stands where its ref \
+                would go (one name is a folder of the other). Undo will not overwrite it. To bring \
+                the deleted pallet back under another name, run \"forklift undo --as <new-name>\". \
+                Nothing was undone.",
+                wire, head, other
+            ),
+        });
+    }
+
+    exact?;
+
+    refuse_a_bay_out_of_step(&name, &head, as_name)?;
+
+    crate::util::audit_utils::verify_parcel_closure_scoped(&head, None, &crate::util::scope_utils::read_fetch_scope()?, false)
+        .map_err(|e| format!(
+            "The history of deleted pallet \"{}\" ({}) is no longer complete in this warehouse: {} \
+            Nothing was undone. If a remote holds that history, \"forklift lower {}\" brings the \
+            pallet back from it; otherwise the history is gone.",
+            wire, head, e, deleted.name
+        ))?;
+
+    let preconditions = trust_preconditions(&wire, &head)?;
+
+    create_deleted(&wire, &name, as_name.is_some(), &head, &preconditions).map(restored)
+}
+
+/// The compare-and-set [`restore_deleted`] ends in: create `name` at `head`, judging a lost race
+/// by the head the name was found at, and a failed write by reading the name back.
+fn create_deleted(wire: &str,
+                  name: &str,
+                  renamed: bool,
+                  head: &str,
+                  preconditions: &pallet_utils::RefPreconditions) -> Result<Restored, String> {
+    match pallet_utils::update_pallet_head_in(PalletNamespace::User, name, None, head, preconditions) {
+        Ok(()) => Ok(Restored::Created),
+        Err(RefUpdateError::Moved(moved)) => settle_on(wire, name, renamed, head, moved.found),
+        Err(RefUpdateError::Failed(error)) => match pallet_utils::get_pallet_head(name) {
+            Ok(Some(found)) if found == head => Ok(Restored::Created),
+            _ => Err(format!("{} The undo entry is kept; run \"forklift undo\" again.", error)),
+        },
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Judge a name found holding `found` while bringing back `wire`'s `head` (see [`restore_deleted`]).
+fn settle_on(wire: &str, name: &str, renamed: bool, head: &str, found: Option<String>) -> Result<Restored, String> {
+    match found {
+        Some(found) if found == head => Ok(Restored::AlreadyThere),
+        Some(found) if renamed => Err(format!(
+            "Pallet \"{}\" already exists (at {}); bring deleted pallet \"{}\" back under another \
+            name. Nothing was undone.",
+            name, found, wire
+        )),
+        Some(found) => Err(format!(
+            "Pallet \"{}\" was deleted at {}, and a pallet of that name exists again, at {}. Undo \
+            will not overwrite it. To bring the deleted pallet back under another name, run \
+            \"forklift undo --as <new-name>\". Nothing was undone.",
+            wire, head, found
+        )),
+        None => Err(format!(
+            "Pallet \"{}\" changed while undo was creating it; nothing was undone. Run \"forklift \
+            undo\" again.",
+            name
+        )),
+    }
+}
+
+/// Refuse to create `name` at `head` while a checkout stands on the name at no base or another one:
+/// the ref would appear under it out of step with its files. A checkout at exactly `head` is the
+/// usual loser of a delete's race with a shift, and the restore puts it back in step.
+fn refuse_a_bay_out_of_step(name: &str, head: &str, as_name: Option<&str>) -> Result<(), String> {
+    for (which, position) in crate::util::bay_utils::bays_on(name)? {
+        if position.base.as_deref() == Some(head) {
+            continue;
+        }
+
+        let at = match &position.base {
+            Some(base) => format!("at {}", base),
+            None => "on nothing stacked".to_string(),
+        };
+        let rerun = match as_name {
+            Some(as_name) => format!("forklift undo --as {}", as_name),
+            None => "forklift undo".to_string(),
+        };
+
+        let mut which = which;
+        which[..1].make_ascii_uppercase();
+
+        return Err(format!(
+            "{} stands on pallet \"{}\" {}, and the undo would create that pallet at {}, out of \
+            step with its files. Shift it to another pallet, run \"{}\" again, then shift it back. \
+            Nothing was undone.",
+            which, name, at, head, rerun
+        ));
+    }
+
+    Ok(())
+}
+
+/// The trust state a restored head must pass, and the preconditions that pin it for the write: in
+/// a warehouse with an anchor, `head`'s history must verify against the anchor and office as they
+/// are now, and both must still hold when the ref is written; without one, there must still be
+/// none, so an enrollment cannot slip in between and miss the head.
+fn trust_preconditions(wire: &str, head: &str) -> Result<pallet_utils::RefPreconditions, String> {
+    use crate::util::{audit_utils, office_utils};
+    use pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
+
+    let Some((anchor, bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
+        return Ok(RefPreconditions {
+            office: OfficePrecondition::NotConsumed,
+            anchor: AnchorPrecondition::Absent,
+            pallets: PalletsPrecondition::NotConsumed,
+        });
+    };
+
+    let Some(office_head) = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? else {
+        return Err("Trust is established but the office pallet is missing; nothing was undone.".to_string());
+    };
+
+    let untrusted = |e: String| format!(
+        "The history of deleted pallet \"{}\" no longer passes this warehouse's trust check: {} \
+        Nothing was undone.",
+        wire, e
+    );
+
+    let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| untrusted(e.into()))?;
+    audit_utils::verify_pallet_history(head, &anchor, &office_state, None).map_err(untrusted)?;
+
+    Ok(RefPreconditions {
+        office: OfficePrecondition::At(Some(office_head)),
+        anchor: AnchorPrecondition::Bytes(bytes),
+        pallets: PalletsPrecondition::NotConsumed,
+    })
+}
+
 /// Look at the most recent journal entry without consuming it. The caller (`undo`) must
 /// validate — and, for a soft reset, actually restore — an entry *before* it commits to
 /// removing it from the journal: `pop` throws the entry away the moment it is called, so a
@@ -470,6 +716,9 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// A bay that matches is still refused when the entry would put back a cherry-pick whose source
 /// this store no longer holds (see [`refuse_a_pick_without_its_source`]).
 ///
+/// A delete is never refused here, nor is the bay read for it: it changed no bay state and puts
+/// none back, so nothing the bay did since stands between it and its undo.
+///
 /// # Arguments
 /// * `entry` - The entry `undo` is about to reverse.
 ///
@@ -478,6 +727,10 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// * `Err(String)` - The refusal, naming what differs or the lost pick source; or the state could
 ///                   not be read.
 pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
+    if entry.op == DELETE_OP {
+        return Ok(());
+    }
+
     let now = BayState::read()?;
     let after = entry.after.bay_state();
 
@@ -813,7 +1066,7 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
 /// Check that an entry holds only what the warehouse could have written: two valid snapshots,
 /// and a removed ref only where a delete recorded it — in `after`, exactly one, a user pallet with
 /// a head before, never a current pallet. So every restore but the delete's meets no removal.
-fn validate_entry(entry: &JournalEntry) -> Result<(), String> {
+pub(crate) fn validate_entry(entry: &JournalEntry) -> Result<(), String> {
     validate_snapshot(&entry.before)?;
     validate_snapshot(&entry.after)?;
 
@@ -2004,5 +2257,61 @@ mod tests {
         assert_eq!(entries[0].before.head("main"), Some(&format!("{:064x}", 10)));
         let newest = pop().unwrap().unwrap();
         assert_eq!(newest.before.head("main"), Some(&format!("{:064x}", MAX_ENTRIES + 9)));
+    }
+    #[test]
+    fn a_lost_create_of_a_deleted_pallet_is_judged_by_the_head_it_found() {
+        let _scratch = Scratch::new("create-deleted-race");
+        let none = pallet_utils::RefPreconditions::NONE;
+
+        // Created meanwhile at the deleted head: restored, for undo and for "--as" alike.
+        pallet_utils::update_pallet_head("side", None, &hash('a'), &none).unwrap();
+        assert_eq!(create_deleted("side", "side", false, &hash('a'), &none), Ok(Restored::AlreadyThere));
+        assert_eq!(create_deleted("side", "side", true, &hash('a'), &none), Ok(Restored::AlreadyThere));
+
+        // Created meanwhile at another head: refused, theirs stands.
+        pallet_utils::update_pallet_head("other", None, &hash('b'), &none).unwrap();
+        let refused = create_deleted("side", "other", false, &hash('a'), &none).unwrap_err();
+        assert!(refused.contains("exists again") && refused.contains("forklift undo --as <new-name>"), "{}", refused);
+        let refused = create_deleted("side", "other", true, &hash('a'), &none).unwrap_err();
+        assert!(refused.contains("Pallet \"other\" already exists"), "{}", refused);
+        assert_eq!(pallet_utils::get_pallet_head("other").unwrap(), Some(hash('b')));
+
+        assert_eq!(create_deleted("side", "fresh", true, &hash('c'), &none), Ok(Restored::Created));
+        assert_eq!(pallet_utils::get_pallet_head("fresh").unwrap(), Some(hash('c')));
+    }
+
+    #[test]
+    fn a_create_of_a_fenced_deleted_head_refuses() {
+        let _scratch = Scratch::new("create-deleted-fenced");
+        let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+        crate::util::fetch_ledger::write_fence(&lock, &[hash('a')]).unwrap();
+        drop(lock);
+
+        let refused = create_deleted("side", "side", false, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap_err();
+        assert!(refused.contains("fetched only part-way"), "{}", refused);
+        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
+    }
+
+    #[test]
+    fn a_restore_without_trust_pins_the_anchor_absent() {
+        let _scratch = Scratch::new("restore-no-anchor");
+
+        // An enrollment between the trust read and the write must make the create lose.
+        let preconditions = trust_preconditions("side", &hash('a')).unwrap();
+        assert!(matches!(preconditions.anchor, pallet_utils::AnchorPrecondition::Absent));
+    }
+
+    #[test]
+    fn a_delete_made_during_a_pick_undoes_after_the_picked_parcel_is_gone() {
+        let _scratch = Scratch::new("delete-during-pick");
+
+        advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &hash('2')).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('2')))).unwrap();
+        cherry_pick_utils::write_state(&CherryPickState { source: hash('6'), our_head: hash('2'), our_pallet: "main".to_string(), description: None }).unwrap();
+
+        // The delete leaves the pick in progress as it found it, so undoing it puts no pick back.
+        let deleted = super::delete_entry("side", &hash('3')).unwrap();
+        assert!(deleted.before.cherry_pick.is_some());
+        check_undoable(&deleted).unwrap();
     }
 }
