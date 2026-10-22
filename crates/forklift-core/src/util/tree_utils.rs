@@ -77,39 +77,6 @@ pub async fn build_tree_from_inventory_deferred(
         return Ok((None, BTreeMap::new()));
     }
 
-    // Collect every inventoried directory key plus all of its ancestors (ancestors may
-    // have no shard of their own), then derive the parent → children relation.
-    let mut keys: BTreeSet<String> = BTreeSet::new();
-
-    for entry in metadata {
-        let mut key = inventory_utils::metadata_entry_to_key(entry);
-
-        loop {
-            keys.insert(key.to_string());
-
-            match key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
-                Some((parent, _)) => key = parent,
-                None => break,
-            }
-        }
-
-        keys.insert(String::new());
-    }
-
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for key in &keys {
-        if key.is_empty() {
-            continue;
-        }
-
-        let parent = key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR)
-            .map(|(parent, _)| parent)
-            .unwrap_or("");
-
-        children.entry(parent.to_string()).or_default().push(key.clone());
-    }
-
     let skip_plan = &prepared.skip;
 
     // The entire staged tree is provably identical to head (the root's own rollup already
@@ -121,22 +88,11 @@ pub async fn build_tree_from_inventory_deferred(
 
     refuse_alias_pairs(prepared)?;
 
-    // Every pruned key (a skipped subtree's root, and everything beneath it) is excluded from
-    // the task graph entirely — as if it were never inventoried. Its parent instead gets it
-    // injected verbatim (by hash) inside `build_tree_for_inventory_key`, from the plan's
-    // `injections`. Only worth rebuilding `keys`/`children` when the plan pruned something.
-    if !skip_plan.pruned.is_empty() {
-        keys = keys.difference(&skip_plan.pruned).cloned().collect();
-        children = children.into_iter()
-            .filter(|(key, _)| !skip_plan.pruned.contains(key))
-            .map(|(key, child_keys)| {
-                let child_keys = child_keys.into_iter().filter(|c| !skip_plan.pruned.contains(c)).collect();
-                (key, child_keys)
-            })
-            .collect();
-    }
-
-    let children = Arc::new(children);
+    // The layout leaves out every pruned key (a skipped subtree's root, and everything beneath
+    // it), so the task graph never holds one. Its parent instead gets it injected verbatim (by
+    // hash) inside `build_tree_for_inventory_key`, from the plan's `injections`.
+    let keys = &prepared.layout.keys;
+    let children = &prepared.layout.children;
 
     // Dependency counters: a directory becomes buildable once all of its (unpruned) children are
     // built. Directories without children (the leaves) are buildable immediately.

@@ -1338,9 +1338,9 @@ fn directory_has_no_untracked_content(key: &str,
 /// 10, finding #3) — the new content of every shard that needs rewriting, as `load`'s parallel
 /// walk decides per directory — then publishes through [`shard_write::publish_shards`], the
 /// funnel shared with `load`'s own `create_inventory_for_directory`. It decides every rollup from
-/// all of this pass's shards at once, so a shard decided early in this loop (say, because only its
-/// stat data drifted) never keeps a rollup over the ancestor clear a *later*-decided sibling's real
-/// content change requires (finding #1).
+/// all of this pass's shards at once, so a shard whose stat data alone drifted never keeps a
+/// rollup over the ancestor clear a sibling's real content change requires, whichever of the two
+/// comes first in metadata order (finding #1).
 ///
 /// Each decision takes its stat anchor at its start, before it stats anything, so every entry it
 /// rebuilds proves itself (see [`file_utils::StatAnchor`]); when the shard is later published
@@ -1353,23 +1353,27 @@ fn directory_has_no_untracked_content(key: &str,
 /// strictly before `shard_write::publish_shards` stages any shard content (DESIGN.html §5.0 D
 /// item 10, finding #7; see its doc comment for why the two must not share one batch).
 ///
-/// If deciding a shard's new content fails partway through (an unreadable file, a corrupt
-/// shard), that failure alone does not cost the whole pass: every shard decided *before* it is
-/// still handed to the publish step below, the same keep-whatever-was-decided resilience
-/// `create_inventory_for_directory` gives `load` (see its own doc comment). But every rebuilt
-/// file's blob this pass stages shares one batch, and if finishing that batch fails — including
-/// the leaked-reservation case where a producer won a reservation but never finished staging it —
-/// `WriteBatch::finish` refuses to publish the whole batch (see the blob-batch comment below), so
-/// nothing this pass decided is published, not just the shards decided after that failure. A
-/// retry after a decide-loop failure only has to redo the shards from the failure onward; a retry
-/// after a blob-batch failure has to redo the whole tracked set.
+/// Shards are decided in parallel, and taken up in metadata order. If deciding one fails (an
+/// unreadable file, a corrupt shard), the first such shard in that order ends the pass there:
+/// neither it nor any shard after it is published, though those were decided too, and any blob they
+/// rebuilt was staged and becomes durable with the batch, unreferenced. That failure alone does not
+/// cost the whole pass: every shard *before* it in metadata order is still handed to the publish
+/// step below, the same keep-whatever-was-decided resilience `create_inventory_for_directory` gives
+/// `load` (see its own doc comment). But every rebuilt file's blob this pass stages shares one
+/// batch, and if finishing that batch fails — including the leaked-reservation case where a
+/// producer won a reservation but never finished staging it — `WriteBatch::finish` refuses to
+/// publish the whole batch (see the blob-batch comment below), so nothing this pass decided is
+/// published, not just the shards after that failure. Because every shard is decided, a shard
+/// *after* the first failure can be the one that leaks, and then the shards before the failure
+/// are not published either. A retry after a decide-loop failure only has to redo the shards from
+/// the failure onward when the batch finished; otherwise it has to redo the whole tracked set.
 ///
 /// # Returns
 /// * `Ok(())`      - If the refresh completed.
 /// * `Err(String)` - If a shard or file could not be processed, or the blob batch failed to
-///                   publish. Every shard decided before a decide-loop failure was still handed
-///                   to the publish step; a blob-batch failure instead publishes nothing from
-///                   this pass — see the doc comment above.
+///                   publish. Every shard before the first failure in metadata order is handed
+///                   to the publish step when the blob batch finishes; a blob-batch failure
+///                   publishes nothing from this pass — see the doc comment above.
 pub fn refresh_tracked_entries() -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
@@ -1387,86 +1391,24 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     let blob_batch = file_utils::WriteBatch::new();
     let mut writes: BTreeMap<String, Inventory> = BTreeMap::new();
 
-    // The first failure hit while deciding a shard, if any — recorded instead of propagated
-    // immediately (see the function's own doc comment on why: everything decided before this
-    // point must still reach the publish step below, exactly as it would have under the old
-    // per-shard, immediate-write loop this replaced).
+    // The first failure in metadata order, if any — recorded instead of propagated immediately
+    // (see the function's own doc comment on why: every shard before it in metadata order must
+    // still reach the publish step below).
     let mut result: Result<(), String> = Ok(());
 
-    for entry in &metadata {
-        let key = metadata_entry_to_key(entry);
+    // Every shard is decided across every core; each decision is independent of the others (its
+    // own anchor, its own shard, its own files), and they are taken up below in metadata order.
+    let keys: Vec<&str> = metadata.iter().map(|entry| metadata_entry_to_key(entry)).collect();
+    let decisions = fanout_utils::fanout_map(&keys, |key| decide_tracked_refresh(key, &blob_batch));
 
-        // `Ok(Some(inventory))` when this shard needs rewriting; `Ok(None)` when nothing about it
-        // changed at all.
-        let decision = (|| -> Result<Option<Inventory>, String> {
-            // Before this decision stats anything below — see the function's own doc comment.
-            let anchor = file_utils::take_stat_anchor()?;
-
-            let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
-
-            let Some(bytes) = bytes_opt else {
-                return Ok(None);
-            };
-
-            let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
-                .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
-
-            let names: Vec<String> = inventory.get_items().map(|(name, _)| name.clone()).collect();
-            let mut changed = false;
-
-            for name in names {
-                let item = inventory.get_item_by_name(&name).unwrap();
-
-                if item.state == InventoryItemState::Deleted {
-                    continue;
-                }
-
-                let file_path = if key.is_empty() {
-                    std::path::PathBuf::from(&name)
-                } else {
-                    std::path::PathBuf::from(format!("{}/{}", key, name))
-                };
-
-                let Ok(metadata) = file_utils::get_symlink_metadata_for_path(&file_path) else {
-                    // The file is gone from disk: its removal becomes staged.
-                    inventory.mark_item_deleted(&name);
-                    changed = true;
-                    continue;
-                };
-
-                let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
-
-                // The entry is rebuilt even when only the stat data went stale (same
-                // content), so the refreshed shard keeps the fast path warm. Blobs are staged,
-                // not stored immediately — see the batch comment above. Staging an unchanged
-                // file's blob too heals one that went missing from the store, as `load` does.
-                let rebuilt = match classify_file_against_entry(
-                    &item, &metadata, item_type, &file_path, &name, IngestMode::Store, anchor,
-                )? {
-                    FileVerdict::UnchangedByStat => continue,
-                    FileVerdict::UnchangedByHash(rebuilt, object) | FileVerdict::Modified(rebuilt, object) => {
-                        if let Some(mut object) = object {
-                            object.store_deferred(&blob_batch)?;
-                        }
-                        rebuilt
-                    }
-                };
-                changed = true;
-
-                inventory.add_item(rebuilt);
-            }
-
-            Ok(changed.then_some(inventory))
-        })();
-
+    for (key, decision) in keys.iter().zip(decisions) {
         match decision {
             // Whether only stat data went stale (the rollup kept) or content changed (every
             // rollup above cleared) is the publish's to decide, against the shard on disk.
             Ok(Some(inventory)) => { writes.insert(key.to_string(), inventory); }
             Ok(None) => {}
-            // Matches the old loop's own behavior: a shard's failure stops the walk right there
-            // (never proceeds to a later shard in metadata order) — only *what happens to
-            // already-decided shards* changes here, not which shards get a chance to be decided.
+            // The first failure in metadata order ends the pass there: no shard after it is
+            // published, though the fan-out decided them too (see the function's doc comment).
             Err(e) => { result = Err(e); break; }
         }
     }
@@ -1483,9 +1425,10 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     // tell which of this pass's blobs actually landed, and some leave a subset durable and the rest
     // not, so publishing any shard content below could durably name a blob that never actually
     // landed — see `create_inventory_for_directory`'s identical phase-0 gating for the same
-    // reasoning (and the leaked-reservation blast radius, scoped here to a path *this pass*
-    // reserved but a fallible step between reservation and stage failed to finish staging — this
-    // function has no concurrent workers) in more detail.
+    // reasoning (and the leaked-reservation blast radius) in more detail. The decisions run
+    // concurrently, so a shard decided cleanly can name a blob whose reservation another decision
+    // won and then failed to stage; that leak fails `finish`, which keeps this pass from
+    // publishing the clean shard over a blob that never landed.
     let blob_batch_published = match blob_batch.finish() {
         Ok(()) => true,
         Err(e) => { if result.is_ok() { result = Err(e); } false }
@@ -1501,6 +1444,74 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     }
 
     result
+}
+
+/// Decide one tracked shard's refreshed content for [`refresh_tracked_entries`], writing nothing
+/// but staging every rebuilt file's blob into `blob_batch`.
+///
+/// # Returns
+/// * `Ok(Some(Inventory))` - The shard's new content, when any entry changed (stat data included).
+/// * `Ok(None)`            - When nothing about the shard changed, or it has no shard file.
+/// * `Err(String)`         - If the shard could not be read or parsed, or a file not processed.
+fn decide_tracked_refresh(key: &str, blob_batch: &file_utils::WriteBatch) -> Result<Option<Inventory>, String> {
+    // Before this decision stats anything below — see `refresh_tracked_entries`'s doc comment.
+    let anchor = file_utils::take_stat_anchor()?;
+
+    let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+
+    let Some(bytes) = bytes_opt else {
+        return Ok(None);
+    };
+
+    let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
+        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
+
+    let names: Vec<String> = inventory.get_items().map(|(name, _)| name.clone()).collect();
+    let mut changed = false;
+
+    for name in names {
+        let item = inventory.get_item_by_name(&name).unwrap();
+
+        if item.state == InventoryItemState::Deleted {
+            continue;
+        }
+
+        let file_path = if key.is_empty() {
+            std::path::PathBuf::from(&name)
+        } else {
+            std::path::PathBuf::from(format!("{}/{}", key, name))
+        };
+
+        let Ok(metadata) = file_utils::get_symlink_metadata_for_path(&file_path) else {
+            // The file is gone from disk: its removal becomes staged.
+            inventory.mark_item_deleted(&name);
+            changed = true;
+            continue;
+        };
+
+        let item_type = file_utils::get_type_of_dir_entry(&metadata)?;
+
+        // The entry is rebuilt even when only the stat data went stale (same content), so the
+        // refreshed shard keeps the fast path warm. Blobs are staged, not stored immediately — see
+        // `refresh_tracked_entries`'s batch comment. Staging an unchanged file's blob too heals one
+        // that went missing from the store, as `load` does.
+        let rebuilt = match classify_file_against_entry(
+            &item, &metadata, item_type, &file_path, &name, IngestMode::Store, anchor,
+        )? {
+            FileVerdict::UnchangedByStat => continue,
+            FileVerdict::UnchangedByHash(rebuilt, object) | FileVerdict::Modified(rebuilt, object) => {
+                if let Some(mut object) = object {
+                    object.store_deferred(blob_batch)?;
+                }
+                rebuilt
+            }
+        };
+        changed = true;
+
+        inventory.add_item(rebuilt);
+    }
+
+    Ok(changed.then_some(inventory))
 }
 
 /// One read-and-parse pass over the inventory shards a tree build can need.
@@ -1537,6 +1548,22 @@ pub struct PreparedInventory {
     /// Which subtrees the rollup skip proved unchanged from head. Empty without a head, with the
     /// kill switch set, or when no rollup matched.
     pub skip: RollupSkipPlan,
+
+    /// The directories the tree build visits, derived once here from the metadata so the read and
+    /// the build walk one relation.
+    pub layout: DirectoryLayout,
+}
+
+/// Every directory a tree build over the metadata visits: each registered key and all of its
+/// ancestors (an ancestor may have no shard of its own), the root `""` included, with the parent
+/// → children relation over them in key order. The keys `skip` pruned are left out of both, so a
+/// skipped subtree is built as if it were never inventoried. Empty without metadata entries.
+#[derive(Default)]
+pub struct DirectoryLayout {
+    pub(crate) keys: BTreeSet<String>,
+
+    /// Shared with every task of the tree build.
+    pub(crate) children: Arc<BTreeMap<String, Vec<String>>>,
 }
 
 /// The subtrees a [`PreparedInventory`] proved unchanged from head, because each one's shard
@@ -1598,10 +1625,12 @@ pub fn prepare_stack_inventory(skip: Option<(&str, &MaterializationScope)>) -> R
     let Some(metadata) = metadata_opt else {
         return Ok(PreparedInventory {
             metadata: None, shards: BTreeMap::new(), has_conflict: false, skip: RollupSkipPlan::default(),
+            layout: DirectoryLayout::default(),
         });
     };
 
     let registered: BTreeSet<&str> = metadata.iter().map(|entry| metadata_entry_to_key(entry)).collect();
+    let (keys, children) = directory_relation(&registered);
 
     let mut parsed: BTreeMap<String, Result<Option<(Inventory, bool)>, String>> = BTreeMap::new();
     let mut plan = RollupSkipPlan::default();
@@ -1614,9 +1643,20 @@ pub fn prepare_stack_inventory(skip: Option<(&str, &MaterializationScope)>) -> R
             }
         }
         Some((head_root_tree_hash, scope)) => {
-            read_unskipped_shards(&metadata, &registered, head_root_tree_hash, scope, &mut parsed, &mut plan)?;
+            read_unskipped_shards(&registered, &children, head_root_tree_hash, scope, &mut parsed, &mut plan)?;
         }
     }
+
+    let layout = if plan.pruned.is_empty() {
+        DirectoryLayout { keys, children: Arc::new(children) }
+    } else {
+        let children = children.into_iter()
+            .filter(|(key, _)| !plan.pruned.contains(key))
+            .map(|(key, child_keys)| (key, child_keys.into_iter().filter(|c| !plan.pruned.contains(c)).collect()))
+            .collect();
+
+        DirectoryLayout { keys: keys.difference(&plan.pruned).cloned().collect(), children: Arc::new(children) }
+    };
 
     // The deterministic fold: `parsed` is a `BTreeMap`, so walking it stops at the first `Err` or
     // conflict in sorted key order, whatever order the parallel workers finished in.
@@ -1629,14 +1669,37 @@ pub fn prepare_stack_inventory(skip: Option<(&str, &MaterializationScope)>) -> R
                 shards.insert(key, inventory);
 
                 if has_conflict {
-                    return Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: true, skip: plan });
+                    return Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: true, skip: plan, layout });
                 }
             }
             Err(e) => return Err(e),
         }
     }
 
-    Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: false, skip: plan })
+    Ok(PreparedInventory { metadata: Some(metadata), shards, has_conflict: false, skip: plan, layout })
+}
+
+/// Every registered key plus all of its ancestors and the root `""` (none when nothing is
+/// registered), and the parent → children relation over them, each child list in key order.
+fn directory_relation(registered: &BTreeSet<&str>) -> (BTreeSet<String>, BTreeMap<String, Vec<String>>) {
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+
+    for &registered_key in registered {
+        let mut key = registered_key;
+
+        while keys.insert(key.to_string()) && !key.is_empty() {
+            key = key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).map(|(parent, _)| parent).unwrap_or("");
+        }
+    }
+
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for key in keys.iter().filter(|key| !key.is_empty()) {
+        let parent = key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).map(|(parent, _)| parent).unwrap_or("");
+        children.entry(parent.to_string()).or_default().push(key.clone());
+    }
+
+    (keys, children)
 }
 
 /// The first path below the top level that `stack` would record in a tree and that names a metadata
@@ -1683,8 +1746,9 @@ pub fn nested_metadata_entry(prepared: &PreparedInventory) -> Result<Option<Stri
     Ok(None)
 }
 
-/// Read and parse one registered shard for [`prepare_stack_inventory`], noting whether it holds a
-/// conflict entry. `Ok(None)` when the shard file does not exist.
+/// Read and parse one registered shard for [`prepare_stack_inventory`] and
+/// [`has_conflict_entries`], noting whether it holds a conflict entry. `Ok(None)` when the shard
+/// file does not exist.
 fn read_stack_shard(key: &str) -> Result<Option<(Inventory, bool)>, String> {
     let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
 
@@ -1705,27 +1769,12 @@ fn read_stack_shard(key: &str) -> Result<Option<(Inventory, bool)>, String> {
 
 /// The top-down walk behind [`prepare_stack_inventory`]'s skip: read one depth of the tree at a
 /// time, decide which of its keys are skip roots, and descend only into the rest.
-fn read_unskipped_shards(metadata: &BTreeSet<String>,
-                         registered: &BTreeSet<&str>,
+fn read_unskipped_shards(registered: &BTreeSet<&str>,
+                         children: &BTreeMap<String, Vec<String>>,
                          head_root_tree_hash: &str,
                          scope: &MaterializationScope,
                          parsed: &mut BTreeMap<String, Result<Option<(Inventory, bool)>, String>>,
                          plan: &mut RollupSkipPlan) -> Result<(), String> {
-    // Every registered key plus all of its ancestors (an ancestor may have no shard of its own),
-    // and the parent → children relation over them, exactly as the tree build derives it.
-    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut known: BTreeSet<&str> = BTreeSet::new();
-
-    for entry in metadata {
-        let mut key = metadata_entry_to_key(entry);
-
-        while !key.is_empty() && known.insert(key) {
-            let parent = key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).map(|(parent, _)| parent).unwrap_or("");
-            children.entry(parent).or_default().push(key);
-            key = parent;
-        }
-    }
-
     let scope_is_full = scope.is_full();
     let in_scope = |key: &str| scope_is_full || scope.classify(key) == ScopeClass::InScope;
 
@@ -1752,7 +1801,7 @@ fn read_unskipped_shards(metadata: &BTreeSet<String>,
 
             if let (true, Some(head_hash), Some(rollup)) = (parent_in_scope, &head_hash, &rollup) {
                 if rollup == head_hash {
-                    prune_keys_under(key, &children, &mut plan.pruned);
+                    prune_keys_under(key, children, &mut plan.pruned);
                     record_rollup_skip();
 
                     if key.is_empty() {
@@ -1787,7 +1836,7 @@ fn read_unskipped_shards(metadata: &BTreeSet<String>,
             };
             let key_in_scope = in_scope(key);
 
-            for &child_key in &children[key] {
+            for child_key in children[*key].iter().map(String::as_str) {
                 let child_name = child_key.rsplit_once(file_utils::PATH_SEPARATOR_CHAR).map(|(_, name)| name).unwrap_or(child_key);
                 next.push((child_key, head_subtrees.get(child_name).map(|hash| hash.to_string()), key_in_scope));
             }
@@ -1800,7 +1849,7 @@ fn read_unskipped_shards(metadata: &BTreeSet<String>,
 }
 
 /// Add `key` and every key beneath it (through `children`) to `pruned`.
-fn prune_keys_under(key: &str, children: &BTreeMap<&str, Vec<&str>>, pruned: &mut BTreeSet<String>) {
+fn prune_keys_under(key: &str, children: &BTreeMap<String, Vec<String>>, pruned: &mut BTreeSet<String>) {
     pruned.insert(key.to_string());
 
     if let Some(child_keys) = children.get(key) {
@@ -1812,6 +1861,10 @@ fn prune_keys_under(key: &str, children: &BTreeMap<&str, Vec<&str>>, pruned: &mu
 
 /// Check whether any inventory entry is in a conflict state (an unresolved consolidation).
 ///
+/// Every shard is read and parsed across every core, then judged in key order, so the answer is a
+/// serial scan's: a conflict in a shard before the first unreadable one in key order is reported,
+/// and an unreadable shard before any conflict is an error.
+///
 /// # Returns
 /// * `Ok(bool)`    - Whether at least one entry is in conflict.
 /// * `Err(String)` - If a shard could not be read or parsed.
@@ -1822,31 +1875,22 @@ pub fn has_conflict_entries() -> Result<bool, String> {
         return Ok(false);
     };
 
-    for entry in &metadata {
-        let key = metadata_entry_to_key(entry);
-        let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
+    let keys: Vec<&str> = metadata.iter().map(|entry| metadata_entry_to_key(entry)).collect();
 
-        let Some(bytes) = bytes_opt else {
-            continue;
-        };
+    // Each worker keeps only its answer, never the parsed shard.
+    let answers = fanout_utils::fanout_map(&keys, |key| {
+        read_stack_shard(key).map(|shard| shard.is_some_and(|(_, has_conflict)| has_conflict))
+    });
 
-        let inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
-            .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
-
-        let has_conflict = inventory.get_items().any(|(_, item)| matches!(
-            item.state,
-            InventoryItemState::FirstParentConflict
-                | InventoryItemState::SecondParentConflict
-                | InventoryItemState::ThirdParentConflict
-        ));
-
-        if has_conflict {
+    for has_conflict in answers {
+        if has_conflict? {
             return Ok(true);
         }
     }
 
     Ok(false)
 }
+
 
 /// Like [`has_conflict_entries`], but against an already-parsed [`PreparedInventory`] snapshot
 /// instead of reading and parsing the shards again. Used by `stack` (`stack_utils::stack_parcel`),
@@ -3067,11 +3111,10 @@ mod tests {
     #[test]
     fn prepare_stack_inventory_reports_a_conflict_found_before_a_later_corrupt_shard() {
         // Regression: a single up-front parse pass must not let an unrelated corrupt shard mask
-        // a real, actionable conflict discovered earlier in the (sorted) scan. The old
-        // `has_conflict_entries` short-circuits — check, then parse, then check, one shard at a
-        // time — so a conflict in an earlier-sorting shard is always what the user sees, even
-        // when a later shard happens to be corrupt. `prepare_stack_inventory` must reproduce
-        // that prioritization, not just accidentally match it when there is nothing corrupt.
+        // a real, actionable conflict discovered earlier in the (sorted) scan. A conflict in an
+        // earlier-sorting shard is what the user sees, even when a later shard happens to be
+        // corrupt, from both `prepare_stack_inventory` and `has_conflict_entries` (park's check),
+        // though both read every shard in parallel.
         let _scratch = Scratch::new("conflict-before-corrupt");
 
         // "aaa" sorts before "zzz" and has a genuine unresolved conflict.
@@ -3089,6 +3132,9 @@ mod tests {
         metadata.insert("zzz".to_string());
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        assert_eq!(has_conflict_entries(), Ok(true),
+            "park's check must report the conflict in \"aaa\", not \"zzz\"'s parse error");
 
         let prepared = prepare_stack_inventory(None)
             .expect("the conflict in \"aaa\" must be reported, not \"zzz\"'s parse error");
@@ -3128,6 +3174,64 @@ mod tests {
             Err(message) => message,
         };
         assert!(error.contains("zzz"), "the error should name the offending shard, got: {error}");
+    }
+
+    #[test]
+    fn has_conflict_entries_fails_on_a_corrupt_shard_before_any_conflict() {
+        // The parallel read must not let a later conflict mask an earlier corrupt shard: in key
+        // order the corrupt "aaa" comes first, so the check fails rather than answering.
+        let _scratch = Scratch::new("corrupt-before-conflict");
+
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("aaa").unwrap();
+        std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
+
+        let mut conflicted = Inventory::new();
+        conflicted.add_item(item("file.txt", 1, InventoryItemState::FirstParentConflict));
+        plant_shard(&conflicted, "zzz");
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        metadata.insert("aaa".to_string());
+        metadata.insert("zzz".to_string());
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        match has_conflict_entries() {
+            Ok(answer) => panic!("a corrupt shard before the conflict must fail the check, got Ok({answer})"),
+            Err(message) => assert!(message.contains("aaa"), "the error should name \"aaa\", got: {message}"),
+        }
+    }
+
+    #[test]
+    fn a_refresh_publishes_the_shards_before_a_failing_one_and_none_after() {
+        // Every shard is decided in parallel, but they are taken up in metadata order: the corrupt
+        // "bbb" ends the pass, so "aaa"'s refresh is published and "ccc"'s is not.
+        let _scratch = Scratch::new("refresh-stops-at-failure");
+
+        for key in ["aaa", "ccc"] {
+            let mut tracked = Inventory::new();
+            tracked.add_item(item("gone-from-disk.txt", 1, InventoryItemState::Normal));
+            plant_shard(&tracked, key);
+        }
+
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("bbb").unwrap();
+        std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
+
+        let metadata: BTreeSet<String> = ["aaa", "bbb", "ccc"].iter().map(|key| key.to_string()).collect();
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        let error = refresh_tracked_entries().expect_err("the corrupt shard must fail the refresh");
+        assert!(error.contains("bbb"), "the error should name \"bbb\", got: {error}");
+
+        let state_of = |key: &str| {
+            let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
+            let shard = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+            shard.get_item_by_name("gone-from-disk.txt").unwrap().state
+        };
+        assert!(state_of("aaa") == InventoryItemState::Deleted, "the shard before the failure must be published");
+        assert!(state_of("ccc") == InventoryItemState::Normal, "no shard after the failure may be published");
     }
 
     /// Write a shard straight to `key`'s address, registered or not: a fixture placing one, never
