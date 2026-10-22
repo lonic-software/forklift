@@ -7239,6 +7239,17 @@ fn lowering_a_pallet_the_remote_lacks_names_only_user_pallets() {
     let value = json_of(&refused);
     assert_eq!((value["error"]["code"].as_str(), value["error"]["next_step"].as_str()),
         (Some("pallet_not_found"), Some("forklift palletize --remote")), "{}", value);
+
+    // A pin the remote fails is refused as such, not as the remote's missing pallet.
+    let pinned = area.forklift("b", &["--json", "lower", "nope", "--expect", &"0".repeat(64)]);
+    assert!(!pinned.status.success());
+    assert_ne!(json_of(&pinned)["error"]["code"], "pallet_not_found", "{}", stdout(&pinned));
+
+    // The current pallet the remote lacks is the same condition, with the remedy at that site.
+    assert_success(&area.forklift("b", &["palletize", "local-only"]));
+    let bare = area.forklift("b", &["--json", "lower"]);
+    assert_eq!(bare.status.code(), Some(29), "{}{}", stdout(&bare), stderr(&bare));
+    assert_eq!(json_of(&bare)["error"]["next_step"], "forklift lift");
 }
 
 // Revert: drop the unborn-bay check → the lower creates feat under the bay standing on it.
@@ -7258,7 +7269,7 @@ fn a_named_lower_does_not_create_a_pallet_a_bay_stands_on_unborn() {
 
     let refused = area.forklift("b", &["lower", "feat"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
-    assert!(stderr(&refused).contains("A bay stands on pallet \"feat\""), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("Bay \"w\" stands on pallet \"feat\""), "{}", stderr(&refused));
     assert!(!area.path("b/.forklift/pallets/feat").exists());
 }
 
