@@ -106,7 +106,7 @@ const MAX_DELTA_CHAIN: u32 = 50;
 const PACK_DATA_HEADER_LEN: u64 = 12;
 
 /// An object hash is a Blake3 digest: 32 raw bytes (64 hex characters).
-const HASH_LEN: usize = 32;
+pub(crate) const HASH_LEN: usize = 32;
 
 /// One index record: the 32-byte hash, then the u64 offset and u64 length of the blob in
 /// the data file. Records are stored sorted by hash so a lookup is a binary search.
@@ -5098,13 +5098,26 @@ impl TransportPackBuilder {
     }
 
     /// Append raw verified object bytes as a native full record.
+    #[cfg(test)]
     pub fn append_full(&mut self, hash: &str, raw: &[u8]) -> Result<(), String> {
+        let compressed = Self::compress_full(hash, raw)?;
+        self.append_compressed_full(hash, &compressed)
+    }
+
+    /// The payload [`Self::append_compressed_full`] takes for `raw`: the bytes verified against
+    /// `hash`, then zstd-compressed. It touches no builder state, so a caller can run it on
+    /// worker threads and append the results in order.
+    pub fn compress_full(hash: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
+        object_utils::verify_object_bytes(hash, raw)?;
+        zstd::encode_all(raw, 0)
+            .map_err(|e| format!("Error while compressing bundled object {}: {}", hash, e))
+    }
+
+    /// Append a full record whose payload [`Self::compress_full`] produced for `hash`.
+    pub fn append_compressed_full(&mut self, hash: &str, compressed: &[u8]) -> Result<(), String> {
         let hash_bytes = hash_to_bytes(hash)
             .ok_or_else(|| format!("Cannot pack \"{}\": not a 64-character object hash.", hash))?;
-        object_utils::verify_object_bytes(hash, raw)?;
-        let compressed = zstd::encode_all(raw, 0)
-            .map_err(|e| format!("Error while compressing bundled object {}: {}", hash, e))?;
-        self.writer_mut()?.append_full(hash_bytes, &compressed, None)?;
+        self.writer_mut()?.append_full(hash_bytes, compressed, None)?;
         self.roll_if_needed()
     }
 
@@ -5479,12 +5492,21 @@ fn is_chunk(raw: &[u8]) -> bool {
 /// uppercase spelling would find a packed object that the same spelling misses while it is loose
 /// on a case-sensitive file system, so presence would depend on the platform and on whether a
 /// `compact` had run.
-fn hash_to_bytes(hash: &str) -> Option<[u8; HASH_LEN]> {
+pub(crate) fn hash_to_bytes(hash: &str) -> Option<[u8; HASH_LEN]> {
     if !object_utils::is_object_hash(hash) {
         return None;
     }
 
-    sign_utils::from_hex(hash).ok()?.try_into().ok()
+    // `is_object_hash` admits only lowercase hex digits, so each pair decodes.
+    let digit = |b: u8| if b.is_ascii_digit() { b - b'0' } else { b - b'a' + 10 };
+    let hex = hash.as_bytes();
+    let mut bytes = [0u8; HASH_LEN];
+
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (digit(hex[2 * index]) << 4) | digit(hex[2 * index + 1]);
+    }
+
+    Some(bytes)
 }
 
 /// Read a little-endian u64 at `offset` in `bytes` (offset is always in bounds by construction).
