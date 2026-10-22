@@ -1371,9 +1371,9 @@ fn directory_has_no_untracked_content(key: &str,
 /// # Returns
 /// * `Ok(())`      - If the refresh completed.
 /// * `Err(String)` - If a shard or file could not be processed, or the blob batch failed to
-///                   publish. Every shard decided before a decide-loop failure was still handed
-///                   to the publish step; a blob-batch failure instead publishes nothing from
-///                   this pass — see the doc comment above.
+///                   publish. Every shard before the first failure in metadata order is handed
+///                   to the publish step when the blob batch finishes; a blob-batch failure
+///                   publishes nothing from this pass — see the doc comment above.
 pub fn refresh_tracked_entries() -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
