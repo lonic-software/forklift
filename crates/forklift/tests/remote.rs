@@ -1727,6 +1727,28 @@ fn a_held_haul_merge_names_a_drop_that_keeps_the_rest_of_the_haul() {
     assert_eq!(remote_pallet_head(&server, "@haul"), Some(area.read_file("a/.forklift/meta/haul").trim().to_string()));
 }
 
+/// A remote with no @haul yet gives "lower --keep" no remote side to keep, so a merge held on
+/// its first lift names only lifting the target.
+#[test]
+fn a_held_haul_merge_on_a_remote_without_haul_names_no_drop() {
+    let area = TestArea::new("haul-held-first");
+    let server = Server::start(&area, None);
+    haul_warehouse(&area, &server);
+    assert_eq!(remote_pallet_head(&server, "@haul"), None);
+
+    let id = open_haul(&area, "a", "First");
+    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    assert_success(&area.forklift("a", &["shift", "feat"]));
+
+    let held = area.forklift("a", &["lift"]);
+    assert!(!held.status.success(), "{}", stdout(&held));
+    let why = stderr(&held);
+    assert!(why.contains(&format!("haul {} merged as", &id[..12])), "{}", why);
+    assert!(why.contains("an operator who may write the target lifts it"), "{}", why);
+    assert!(!why.contains("--keep"), "{}", why);
+    assert_eq!(remote_pallet_head(&server, "@haul"), None);
+}
+
 /// A fresh remote admits the whole @haul history against today's office, so a merge whose signer
 /// has since lost write on the target is refused there, naming both; re-granted, it goes.
 #[test]
