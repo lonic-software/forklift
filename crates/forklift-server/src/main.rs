@@ -110,17 +110,7 @@ enum Command {
 /// inline on the thread polling [`async_main`], so that is a worker thread with the same stack
 /// rather than the process's main thread (1 MiB on Windows).
 fn main() {
-    forklift_core::util::fanout_utils::run_on_worker_stack("forklift-server-main", run);
-}
-
-/// Build the async runtime and run [`async_main`] on it, on the worker thread `main` spawns.
-fn run() {
-    tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(forklift_core::util::fanout_utils::WORKER_STACK_SIZE)
-        .enable_all()
-        .build()
-        .expect("failed to start the async runtime")
-        .block_on(async_main());
+    forklift_core::util::fanout_utils::block_on_worker_stack("forklift-server-main", async_main);
 }
 
 /// Parse the command line and run it.

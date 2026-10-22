@@ -7512,6 +7512,46 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// On a thread with `WORKER_STACK_SIZE`, a cold read of a chain one delta past
+    /// `MAX_RECONSTRUCT_DEPTH` fails with the depth-limit error, and one exactly at the limit reads
+    /// back: the recursion to the limit fits that stack, so the backstop is reached as an error and
+    /// not as a stack overflow, which aborts the process. The past-limit read goes first, because
+    /// the limit bounds one reconstruction's recursion: once the at-limit read has cached the
+    /// bases, the deeper object is a single delta away.
+    ///
+    /// Mutation: shrink `WORKER_STACK_SIZE` to tokio's 2 MiB default → the read overflows → red.
+    #[test]
+    fn a_chain_at_the_depth_limit_reads_and_one_past_it_fails_cleanly_on_the_worker_stack() {
+        let temp = fresh_root("delta-chain-depth-limit");
+        let links = MAX_RECONSTRUCT_DEPTH as usize + 1;
+        let contents: Vec<Vec<u8>> = (0..=links)
+            .map(|i| [b"depth limit chain".as_slice(), &deterministic_fill(64), format!("{}", i).as_bytes()].concat())
+            .collect();
+        let hashes: Vec<String> = contents.iter().map(|c| blake3::hash(c).to_hex().to_string()).collect();
+        let records: Vec<(&str, Vec<u8>)> = (0..=links)
+            .map(|i| (hashes[i].as_str(), match i {
+                0 => full_record(&contents[0]),
+                _ => delta_record(&hashes[i - 1], &contents[i - 1], &contents[i]),
+            }))
+            .collect();
+        write_raw_pack(&temp.join(".forklift/objects/pack"), "deep", &records);
+
+        let root = temp.clone();
+        let (at_limit, past_limit) = crate::util::fanout_utils::run_on_worker_stack("depth-limit-probe", move || {
+            let _scope = StorageRootScope::enter(&root);
+            let past_limit = file_utils::retrieve_object_by_hash(&hashes[links]);
+            let at_limit = file_utils::retrieve_object_by_hash(&hashes[links - 1]);
+            (at_limit, past_limit)
+        });
+
+        let error = past_limit.expect_err("a cold read of a chain past the depth limit must fail");
+        assert!(error.contains("depth limit"), "the failure must name the depth limit: {}", error);
+        assert_eq!(at_limit.as_deref(), Ok(contents[links - 1].as_slice()),
+                   "a chain exactly at the depth limit must read back");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     /// A chain whose middle record decodes to the wrong bytes fails its target's read with the
     /// error naming the corrupt middle object — the attribution the fully verified read gives —
     /// and the middle object fails its own read.
