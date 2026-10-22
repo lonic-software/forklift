@@ -4275,6 +4275,115 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
     assert_eq!(std::fs::read_to_string(bay_dir.join("src/web/w.txt")).unwrap(), "web v1\n");
 }
 
+/// A sparse warehouse "sparse", scoped to `src/api`, whose `lower` was refused as diverged: the
+/// remote head, lifted from a full clone "up", changes `src/web` too, so the refused lower fetched
+/// it with `src/web` sealed. Returns that head and its `src/web/w.txt` blob.
+fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, String) {
+    prepare_warehouse(area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "up"]));
+
+    area.write_file("up/src/api/a.txt", "api v2 from up\n");
+    area.write_file("up/src/web/w.txt", "web v2 from up\n");
+    assert_success(&area.forklift("up", &["load", "."]));
+    assert_success(&area.forklift("up", &["stack", "up edits both"]));
+    assert_success(&area.forklift("up", &["lift"]));
+
+    let up_head = pallet_head(area, "up", "main");
+    let web_blob = path_object_hash(area, "up", &up_head, "src/web/w.txt");
+
+    area.write_file("sparse/src/api/a.txt", "api v2 from sparse\n");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "sparse edits api"]));
+
+    let lowered = area.forklift("sparse", &["lower"]);
+    assert!(!lowered.status.success() && stderr(&lowered).contains("diverged"), "{}", stderr(&lowered));
+    assert!(object_present(area, "sparse", &up_head), "the refused lower fetched the remote head");
+    assert!(!object_present(area, "sparse", &web_blob), "with src/web sealed");
+
+    (up_head, web_blob)
+}
+
+// Revert: expand skips the fetched-heads ledger → the remote head's src/web stays sealed, so the
+// palletize makes a ref whose closure lacks it.
+#[test]
+fn expand_fetches_the_widened_content_of_a_head_a_refused_lower_fetched() {
+    let area = TestArea::new("sparse-expand-ledger");
+    let server = Server::start(&area, None);
+    let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
+
+    assert_success(&area.forklift("sparse", &["expand", "src/web"]));
+    assert_success(&area.forklift("sparse", &["palletize", &format!("main-remote-{}", &up_head[..12]), &up_head]));
+
+    assert!(object_present(&area, "sparse", &web_blob), "the palletized head's widened content is present");
+}
+
+// Revert: let the ref compare-and-set skip the fence → the palletize lands on a head whose
+// src/web is missing.
+#[test]
+fn expand_fences_a_fetched_head_the_remote_can_no_longer_serve() {
+    let area = TestArea::new("sparse-expand-fence");
+    let server = Server::start(&area, None);
+    let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
+
+    std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
+
+    let expanded = area.forklift("sparse", &["expand", "src/web"]);
+    assert_success(&expanded);
+
+    let refused = area.forklift("sparse", &["palletize", "x", &up_head]);
+    assert!(!refused.status.success(), "a fenced head is no new head: {}", stdout(&refused));
+    assert!(stderr(&refused).contains("fetched only part-way"), "{}", stderr(&refused));
+    assert!(!area.path("sparse/.forklift/pallets/x").exists());
+}
+
+// Revert: walk every closure before checking the added paths → the unservable ref refuses the
+// expand first, hiding the typo.
+#[test]
+fn expand_checks_its_paths_before_walking_other_histories() {
+    let area = TestArea::new("sparse-expand-typo");
+    let server = Server::start(&area, None);
+    let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
+
+    assert_success(&area.forklift("sparse", &["palletize", "x", &up_head]));
+    assert_success(&area.forklift("sparse", &["shift", "main"]));
+    std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
+
+    let refused = area.forklift("sparse", &["expand", "src/web", "src/wbe"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("\"src/wbe\" is not a directory"), "{}", stderr(&refused));
+}
+
+// Revert: franchise fetches through the scope on disk, which does not exist yet → the whole
+// tree is fetched and nothing is recorded.
+#[test]
+fn a_sparse_franchise_records_its_head_and_fetches_only_its_scope() {
+    let area = TestArea::new("sparse-franchise-ledger");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    assert!(!object_present(&area, "sparse", &web_blob), "src/web stays sealed");
+    let ledger = area.read_file("sparse/.forklift/fetched-heads");
+    assert!(ledger.contains(&format!("{} main", head)), "{}", ledger);
+}
+
 #[test]
 fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it() {
     // Sparse × chunked (§9.4b Stage 3): an out-of-scope chunked file fetches NOTHING — its recipe

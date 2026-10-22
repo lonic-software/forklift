@@ -8,7 +8,7 @@ use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     audit_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
-    pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, trust_utils,
+    pallet_utils, remote_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
 use crate::events;
@@ -153,8 +153,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     // — a full fetch scope makes this byte-identical to the unscoped fetch. The office and meta
     // pallets synced above keep routing through the unscoped fetch, since their audit reads full
     // content.
-    let fetch_scope = scope_utils::read_fetch_scope()?;
-    let stats = remote_utils::fetch_history_scoped(client, remote_head, &fetch_scope, progress).await?;
+    let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, progress).await?;
     report.fetched_objects = stats.fetched_objects;
     report.fetched_signatures = stats.fetched_signatures;
 

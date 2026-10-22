@@ -101,7 +101,7 @@ pub async fn handle_command(url: &str,
     // immediately, before anything is fetched or mutated: the same principle once more. (The
     // `--only` scope, by contrast, cannot be validated this early: it names a subtree of a
     // *tree*, and no tree is available until the pallet's history is actually fetched — see the
-    // check after `fetch_history_scoped` below. That fetch is unavoidably real I/O even for this
+    // check after `fetch_history_at` below. That fetch is unavoidably real I/O even for this
     // validation, though a sparse one stays lean — spine and signatures only, never out-of-scope
     // content — so a typo'd --only wastes far less than a typo'd --pallet against a non-sparse
     // franchise would have, before this change.)
@@ -276,7 +276,7 @@ async fn franchise_into_prepared_target(
         return Ok(());
     };
 
-    let stats = remote_utils::fetch_history_scoped(client, &remote_head, &fetch_scope, &Progress::NONE).await?;
+    let stats = remote_utils::fetch_history_at(client, &remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
 
     let tree_hash = object_utils::load_parcel(&remote_head)?.tree_hash;
 
