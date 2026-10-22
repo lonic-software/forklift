@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use crate::model::task::base_task_context::BaseTaskContext;
 use crate::traits::task_context::TaskContext;
 use crate::util::file_utils;
-use crate::util::inventory_utils::ShardOutcome;
+use crate::model::inventory::Inventory;
 
 /// The context for the inventory builder task.
 pub struct InventoryBuilderContext {
@@ -25,8 +25,8 @@ pub struct InventoryBuilderContext {
     /// [`file_utils::WriteBatch::stage`]'s doc comment).
     ///
     /// Finished on its own, strictly *before* any shard content is staged (see
-    /// `create_inventory_for_directory`'s join point, which staged shard content through its own
-    /// local batch inside `publish_shard_outcomes`, not through this context at all) — DESIGN.html
+    /// `create_inventory_for_directory`'s join point, which stages shard content through its own
+    /// local batch inside `publish_shards`, not through this context at all) — DESIGN.html
     /// §5.0 D item 10, finding #7: a shard published afterward can name one of these blobs'
     /// hashes, so the blob must already be durable — not merely staged in some batch that has not
     /// been through its own `finish()` yet — before that shard's rename can land. Sharing one
@@ -39,15 +39,11 @@ pub struct InventoryBuilderContext {
     /// doc comment for why that is out of scope here.
     pub blob_batch: Arc<file_utils::WriteBatch>,
 
-    /// Every ancestor key some directory's real content change (or the post-walk dirty-path
-    /// deleted-marking) requires invalidated. Collected here by every task instead of cleared
-    /// reactively (which would need cross-task locking — see `inventory_utils::build_inventory`'s
-    /// own doc comment), and drained once at the single-threaded join point.
-    pub clear_keys: Arc<Mutex<BTreeSet<String>>>,
-
-    /// Every directory's write decision this walk, collected instead of written immediately —
-    /// see [`ShardOutcome`] and the join point.
-    pub outcomes: Arc<Mutex<BTreeMap<String, ShardOutcome>>>,
+    /// Every shard this walk decided to rewrite, by key, collected instead of written immediately
+    /// and published once at the single-threaded join point through
+    /// `inventory_utils::shard_write::publish_shards`, which decides the rollups (see
+    /// `inventory_utils::build_inventory`'s own doc comment).
+    pub writes: Arc<Mutex<BTreeMap<String, Inventory>>>,
 }
 
 impl InventoryBuilderContext {
@@ -61,8 +57,7 @@ impl InventoryBuilderContext {
             new_inventory_paths: Arc::new(Mutex::new(BTreeSet::new())),
             dirty_inventory_paths: Arc::new(Mutex::new(BTreeSet::new())),
             blob_batch: Arc::new(file_utils::WriteBatch::new()),
-            clear_keys: Arc::new(Mutex::new(BTreeSet::new())),
-            outcomes: Arc::new(Mutex::new(BTreeMap::new())),
+            writes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }

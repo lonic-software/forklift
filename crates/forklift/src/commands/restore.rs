@@ -610,11 +610,11 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when the reset here
-    // is a complete materialization of `tree` — see `tree_utils::rollup_stampable`'s doc comment
+    // is a complete materialization of `tree` — see `tree_utils::rollup_stamp`'s doc comment
     // (shared with `shift`'s own tree-to-shard builder, which must decide this exactly the same
     // way).
-    if tree_utils::rollup_stampable(scope, key, tree) {
-        inventory.set_rollup_hash(Some(tree_hash.to_string()));
+    if let Some(stamp) = tree_utils::rollup_stamp(scope, key, tree, tree_hash) {
+        inventory.stamp_rollup(stamp);
     }
 
     shards.insert(key.to_string(), inventory);

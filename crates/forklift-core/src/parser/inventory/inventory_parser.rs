@@ -1,6 +1,6 @@
 use crate::enums::inventory_version::InventoryVersion;
 use crate::globals;
-use crate::model::inventory::Inventory;
+use crate::model::inventory::{Inventory, RollupStamp};
 use crate::util::byte_utils;
 
 struct ParsedInventoryHeader {
@@ -28,7 +28,9 @@ pub fn parse_inventory(content: &[u8]) -> Result<Inventory, String> {
         })?;
 
     let mut inventory = header.version.get_parser()(cursor, content)?;
-    inventory.set_rollup_hash(header.rollup_hash);
+    if let Some(rollup_hash) = header.rollup_hash {
+        inventory.stamp_rollup(RollupStamp::trusted(rollup_hash));
+    }
 
     Ok(inventory)
 }
@@ -210,7 +212,7 @@ mod tests {
     fn round_trip_preserves_a_present_rollup_hash() {
         let mut inventory = crate::model::inventory::Inventory::new();
         inventory.add_item(item("file.txt"));
-        inventory.set_rollup_hash(Some("a".repeat(64)));
+        inventory.stamp_rollup(RollupStamp::trusted("a".repeat(64)));
 
         let bytes = InventoryBuilder::build(&inventory);
         let parsed = parse_inventory(&bytes).unwrap();
@@ -222,7 +224,7 @@ mod tests {
     fn round_trip_preserves_an_absent_rollup_hash() {
         let mut inventory = crate::model::inventory::Inventory::new();
         inventory.add_item(item("file.txt"));
-        inventory.set_rollup_hash(None);
+        inventory.clear_rollup();
 
         let bytes = InventoryBuilder::build(&inventory);
         let parsed = parse_inventory(&bytes).unwrap();

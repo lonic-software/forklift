@@ -17,26 +17,14 @@ use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 
+mod shard_write;
+
+use shard_write::{publish_shards, write_shard_mutation, write_shard_mutation_with_extra};
+pub use shard_write::{cleanup_after_stack_with, remove_inventories_under, replace_all_inventories};
+
 /// The metadata entry used for the warehouse root (its key is the empty string,
 /// which would be confusing as a line in the metadata file).
 const METADATA_ENTRY_ROOT: &str = "./";
-
-/// Serializes the read-modify-write step of rollup maintenance (clearing an ancestor's rollup,
-/// or writing a mutated shard) against every other such step in this process.
-///
-/// This is needed because `load`'s per-directory walker (`build_inventory`, below) is genuinely
-/// concurrent: a directory's task fires off its subdirectories' tasks and then writes its own
-/// shard without waiting for them (see the task's own doc comment). So a directory's shard can
-/// be mid-write on one task while a descendant's task is independently walking up to invalidate
-/// that same directory's rollup as one of its ancestors. Without serializing the two, a
-/// read-modify-write ancestor clear could read stale content, race a sibling task's fresh
-/// rewrite of the same file, and lose that rewrite's real content changes — not just its rollup.
-///
-/// The lock is held only across the (cheap) parse-decide-rewrite of a shard file, never across
-/// the (expensive) filesystem walk, hashing or object I/O that produces the content to write —
-/// so it costs real parallelism only for that narrow step, and is uncontended (near-free)
-/// outside `load`, where every other writer touches shards one at a time to begin with.
-static SHARD_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The warehouse path keys of every strict ancestor of `key`, from the root (`""`) down to
 /// (but not including) `key` itself.
@@ -51,170 +39,6 @@ fn ancestor_keys_root_first(key: &str) -> Vec<String> {
 
     chain.reverse();
     chain
-}
-
-/// Stage a single shard's rollup clear into `batch`, if it exists and currently has one. A
-/// missing shard, or a shard whose rollup is already `None`, is left untouched — not even
-/// staged. The batched counterpart of the old per-shard immediate clear (DESIGN.html §5.0 D
-/// item 8, stage 2b): a caller invalidating several ancestors stages them all here and calls
-/// [`file_utils::WriteBatch::finish`] once, instead of paying a full atomic-write barrier per
-/// shard — see [`clear_ancestors_batched`].
-///
-/// # Returns
-/// * `Ok(())`      - The clear was staged (or there was nothing to clear).
-/// * `Err(String)` - If the shard could not be read, parsed, or staged.
-fn stage_rollup_clear(ledger: &ShardLedger, key: &str, batch: &file_utils::WriteBatch) -> Result<(), String> {
-    // Read through the ledger: an unregistered key has no shard to clear, whatever its address
-    // holds.
-    let Some(bytes) = ledger.retrieve(key)? else {
-        return Ok(());
-    };
-
-    let shard_path = file_utils::get_inventory_data_path_for_key(key)?;
-
-    let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
-        .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
-
-    if inventory.get_rollup_hash().is_none() {
-        return Ok(());
-    }
-
-    inventory.set_rollup_hash(None);
-    let bytes = ensure_inventory_folder_and_build(&inventory, &shard_path)?;
-
-    batch.stage(&shard_path, &bytes)
-}
-
-/// Clear the rollup hash of every existing ancestor shard of `key`, from the root down to (but
-/// not including) `key` itself, as one batched durability barrier (DESIGN.html §5.0 D item 8,
-/// stage 2b) — every ancestor's clear is staged first, then fsynced, renamed and its directory
-/// fsynced together in [`file_utils::WriteBatch::finish`], instead of once per ancestor. Must
-/// run to completion before a caller writes new content at `key` — see [`write_shard_mutation`],
-/// the funnel that does both, in the correct order, as two separate barriers (not one shared
-/// batch — see its doc comment for why the boundary between them matters).
-fn clear_ancestors_batched(ledger: &ShardLedger, key: &str) -> Result<(), String> {
-    let batch = file_utils::WriteBatch::new();
-
-    for ancestor_key in ancestor_keys_root_first(key) {
-        stage_rollup_clear(ledger, &ancestor_key, &batch)?;
-    }
-
-    batch.finish()
-}
-
-/// Clear the rollup hash of every existing ancestor shard of `key` — see
-/// [`clear_ancestors_batched`] for the batching. Public on its own for a caller that removes
-/// (rather than rewrites) the shard at `key` — e.g. `remove_inventories_under` — which still
-/// needs its ancestors invalidated but has no new content of its own to write there.
-///
-/// # Arguments
-/// * `ledger` - The registered set; only a registered ancestor's shard is read.
-/// * `key`    - The warehouse path key whose ancestors should be invalidated.
-///
-/// # Returns
-/// * `Ok(())`      - Every existing ancestor shard's rollup is now cleared on disk.
-/// * `Err(String)` - If an ancestor shard could not be read, parsed or written.
-fn clear_ancestor_rollups(ledger: &ShardLedger, key: &str) -> Result<(), String> {
-    let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    clear_ancestors_batched(ledger, key)
-}
-
-/// Write a shard whose effective content (any entry's name/type/hash/state) just changed: the
-/// rollup hash of every ancestor shard is cleared first, top-down (root first, batched into one
-/// durability barrier — see [`clear_ancestors_batched`]), then this shard's own rollup is
-/// cleared and its new content written as a second, separate barrier.
-///
-/// Every writer that changes a shard's effective content must go through this instead of
-/// writing the shard directly — a direct write would leave a stale-but-still-matching rollup on
-/// an ancestor above the change, silently hiding it from a future rollup-based skip
-/// (DESIGN.html §5.0 D item 8). A writer that only refreshes stat data (mtime/ctime/inode) for
-/// an otherwise-identical entry should *not* go through this — it may write the shard directly
-/// and carry its existing rollup forward unchanged.
-///
-/// Ordering matters for crash safety: nothing above the mutated shard is ever left stale once
-/// this shard's write is durable, because every ancestor is cleared (and durable — the ancestor
-/// batch's `finish` has already returned `Ok`) first; a crash before this shard's write only
-/// costs a few lost skips (ancestors cleared for a mutation that, from disk's perspective, never
-/// actually happened yet), never a wrong one. The two phases are deliberately *not* merged into
-/// one shared batch: a single `WriteBatch::finish` gives no ordering guarantee between the
-/// renames inside it, only that all of them are durable before it returns — merging the two
-/// phases could let the mutated shard's rename land (and become visible) before an ancestor's,
-/// which is exactly the ordering this function exists to prevent.
-///
-/// # Arguments
-/// * `ledger`    - The registered set, which must already hold `key` (see [`ShardLedger`]).
-/// * `key`       - The warehouse path key of the shard being written.
-/// * `inventory` - The new content. Its rollup hash is overwritten with `None` here — callers
-///                 never need to (and must not) set it themselves.
-///
-/// # Returns
-/// * `Ok(())`      - Every ancestor was invalidated and the shard was written.
-/// * `Err(String)` - If `key` is not registered, or an ancestor or this shard could not be read,
-///                   parsed or written.
-fn write_shard_mutation(ledger: &ShardLedger, key: &str, inventory: &mut Inventory) -> Result<(), String> {
-    write_shard_mutation_with_extra(ledger, key, inventory, None)
-}
-
-/// Like [`write_shard_mutation`], but when `extra` is `Some((path, content))`, additionally
-/// publishes that one other, unrelated file as part of *this shard's own* content-write barrier
-/// (the second of the two phases `write_shard_mutation` documents — never the ancestor-clear
-/// phase, which must stay a separate, earlier barrier for the ordering reasons its own doc
-/// comment gives, and which `extra` has no ordering relationship with at all).
-///
-/// This exists so a caller with exactly one other small file it needs durable no later than this
-/// shard's own write can fold it in instead of paying a second, standalone barrier —
-/// `inventory_utils::add_file_to_inventory` folding in `load_guard_utils`'s incomplete-load
-/// marker is the motivating (and, so far, only) case: a single-file `load` has no walk-wide blob
-/// batch to ride (unlike a directory `load` — see `create_inventory_for_directory`'s doc
-/// comment), so this shard's own write is the first durable mutation that can stage anything
-/// (a registration before it adds only keys with no shard, which stage nothing). Folding
-/// `extra` in here — rather than into the ancestor-clear phase — is what keeps this zero-cost:
-/// that phase is a no-op (no barrier at all) whenever `key` has no ancestor with a rollup to
-/// clear, which is the common case before a first `stack`; forcing a barrier there just to carry
-/// `extra` would reintroduce exactly the extra barrier this exists to avoid.
-///
-/// # Arguments
-/// * `ledger`    - The registered set, which must already hold `key` (see [`ShardLedger`]).
-/// * `key`       - The warehouse path key of the shard being written.
-/// * `inventory` - The new content (see [`write_shard_mutation`]).
-/// * `extra`     - An optional extra `(path, content)` to publish in the same barrier as this
-///                 shard's own content. `None` behaves exactly like [`write_shard_mutation`].
-///
-/// # Returns
-/// * `Ok(())`      - Every ancestor was invalidated, and the shard (and `extra`, if given) was
-///                   written.
-/// * `Err(String)` - If `key` is not registered, or an ancestor, the shard, or `extra` could not
-///                   be read, parsed or written.
-fn write_shard_mutation_with_extra(ledger: &ShardLedger,
-                                   key: &str,
-                                   inventory: &mut Inventory,
-                                   extra: Option<(&Path, &[u8])>) -> Result<(), String> {
-    let shard_path = ledger.shard_path_for_write(key)?;
-
-    let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    clear_ancestors_batched(ledger, key)?;
-
-    inventory.set_rollup_hash(None);
-
-    let bytes = ensure_inventory_folder_and_build(inventory, &shard_path)?;
-
-    let Some((extra_path, extra_content)) = extra else {
-        return file_utils::write_file_atomically(&shard_path, &bytes);
-    };
-
-    let batch = file_utils::WriteBatch::new();
-    batch.stage(&shard_path, &bytes)?;
-
-    if let Some(parent) = extra_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            file_utils::create_folder_if_not_exists(parent)?;
-        }
-    }
-    batch.stage(extra_path, extra_content)?;
-
-    batch.finish()
 }
 
 /// Process-wide count of rollup-based skips actually applied (DESIGN.html §5.0 D item 8, stage
@@ -707,7 +531,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // §5.0 D item 10, findings #1/#7). A shard phase B publishes can name one of these blobs'
     // hashes, so the blob must already be durable — not merely staged in a batch that has not yet
     // been through its own `finish()` — before that shard's rename is allowed to land. See
-    // `publish_shard_outcomes`'s doc comment for why blobs and shard content cannot share one
+    // `shard_write::publish_shards`'s doc comment for why blobs and shard content cannot share one
     // batch and still give that ordering.
     //
     // A failure here is different from every other failure this join point tolerates: this batch
@@ -742,12 +566,11 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     }
 
     // The join point (DESIGN.html §5.0 D item 8, stage 2b): every per-directory task only ever
-    // *decided* what to write (`ShardOutcome`, collected in `context.outcomes`) and which
-    // ancestors that decision invalidates (`context.clear_keys`) — nothing was written to disk
-    // by any task. Publishing happens here, once, single-threaded, after every task that managed
-    // to run has reported in (whether or not the walk as a whole succeeded — see below).
-    let mut clear_keys: BTreeSet<String> = std::mem::take(&mut *context.clear_keys.lock().await);
-    let mut outcomes: BTreeMap<String, ShardOutcome> = std::mem::take(&mut *context.outcomes.lock().await);
+    // *decided* what to write (collected in `context.writes`) — nothing was written to disk by any
+    // task. Publishing happens here, once, single-threaded, after every task that managed to run
+    // has reported in (whether or not the walk as a whole succeeded — see below), through
+    // `shard_write::publish_shards`, which decides every rollup.
+    let mut writes: BTreeMap<String, Inventory> = std::mem::take(&mut *context.writes.lock().await);
     let mut stale_keys: BTreeSet<String> = BTreeSet::new();
 
     // Directories that are gone from the working directory keep their
@@ -777,9 +600,9 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
             let Some(bytes) = bytes_opt else {
                 // The shard itself is gone — every ancestor's rollup that named a tree including
                 // this directory is now wrong (it would still match head, but head no longer
-                // reflects a subtree that no longer exists), so they must be invalidated exactly
-                // like any other real content change, not just dropped from metadata.
-                clear_keys.extend(ancestor_keys_root_first(dirty_key));
+                // reflects a subtree that no longer exists), so the publish below invalidates
+                // them exactly like any other real content change, not just drops it from
+                // metadata.
                 stale_keys.insert(dirty_key.clone());
                 continue;
             };
@@ -793,9 +616,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
             };
 
             if inventory.mark_all_items_deleted() {
-                clear_keys.extend(ancestor_keys_root_first(dirty_key));
-                inventory.set_rollup_hash(None);
-                outcomes.insert(dirty_key.clone(), ShardOutcome::Changed(inventory));
+                writes.insert(dirty_key.clone(), inventory);
             }
         }
     }
@@ -811,7 +632,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // for why a blob-batch failure must not let any shard content publish at all. A failed
     // registration publishes nothing: it may have cleared and registered some of the keys, which
     // then read as empty directories until a later load publishes them, never as a shard nobody
-    // registered. A failure in phase A or phase B (see `publish_shard_outcomes`) is folded into
+    // registered. A failure in phase A or phase B (see `shard_write::publish_shards`) is folded into
     // `result` the same way; a key registered whose shard did not land reads as empty too.
     if blob_batch_published {
         let new_inventory_paths = context.new_inventory_paths.lock().await.clone();
@@ -823,7 +644,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         // are no stale keys to unregister.
         let published = ShardLedger::read().and_then(|mut ledger| {
             ledger.update(&stale_keys, &new_inventory_paths)?;
-            publish_shard_outcomes(&ledger, &clear_keys, &mut outcomes)
+            publish_shards(&ledger, writes, &stale_keys, None)
         });
 
         if let Err(e) = published {
@@ -949,98 +770,6 @@ fn mark_shard_entries_deleted(ledger: &ShardLedger, key: &str) -> Result<bool, S
     Ok(true)
 }
 
-/// One shard's write decision, collected for a single-threaded join point to publish
-/// (`publish_shard_outcomes`) instead of written immediately from whatever decided it. Three
-/// producers share this shape: `load`'s parallel walk (`build_inventory`, one task per
-/// directory, joined by `create_inventory_for_directory`), `park`'s working-directory refresh
-/// (`refresh_tracked_entries`, a single-threaded loop over every tracked shard), and
-/// [`ShardMutationBatch`] (many edits from one command, such as `restore` of a directory) — see
-/// each producer's own doc comment for why a decision never touches disk directly.
-pub enum ShardOutcome {
-    /// Content unchanged from the previous shard (same name/type/hash/state for every entry),
-    /// but it still needs rewriting: stat data drifted, or at least one entry had to be
-    /// re-verified (read and rehashed) even though it ended up matching. Carries the previous
-    /// rollup forward — the join point drops it back to `None` instead if this key turns out to
-    /// be an ancestor of some other real change in the same batch.
-    Carry(Inventory),
-
-    /// Effective content changed (a brand-new shard, an entry added or removed, or any entry's
-    /// name/type/hash/state differs from before) — or every non-`Deleted` item was just staged
-    /// for removal (`load`'s post-walk dirty-path pass, or a file gone from disk during a
-    /// refresh). Always published with rollup `None`.
-    Changed(Inventory),
-}
-
-/// Publish a batch of [`ShardOutcome`] decisions through the same two-phase ordering `load`'s
-/// join point (`create_inventory_for_directory`), `park`'s working-directory refresh
-/// (`refresh_tracked_entries`) and [`ShardMutationBatch::publish`] all need: drop a carried rollup that turns out to be an ancestor
-/// of some other real change in the very same batch (step 1, in-memory only — this is what closes
-/// DESIGN.html §5.0 D item 10, finding #1: a decision made *before* a sibling's later-processed
-/// real change is never blindly restamped over the ancestor clear that change requires, because
-/// this check runs after every decision in the batch is already known), then clear every *other*
-/// invalidation target as one batched, mtime-preserving barrier (phase A), then publish every
-/// outcome's own new content as a second, separate barrier (phase B). The two phases are
-/// deliberately never merged into one shared batch — see [`write_shard_mutation`]'s doc comment
-/// for why the ordering boundary between "an ancestor's clear is durable" and "the mutated
-/// shard's own content is durable" matters.
-///
-/// Any blob a published outcome's content might reference must already be durable *before* this
-/// is called — neither phase here stages a blob write; each caller finishes its own blob batch
-/// first (DESIGN.html §5.0 D item 10, finding #7): `create_inventory_for_directory`'s
-/// `context.blob_batch`, `refresh_tracked_entries`'s own local one, and for a
-/// [`ShardMutationBatch`] whatever its caller stored before calling `publish`.
-///
-/// A failure in either phase is folded into the returned `Err` and the *other* phase is skipped
-/// (phase A failing skips phase B entirely, preserving `write_shard_mutation`'s ordering
-/// invariant; phase B is simply not attempted if phase A never returns `Ok`) — every caller
-/// treats an `Err` here as "nothing in `outcomes` is known to be published", exactly as if this
-/// were still one inline step of its own join point: phase B may have written some shards before
-/// it failed, so no caller registers a key on the strength of this call, and none rolls an
-/// outcome back as if it were never written.
-///
-/// Every key in `outcomes` must already be registered in `ledger` (see [`ShardLedger`]); phase B
-/// refuses one that is not.
-///
-/// # Arguments
-/// * `ledger`     - The registered set, holding every key of `outcomes`.
-/// * `clear_keys` - Every ancestor key some outcome's real content change invalidates.
-/// * `outcomes`   - Every shard this batch decided to (re)write, by key. Mutated in place (a
-///                  carried rollup may be dropped) before anything is staged.
-///
-/// # Returns
-/// * `Ok(())`      - Phase A and phase B both fully succeeded: every outcome in `outcomes` is
-///                   durably published, and every ancestor clear this batch owed is durable too.
-/// * `Err(String)` - Phase A or phase B failed; nothing in `outcomes` may be treated as published.
-fn publish_shard_outcomes(ledger: &ShardLedger,
-                          clear_keys: &BTreeSet<String>,
-                          outcomes: &mut BTreeMap<String, ShardOutcome>) -> Result<(), String> {
-    for (key, outcome) in outcomes.iter_mut() {
-        if let ShardOutcome::Carry(inventory) = outcome {
-            if clear_keys.contains(key) {
-                inventory.set_rollup_hash(None);
-            }
-        }
-    }
-
-    let phase_a_batch = file_utils::WriteBatch::new();
-
-    for key in clear_keys.iter().filter(|key| !outcomes.contains_key(key.as_str())) {
-        stage_rollup_clear(ledger, key, &phase_a_batch)?;
-    }
-
-    phase_a_batch.finish()?;
-
-    let phase_b_batch = file_utils::WriteBatch::new();
-
-    for (key, outcome) in outcomes.iter() {
-        let (ShardOutcome::Carry(inventory) | ShardOutcome::Changed(inventory)) = outcome;
-
-        save_inventory_deferred(ledger, key, inventory, &phase_b_batch)?;
-    }
-
-    phase_b_batch.finish()
-}
-
 /// Split a warehouse path into the key of the shard that lists it and its name in that shard.
 pub fn split_path_key(path: &str) -> (&str, &str) {
     match path.rsplit_once(file_utils::PATH_SEPARATOR_CHAR) {
@@ -1050,34 +779,21 @@ pub fn split_path_key(path: &str) -> (&str, &str) {
 }
 
 /// One shard a [`ShardMutationBatch`] has touched: the bytes it read on first touch (`None` when
-/// the shard did not exist yet), the effective content those bytes parsed to, and the in-memory
-/// copy every change applies to.
+/// the shard did not exist yet), and the in-memory copy every change applies to.
 struct TouchedShard {
     original_bytes: Option<Vec<u8>>,
-    original_content: Option<EffectiveContent>,
     inventory: Inventory,
 }
 
-/// A shard's effective content: every entry's name, hash, type and state — exactly what a
-/// rollup hash depends on, and nothing a stat refresh changes.
-type EffectiveContent = Vec<(String, String, DirEntryType, InventoryItemState)>;
-
-fn effective_content(inventory: &Inventory) -> EffectiveContent {
-    inventory.get_items()
-        .map(|(name, item)| (name.clone(), item.hash.clone(), item.item_type, item.state))
-        .collect()
-}
-
 /// Many shard edits from one single-threaded operation, published together as one
-/// [`publish_shard_outcomes`] call — the third producer of [`ShardOutcome`]s, beside `load`'s walk
-/// and `park`'s refresh — instead of one [`ShardLedger::update_shard`] (and so one ancestor-clear
+/// [`shard_write::publish_shards`] call — beside `load`'s walk and `park`'s refresh — instead of one [`ShardLedger::update_shard`] (and so one ancestor-clear
 /// barrier, one shard write and one metadata rewrite) per edited entry.
 ///
 /// [`update`](Self::update) reads a shard on its first touch and applies every later change for
 /// the same key to the same in-memory copy; nothing reaches disk before [`publish`](Self::publish).
-/// Each shard is then a [`ShardOutcome::Changed`] if its effective content (any entry's
-/// name/hash/type/state) differs from what was read, or the shard is new, and a
-/// [`ShardOutcome::Carry`] otherwise — so a pure stat refresh, such as `restore` writing a file
+/// Each shard then clears every rollup above it if its effective content (any entry's
+/// name/hash/type/state) differs from what was read, or the shard is new, and keeps its own rollup
+/// otherwise (see [`shard_write::publish_shards`]) — so a pure stat refresh, such as `restore` writing a file
 /// back to the blob it already has staged, keeps every rollup above it.
 ///
 /// An entry the batch records from a stat proves itself (see [`file_utils::StatAnchor`]): the
@@ -1087,7 +803,7 @@ fn effective_content(inventory: &Inventory) -> EffectiveContent {
 /// the hash the caller wrote, and an edit older than the anchor would be trusted.
 ///
 /// Every blob a change makes an entry name must be durable before its shard is published, as
-/// [`publish_shard_outcomes`] requires: either stored before the change, or staged through
+/// [`shard_write::publish_shards`] requires: either stored before the change, or staged through
 /// [`stage_file_storing_blob`](Self::stage_file_storing_blob), whose blobs every publish makes
 /// durable first, in one barrier.
 pub struct ShardMutationBatch<'l> {
@@ -1143,9 +859,7 @@ impl<'l> ShardMutationBatch<'l> {
                 None => Inventory::new(),
             };
 
-            let original_content = original_bytes.as_ref().map(|_| effective_content(&inventory));
-
-            self.shards.insert(key.to_string(), TouchedShard { original_bytes, original_content, inventory });
+            self.shards.insert(key.to_string(), TouchedShard { original_bytes, inventory });
         }
 
         let shard = self.shards.get_mut(key).unwrap();
@@ -1212,11 +926,11 @@ impl<'l> ShardMutationBatch<'l> {
 
     /// Register any touched key the metadata does not list yet, then publish every touched shard.
     ///
-    /// Each shard is re-read first, under `SHARD_MUTATION_LOCK`, through a ledger read afresh: if
-    /// any changed since this batch read it, nothing is published and an error is returned — the
-    /// batch would otherwise overwrite that change, or carry a rollup decided against bytes no
-    /// longer there. An unregistered key reads as no shard both times, whatever its address holds,
-    /// so a shard nobody registered never blocks the batch; a key registered and written since this
+    /// Each shard is re-read first, under the shard-write lock, through a ledger read afresh: if any
+    /// changed since this batch read it, nothing is published and an error is returned — the batch
+    /// would otherwise overwrite that change, or carry a rollup decided against bytes no longer
+    /// there. An unregistered key reads as no shard both times, whatever its address holds, so a
+    /// shard nobody registered never blocks the batch; a key registered and written since this
     /// batch read it does. Within a command (which holds the warehouse lock) that can only be a
     /// caller writing a touched shard some other way before publishing.
     ///
@@ -1234,53 +948,37 @@ impl<'l> ShardMutationBatch<'l> {
             return Ok(());
         }
 
-        let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
         let mut ledger = ShardLedger::read()?;
 
-        let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
-        let mut clear_keys: BTreeSet<String> = BTreeSet::new();
+        let mut expected: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+        let mut writes: BTreeMap<String, Inventory> = BTreeMap::new();
 
         for (key, shard) in shards {
-            let current_bytes = ledger.retrieve(&key)?;
-
-            if current_bytes != shard.original_bytes {
-                return Err(format!(
-                    "The inventory of folder \"{}\" changed while it was being updated, so the \
-                    inventory changes this command still held were not recorded.",
-                    load_guard_utils::display_path(&key)
-                ));
-            }
-
-            let mut inventory = shard.inventory;
-
-            if shard.original_content.as_ref() == Some(&effective_content(&inventory)) {
-                outcomes.insert(key, ShardOutcome::Carry(inventory));
-            } else {
-                inventory.set_rollup_hash(None);
-                clear_keys.extend(ancestor_keys_root_first(&key));
-                outcomes.insert(key, ShardOutcome::Changed(inventory));
-            }
+            expected.insert(key.clone(), shard.original_bytes);
+            writes.insert(key, shard.inventory);
         }
 
-        ledger.register(&outcomes.keys().cloned().collect())?;
+        // A key new to the metadata reads as no shard before and after its registration (which
+        // clears its address), so registering first leaves the comparison unchanged; one that
+        // fails it leaves only registered keys with no shard, which read as empty directories.
+        ledger.register(&writes.keys().cloned().collect())?;
 
-        publish_shard_outcomes(&ledger, &clear_keys, &mut outcomes)
+        publish_shards(&ledger, writes, &BTreeSet::new(), Some(&expected))
     }
 }
 
 /// A task for building an inventory file for a given directory.
 /// When encountering a subdirectory, a new task is created to build the inventory for that directory.
 ///
-/// Never writes *shard content* to disk itself: it only *decides* this directory's
-/// [`ShardOutcome`] (or that nothing changed at all, in which case it decides nothing) and
-/// records that decision — plus, for a real content change, this directory's ancestor keys — in
+/// Never writes *shard content* to disk itself: it only *decides* this directory's new content
+/// (or that nothing changed at all, in which case it decides nothing) and records that decision in
 /// the shared [`InventoryBuilderContext`], for `create_inventory_for_directory`'s single-threaded
-/// join point to publish once every task has run. This is deliberate: this walker is
-/// fire-and-forget concurrent (a directory's task fires off its subdirectories' tasks and returns
-/// without waiting for them), so writing — and, worse, invalidating ancestors — directly from
-/// here would need the same cross-task synchronization every other writer's funnel
-/// ([`write_shard_mutation`]) uses, one durability barrier at a time. Deferring the decision to
+/// join point to publish once every task has run, through [`shard_write::publish_shards`] —
+/// which also decides, from the shard on disk, whether the rollups above survive. This is
+/// deliberate: this walker is fire-and-forget concurrent (a directory's task fires off its
+/// subdirectories' tasks and returns without waiting for them), so writing — and, worse,
+/// invalidating ancestors — directly from here would need cross-task synchronization around every
+/// write, one durability barrier at a time. Deferring the decision to
 /// a join point instead turns the whole walk into at most three barriers total (DESIGN.html §5.0
 /// D item 10, finding #7 — one more than the two of the original stage 2b design, because the
 /// blob barrier below must complete, on its own, before shard content publishes), and needs no
@@ -1289,8 +987,8 @@ impl<'l> ShardMutationBatch<'l> {
 /// A changed or brand-new *small* file's blob is the one exception (DESIGN.html §5.0 D item 10,
 /// finding #1): its content is content-addressed and its write is staged (not fsynced) via
 /// [`file_utils::WriteBatch::stage`] into `context.blob_batch` — a batch the join point finishes,
-/// on its own, strictly *before* it stages any shard content (see `publish_shard_outcomes`'s doc
-/// comment for why the two must not share one batch) — instead of paying its own atomic-write
+/// on its own, strictly *before* it stages any shard content (see `shard_write::publish_shards`'s
+/// doc comment for why the two must not share one batch) — instead of paying its own atomic-write
 /// barrier per file. This is safe to do straight from a concurrent task (unlike a shard's
 /// content): `WriteBatch::stage` is documented safe for concurrent callers. Two tasks staging the
 /// same hash never both pay the compress-and-write cost either (DESIGN.html §5.0 D item 10,
@@ -1484,30 +1182,16 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
         let key = path.as_key().to_string();
 
-        let is_carry = existing_inventory.as_ref()
+        let content_unchanged = existing_inventory.as_ref()
             .is_some_and(|old_inventory| inventory_content_matches(&inventory, old_inventory));
 
-        if is_carry {
-            // Case (a): every entry hit the pure stat-cache fast path and the entry set is
-            // unchanged — literally nothing here differs from what is already on disk (not even
-            // stat data). Write nothing at all.
-            if any_entry_rebuilt {
-                // Case (b): content unchanged, but at least one entry was re-verified (or stat
-                // data drifted). Tentatively carry the rollup this task read at start — the join
-                // point drops it if this key is also an ancestor of some other real change.
-                let carried_rollup = existing_inventory.as_ref()
-                    .and_then(|old_inventory| old_inventory.get_rollup_hash().cloned());
-                inventory.set_rollup_hash(carried_rollup);
-
-                context.outcomes.lock().await.insert(key, ShardOutcome::Carry(inventory));
-            }
-        } else {
-            // Case (c): effective content changed (or this is a brand-new shard). Always
-            // published with rollup `None`; every ancestor becomes an invalidation target.
-            inventory.set_rollup_hash(None);
-
-            context.clear_keys.lock().await.extend(ancestor_keys_root_first(&key));
-            context.outcomes.lock().await.insert(key, ShardOutcome::Changed(inventory));
+        // Every entry hit the pure stat-cache fast path and the entry set is unchanged: literally
+        // nothing here differs from what is already on disk (not even stat data), so nothing is
+        // written. Otherwise the shard is rewritten — with its rollup kept when only stat data
+        // drifted or an entry was re-verified to the same content, and every rollup above it
+        // cleared when its content changed, as the join point's publish decides.
+        if !content_unchanged || any_entry_rebuilt {
+            context.writes.lock().await.insert(key, inventory);
         }
 
         // Registered only once this directory's content is decided: registration is what makes
@@ -1659,17 +1343,12 @@ fn directory_has_no_untracked_content(key: &str,
 /// staging the whole work in progress without swallowing untracked content.
 ///
 /// Decides every shard's new content first, without writing any of it (DESIGN.html §5.0 D item
-/// 10, finding #3) — one [`ShardOutcome`] per shard that needs rewriting, the same shape `load`'s
-/// parallel walk decides per directory — then publishes through [`publish_shard_outcomes`], the
-/// join-point machinery shared with `load`'s own `create_inventory_for_directory`. Sharing that
-/// machinery (rather than a bespoke second implementation) is what closes two correctness gaps an
-/// earlier version of this batching had:
-///
-/// * **Finding #1.** A shard decided early in this loop (say, because only its stat data drifted)
-///   must not blindly restamp its *decision-time* rollup over an ancestor clear a *later*-decided
-///   sibling's real content change requires — `publish_shard_outcomes`'s step 1 drops a carried
-///   rollup for any key that ends up in `clear_keys`, computed from every decision in this whole
-///   batch, not just the ones already processed when a given shard was decided.
+/// 10, finding #3) — the new content of every shard that needs rewriting, as `load`'s parallel
+/// walk decides per directory — then publishes through [`shard_write::publish_shards`], the
+/// funnel shared with `load`'s own `create_inventory_for_directory`. It decides every rollup from
+/// all of this pass's shards at once, so a shard decided early in this loop (say, because only its
+/// stat data drifted) never keeps a rollup over the ancestor clear a *later*-decided sibling's real
+/// content change requires (finding #1).
 ///
 /// Each decision takes its stat anchor at its start, before it stats anything, so every entry it
 /// rebuilds proves itself (see [`file_utils::StatAnchor`]); when the shard is later published
@@ -1679,9 +1358,8 @@ fn directory_has_no_untracked_content(key: &str,
 /// storage alone.
 ///
 /// Every rebuilt file's blob is staged into its own batch, finished on its own — durable —
-/// strictly before `publish_shard_outcomes` stages any shard content (DESIGN.html §5.0 D item 10,
-/// finding #7; see `publish_shard_outcomes`'s doc comment for why the two must not share one
-/// batch).
+/// strictly before `shard_write::publish_shards` stages any shard content (DESIGN.html §5.0 D
+/// item 10, finding #7; see its doc comment for why the two must not share one batch).
 ///
 /// If deciding a shard's new content fails partway through (an unreadable file, a corrupt
 /// shard), that failure alone does not cost the whole pass: every shard decided *before* it is
@@ -1715,8 +1393,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     // immediate-write loop. Every rebuilt file's blob is staged into one shared batch instead of
     // paying its own atomic-write barrier, finished below before any decision is published.
     let blob_batch = file_utils::WriteBatch::new();
-    let mut outcomes: BTreeMap<String, ShardOutcome> = BTreeMap::new();
-    let mut clear_keys: BTreeSet<String> = BTreeSet::new();
+    let mut writes: BTreeMap<String, Inventory> = BTreeMap::new();
 
     // The first failure hit while deciding a shard, if any — recorded instead of propagated
     // immediately (see the function's own doc comment on why: everything decided before this
@@ -1727,9 +1404,9 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     for entry in &metadata {
         let key = metadata_entry_to_key(entry);
 
-        // `Ok(Some((inventory, content_changed)))` when this shard needs rewriting; `Ok(None)`
-        // when nothing about it changed at all.
-        let decision = (|| -> Result<Option<(Inventory, bool)>, String> {
+        // `Ok(Some(inventory))` when this shard needs rewriting; `Ok(None)` when nothing about it
+        // changed at all.
+        let decision = (|| -> Result<Option<Inventory>, String> {
             // Before this decision stats anything below — see the function's own doc comment.
             let anchor = file_utils::take_stat_anchor()?;
 
@@ -1744,10 +1421,6 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
 
             let names: Vec<String> = inventory.get_items().map(|(name, _)| name.clone()).collect();
             let mut changed = false;
-            // Whether any entry's *effective* content (hash/type/state) actually changed, as
-            // opposed to only its stat fields going stale (e.g. a re-save with identical bytes).
-            // Only a real content change invalidates the rollup — see `write_shard_mutation`.
-            let mut content_changed = false;
 
             for name in names {
                 let item = inventory.get_item_by_name(&name).unwrap();
@@ -1766,7 +1439,6 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
                     // The file is gone from disk: its removal becomes staged.
                     inventory.mark_item_deleted(&name);
                     changed = true;
-                    content_changed = true;
                     continue;
                 };
 
@@ -1789,32 +1461,16 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
                 };
                 changed = true;
 
-                if rebuilt.hash != item.hash || rebuilt.item_type != item.item_type || rebuilt.state != item.state {
-                    content_changed = true;
-                }
-
                 inventory.add_item(rebuilt);
             }
 
-            Ok(changed.then_some((inventory, content_changed)))
+            Ok(changed.then_some(inventory))
         })();
 
         match decision {
-            Ok(Some((mut inventory, true))) => {
-                // A real content change: always published with rollup `None`, and every ancestor
-                // becomes an invalidation target — the same `ShardOutcome::Changed` semantics
-                // `load`'s walk uses for the same reason (see its own doc comment).
-                inventory.set_rollup_hash(None);
-                clear_keys.extend(ancestor_keys_root_first(key));
-                outcomes.insert(key.to_string(), ShardOutcome::Changed(inventory));
-            }
-            Ok(Some((inventory, false))) => {
-                // Only stat data went stale: carry the rollup forward tentatively —
-                // `publish_shard_outcomes` drops it if this key also turns out to be an ancestor
-                // of some other shard's real change decided elsewhere in this same pass (finding
-                // #1 — see the function's own doc comment).
-                outcomes.insert(key.to_string(), ShardOutcome::Carry(inventory));
-            }
+            // Whether only stat data went stale (the rollup kept) or content changed (every
+            // rollup above cleared) is the publish's to decide, against the shard on disk.
+            Ok(Some(inventory)) => { writes.insert(key.to_string(), inventory); }
             Ok(None) => {}
             // Matches the old loop's own behavior: a shard's failure stops the walk right there
             // (never proceeds to a later shard in metadata order) — only *what happens to
@@ -1824,11 +1480,11 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     }
 
     // Every rebuilt file's blob decided above becomes durable now, in its own barrier — strictly
-    // before `publish_shard_outcomes` below even stages any shard content (DESIGN.html §5.0 D
+    // before `publish_shards` below even stages any shard content (DESIGN.html §5.0 D
     // item 10, finding #7): a published shard's entries may carry one of these blobs' hashes, so
     // the blob must already be durable — not merely staged — before that shard's rename can land.
     //
-    // A failure here skips `publish_shard_outcomes` entirely, rather than the "keep whatever was
+    // A failure here skips `publish_shards` entirely, rather than the "keep whatever was
     // decided" resilience the decide loop above gives a per-shard failure. `WriteBatch::finish` can
     // fail more than one way (see its own `# Returns`; `run_write_barrier` for why a rename-partway
     // or trailing-sync failure is not all-or-nothing) — no failure mode leaves a per-hash way to
@@ -1843,11 +1499,11 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
         Err(e) => { if result.is_ok() { result = Err(e); } false }
     };
 
-    // Publish every shard this pass decided to rewrite — see `publish_shard_outcomes`'s doc
-    // comment for the exact ordering (and how it closes findings #1 and #6, per this function's
-    // own doc comment above).
+    // Publish every shard this pass decided to rewrite — see `shard_write::publish_shards`'s doc
+    // comment for the exact ordering (and how it closes finding #1, per this function's own doc
+    // comment above).
     if blob_batch_published {
-        if let Err(e) = publish_shard_outcomes(&ledger, &clear_keys, &mut outcomes) {
+        if let Err(e) = publish_shards(&ledger, writes, &BTreeSet::new(), None) {
             if result.is_ok() { result = Err(e); }
         }
     }
@@ -1914,8 +1570,8 @@ pub struct RollupSkipPlan {
 /// **What is read.** With `skip` `Some((head_root_tree_hash, scope))` and the rollup skip enabled,
 /// the read walks the tree top-down, one depth at a time (each depth fanned out across every core
 /// with [`fanout_utils::fanout_map`]). A shard whose rollup equals the head subtree hash at its key
-/// becomes a skip root, and nothing beneath it is read: the shard-mutation funnel
-/// ([`write_shard_mutation`]) clears the rollup of a shard and of every ancestor before it writes
+/// becomes a skip root, and nothing beneath it is read: every shard write goes through a funnel
+/// of [`shard_write`], which clears the rollup of a shard and of every ancestor before it writes
 /// any change of content (an entry's name, type, hash or state), so a matching rollup proves that
 /// no shard beneath it holds a staged change, a staged removal or a conflict entry. A shard
 /// beneath a skip root that would not parse is therefore not reported either: its content is not
@@ -2313,291 +1969,6 @@ impl ShardLedger {
 
         write_shard_mutation(self, key, &mut inventory)
     }
-
-    /// Replace the staging area below the given directory with the given shards: the existing
-    /// inventory folders under the key are removed, the given shards are written, and the
-    /// metadata file is updated accordingly. Used by `restore --staged` (and `unload`) to reset a
-    /// subtree of the inventory to the pallet head.
-    ///
-    /// The subtree at `key` is now rebuilt wholesale from `shards` — a known-good source — so any
-    /// incomplete-load marker `key` covers no longer describes a real gap; see
-    /// `load_guard_utils::clear_recorded_under`'s doc comment. A marker only partially overlapping
-    /// `key` is left alone (conservative — part of that region may still be genuinely incomplete).
-    ///
-    /// # Arguments
-    /// * `key`    - The warehouse path key of the subtree to replace (`""` for everything).
-    /// * `shards` - Warehouse path key → inventory for the new state of the subtree.
-    ///
-    /// # Returns
-    /// * `Ok(())`      - If the subtree was replaced.
-    /// * `Err(String)` - If a folder or file operation failed.
-    pub fn replace_subtree(&mut self,
-                           key: &str,
-                           shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
-        // The subtree at `key` is about to be replaced wholesale — a content change from any
-        // ancestor's point of view — so their rollups (if any) must be cleared before the new
-        // content lands, exactly as `write_shard_mutation` orders it. `shards` itself carries
-        // correctly-stamped rollups already (the caller builds them from a known tree), so nothing
-        // further is needed for `key` and below.
-        clear_ancestor_rollups(self, key)?;
-
-        // `path_utils::covers("", _)` is always true, so this one predicate already subsumes the
-        // former separate `key.is_empty()` case (drop everything) without a special-cased branch.
-        let replaced: BTreeSet<String> = self.keys()
-            .filter(|entry_key| path_utils::covers(key, entry_key))
-            .map(str::to_string)
-            .collect();
-
-        for replaced_key in &replaced {
-            remove_shard_folder(replaced_key)?;
-        }
-
-        // Unregister what was removed and register what is about to be published, in one metadata
-        // write before any new shard lands. A key removed above and republished here is cleared and
-        // synced again, so the removal is durable before the key is registered again.
-        self.update(&replaced, &shards.keys().cloned().collect())?;
-
-        // One durability barrier for the whole replacement burst instead of one per shard
-        // (DESIGN.html §5.0 D item 8, stage 2b) — every shard here carries a caller-computed,
-        // already-correct rollup (or none), so these writes have no ordering requirement against
-        // each other, only against the ancestor clear above (already durable by the time this runs).
-        let batch = file_utils::WriteBatch::new();
-
-        for (shard_key, inventory) in shards {
-            save_inventory_deferred(self, shard_key, inventory, &batch)?;
-        }
-
-        batch.finish()?;
-
-        load_guard_utils::clear_recorded_under(key);
-
-        sweep_unregistered_shards();
-
-        Ok(())
-    }
-}
-
-/// Replace the whole staging area with the given shards: the existing inventory folders
-/// are removed, the given shards are written, and the metadata file is rewritten to list
-/// exactly their directories. Used when `shift` repopulates the inventory from the target
-/// pallet's tree, `park`'s push resets to the pallet head, a `consolidate` fast-forward
-/// repopulates from the target pallet, `import-git` checks out its initial branch, and
-/// `lower`/`franchise` materialize a fetched tree (`shift_utils::materialize_tree`).
-///
-/// The whole staging area is now rebuilt wholesale from `shards` — a known-good source — so
-/// every previously recorded incomplete-load root is now moot; see
-/// `load_guard_utils::clear_all_recorded`'s doc comment.
-///
-/// # Arguments
-/// * `shards` - Warehouse path key → inventory, for every tracked directory.
-///
-/// # Returns
-/// * `Ok(())`      - If the staging area was replaced.
-/// * `Err(String)` - If a folder or file operation failed.
-pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
-    // The whole store goes, not the root key's shard, and the new set is registered before any
-    // shard lands. The old metadata is replaced, not read, so a damaged one cannot block the reset.
-    let ledger = ShardLedger::replace(&shards.keys().cloned().collect())?;
-
-    // One durability barrier for the whole warehouse instead of one per shard (DESIGN.html
-    // §5.0 D item 8, stage 2b) — the whole staging area was just wiped above, so there is no
-    // ancestor ordering to preserve here at all, only the fresh content itself.
-    let batch = file_utils::WriteBatch::new();
-
-    for (key, inventory) in shards {
-        save_inventory_deferred(&ledger, key, inventory, &batch)?;
-    }
-
-    batch.finish()?;
-
-    // Only once every shard has landed: the markers must not go while registered keys still have
-    // no shard.
-    load_guard_utils::clear_all_recorded();
-
-    Ok(())
-}
-
-/// Clean up the staged state after a parcel was stacked, so the inventory describes exactly the
-/// tree that parcel recorded: the parcel consumed every staged removal, so `Deleted` entries are
-/// dropped from their shards, and a key with nothing left (no surviving entry of its own and no
-/// surviving registered key beneath it) is unregistered and its shard folder removed.
-///
-/// Whether a key goes is decided from the inventory alone, never from the working directory. A
-/// directory deleted from disk without a `load` is still in the parcel just stacked, so its shard
-/// stays, and `stocktake` keeps reporting the removal as not yet loaded. Deciding from the disk
-/// instead would drop that shard after the parcel recorded its content, and the next `stack`
-/// would then commit a removal nobody staged.
-///
-/// Reuses the [`PreparedInventory`] snapshot `stack` built before writing anything. Nothing
-/// between then and this call changes a shard's content on disk (stacking writes only
-/// tree/parcel objects, the pallet ref and the signature sidecar before this point), so reusing it
-/// produces exactly what a fresh read would.
-///
-/// After a stack, staged state *is* the new head, so every surviving shard's rollup ends up in
-/// one of three states:
-///  * **Stamp** — `key` is in `stamp_hashes`: rewrite it with the just-built subtree hash from
-///    the same tree build `stack` just ran.
-///  * **Untouched** — `key` is in `prepared.skip.pruned` (a skip root or a key beneath one): its
-///    on-disk rollup already names the right tree (that is *why* it was skipped), and the funnel
-///    guarantees it holds no staged removal, so it is left exactly as it sits, unread.
-///  * **Clear** — everything else (a key in neither set: an out-of-scope/spine shard in a
-///    scoped bay, or a genuinely empty subtree): stamped `None` instead of guessed.
-///
-/// # Arguments
-/// * `prepared`     - The snapshot from [`prepare_stack_inventory`].
-/// * `stamp_hashes` - Warehouse path key → the subtree hash `stack` just built there. Trusted
-///                    for every key it names (see `stack_utils::stack_parcel`, which omits any
-///                    key a scoped bay's spine splice could have changed).
-///
-/// # Returns
-/// * `Ok(())`      - If the cleanup completed.
-/// * `Err(String)` - If a shard could not be written, or a folder could not be removed.
-pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
-                                stamp_hashes: &BTreeMap<String, String>) -> Result<(), String> {
-    let Some(metadata) = &prepared.metadata else {
-        return Ok(());
-    };
-
-    // Every key rewritten below is one this snapshot read from the metadata.
-    let ledger = ShardLedger { entries: metadata.clone() };
-
-    let mut removed_keys: BTreeSet<String> = BTreeSet::new();
-
-    // Every shard rewritten below (a stamp or a `Deleted`-entry drop) is staged here and
-    // published as one durability barrier at the end, instead of once per shard (DESIGN.html
-    // §5.0 D item 8, stage 2b) — these rewrites carry no ordering requirement against each
-    // other: a stamp is only ever consulted after `stack`'s ref move is already durable (see
-    // `stack_utils::stack_parcel`), so losing some of them to a crash mid-barrier only costs a
-    // few lost skips next time, never a wrong one.
-    let batch = file_utils::WriteBatch::new();
-
-    // Deepest first, so every key beneath `key` is decided before `key` itself.
-    for entry in metadata.iter().rev() {
-        let key = metadata_entry_to_key(entry);
-
-        if prepared.skip.pruned.contains(key) {
-            continue;
-        }
-
-        let inventory = prepared.shards.get(key);
-        let has_survivor = inventory.is_some_and(|inventory| inventory.get_items()
-            .any(|(_, item)| item.state != InventoryItemState::Deleted));
-
-        if !key.is_empty() && !has_survivor {
-            let prefix = format!("{}/", key);
-            let has_registered_descendant = metadata.range(prefix.clone()..)
-                .take_while(|other| other.starts_with(&prefix))
-                .any(|other| !removed_keys.contains(metadata_entry_to_key(other)));
-
-            if !has_registered_descendant {
-                // Every key beneath this one is already removed, so this one can go too.
-                remove_shard_folder(key)?;
-
-                removed_keys.insert(key.to_string());
-                continue;
-            }
-        }
-
-        let Some(inventory) = inventory else {
-            continue;
-        };
-
-        let has_staged_removals = inventory.get_items()
-            .any(|(_, item)| item.state == InventoryItemState::Deleted);
-
-        let target_rollup = stamp_hashes.get(key).cloned();
-
-        // A rewrite is needed either to drop the now-consumed `Deleted` entries (dropping them
-        // never changes the tree `stack` already built, since the tree build itself excludes
-        // `Deleted` entries) or, even with nothing to drop, purely to stamp a rollup this shard
-        // did not already carry.
-        if has_staged_removals || inventory.get_rollup_hash() != target_rollup.as_ref() {
-            let mut rebuilt = Inventory::new();
-
-            for (_, item) in inventory.get_items() {
-                if item.state != InventoryItemState::Deleted {
-                    rebuilt.add_item((**item).clone());
-                }
-            }
-
-            rebuilt.set_rollup_hash(target_rollup);
-
-            save_inventory_deferred(&ledger, key, &rebuilt, &batch)?;
-        }
-    }
-
-    batch.finish()?;
-
-    if removed_keys.is_empty() {
-        return Ok(());
-    }
-
-    unregister_inventory_keys(&removed_keys)?;
-
-    sweep_unregistered_shards();
-
-    Ok(())
-}
-
-/// Remove every inventory shard at or under a warehouse path prefix, dropping those keys from
-/// the metadata too. Unlike [`stage_removal_for_directory`], this leaves no `Deleted` record —
-/// the entries vanish, as if the subtree had never been inventoried. Used by `narrow` when a
-/// subtree leaves the checkout's materialization scope: it should stop being reported entirely,
-/// not appear as a staged removal to be committed.
-///
-/// # Arguments
-/// * `prefix` - The warehouse path key of the subtree leaving scope (never the root).
-///
-/// # Returns
-/// * `Ok(())`      - If the shards under the prefix were removed.
-/// * `Err(String)` - If a shard folder or the metadata could not be updated.
-pub fn remove_inventories_under(prefix: &str) -> Result<(), String> {
-    let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
-
-    let Some(metadata) = metadata_opt else {
-        return Ok(());
-    };
-
-    let ledger = ShardLedger { entries: metadata };
-
-    // Conservative: the removed shards themselves have no content left to invalidate (their
-    // files are about to be deleted below), but every ancestor above `prefix` may have had a
-    // rollup describing a subtree that included them — clear those before anything is removed.
-    clear_ancestor_rollups(&ledger, prefix)?;
-
-    let mut removed_keys: BTreeSet<String> = BTreeSet::new();
-
-    for key in ledger.keys() {
-        // The prefix directory itself, or a directory strictly under it.
-        let under = key == prefix
-            || (key.len() > prefix.len()
-                && key.as_bytes()[prefix.len()] == b'/'
-                && key.starts_with(prefix));
-
-        if !under {
-            continue;
-        }
-
-        remove_shard_folder(key)?;
-
-        removed_keys.insert(key.to_string());
-    }
-
-    unregister_inventory_keys(&removed_keys)?;
-
-    sweep_unregistered_shards();
-
-    Ok(())
-}
-
-/// Remove the shard folder of `key`, if there is one, or whatever non-folder occupies its slot.
-/// Folders are flat, so this removes no other key's shard.
-fn remove_shard_folder(key: &str) -> Result<(), String> {
-    let folder = file_utils::get_inventory_folder_for_key(key)?;
-
-    remove_store_entry(&folder).map_err(|e| format!(
-        "Error while removing the inventory of folder \"{}\": {}", load_guard_utils::display_path(key), e
-    ))
 }
 
 /// Remove one entry of the shard store: a folder with everything in it, or a file or link in a
@@ -2803,9 +2174,8 @@ fn close_under_ancestors(metadata: &BTreeSet<String>) -> BTreeSet<String> {
 }
 
 /// The registered set of directory keys — the inventory metadata, closed under ancestors — and the
-/// only way to write a shard's content. Every content-write primitive ([`write_shard_mutation`],
-/// [`write_shard_mutation_with_extra`], [`save_inventory`], [`save_inventory_deferred`]) takes one
-/// and refuses a key it does not hold, so a writer must register a key before it publishes the
+/// only way to write a shard's content. Every shard-write funnel ([`shard_write`]) takes one and
+/// refuses a key it does not hold, so a writer must register a key before it publishes the
 /// key's shard. A shard on disk whose key is not registered is therefore never one this build
 /// published, and is never read as anything: [`retrieve`](Self::retrieve) answers `None` for an
 /// unregistered key without opening its address, so no writer adopts what an unregistered address
@@ -3017,20 +2387,6 @@ impl ShardLedger {
         self.entries = close_under_ancestors(&entries);
 
         Ok(())
-    }
-
-    /// The shard path of `key`, for a write: refused when `key` is not registered, or when its
-    /// address is damaged, so that nothing is written through a link.
-    fn shard_path_for_write(&self, key: &str) -> Result<std::path::PathBuf, String> {
-        if !self.holds(key) {
-            return Err(format!(
-                "The inventory of folder \"{}\" was not written: the folder is not registered in the \
-                inventory metadata.",
-                load_guard_utils::display_path(key)
-            ));
-        }
-
-        Ok(file_utils::judge_shard_address(key)?.0)
     }
 }
 
@@ -3552,67 +2908,10 @@ fn stage_removal_for_file(ledger: &ShardLedger, path: &WarehousePath) -> Result<
     Ok(())
 }
 
-/// Save the given inventory as the shard of `key`.
-///
-/// # Arguments
-/// * `ledger`    - The registered set, which must already hold `key` (see [`ShardLedger`]).
-/// * `key`       - The warehouse path key of the shard.
-/// * `inventory` - The inventory data that should be written to the shard.
-///
-/// # Returns
-/// * `Ok(())`      - If the inventory was saved successfully.
-/// * `Err(String)` - If `key` is not registered, or there was an error.
-fn save_inventory(ledger: &ShardLedger, key: &str, inventory: &Inventory) -> Result<(), String> {
-    let inventory_path = ledger.shard_path_for_write(key)?;
-    let bytes = ensure_inventory_folder_and_build(inventory, &inventory_path)?;
-
-    // Atomic (temp file, fsync, rename, directory fsync) — the store-wide "durable before
-    // destructive" contract. This matters far more now than it used to: post-stack rollup
-    // stamping (`cleanup_after_stack_with`) can rewrite every registered shard on a single
-    // `stack`, not just the ones with consumed staged removals, so a shard write is on the hot
-    // path of a crash-safety-sensitive operation far more often than before. A caller writing
-    // more than one shard for the same logical operation should prefer
-    // [`save_inventory_deferred`] instead — see its doc comment for why a burst of these,
-    // fsynced and renamed one at a time, is the dominant cost stage 2b's benchmark caught.
-    file_utils::write_file_atomically(&inventory_path, &bytes)
-}
-
-/// Stage a shard write into `batch` instead of writing (and fsyncing) it immediately — the
-/// deferred counterpart of [`save_inventory`], for a caller writing several shards as one
-/// logical operation (`cleanup_after_stack_with`'s post-stack stamping, a materializer's
-/// wholesale shard replacement, the mutation funnel's ancestor-clear set). Batches the fsync and
-/// rename of every staged shard into one durability barrier — see [`file_utils::WriteBatch`] —
-/// instead of paying a full write-fsync-rename-directory-fsync cycle per shard: on a synthetic
-/// 300-directory corpus this was the entire gap between stage 1 (per-shard atomic writes) and
-/// pre-stage-1 `stack` timings (DESIGN.html §5.0 D item 8, stage 2b measurement).
-///
-/// The caller must call [`file_utils::WriteBatch::finish`] once every shard for this operation
-/// has been staged — nothing staged here is visible or durable before that returns `Ok`.
-/// `key` must already be registered in `ledger`, exactly as for [`save_inventory`].
-fn save_inventory_deferred(ledger: &ShardLedger,
-                           key: &str,
-                           inventory: &Inventory,
-                           batch: &file_utils::WriteBatch) -> Result<(), String> {
-    let inventory_path = ledger.shard_path_for_write(key)?;
-    let bytes = ensure_inventory_folder_and_build(inventory, &inventory_path)?;
-
-    batch.stage(&inventory_path, &bytes)
-}
-
-/// The shared prelude of [`save_inventory`] and [`save_inventory_deferred`]: make sure the
-/// shard's parent folder exists, and serialize its bytes.
-fn ensure_inventory_folder_and_build(inventory: &Inventory, inventory_path: &Path) -> Result<Vec<u8>, String> {
-    let mut parent_path = std::path::PathBuf::from(inventory_path);
-    parent_path.pop();
-
-    file_utils::create_folder_if_not_exists(&parent_path)?;
-
-    Ok(InventoryBuilder::build(inventory))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::inventory::RollupStamp;
 
     /// Whether `key` is registered, as a fresh read of the metadata finds it.
     fn is_registered(key: &str) -> bool {
@@ -3842,8 +3141,8 @@ mod tests {
     /// a writer (every writer goes through a `ShardLedger`).
     fn plant_shard(inventory: &Inventory, key: &str) {
         let path = file_utils::get_inventory_data_path_for_key(key).unwrap();
-        let bytes = ensure_inventory_folder_and_build(inventory, &path).unwrap();
-        file_utils::write_file_atomically(&path, &bytes).unwrap();
+        file_utils::create_folder_if_not_exists(path.parent().unwrap()).unwrap();
+        file_utils::write_file_atomically(&path, &InventoryBuilder::build(inventory)).unwrap();
     }
 
     /// Write a shard directly (bypassing the funnel) with the given rollup hash already
@@ -3852,7 +3151,9 @@ mod tests {
     fn write_stamped_shard(key: &str, rollup_hash: Option<&str>) {
         let mut inventory = Inventory::new();
         inventory.add_item(item("file.txt", 1, InventoryItemState::Normal));
-        inventory.set_rollup_hash(rollup_hash.map(|h| h.to_string()));
+        if let Some(hash) = rollup_hash {
+            inventory.stamp_rollup(RollupStamp::trusted(hash.to_string()));
+        }
         plant_shard(&inventory, key);
     }
 
@@ -3911,6 +3212,99 @@ mod tests {
             assert_eq!(read_rollup(key), None, "a state change must clear the rollup of \"{key}\"");
         }
         assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "an unrelated sibling must keep its rollup");
+    }
+
+    /// One shard listing `file.txt` as the fixture writes it, with stat data `inode` and `state`,
+    /// carrying a rollup no funnel would trust: whatever a producer hands in is never what lands.
+    fn forged_shard(inode: u64, state: InventoryItemState) -> Inventory {
+        let mut inventory = Inventory::new();
+        inventory.add_item(item("file.txt", inode, state));
+        inventory.stamp_rollup(RollupStamp::trusted("forged".to_string()));
+        inventory
+    }
+
+    fn publish(writes: Vec<(&str, Inventory)>, removed: &[&str]) -> Result<(), String> {
+        let writes = writes.into_iter().map(|(key, inventory)| (key.to_string(), inventory)).collect();
+        let removed = removed.iter().map(|key| key.to_string()).collect();
+
+        publish_shards(&ShardLedger::read().unwrap(), writes, &removed, None)
+    }
+
+    /// The funnel decides every rollup from the shard on disk: a stat-only rewrite keeps the one on
+    /// disk, a change gets none, and neither keeps the one the producer handed in.
+    #[test]
+    fn publish_shards_decides_each_rollup_from_the_shard_on_disk() {
+        let _scratch = Scratch::new("publish-classify");
+        stamped_chain_with_sibling();
+
+        publish(vec![
+            ("a/b", forged_shard(7, InventoryItemState::Normal)),
+            ("x", forged_shard(1, InventoryItemState::FirstParentConflict)),
+        ], &[]).unwrap();
+
+        assert_eq!(read_rollup("a/b").as_deref(), Some("rollup"), "a stat-only rewrite keeps the rollup on disk");
+        assert_eq!(read_rollup("a").as_deref(), Some("rollup"), "nothing below \"a\" changed content");
+        assert_eq!(read_rollup("x"), None, "a content change keeps no rollup");
+        assert_eq!(read_rollup(""), None, "the ancestor of a content change keeps no rollup");
+        assert_eq!(registered_inode("a/b", "file.txt"), 7, "the stat refresh is published");
+    }
+
+    /// A shard classified as stat-only keeps no rollup when it is also the ancestor of a change
+    /// decided later in the same call (DESIGN.html §5.0 D item 10, finding #1).
+    #[test]
+    fn publish_shards_drops_the_rollup_of_a_carried_ancestor_of_a_change() {
+        let _scratch = Scratch::new("publish-carried-ancestor");
+        stamped_chain_with_sibling();
+
+        publish(vec![
+            ("a", forged_shard(7, InventoryItemState::Normal)),
+            ("a/b", forged_shard(1, InventoryItemState::FirstParentConflict)),
+        ], &[]).unwrap();
+
+        for key in ["", "a", "a/b"] {
+            assert_eq!(read_rollup(key), None, "\"{key}\" is above or at the change");
+        }
+        assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "an unrelated sibling keeps its rollup");
+        assert_eq!(registered_inode("a", "file.txt"), 7, "the carried shard is still published");
+    }
+
+    /// A removed shard leaves no rollup standing above it, a carried one in the same call included.
+    #[test]
+    fn publish_shards_clears_every_ancestor_of_a_removed_key() {
+        let _scratch = Scratch::new("publish-removed");
+        stamped_chain_with_sibling();
+
+        publish(vec![("a", forged_shard(7, InventoryItemState::Normal))], &["a/b"]).unwrap();
+
+        assert_eq!(read_rollup(""), None, "the root is above the removal");
+        assert_eq!(read_rollup("a"), None, "a carried shard above the removal keeps no rollup");
+        assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "an unrelated sibling keeps its rollup");
+    }
+
+    /// A shard on disk that does not parse is an error, never a new shard to overwrite: nothing of
+    /// the call is written and no rollup is cleared.
+    #[test]
+    fn publish_shards_refuses_over_a_shard_that_does_not_parse() {
+        let _scratch = Scratch::new("publish-corrupt");
+        stamped_chain_with_sibling();
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("a/b").unwrap();
+        std::fs::write(&corrupt_path, b"not an inventory").unwrap();
+
+        let error = publish(vec![
+            ("a/b", forged_shard(7, InventoryItemState::Normal)),
+            ("x", forged_shard(1, InventoryItemState::FirstParentConflict)),
+        ], &[]).unwrap_err();
+
+        assert!(error.contains("a/b"), "the error names the shard: {error}");
+        assert_eq!(std::fs::read(&corrupt_path).unwrap(), b"not an inventory", "the damaged shard is not overwritten");
+        assert_eq!(registered_inode("x", "file.txt"), 1, "no other shard of the call is written");
+        for key in ["", "a", "x"] {
+            assert_eq!(read_rollup(key).as_deref(), Some("rollup"), "\"{key}\" keeps its rollup");
+        }
+    }
+
+    fn registered_inode(key: &str, name: &str) -> u64 {
+        ShardLedger::read().unwrap().inventory(key).unwrap().unwrap().get_item_by_name(name).unwrap().inode
     }
 
     /// A case-only rename of a directory: the old spelling's entry is removed, then the new
@@ -4975,12 +4369,10 @@ mod tests {
             assert!(error.contains("not registered in the inventory metadata"), "{error}");
         };
         refused(write_shard_mutation(&ledger, "stray", &mut inventory));
-        refused(save_inventory(&ledger, "stray", &inventory));
-        let batch = file_utils::WriteBatch::new();
-        refused(save_inventory_deferred(&ledger, "stray", &inventory, &batch));
-        batch.finish().unwrap();
+        refused(publish_shards(&ledger, BTreeMap::from([("stray".to_string(), inventory)]), &BTreeSet::new(), None));
 
         assert!(file_utils::retrieve_inventory_or_none_by_key("stray").unwrap().1.is_none(), "nothing was written");
+        assert_eq!(read_rollup(""), Some("rollup".to_string()), "a refused write clears no rollup");
     }
 
     /// Only folders belong at the fan-out level, so registering a key removes a file in its
@@ -5162,7 +4554,7 @@ mod tests {
             let ledger = ShardLedger::read().unwrap();
 
             let read = ledger.retrieve("a/b");
-            let written = save_inventory(&ledger, "a/b", &Inventory::new());
+            let written = publish_shards(&ledger, BTreeMap::from([("a/b".to_string(), Inventory::new())]), &BTreeSet::new(), None);
             let updated = ShardLedger::read().unwrap().update_shard("a/b", add_new_txt);
 
             assert_eq!(std::fs::read(&behind).unwrap(), shard_behind, "{level}: nothing is written behind the link");
