@@ -263,13 +263,15 @@ pub(crate) struct PruneReport {
     /// design, not pending a future repack.
     retained_shared: usize,
 
-    /// Candidates kept because history the remote does not hold needs them: work stacked here
-    /// and never lifted, or lifted to a remote head not lowered here since. Freeing them could
-    /// lose the only copy; a later prune of the same path frees them once that history is lifted.
+    /// Candidates kept because lifting history the remote does not hold reads them: work stacked
+    /// here and never lifted, or lifted to a remote head not lowered here since. Some may be the
+    /// only copy, the rest are base trees the lift compares against; a later prune of the same
+    /// path frees them once that history is lifted.
     kept_unlifted: usize,
 
-    /// The pallets whose head the remote does not hold, when `kept_unlifted` is non-zero; lifting
-    /// (or lowering) them is what lets a later prune free the rest.
+    /// The pallets whose unlifted history changed the pruned path; lifting them (or lowering) is
+    /// what lets a later prune free the rest. Pallets with unlifted work elsewhere are not listed,
+    /// and it can be empty when gaps in the history hide which pallet leads to the kept work.
     unlifted_pallets: Vec<String>,
 
     /// Whether every requested path was already outside the fetch scope before this call — a
@@ -333,18 +335,20 @@ impl CommandOutput for PruneReport {
         }
 
         if self.kept_unlifted > 0 {
-            let pallets = self.unlifted_pallets.iter()
-                .map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", ");
-            let paths = self.pruned.iter()
-                .map(|path| if path.contains(char::is_whitespace) { format!("'{}'", path) } else { path.clone() })
-                .collect::<Vec<_>>().join(" ");
+            let pallets = if self.unlifted_pallets.is_empty() {
+                String::new()
+            } else {
+                format!(" (pallets {})", self.unlifted_pallets.iter()
+                    .map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", "))
+            };
+            let separator = if self.pruned.iter().any(|path| path.starts_with('-')) { "-- " } else { "" };
+            let paths = self.pruned.iter().map(|path| shell_quote(path)).collect::<Vec<_>>().join(" ");
 
             println!(
-                "{} object(s) were kept because history the remote does not hold yet needs them \
-                (pallets {}); \
-                freeing them could lose the only copy. Lift that work (or lower, if the remote is \
-                ahead), then run \"scope-prune {}\" again to free them.",
-                self.kept_unlifted, pallets, paths
+                "{} object(s) were kept because lifting history the remote does not hold yet reads \
+                them{}; some may be the only copy. Lift that work (or lower, if the remote is \
+                ahead), then run \"scope-prune {}{}\" again to free them.",
+                self.kept_unlifted, pallets, separator, paths
             );
         }
 
@@ -357,10 +361,36 @@ impl CommandOutput for PruneReport {
 }
 
 
+/// Quote a path for a POSIX shell, leaving it bare when it holds only characters a shell never
+/// reinterprets.
+///
+/// # Arguments
+/// * `path` - The path key.
+fn shell_quote(path: &str) -> String {
+    if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
+        return path.to_string();
+    }
+
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<PruneReport>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_leaves_plain_paths_bare_and_quotes_the_rest() {
+        assert_eq!(shell_quote("src/api_v2.d-x"), "src/api_v2.d-x");
+        assert_eq!(shell_quote("design docs"), "'design docs'");
+        assert_eq!(shell_quote("assets/*.png"), "'assets/*.png'");
+        assert_eq!(shell_quote("it's docs"), "'it'\\''s docs'");
+    }
 }

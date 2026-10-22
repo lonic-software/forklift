@@ -5222,7 +5222,7 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     // The fetch scope did narrow: docs is pruned, only its content stays until it is lifted.
     let rerun = area.forklift("sparse", &["scope-prune", "--dry-run", "docs"]);
     assert_success(&rerun);
-    assert!(stdout(&rerun).contains("kept because history the remote does not hold"), "{}", stdout(&rerun));
+    assert!(stdout(&rerun).contains("kept because lifting history the remote does not hold"), "{}", stdout(&rerun));
     assert!(stdout(&rerun).contains("\"main\""), "the pallet to lift is named: {}", stdout(&rerun));
     assert!(stdout(&rerun).contains("scope-prune docs\" again"), "the rerun is named: {}", stdout(&rerun));
 

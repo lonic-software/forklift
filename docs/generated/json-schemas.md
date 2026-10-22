@@ -4240,7 +4240,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "kept_unlifted": {
-      "description": "Candidates kept because history the remote does not hold needs them: work stacked here\nand never lifted, or lifted to a remote head not lowered here since. Freeing them could\nlose the only copy; a later prune of the same path frees them once that history is lifted.",
+      "description": "Candidates kept because lifting history the remote does not hold reads them: work stacked\nhere and never lifted, or lifted to a remote head not lowered here since. Some may be the\nonly copy, the rest are base trees the lift compares against; a later prune of the same\npath frees them once that history is lifted.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -4272,7 +4272,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "unlifted_pallets": {
-      "description": "The pallets whose head the remote does not hold, when `kept_unlifted` is non-zero; lifting\n(or lowering) them is what lets a later prune free the rest.",
+      "description": "The pallets whose unlifted history changed the pruned path; lifting them (or lowering) is\nwhat lets a later prune free the rest. Pallets with unlifted work elsewhere are not listed,\nand it can be empty when gaps in the history hide which pallet leads to the kept work.",
       "items": {
         "type": "string"
       },

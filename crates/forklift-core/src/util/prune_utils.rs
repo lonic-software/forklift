@@ -73,14 +73,16 @@ pub struct PrunePlan {
     /// can tell the two apart instead of leaving the reason unstated.
     pub retained_shared: usize,
 
-    /// Candidates kept because history the remote is not known to hold needs them: work stacked
-    /// here and never lifted, or lifted to a remote head this warehouse has not lowered since.
-    /// Freeing them could lose the only copy. A later prune of the same path frees them once
-    /// the remote's heads reach that history.
+    /// Candidates kept because lifting history the remote is not known to hold reads them: work
+    /// stacked here and never lifted, or lifted to a remote head this warehouse has not lowered
+    /// since. Some may be the only copy; the rest are the base trees that lift compares against.
+    /// A later prune of the same path frees them once the remote's heads reach that history.
     pub kept_unlifted: usize,
 
-    /// The user pallets whose head the remote is not known to hold, as wire names, when
-    /// `kept_unlifted` is non-zero; empty otherwise.
+    /// The user pallets, as wire names, whose unlifted history changed a pruned path, so that
+    /// lifting them (or lowering) lets a later prune free what this one kept. Empty when
+    /// `kept_unlifted` is zero, and possibly empty otherwise when gaps in the history hide which
+    /// pallet leads to the kept work. A pallet with unlifted work elsewhere is not listed.
     pub unlifted_pallets: Vec<String>,
 }
 
@@ -161,8 +163,10 @@ pub fn plan_prune(
     let mut unlifted_pallets: Vec<String> = Vec::new();
 
     if kept_unlifted > 0 {
+        let leading = leading_to_touching(&unlifted, &touching)?;
+
         for (pallet_ref, head) in pallet_utils::all_pallet_refs()? {
-            if pallet_ref.namespace == PalletNamespace::User && reaches_any(&head, &unlifted, &touching)? {
+            if pallet_ref.namespace == PalletNamespace::User && leading.contains(&head) {
                 unlifted_pallets.push(pallet_ref.to_wire());
             }
         }
@@ -329,34 +333,38 @@ fn retain_changed(tree_hash: &str,
     Ok(())
 }
 
-/// Whether `head`'s ancestry within `unlifted` contains a parcel in `touching`: whether lifting
-/// that pallet is part of what lets a later prune free what this one kept.
+/// The unlifted parcels whose lift is part of what lets a later prune free what this one kept:
+/// each parcel in `touching` and every unlifted descendant of one, found in one pass over the
+/// unlifted parcels' parent edges.
 ///
 /// # Arguments
-/// * `head`     - A user pallet head.
 /// * `unlifted` - The parcels from [`unlifted_parcels`].
 /// * `touching` - The unlifted parcels that changed a pruned path.
-fn reaches_any(head: &str, unlifted: &HashSet<String>, touching: &HashSet<String>) -> Result<bool, String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut frontier: Vec<String> = vec![head.to_string()];
+fn leading_to_touching(unlifted: &HashSet<String>, touching: &HashSet<String>) -> Result<HashSet<String>, String> {
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
 
-    while let Some(hash) = frontier.pop() {
-        if !unlifted.contains(&hash) || !seen.insert(hash.clone()) {
+    for parcel in unlifted {
+        if !file_utils::is_present_for_sweep(parcel)? {
             continue;
         }
 
-        if touching.contains(&hash) {
-            return Ok(true);
+        for parent in object_utils::load_parcel(parcel)?.parents {
+            if unlifted.contains(&parent) {
+                children.entry(parent).or_default().push(parcel.clone());
+            }
         }
-
-        if !file_utils::is_present_for_sweep(&hash)? {
-            continue;
-        }
-
-        frontier.extend(object_utils::load_parcel(&hash)?.parents);
     }
 
-    Ok(false)
+    let mut leading: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<String> = touching.iter().cloned().collect();
+
+    while let Some(hash) = frontier.pop() {
+        if leading.insert(hash.clone()) {
+            frontier.extend(children.remove(&hash).unwrap_or_default());
+        }
+    }
+
+    Ok(leading)
 }
 
 /// Delete the planned loose objects, reclaiming their disk. Content objects (trees, blobs)
@@ -1024,6 +1032,17 @@ mod tests {
         assert_eq!(plan.to_free, vec![f.web_blob.clone()], "only the parent's unread blob is freed");
         assert_eq!(plan.kept_unlifted, 3);
         assert_eq!(plan.unlifted_pallets, vec!["main".to_string()]);
+
+        // An unlifted parcel on top that leaves src/web alone still leads to the change, so the
+        // pallet is still named.
+        let grandchild = store_parcel(&root_tree_v2, vec![child.clone()]);
+        pallet_utils::update_pallet_head(
+            "main", Some(child.as_str()), &grandchild, &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &store_access())
+            .unwrap();
+        assert_eq!(plan.kept_unlifted, 3);
+        assert_eq!(plan.unlifted_pallets, vec!["main".to_string()], "named through its descendant head");
 
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[child], &store_access()).unwrap();
         for freed in [&f.web_tree, &f.web_blob, &web_tree_v2, &web_blob_v2] {
