@@ -1424,7 +1424,8 @@ struct WalkRoots {
     /// The head every haul not yet merged proposes ([`GcRootSources::haul_heads`]), walked like a
     /// `Gap`-policy pin: a haul opened elsewhere declares a head this warehouse may never have
     /// fetched, so its absence is never reported as a dangling reference. No note names one
-    /// either: `haul merge` says so when it needs the head.
+    /// either: `haul merge` says so when it needs the head. Like a `Gap` pin, this cannot tell a
+    /// head never fetched from one held here and then lost to damage: both read as absent.
     haul_heads: Vec<String>,
     /// Object hashes a staged inventory shard (of any bay) references directly (never through a
     /// parcel), with the entry's type (so a chunked file's recipe is still descended into for its

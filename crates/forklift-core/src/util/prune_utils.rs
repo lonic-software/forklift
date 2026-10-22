@@ -488,7 +488,7 @@ fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
 /// targets through them.
 struct LocalRoots {
     /// Every parcel reachable from a bay's base or parked parcel, an in-progress consolidation or
-    /// cherry-pick, a haul not yet merged, or a trust pin, in any bay, that the pallet heads do not already reach. Walked scoped, like history.
+    /// cherry-pick, or a trust pin, in any bay, that the pallet heads do not already reach. Walked scoped, like history.
     parcels: Vec<String>,
     /// Every staged inventory shard leaf, in any bay. Retained whatever its path.
     staged: Vec<(String, DirEntryType)>,
