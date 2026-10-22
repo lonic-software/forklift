@@ -574,6 +574,33 @@ pub fn all_bay_state_dirs() -> Result<Vec<PathBuf>, String> {
     Ok(dirs)
 }
 
+/// Every checkout whose position names `pallet`, the main tree's first: `(which, position)`, with
+/// `which` naming the checkout for a refusal ("the warehouse's own working tree", "bay \"x\"").
+/// Positions are written without the ref lock, so the answer can be stale by the time it is used.
+///
+/// # Returns
+/// * `Ok(Vec<(String, BayPosition)>)` - The checkouts standing on `pallet`, with their positions.
+/// * `Err(String)`                    - If the bays could not be listed, or a position could not be
+///                                      read (that checkout might stand on `pallet`), naming it.
+pub fn bays_on(pallet: &str) -> Result<Vec<(String, pallet_utils::BayPosition)>, String> {
+    let checkouts = std::iter::once(("the warehouse's own working tree".to_string(), forklift_root()))
+        .chain(list_bays()?.into_iter().map(|name| (format!("bay \"{}\"", name), bay_state_dir(&name))));
+
+    let mut on = Vec::new();
+
+    for (which, dir) in checkouts {
+        let position = pallet_utils::read_position_in(&dir).map_err(|error| format!(
+            "Cannot tell whether {} stands on pallet \"{}\": {}", which, pallet, error
+        ))?;
+
+        if position.pallet == pallet {
+            on.push((which, position));
+        }
+    }
+
+    Ok(on)
+}
+
 /// How [`collect_bay_scoped_parcel_roots`] treats a bay whose `parked`/`consolidation` state
 /// cannot be read.
 ///
