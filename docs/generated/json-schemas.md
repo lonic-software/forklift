@@ -1144,6 +1144,17 @@ A command not listed here either reports only the generic human-message shape `{
         "id": {
           "type": "string"
         },
+        "merge_proof": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeProofLine"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this warehouse proves about the recorded merge; present exactly when merged."
+        },
         "source": {
           "type": "string"
         },
@@ -1164,6 +1175,26 @@ A command not listed here either reports only the generic human-message shape `{
         "target",
         "status",
         "approvals"
+      ],
+      "type": "object"
+    },
+    "MergeProofLine": {
+      "description": "What the local warehouse proves about a merged haul's recorded merge. A merge is recorded by\na writer of the target; this is judged on read, against the history held here.",
+      "properties": {
+        "reason": {
+          "description": "Absent when verified. Refuted: `head_not_contained`. Unproven: `parcel_not_held`,\n`target_not_held`, `not_on_target` or `history_unreadable`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verdict": {
+          "description": "`verified` (the merge parcel contains the haul's head, and the target here contains the\nparcel), `refuted` (the merge parcel held here does not contain the head) or `unproven`.\nA reader meeting any other value treats it as not verified.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict"
       ],
       "type": "object"
     },
@@ -1236,6 +1267,26 @@ A command not listed here either reports only the generic human-message shape `{
         "author",
         "body",
         "commented_at"
+      ],
+      "type": "object"
+    },
+    "MergeProofLine": {
+      "description": "What the local warehouse proves about a merged haul's recorded merge. A merge is recorded by\na writer of the target; this is judged on read, against the history held here.",
+      "properties": {
+        "reason": {
+          "description": "Absent when verified. Refuted: `head_not_contained`. Unproven: `parcel_not_held`,\n`target_not_held`, `not_on_target` or `history_unreadable`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verdict": {
+          "description": "`verified` (the merge parcel contains the haul's head, and the target here contains the\nparcel), `refuted` (the merge parcel held here does not contain the head) or `unproven`.\nA reader meeting any other value treats it as not verified.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict"
       ],
       "type": "object"
     },
@@ -1321,6 +1372,17 @@ A command not listed here either reports only the generic human-message shape `{
         "string",
         "null"
       ]
+    },
+    "merge_proof": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MergeProofLine"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What this warehouse proves about the recorded merge; present exactly when merged."
     },
     "opened_at": {
       "format": "int64",

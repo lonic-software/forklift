@@ -218,9 +218,16 @@ The pallet rules, checked wherever the content check runs:
 - `opened` is written once, by the operator it names, at the id its value derives, in the same
   parcel as a `state` that reads open, and is never changed or removed.
 - No other cell may exist in a haul directory without its `opened`.
-- `state` is never removed, and never changed once it reads merged. Anyone may close, reopen or
-  merge at the current head; only the opener moves the head, to any parcel (a review of an
-  earlier head stops counting). Because the status and head are one cell, a merge always records
+- `state` is never removed, and never changed once it reads merged. Anyone may close or reopen
+  at the current head; only the opener moves the head, to any parcel (a review of an earlier
+  head stops counting). A state that reads merged is admitted only from an operator whose user
+  record may write the haul's target — an admin, a writer of every pallet, or a writer granted
+  the target — since the record says the target took the haul. The rule binds where a parcel is
+  first admitted (stacking it, a remote accepting its lift); a warehouse adopting a remote's
+  already-admitted @haul audits only the signatures and the other rules, so a merge whose signer
+  has since lost write on the target stays. A fresh remote admits the whole history against its
+  current office, so such a merge is refused there, naming its signer and target; an admin who
+  grants the signer write on the target again lets it lift. Because the status and head are one cell, a merge always records
   the head it merged, and an update racing a close or a merge is a conflict on that cell rather
   than two clean changes.
 - `review/<op>` and `comment/<op>/…` are written or removed only by the operator `op` names.
@@ -236,9 +243,25 @@ a haul's state — a close, a reopen, an update, a merge — are a conflict on `
 `ours` over the opener's update replays the old head, so only the opener can; anyone else keeps
 `theirs` and runs the merge or close again.
 
-A `merged` status names the parcel the merge stacked, but nothing yet checks that the parcel
-exists or contains the haul's head, nor who may merge: any operator in the office can record
-one. Treat it as a signed claim by its writer, not as proof of the merge.
+A `merged` status names the parcel the merge stacked. The record is a signed claim by a writer of
+the target; a reader judges it on read against what its own warehouse holds, as its merge proof:
+
+- `verified` — the parcel contains the haul's head, and the local target contains the parcel;
+- `refuted` (`head_not_contained`) — the parcel is held here and does not contain the head;
+- `unproven` — neither, because the parcel is not held here (`parcel_not_held`), the target has
+  no head here (`target_not_held`), the target here does not contain the parcel
+  (`not_on_target`), or the history the answer needs could not be read (`history_unreadable`).
+  None of these says the record is false: a warehouse behind its remote reads the same.
+
+A lift of `@haul` (and the replay a diverged `lower` lifts) holds back a merge record whose parcel
+is in the history of the local target while the remote's target is not known to hold it — the
+remote has no such pallet, its head is not held here, or it is held without the parcel — so a
+remote never holds a final merge before the parcel it names. `lift` lifts `@haul` after the
+working pallet, whatever that lift's outcome, counting a head it just landed; the other meta
+pallets lift first. A held `@haul` fails as a meta pallet naming each haul, parcel and target. It
+goes once an operator who may write the target lifts it there (lowering it first when the
+remote's head is not held here). A record whose parcel is on no local target, or whose target is
+not held here, goes through: waiting would not bring that parcel.
 
 ## Record formats (TOML)
 A user record:
