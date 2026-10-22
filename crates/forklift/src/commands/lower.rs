@@ -616,12 +616,19 @@ async fn replay(client: &RemoteClient,
     // The remote already holds the replay, so a refusal says so rather than "nothing was written".
     match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &office.preconditions()) {
         Ok(()) => {}
-        Err(pallet_utils::RefUpdateError::OfficeMoved { .. } | pallet_utils::RefUpdateError::AnchorMoved) => return Err(format!(
-            "{} was lifted to the remote, but its local head was not moved: the office or the trust \
-            anchor it was signed under changed here meanwhile. Run \"forklift lower\" again to catch up.",
-            wire
-        )),
-        Err(error) => return Err(error.into()),
+        Err(pallet_utils::RefUpdateError::Failed(why)) => return Err(why),
+        Err(refused) => {
+            let why = match refused {
+                pallet_utils::RefUpdateError::Moved(_) => "another bay or process moved it here meanwhile",
+                _ => "the office or the trust anchor it was signed under changed here meanwhile",
+            };
+
+            return Err(format!(
+                "{} was lifted to the remote, but its local head was not moved: {}. Run \"forklift \
+                lower\" again to catch up.",
+                wire, why
+            ));
+        }
     }
     restamped.extend(resigned);
 
