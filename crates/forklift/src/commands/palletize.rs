@@ -263,8 +263,9 @@ fn refuse_an_open_haul(pallet: &str, hauls: &haul_utils::HaulsRead) -> Result<Ve
 /// here (no local write can remove a remote head, so that needs no precondition). Neither is a
 /// refusal naming `--force`.
 async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPreconditions), String> {
-    // A history that cannot be read is reported, never taken as "does not hold it": that answer
-    // would steer the user to "--force".
+    // A history that cannot be read is never taken as "does not hold it", which would steer the
+    // user to "--force": the first such error is the refusal when nothing else holds the work.
+    let mut unreadable: Option<String> = None;
     let reaches = |which: &str, other: &str| -> Result<bool, String> {
         if other == head {
             return Ok(true);
@@ -281,7 +282,15 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
             continue;
         }
 
-        if reaches(&format!("pallet \"{}\"", reference.name), &other)? {
+        let held = match reaches(&format!("pallet \"{}\"", reference.name), &other) {
+            Ok(held) => held,
+            Err(e) => {
+                unreadable.get_or_insert(e);
+                false
+            }
+        };
+
+        if held {
             let preconditions = RefPreconditions {
                 pallets: PalletsPrecondition::Witness { pallet: reference.name.clone(), head: other },
                 ..RefPreconditions::NONE
@@ -301,7 +310,7 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
     );
 
     if !RemoteClient::is_configured() {
-        return Err(unheld);
+        return Err(unreadable.unwrap_or(unheld));
     }
 
     let note = "The delete asks the remote whether it holds the pallet's work; nothing was deleted.";
@@ -311,9 +320,18 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
 
     let mut held = false;
     for (wire, other) in &info.pallets {
-        if file_utils::does_object_exist(other)? && reaches(&format!("the remote's pallet \"{}\"", wire), other)? {
-            held = true;
-            break;
+        let reached = file_utils::does_object_exist(other)
+            .and_then(|present| Ok(present && reaches(&format!("the remote's pallet \"{}\"", wire), other)?));
+
+        match reached {
+            Ok(true) => {
+                held = true;
+                break;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                unreadable.get_or_insert(e);
+            }
         }
     }
 
@@ -321,7 +339,7 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
         return Ok((Some("the remote".to_string()), RefPreconditions::NONE));
     }
 
-    Err(format!("{} Neither does the remote.", unheld))
+    Err(unreadable.unwrap_or(format!("{} Neither does the remote.", unheld)))
 }
 
 /// A deleted pallet.
@@ -703,7 +721,12 @@ mod tests {
 
         let refused = test_support::block_on(delete_pallet("side", false)).unwrap_err();
         assert!(refused.contains("Cannot tell whether pallet \"x\" holds the work"), "{}", refused);
-        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(side));
+        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(side.clone()));
+
+        // A witness listed after the unreadable one still holds the work.
+        pallet_utils::update_pallet_head("y", None, &side, &none).unwrap();
+        test_support::block_on(delete_pallet("side", false)).unwrap();
+        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
     }
 
     #[test]

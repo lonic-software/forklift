@@ -985,7 +985,8 @@ pub enum Command {
                       the inventory stay as they are (like git's \"reset --soft HEAD~1\"), so the \
                       undone changes are staged again and can be re-stacked — e.g. with a \
                       corrected message or author. A shift is reversed by shifting back. Undo \
-                      reverses only the user's last operation: if the current pallet has been \
+                      reverses only the user's last operation: except for a pallet delete, which \
+                      changed nothing in the bay, if the current pallet has been \
                       switched (e.g. by palletize or deliver), its head has moved, or a \
                       consolidation or cherry-pick was started or finished since the journaled \
                       operation, it refuses \

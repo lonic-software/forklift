@@ -1023,7 +1023,8 @@ was deleted at. It refuses:
   the history held here). The output says what holds it.
 
 While the delete is in the bay's undo journal, its head is kept by `gc`, by automatic and manual
-repacks and by `scope prune`, so `undo` can always bring it back. That window ends when the
+repacks and by `scope prune`, so its history stays here for `undo` to bring back — once the
+delete is the last entry again, and subject to the checks below. That window ends when the
 delete is undone, when 100 later journaled operations in that bay push it out, or when the bay is
 removed (`bay remove`); after that, work no other pallet holds is collectable. With `--json` the
 delete reports `pallet`, `head`, `contained_by` (`pallet "<name>"`, `the remote`, or `null`

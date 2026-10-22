@@ -519,32 +519,34 @@ pub fn restore_deleted(entry: &JournalEntry, as_name: Option<&str>) -> Result<Re
 
     let restored = |outcome| RestoredPallet { deleted: wire.clone(), name: name.clone(), head: head.clone(), outcome };
 
-    let refs = pallet_utils::all_pallet_refs()?;
-    let users = || refs.iter().filter(|(reference, _)| reference.namespace == PalletNamespace::User);
-
-    if let Some((_, found)) = users().find(|(reference, _)| reference.name == name) {
+    // A read error is reported once no colliding pallet below explains it.
+    let exact = pallet_utils::get_pallet_head_in(PalletNamespace::User, &name);
+    if let Ok(Some(found)) = &exact {
         return settle_on(&wire, &name, as_name.is_some(), &head, Some(found.clone())).map(restored);
     }
 
     // The delete pruned emptied ref folders, so a pallet created since can stand where the ref
     // would go: a folder of the name, or under it.
     let nested = |outer: &str, inner: &str| inner.starts_with(&format!("{}/", outer));
-    if let Some((other, _)) = users().find(|(reference, _)| nested(&reference.name, &name) || nested(&name, &reference.name)) {
+    let users = pallet_utils::list_pallets_in(PalletNamespace::User)?;
+    if let Some(other) = users.iter().find(|other| nested(other, &name) || nested(&name, other)) {
         return Err(match as_name {
             Some(_) => format!(
                 "Pallet name \"{}\" collides with pallet \"{}\" (one name is a folder of the \
                 other); bring deleted pallet \"{}\" back under another name. Nothing was undone.",
-                name, other.name, wire
+                name, other, wire
             ),
             None => format!(
                 "Pallet \"{}\" was deleted at {}, and pallet \"{}\" now stands where its ref \
                 would go (one name is a folder of the other). Undo will not overwrite it. To bring \
                 the deleted pallet back under another name, run \"forklift undo --as <new-name>\". \
                 Nothing was undone.",
-                wire, head, other.name
+                wire, head, other
             ),
         });
     }
+
+    exact?;
 
     refuse_a_bay_out_of_step(&name, &head, as_name)?;
 
@@ -714,6 +716,9 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// A bay that matches is still refused when the entry would put back a cherry-pick whose source
 /// this store no longer holds (see [`refuse_a_pick_without_its_source`]).
 ///
+/// A delete is never refused here, nor is the bay read for it: it changed no bay state and puts
+/// none back, so nothing the bay did since stands between it and its undo.
+///
 /// # Arguments
 /// * `entry` - The entry `undo` is about to reverse.
 ///
@@ -722,14 +727,12 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// * `Err(String)` - The refusal, naming what differs or the lost pick source; or the state could
 ///                   not be read.
 pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
-    let now = BayState::read()?;
-    let after = entry.after.bay_state();
-
-    // A delete changed no bay state and puts back none, so nothing the bay did since stands in
-    // the way of bringing its pallet back.
     if entry.op == DELETE_OP {
         return Ok(());
     }
+
+    let now = BayState::read()?;
+    let after = entry.after.bay_state();
 
     if now == after {
         return refuse_a_pick_without_its_source(entry);
