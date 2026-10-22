@@ -1000,15 +1000,17 @@ mod tests {
         assert_eq!(test_support::block_on(handle_command("feature")).unwrap_err(), "crashed");
         operation_utils::forget_raised_for_tests();
 
-        // The merge wrote their b.txt; the user then wrote over it, before running heal.
+        // The merge wrote their b.txt and added new.txt; the user then wrote over both, before
+        // running heal.
         std::fs::write(warehouse.root.join("b.txt"), b"notes\n").unwrap();
+        std::fs::write(warehouse.root.join("new.txt"), b"mine\n").unwrap();
 
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
         assert_eq!(recovery.outcome, RecoveryOutcome::RolledBack);
         assert_eq!(recovery.unheld, vec!["b.txt".to_string()], "the edit is reported, not overwritten");
         assert!(test_support::file_holds(&warehouse.root, "b.txt", b"notes\n"));
-        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"ours\n") && !warehouse.root.join("new.txt").exists(),
-            "every file the merge left as it wrote it is put back");
+        assert!(test_support::file_holds(&warehouse.root, "new.txt", b"mine\n"), "an edited addition is not removed");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"ours\n"), "a file the merge left as it wrote it is put back");
         assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("main", Some(our_head)));
         let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
         assert!(staged.is_empty(), "staging is at our tree");
@@ -1045,6 +1047,38 @@ mod tests {
         assert_eq!(recovery.outcome, RecoveryOutcome::RolledBack);
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere), "the other bay's parcel stands");
         assert_back_at_ours(&warehouse.root, &our_head, &our_tree);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_whose_stack_fails_before_recording_its_parcel_leaves_it_to_its_consolidation_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _warehouse = Warehouse::with_working_tree("consolidate-merge-stack-fails");
+        a_clean_merge_on_main();
+
+        // Every object directory refuses writes, so the stack fails before its parcel exists.
+        fn set_dirs(dir: &std::path::Path, mode: u32) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { set_dirs(&path, mode); }
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let objects = std::path::PathBuf::from(file_utils::get_path_objects_root());
+        let locked = objects.clone();
+        BEFORE_MERGE_STACK.with(|seam| seam.set(Some(Box::new(move || set_dirs(&locked, 0o555)))));
+
+        let result = test_support::block_on(handle_command("feature"));
+        set_dirs(&objects, 0o755);
+        result.expect_err("a merge whose stack failed must not report success");
+        operation_utils::forget_raised_for_tests();
+
+        // Its consolidation state owns the bay now, as at conflicts: `stack` completes it.
+        assert!(operation_utils::read().unwrap().is_none(), "no interrupted operation stands");
+        assert!(merge_utils::read_consolidation_state().unwrap().is_some());
+        let (parcel, _) = test_support::block_on(stack_utils::stack_parcel(None, None)).expect("stack completes the merge");
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(parcel));
     }
 
     /// A fast-forward of "main" (checked out) to "feature", crashed just before its head write;
