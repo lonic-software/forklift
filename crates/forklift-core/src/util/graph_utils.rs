@@ -924,8 +924,10 @@ const PARALLEL_FILTER_THRESHOLD: usize = 64;
 /// # Returns
 /// * `Ok(usize)`   - How many of `parcels`, from the front, have a record; every filter among them
 ///   that could be computed is stored. On a first-parent chain, no parcel past that count can
-///   ever get a record in this store: its ancestry holds the one that could not be resolved, so
-///   [`path_maybe_changed`] on it walks that ancestry again only to fail where this pass did.
+///   get a record while the store stays as it is: its ancestry holds the one that could not be
+///   resolved, so [`path_maybe_changed`] on it walks that ancestry again only to fail where this
+///   pass did. The count describes this call only: once the missing parcel arrives (a fetch, a
+///   heal), the same parcels resolve, so it must not be kept across calls.
 /// * `Err(String)` - If the cache lock was poisoned.
 pub fn ensure_path_filters(parcels: &[String]) -> Result<usize, String> {
     let root = file_utils::get_path_graph_root();

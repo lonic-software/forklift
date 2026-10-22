@@ -396,12 +396,18 @@ if [ -z "${BLAME_FILE:-}" ]; then
             | while read -r f; do [ -f "$A/$f" ] && { echo "$f"; break; }; done || true)
     fi
 fi
-if [ -n "$BLAME_FILE" ]; then
-    GM=$(time_cmd "$RUNS" "$A" "" "git blame --first-parent $BLAME_FILE")
-    FM=$(time_cmd "$RUNS" "$B" "" "forklift blame $BLAME_FILE")
-    add_row "blame (one file)" "$GM" "$FM" "$BLAME_FILE, first-parent"
-else
+# Quoted once for both readers of the command line: run_in's eval and hyperfine -N's word
+# splitting each take a backslash-escaped name as one argument.
+BLAME_ARG=$(printf '%q' "${BLAME_FILE:-}")
+if [ -z "$BLAME_FILE" ]; then
     echo "  (no tracked file to blame; skipping the row)"
+elif ! ( cd "$B" && eval "forklift blame $BLAME_ARG" ) >/dev/null 2>&1; then
+    # A file forklift cannot blame (one stored in chunks, say) costs this row, not the run.
+    echo "  (forklift cannot blame $BLAME_FILE; skipping the row)"
+else
+    GM=$(time_cmd "$RUNS" "$A" "" "git blame --first-parent $BLAME_ARG")
+    FM=$(time_cmd "$RUNS" "$B" "" "forklift blame $BLAME_ARG")
+    add_row "blame (one file)" "$GM" "$FM" "$BLAME_FILE, first-parent"
 fi
 
 # ── shared by the commit and diff steps ───────────────────────────────────
@@ -458,7 +464,7 @@ expect_clean() {
     fi
 }
 
-# ── 4. commit / stack (per-run setup: make + stage a one-line change) ───────
+# ── 5. commit / stack (per-run setup: make + stage a one-line change) ───────
 echo "→ [5/6] commit…"
 # Runs before the diff step, on the clean tree onboarding left, so nothing has to be
 # reset first: a reset would be a different operation per tool, and forklift's state
@@ -479,7 +485,7 @@ expect_clean "after the commit step (a timed commit left something behind)"
 add_row "commit (1 file)" "$GM" "$FM" "git commit vs forklift stack, staging untimed"
 add_row "commit, git fsync=all" "$GDM" "$FM" "same, git with core.fsync=all core.fsyncMethod=fsync"
 
-# ── 5. diff of a dirty tree ─────────────────────────────────────────────────
+# ── 6. diff of a dirty tree ─────────────────────────────────────────────────
 echo "→ [6/6] diff…"
 # Dirty the edit set in both copies, then diff read-only, twice: unstaged (working
 # directory vs index/inventory), then staged (index/inventory vs head) after staging

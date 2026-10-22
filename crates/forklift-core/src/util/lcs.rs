@@ -64,6 +64,25 @@ pub fn lcs_matches<T: Eq>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
 /// # Returns
 /// * `Vec<Option<usize>>` - One entry per element of `a`; matched indices increase.
 pub fn myers_matches<T: Eq>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
+    myers_matches_within(a, b, u64::MAX).expect("an unbounded search always finishes")
+}
+
+/// [`myers_matches`], giving up once the search has taken `budget` steps (a step being one
+/// diagonal visited or one equal pair walked). Two long inputs with little in common cost
+/// about the product of their lengths even under Myers; a caller with a fallback for that case
+/// bounds it here instead of by the inputs' lengths, which would also refuse a long input
+/// edited lightly.
+///
+/// # Arguments
+/// * `a` - The first slice (the returned vector has one entry per element).
+/// * `b` - The second slice.
+/// * `budget` - The most steps to take.
+///
+/// # Returns
+/// * `Some(Vec<Option<usize>>)` - As [`myers_matches`] returns.
+/// * `None` - The budget ran out first.
+pub fn myers_matches_within<T: Eq>(a: &[T], b: &[T], budget: u64) -> Option<Vec<Option<usize>>> {
+    let mut budget = budget;
     let mut matches = vec![None; a.len()];
     let mut work = vec![(0..a.len(), 0..b.len())];
 
@@ -86,7 +105,7 @@ pub fn myers_matches<T: Eq>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
         }
 
         let (x_start, y_start, x_end, y_end) =
-            middle_snake(&a[old.clone()], &b[new.clone()]);
+            middle_snake(&a[old.clone()], &b[new.clone()], &mut budget)?;
         for offset in 0..x_end - x_start {
             matches[old.start + x_start + offset] = Some(new.start + y_start + offset);
         }
@@ -94,7 +113,7 @@ pub fn myers_matches<T: Eq>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
         work.push((old.start + x_end..old.end, new.start + y_end..new.end));
     }
 
-    matches
+    Some(matches)
 }
 
 /// Shift each run of unmatched elements of `matches` (from `a` to `b`) along equal neighbours to
@@ -271,8 +290,9 @@ fn slide_side<T: Eq>(lines: &[T], changed: &mut [bool], other: &[bool]) {
 /// is forward diagonal `k`, and a reversed x of `r` is a forward x of `n - r`.
 ///
 /// # Returns
-/// * `(usize, usize, usize, usize)` - `(x_start, y_start, x_end, y_end)`.
-fn middle_snake<T: Eq>(a: &[T], b: &[T]) -> (usize, usize, usize, usize) {
+/// * `Some((usize, usize, usize, usize))` - `(x_start, y_start, x_end, y_end)`.
+/// * `None` - `budget` ran out first (each diagonal visited and each equal pair walked costs one).
+fn middle_snake<T: Eq>(a: &[T], b: &[T], budget: &mut u64) -> Option<(usize, usize, usize, usize)> {
     let n = a.len() as isize;
     let m = b.len() as isize;
     let delta = n - m;
@@ -294,6 +314,10 @@ fn middle_snake<T: Eq>(a: &[T], b: &[T]) -> (usize, usize, usize, usize) {
     };
 
     for d in 0..=max {
+        // Each round visits 2d + 2 diagonals and walks at most n + m equal pairs between them.
+        let round = 2 * d as u64 + 2 + (n + m) as u64;
+        *budget = budget.checked_sub(round)?;
+
         let mut k = -d;
         while k <= d {
             let x_start = step(&forward, k, d);
@@ -308,7 +332,7 @@ fn middle_snake<T: Eq>(a: &[T], b: &[T]) -> (usize, usize, usize, usize) {
             // An odd delta meets a reverse path of d - 1 steps on this diagonal.
             let reverse_k = delta - k;
             if odd && reverse_k.abs() < d && x + reverse[(reverse_k + offset) as usize] >= n {
-                return (x_start as usize, y_start as usize, x as usize, y as usize);
+                return Some((x_start as usize, y_start as usize, x as usize, y as usize));
             }
             k += 2;
         }
@@ -327,7 +351,8 @@ fn middle_snake<T: Eq>(a: &[T], b: &[T]) -> (usize, usize, usize, usize) {
             // An even delta meets a forward path of d steps on this diagonal.
             let forward_k = delta - k;
             if !odd && forward_k.abs() <= d && r + forward[(forward_k + offset) as usize] >= n {
-                return ((n - r) as usize, (m - s) as usize, (n - r_start) as usize, (m - s_start) as usize);
+                let (x_start, y_start) = ((n - r) as usize, (m - s) as usize);
+                return Some((x_start, y_start, (n - r_start) as usize, (m - s_start) as usize));
             }
             k += 2;
         }
@@ -421,6 +446,18 @@ mod tests {
 
         assert_eq!(slide_changes(&a, &b, &[None, Some(1)]), vec![None, Some(1)]);
         assert_eq!(slide_changes(&a, &b, &[Some(1), None]), vec![None, Some(1)]);
+    }
+
+    #[test]
+    fn a_bounded_search_gives_up_on_unrelated_inputs_but_not_on_similar_ones() {
+        // Two unrelated 2,000-element inputs need D = 4,000 rounds; one edit needs one.
+        let a: Vec<u32> = (0..2_000).collect();
+        let unrelated: Vec<u32> = (2_000..4_000).rev().collect();
+        let mut edited = a.clone();
+        edited[1_000] = u32::MAX;
+
+        assert_eq!(myers_matches_within(&a, &unrelated, 1_000_000), None);
+        assert_eq!(myers_matches_within(&a, &edited, 1_000_000), Some(myers_matches(&a, &edited)));
     }
 
     #[test]

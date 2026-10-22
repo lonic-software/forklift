@@ -19,12 +19,12 @@
 use std::collections::HashMap;
 use crate::util::{graph_utils, lcs, object_utils};
 
-/// Above this many lines (per side), the line-level attribution is skipped for a version
-/// and its whole content is attributed to the introducing parcel. Myers' cost grows with the
-/// lines that changed, so a long file edited lightly is cheap; this bounds the case it is not
-/// cheap for, a long file rewritten wholesale, where the cost approaches the product of the
-/// two versions' lengths.
-const MAX_BLAME_LINES: usize = 20_000;
+/// The most steps the match of one version may take (see [`lcs::myers_matches_within`]), a
+/// fraction of a second. A version whose match would take more (two long versions with many
+/// shared lines in a thoroughly different order) skips the line-level attribution, and its
+/// whole content is attributed to the introducing parcel. Its length alone never does: a long
+/// file edited lightly costs about its length.
+const MAX_BLAME_STEPS: u64 = 50_000_000;
 
 /// One attributed line of the blamed file.
 pub struct BlameLine {
@@ -81,10 +81,10 @@ pub fn blame(head: &str, path: &str) -> Result<FileBlame, String> {
 
     // Fill the filters the walk below queries in one batched pass, so a cold graph is written a
     // shard at a time per batch rather than once per parcel. Best-effort: each query still
-    // computes whatever this left missing. Past the parcels it could record (a merge whose other
-    // parent is missing from a partial or damaged store), a query would walk the same ancestry
-    // back to the same missing parcel, once per parcel above it; those parcels go straight to the
-    // tree check instead.
+    // computes whatever this left missing. Past the parcels it could record (typically a merge
+    // whose other parent is missing from a partial or damaged store, but any failure to record
+    // counts), a query would walk the same ancestry to the same failure, once per parcel above
+    // it; those parcels go straight to the tree check, the answer a failed query falls back to.
     let recorded = graph_utils::ensure_path_filters(chain.get(1..).unwrap_or(&[]))
         .map_or(chain.len(), |count| count + 1);
 
@@ -148,6 +148,15 @@ fn intern<'a>(ids: &mut HashMap<&'a [u8], u32>, line: &'a [u8]) -> u32 {
     *ids.entry(line).or_insert(next)
 }
 
+/// Which ids, of `count`, occur in `line_ids`.
+fn present(line_ids: &[u32], count: usize) -> Vec<bool> {
+    let mut seen = vec![false; count];
+    for &id in line_ids {
+        seen[id as usize] = true;
+    }
+    seen
+}
+
 /// Attribute the lines of a new version of the file: a line that matches one of the
 /// previous version's lines (under a longest common subsequence) inherits its attribution;
 /// every other line is attributed to `parcel`, which introduced it.
@@ -157,28 +166,43 @@ fn intern<'a>(ids: &mut HashMap<&'a [u8], u32>, line: &'a [u8]) -> u32 {
 /// spent nearly all of a 13 s blame of git.git's 4,000-line Makefile. Where several
 /// subsequences are equally long, the changed runs are then slid to where git's diff puts them,
 /// so a repeated line (a blank, a closing brace) mostly keeps the parcel git's blame credits
-/// it to.
-/// The display diff's histogram match was measured too and rejected: on that file it credited
+/// it to. The display diff's histogram match was measured too and rejected: on that file it credited
 /// one parcel with 312 lines where git and the longest subsequence credit it with 9.
 fn attribute_version(previous: &[BlameLine], content: &[u8], parcel: &str) -> Vec<BlameLine> {
     let new_lines = split_lines(content);
-
-    // Over the guard, skip the match and attribute the whole version to the introducing
-    // parcel: coarse, but bounded (large generated/data files, rarely blamed).
-    if previous.len() > MAX_BLAME_LINES || new_lines.len() > MAX_BLAME_LINES {
-        return new_lines.into_iter()
-            .map(|line| BlameLine { content: line.to_vec(), parcel: parcel.to_string() })
-            .collect();
-    }
 
     // Lines as small integer ids, so the matcher compares integers, not line bytes.
     let mut ids: HashMap<&[u8], u32> = HashMap::new();
     let old_ids: Vec<u32> = previous.iter().map(|line| intern(&mut ids, &line.content)).collect();
     let new_ids: Vec<u32> = new_lines.iter().map(|line| intern(&mut ids, line)).collect();
 
+    // A line only one side holds can never match, so the search runs without them: the
+    // longest subsequence is the same, and a version that rewrote most of the file leaves
+    // little to search. `old_kept[i]` is the old line the i-th searched one stands for.
+    let in_old = present(&old_ids, ids.len());
+    let in_new = present(&new_ids, ids.len());
+    let old_kept: Vec<usize> = (0..old_ids.len()).filter(|&i| in_new[old_ids[i] as usize]).collect();
+    let new_kept: Vec<usize> = (0..new_ids.len()).filter(|&j| in_old[new_ids[j] as usize]).collect();
+    let old_searched: Vec<u32> = old_kept.iter().map(|&i| old_ids[i]).collect();
+    let new_searched: Vec<u32> = new_kept.iter().map(|&j| new_ids[j]).collect();
+
+    // Past the budget, skip the match and attribute the whole version to the introducing
+    // parcel: coarse, but bounded.
+    let Some(searched) = lcs::myers_matches_within(&old_searched, &new_searched, MAX_BLAME_STEPS) else {
+        return new_lines.into_iter()
+            .map(|line| BlameLine { content: line.to_vec(), parcel: parcel.to_string() })
+            .collect();
+    };
+    let mut found = vec![None; old_ids.len()];
+    for (index, matched) in searched.iter().enumerate() {
+        if let Some(new_index) = matched {
+            found[old_kept[index]] = Some(new_kept[*new_index]);
+        }
+    }
+
     // For each old line, the new line it maps to (or none). A new line so matched inherits
     // the old line's attribution.
-    let matches = lcs::slide_changes(&old_ids, &new_ids, &lcs::myers_matches(&old_ids, &new_ids));
+    let matches = lcs::slide_changes(&old_ids, &new_ids, &found);
 
     let mut inherited: Vec<Option<&str>> = vec![None; new_lines.len()];
 
@@ -294,6 +318,36 @@ mod tests {
         let parcels: Vec<&str> = result.iter().map(|blame| blame.parcel.as_str()).collect();
 
         assert_eq!(parcels, vec!["P1", "P2", "P2"]);
+    }
+
+    #[test]
+    fn a_long_file_edited_lightly_keeps_its_line_level_attribution() {
+        // 30,000 lines, one of them changed: the match costs about the file's length, so its
+        // length alone must not send the version to the whole-file fallback.
+        let previous: Vec<BlameLine> = (0..30_000).map(|i| line(&format!("line {i}\n"), "P1")).collect();
+        let mut content: String = (0..30_000).map(|i| format!("line {i}\n")).collect();
+        content = content.replacen("line 15000\n", "changed\n", 1);
+
+        let result = attribute_version(&previous, content.as_bytes(), "P2");
+
+        assert_eq!(result.iter().filter(|blame| blame.parcel == "P2").count(), 1);
+        assert_eq!(result[15_000].parcel, "P2");
+    }
+
+    #[test]
+    fn a_version_past_the_step_budget_is_attributed_whole() {
+        // The two halves of 40,000 lines interleaved: every line is shared but no two neighbours
+        // stay together, so the shortest edit script is about 40,000 long and the search costs
+        // about the product of the lengths, past the budget. The version falls back to the
+        // introducing parcel rather than taking that long.
+        let previous: Vec<BlameLine> = (0..40_000).map(|i| line(&format!("{i}\n"), "P1")).collect();
+        let content: String = (0..40_000)
+            .map(|i| format!("{}\n", if i % 2 == 0 { i / 2 } else { 20_000 + i / 2 }))
+            .collect();
+
+        let result = attribute_version(&previous, content.as_bytes(), "P2");
+
+        assert!(result.iter().all(|blame| blame.parcel == "P2"));
     }
 
     #[test]

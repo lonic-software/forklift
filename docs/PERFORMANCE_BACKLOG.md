@@ -501,17 +501,23 @@ the cost. The second (per-version blob loads) was not.
   subsequences the one git's diff shows. Without that step, Myers alone agreed with git's
   blame less often than the old table did. The merge (diff3) keeps the exact table: it must
   stay exact, and its inputs are already bounded.
+- **The guard moved from length to work.** The old table needed a 20,000-line cap per side.
+  Myers on a long file edited lightly costs about its length, so blame now drops the lines only
+  one side holds (exact: they can never match, and a version that rewrote most of the file is
+  left with little to search) and gives each version's search a budget of 50 million steps
+  (`lcs::myers_matches_within`). A version past it falls back to crediting every line to its
+  parcel, as the length cap did.
 - **Attribution against `git blame --first-parent`** (lines whose author email and date both
   match; the identity mapping makes this a noisy measure, so compare the rows, not the
-  absolute numbers): exact table 3,041 of 4,143; Myers alone 2,916; Myers then slide 3,085.
-  On the lines where the new and old output differ, git agrees with the new output on 65
-  and with the old on 21.
+  absolute numbers): exact table 3,041 of 4,143; Myers alone 2,916; Myers then slide 3,091.
+  On the lines where the new and old output differ, git agrees with the new output on 68
+  and with the old on 18.
 
 | Warm `blame Makefile` (hyperfine) | before | after |
 |---|---|---|
-| wall time | 12.91 ± 0.22 s | 0.88 ± 0.01 s (14.6x) |
+| wall time | 12.91 ± 0.22 s | 0.91 ± 0.03 s (14.2x) |
 | peak memory | 1.4 GiB | 1.1 GiB |
-| `git blame --first-parent Makefile` | 0.30 s (42.6x faster) | 0.30 s (2.9x faster) |
+| `git blame --first-parent Makefile` | 0.30 s (42.6x faster) | 0.30 s (3.0x faster) |
 
 What is left: about 45% of the remaining samples rebuild trees through delta chains
 (`resolve_tree_file` → `reconstruct_record`, a chain of a dozen deltas or more). That is the
