@@ -69,7 +69,8 @@ bin/benchmark --repo git --out results.md --keep
 
 Options: `--runs N` (iterations for the fast read-only ops; default 20 under hyperfine,
 5 with the shell timer — the commit rows default to 10 and 3, set `COMMIT_RUNS` in the
-environment to change that),
+environment to change that; `BLAME_FILE` picks the blamed file, by default `Makefile` when
+the repo tracks one, else the file the last 1,000 first-parent commits changed most),
 `--work DIR` (where to build the copies; default a fresh temp dir),
 `--keep` (don't delete the work dir), `--out FILE` (append the results table),
 `--no-redelta` (skip the post-import densify pass and time the as-imported store —
@@ -85,6 +86,7 @@ in copy `B`:
 |-----------|-----|----------|
 | **status** (clean tree) | `git status` | `forklift stocktake --summary` |
 | **log** (whole history) | `git log` | `forklift history` |
+| **blame** (one file) | `git blame --first-parent <file>` | `forklift blame <file>` |
 | **diff, unstaged** (20 edited files) | `git diff` | `forklift diff` |
 | **diff, staged** (same 20, staged) | `git diff --staged` | `forklift diff --staged` |
 | **commit** (1 file) | `git commit` | `forklift stack` |

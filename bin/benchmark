@@ -40,8 +40,8 @@ fi
 #      densified store, the steady state a user who followed the suggestion is in.
 #      `--no-redelta` skips this (redelta re-encodes every object; on kernel-scale
 #      repos that is minutes of CPU) and times the as-imported store instead.
-#   3. Times the operations people actually run — onboard, status, log, diff,
-#      commit — for both tools and prints a markdown table with the ratio.
+#   3. Times the operations people actually run — onboard, status, log, blame,
+#      diff, commit — for both tools and prints a markdown table with the ratio.
 #
 # It times with hyperfine when hyperfine is on PATH (warm-up, many runs) and falls
 # back to a built-in shell timer otherwise, so nothing beyond git and forklift is
@@ -51,6 +51,8 @@ fi
 #
 # --runs N sets the read-only ops' run count; the environment variable COMMIT_RUNS sets
 # the commit rows' (defaults: 20 and 10 under hyperfine, 5 and 3 with the shell timer).
+# BLAME_FILE names the file the blame row blames (default: Makefile when the repo tracks
+# one, else the tracked file the last 1,000 first-parent commits changed most).
 #
 # Output is an aligned text table by default; pass --markdown for a table you can paste
 # into a doc. Onboarding (clone vs import-git) is reported separately, never as a ratio.
@@ -166,7 +168,7 @@ MAIN_REF=$(git -C "$A" symbolic-ref --short HEAD)
 echo "→ building the forklift working copy (B = copy of A)…"
 cp -a "$A" "$B"
 ( cd "$B" && forklift prepare >/dev/null )
-# forklift import-git itself is timed below, in step [1/5] — that IS the onboard cost.
+# forklift import-git itself is timed below, in step [1/6] — that IS the onboard cost.
 
 # ── repo shape (context for the report) ─────────────────────────────────────
 N_COMMITS=$(git -C "$A" rev-list --count HEAD)
@@ -284,7 +286,7 @@ render_table_markdown() {
 }
 
 # ── 1. onboard cost (single run; one-shot by nature) ────────────────────────
-echo "→ [1/5] onboard cost…"
+echo "→ [1/6] onboard cost…"
 # git: a fresh local clone from the mirror. forklift: import-git on an existing
 # checkout. Different work, same question — "time to bring this history under the
 # VCS" — so the note flags that they are not byte-identical operations.
@@ -371,16 +373,45 @@ fi
 # From here B is a fully imported, packed warehouse whose current pallet is '$MAIN_REF'.
 
 # ── 2. status on a clean tree ───────────────────────────────────────────────
-echo "→ [2/5] status…"
+echo "→ [2/6] status…"
 GM=$(time_cmd "$RUNS" "$A" "" 'git status')
 FM=$(time_cmd "$RUNS" "$B" "" 'forklift stocktake --summary')
 add_row "status (clean tree)" "$GM" "$FM" "git status vs forklift stocktake --summary"
 
 # ── 3. full-history log walk ────────────────────────────────────────────────
-echo "→ [3/5] log…"
+echo "→ [3/6] log…"
 GM=$(time_cmd "$RUNS" "$A" "" 'git log')
 FM=$(time_cmd "$RUNS" "$B" "" 'forklift history')
 add_row "log (whole history)" "$GM" "$FM" "$N_COMMITS commits walked"
+
+# ── 4. blame one long-lived file ────────────────────────────────────────────
+# forklift blame walks the first-parent chain, so git is timed with --first-parent too.
+echo "→ [4/6] blame…"
+if [ -z "${BLAME_FILE:-}" ]; then
+    if git -C "$A" ls-files --error-unmatch Makefile >/dev/null 2>&1; then
+        BLAME_FILE=Makefile
+    else
+        BLAME_FILE=$(git -C "$A" log --first-parent -n 1000 --format= --name-only \
+            | sort | uniq -c | sort -rn | sed 's/^ *[0-9]* //' \
+            | while read -r f; do [ -f "$A/$f" ] && { echo "$f"; break; }; done || true)
+    fi
+fi
+# Quoted once for both readers of the command line: run_in's eval and hyperfine -N's word
+# splitting each take a backslash-escaped name as one argument.
+BLAME_ARG=$(printf '%q' "${BLAME_FILE:-}")
+if [ -z "$BLAME_FILE" ]; then
+    echo "  (no tracked file to blame; skipping the row)"
+elif [ "${BLAME_ARG#\$\'}" != "$BLAME_ARG" ]; then
+    # %q falls back to $'...' for bytes the locale cannot print, which hyperfine cannot read.
+    echo "  ($BLAME_FILE needs quoting hyperfine cannot read; set BLAME_FILE; skipping the row)"
+elif ! ( cd "$B" && eval "forklift blame $BLAME_ARG" ) >/dev/null 2>&1; then
+    # A file forklift cannot blame (one stored in chunks, say) costs this row, not the run.
+    echo "  (forklift cannot blame $BLAME_FILE; skipping the row)"
+else
+    GM=$(time_cmd "$RUNS" "$A" "" "git blame --first-parent $BLAME_ARG")
+    FM=$(time_cmd "$RUNS" "$B" "" "forklift blame $BLAME_ARG")
+    add_row "blame (one file)" "$GM" "$FM" "$BLAME_FILE, first-parent"
+fi
 
 # ── shared by the commit and diff steps ───────────────────────────────────
 # The edit set: the same handful of tracked files in both copies.
@@ -436,8 +467,8 @@ expect_clean() {
     fi
 }
 
-# ── 4. commit / stack (per-run setup: make + stage a one-line change) ───────
-echo "→ [4/5] commit…"
+# ── 5. commit / stack (per-run setup: make + stage a one-line change) ───────
+echo "→ [5/6] commit…"
 # Runs before the diff step, on the clean tree onboarding left, so nothing has to be
 # reset first: a reset would be a different operation per tool, and forklift's state
 # after it (inventory stat data, subtree rollups) differs from a fresh import's.
@@ -457,8 +488,8 @@ expect_clean "after the commit step (a timed commit left something behind)"
 add_row "commit (1 file)" "$GM" "$FM" "git commit vs forklift stack, staging untimed"
 add_row "commit, git fsync=all" "$GDM" "$FM" "same, git with core.fsync=all core.fsyncMethod=fsync"
 
-# ── 5. diff of a dirty tree ─────────────────────────────────────────────────
-echo "→ [5/5] diff…"
+# ── 6. diff of a dirty tree ─────────────────────────────────────────────────
+echo "→ [6/6] diff…"
 # Dirty the edit set in both copies, then diff read-only, twice: unstaged (working
 # directory vs index/inventory), then staged (index/inventory vs head) after staging
 # the same files on both sides. Each row pairs the two tools' like-for-like operation;

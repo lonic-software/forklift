@@ -711,7 +711,13 @@ line reads `[agent, supervised by <human>]` in the gutter, exactly like `history
 follows the first-parent chain from the revision (git's `blame --first-parent`); a line a
 merge brought in from a side line is attributed to the merge parcel. On a long history the walk
 uses the commit-graph's **changed-path filters** (built by [`compact`](#compact--pack-the-object-store))
-to skip the parcels that never touched the file, so it stays fast as history grows.
+to skip the parcels that never touched the file, so it stays fast as history grows. Each
+version is matched against the one before it the way `git diff` matches them, so where a
+repeated line (a blank, a closing brace) could be credited to either of two parcels, blame
+breaks the tie the way git's diff slides its hunks (without git's indentation heuristic, so
+next to an indented block the two can still differ). A version whose matching would be
+unusually expensive (a long file whose shared lines were reordered wholesale) is not matched
+line by line: all of its lines are credited to the parcel that made it.
 
 blame refuses a large binary file (one stored in chunks — see below): there are no lines to
 attribute, so it fails with a clear message rather than assembling gigabytes to guess.
