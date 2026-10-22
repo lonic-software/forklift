@@ -4352,9 +4352,10 @@ fn expand_checks_its_paths_before_walking_other_histories() {
     let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
 
     assert_success(&area.forklift("sparse", &["palletize", "x", &up_head]));
+    assert_success(&area.forklift("sparse", &["shift", "main"]));
     std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
 
-    let refused = area.forklift("sparse", &["expand", "src/wbe"]);
+    let refused = area.forklift("sparse", &["expand", "src/web", "src/wbe"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("\"src/wbe\" is not a directory"), "{}", stderr(&refused));
 }
