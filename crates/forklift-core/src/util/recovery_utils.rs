@@ -1482,9 +1482,10 @@ pub(crate) struct GcRootSources {
 /// (gc's and prune's `FailClosed`/`FailClosed`, heal's `Tolerate`/`Tolerate`). They govern the
 /// bay-scoped parcels and the office record only, and `bay_policy` the hauls' proposed heads too
 /// ([`haul_utils::unmerged_haul_heads`]): a haul names its head in a meta cell, not a ref, so a
-/// source pallet moved or deleted off that head leaves the haul its only holder. The staged shards are always read fail-closed:
-/// a shard that exists but cannot be read or parsed may name the only copy of staged work. A
-/// shard or folder that vanishes mid-walk is no reference at all and is skipped.
+/// source pallet moved or deleted off that head leaves the haul its only holder. The staged
+/// shards are always read fail-closed: a shard that exists but cannot be read or parsed may name
+/// the only copy of staged work. A shard or folder that vanishes mid-walk is no reference at all
+/// and is skipped.
 ///
 /// # Arguments
 /// * `bay_dirs`   - The bay-local state dirs to read, in order — the caller's own

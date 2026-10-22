@@ -3217,7 +3217,8 @@ mod tests {
     }
 
     // Revert: drop the merged filter, or skip closed hauls, or skip a state that does not read in
-    // unmerged_haul_heads → the heads differ, or the unreadable state reads as no head.
+    // unmerged_haul_heads → the heads differ, or the unreadable state reads as no head; in
+    // gc_root_sources, tolerate it under FailClosed or refuse it under Tolerate → red.
     #[test]
     fn every_haul_not_yet_merged_roots_its_head_and_an_unreadable_state_refuses() {
         use haul_utils::HaulStatus;
@@ -3262,6 +3263,13 @@ mod tests {
 
         let error = haul_utils::unmerged_haul_heads().unwrap_err();
         assert!(error.contains("haul.state 2"), "{}", error);
+
+        // gc and prune refuse on it; heal reads past it and says so.
+        use crate::util::{bay_utils::BayReadPolicy, office_utils::TrustPinReadPolicy, recovery_utils};
+        let refused = recovery_utils::gc_root_sources(&[], BayReadPolicy::FailClosed, TrustPinReadPolicy::FailClosed);
+        assert!(refused.err().unwrap_or_default().contains("haul.state 2"));
+        let tolerated = recovery_utils::gc_root_sources(&[], BayReadPolicy::Tolerate, TrustPinReadPolicy::Tolerate).unwrap();
+        assert!(tolerated.degraded.iter().any(|note| note.contains("haul.state 2")), "{:?}", tolerated.degraded);
     }
 
     #[test]
