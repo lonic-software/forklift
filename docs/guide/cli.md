@@ -431,7 +431,10 @@ checking one out would plant another working tree inside this one. It also
 refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
 named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
-stack again. And it refuses with `staged_content_missing` (exit 25), naming the path and the
+stack again. The same code covers a command that rewrites the whole staging area (a shift, park,
+merge, cherry-pick, fast-forward, `lower`, `import-git` or bay creation) and was interrupted
+before it finished: then the message names that command, and `forklift heal` is the way out (see
+`heal` below). And it refuses with `staged_content_missing` (exit 25), naming the path and the
 hash, when the store no longer holds the content of a file staged since the head (for a large
 file, its recipe or any of its chunks) — lost after the `load`, say to a crash or a manual
 deletion. A parcel signed over it would pass `audit` and fail only at a later `restore`. Loading
@@ -1842,7 +1845,7 @@ different pack format, naming its version. Every read it might answer fails with
 than reporting the object missing, so re-create the warehouse with this build — do not move the
 file aside, which would make its objects read as missing. In the human view all four appear as a `pack problems:` section, only when non-empty.
 
-### `heal` — resolve a standing durability taint
+### `heal` — resolve a durability taint or an interrupted operation
 
 ```sh
 forklift heal
@@ -1927,6 +1930,38 @@ the file to move aside. This appears even when `heal` still has to refuse — as
 clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
 index the refusal itself names (see the bullet above) is part of its cause; the time one coincides
 with a refusal is exactly when an operator most needs to be told about it.
+
+#### Interrupted operations
+
+Every command that rewrites the whole staging area — `shift`, `park`, `consolidate` (a merge or a
+fast-forward, and the merges `haul` and `lift` run for you), `cherry-pick`, `lower`, `import-git`,
+and creating a bay — first records that it has begun, and clears the record once it is done. If
+one is killed or fails part-way (a crash, a full disk, a power cut), the record stays, and every
+command that changes the bay or commits staged content (`stack`, `load`, `shift`, `park`, `lift`,
+`haul`, and the rest) refuses with `incomplete_load` (exit 20), naming the command that was
+interrupted. Committing then could record a half-written staging area — at worst, the removal
+of every tracked file.
+
+`forklift heal` finishes or undoes the operation, whichever the bay's state says it reached:
+
+- **It had already finished its work** (its new head is recorded, even if later work was stacked
+  on top) — the record is cleared and nothing else is touched.
+- **It can be finished** — a shift (always: the tree it was moving to is already stored), a
+  fast-forward or merge whose head landed, a park whose work is already in the parked list, an
+  `import-git` or a bay creation — staging is rebuilt from
+  the tree it was moving to, and the bay is put at that position. Every file is re-read for this,
+  so a file the crash left at other content is reported as a local change (`unheld` in `--json`),
+  never staged: check it with `stocktake` and `restore` it if it is not yours.
+- **It did not get that far** — the head it was moving to never landed, or another bay moved the
+  pallet meanwhile — the operation is undone: for a merge, cherry-pick, fast-forward or `lower`,
+  the files it may have written are put back to the tree it started from, and staging and the
+  position follow. A park that was interrupted before its work reached the parked list leaves that
+  work where it was.
+
+An interrupted `franchise` is not recovered: it held no work yet, so remove the directory and
+franchise again. `heal` reports what it did as an `operation` entry (`finished`,
+`rolled_forward`, `rolled_back` or `cleared`) beside its taint report. A `load` run meanwhile does
+not clear the record: only `heal` does.
 
 ---
 
@@ -2117,7 +2152,7 @@ what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `s
 | `bay` | | Parallel working directories (add / list / remove) |
 | `compact` | | Pack the loose object store into dense pack files |
 | `store` | | Report object-store health (loose vs packed, sizes, maintenance due) |
-| `heal` | | Resolve a standing durability taint automated recovery could not clear |
+| `heal` | | Resolve a standing durability taint, or finish or undo an interrupted operation |
 | `conflicts` | | List unresolved conflicts |
 | `park` | `pa` | Stash / list / pop work in progress |
 | `franchise` | `fr` | Clone a remote warehouse (`--only` for a sparse clone) |
