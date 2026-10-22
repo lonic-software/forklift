@@ -12761,3 +12761,405 @@ fn scope_prune_reports_a_local_refusal_before_asking_the_remote() {
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("holds the full tree"), "{}", stderr(&refused));
 }
+
+/// Stack `content` at `path` on the current pallet of `warehouse` (a bay too), returning the parcel.
+fn stack_one(warehouse: &TestWarehouse, path: &str, content: &str) -> String {
+    warehouse.write_file(path, content);
+    assert_success(&warehouse.run(&["load", "."]));
+    let stacked = warehouse.run(&["stack", path]);
+    assert_success(&stacked);
+    extract_parcel_hash(&stacked)
+}
+
+/// The user pallets `palletize` lists, with their heads.
+fn pallet_heads(warehouse: &TestWarehouse) -> Vec<(String, String)> {
+    let listed = json(&warehouse.run(&["--json", "palletize"]));
+    listed["data"]["pallets"].as_array().unwrap().iter()
+        .map(|pallet| (pallet["name"].as_str().unwrap().to_string(), pallet["head"].as_str().unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// Open bay `name` (on a new pallet of that name) next to `warehouse`.
+fn open_bay(warehouse: &TestWarehouse, name: &str) -> TestWarehouse {
+    let dir = warehouse.home.join(name);
+    assert_success(&warehouse.run(&["bay", "add", name, dir.to_str().unwrap()]));
+    TestWarehouse { root: dir, home: warehouse.home.clone() }
+}
+
+/// The position file of bay `name`.
+fn bay_position_file(warehouse: &TestWarehouse, name: &str) -> std::path::PathBuf {
+    warehouse.root.join(".forklift/bays").join(name).join("position")
+}
+
+/// The number of entries in the main tree's undo journal.
+fn journal_len(warehouse: &TestWarehouse) -> usize {
+    let text = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+    serde_json::from_str::<serde_json::Value>(&text).unwrap()["entries"].as_array().unwrap().len()
+}
+
+/// A warehouse on main at `base`, with pallet "side" at the same head (left by a shift back).
+fn warehouse_with_side(name: &str) -> (TestWarehouse, String) {
+    let warehouse = TestWarehouse::new(name);
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    let base = stack_one(&warehouse, "a.txt", "one\n");
+    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    (warehouse, base)
+}
+
+// Revert: drop the delete arm in undo → the delete entry is soft-reset and refused, side stays gone.
+#[test]
+fn a_deleted_pallet_is_gone_from_the_list_and_undo_brings_it_back() {
+    let (warehouse, base) = warehouse_with_side("delete-undo");
+    let entries = journal_len(&warehouse);
+
+    let deleted = warehouse.run(&["--json", "palletize", "--delete", "side"]);
+    assert_success(&deleted);
+    let value = json(&deleted);
+    assert_eq!(value["data"]["pallet"], "side", "{}", value);
+    assert_eq!(value["data"]["head"], base.as_str(), "{}", value);
+    assert_eq!(value["data"]["contained_by"], "pallet \"main\"", "{}", value);
+    assert!(!pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"));
+    assert_eq!(journal_len(&warehouse), entries + 1, "the delete is journaled");
+
+    let undone = warehouse.run(&["--json", "undo"]);
+    assert_success(&undone);
+    let value = json(&undone);
+    assert_eq!(value["data"]["op"], "delete", "{}", value);
+    assert_eq!(value["data"]["pallet"], "main", "the current pallet keeps its meaning: {}", value);
+    assert_eq!(value["data"]["restored"], "side", "{}", value);
+    assert_eq!(value["data"]["restored_as"], "side", "{}", value);
+    assert_eq!(value["data"]["restored_head"], base.as_str(), "{}", value);
+    assert!(pallet_heads(&warehouse).contains(&("side".to_string(), base.clone())));
+    assert_eq!(journal_len(&warehouse), entries, "the undo consumed the delete's entry");
+
+    let human = warehouse.run(&["palletize", "--delete", "side"]);
+    assert_success(&human);
+    assert!(stdout(&human).contains("Deleted pallet \"side\""), "{}", stdout(&human));
+    let undone = warehouse.run(&["undo"]);
+    assert_success(&undone);
+    assert!(stdout(&undone).contains("pallet \"side\" is back at"), "{}", stdout(&undone));
+}
+
+// Revert: drop the bay check, the meta refusal or the containment check in delete_pallet → each
+// refusal below deletes instead.
+#[test]
+fn a_delete_refuses_a_meta_pallet_one_a_checkout_stands_on_and_unheld_work() {
+    let (warehouse, _) = warehouse_with_side("delete-refusals");
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    let meta = warehouse.run(&["palletize", "--delete", "@office"]);
+    assert!(!meta.status.success());
+    assert!(stderr(&meta).contains("is a meta pallet"), "{}", stderr(&meta));
+
+    let current = warehouse.run(&["palletize", "--delete", "main"]);
+    assert!(!current.status.success());
+    assert!(stderr(&current).contains("The warehouse's own working tree stands on pallet \"main\""), "{}", stderr(&current));
+
+    let bay = open_bay(&warehouse, "b2");
+    let in_bay = warehouse.run(&["palletize", "--delete", "b2"]);
+    assert!(!in_bay.status.success());
+    assert!(stderr(&in_bay).contains("Bay \"b2\" stands on pallet \"b2\""), "{}", stderr(&in_bay));
+    assert_success(&bay.run(&["shift", "side"]));
+    let from_main = warehouse.run(&["palletize", "--delete", "side"]);
+    assert!(stderr(&from_main).contains("Bay \"b2\" stands on pallet \"side\""), "{}", stderr(&from_main));
+    assert_success(&bay.run(&["shift", "b2"]));
+
+    let missing = warehouse.run(&["palletize", "--delete", "nope"]);
+    assert!(!missing.status.success());
+
+    // Work on "lone" that no other pallet holds, with no remote to ask.
+    assert_success(&warehouse.run(&["palletize", "lone"]));
+    let lone = stack_one(&warehouse, "lone.txt", "lone\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    let unheld = warehouse.run(&["palletize", "--delete", "lone"]);
+    assert!(!unheld.status.success());
+    let message = stderr(&unheld);
+    assert!(message.contains("No other pallet here holds the work on pallet \"lone\""), "{}", message);
+    assert!(message.contains("\"--force\""), "{}", message);
+    assert!(message.contains("100 later journaled operations"), "{}", message);
+    assert!(pallet_heads(&warehouse).contains(&("lone".to_string(), lone.clone())), "a refused delete removes nothing");
+
+    let forced = warehouse.run(&["--json", "palletize", "--delete", "lone", "--force"]);
+    assert_success(&forced);
+    assert!(json(&forced)["data"]["contained_by"].is_null(), "{}", stdout(&forced));
+    assert!(!pallet_heads(&warehouse).iter().any(|(name, _)| name == "lone"));
+
+    // A pallet a later pallet descends from is held by it.
+    assert_success(&warehouse.run(&["undo"]));
+    let held = warehouse.run(&["--json", "palletize", "--delete", "side"]);
+    assert_success(&held);
+    let by = json(&held)["data"]["contained_by"].as_str().unwrap().to_string();
+    assert!(by == "pallet \"b2\"" || by == "pallet \"lone\"" || by == "pallet \"main\"", "{}", by);
+
+    let force_alone = warehouse.run(&["palletize", "--force"]);
+    assert!(!force_alone.status.success(), "--force needs --delete");
+}
+
+// Revert: drop the open-haul check → the haul's source and target delete.
+#[test]
+fn a_delete_refuses_an_open_hauls_pallets_and_names_a_merged_haul() {
+    let warehouse = TestWarehouse::new("delete-hauls");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    stack_one(&warehouse, "base.txt", "base\n");
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    stack_one(&warehouse, "feature.txt", "feat\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["palletize", "release"]));
+
+    assert_success(&warehouse.run(&["haul", "open", "--target", "release", "--source", "feature", "--title", "Ship it"]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    for pallet in ["feature", "release"] {
+        let refused = warehouse.run(&["palletize", "--delete", pallet, "--force"]);
+        assert!(!refused.status.success(), "{}", pallet);
+        assert!(stderr(&refused).contains(&format!("Open haul {}", id)), "{}", stderr(&refused));
+        assert!(pallet_heads(&warehouse).iter().any(|(name, _)| name == pallet));
+    }
+
+    assert_success(&warehouse.run(&["shift", "release"]));
+    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    let deleted = warehouse.run(&["--json", "palletize", "--delete", "release", "--force"]);
+    assert_success(&deleted);
+    assert_eq!(json(&deleted)["data"]["merged_hauls"], serde_json::json!([id]), "{}", stdout(&deleted));
+}
+
+// Revert: count a found head other than the deleted one as restored in settle_on → the undo pops and
+// reports success over the re-created pallet.
+#[test]
+fn undo_of_a_delete_refuses_a_name_taken_since_and_undo_as_brings_it_back_elsewhere() {
+    let (warehouse, base) = warehouse_with_side("delete-undo-as");
+    let second = stack_one(&warehouse, "b.txt", "two\n");
+    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
+
+    // Another bay creates "side" again, at another head.
+    let bay = open_bay(&warehouse, "b2");
+    assert_success(&bay.run(&["palletize", "side", &second]));
+    let entries = journal_len(&warehouse);
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    let message = stderr(&refused);
+    assert!(message.contains("exists again"), "{}", message);
+    assert!(message.contains(&base), "the deleted head is named: {}", message);
+    assert!(message.contains("forklift undo --as <new-name>"), "{}", message);
+    assert_eq!(journal_len(&warehouse), entries, "a refused undo keeps its entry");
+    assert!(pallet_heads(&warehouse).contains(&("side".to_string(), second.clone())), "theirs stands");
+
+    for taken in ["side", "main"] {
+        let refused = warehouse.run(&["undo", "--as", taken]);
+        assert!(stderr(&refused).contains(&format!("Pallet \"{}\" already exists", taken)), "{}", stderr(&refused));
+        assert_eq!(journal_len(&warehouse), entries);
+    }
+    assert!(!warehouse.run(&["undo", "--as", "Not Valid"]).status.success());
+
+    let position = std::fs::read(warehouse.root.join(".forklift/position")).unwrap();
+    let undone = warehouse.run(&["--json", "undo", "--as", "side-old"]);
+    assert_success(&undone);
+    let value = json(&undone);
+    assert_eq!(value["data"]["restored"], "side", "{}", value);
+    assert_eq!(value["data"]["restored_as"], "side-old", "{}", value);
+    assert!(pallet_heads(&warehouse).contains(&("side-old".to_string(), base.clone())));
+    assert_eq!(std::fs::read(warehouse.root.join(".forklift/position")).unwrap(), position, "the bay stays where it is");
+    assert_eq!(journal_len(&warehouse), entries - 1);
+
+    // The next entry is the stack: "--as" is for a delete only.
+    let not_a_delete = warehouse.run(&["undo", "--as", "other"]);
+    assert!(!not_a_delete.status.success());
+    assert!(stderr(&not_a_delete).contains("not a pallet delete"), "{}", stderr(&not_a_delete));
+    assert_eq!(journal_len(&warehouse), entries - 1);
+
+    let human = warehouse.run(&["undo"]);
+    assert_success(&human);
+    assert!(stdout(&human).contains("Undid stack"), "{}", stdout(&human));
+}
+
+// Revert: drop the "found == head" arm in settle_on → a name already at the deleted head refuses.
+#[test]
+fn undo_of_a_delete_whose_pallet_is_back_at_its_head_counts_as_restored() {
+    let (warehouse, base) = warehouse_with_side("delete-undo-restored");
+    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
+    let bay = open_bay(&warehouse, "b2");
+    assert_success(&bay.run(&["palletize", "side", &base]));
+    let entries = journal_len(&warehouse);
+
+    let undone = warehouse.run(&["--json", "undo"]);
+    assert_success(&undone);
+    assert_eq!(json(&undone)["data"]["restored_head"], base.as_str());
+    assert_eq!(journal_len(&warehouse), entries - 1, "the entry is consumed");
+}
+
+// Revert: skip refuse_a_bay_out_of_step → the undo creates the pallet under a bay at another base.
+#[test]
+fn undo_of_a_delete_refuses_a_bay_on_the_name_out_of_step_and_leaves_one_at_the_head() {
+    let (warehouse, _) = warehouse_with_side("delete-undo-bay");
+    let bay = open_bay(&warehouse, "b2");
+
+    // The bay on "side" at its first head, as a shift that lost the race with the delete leaves it.
+    assert_success(&bay.run(&["shift", "side"]));
+    let early = std::fs::read(bay_position_file(&warehouse, "b2")).unwrap();
+    assert_success(&bay.run(&["shift", "b2"]));
+
+    assert_success(&warehouse.run(&["shift", "side"]));
+    let head = stack_one(&warehouse, "side.txt", "side\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&bay.run(&["shift", "side"]));
+    let at_head = std::fs::read(bay_position_file(&warehouse, "b2")).unwrap();
+    assert_success(&bay.run(&["shift", "b2"]));
+    assert_success(&warehouse.run(&["palletize", "--delete", "side", "--force"]));
+
+    std::fs::write(bay_position_file(&warehouse, "b2"), &early).unwrap();
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    let message = stderr(&refused);
+    assert!(message.contains("Bay \"b2\" stands on pallet \"side\" at"), "{}", message);
+    assert!(message.contains("run \"forklift undo\" again, then shift it back"), "{}", message);
+    assert!(!pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"), "nothing was created");
+
+    // "--as" judges the bays on the name it creates: one standing on "side-new" at another base refuses.
+    assert_success(&bay.run(&["palletize", "side-new"]));
+    let on_new = std::fs::read(bay_position_file(&warehouse, "b2")).unwrap();
+    assert_success(&bay.run(&["shift", "b2"]));
+    assert_success(&bay.run(&["palletize", "--delete", "side-new"]));
+    std::fs::write(bay_position_file(&warehouse, "b2"), &on_new).unwrap();
+    let refused = warehouse.run(&["undo", "--as", "side-new"]);
+    assert!(stderr(&refused).contains("Bay \"b2\" stands on pallet \"side-new\""), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("forklift undo --as side-new"), "{}", stderr(&refused));
+
+    // A bay at exactly the deleted head is the restore's to put back in step.
+    std::fs::write(bay_position_file(&warehouse, "b2"), &at_head).unwrap();
+    assert_success(&warehouse.run(&["undo"]));
+    assert!(pallet_heads(&warehouse).contains(&("side".to_string(), head)));
+    assert_eq!(std::fs::read(bay_position_file(&warehouse, "b2")).unwrap(), at_head, "the bay is left alone");
+}
+
+// Revert: drop the trust check in restore_deleted → both undos bring back unsigned work past enroll.
+#[test]
+fn undo_of_a_delete_refuses_history_enrollment_left_out_and_survives_an_admit() {
+    let (warehouse, _) = warehouse_with_side("delete-undo-trust");
+    assert_success(&warehouse.run(&["shift", "side"]));
+    stack_one(&warehouse, "side.txt", "unsigned\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["palletize", "--delete", "side", "--force"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    for args in [&["undo"][..], &["undo", "--as", "side-old"][..]] {
+        let refused = warehouse.run(args);
+        assert!(!refused.status.success());
+        assert!(stderr(&refused).contains("no longer passes this warehouse's trust check"), "{}", stderr(&refused));
+    }
+    assert!(!pallet_heads(&warehouse).iter().any(|(name, _)| name.starts_with("side")));
+
+    // Signed work deleted before an admit comes back.
+    assert_success(&warehouse.run(&["palletize", "signed"]));
+    let signed = stack_one(&warehouse, "signed.txt", "signed\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let entries = journal_len(&warehouse);
+    assert_success(&warehouse.run(&["palletize", "--delete", "signed", "--force"]));
+    let bob = keygen_admit_args(&warehouse, "bob@forklift");
+    assert_success(&warehouse.run(&["office", "admit", &bob[0], &bob[1], &bob[2]]));
+    assert_success(&warehouse.run(&["undo"]));
+    assert!(pallet_heads(&warehouse).contains(&("signed".to_string(), signed)));
+    assert_eq!(journal_len(&warehouse), entries);
+}
+
+// Revert: drop the journal's removed heads from the bay-scoped roots → the repack drops the head.
+#[test]
+fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
+    let warehouse = TestWarehouse::new("delete-repack");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    stack_one(&warehouse, "a.txt", "one\n");
+
+    assert_success(&warehouse.run(&["palletize", "side"]));
+    let head = stack_one(&warehouse, "side.txt", "only here\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["palletize", "--delete", "side", "--force"]));
+
+    // Automatic maintenance repacks on the next command.
+    assert_success(&warehouse.run(&["compact"]));
+    std::fs::write(
+        warehouse.root.join(".forklift/config/warehouse.toml"),
+        "[maintenance]\nloose = \"100000\"\npacks = \"0\"\n",
+    ).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["show", &format!("{}:side.txt", head)]));
+
+    assert_success(&warehouse.run(&["undo"]));
+    assert!(pallet_heads(&warehouse).contains(&("side".to_string(), head.clone())));
+
+    // Deleted from a bay, then the bay removed: nothing roots the head any more.
+    let bay = open_bay(&warehouse, "b2");
+    assert_success(&bay.run(&["palletize", "--delete", "side", "--force"]));
+    assert_success(&bay.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["show", &format!("{}:side.txt", head)]));
+    assert_success(&warehouse.run(&["bay", "remove", "b2"]));
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert!(!warehouse.run(&["show", &format!("{}:side.txt", head)]).status.success(), "the head is freed once its window ends");
+}
+
+// Revert: read only version 3 journals → the planted version-2 journal is refused.
+#[test]
+fn a_version_two_journal_takes_a_delete_and_its_undo() {
+    let (warehouse, _) = warehouse_with_side("delete-journal-v2");
+    let second = stack_one(&warehouse, "b.txt", "two\n");
+
+    let path = warehouse.root.join(".forklift/journal.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"version\":3"), "{}", text);
+    std::fs::write(&path, text.replace("\"version\":3", "\"version\":2")).unwrap();
+
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
+    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["undo"]));
+    assert!(pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"));
+
+    let undone = warehouse.run(&["--json", "undo"]);
+    assert_success(&undone);
+    assert_eq!(json(&undone)["data"]["undone"], second.as_str(), "the version-2 stack entry undoes");
+    let restacked = stack_one(&warehouse, "c.txt", "three\n");
+    let undone = warehouse.run(&["--json", "undo"]);
+    assert_eq!(json(&undone)["data"]["undone"], restacked.as_str(), "ordinary commands still journal");
+}
+
+#[test]
+fn older_entries_after_undo_as_act_on_whatever_the_old_name_holds() {
+    let warehouse = TestWarehouse::new("delete-undo-as-older");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    let base = stack_one(&warehouse, "a.txt", "one\n");
+    assert_success(&warehouse.run(&["palletize", "x"]));
+    stack_one(&warehouse, "x.txt", "x\n");
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["palletize", "--delete", "x", "--force"]));
+
+    let renamed = warehouse.run(&["undo", "--as", "y"]);
+    assert_success(&renamed);
+    assert!(stdout(&renamed).contains("Older undo entries still refer to \"x\""), "{}", stdout(&renamed));
+
+    // The shift back onto "x" refuses while no pallet has that name.
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert_eq!(pallet_heads(&warehouse).iter().filter(|(name, _)| name == "x").count(), 0);
+
+    // Once "x" exists again, at another head, the shift lands on it; the stack on the old "x" then
+    // refuses as moved.
+    let bay = open_bay(&warehouse, "b2");
+    assert_success(&bay.run(&["palletize", "x", &base]));
+    assert_success(&warehouse.run(&["undo"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("x.txt")).ok(), None, "the bay is on the new x");
+
+    let moved = warehouse.run(&["undo"]);
+    assert!(!moved.status.success());
+    assert!(stderr(&moved).contains("has moved since"), "{}", stderr(&moved));
+}
