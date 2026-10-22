@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
-use forklift_core::util::fanout_utils::WORKER_STACK_SIZE;
+use forklift_core::util::fanout_utils::block_on_worker_stack;
 use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
@@ -29,8 +29,9 @@ mod test_support;
 /// future frame that might grow this further (more subcommands, longer help text), the real
 /// work runs on a dedicated thread with an explicit, generous stack size — the standard fix
 /// for this class of problem — so the platform difference in the OS-assigned main-thread
-/// stack never matters. The size is core's [`WORKER_STACK_SIZE`], which the runtime's threads
-/// get too: they read objects, and a delta chain's reconstruction recurses.
+/// stack never matters. The size is core's
+/// [`WORKER_STACK_SIZE`](forklift_core::util::fanout_utils::WORKER_STACK_SIZE), which the
+/// runtime's threads get too: they read objects, and a delta chain's reconstruction recurses.
 ///
 /// The process entry point: hands off to a worker thread with an explicit stack size and waits
 /// for it. `main` itself does no work that could need a large stack, so its own
@@ -40,23 +41,7 @@ fn main() {
     // number is only sound while nothing of ours could have been given that number.
     events::init();
 
-    std::thread::Builder::new()
-        .name("forklift-main".to_string())
-        .stack_size(WORKER_STACK_SIZE)
-        .spawn(run)
-        .expect("failed to spawn the forklift worker thread")
-        .join()
-        .expect("the forklift worker thread panicked");
-}
-
-/// Build the async runtime and run [`async_main`] on it, on the worker thread `main` spawns.
-fn run() {
-    tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(WORKER_STACK_SIZE)
-        .enable_all()
-        .build()
-        .expect("failed to start the async runtime")
-        .block_on(async_main());
+    block_on_worker_stack("forklift-main", async_main);
 }
 
 /// The real entry point: parses arguments, wires up the pager and passphrase provider, and is

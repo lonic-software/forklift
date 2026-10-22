@@ -1338,11 +1338,11 @@ mod tests {
 
         // What the run did write is quoted, warnings aside, so a panic is not lost.
         let warning = r#"{"lonic_json":1,"tool":"forklift","warning":"w","message":"m","next_step":"n"}"#;
-        let stderr = format!("thread 'main' panicked at src/x.rs:1:1:\nboom\n{}\n", warning);
+        let stderr = format!("thread 'forklift-main' panicked at src/x.rs:1:1:\nboom\n{}\n", warning);
         let result = super::tool_result(b"partial", stderr.as_bytes(), exited(101));
         assert_eq!(
             result["content"][0]["text"],
-            "forklift left no result document: it exited with status 101.\n\nstdout:\npartial\n\nstderr:\nthread 'main' panicked at src/x.rs:1:1:\nboom",
+            "forklift left no result document: it exited with status 101.\n\nstdout:\npartial\n\nstderr:\nthread 'forklift-main' panicked at src/x.rs:1:1:\nboom",
         );
         assert_eq!(result["content"][1]["text"], warning);
 

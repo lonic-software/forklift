@@ -2765,6 +2765,10 @@ thread_local! {
 /// corrupt or adversarial pack that chains without end, turning unbounded recursion (a crash)
 /// into a clean error, never a lost or wrong object (caught before anything is written or
 /// deleted). `true_depth`'s own walk is bounded by this same constant for the same reason.
+///
+/// It bounds one reconstruction's recursion, not a chain's length: a base already in the read
+/// cache ends the recursion there, so whether an object deeper than this reads back depends on
+/// what was read before it.
 const MAX_RECONSTRUCT_DEPTH: u32 = 1000;
 
 thread_local! {
@@ -7510,6 +7514,69 @@ pub(crate) mod tests {
         assert_eq!(verify_calls() - before, 1, "a base read directly hashes once, then serves from the cache");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// On a thread with `WORKER_STACK_SIZE`, a cold read of a chain one delta past
+    /// `MAX_RECONSTRUCT_DEPTH` fails with the depth-limit error, and one exactly at the limit reads
+    /// back: the recursion to the limit fits that stack, so the backstop is reached as an error and
+    /// not as a stack overflow, which aborts the process. Both reads start beneath 4 MiB of used
+    /// stack, standing in for the frames above a real read (the async entry point, the command,
+    /// clap's), so the test pins headroom and not only a fit at the top of a fresh thread. In a
+    /// debug build the failing read was measured at about 7.5 MiB and the at-limit read under
+    /// 4 MiB: the at-limit read succeeds on the unverified attempt, while the failing one also
+    /// redoes the chain on the verified route, the deeper of the two. The past-limit read goes
+    /// first because the limit bounds one reconstruction's recursion: once the at-limit read has
+    /// cached the bases, the deeper object is a single delta away. The
+    /// past-limit read fails before decoding anything, so the at-limit read after it is still cold.
+    ///
+    /// Mutation (debug build, which is what `cargo test` and CI run): `WORKER_STACK_SIZE` back to
+    /// 8 MiB → the failing read overflows beneath the 4 MiB → red. In a release build the
+    /// read takes under 2 MiB and the mutation stays green.
+    #[test]
+    fn a_chain_at_the_depth_limit_reads_and_one_past_it_fails_cleanly_on_the_worker_stack() {
+        let temp = fresh_root("delta-chain-depth-limit");
+        let links = MAX_RECONSTRUCT_DEPTH as usize + 1;
+        let contents: Vec<Vec<u8>> = (0..=links)
+            .map(|i| [b"depth limit chain".as_slice(), &deterministic_fill(64), format!("{}", i).as_bytes()].concat())
+            .collect();
+        let hashes: Vec<String> = contents.iter().map(|c| blake3::hash(c).to_hex().to_string()).collect();
+        let records: Vec<(&str, Vec<u8>)> = (0..=links)
+            .map(|i| (hashes[i].as_str(), match i {
+                0 => full_record(&contents[0]),
+                _ => delta_record(&hashes[i - 1], &contents[i - 1], &contents[i]),
+            }))
+            .collect();
+        write_raw_pack(&temp.join(".forklift/objects/pack"), "deep", &records);
+
+        let root = temp.clone();
+        let (at_limit, past_limit) = crate::util::fanout_utils::run_on_worker_stack("depth-limit-probe", move || {
+            let _scope = StorageRootScope::enter(&root);
+            let top = 0u8;
+            let past_limit = beneath_used_stack(&top as *const u8 as usize, 4 * 1024 * 1024,
+                                                &|| file_utils::retrieve_object_by_hash(&hashes[links]));
+            let at_limit = beneath_used_stack(&top as *const u8 as usize, 4 * 1024 * 1024,
+                                              &|| file_utils::retrieve_object_by_hash(&hashes[links - 1]));
+            (at_limit, past_limit)
+        });
+
+        let error = past_limit.expect_err("a cold read of a chain past the depth limit must fail");
+        assert!(error.contains("depth limit"), "the failure must name the depth limit: {}", error);
+        assert_eq!(at_limit.as_deref(), Ok(contents[links - 1].as_slice()),
+                   "a chain exactly at the depth limit must read back");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Call `f` once the stack in use, measured from `top` (an address in an outer frame), is at
+    /// least `bytes`.
+    #[inline(never)]
+    fn beneath_used_stack<R>(top: usize, bytes: usize, f: &dyn Fn() -> R) -> R {
+        let frame = std::hint::black_box([0u8; 1024]);
+        let here = std::hint::black_box(&frame as *const _ as usize);
+        if here.abs_diff(top) >= bytes { return f(); }
+        let result = beneath_used_stack(top, bytes, f);
+        std::hint::black_box(&frame);
+        result
     }
 
     /// A chain whose middle record decodes to the wrong bytes fails its target's read with the

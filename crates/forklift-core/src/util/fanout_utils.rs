@@ -115,12 +115,48 @@ where
     })
 }
 
-/// The stack every thread that reads objects runs with: fan-out workers, `forklift`'s own worker
-/// thread, and the async runtime threads of `forklift` and `forklift-server` (their
-/// `spawn_blocking` pools included), instead of the spawned-thread default (2 MiB).
+/// The stack every thread that reads packed objects runs with: fan-out workers, and in `forklift`
+/// and `forklift-server` the thread `main` hands its work to and the async runtime's threads, its
+/// `spawn_blocking` pool included ([`block_on_worker_stack`]), instead of the spawned-thread
+/// default (2 MiB).
 /// Reconstructing a delta chain recurses once per link up to the pack reader's depth limit, and
 /// that limit has to be reached as an error, not as a stack overflow, which aborts the process.
-pub const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// A cold read of a chain at that limit was measured at about 7.5 MiB of stack in a debug build
+/// and under 2 MiB in release, so 16 MiB leaves room for the frames above the read in both. On
+/// Windows the size is a reservation, and Linux and macOS map it lazily, so only the pages a thread
+/// touches use memory; under Linux's strict overcommit mode (`vm.overcommit_memory=2`) the whole
+/// size counts against the commit limit for each thread.
+pub const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Run `f` on a new thread named `name` with [`WORKER_STACK_SIZE`], wait for it, and return its
+/// result. `forklift`'s and `forklift-server`'s `main` hand all their work to this (through
+/// [`block_on_worker_stack`]), so none of it runs on the process's main thread, whose stack size
+/// the platform picks (1 MiB on Windows, 8 MiB on Linux and macOS).
+/// A panic in `f` is re-raised here.
+pub fn run_on_worker_stack<R: Send + 'static>(name: &str, f: impl FnOnce() -> R + Send + 'static) -> R {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(WORKER_STACK_SIZE)
+        .spawn(f)
+        .unwrap_or_else(|e| panic!("failed to spawn the {} thread: {}", name, e))
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// A binary's async entry point: on a thread from [`run_on_worker_stack`], build a multi-thread
+/// tokio runtime whose threads (its `spawn_blocking` pool included) also get [`WORKER_STACK_SIZE`]
+/// instead of tokio's 2 MiB default, and drive `make()`'s future to completion on it.
+pub fn block_on_worker_stack<F: std::future::Future>(name: &str, make: impl FnOnce() -> F + Send + 'static) -> F::Output
+    where F::Output: Send + 'static {
+    run_on_worker_stack(name, move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .thread_stack_size(WORKER_STACK_SIZE)
+            .enable_all()
+            .build()
+            .expect("failed to start the async runtime")
+            .block_on(make())
+    })
+}
 
 /// Spawn one scoped fan-out worker with [`WORKER_STACK_SIZE`].
 fn worker<'scope, 'env, R: Send + 'scope>(scope: &'scope std::thread::Scope<'scope, 'env>,
@@ -700,5 +736,56 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(consumed, items.len());
+    }
+
+    /// Recurse until the stack in use, measured from `top` (an address in the outermost frame), is
+    /// at least `bytes`, and return the depth reached. Measuring rather than counting frames keeps
+    /// the probe the same size in debug and release builds, whose frames differ a lot.
+    #[inline(never)]
+    fn use_stack(top: usize, bytes: usize) -> usize {
+        let frame = std::hint::black_box([0u8; 1024]);
+        let here = std::hint::black_box(&frame as *const _ as usize);
+        if here.abs_diff(top) >= bytes { return 0; }
+        1 + std::hint::black_box(use_stack(top, bytes))
+    }
+
+    #[test]
+    fn run_on_worker_stack_gives_the_work_the_worker_stack_and_returns_its_result() {
+        // 5 MiB: more than the 2 MiB of a test thread or a default spawned thread, so this
+        // overflows (and aborts the test binary) unless the work runs on a WORKER_STACK_SIZE thread.
+        let (name, depth) = run_on_worker_stack("stack-probe", || {
+            let top = 0u8;
+            (std::thread::current().name().map(str::to_string),
+             use_stack(&top as *const u8 as usize, 5 * 1024 * 1024))
+        });
+
+        assert_eq!(name.as_deref(), Some("stack-probe"));
+        assert!(depth > 0, "the probe must actually recurse");
+    }
+
+    #[test]
+    fn block_on_worker_stack_gives_the_polling_thread_and_the_blocking_pool_the_worker_stack() {
+        // 5 MiB each, on the thread polling the future and on a `spawn_blocking` thread: more than
+        // a default thread's 2 MiB, so either overflows unless it has WORKER_STACK_SIZE.
+        let (name, polled, blocking) = block_on_worker_stack("async-stack-probe", || async {
+            let top = 0u8;
+            let polled = use_stack(&top as *const u8 as usize, 5 * 1024 * 1024);
+            let blocking = tokio::task::spawn_blocking(|| {
+                let top = 0u8;
+                use_stack(&top as *const u8 as usize, 5 * 1024 * 1024)
+            }).await.unwrap();
+            (std::thread::current().name().map(str::to_string), polled, blocking)
+        });
+
+        assert_eq!(name.as_deref(), Some("async-stack-probe"));
+        assert!(polled > 0 && blocking > 0, "both probes must actually recurse");
+    }
+
+    #[test]
+    fn run_on_worker_stack_re_raises_a_panic_in_the_work() {
+        let caught = std::panic::catch_unwind(|| run_on_worker_stack("panics", || panic!("boom")));
+
+        let payload = caught.expect_err("the work's panic must reach the caller");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
     }
 }
