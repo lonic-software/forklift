@@ -288,7 +288,7 @@ A/B tests against saved binaries on a quiet machine.
 
 The memory rise does not depend on the window: a window of 32 measured the same. Remaining
 work, a stat-clean worktree read and the other commands' serial loads, was FORK-192 (below),
-except `restore`'s serial blob loads, which are FORK-246.
+except `restore`'s and `restore --staged`'s serial loops, which are FORK-246.
 
 ## FORK-188: delta chains hash only the object asked for (2026-10-18)
 
@@ -559,7 +559,7 @@ cache and read later as a verified target, or cache eviction. Neither is worth a
 **The other serial per-file loads.** `audit`'s phase 2 and `query`'s verified resolve already run
 on `fanout_map`. `peek` reads one object. `blame`'s per-version blob loads were a few percent in
 FORK-190, and parallel blame stays ruled out (the blame row of `PARALLELIZATION_PLAN.md`).
-`restore` goes with FORK-181. That left the bundle build, which was entirely single-threaded:
+`restore`'s serial loops are FORK-246. That left the bundle build, which was entirely single-threaded:
 61.8 s wall, 56.6 s user. In a `sample` of its first 25 s, compression was about half the time
 (zstd 7,382 of 18.1k samples; the delta encoder 3,375), tree loads about a quarter (`load_tree`
 4,283), and the rest was reading and hash-verifying objects. Each record's work is independent.
@@ -607,10 +607,11 @@ against 16.3 s).
 instead of its stored blob whenever the inventory's stat record says the two match, in the
 readers that need the content of a version the worktree also holds: `diff --staged`'s new side,
 and either side of a pallet `diff` when that side is the bay's base (`diff_block` loads both
-sides alike). A three-way merge's "ours", blame's newest version and `show` are one load each per
-file, so they gain less still. To bound the gain,
-a throwaway build replaced those loads with a plain `fs::read` of the path: no stat check, no
-inventory read and no hash, so a real implementation can only be slower.
+sides alike). The other readers gain less: a three-way merge's "ours" is one of three loads per
+merged file, blame's newest version is one of its N versions, and `show` reads a single file. To
+bound the gain, a throwaway build replaced the two diff readers' loads with a plain `fs::read` of
+the path: no stat check, no inventory read and no hash, so a real implementation can only be
+slower.
 
 | Run (git.git, release, 18 cores) | stored blobs | plain file read (ceiling) |
 |---|---|---|
@@ -624,12 +625,13 @@ And a read that keeps today's guarantee must hash what it reads, which `load_blo
 That would keep the share spent on the pack lookup, delta apply and decompression, but not the
 hash. Trusting the stat without a hash would keep more of it, but a stat collision would then
 print the wrong content as the stored version. Neither is worth at most 6% (24 ms on the
-5,089-file diff, 3 ms on the 1,265-file one). Nothing was changed.
+5,089-file diff, 3 ms on the 1,265-file one). Nothing was changed. One caveat for any future
+attempt: a plain read follows a symlink, so the 5,089-file run's output differed at the one
+symlink in the range.
 
 Not measured: materializers writing a file whose content already sits, stat-clean, at another
 worktree path (a large rename in `shift` or `consolidate`). That is a different idea, a copy from
-the moved file, with the same verification question; it was not pursued. One caveat for any future attempt: a plain
-read follows a symlink, so the 5,089-file run's output differed at the one symlink in the range.
+the moved file, with the same verification question; it was not pursued.
 
 ## Remaining items
 
