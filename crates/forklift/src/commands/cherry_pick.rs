@@ -32,7 +32,6 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // while a load that started but never finished cleanly is still recorded
     // (`load_guard_utils`).
     load_guard_utils::check_no_incomplete_load()?;
-    operation_utils::check_none_standing()?;
 
     // A pick applies a diff (the merge machinery) into the working directory, which could
     // touch out-of-scope paths a scoped bay never materialized, so it refuses here.

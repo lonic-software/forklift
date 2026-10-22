@@ -389,7 +389,16 @@ pub(crate) async fn stack_completion(description: Option<String>,
             operation_utils::finish()?;
             return Ok(parcel);
         }
-        Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => return Err(error.into()),
+        Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => {
+            // Refused before its parcel was recorded (a signing or trust refusal, say): the
+            // merge is applied and its consolidation state written, which owns the bay from here
+            // as at conflicts, and `stack` completes it once the cause is fixed. With a parcel
+            // recorded, the marker stays for `forklift heal`.
+            if operation_utils::read()?.map_or(false, |operation| operation.target.base.is_none()) {
+                operation_utils::finish()?;
+            }
+            return Err(error.into());
+        }
         Err(StackError::HeadWrite { error, pallet, parcel, tree }) => (error, pallet, parcel, tree),
     };
 
@@ -980,6 +989,29 @@ mod tests {
         let recovery = operation_utils::recover().unwrap().expect("a marker stands");
         assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
         assert_back_at_ours(&warehouse.root, &our_head, &our_tree);
+    }
+
+    #[test]
+    fn rolling_back_an_interrupted_merge_keeps_an_edit_made_since_the_crash() {
+        let warehouse = Warehouse::with_working_tree("consolidate-merge-crash-edit");
+        let (our_head, our_tree, _) = a_clean_merge_on_main();
+
+        AFTER_MERGE_APPLY.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(handle_command("feature")).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        // The merge wrote their b.txt; the user then wrote over it, before running heal.
+        std::fs::write(warehouse.root.join("b.txt"), b"notes\n").unwrap();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!(recovery.outcome, RecoveryOutcome::RolledBack);
+        assert_eq!(recovery.unheld, vec!["b.txt".to_string()], "the edit is reported, not overwritten");
+        assert!(test_support::file_holds(&warehouse.root, "b.txt", b"notes\n"));
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"ours\n") && !warehouse.root.join("new.txt").exists(),
+            "every file the merge left as it wrote it is put back");
+        assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("main", Some(our_head)));
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
+        assert!(staged.is_empty(), "staging is at our tree");
     }
 
     #[cfg(unix)]

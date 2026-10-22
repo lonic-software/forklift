@@ -24,8 +24,21 @@ pub async fn handle_command() -> Result<(), String> {
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
     // itself a no-op under `--json` (progress is never part of the result document), and
     // `forklift-core` never prints on its own (DESIGN.html §3.4) — this closure is the one bridge.
-    let outcome = recovery_utils::run(Some(&|line: &str| crate::human!("{}", line)))
-        .await.map_err(String::from)?;
+    let outcome = match recovery_utils::run(Some(&|line: &str| crate::human!("{}", line))).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // An interrupted operation waits for the taint (below), so the refusal says so: it
+            // is not the only thing left standing.
+            let error = String::from(error);
+            return Err(match operation_utils::read() {
+                Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
+                    "An interrupted {} also stands in this bay; heal finishes or undoes it once the \
+                    taint is resolved.", operation.kind.as_str(),
+                )),
+                _ => error,
+            });
+        }
+    };
 
     // After the taint: an operation's recovery reads and writes the store the taint vouches for.
     let operation = operation_utils::recover()?.map(|recovery| OperationRecovery {

@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    audit_utils, bay_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
+    alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
     operation_utils, pallet_utils, remote_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -200,6 +200,11 @@ async fn lower_working_pallet(client: &RemoteClient,
     }
 
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
+
+    // Refused before the marker, so a refusal leaves nothing standing (`materialize_tree` checks
+    // again, finding the same).
+    let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
+    alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
 
     // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
     let mut operation = Operation::new(

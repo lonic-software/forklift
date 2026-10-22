@@ -673,10 +673,9 @@ fn run_park_kill_spread(
 
         // A kill inside park's bracket leaves its operation marker, and every later park refuses
         // until heal settles it: back to where it was if the parked list does not name the parcel
-        // yet, forward to the head if it does. Rolling forward leaves the parked content in the
-        // working files (heal never rewrites them), so they go back to the head before the pop.
-        let interrupted = operation_standing(warehouse);
-        if interrupted {
+        // yet, forward to the head if it does. Rolling forward finishes the reset, so the pop below
+        // runs over a clean bay either way.
+        if operation_standing(warehouse) {
             let heal = area.run(&["heal"]);
             assert!(heal.status.success(), "park {tag} kill #{i}: heal must settle the interrupted park, stderr: {}",
                 String::from_utf8_lossy(&heal.stderr));
@@ -687,12 +686,6 @@ fn run_park_kill_spread(
 
         if after > before {
             parked += 1;
-
-            if interrupted {
-                let restore = area.run(&["restore", "."]);
-                assert!(restore.status.success(), "park {tag} kill #{i}: restore failed: {}",
-                    String::from_utf8_lossy(&restore.stderr));
-            }
 
             let pop = area.run(&["park", "pop"]);
             assert!(pop.status.success(),

@@ -370,8 +370,10 @@ pub enum Command {
                       area (shift, park, a merge, cherry-pick or fast-forward, lower, import-git, \
                       bay creation) and was interrupted (\"incomplete_load\" refusals naming it, \
                       exit 20): rolled forward where the bay's state shows it got far enough, \
-                      rolled back otherwise. Rolling forward re-reads every file, so a file left \
-                      at other content is reported as a local change, never staged."
+                      rolled back otherwise. Either way it rewrites only files that still hold \
+                      one side's content or are missing; any other file (an edit made since, or \
+                      a merge's combination of both sides) is left and reported as a local \
+                      change, never staged."
     )]
     Heal,
 

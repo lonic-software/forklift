@@ -1948,15 +1948,19 @@ of every tracked file.
   on top) — the record is cleared and nothing else is touched.
 - **It can be finished** — a shift (always: the tree it was moving to is already stored), a
   fast-forward or merge whose head landed, a park whose work is already in the parked list, an
-  `import-git` or a bay creation — staging is rebuilt from
-  the tree it was moving to, and the bay is put at that position. Every file is re-read for this,
-  so a file the crash left at other content is reported as a local change (`unheld` in `--json`),
-  never staged: check it with `stocktake` and `restore` it if it is not yours.
+  `import-git` or a bay creation — the files it had not written yet are written, staging is
+  rebuilt from the tree it was moving to, and the bay is put at that position. For a park, that
+  means the working files are reset to the head, as the park would have left them.
 - **It did not get that far** — the head it was moving to never landed, or another bay moved the
   pallet meanwhile — the operation is undone: for a merge, cherry-pick, fast-forward or `lower`,
-  the files it may have written are put back to the tree it started from, and staging and the
-  position follow. A park that was interrupted before its work reached the parked list leaves that
-  work where it was.
+  the files it wrote are put back to the tree it started from, and staging and the position
+  follow. A park that was interrupted before its work reached the parked list leaves that work
+  where it was.
+
+Either way, heal only rewrites a file that still holds one of the two trees' content, or is
+missing. A file at anything else — an edit you made after the crash, or a file a merge combined
+from both sides — is left as it is and reported as a local change (`unheld` in `--json`), never
+staged: check it with `stocktake`, and `restore` it if it is not yours.
 
 An interrupted `franchise` is not recovered: it held no work yet, so remove the directory and
 franchise again. `heal` reports what it did as an `operation` entry (`finished`,

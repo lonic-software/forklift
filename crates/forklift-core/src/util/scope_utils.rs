@@ -411,6 +411,15 @@ fn current_scope_remedy() -> &'static str {
 /// # Arguments
 /// * `scope` - The materialization scope to record for the active bay.
 pub fn set_bay_scope(scope: &MaterializationScope) -> Result<(), String> {
+    set_bay_scope_at(&bay_scope_path(), scope)
+}
+
+/// [`set_bay_scope`] for the bay whose state dir is `dir`, before its context is entered.
+pub fn set_bay_scope_in(dir: &std::path::Path, scope: &MaterializationScope) -> Result<(), String> {
+    set_bay_scope_at(&dir.join(FILE_NAME_BAY_SCOPE), scope)
+}
+
+fn set_bay_scope_at(path: &std::path::Path, scope: &MaterializationScope) -> Result<(), String> {
     let fetch = read_fetch_scope()?;
 
     if !scope.subset_of(&fetch) {
@@ -420,13 +429,11 @@ pub fn set_bay_scope(scope: &MaterializationScope) -> Result<(), String> {
         );
     }
 
-    let path = bay_scope_path();
-
     if let Some(parent) = path.parent() {
         crate::util::file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    write_scope_file(&path, scope)
+    write_scope_file(path, scope)
 }
 
 /// Set the warehouse fetch scope (shared across bays). A sparse franchise records the paths it

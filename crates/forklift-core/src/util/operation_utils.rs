@@ -490,14 +490,11 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
 
     match operation.kind {
         OperationKind::Shift => match &operation.target_tree {
-            Some(tree) if object_utils::load_tree(tree).is_ok() => {
-                let unheld = rebuild_staging(Some(tree))?;
-                pallet_utils::write_position(&operation.target)?;
-                Ok((RecoveryOutcome::RolledForward, unheld))
-            }
-            Some(_) => roll_back(operation),
-            None => {
-                let unheld = rebuild_staging(None)?;
+            Some(tree) if object_utils::load_tree(tree).is_err() => roll_back(operation),
+            target_tree => {
+                let target_tree = tree_or_empty(target_tree.as_deref())?;
+                put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree)?;
+                let unheld = rebuild_staging(Some(&target_tree))?;
                 pallet_utils::write_position(&operation.target)?;
                 Ok((RecoveryOutcome::RolledForward, unheld))
             }
@@ -506,13 +503,17 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
         OperationKind::Park => {
             // The position does not change across a park, so the parked list is its signal: the
             // work is safe there only if the list names the parked parcel.
-            let parked = operation.parked.as_deref()
-                .map(|hash| park_utils::read_parked().map(|list| list.iter().any(|entry| entry == hash)))
-                .transpose()?
-                .unwrap_or(false);
+            let parked = match operation.parked.as_deref() {
+                Some(hash) if park_utils::read_parked()?.iter().any(|entry| entry == hash) => Some(hash),
+                _ => None,
+            };
 
-            if parked {
-                Ok((RecoveryOutcome::RolledForward, rebuild_staging(operation.source_tree.as_deref())?))
+            if let Some(parcel) = parked {
+                // The work is safe in the list, so the reset to the head is finished: a file still
+                // holding the parked content goes back to the head.
+                let head_tree = tree_or_empty(operation.source_tree.as_deref())?;
+                put_back(&object_utils::load_parcel(parcel)?.tree_hash, &head_tree)?;
+                Ok((RecoveryOutcome::RolledForward, rebuild_staging(Some(&head_tree))?))
             } else {
                 // The working files were never touched, and staging holds only what they hold.
                 Ok((RecoveryOutcome::Cleared, Vec::new()))
@@ -535,7 +536,9 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
             ).is_ok());
 
             if landed {
-                let unheld = rebuild_staging(operation.target_tree.as_deref())?;
+                let target_tree = tree_or_empty(operation.target_tree.as_deref())?;
+                put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree)?;
+                let unheld = rebuild_staging(Some(&target_tree))?;
                 pallet_utils::record_landed(&operation.target.pallet, new)?;
                 Ok((RecoveryOutcome::RolledForward, unheld))
             } else {
@@ -566,29 +569,32 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
         OperationKind::BayCreation => {
             // A bay being created holds no work of its own, so its files are written outright.
             if let Some(tree) = &operation.target_tree {
-                put_back(None, tree)?;
+                put_back(&object_utils::empty_tree_hash()?, tree)?;
             }
 
             Ok((RecoveryOutcome::RolledForward, rebuild_staging(operation.target_tree.as_deref())?))
         }
 
-        OperationKind::ImportGit => Ok((RecoveryOutcome::RolledForward, rebuild_staging(operation.target_tree.as_deref())?)),
+        OperationKind::ImportGit => {
+            // Raised before the position, so the position may still be the earlier one.
+            let unheld = rebuild_staging(operation.target_tree.as_deref())?;
+            pallet_utils::write_position(&operation.target)?;
+            Ok((RecoveryOutcome::RolledForward, unheld))
+        }
 
         OperationKind::Franchise => unreachable!("franchise refuses above"),
     }
 }
 
-/// Undo `operation`: put the files it may have written back at the source tree where the operation
-/// checked the bay clean first, rebuild staging from the source tree, restore the source position,
-/// and clear any in-progress state.
+/// Undo `operation`: put the files it may have written back at the source tree, rebuild staging
+/// from the source tree, restore the source position, and clear any in-progress state.
 fn roll_back(operation: &Operation) -> Result<(RecoveryOutcome, Vec<String>), String> {
-    let source_tree = match &operation.source_tree {
-        Some(tree) => tree.clone(),
-        None => object_utils::empty_tree_hash()?,
-    };
+    let source_tree = tree_or_empty(operation.source_tree.as_deref())?;
 
-    // Every one of these checked the bay clean against the source before it wrote a file, so a
-    // file on a path it can have written holds its output, never work of the user's.
+    // Each of these checked the bay clean against the source before it wrote a file, so a file
+    // holding the tree it was writing is its output, and goes back. A merge's file that took both
+    // sides' changes holds neither tree, so it stays, reported as a local change, beside any edit
+    // made since the crash.
     let written_from = match operation.kind {
         OperationKind::FastForward | OperationKind::Lower => operation.target_tree.clone(),
         OperationKind::Merge | OperationKind::CherryPick => operation.their_tree.clone(),
@@ -596,7 +602,7 @@ fn roll_back(operation: &Operation) -> Result<(RecoveryOutcome, Vec<String>), St
     };
 
     if let Some(written_from) = written_from {
-        put_back(Some(&written_from), &source_tree)?;
+        put_back(&written_from, &source_tree)?;
     }
 
     let unheld = rebuild_staging(Some(&source_tree))?;
@@ -618,18 +624,38 @@ fn clear_in_progress_state(operation: &Operation) -> Result<(), String> {
     Ok(())
 }
 
-/// Write `to`'s content over every path that differs between `from` (the empty tree for `None`)
-/// and `to`, whatever the working directory holds there now: each write replaces, and a removal of
-/// a missing file is already done.
-fn put_back(from: Option<&str>, to: &str) -> Result<(), String> {
-    let (ops, removed_dirs) = shift_utils::diff_trees(from, to)?;
+/// Bring every path that differs between `from` and `to` to `to`'s content, where the working
+/// directory still holds what the operation could have left there: `from`'s content, `to`'s (then
+/// the path is done already), or nothing. A file holding anything else is the user's work since the
+/// crash, or an untracked file where `to` adds one, so it is left alone, and the rebuild after
+/// reports it as a local change.
+fn put_back(from: &str, to: &str) -> Result<(), String> {
+    let (ops, removed_dirs) = shift_utils::diff_trees(Some(from), to)?;
 
-    let ops: Vec<FileOp> = ops.into_iter().map(|op| match op {
-        FileOp::Write { path, hash, item_type, .. } => FileOp::Write { path, hash, item_type, is_new: false },
-        remove => remove,
+    // Every file not at a tree's content, a missing one included, comes back from its rebuild.
+    let unheld = |tree: &str| -> Result<std::collections::HashSet<String>, String> {
+        Ok(shift_utils::build_inventories_for_tree(tree, TreeProvenance::Verify)?.unheld.into_iter().collect())
+    };
+    let (off_from, off_to) = (unheld(from)?, unheld(to)?);
+    let present = |path: &str| crate::globals::warehouse_root().join(path).symlink_metadata().is_ok();
+
+    let ops: Vec<FileOp> = ops.into_iter().filter_map(|op| match op {
+        FileOp::Write { path, hash, item_type, is_new } => {
+            let writable = off_to.contains(&path) && (!present(&path) || (!is_new && !off_from.contains(&path)));
+            writable.then_some(FileOp::Write { path, hash, item_type, is_new: false })
+        }
+        FileOp::Remove { path } => (present(&path) && !off_from.contains(&path)).then_some(FileOp::Remove { path }),
     }).collect();
 
     shift_utils::apply_ops(&ops, &removed_dirs)
+}
+
+/// `tree`, or the empty tree for `None`.
+fn tree_or_empty(tree: Option<&str>) -> Result<String, String> {
+    match tree {
+        Some(tree) => Ok(tree.to_string()),
+        None => object_utils::empty_tree_hash(),
+    }
 }
 
 /// Rebuild staging from `tree` (the empty tree for `None`), re-proving every file, so a file a

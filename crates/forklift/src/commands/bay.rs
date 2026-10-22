@@ -90,6 +90,12 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     std::fs::create_dir_all(&bay_dir)
         .map_err(|e| format!("Error while creating the bay directory \"{}\": {}", bay_dir.to_string_lossy(), e))?;
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
+    // The materialization scope goes in before the marker, so recovery fills in only the scope:
+    // the materialize (and every later scope-aware verb in this bay, `forklift heal` included)
+    // reads it back through `scope_utils::current_scope`.
+    if !scope.is_full() {
+        scope_utils::set_bay_scope_in(&bay_utils::bay_state_dir(name), &scope)?;
+    }
     // Raised in the new bay before its position, and finished once its tree is materialized: a
     // bay interrupted between the two is filled in by `forklift heal` (or dropped by `bay remove`).
     let position = pallet_utils::BayPosition::new(name, Some(head.clone()));
@@ -116,12 +122,6 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // The new bay's own lock, held until it is filled: a command run in the bay meanwhile waits
     // for it rather than staging against a half-made tree or clearing an assembly in flight.
     let _bay_lock = lock_utils::WarehouseLock::acquire()?;
-
-    // Record the materialization scope before materializing — the materialize (and every
-    // later scope-aware verb in this bay) reads it back through `scope_utils::current_scope`.
-    if !scope.is_full() {
-        scope_utils::set_bay_scope(&scope)?;
-    }
 
     shift_utils::materialize_tree(None, &tree, "Creating the bay", file_utils::take_stat_anchor()?, &Progress::NONE)?;
     operation_utils::finish()?;

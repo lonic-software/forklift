@@ -27,7 +27,6 @@ pub async fn park_changes() -> Result<(), String> {
     // already permanent) — so it must refuse exactly like `stack` while a load that started but
     // never finished cleanly is still recorded (`load_guard_utils`).
     load_guard_utils::check_no_incomplete_load()?;
-    operation_utils::check_none_standing()?;
 
     let operator = config_utils::get_operator()?;
 
@@ -474,8 +473,8 @@ mod tests {
         assert!(object_utils::load_tree(&parked_tree).is_ok(), "the parked parcel's tree is stored");
         assert!(staged_paths(&tree).is_empty(), "staging is back at the head");
 
-        // The file was never reset: it reads as a local change, never as staged content.
-        assert_eq!(recovery.unheld, vec!["a.txt".to_string()]);
-        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"));
+        // The reset is finished: the file still held the parked content, so it is back at the head.
+        assert!(recovery.unheld.is_empty(), "{:?}", recovery.unheld);
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"one\n"));
     }
 }

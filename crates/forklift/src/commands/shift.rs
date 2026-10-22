@@ -374,6 +374,9 @@ mod tests {
         // so every registered key reads as empty.
         std::fs::remove_dir_all(file_utils::get_inventory_store_root().unwrap()).unwrap();
 
+        // And a kill part-way through the writes before it: b.txt never reached the target.
+        std::fs::write(warehouse.root.join("b.txt"), b"two\n").unwrap();
+
         let error = test_support::block_on(crate::commands::stack::handle_command(Some("after crash".to_string())))
             .expect_err("a stack over an interrupted rewrite must be refused");
         assert!(error.contains("forklift heal"), "{}", error);
