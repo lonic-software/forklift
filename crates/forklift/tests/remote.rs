@@ -7190,7 +7190,9 @@ fn a_missing_pallet_is_a_coded_refusal_naming_lower_only_with_a_remote() {
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("b", &["lower"]));
 
-    for args in [&["shift", "nope"][..], &["consolidate", "nope"], &["audit", "nope"]] {
+    for args in [&["shift", "nope"][..], &["consolidate", "nope"], &["audit", "nope"],
+                 &["haul", "open", "--target", "nope", "--source", "main", "--title", "t"],
+                 &["haul", "open", "--target", "main", "--source", "nope", "--title", "t"]] {
         let mut json = vec!["--json"];
         json.extend_from_slice(args);
         let refused = area.forklift("b", &json);
