@@ -15,9 +15,27 @@ pub struct Inventory {
     /// descendant shard, with empty-subtree pruning), from current staged state — directly
     /// comparable to a head subtree hash. `None` when the shard's true subtree hash is not
     /// currently known (never derived independently; only ever stamped from a tree hash the
-    /// writer already holds, or cleared). See `inventory_utils::write_shard_mutation` and the
-    /// per-writer maintenance around it (DESIGN.html §5.0 D item 8) for how this stays correct.
+    /// writer already holds, or cleared). Only a [`RollupStamp`] sets it; the shard-write funnels
+    /// (`inventory_utils::shard_write`) clear it where a change invalidates it (DESIGN.html §5.0 D
+    /// item 8).
     rollup_hash: Option<String>,
+}
+
+/// A tree hash a shard may carry as its rollup. A shard rebuilt from a tree gets one only from
+/// `tree_utils::rollup_stamp`, which decides whether the rebuild is a complete materialization of
+/// that tree, so no tree-to-shard builder can stamp without that check. Inside this crate it is also
+/// minted from a hash already trusted: one read off a shard on disk, or one `stack` just built.
+///
+/// The type confines who mints a stamp, not whether the hash is right: neither mint can check that
+/// the hash names the content the shard holds, so each trusts its caller for that.
+pub struct RollupStamp(String);
+
+impl RollupStamp {
+    /// A stamp for a hash already trusted as this shard's rollup — one parsed from the shard's own
+    /// bytes, or the subtree hash the tree build of the stack being cleaned up produced.
+    pub(crate) fn trusted(hash: String) -> RollupStamp {
+        RollupStamp(hash)
+    }
 }
 
 impl Inventory {
@@ -41,14 +59,18 @@ impl Inventory {
         self.rollup_hash.as_ref()
     }
 
-    /// Set (or clear) the rollup hash of this shard's subtree. Callers own the correctness of
-    /// this value — the model never derives or invalidates it on its own; see
-    /// `inventory_utils::write_shard_mutation`.
+    /// Stamp this shard's rollup hash. The model never derives or invalidates it on its own; see
+    /// [`RollupStamp`] for where a stamp comes from.
     ///
     /// # Arguments
-    /// * `rollup_hash` - The new rollup hash, or `None` to clear it.
-    pub fn set_rollup_hash(&mut self, rollup_hash: Option<String>) {
-        self.rollup_hash = rollup_hash;
+    /// * `stamp` - The rollup hash to carry.
+    pub fn stamp_rollup(&mut self, stamp: RollupStamp) {
+        self.rollup_hash = Some(stamp.0);
+    }
+
+    /// Clear this shard's rollup hash: its subtree hash is no longer known.
+    pub fn clear_rollup(&mut self) {
+        self.rollup_hash = None;
     }
 
     /// Add an item to the inventory. If an item with the same name already exists

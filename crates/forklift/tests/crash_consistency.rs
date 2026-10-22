@@ -1397,7 +1397,7 @@ fn a_small_directory_load_pays_no_extra_barrier_for_the_incomplete_load_marker()
 /// The single-file `load` counterpart of the pin above. A single-file load never builds a
 /// walk-wide blob batch (see `inventory_utils::add_file_to_inventory`'s doc comment — there is no
 /// walk, just this one file), so the marker instead folds into the loaded file's own
-/// shard-content publish (`inventory_utils::write_shard_mutation_with_extra`). A root-level file
+/// shard-content publish (the `extra` of `inventory_utils::shard_write::publish_shards`). A root-level file
 /// has no ancestor rollup to clear, so that shard write is this load's only real barrier — with
 /// or without the marker.
 ///

@@ -6,6 +6,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::task::tree_builder::tree_builder_context::TreeBuilderContext;
 use crate::model::task::TaskExecutor;
+use crate::model::inventory::RollupStamp;
 use crate::model::tree_item::TreeItem;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
@@ -853,12 +854,17 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
     tree.get_files().len() == 0 && tree.get_subtrees().len() == 0
 }
 
-/// Whether a directory's inventory shard, just rebuilt wholesale from `tree`, may be trusted to
-/// carry `tree`'s hash as its rollup. Shared by `restore --staged`'s and `shift`'s tree-to-shard
-/// builders (`build_unstaged_shards`, `shift_utils::build_inventories_for_tree`), which each
-/// independently rebuild every shard of a subtree straight from a resolved tree and must decide
-/// the same way whether the shard they just wrote is a trustworthy rollup — kept as one function
-/// so the (subtle) rule can never drift between the two copies.
+/// The rollup a directory's inventory shard, just rebuilt wholesale from `tree`, may carry: `tree`'s
+/// hash, or `None` when the rebuild may not be trusted to name it. The only way a tree-to-shard
+/// builder gets a [`RollupStamp`], so none can stamp without this check. Shared by
+/// `restore --staged`'s and `shift`'s tree-to-shard builders (`build_unstaged_shards`,
+/// `shift_utils::build_inventories_for_tree`), which each independently rebuild every shard of a
+/// subtree straight from a resolved tree and must decide the same way whether the shard they just
+/// wrote is a trustworthy rollup — kept as one function so the (subtle) rule can never drift
+/// between the two copies.
+///
+/// The caller vouches that `tree_hash` is `tree`'s hash and that the shard holds exactly what it
+/// built from `tree`; this checks neither.
 ///
 /// A rewrite is only trustworthy when both hold:
 /// * it is a *complete* materialization of `tree` — the whole tree (an unscoped bay), or a
@@ -870,11 +876,14 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 ///   as a rollup either way.
 ///
 /// # Arguments
-/// * `scope` - The active bay's materialization scope.
-/// * `key`   - The warehouse path key of the directory whose shard was just rebuilt.
-/// * `tree`  - The (loaded) tree the shard was rebuilt from.
-pub fn rollup_stampable(scope: &MaterializationScope, key: &str, tree: &TreeItem) -> bool {
-    (scope.is_full() || scope.classify(key) == ScopeClass::InScope) && !is_tree_empty(tree)
+/// * `scope`     - The active bay's materialization scope.
+/// * `key`       - The warehouse path key of the directory whose shard was just rebuilt.
+/// * `tree`      - The (loaded) tree the shard was rebuilt from.
+/// * `tree_hash` - The hash of `tree`.
+pub fn rollup_stamp(scope: &MaterializationScope, key: &str, tree: &TreeItem, tree_hash: &str) -> Option<RollupStamp> {
+    let stampable = (scope.is_full() || scope.classify(key) == ScopeClass::InScope) && !is_tree_empty(tree);
+
+    stampable.then(|| RollupStamp::trusted(tree_hash.to_string()))
 }
 
 /// Build, store and hash a tree object (setting the item's hash), like the per-directory step

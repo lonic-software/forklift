@@ -123,7 +123,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
         ));
     }
 
-    // Through a batch rather than `update_shard`: recording only stat data keeps the rollups.
+    // Recording only stat data keeps the rollups (see `ShardMutationBatch`).
     let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
 
     let message = match restore_entry(parent.as_key(), &item)? {
@@ -454,8 +454,8 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
             let current = ledger.inventory(parent.as_key()).unwrap_or(None);
             let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref())?;
 
-            // Through a batch rather than `update_shard`: an entry that already matched the head
-            // changes only its stat data, which keeps the rollups.
+            // An entry that already matched the head changes only its stat data, which keeps the
+            // rollups (see `ShardMutationBatch`).
             let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
             batch.update(parent.as_key(), |inventory| inventory.add_item(entry))?;
             batch.publish()?;
@@ -610,11 +610,11 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when the reset here
-    // is a complete materialization of `tree` — see `tree_utils::rollup_stampable`'s doc comment
+    // is a complete materialization of `tree` — see `tree_utils::rollup_stamp`'s doc comment
     // (shared with `shift`'s own tree-to-shard builder, which must decide this exactly the same
     // way).
-    if tree_utils::rollup_stampable(scope, key, tree) {
-        inventory.set_rollup_hash(Some(tree_hash.to_string()));
+    if let Some(stamp) = tree_utils::rollup_stamp(scope, key, tree, tree_hash) {
+        inventory.stamp_rollup(stamp);
     }
 
     shards.insert(key.to_string(), inventory);

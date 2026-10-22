@@ -775,7 +775,9 @@ itself as well as the findings.
      batch, not just the ones already processed) is dropped before anything is published. A CLI
      regression test translating the review's exact repro (a `(marketing)/` directory, a real edit
      inside it, a same-content root-level rewrite) failed with the predicted "nothing to park"
-     error on the pre-fix branch and passes now.
+     error on the pre-fix branch and passes now. *Since FORK-199 the primitive is
+     `inventory_utils::shard_write::publish_shards`: producers hand it only each shard's new
+     content, and it classifies carry versus change itself, against the shard on disk.*
    * **Round 2, finding #6 (mtime widening, PLAUSIBLE, confirmed real).** The same pass-1/pass-2
      split published a stat-only shard rewrite (no real content change, just stale stat data) with
      "now" — the moment the *whole* refresh finished deciding every tracked shard — instead of the
@@ -823,7 +825,8 @@ itself as well as the findings.
      `Carry`. `restore .` now pays 1 barrier for 10 or 50 files (it paid 11 and 51), and no
      longer strips the rollups above the files it rewrites, so the next `stocktake` still
      skips them. Synthetic, 48 dirtied files: 721 → 20 ms. git.git, `restore Documentation`
-     (982 tracked files, 200 of them dirtied): 18.6 s → 0.55 s (34×), 982 barriers → 1. Each shard is published at the moment of its last change. A caller must stat each file
+     (982 tracked files, 200 of them dirtied): 18.6 s → 0.55 s (34×), 982 barriers → 1.
+     (`publish_shard_outcomes` is `shard_write::publish_shards` since FORK-199.) Each shard is published at the moment of its last change. A caller must stat each file
      right after writing it, then call `update`; writing many files first and statting them
      later would trust an edit made in between.
    * **`park pop`: done (FORK-195, slice 2).** Its Write and Remove ops stage through one
