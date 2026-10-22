@@ -6025,6 +6025,7 @@ mod tests {
                 "main",
                 crate::util::pallet_utils::get_pallet_head("main").unwrap().as_deref(),
                 &parcel_object.hash,
+                &crate::util::pallet_utils::RefPreconditions::NONE,
             ).unwrap();
             crate::util::pack_utils::compact(false, false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
 

@@ -30,7 +30,8 @@ pub async fn park_changes() -> Result<(), String> {
     let operator = config_utils::get_operator()?;
 
     // Parked parcels are parcels: once trust is established they are signed too.
-    let signing_key_id = stack_utils::resolve_signing_key(&operator)?;
+    // Park writes no pallet head, so only the key is kept.
+    let signing_key_id = stack_utils::resolve_signing_key(&operator)?.key_id().map(str::to_string);
 
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(

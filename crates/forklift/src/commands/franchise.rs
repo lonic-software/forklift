@@ -303,7 +303,7 @@ async fn franchise_into_prepared_target(
     }
 
     // A franchise fills a fresh warehouse, so the pallet is unborn here.
-    pallet_utils::update_pallet_head(&pallet_name, None, &remote_head)?;
+    pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &pallet_utils::RefPreconditions::NONE)?;
     pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
 
     // A failure here still goes through the caller's ordinary cleanup — the whole target is

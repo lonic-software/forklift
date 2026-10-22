@@ -1272,6 +1272,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let relative_str = h_relative.to_string_lossy().into_owned();

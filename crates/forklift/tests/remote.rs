@@ -5317,6 +5317,7 @@ fn build_over_cap_subtree_without_blobs(warehouse_root: &Path, name: &str) -> St
         "main",
         pallet_utils::get_pallet_head("main").unwrap().as_deref(),
         &parcel_hash,
+        &pallet_utils::RefPreconditions::NONE,
     ).unwrap();
 
     parcel_hash

@@ -35,7 +35,9 @@ use forklift_core::model::remote::{
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
-use forklift_core::util::pallet_utils::RefUpdateError;
+use forklift_core::util::pallet_utils::{
+    AnchorPrecondition, BoundaryScope, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError,
+};
 use forklift_core::util::lock_utils::{self, BaseServeLock, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     audit_utils, body_utils, bay_utils, bundle_utils, file_utils, hook_utils, merge_utils, meta_tree,
@@ -974,6 +976,22 @@ fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
     (StatusCode::CONFLICT, pallet_utils::pallet_moved_refusal(current, expected).into())
 }
 
+/// The refusal for a ref update whose audit consumed an office head that moved before the write:
+/// the pallet did not move, but the office state the audit trusted did. The same wording as the
+/// Lambda head's.
+fn office_moved(current: Option<&str>) -> HandlerError {
+    (StatusCode::CONFLICT, pallet_utils::remote_ahead_refusal(format!(
+        "The office pallet moved during the audit: its head is now {}. Lower and retry.",
+        current.unwrap_or("unborn")
+    )).into())
+}
+
+/// The refusal for a ref update whose audit consumed a trust anchor that changed before the
+/// write (established, or replaced by a re-genesis). The same wording as the Lambda head's.
+fn anchor_moved() -> HandlerError {
+    (StatusCode::CONFLICT, "The trust anchor changed during the audit; re-read the warehouse and retry.".to_string())
+}
+
 /// Whether `root` holds a warehouse. A bay's working directory holds a `.forklift` folder too, so
 /// the shared classifier decides, never the folder's mere presence: a bay is never served,
 /// adopted or reported as an existing warehouse. A `.forklift` that cannot be classified (a
@@ -981,6 +999,15 @@ fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
 /// creation finds the name taken.
 fn holds_warehouse(root: &std::path::Path) -> bool {
     matches!(bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), Ok(bay_utils::ForkliftKind::Warehouse))
+}
+
+/// Map a trust install that did not land: a `409` when what the handler read moved meanwhile (it
+/// wrote nothing, and a retry re-reads), a 500 when a write failed.
+fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
+    match error {
+        RefUpdateError::Failed(message) => internal(message),
+        moved => (StatusCode::CONFLICT, moved.to_string()),
+    }
 }
 
 /// Map an internal storage error to a 500.
@@ -1332,6 +1359,38 @@ fn office_lookup_test_checkpoint(identifier: &str) {
 
 #[cfg(not(test))]
 fn office_lookup_test_checkpoint(_identifier: &str) {}
+
+/// Test seam: a ref update for the armed pallet name (or `PUT /v1/trust`, armed as
+/// [`TRUST_WRITE_SEAM`]) runs the armed closure after its decision and before its write, so a test
+/// can move what the decision read in exactly that window. Keyed and a `Mutex` for the same
+/// reasons as [`OFFICE_LOOKUP_TEST_SEAM`].
+/// The key [`REF_WRITE_TEST_SEAM`] arms `PUT /v1/trust` under: no pallet name holds a `/`.
+const TRUST_WRITE_SEAM: &str = "/v1/trust";
+
+#[cfg(test)]
+type RefWriteSeam = Option<(String, Box<dyn FnOnce() + Send>)>;
+
+#[cfg(test)]
+static REF_WRITE_TEST_SEAM: Mutex<RefWriteSeam> = Mutex::new(None);
+
+#[cfg(test)]
+fn ref_write_test_checkpoint(name: &str) {
+    let armed = {
+        let mut slot = REF_WRITE_TEST_SEAM.lock().unwrap_or_else(|e| e.into_inner());
+
+        match slot.as_ref() {
+            Some((armed_for, _)) if armed_for == name => slot.take(),
+            _ => None,
+        }
+    };
+
+    if let Some((_, run)) = armed {
+        run();
+    }
+}
+
+#[cfg(not(test))]
+fn ref_write_test_checkpoint(_name: &str) {}
 
 /// Derive the office state from a head **already read once by the caller** — the two
 /// arms C9 requires, in one place so neither can be reinstated independently. `Some`
@@ -2246,8 +2305,8 @@ async fn put_trust(State(state): State<Arc<AppState>>,
         let _guard = warehouse.writes.lock()
             .map_err(|_| internal("The write lock is poisoned.".to_string()))?;
 
-        match office_utils::read_trust_anchor().map_err(internal)? {
-            Some(existing) => {
+        match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
+            Some((existing, existing_bytes)) => {
                 if TrustAnchorDto::from(&existing) == anchor {
                     return Ok(None);
                 }
@@ -2295,7 +2354,23 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     "TRUST RESET: the trust anchor was replaced by a re-genesis"
                 );
 
-                office_utils::replace_trust_anchor(&anchor.to_anchor()).map_err(internal)?;
+                ref_write_test_checkpoint(TRUST_WRITE_SEAM);
+
+                // The anchor and the office head the tests above read are the install's
+                // preconditions, and the boundary it records holds every pallet head: a bay of
+                // this warehouse moving either meanwhile refuses the install rather than planting
+                // an anchor over history it never adopted.
+                office_utils::install_trust(&office_utils::TrustInstall {
+                    anchor: &anchor.to_anchor(),
+                    replaces: Some(&existing_bytes),
+                    office: office_head.as_deref(),
+                    new_office: None,
+                    pallets: PalletsPrecondition::WithinBoundary {
+                        boundary: anchor.boundary.clone(),
+                        scope: BoundaryScope::AllButOffice,
+                    },
+                })
+                .map_err(trust_install_refusal)?;
 
                 let mut event = HookEvent::new(EVENT_TRUST_RESET);
                 event.detail = Some(anchor.genesis.clone());
@@ -2303,8 +2378,9 @@ async fn put_trust(State(state): State<Arc<AppState>>,
             }
             None => {
                 // No anchor but an office: the anchor was lost, and whichever client lifts first
-                // would otherwise plant its own over a chain it never verified. The office cannot
-                // appear meanwhile: its lift needs an anchor, and this holds the write lock.
+                // would otherwise plant its own over a chain it never verified. The install below
+                // conditions on the office still being unborn, so a bay of this warehouse enrolling
+                // meanwhile refuses it.
                 if pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)
                     .map_err(internal)?
                     .is_some() {
@@ -2325,7 +2401,19 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 )
                 .map_err(|refusal| (StatusCode::UNPROCESSABLE_ENTITY, refusal))?;
 
-                office_utils::write_trust_anchor(&anchor.to_anchor()).map_err(internal)?;
+                ref_write_test_checkpoint(TRUST_WRITE_SEAM);
+
+                office_utils::install_trust(&office_utils::TrustInstall {
+                    anchor: &anchor.to_anchor(),
+                    replaces: None,
+                    office: None,
+                    new_office: None,
+                    pallets: PalletsPrecondition::WithinBoundary {
+                        boundary: anchor.boundary.clone(),
+                        scope: BoundaryScope::UserPallets,
+                    },
+                })
+                .map_err(trust_install_refusal)?;
 
                 let mut event = HookEvent::new(EVENT_TRUST_ESTABLISHED);
                 event.detail = Some(anchor.genesis.clone());
@@ -2398,22 +2486,26 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 
         let pallet_rules = if is_meta { meta_tree::meta_rules(&bare) } else { None };
 
-        // The CAS read-check-write is one critical section. The trust anchor and
-        // office state are read here too, once, so transport authorization below and
-        // the audit that follows consume exactly the same values — the lock that
-        // already keeps a running audit's inputs from moving is what makes a single
-        // read enough; a second, earlier read outside the lock could disagree with
-        // what the audit below settles on.
+        // The CAS read-check-write is one critical section against other requests. The trust
+        // anchor and office state are read here too, once, so transport authorization below and
+        // the audit that follows consume exactly the same values. This lock holds out only other
+        // requests, not a local bay of the warehouse: the final write conditions on the anchor's
+        // bytes and the office head being the ones read here, so a bay moving either meanwhile
+        // refuses the write rather than committing what a stale audit settled.
         let _guard = handle.writes.lock()
             .map_err(|_| internal("The write lock is poisoned.".to_string()))?;
 
-        let anchor = office_utils::read_trust_anchor().map_err(internal)?;
+        let (anchor, anchor_bytes) = match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
+            Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
+            None => (None, None),
+        };
 
         // The office head, read once, is an `Option`: `Some` derives the state
         // through the hash-taking accessor (content-addressed reads only, no second
         // head lookup); `None` is the ordinary bootstrap window — trust established
         // but the office not yet lifted — not an error.
         let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(internal)?;
+        let office_head_read = office_head.clone();
 
         // Transport authorization: may this principal move this ref? The role and
         // the pallet grants come from the office — signed, tracked metadata — read
@@ -2576,13 +2668,28 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             ).map_err(unprocessable)?;
         }
 
+        ref_write_test_checkpoint(&name);
+
         // The compare-and-set against the request's old head, under the warehouse's ref lock, so a
-        // local bay's writer that moved the ref since the check above is refused, not overwritten.
-        match pallet_utils::update_pallet_head_in(namespace, &bare, request.old_head.as_deref(), &request.new_head) {
+        // local bay's writer that moved the ref since the check above is refused, not overwritten;
+        // and so is one that moved the office or the anchor the decision above consumed.
+        let preconditions = RefPreconditions {
+            office: OfficePrecondition::At(office_head_read),
+            anchor: match anchor_bytes {
+                Some(bytes) => AnchorPrecondition::Bytes(bytes),
+                None => AnchorPrecondition::Absent,
+            },
+            pallets: PalletsPrecondition::NotConsumed,
+        };
+
+        match pallet_utils::update_pallet_head_in(namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions) {
             Ok(()) => {}
             Err(RefUpdateError::Moved(moved)) => {
                 return Err(pallet_moved(moved.found.as_deref(), request.old_head.as_deref()));
             }
+            Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
+            Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
+            Err(moved @ RefUpdateError::PalletsMoved { .. }) => return Err((StatusCode::CONFLICT, moved.to_string())),
             Err(RefUpdateError::Failed(e)) => return Err(internal(e)),
         }
 
@@ -2795,6 +2902,20 @@ mod tests {
     use forklift_core::util::{office_utils, scope_utils, warehouse_utils};
     use forklift_core::util::office_utils::{IdentityClass, OfficeState, Role, TrustAnchor, UserRecord};
 
+
+    /// Establish `anchor` over whatever office this warehouse holds, as a fixture would without
+    /// an enrollment ceremony.
+    fn plant_trust_anchor(anchor: &TrustAnchor) -> Result<(), RefUpdateError> {
+        let office = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
+
+        office_utils::install_trust(&office_utils::TrustInstall {
+            anchor,
+            replaces: None,
+            office: office.as_deref(),
+            new_office: None,
+            pallets: PalletsPrecondition::NotConsumed,
+        })
+    }
     /// The durable-taint machinery (module `taint_utils` in `forklift_core`) is activation-gated
     /// all-or-nothing: a process that taints or gates existence checks without ever healing them
     /// is strictly worse than today's baseline (a permanent in-process wedge, or a disk taint
@@ -4296,10 +4417,11 @@ mod tests {
 
             let genesis = office_utils::stack_office_parcel(
                 &state, &admin, "genesis".to_string(), &key_id,
-                forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref()
+                forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref(),
+                &RefPreconditions::NONE,
             ).unwrap();
 
-            office_utils::write_trust_anchor(&TrustAnchor {
+            plant_trust_anchor(&TrustAnchor {
                 genesis,
                 enabled_at: 1_700_000_000,
                 boundary: Vec::new(),
@@ -4344,7 +4466,8 @@ mod tests {
 
             office_utils::stack_office_parcel(
                 &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id,
-                forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref()
+                forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref(),
+                &RefPreconditions::NONE,
             ).unwrap();
 
             key_id
@@ -4443,7 +4566,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&root);
         std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
 
-        office_utils::write_trust_anchor(&TrustAnchor {
+        plant_trust_anchor(&TrustAnchor {
             genesis: "0".repeat(64),
             enabled_at: 0,
             boundary: Vec::new(),
@@ -4658,7 +4781,8 @@ mod tests {
         promoted.users.iter_mut().find(|user| user.identifier == "bob").unwrap().role = Role::Admin;
         let base = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
         let held = office_utils::stack_office_parcel(
-            &promoted, &bob, "bob promotes himself".to_string(), &bob_key_id, base.as_deref()
+            &promoted, &bob, "bob promotes himself".to_string(), &bob_key_id, base.as_deref(),
+            &RefPreconditions::NONE,
         ).unwrap();
 
         // The admin demotes Bob again: legitimate in itself.
@@ -4871,7 +4995,8 @@ mod tests {
                     .role = Role::Reader;
                 office_utils::stack_office_parcel(
                     &office_state, &fixture.admin, "revoke quinn".to_string(), &fixture.admin_key_id,
-                    forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref()
+                    forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref(),
+                    &RefPreconditions::NONE,
                 ).unwrap();
                 drop(guard);
 
@@ -4958,7 +5083,7 @@ mod tests {
             &genesis_state, &admin, "genesis".to_string(), &key_id, Vec::new()
         ).unwrap();
 
-        office_utils::write_trust_anchor(&TrustAnchor {
+        plant_trust_anchor(&TrustAnchor {
             genesis: genesis_hash.clone(),
             enabled_at: 1_700_000_000,
             boundary: Vec::new(),
@@ -4992,6 +5117,139 @@ mod tests {
     }
 
     /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
+    /// Arm the write seam for `name` with `run`.
+    fn arm_write_seam(name: &str, run: impl FnOnce() + Send + 'static) {
+        *REF_WRITE_TEST_SEAM.lock().unwrap() = Some((name.to_string(), Box::new(run)));
+    }
+
+    async fn body_text(response: Response) -> String {
+        String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+    }
+
+    // Revert: the final write passes `OfficePrecondition::NotConsumed` → the push lands, judged
+    // against an office that no longer stands.
+    #[tokio::test]
+    async fn a_push_whose_office_moved_after_its_audit_is_refused_and_writes_nothing() {
+        let fixture = OfficeFixture::genesis("post-ref-office-moved");
+        let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["office-moved".to_string()], IdentityClass::Human, None);
+        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
+        let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        // A local bay of this warehouse moves the office between the audit and the write.
+        let office = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
+        let moved = "e".repeat(64);
+        let to = moved.clone();
+        arm_write_seam("office-moved", move || {
+            forklift_core::util::pallet_utils::update_meta_pallet_head(
+                OFFICE_PALLET_NAME, office.as_deref(), &to, &RefPreconditions::NONE,
+            ).unwrap();
+        });
+
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("office-moved")),
+            Json(RefUpdateRequest { old_head: None, new_head }),
+        ).await.into_response();
+
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("office-moved").unwrap(), None,
+            "the pallet must be unchanged");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_text(response).await;
+        assert!(body.contains(&format!("The office pallet moved during the audit: its head is now {}.", moved)), "{}", body);
+    }
+
+    // Revert: the final write passes `AnchorPrecondition::NotConsumed` → the push lands, judged
+    // against an anchor that no longer stands.
+    #[tokio::test]
+    async fn a_push_whose_anchor_changed_after_its_audit_is_refused_and_writes_nothing() {
+        let fixture = OfficeFixture::genesis("post-ref-anchor-moved");
+        let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["anchor-moved".to_string()], IdentityClass::Human, None);
+        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
+        let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        // The anchor's bytes change between the audit and the write.
+        let trust = fixture.root.join(FOLDER_NAME_FORKLIFT_ROOT).join("trust");
+        arm_write_seam("anchor-moved", move || {
+            let mut bytes = std::fs::read(&trust).unwrap();
+            bytes.extend_from_slice(b"# changed\n");
+            std::fs::write(&trust, bytes).unwrap();
+        });
+
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("anchor-moved")),
+            Json(RefUpdateRequest { old_head: None, new_head }),
+        ).await.into_response();
+
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("anchor-moved").unwrap(), None,
+            "the pallet must be unchanged");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_text(response).await;
+        assert!(body.contains("The trust anchor changed during the audit; re-read the warehouse and retry."), "{}", body);
+    }
+
+    /// A first anchor for an empty warehouse, adopting nothing.
+    fn first_anchor(boundary: Vec<String>) -> TrustAnchorDto {
+        TrustAnchorDto { genesis: "0".repeat(64), enabled_at: 1, boundary, prior_genesis: None, adopts: None }
+    }
+
+    /// A storage-only warehouse entered on this thread, for a test of `PUT /v1/trust`.
+    fn trust_warehouse(name: &str) -> (PathBuf, StorageRootScope) {
+        let root = scratch_dir(name);
+        let scope = StorageRootScope::enter(&root);
+        std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+
+        (root, scope)
+    }
+
+    // Revert: the first anchor installs with `OfficePrecondition::NotConsumed` → the anchor lands
+    // over an office it never saw.
+    #[tokio::test]
+    async fn a_first_anchor_whose_office_was_born_meanwhile_is_refused_and_writes_nothing() {
+        let (root, _scope) = trust_warehouse("put-trust-office-born");
+        let state = Arc::new(single_mode_state(root.clone()));
+        arm_write_seam(TRUST_WRITE_SEAM, || {
+            forklift_core::util::pallet_utils::update_meta_pallet_head(
+                OFFICE_PALLET_NAME, None, &"e".repeat(64), &RefPreconditions::NONE,
+            ).unwrap();
+        });
+
+        let response = put_trust(State(state), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(Vec::new())))
+            .await.into_response();
+
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Revert: the first anchor installs with `PalletsPrecondition::NotConsumed` → the anchor lands
+    // with a boundary that does not vouch for "main".
+    #[tokio::test]
+    async fn a_first_anchor_whose_boundary_misses_a_head_is_refused_and_writes_nothing() {
+        let (root, _scope) = trust_warehouse("put-trust-boundary");
+        forklift_core::util::pallet_utils::update_pallet_head("main", None, &"1".repeat(64), &RefPreconditions::NONE).unwrap();
+        let state = Arc::new(single_mode_state(root.clone()));
+
+        let response = put_trust(State(state), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(vec!["2".repeat(64)])))
+            .await.into_response();
+
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_text(response).await;
+        assert!(body.contains("pallet \\\"main\\\""), "{}", body);
+
+        let accepted = put_trust(
+            State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(PathParams::new()),
+            Json(first_anchor(vec!["1".repeat(64)])),
+        ).await.into_response();
+        assert!(accepted.status().is_success(), "a boundary holding every head installs: {}", accepted.status());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn admin_token_state(fixture: &OfficeFixture) -> Arc<AppState> {
         let mut operator_tokens = HashMap::new();
         operator_tokens.insert("tok-alice".to_string(), fixture.admin.identifier.clone());
@@ -5022,7 +5280,7 @@ mod tests {
 
         let fixture = OfficeFixture::genesis("post-ref-kv-forged-stamp");
         let bob_key_id = fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
-        let office = office_utils::read_office_state().unwrap();
+        let office = audit_utils::verified_local_office().unwrap();
 
         // Signed by alice, stamped as bob: the writer's own check refuses it after the parcel
         // is stored, so the signing closure keeps the hash for the push.

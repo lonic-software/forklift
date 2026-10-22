@@ -112,15 +112,21 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         session.finish()?;
     }
 
-    // Each local branch becomes a pallet.
+    // Each local branch becomes a pallet, unsigned, so each is written only while no anchor
+    // stands: an "office enroll" in another bay during the conversion refuses the import rather
+    // than leaving heads outside the boundary it recorded.
     let mut imported: Vec<(String, String)> = Vec::new();
+    let unsigned = pallet_utils::RefPreconditions {
+        anchor: pallet_utils::AnchorPrecondition::Absent,
+        ..pallet_utils::RefPreconditions::NONE
+    };
 
     for ((branch, commit), pallet) in branches.iter().zip(pallets) {
         let head = converter.commits.get(commit).cloned().ok_or(format!(
             "Branch \"{}\" points at a commit that was not imported.", branch
         ))?;
 
-        pallet_utils::update_pallet_head(&pallet, None, &head)?;
+        pallet_utils::update_pallet_head(&pallet, None, &head, &unsigned)?;
         imported.push((branch.clone(), pallet));
     }
 

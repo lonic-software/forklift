@@ -3,7 +3,6 @@ use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
-use forklift_core::util::office_utils::OfficeState;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
@@ -567,7 +566,7 @@ async fn replay(client: &RemoteClient,
     // Every local change is on the remote already or dropped by a resolution. Nothing is signed,
     // so an operator the office no longer lets sign can still drop what the remote refuses.
     if plan.is_empty() {
-        pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head)?;
+        pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
         return Ok(Reconciled::Adopted);
     }
 
@@ -582,7 +581,7 @@ async fn replay(client: &RemoteClient,
     let parcel = match replayed {
         Ok(Some(parcel)) => parcel,
         Ok(None) => {
-            pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head)?;
+            pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
             return Ok(Reconciled::Adopted);
         }
         Err(ReplayError::Conflicts(conflicts)) => {
@@ -613,7 +612,7 @@ async fn replay(client: &RemoteClient,
     }
 
     remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), info.chunking, &Progress::NONE).await?;
-    pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel)?;
+    pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &pallet_utils::RefPreconditions::NONE)?;
     restamped.extend(resigned);
 
     Ok(Reconciled::Replayed)
@@ -621,8 +620,8 @@ async fn replay(client: &RemoteClient,
 
 /// The office, verified against the anchor, and the operator's signing key in it. A converted
 /// pallet's writes are judged against the verified office, never the unverified local read.
-pub(crate) fn verified_signing_office(actor: &Operator) -> Result<(OfficeState, String), String> {
-    let (_unverified, _office_head, signing_key_id, _actor_id) = office::require_signing_actor(actor)?;
+pub(crate) fn verified_signing_office(actor: &Operator) -> Result<(audit_utils::VerifiedOffice, String), String> {
+    let signing_key_id = office::require_signing_actor(actor)?.signing_key_id;
 
     Ok((audit_utils::verified_local_office()?, signing_key_id))
 }

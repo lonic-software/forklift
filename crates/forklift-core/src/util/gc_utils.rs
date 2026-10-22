@@ -432,6 +432,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         object.hash
     }
@@ -609,7 +610,7 @@ pub(crate) mod tests {
         tree.store().unwrap();
         parcel.store().unwrap();
         let main = pallet_utils::get_pallet_head("main").unwrap();
-        pallet_utils::update_pallet_head("main", main.as_deref(), &parcel.hash).unwrap();
+        pallet_utils::update_pallet_head("main", main.as_deref(), &parcel.hash, &pallet_utils::RefPreconditions::NONE).unwrap();
 
         let moved = respell(&loose_path(&blob.hash));
         assert!(moved.exists(), "the blob sits under the respelled entry");
@@ -906,6 +907,7 @@ pub(crate) mod tests {
             crate::util::office_utils::OFFICE_PALLET_NAME,
             pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
             &never_stored_office_head,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let result = collect_live_set();
@@ -1005,6 +1007,7 @@ pub(crate) mod tests {
             crate::util::office_utils::OFFICE_PALLET_NAME,
             pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
             &office_parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // Sanity: the malformed user record really would abort the FULL office-state reader.

@@ -6320,6 +6320,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // Incremental compact: no live-set filtering, packs everything loose. This also runs
@@ -6470,6 +6471,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // First `compact --all`: X is live (reachable from `main`'s head), so it is packed into a
@@ -6663,6 +6665,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // First `compact --all`: X is packed good into pack A. No existing packs yet, so nothing
@@ -6773,6 +6776,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let first = compact(true, false, true, &Progress::NONE).unwrap();
@@ -6923,6 +6927,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let first = compact(true, false, true, &Progress::NONE).unwrap();
@@ -7031,6 +7036,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let first = compact(true, false, true, &Progress::NONE).unwrap();
@@ -7157,6 +7163,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         invalidate_cache();
@@ -7639,6 +7646,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         assert!(matches!(retrieve_from_packs(&target.hash).unwrap(), PackRetrieval::Verified(_)),
@@ -8050,6 +8058,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_v2_obj.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // Corrupt v1's blob loose file in place: a well-formed zstd frame (so it decodes) whose
@@ -8160,6 +8169,7 @@ pub(crate) mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_v2_obj.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let stats = compact(false, false, false, &Progress::NONE).unwrap();
@@ -8606,7 +8616,7 @@ pub(crate) mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &parcel_object.hash)
+        pallet_utils::update_pallet_head("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &parcel_object.hash, &pallet_utils::RefPreconditions::NONE)
             .unwrap();
     }
 

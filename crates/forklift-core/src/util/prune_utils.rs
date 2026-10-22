@@ -697,6 +697,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         Fixture { parcel, root_tree, src_tree, api_tree, api_blob, web_tree, web_blob, readme_blob }
@@ -754,6 +755,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -913,6 +915,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &p2,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -975,6 +978,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -1049,6 +1053,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -1109,6 +1114,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -1171,6 +1177,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -1219,6 +1226,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
@@ -1297,7 +1305,7 @@ mod tests {
             let web = store_tree(&[("big.bin", &pruned_recipe, DirEntryType::NormalChunked)]);
             let src = store_tree(&[("web", &web, DirEntryType::Tree)]);
             let parcel = store_parcel(&store_tree(&[("src", &src, DirEntryType::Tree)]), Vec::new());
-            pallet_utils::update_pallet_head("main", None, &parcel).unwrap();
+            pallet_utils::update_pallet_head("main", None, &parcel, &pallet_utils::RefPreconditions::NONE).unwrap();
 
             crate::util::gc_utils::tests::plant_staged_shard("b", &[("big.bin", &staged_recipe, DirEntryType::NormalChunked)]);
             pack_as_unreadable(&staged_recipe, how);

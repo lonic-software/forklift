@@ -409,19 +409,22 @@ impl BaseServeLock {
 }
 
 /// An exclusive lock on the pallet refs (user and meta) and the trust anchor that every bay of a
-/// warehouse shares, held for one read → compare → write of one of them and no longer.
+/// warehouse shares, held for one read → compare → write and no longer.
 ///
 /// The bay lock ([`WarehouseLock`]) is bay-local, so it cannot order two bays' ref writes; this
 /// lock lives in the shared forklift root (`forklift_root()/refs.lock`), which is the same file
 /// from every bay. It is a kernel lock on a never-deleted sidecar, like [`StoreAccessLock`], so a
-/// hard-killed holder leaves nothing stale and a writer may wait. A hold spans one ref (or
-/// anchor) read and one durable write of it (its fsyncs included) and nothing else, so the wait
-/// is short and is not announced; a holder stalled inside that write stalls every ref writer.
+/// hard-killed holder leaves nothing stale and a writer may wait. A hold spans the reads of the
+/// refs (and anchor) the write's decision consumed, then one durable write (its fsyncs included)
+/// — or, for a trust install, the anchor write and the office write of that one install — and
+/// nothing else, so the wait is short and is not announced; a holder stalled inside a write
+/// stalls every ref writer.
 ///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
-/// ref compare-and-set, the trust anchor writes and `heal`'s restage of a ref or the anchor
-/// take it, and none of them calls another.
+/// ref compare-and-set, the trust install and `heal`'s restage of a ref or the anchor take it,
+/// and none of them calls another: work inside a hold uses the lock-free variants, which take
+/// the held lock as an argument.
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.
     _file: std::fs::File,
@@ -447,6 +450,25 @@ impl RefLock {
         file.lock().map_err(|e| lock_error(&path, &e))?;
 
         Ok(RefLock { _file: file })
+    }
+
+    /// Take the ref lock of the warehouse whose forklift root is `root` without waiting, for a
+    /// test that checks the lock is held.
+    ///
+    /// # Returns
+    /// * `Ok(Some(RefLock))` - The lock was free, and is now held.
+    /// * `Ok(None)`          - Another thread or process holds it.
+    /// * `Err(String)`       - The sidecar could not be opened or locked.
+    #[cfg(test)]
+    pub(crate) fn try_acquire_in(root: &Path) -> Result<Option<RefLock>, String> {
+        let path = absolute(root.join(FILE_NAME_REF_LOCK));
+        let file = open_lock_sidecar(&path)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Some(RefLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
     }
 }
 

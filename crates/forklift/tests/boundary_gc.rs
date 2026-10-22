@@ -1169,6 +1169,7 @@ fn a_torn_taint_heals_over_a_malformed_tag_record_and_notes_it() {
             tag_utils::TAGS_PALLET_NAME,
             pallet_utils::get_meta_pallet_head(tag_utils::TAGS_PALLET_NAME).unwrap().as_deref(),
             &parcel.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         assert!(tag_utils::read_tags().is_err(), "the fixture needs an unreadable tag history");
     });

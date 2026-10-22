@@ -108,6 +108,7 @@ impl Warehouse {
             name,
             pallet_utils::get_pallet_head(name).unwrap().as_deref(),
             &parcel_hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
     }
 }
@@ -391,6 +392,7 @@ fn a_symlink_at_the_chunked_assembly_temp_path_is_not_written_through() {
             "before",
             pallet_utils::get_pallet_head("before").unwrap().as_deref(),
             &first,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
     }
     warehouse.run_ok(&["shift", "before"]);
@@ -437,6 +439,7 @@ fn with_chunked_file(warehouse: &Warehouse, big: &str) -> Vec<u8> {
             "before",
             pallet_utils::get_pallet_head("before").unwrap().as_deref(),
             &first,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
     }
     warehouse.run_ok(&["shift", "before"]);
@@ -557,6 +560,7 @@ fn a_tracked_file_named_like_an_assembly_temp_file_survives_checkout() {
             "before",
             pallet_utils::get_pallet_head("before").unwrap().as_deref(),
             &first,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
     }
     warehouse.run_ok(&["shift", "before"]);

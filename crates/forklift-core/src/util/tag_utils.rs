@@ -18,6 +18,7 @@ use crate::model::operator::Operator;
 use crate::util::meta_tree::{
     self, Admission, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
 };
+use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState, Role};
 use crate::util::object_utils;
 
@@ -194,7 +195,7 @@ impl PalletRules for TagsRules {
 /// lock and passes the verified office; the content check refuses a signer who is not an
 /// admin, and a name that already exists.
 pub fn record_tag(tag: &Tag,
-                  office: &OfficeState,
+                  office: &VerifiedOffice,
                   actor: &Operator,
                   signer: &MetaSigner) -> Result<String, String> {
     validate_tag_name(&tag.name)?;

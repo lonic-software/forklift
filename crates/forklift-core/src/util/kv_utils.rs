@@ -10,7 +10,7 @@ use crate::model::operator::Operator;
 use crate::util::meta_tree::{
     self, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
 };
-use crate::util::office_utils::OfficeState;
+use crate::util::audit_utils::VerifiedOffice;
 use crate::util::{object_utils, pallet_utils, sign_utils};
 
 /// The name of the custom metadata pallet, reached as `@kv`.
@@ -218,7 +218,7 @@ fn read_value(read: CellRead) -> (KvValue, Option<String>) {
 pub fn set(subject: &str,
            key: &str,
            text: &str,
-           office: &OfficeState,
+           office: &VerifiedOffice,
            actor: &Operator,
            signer: &MetaSigner) -> Result<Option<String>, String> {
     validate_key(key)?;
@@ -233,7 +233,7 @@ pub fn set(subject: &str,
 /// Remove a key from a subject, as one signed parcel. A key that holds no value is an error.
 pub fn unset(subject: &str,
              key: &str,
-             office: &OfficeState,
+             office: &VerifiedOffice,
              actor: &Operator,
              signer: &MetaSigner) -> Result<String, String> {
     validate_key(key)?;

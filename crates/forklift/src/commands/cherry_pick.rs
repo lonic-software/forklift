@@ -276,14 +276,14 @@ mod tests {
         let source = test_support::store_parcel(&test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"picked\n")]), &[&base]);
         let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
 
-        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
         // Another bay stacks on "main" after the pick was applied, before its parcel is stacked.
         let moved_to = elsewhere.clone();
         BEFORE_PICK_STACK.with(|seam| seam.set(Some(Box::new(move || {
-            pallet_utils::update_pallet_head("main", Some(&our_head), &moved_to).unwrap();
+            pallet_utils::update_pallet_head("main", Some(&our_head), &moved_to, &pallet_utils::RefPreconditions::NONE).unwrap();
         }))));
 
         let error = test_support::block_on(handle_command(&source, None))

@@ -2815,6 +2815,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // Thread-local sync recorders, NOT the process-wide `barrier_count()`/`dir_sync_count()`:
@@ -2896,6 +2897,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         absent_subtree_hash
@@ -2989,6 +2991,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &vanished_head_hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let targets: BTreeSet<String> = [vanished_head_hash.clone()].into_iter().collect();
@@ -3029,6 +3032,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &corrupt_hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // Unrelated, non-empty (an empty `targets` set short-circuits before the walk ever runs).
@@ -3117,6 +3121,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         chunk_hash
@@ -3273,6 +3278,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
@@ -3683,6 +3689,7 @@ mod tests {
             office_utils::OFFICE_PALLET_NAME,
             pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
     }
 
@@ -3910,6 +3917,7 @@ mod tests {
             office_utils::OFFICE_PALLET_NAME,
             pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
             &never_stored_office_head,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let walk = collect_walk_roots().expect(
@@ -4003,6 +4011,7 @@ mod tests {
             office_utils::OFFICE_PALLET_NAME,
             pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME).unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         office_utils::write_trust_anchor(&TrustAnchor {
@@ -4598,6 +4607,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // B vanishes — the crash-lost dentry this whole mechanism exists for.
@@ -4685,6 +4695,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // Torn; the surviving prefix is irrelevant here (empty) — directory-driven step 1 finds
@@ -5323,6 +5334,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         plant_complete_taint(&forklift, &[h_relative.to_string_lossy().as_ref()]);
@@ -5729,6 +5741,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &v0,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // The taint records the ref's *path* only ("pallets/main") — see this test's own doc
@@ -5746,6 +5759,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &v1,
+            &pallet_utils::RefPreconditions::NONE,
         );
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap().unwrap(), v1,
             "sanity: the rename to V1 must have physically landed despite the call's own Err");
@@ -5798,6 +5812,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &"0".repeat(64),
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         plant_complete_taint(&forklift, &["pallets/main"]);
 
@@ -6067,6 +6082,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         std::fs::remove_file(&b_absolute).unwrap();
@@ -6145,6 +6161,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &"0".repeat(64),
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         plant_complete_taint(&forklift, &["pallets/main"]);
 
@@ -6231,6 +6248,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // The sibling: a genuinely present, intact loose object H — unrelated to Y, tainted
@@ -6390,6 +6408,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let (folder, file_name) = file_utils::get_path_for_object(&candidate_hash).unwrap();
@@ -6458,6 +6477,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &"0".repeat(64),
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         plant_complete_taint(&forklift, &["pallets/main"]);
 

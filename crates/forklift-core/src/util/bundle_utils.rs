@@ -1434,6 +1434,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let stats = build_bundle().unwrap();
@@ -1609,6 +1610,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let error = build_bundle().err().expect("a chunked file must refuse the bundle");
@@ -1669,6 +1671,7 @@ mod tests {
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let error = build_bundle().err().expect("a grandfathered giant must refuse the bundle");

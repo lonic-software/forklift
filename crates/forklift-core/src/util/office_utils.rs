@@ -20,6 +20,7 @@ use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
 use crate::util::{alias_utils, file_utils, object_utils, pallet_utils, sign_utils};
+use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError};
 
 /// The name of the office meta pallet — the tracked-metadata pallet holding users and
 /// keys. It lives in the meta namespace (`.forklift/meta/office`, not `.forklift/pallets/`),
@@ -603,21 +604,45 @@ pub fn ensure_not_metadata_root(root: &TreeItem) -> Result<(), String> {
 /// * `Ok(None)`              - If signing has not been established.
 /// * `Err(String)`           - If the trust file exists but is invalid.
 pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
-    let path = forklift_root().join(FILE_NAME_TRUST);
+    Ok(read_trust_anchor_with_bytes()?.map(|(anchor, _)| anchor))
+}
 
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("Error while reading the trust file: {}", e)),
+/// [`read_trust_anchor`], with the trust file's bytes the anchor was decoded from: one read, so
+/// a writer conditioned on the bytes ([`AnchorPrecondition::Bytes`]) is conditioned on exactly
+/// the anchor it judged.
+///
+/// # Returns
+/// * `Ok(Some((TrustAnchor, Vec<u8>)))` - The anchor, and the file's bytes.
+/// * `Ok(None)`                         - If signing has not been established.
+/// * `Err(String)`                      - If the trust file exists but is invalid.
+pub fn read_trust_anchor_with_bytes() -> Result<Option<(TrustAnchor, Vec<u8>)>, String> {
+    let Some(bytes) = read_trust_anchor_bytes()? else {
+        return Ok(None);
     };
 
+    let content = std::str::from_utf8(&bytes)
+        .map_err(|e| format!("The trust file is not valid UTF-8: {}", e))?;
+
+    Ok(Some((parse_trust_anchor(content)?, bytes)))
+}
+
+/// The trust file's bytes, undecoded (`None`: there is no trust file).
+pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(forklift_root().join(FILE_NAME_TRUST)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Error while reading the trust file: {}", e)),
+    }
+}
+
+fn parse_trust_anchor(content: &str) -> Result<TrustAnchor, String> {
     let doc: DocumentMut = content.parse()
         .map_err(|e| format!("The trust file is not valid TOML: {}", e))?;
 
     let genesis = read_string(&doc, "genesis", "trust file")?;
     let enabled_at = read_integer(&doc, "enabled_at", "trust file")?;
 
-    // Required and strict: `write_trust_anchor_file` always writes this key, even when the
+    // Required and strict: `encode_trust_anchor` always writes this key, even when the
     // boundary is empty (an empty array, never an omitted key) — so a trust file missing it, or
     // carrying a non-string entry, is corrupt, never merely "an old/lenient shape" to shrug off.
     // Silently dropping a non-string entry (the previous `filter_map` behavior) would under-count
@@ -626,7 +651,7 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     // to a permissive default).
     let boundary = read_required_string_array(&doc, "boundary", "trust file")?;
 
-    // Optional, unlike `boundary`: `write_trust_anchor_file` writes these two only for a
+    // Optional, unlike `boundary`: `encode_trust_anchor` writes these two only for a
     // re-genesis anchor, so an absent key is the normal (original-enrollment) shape and must
     // parse as `None`. A *present* value that is not a string, though, must still fail loudly
     // rather than be silently treated the same as absent — `.and_then(as_str)` would conflate
@@ -635,13 +660,13 @@ pub fn read_trust_anchor() -> Result<Option<TrustAnchor>, String> {
     let prior_genesis = read_optional_string(&doc, "prior_genesis", "trust file")?;
     let adopts = read_optional_string(&doc, "adopts", "trust file")?;
 
-    Ok(Some(TrustAnchor {
+    Ok(TrustAnchor {
         genesis,
         enabled_at,
         boundary,
         prior_genesis,
         adopts,
-    }))
+    })
 }
 
 /// How [`collect_trust_pin_roots`] treats an unreadable office record (the parcel history that
@@ -975,17 +1000,190 @@ fn degraded_office_note(kind: OfficeReadErrorKind, error: &str) -> String {
     )
 }
 
-/// Write the trust anchor. This is a one-way door: once signing is established it can
-/// never be disabled (admin lockout is handled by archive + re-genesis, not by an
-/// unsigned escape hatch), so overwriting an existing anchor is refused.
+/// One trust install: a new trust anchor, and the office head it governs, written together
+/// (see [`install_trust`]).
+pub struct TrustInstall<'a> {
+    /// The anchor to install.
+    pub anchor: &'a TrustAnchor,
+
+    /// The trust file's bytes as the caller's decision read them (`None`: no anchor was held).
+    /// `Some` makes this a re-genesis: `anchor` must name the replaced anchor's genesis as its
+    /// prior and pin the office head it adopts.
+    pub replaces: Option<&'a [u8]>,
+
+    /// The office head the caller's decision read (`None`: unborn).
+    pub office: Option<&'a str>,
+
+    /// The office head the anchor governs (`None`: the office stays at `office`).
+    pub new_office: Option<&'a str>,
+
+    /// The boundary the anchor records, as a precondition on the pallet heads
+    /// ([`PalletsPrecondition::NotConsumed`] for an anchor adopted from a remote, whose boundary
+    /// is the remote's).
+    pub pallets: PalletsPrecondition,
+}
+
+/// Install a trust anchor and move the office to the head it governs, in one hold of the ref
+/// lock: the only way an anchor is written. The one-way door: an anchor is replaced only by a
+/// re-genesis whose chain of custody matches (`replaces`), never removed.
 ///
-/// # Arguments
-/// * `anchor` - The anchor to write.
+/// Under the hold, the office, the anchor and the boundary are checked against what the caller
+/// read, then the anchor is written, then the office moves. So no other bay ever sees the new
+/// anchor beside the old office, and a refusal writes nothing. Its parcels are built and signed
+/// before, outside the hold. A write can land and still fail, so on any error both files are read
+/// back before anything is decided: both new is success, a new anchor beside the old office puts
+/// the old anchor back (still inside the hold), and anything else fails naming both.
+///
+/// An install whose anchor and office are both already in place succeeds without writing: another
+/// bay installed the same trust (accepted the same re-genesis) first.
 ///
 /// # Returns
-/// * `Ok(())`      - If the anchor was written.
-/// * `Err(String)` - If an anchor already exists or the write failed.
-pub fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
+/// * `Ok(())`              - The anchor and the office both carry the install.
+/// * `Err(RefUpdateError)` - `OfficeMoved`, `AnchorMoved` or `PalletsMoved` if what the caller read
+///                           moved (nothing was written); `Failed` if the chain of custody does
+///                           not match or a write failed (the warehouse is as before, unless the
+///                           message says otherwise).
+pub fn install_trust(install: &TrustInstall) -> Result<(), RefUpdateError> {
+    if let Some(replaced) = install.replaces {
+        let replaced = std::str::from_utf8(replaced)
+            .map_err(|e| format!("The trust file is not valid UTF-8: {}", e))
+            .and_then(parse_trust_anchor)?;
+
+        if install.anchor.prior_genesis.as_deref() != Some(replaced.genesis.as_str()) {
+            return Err(RefUpdateError::Failed(format!(
+                "The new anchor does not name this warehouse's genesis ({}) as its prior; \
+                the chain of custody does not match.",
+                replaced.genesis
+            )));
+        }
+
+        if install.anchor.adopts.is_none() {
+            return Err(RefUpdateError::Failed(
+                "A re-genesis anchor must pin the office head it adopts.".to_string()
+            ));
+        }
+    }
+
+    let bytes = encode_trust_anchor(install.anchor).into_bytes();
+    let office_target = install.new_office.or(install.office);
+
+    let lock = crate::util::lock_utils::RefLock::acquire()?;
+
+    if read_trust_anchor_bytes()?.as_deref() == Some(bytes.as_slice())
+        && pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.as_deref() == office_target {
+        return Ok(());
+    }
+
+    pallet_utils::check_preconditions(&lock, &RefPreconditions {
+        office: OfficePrecondition::At(install.office.map(str::to_string)),
+        anchor: match install.replaces {
+            Some(replaced) => AnchorPrecondition::Bytes(replaced.to_vec()),
+            None => AnchorPrecondition::Absent,
+        },
+        pallets: install.pallets.clone(),
+    })?;
+
+    let error = match write_trust_install(&lock, install, &bytes) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    // Read back, still inside the hold: what a failed write left decides what to put back.
+    let anchor_now = read_trust_anchor_bytes();
+    let office_now = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME);
+
+    let (anchor_now, office_now) = match (anchor_now, office_now) {
+        (Ok(anchor_now), Ok(office_now)) => (anchor_now, office_now),
+        (anchor_now, office_now) => return Err(RefUpdateError::Failed(format!(
+            "{} The trust file and the office could not be read back ({}), so neither was put \
+            back; the trust anchor may not match the office.",
+            error,
+            [anchor_now.err(), office_now.err()].into_iter().flatten().collect::<Vec<_>>().join("; ")
+        ))),
+    };
+
+    let anchor_is_new = anchor_now.as_deref() == Some(bytes.as_slice());
+
+    if anchor_is_new && office_now.as_deref() == office_target {
+        return Ok(());
+    }
+
+    if anchor_now.as_deref() == install.replaces && office_now.as_deref() == install.office {
+        return Err(error);
+    }
+
+    if anchor_is_new && office_now.as_deref() == install.office {
+        return match restore_trust_file(install.replaces) {
+            Ok(()) => Err(error),
+            Err(e) => Err(RefUpdateError::Failed(format!(
+                "{} The previous trust anchor could not be put back either ({}): the trust anchor \
+                is the new one while the office is not.",
+                error, e
+            ))),
+        };
+    }
+
+    Err(RefUpdateError::Failed(format!(
+        "{} The trust file and the office were left in a state this install did not write (the \
+        trust anchor is {}, the office head is {}); run \"forklift audit\" to see whether they \
+        match.",
+        error,
+        if anchor_is_new { "the new one" } else { "not the new one" },
+        office_now.as_deref().unwrap_or("unborn")
+    )))
+}
+
+/// The writes of [`install_trust`], under its hold: the anchor, then the office.
+fn write_trust_install(lock: &crate::util::lock_utils::RefLock,
+                       install: &TrustInstall,
+                       bytes: &[u8]) -> Result<(), RefUpdateError> {
+    file_utils::write_file_atomically(&forklift_root().join(FILE_NAME_TRUST), bytes)?;
+
+    #[cfg(test)]
+    tests::BETWEEN_TRUST_WRITES.with(|seam| seam.take().map(|seam| seam()));
+
+    let Some(new_office) = install.new_office.filter(|new| Some(*new) != install.office) else {
+        return Ok(());
+    };
+
+    #[cfg(test)]
+    let fault = tests::OFFICE_WRITE_FAULT.with(|fault| fault.replace(tests::OfficeWriteFault::None));
+
+    #[cfg(test)]
+    if fault == tests::OfficeWriteFault::Refuse {
+        return Err(RefUpdateError::Failed("injected office write refusal".to_string()));
+    }
+
+    let written = pallet_utils::update_pallet_head_locked(
+        lock, pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new_office,
+    );
+
+    #[cfg(test)]
+    if written.is_ok() && fault == tests::OfficeWriteFault::AfterLanding {
+        return Err(RefUpdateError::Failed("injected office write failure".to_string()));
+    }
+
+    written
+}
+
+/// Put the trust file back to `previous` (`None`: remove it), under [`install_trust`]'s hold.
+fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
+    let path = forklift_root().join(FILE_NAME_TRUST);
+
+    match previous {
+        Some(previous) => file_utils::write_file_atomically(&path, previous),
+        None => {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("Error while removing the trust file: {}", e))?;
+            file_utils::sync_dir(&forklift_root())
+        }
+    }
+}
+
+/// Write a trust anchor where none is held, for a test that needs a signed warehouse without an
+/// office ceremony.
+#[cfg(test)]
+pub(crate) fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
     let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
     let path = forklift_root().join(FILE_NAME_TRUST);
 
@@ -993,72 +1191,11 @@ pub fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
         return Err("Trust is already established for this warehouse; it cannot be re-established.".to_string());
     }
 
-    write_trust_anchor_file(anchor)
+    file_utils::write_file_atomically(&path, encode_trust_anchor(anchor).as_bytes())
 }
 
-/// Replace the trust anchor with a re-genesis anchor (§8.7) — the one sanctioned way
-/// through the one-way door. The new anchor must name the current genesis as its
-/// prior and pin an adopted office head; the caller owns the ceremony (this is the
-/// mechanical check, not the authorization).
-///
-/// # Arguments
-/// * `anchor` - The re-genesis anchor.
-///
-/// # Returns
-/// * `Ok(())`      - If the anchor was replaced.
-/// * `Err(String)` - If no anchor exists, the chain of custody does not match, or the
-///                   write failed.
-pub fn replace_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
-    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
-
-    let Some(existing) = read_trust_anchor()? else {
-        return Err(
-            "This warehouse has no trust anchor to replace; use \"office enroll\".".to_string()
-        );
-    };
-
-    if anchor.prior_genesis.as_deref() != Some(existing.genesis.as_str()) {
-        return Err(format!(
-            "The new anchor does not name this warehouse's genesis ({}) as its prior; \
-            the chain of custody does not match.",
-            existing.genesis
-        ));
-    }
-
-    if anchor.adopts.is_none() {
-        return Err("A re-genesis anchor must pin the office head it adopts.".to_string());
-    }
-
-    write_trust_anchor_file(anchor)
-}
-
-/// Put back the anchor that stood before a [`replace_trust_anchor`] in this same process, after
-/// the office move that should have followed it was refused — but only while the anchor is
-/// still `written`, the one that replace wrote: an anchor another bay installed meanwhile is its
-/// own, and stays. No chain-of-custody check: `previous` is the anchor this warehouse held a
-/// moment ago, not a new one.
-///
-/// The check and the write happen under one hold of the ref lock, which every anchor write
-/// takes, so no other anchor write can land between them.
-///
-/// # Returns
-/// * `Ok(())`      - `previous` is back, or the anchor was no longer `written` (left alone).
-/// * `Err(String)` - The anchor could not be read or written.
-pub(crate) fn restore_trust_anchor(written: &TrustAnchor, previous: &TrustAnchor) -> Result<(), String> {
-    let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
-
-    if read_trust_anchor()?.as_ref() != Some(written) {
-        return Ok(());
-    }
-
-    write_trust_anchor_file(previous)
-}
-
-/// Serialize an anchor to the trust file (no one-way-door check — callers own that, and take
-/// the ref lock around it).
-fn write_trust_anchor_file(anchor: &TrustAnchor) -> Result<(), String> {
-    let path = forklift_root().join(FILE_NAME_TRUST);
-
+/// Serialize an anchor as the trust file holds it.
+pub fn encode_trust_anchor(anchor: &TrustAnchor) -> String {
     let mut doc = DocumentMut::new();
     doc["genesis"] = value(anchor.genesis.as_str());
     doc["enabled_at"] = value(anchor.enabled_at);
@@ -1079,7 +1216,7 @@ fn write_trust_anchor_file(anchor: &TrustAnchor) -> Result<(), String> {
         doc["adopts"] = value(adopts.as_str());
     }
 
-    file_utils::write_file_atomically(&path, doc.to_string().as_bytes())
+    doc.to_string()
 }
 
 /// Read the full office state from the office pallet's head. An unborn office pallet
@@ -1204,53 +1341,31 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
 /// * `base`           - The office head `state` was read from (`None`: the office is unborn). It
 ///                      is the new parcel's parent, and the office ref moves only while it still
 ///                      holds it.
+/// * `preconditions`  - What the change's decision consumed besides the office: the anchor it
+///                      was judged under, and the boundary it records.
 ///
 /// # Returns
-/// * `Ok(String)`  - The hash of the new office parcel.
-/// * `Err(String)` - If an object could not be built, stored or signed, or the office moved
-///                   since `base` was read.
+/// * `Ok(String)`          - The hash of the new office parcel.
+/// * `Err(RefUpdateError)` - `Failed` if an object could not be built, stored or signed, or the
+///                           office ref write's refusal or failure.
 pub fn stack_office_parcel(state: &OfficeState,
                            actor: &Operator,
                            description: String,
                            signing_key_id: &str,
-                           base: Option<&str>) -> Result<String, String> {
+                           base: Option<&str>,
+                           preconditions: &RefPreconditions) -> Result<String, RefUpdateError> {
     let parents: Vec<String> = base.map(str::to_string).into_iter().collect();
-
-    stack_office_parcel_with_parents(state, actor, description, signing_key_id, parents, base)
-}
-
-/// Stack a parentless office genesis parcel: the root of a fresh office chain. Used by
-/// re-genesis (§8.7), where the office head exists but the new chain must not descend from it —
-/// the old chain is pinned by the anchor's `adopts`, not extended. `old_head` is the office head
-/// the caller read: the ref is replaced only while it still holds it.
-pub fn stack_office_genesis(state: &OfficeState,
-                            actor: &Operator,
-                            description: String,
-                            signing_key_id: &str,
-                            old_head: Option<&str>) -> Result<String, String> {
-    stack_office_parcel_with_parents(state, actor, description, signing_key_id, Vec::new(), old_head)
-}
-
-/// The shared body: build the record trees, stack the parcel with the given parents,
-/// sign it and move the office head from `expected` to it.
-fn stack_office_parcel_with_parents(state: &OfficeState,
-                                    actor: &Operator,
-                                    description: String,
-                                    signing_key_id: &str,
-                                    parents: Vec<String>,
-                                    expected: Option<&str>) -> Result<String, String> {
     let hash = build_and_sign_office_parcel(state, actor, description, signing_key_id, parents)?;
 
-    pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, expected, &hash)?;
+    pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, base, &hash, preconditions)?;
 
     Ok(hash)
 }
 
-/// Build, store and sign an office parcel — everything [`stack_office_parcel_with_parents`]
-/// does except advancing the office ref. A caller that must drive the ref move itself
-/// (a test exercising `post_ref_update`'s own handling of a lift, rather than landing
-/// one out of band) needs the exact tree shape a real office lift produces without
-/// this function landing it first.
+/// Build, store and sign an office parcel — everything [`stack_office_parcel`] does except
+/// advancing the office ref. For a caller that moves the ref itself: a trust install (enroll's
+/// genesis, a re-genesis's parentless one), which moves it together with the anchor, or a test
+/// exercising `post_ref_update`'s own handling of a lift.
 ///
 /// # Returns
 /// * `Ok(String)`  - The hash of the new (unlinked) office parcel.
@@ -1791,6 +1906,27 @@ fn strict_string_array(array: &toml_edit::Array, field: &str, record_kind: &str)
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Run between [`install_trust`]'s anchor write and its office write.
+        pub(crate) static BETWEEN_TRUST_WRITES: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+
+        /// Fail [`install_trust`]'s office write once.
+        pub(crate) static OFFICE_WRITE_FAULT: Cell<OfficeWriteFault> = const { Cell::new(OfficeWriteFault::None) };
+    }
+
+    /// How [`OFFICE_WRITE_FAULT`] fails the office write.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum OfficeWriteFault {
+        None,
+
+        /// Fail without writing.
+        Refuse,
+
+        /// Write, then report failure.
+        AfterLanding,
+    }
 
     fn user(class: IdentityClass, supervisor: Option<&str>) -> UserRecord {
         UserRecord {
@@ -1921,7 +2057,7 @@ pub(crate) mod tests {
     /// `filter_map(|e| e.as_str())`, silently dropping a non-string entry instead of erroring —
     /// under-counting roots on a damaged trust file and letting `gc` collect a pinned head, the
     /// opposite of what `collect_trust_pin_roots`'s own doc comment claims. `boundary` is a
-    /// required, always-serialized field (`write_trust_anchor_file` writes it even when empty),
+    /// required, always-serialized field (`encode_trust_anchor` writes it even when empty),
     /// so a malformed entry must fail loudly rather than be quietly dropped.
     #[test]
     fn a_non_string_boundary_entry_in_the_trust_file_errors_naming_it() {
@@ -2468,7 +2604,7 @@ pub(crate) mod tests {
         }
 
         let head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
-        pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, head.as_deref(), &parcel_object.hash).unwrap();
+        pallet_utils::update_meta_pallet_head(OFFICE_PALLET_NAME, head.as_deref(), &parcel_object.hash, &pallet_utils::RefPreconditions::NONE).unwrap();
 
         parcel_object.hash
     }
