@@ -774,15 +774,16 @@ struct TouchedShard {
 }
 
 /// Many shard edits from one single-threaded operation, published together as one
-/// [`shard_write::publish_shards`] call — beside `load`'s walk and `park`'s refresh — instead of one [`ShardLedger::update_shard`] (and so one ancestor-clear
-/// barrier, one shard write and one metadata rewrite) per edited entry.
+/// [`shard_write::publish_shards`] call — beside `load`'s walk and `park`'s refresh — instead of
+/// one [`ShardLedger::update_shard`] (and so one ancestor-clear barrier, one shard write and one
+/// metadata rewrite) per edited entry.
 ///
 /// [`update`](Self::update) reads a shard on its first touch and applies every later change for
 /// the same key to the same in-memory copy; nothing reaches disk before [`publish`](Self::publish).
 /// Each shard then clears every rollup above it if its effective content (any entry's
 /// name/hash/type/state) differs from what was read, or the shard is new, and keeps its own rollup
-/// otherwise (see [`shard_write::publish_shards`]) — so a pure stat refresh, such as `restore` writing a file
-/// back to the blob it already has staged, keeps every rollup above it.
+/// otherwise (see [`shard_write::publish_shards`]) — so a pure stat refresh, such as `restore`
+/// writing a file back to the blob it already has staged, keeps every rollup above it.
 ///
 /// An entry the batch records from a stat proves itself (see [`file_utils::StatAnchor`]): the
 /// staging methods take their anchor after the caller's write and before the stat, so an edit
@@ -916,10 +917,11 @@ impl<'l> ShardMutationBatch<'l> {
     ///
     /// Each shard is re-read first, under the shard-write lock: if any changed since this batch
     /// read it, nothing is registered or published and an error is returned — the batch would
-    /// otherwise overwrite that change, or carry a rollup decided against bytes no longer there. An unregistered key reads as no shard both times, whatever its address holds, so a
-    /// shard nobody registered never blocks the batch; a key registered and written since this
-    /// batch read it does. Within a command (which holds the warehouse lock) that can only be a
-    /// caller writing a touched shard some other way before publishing.
+    /// otherwise overwrite that change, or carry a rollup decided against bytes no longer there.
+    /// An unregistered key reads as no shard both times, whatever its address holds, so a shard
+    /// nobody registered never blocks the batch; a key registered and written since this batch
+    /// read it does. Within a command (which holds the warehouse lock) that can only be a caller
+    /// writing a touched shard some other way before publishing.
     ///
     /// # Returns
     /// * `Ok(())`      - Every touched shard is durably published and registered.
