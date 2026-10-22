@@ -575,10 +575,22 @@ async fn resolve_the_rest(
     let mut shard_vanished: Vec<PathBuf> = Vec::new();
     let mut loose_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut pack_stems: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut refs_resolved: Vec<String> = Vec::new();
 
     for relative in &attempt.vanished {
         match classify_vanished(relative) {
             VanishedClass::Loose(hash) => { loose_candidates.insert(hash, relative.clone()); }
+            // A removed ref: the absence is the visible state, so it is made durable, never undone.
+            VanishedClass::Ref => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a removed pallet ref whose removal could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy(), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             VanishedClass::Unrecognized => {
@@ -682,6 +694,7 @@ async fn resolve_the_rest(
     // first place (`restage_object` resolved it directly) — it belongs in `resolved` alongside
     // the vanished-and-unreferenced hashes this loop finds below, not in `remainder`.
     let mut resolved: Vec<String> = display_paths(attempt.recovered_packed.iter());
+    resolved.append(&mut refs_resolved);
 
     for hash in loose_candidates.keys().chain(pack_candidates.keys()) {
         match file_utils::read_object_classified(hash) {
@@ -1322,6 +1335,9 @@ enum VanishedClass {
     PackData(PathBuf),
     /// A pack **index** file; its stem.
     PackIndex(PathBuf),
+    /// A user pallet's ref, removed since the taint was recorded (a delete whose directory sync
+    /// failed, or a later delete of the same pallet).
+    Ref,
     /// A shape none of the above recognizes.
     Unrecognized,
 }
@@ -1335,11 +1351,35 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         return VanishedClass::Shard;
     }
 
+    if matches!(relative.components().next(),
+                Some(std::path::Component::Normal(first)) if first == pallet_utils::FOLDER_NAME_PALLETS_ROOT) {
+        return VanishedClass::Ref;
+    }
+
     match relative.extension().and_then(|ext| ext.to_str()) {
         Some(ext) if ext == pack_utils::PACK_DATA_EXTENSION => VanishedClass::PackData(relative.with_extension("")),
         Some(ext) if ext == pack_utils::PACK_INDEX_EXTENSION => VanishedClass::PackIndex(relative.with_extension("")),
         _ => VanishedClass::Unrecognized,
     }
+}
+
+/// Sync the nearest directory above `relative` (under `root`) that still exists: a removed nested
+/// pallet's emptied parent folders may be gone too, and the first surviving one holds the last
+/// entry the removal changed.
+fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
+    let mut dir = relative.parent();
+
+    while let Some(candidate) = dir {
+        let absolute = root.join(candidate);
+
+        if absolute.is_dir() {
+            return file_utils::sync_dir(&absolute);
+        }
+
+        dir = candidate.parent();
+    }
+
+    file_utils::sync_dir(root)
 }
 
 /// Every durable ref source's roots for the closure walk (§3.2: "every durable ref source", never
@@ -1538,9 +1578,10 @@ pub(crate) fn gc_root_sources(
 /// keeps `FailClosed` unconditionally for both sources; do not change that call site to match
 /// this one.
 ///
-/// The undo journal is deliberately excluded from **both** walks (parity, not an oversight): an
-/// entry there records history for `undo`/`redo`, never a live reference a future write would
-/// resurrect from it.
+/// The undo journal is read by **both** walks only for the heads its delete entries removed (see
+/// `bay_utils::collect_bay_scoped_parcel_roots`): an undo puts such a ref back, so its history is
+/// live until the entry goes. Every other entry records history for `undo`, never a live
+/// reference a future write would resurrect from it.
 ///
 /// Staged inventory shards are enumerated by walking the shard **files on disk**, never the
 /// registration ledger (`inventory_utils::ShardLedger`). No writer publishes a shard at an
@@ -4057,6 +4098,10 @@ mod tests {
             classify_vanished(Path::new("objects/pack/abc123.idx")),
             VanishedClass::PackIndex(stem) if stem == Path::new("objects/pack/abc123")
         ));
+        assert!(matches!(classify_vanished(Path::new("pallets/main")), VanishedClass::Ref));
+        assert!(matches!(classify_vanished(Path::new("pallets/team/feature")), VanishedClass::Ref));
+        // A meta ref is never removed, so its absence stays unexplained.
+        assert!(matches!(classify_vanished(Path::new("meta/office")), VanishedClass::Unrecognized));
         assert!(matches!(
             classify_vanished(Path::new("something/unexpected.txt")),
             VanishedClass::Unrecognized
@@ -5781,59 +5826,50 @@ mod tests {
     }
 
     /// (§10.3, mechanism check 2 — the delete variant) The complementary case to the test above:
-    /// if, instead of being overwritten in place, the tainted ref path is *removed* before heal
-    /// runs (the shape that actually matters for a delete-vs-restage race, symmetric to §10.2's
-    /// pack scenario), `restage_object`'s `ENOENT` branch has no hash to fall back on for a
-    /// non-loose-shaped path (`file_utils::hash_from_object_path` returns `None` for "pallets/
-    /// main") — it reports `Vanished` unconditionally, never recreating the file. One level up,
-    /// `recovery_utils::resolve_the_rest` cannot even classify a bare ref path as an object hash
-    /// to run its absent-and-unreferenced closure walk over (`classify_vanished` falls through to
-    /// `VanishedClass::Unrecognized` — not `Loose`, not `Shard`, not pack-shaped) — the vanished
-    /// ref path goes straight into the dangling remainder, unconditionally.
-    ///
-    /// So a deleted ref pointer is never silently resurrected either — the failure mode this
-    /// variant actually has is the opposite of §10.3's feared silent data loss: a permanently
-    /// dangling, unresolvable-by-heal remainder (worse UX, but not a silent revert).
+    /// the tainted ref path is *removed* before heal runs — a pallet delete whose directory sync
+    /// failed, or a later delete of the same pallet. `restage_object` has no hash to fall back on
+    /// for a ref path, so it reports it vanished and never recreates the file; `classify_vanished`
+    /// files it as [`VanishedClass::Ref`], whose absence is the visible state: heal syncs the
+    /// nearest folder that still exists and clears the record. Pinned for a flat name and for a
+    /// nested one whose emptied parent folder went with it. Mutation: classify a ref path as
+    /// `Unrecognized` again → red (heal refuses with the path kept).
     #[test]
-    fn heal_never_recreates_a_tainted_pallet_ref_whose_path_was_since_deleted() {
+    fn heal_clears_a_tainted_pallet_ref_whose_path_was_since_deleted_and_never_recreates_it() {
         use crate::globals::StorageRootScope;
 
         let _serial = lock_activation();
         taint_utils::activate();
 
-        let root = std::env::temp_dir()
-            .join(format!("forklift-recovery-utils-ref-resurrection-delete-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
-        let _scope = StorageRootScope::enter(&root);
-        let forklift = forklift_root();
+        for (pallet, emptied) in [("main", None), ("team/feature", Some("team"))] {
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-ref-delete-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            let forklift = forklift_root();
 
-        pallet_utils::update_pallet_head(
-            "main",
-            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
-            &"0".repeat(64),
-            &pallet_utils::RefPreconditions::NONE,
-        ).unwrap();
-        plant_complete_taint(&forklift, &["pallets/main"]);
+            pallet_utils::update_pallet_head(pallet, None, &"0".repeat(64), &pallet_utils::RefPreconditions::NONE)
+                .unwrap();
+            let recorded = format!("pallets/{}", pallet);
+            plant_complete_taint(&forklift, &[recorded.as_str()]);
 
-        // The ref file vanishes entirely (e.g. a pallet removed from under the taint) before heal
-        // ever runs.
-        std::fs::remove_file(forklift.join("pallets").join("main")).unwrap();
+            // The ref file vanishes entirely, with a nested name's emptied folder, before heal runs.
+            let ref_path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, pallet);
+            std::fs::remove_file(&ref_path).unwrap();
+            if let Some(folder) = emptied {
+                std::fs::remove_dir(forklift.join("pallets").join(folder)).unwrap();
+            }
 
-        let error = run_heal()
-            .expect_err("a vanished, unrecognized-shape recorded path must not silently clear");
-        assert_durability_taint(&error, &["pallets/main"]);
+            run_heal().unwrap_or_else(|error| panic!("{}: a removed ref must heal, got {}", pallet, error));
 
-        // The critical negative: the file was never recreated by heal.
-        assert!(!forklift.join("pallets").join("main").exists(),
-            "heal must never recreate a vanished, non-object-shaped recorded path — it has no \
-            bytes to restage and no hash to fall back on, unlike a vanished loose object");
+            assert!(!ref_path.exists(), "{}: heal must never recreate a removed ref", pallet);
+            assert_eq!(pallet_utils::get_pallet_head(pallet).unwrap(), None, "{}", pallet);
 
-        let state = taint_utils::read_taints(&forklift).unwrap();
-        assert!(state.recorded.contains(&PathBuf::from("pallets/main")),
-            "the vanished ref path must survive as an unresolved (unrecognized-shape) remainder");
+            let state = taint_utils::read_taints(&forklift).unwrap();
+            assert!(state.recorded.is_empty(), "{}: the removed ref's taint must clear: {:?}", pallet, state.recorded);
 
-        std::fs::remove_dir_all(&root).ok();
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     // ---- Fail-closed/tolerant split on an unreadable bay (design call) ----

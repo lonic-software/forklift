@@ -4239,6 +4239,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_for_deleted": {
+      "description": "Candidates kept because lifting the unlifted history of a pallet deleted here reads them,\nwhile `undo` can still bring that pallet back. Lifting cannot free these; a later prune\ndoes once the delete can no longer be undone.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "kept_unlifted": {
       "description": "Candidates kept because lifting history the remote does not hold reads them: work stacked\nhere and never lifted, or lifted to a remote head not lowered here since. Some may be the\nonly copy, the rest are base trees the lift compares against; a later prune of the same\npath frees them once that history is lifted.",
       "format": "uint",
@@ -4294,6 +4300,7 @@ A command not listed here either reports only the generic human-message shape `{
     "still_packed",
     "retained_shared",
     "kept_unlifted",
+    "kept_for_deleted",
     "unlifted_pallets",
     "all_resumed"
   ],

@@ -1015,7 +1015,9 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             installing the anchor would leave that history outside trust. Nothing was written.",
             pallet.to_wire(), found
         )),
-        moved @ (RefUpdateError::Moved(_) | RefUpdateError::Fenced { .. }) => (StatusCode::CONFLICT, moved.to_string()),
+        moved @ (RefUpdateError::Moved(_) | RefUpdateError::Fenced { .. } | RefUpdateError::WitnessMoved { .. }) => {
+            (StatusCode::CONFLICT, moved.to_string())
+        }
         RefUpdateError::Failed(message) => internal(message),
     }
 }
@@ -2699,7 +2701,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             }
             Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
             Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
-            Err(moved @ (RefUpdateError::PalletsMoved { .. } | RefUpdateError::Fenced { .. })) => {
+            Err(moved @ (RefUpdateError::PalletsMoved { .. } | RefUpdateError::Fenced { .. }
+                         | RefUpdateError::WitnessMoved { .. })) => {
                 return Err((StatusCode::CONFLICT, moved.to_string()));
             }
             Err(RefUpdateError::Failed(e)) => return Err(internal(e)),

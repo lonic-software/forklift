@@ -16,10 +16,20 @@ use crate::util::file_utils;
 /// concern, not the journal's.
 const FILE_NAME_JOURNAL: &str = "journal.json";
 
-/// The journal file's format version. The file is `{"version":2,"entries":[...]}`; any other
-/// version, or anything that does not parse as this shape, is refused by name — never read as an
-/// empty journal, which would make `undo` report "nothing to undo" over a history it lost.
-const JOURNAL_VERSION: u64 = 2;
+/// The journal file's format version. The file is `{"version":3,"entries":[...]}`; any version
+/// but this and [`OLDER_JOURNAL_VERSION`], or anything that does not parse as this shape, is
+/// refused by name — never read as an empty journal, which would make `undo` report "nothing to
+/// undo" over a history it lost.
+const JOURNAL_VERSION: u64 = 3;
+
+/// The one older version still read. Version 3 only widened a snapshot's head to optional (a
+/// removed ref, recorded by a delete), so a version-2 entry means exactly what it meant before.
+const OLDER_JOURNAL_VERSION: u64 = 2;
+
+/// The op name a pallet delete is journaled under. Its entry records the removed ref with its head
+/// before and none after; the removal writes it itself (see
+/// [`pallet_utils::remove_pallet_head_in`]).
+pub const DELETE_OP: &str = "delete";
 
 /// Cap the journal so it cannot grow without bound; the oldest entries fall off (undo is
 /// a recent-history convenience, not an audit trail — that is what `history`/`audit` are).
@@ -34,8 +44,9 @@ pub struct Snapshot {
 
     /// Pallet refs (user and meta), keyed by wire form (`main`, `@office`) → head hash. A
     /// journaled entry keeps only the refs its operation moved, plus both sides' current pallets;
-    /// a ref the operation left alone needs no restoring.
-    pub heads: BTreeMap<String, String>,
+    /// a ref the operation left alone needs no restoring. `None` is a ref the operation removed:
+    /// only a delete's `after` records one (see [`validate_entry`]).
+    pub heads: BTreeMap<String, Option<String>>,
 
     /// The bay's consolidation in progress, if any.
     pub consolidation: Option<ConsolidationInProgress>,
@@ -112,7 +123,12 @@ impl BayState {
 impl Snapshot {
     /// The head of the current pallet, or `None` while it is unborn.
     pub fn current_head(&self) -> Option<&String> {
-        self.heads.get(&self.current_pallet)
+        self.heads.get(&self.current_pallet).and_then(Option::as_ref)
+    }
+
+    /// The head recorded for ref `wire`, or `None` when none is recorded or it was removed.
+    pub fn head(&self, wire: &str) -> Option<&String> {
+        self.heads.get(wire).and_then(Option::as_ref)
     }
 
     /// The bay state this snapshot records. Pallet refs other than the current one are left out:
@@ -159,7 +175,7 @@ fn read_cherry_pick() -> Result<Option<PickInProgress>, String> {
 }
 
 /// One journaled operation: the state before it ran, and the state it left behind.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JournalEntry {
     /// The command that was journaled (`stack`, `consolidate`, `cherry-pick`, `shift`).
@@ -202,7 +218,7 @@ pub fn capture() -> Result<Snapshot, String> {
 
     let position = pallet_utils::read_position()?;
     let heads = position.base
-        .map(|base| BTreeMap::from([(position.pallet.clone(), base)]))
+        .map(|base| BTreeMap::from([(position.pallet.clone(), Some(base))]))
         .unwrap_or_default();
 
     let snapshot = Snapshot {
@@ -285,7 +301,7 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
         // Only a ref's first write tells what it held before the operation.
         if seen.insert(wire.clone()) {
             if let Some(old) = old {
-                before.heads.insert(wire.clone(), old);
+                before.heads.insert(wire.clone(), Some(old));
             }
         }
 
@@ -305,8 +321,8 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
         let is = (pallet == after.current_pallet).then(|| position.base.clone()).flatten();
 
         if let Some(head) = was.clone().or(is.clone()) {
-            before.heads.insert(pallet.clone(), head.clone());
-            after.heads.insert(pallet, is.or(was).unwrap_or(head));
+            before.heads.insert(pallet.clone(), Some(head.clone()));
+            after.heads.insert(pallet, Some(is.or(was).unwrap_or(head)));
         }
     }
 
@@ -314,15 +330,82 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
         return Ok(());
     }
 
+    let entry = JournalEntry { op: op.to_string(), before, after };
+    validate_entry(&entry)?;
+
     let mut entries = read()?;
-    entries.push(JournalEntry { op: op.to_string(), before, after });
+    push_capped(&mut entries, entry);
+
+    write(&entries)
+}
+
+/// Append `entry`, dropping the oldest entries past [`MAX_ENTRIES`].
+fn push_capped(entries: &mut Vec<JournalEntry>, entry: JournalEntry) {
+    entries.push(entry);
 
     let len = entries.len();
     if len > MAX_ENTRIES {
         entries.drain(0..len - MAX_ENTRIES);
     }
+}
 
-    write(&entries)
+/// Append `entry` to the bay's journal for a ref removal, inside its
+/// [`RefLock`](crate::util::lock_utils::RefLock) hold and before the unlink, so the entry that
+/// keeps the removed head rooted exists before the ref stops reaching it. The write is durable when
+/// this returns (the caller refuses inside a bulk store session).
+///
+/// # Returns
+/// * `Ok(Vec<JournalEntry>)` - The entries as read before the append, for
+///                             [`write_back_in_hold`] if the removal does not land.
+/// * `Err(String)`           - The journal could not be read or written; nothing was appended.
+pub(crate) fn append_in_hold(_lock: &crate::util::lock_utils::RefLock,
+                             entry: &JournalEntry) -> Result<Vec<JournalEntry>, String> {
+    validate_entry(entry)?;
+
+    let read = read()?;
+    let mut entries = read.clone();
+    push_capped(&mut entries, entry.clone());
+    write(&entries)?;
+
+    Ok(read)
+}
+
+/// Write the bay's journal back to `entries`, as read by [`append_in_hold`] before a removal that
+/// did not land.
+pub(crate) fn write_back_in_hold(_lock: &crate::util::lock_utils::RefLock,
+                                 entries: &[JournalEntry]) -> Result<(), String> {
+    write(entries)
+}
+
+/// The removed heads of every delete entry in every bay's journal, the main tree's included: the
+/// heads an undo can still put back, which gc, compaction and scope-prune keep. Read under the
+/// same rule as the rest of a bay's state: a journal that cannot be read is an error, so a sweep
+/// fails closed rather than freeing what it might hold.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The removed heads, in bay order.
+/// * `Err(String)`     - If the bays could not be listed or a journal could not be read.
+pub fn removed_heads() -> Result<Vec<String>, String> {
+    let mut heads = Vec::new();
+
+    for dir in crate::util::bay_utils::all_bay_state_dirs()? {
+        heads.append(&mut removed_heads_in(&dir)?);
+    }
+
+    Ok(heads)
+}
+
+/// [`removed_heads`] for the one bay whose state lives in `dir`.
+pub fn removed_heads_in(dir: &Path) -> Result<Vec<String>, String> {
+    Ok(read_in(dir)?.iter().flat_map(removed_by).map(|(_, head)| head).collect())
+}
+
+/// The refs `entry` removed, with the head each held: `(wire, head)`.
+pub fn removed_by(entry: &JournalEntry) -> Vec<(String, String)> {
+    entry.after.heads.iter()
+        .filter(|(_, after)| after.is_none())
+        .filter_map(|(wire, _)| entry.before.head(wire).map(|head| (wire.clone(), head.clone())))
+        .collect()
 }
 
 /// Look at the most recent journal entry without consuming it. The caller (`undo`) must
@@ -515,14 +598,14 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
     let current = &entry.after.current_pallet;
 
     pallet_utils::write_position(&pallet_utils::BayPosition::new(
-        &entry.before.current_pallet, entry.before.heads.get(&entry.before.current_pallet).cloned(),
+        &entry.before.current_pallet, entry.before.current_head().cloned(),
     ))?;
 
     if let Err(error) = put_back_refs(entry) {
         // Which base the bay stands on now: the operation's result while the ref still holds it
         // or a parcel built on it, else the earlier one. An ancestry that cannot be read keeps the
         // earlier base, whose catch-up parks the operation's change rather than losing it.
-        let operation_left = entry.after.heads.get(current);
+        let operation_left = entry.after.head(current);
 
         let keeps_operation = match (pallet_utils::get_pallet_head(current), operation_left) {
             (Ok(Some(head)), Some(left)) => head == *left || merge_utils::is_ancestor(left, &head).unwrap_or(false),
@@ -581,11 +664,17 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
         .chain(entry.before.heads.keys().filter(|wire| *wire != current));
 
     for wire in order {
-        let Some(post_head) = entry.after.heads.get(wire) else {
+        let (Some(pre_head), Some(post_after)) = (entry.before.head(wire), entry.after.heads.get(wire)) else {
             continue;
         };
 
-        let pre_head = &entry.before.heads[wire];
+        // A removed ref is put back by the delete's own restore, never here.
+        let Some(post_head) = post_after else {
+            return Err(format!(
+                "The journal entry for \"{}\" removed pallet \"{}\", which this restore does not put back.",
+                entry.op, wire
+            ));
+        };
 
         // The heads are equal: there is nothing to put back.
         if pre_head == post_head {
@@ -617,7 +706,7 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
 /// them moved off the operation's heads and leaves them alone.
 fn un_restore_current(entry: &JournalEntry, error: String) -> String {
     let current = &entry.after.current_pallet;
-    let (Some(pre_head), Some(post_head)) = (entry.before.heads.get(current), entry.after.heads.get(current)) else {
+    let (Some(pre_head), Some(post_head)) = (entry.before.head(current), entry.after.head(current)) else {
         return error;
     };
 
@@ -646,6 +735,11 @@ fn path() -> PathBuf {
     bay_root().join(FILE_NAME_JOURNAL)
 }
 
+/// The journal file path of the bay whose state lives in `dir`.
+fn path_in(dir: &Path) -> PathBuf {
+    dir.join(FILE_NAME_JOURNAL)
+}
+
 /// The refusal for a journal that cannot be read, naming the file and the way out.
 fn unreadable(path: &Path, reason: &str) -> String {
     format!(
@@ -664,7 +758,7 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
     for (wire, head) in &snapshot.heads {
         PalletRef::parse(wire).map_err(invalid_name)?;
 
-        if !object_utils::is_object_hash(head) {
+        if head.as_ref().is_some_and(|head| !object_utils::is_object_hash(head)) {
             return Err(format!("records a head for \"{}\" that is not an object hash", wire));
         }
     }
@@ -698,10 +792,54 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
     Ok(())
 }
 
-/// Read the journal. A missing file is an empty journal; a file that cannot be read, does not
-/// parse, has another version or holds an impossible value is an error naming the file.
+/// Check that an entry holds only what the warehouse could have written: two valid snapshots,
+/// and a removed ref only where a delete recorded it — in `after`, exactly one, a user pallet with
+/// a head before, never a current pallet. So every restore but the delete's meets no removal.
+fn validate_entry(entry: &JournalEntry) -> Result<(), String> {
+    validate_snapshot(&entry.before)?;
+    validate_snapshot(&entry.after)?;
+
+    if entry.before.heads.values().any(Option::is_none) {
+        return Err("records a removed ref before its operation".to_string());
+    }
+
+    let removed: Vec<&String> = entry.after.heads.iter()
+        .filter(|(_, head)| head.is_none())
+        .map(|(wire, _)| wire)
+        .collect();
+
+    let well_formed = match removed.as_slice() {
+        [] => entry.op != DELETE_OP,
+        [wire] => entry.op == DELETE_OP
+            && entry.before.head(wire).is_some()
+            && **wire != entry.after.current_pallet
+            && **wire != entry.before.current_pallet
+            && PalletRef::parse(wire).is_ok_and(|reference| reference.namespace == PalletNamespace::User),
+        _ => false,
+    };
+
+    if !well_formed {
+        return Err(format!("records the \"{}\" operation with a removal it cannot have made", entry.op));
+    }
+
+    Ok(())
+}
+
+/// Read the active bay's journal (see [`read_from`]).
 fn read() -> Result<Vec<JournalEntry>, String> {
-    let path = path();
+    read_from(&path())
+}
+
+/// Read the journal of the bay whose state lives in `dir` (see [`read_from`]).
+fn read_in(dir: &Path) -> Result<Vec<JournalEntry>, String> {
+    read_from(&path_in(dir))
+}
+
+/// Read the journal at `path`. A missing file is an empty journal; a file that cannot be read,
+/// does not parse, has a version this forklift does not read or holds an impossible value is an
+/// error naming the file.
+fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
+    let path = path.to_path_buf();
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -722,7 +860,7 @@ fn read() -> Result<Vec<JournalEntry>, String> {
         None => return Err(unreadable(&path, "is not a readable journal (it records no format version)")),
     };
 
-    if version != JOURNAL_VERSION {
+    if version != JOURNAL_VERSION && version != OLDER_JOURNAL_VERSION {
         return Err(unreadable(&path, &format!(
             "has format version {}, which this forklift does not understand (it reads version {})",
             version, JOURNAL_VERSION
@@ -733,8 +871,7 @@ fn read() -> Result<Vec<JournalEntry>, String> {
         .map_err(|e| unreadable(&path, &format!("is malformed ({})", e)))?;
 
     for entry in &contents.entries {
-        validate_snapshot(&entry.before)
-            .and_then(|_| validate_snapshot(&entry.after))
+        validate_entry(entry)
             .map_err(|reason| unreadable(&path, &format!("is malformed (an entry {})", reason)))?;
     }
 
@@ -812,7 +949,7 @@ mod tests {
     /// A snapshot on `pallet` holding only that pallet's ref at `head`, with no consolidation.
     fn snapshot(pallet: &str, head: &str) -> Snapshot {
         let mut heads = BTreeMap::new();
-        heads.insert(pallet.to_string(), head.to_string());
+        heads.insert(pallet.to_string(), Some(head.to_string()));
 
         Snapshot { current_pallet: pallet.to_string(), heads, consolidation: None, cherry_pick: None }
     }
@@ -909,8 +1046,8 @@ mod tests {
         assert_eq!(popped.op, "consolidate");
         assert_eq!(popped.before, snapshot("main", &hash('a')));
         assert_eq!(popped.after.current_pallet, "main");
-        assert_eq!(popped.after.heads.get("main"), Some(&hash('b')));
-        assert_eq!(popped.after.heads.get("side"), Some(&hash('c')));
+        assert_eq!(popped.after.head("main"), Some(&hash('b')));
+        assert_eq!(popped.after.head("side"), Some(&hash('c')));
         assert_eq!(popped.after.consolidation, Some(consolidating(&hash('d'), "side")));
         assert!(pop().unwrap().is_none(), "popping removes the entry");
     }
@@ -956,7 +1093,7 @@ mod tests {
         push_if_changed("stack", before).unwrap();
 
         let popped = pop().unwrap().unwrap();
-        let keys = |heads: &BTreeMap<String, String>| heads.keys().cloned().collect::<Vec<_>>();
+        let keys = |heads: &BTreeMap<String, Option<String>>| heads.keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys(&popped.before.heads), ["main", "side"]);
         assert_eq!(keys(&popped.after.heads), ["main", "side"]);
     }
@@ -995,9 +1132,9 @@ mod tests {
         push_if_changed("stack", before).unwrap();
 
         let entry = peek().unwrap().expect("the operation moved the current pallet");
-        assert_eq!(entry.before.heads, BTreeMap::from([("main".to_string(), hash('a'))]),
+        assert_eq!(entry.before.heads, BTreeMap::from([("main".to_string(), Some(hash('a')))]),
             "before holds each written ref's first replaced head, and nothing else");
-        assert_eq!(entry.after.heads, BTreeMap::from([("main".to_string(), hash('c'))]),
+        assert_eq!(entry.after.heads, BTreeMap::from([("main".to_string(), Some(hash('c')))]),
             "after holds each written ref's last written head, and nothing else");
 
         restore_refs(&entry).unwrap();
@@ -1022,7 +1159,7 @@ mod tests {
         let entry = peek().unwrap().expect("the operation moved the current pallet");
         assert!(!entry.before.heads.contains_key("fresh"),
             "a created ref must have no before, not its intermediate head: {:?}", entry.before.heads);
-        assert_eq!(entry.after.heads.get("fresh"), Some(&hash('2')));
+        assert_eq!(entry.after.head("fresh"), Some(&hash('2')));
     }
 
     #[test]
@@ -1202,7 +1339,7 @@ mod tests {
         write(&[entry("stack", "main", &hash('1'), &hash('2'))]).unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], 3);
         assert_eq!(value["entries"][0]["op"], "stack");
         assert_eq!(value["entries"][0]["before"]["heads"]["main"], hash('1'));
         assert_eq!(value["entries"][0]["after"]["heads"]["main"], hash('2'));
@@ -1231,7 +1368,7 @@ mod tests {
 
         // Version 1 is the format before consolidations and picks recorded their base.
         assert_refused_everywhere(r#"{"version":1,"entries":[]}"#, "has format version 1");
-        assert_refused_everywhere(r#"{"version":3,"entries":[]}"#, "has format version 3");
+        assert_refused_everywhere(r#"{"version":4,"entries":[]}"#, "has format version 4");
         assert_refused_everywhere(r#"{"version":"1","entries":[]}"#, "has an unreadable format version (\"1\")");
     }
 
@@ -1261,7 +1398,7 @@ mod tests {
         let _scratch = Scratch::new("bad-hash-journal");
 
         let mut bad_head = entry("stack", "main", &hash('1'), &hash('2'));
-        bad_head.after.heads.insert("main".to_string(), "not-a-hash".to_string());
+        bad_head.after.heads.insert("main".to_string(), Some("not-a-hash".to_string()));
         let mut bad_name = entry("stack", "main", &hash('1'), &hash('2'));
         bad_name.before.current_pallet = "../escape".to_string();
         let mut bad_skeleton = entry("consolidate", "main", &hash('1'), &hash('2'));
@@ -1284,6 +1421,115 @@ mod tests {
             let content = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries: &[bad] }).unwrap();
             assert_refused_everywhere(&content, reason);
         }
+    }
+
+    /// A delete entry removing `victim` at `head`, from a bay on `main`.
+    fn delete_entry(victim: &str, head: &str) -> JournalEntry {
+        let mut entry = entry(DELETE_OP, "main", &hash('1'), &hash('1'));
+        entry.before.heads.insert(victim.to_string(), Some(head.to_string()));
+        entry.after.heads.insert(victim.to_string(), None);
+        entry
+    }
+
+    #[test]
+    fn an_entry_records_a_removal_only_as_a_delete_of_one_other_user_pallet() {
+        let _scratch = Scratch::new("bad-removal-journal");
+
+        let mut not_a_delete = delete_entry("side", &hash('3'));
+        not_a_delete.op = "stack".to_string();
+        let current = delete_entry("main", &hash('3'));
+        let meta = delete_entry("@tags", &hash('3'));
+        let mut two = delete_entry("side", &hash('3'));
+        two.before.heads.insert("other".to_string(), Some(hash('4')));
+        two.after.heads.insert("other".to_string(), None);
+        let mut unrecorded = delete_entry("side", &hash('3'));
+        unrecorded.before.heads.remove("side");
+        let mut none = delete_entry("side", &hash('3'));
+        none.after.heads.insert("side".to_string(), Some(hash('3')));
+        let mut before = delete_entry("side", &hash('3'));
+        before.before.heads.insert("side".to_string(), None);
+
+        for (bad, reason) in [
+            (not_a_delete, "with a removal it cannot have made"),
+            (current, "with a removal it cannot have made"),
+            (meta, "with a removal it cannot have made"),
+            (two, "with a removal it cannot have made"),
+            (unrecorded, "with a removal it cannot have made"),
+            (none, "with a removal it cannot have made"),
+            (before, "records a removed ref before its operation"),
+        ] {
+            let content = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries: &[bad] }).unwrap();
+            assert_refused_everywhere(&content, reason);
+        }
+    }
+
+    #[test]
+    fn a_version_2_journal_is_read_and_written_back_at_version_3() {
+        let _scratch = Scratch::new("v2-journal");
+
+        plant_journal(&format!(
+            r#"{{"version":2,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}},"after":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
+            hash('1'), hash('2')
+        ));
+
+        let entries = read().unwrap();
+        assert_eq!(entries, vec![entry("stack", "main", &hash('1'), &hash('2'))]);
+        assert!(removed_heads_in(&bay_root()).unwrap().is_empty(), "a version-2 journal holds no removals");
+
+        write(&entries).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
+        assert_eq!(value["version"], 3);
+    }
+
+    #[test]
+    fn a_delete_entry_is_written_in_the_removal_hold_and_its_head_stays_rooted() {
+        let _scratch = Scratch::new("delete-entry");
+        pallet_utils::update_pallet_head("victim", None, &hash('5'), &pallet_utils::RefPreconditions::NONE).unwrap();
+        let delete = delete_entry("victim", &hash('5'));
+
+        pallet_utils::remove_pallet_head_in(PalletNamespace::User, "victim", &hash('5'),
+                                            &pallet_utils::RefPreconditions::NONE, Some(&delete)).unwrap();
+
+        assert_eq!(pallet_utils::get_pallet_head("victim").unwrap(), None);
+        assert_eq!(read().unwrap().last(), Some(&delete));
+        assert_eq!(removed_by(&delete), vec![("victim".to_string(), hash('5'))]);
+        assert_eq!(removed_heads_in(&bay_root()).unwrap(), vec![hash('5')]);
+        assert_eq!(removed_heads().unwrap(), vec![hash('5')], "every bay's removals, the main tree's included");
+
+        // The gc roots read it through the bay-scoped roots.
+        let dirs = crate::util::bay_utils::all_bay_state_dirs().unwrap();
+        let roots = crate::util::bay_utils::collect_bay_scoped_parcel_roots(&dirs, crate::util::bay_utils::BayReadPolicy::FailClosed)
+            .unwrap().roots;
+        assert!(roots.contains(&hash('5')), "{:?}", roots);
+    }
+
+    /// A removal that does not land puts back the journal it read before its append, never the
+    /// appended one with its last entry popped: on a full journal the append drained the oldest
+    /// entry, here a live delete whose head must stay rooted. Mutation: write back the appended
+    /// entries minus the last → red (the oldest delete is gone).
+    #[test]
+    #[cfg(unix)]
+    fn a_removal_that_does_not_land_leaves_a_full_journal_exactly_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _scratch = Scratch::new("delete-unlanded");
+        pallet_utils::update_pallet_head("victim", None, &hash('5'), &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let mut full = vec![delete_entry("old", &hash('7'))];
+        full.extend((1..MAX_ENTRIES).map(|i| entry("stack", "main", &format!("{:064x}", i), &format!("{:064x}", i + 1))));
+        write(&full).unwrap();
+
+        let pallets = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "victim").parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let refused = pallet_utils::remove_pallet_head_in(PalletNamespace::User, "victim", &hash('5'),
+                                                          &pallet_utils::RefPreconditions::NONE,
+                                                          Some(&delete_entry("victim", &hash('5'))));
+        std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
+        assert_eq!(pallet_utils::get_pallet_head("victim").unwrap(), Some(hash('5')));
+        assert_eq!(read().unwrap(), full, "the journal is exactly as the removal found it");
+        assert_eq!(removed_heads_in(&bay_root()).unwrap(), vec![hash('7')]);
     }
 
     #[test]
@@ -1316,7 +1562,7 @@ mod tests {
         ).unwrap();
 
         let mut stacked = entry("stack", "main", &hash('1'), &hash('2'));
-        stacked.after.heads.insert("side".to_string(), hash('3'));
+        stacked.after.heads.insert("side".to_string(), Some(hash('3')));
 
         check_undoable(&stacked).unwrap();
     }
@@ -1429,11 +1675,11 @@ mod tests {
 
         let mut restored = entry("consolidate", "main", &hash('a'), &hash('2'));
         restored.before.current_pallet = "feature".to_string();
-        restored.before.heads.insert("@office".to_string(), hash('b'));
+        restored.before.heads.insert("@office".to_string(), Some(hash('b')));
         let mut journaled = consolidating(&hash('c'), "their-pallet");
         journaled.our_pallet = "feature".to_string();
         restored.before.consolidation = Some(journaled);
-        restored.after.heads.insert("@office".to_string(), hash('4'));
+        restored.after.heads.insert("@office".to_string(), Some(hash('4')));
 
         restore_refs(&restored).unwrap();
 
@@ -1571,8 +1817,8 @@ mod tests {
         ).unwrap();
 
         let mut restored = entry("stack", "main", &hash('1'), &hash('2'));
-        restored.before.heads.insert("feature".to_string(), hash('3'));
-        restored.after.heads.insert("feature".to_string(), hash('4'));
+        restored.before.heads.insert("feature".to_string(), Some(hash('3')));
+        restored.after.heads.insert("feature".to_string(), Some(hash('4')));
 
         restore_refs(&restored).unwrap();
 
@@ -1603,7 +1849,7 @@ mod tests {
         // "@office" existed before the op but not after it (deleted by it); something has
         // recreated it since. With no "after" evidence it is never rolled back.
         let mut restored = entry("stack", "main", &hash('1'), &hash('2'));
-        restored.before.heads.insert("@office".to_string(), hash('7'));
+        restored.before.heads.insert("@office".to_string(), Some(hash('7')));
 
         restore_refs(&restored).unwrap();
 
@@ -1622,8 +1868,8 @@ mod tests {
         ).unwrap();
 
         let mut restored = entry("stack", "main", &hash('1'), &hash('2'));
-        restored.before.heads.insert("gone".to_string(), hash('3'));
-        restored.after.heads.insert("gone".to_string(), hash('4'));
+        restored.before.heads.insert("gone".to_string(), Some(hash('3')));
+        restored.after.heads.insert("gone".to_string(), Some(hash('4')));
 
         restore_refs(&restored).unwrap();
 
@@ -1701,8 +1947,8 @@ mod tests {
         // The oldest entries are the ones dropped: the newest surviving entry is the very
         // last one pushed, and the oldest is the eleventh.
         let entries = read().unwrap();
-        assert_eq!(entries[0].before.heads.get("main"), Some(&format!("{:064x}", 10)));
+        assert_eq!(entries[0].before.head("main"), Some(&format!("{:064x}", 10)));
         let newest = pop().unwrap().unwrap();
-        assert_eq!(newest.before.heads.get("main"), Some(&format!("{:064x}", MAX_ENTRIES + 9)));
+        assert_eq!(newest.before.head("main"), Some(&format!("{:064x}", MAX_ENTRIES + 9)));
     }
 }
