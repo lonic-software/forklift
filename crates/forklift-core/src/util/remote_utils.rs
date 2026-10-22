@@ -14220,6 +14220,31 @@ mod tests {
             pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE).unwrap();
         }
 
+        // Revert: keep walked heads on the fence → the healed head stays fenced; or keep absent
+        // heads → the gone head stays listed.
+        #[test]
+        fn the_commit_lifts_the_fence_of_a_walked_head_and_drops_an_absent_one() {
+            let _scratch = Scratch::new("expand-unfence");
+            let base = sparse_main();
+            // A crash between the fence write and the ledger write leaves a head in both; this
+            // walk now completes it.
+            let healed = parcel("healed", vec![base.clone()]);
+            record(&healed, "healed");
+            let gone = "e".repeat(64);
+            {
+                let lock = RefLock::acquire().unwrap();
+                fetch_ledger::write_fence(&lock, &[healed.clone(), gone]).unwrap();
+            }
+
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            expansion.walk_new_ref_heads_locally().unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert!(fetch_ledger::read_fence().unwrap().is_empty());
+            assert_eq!(ledger_heads(), vec![healed]);
+        }
+
         // Revert: drop the local walk's fence check → the commit fences a head a ref now holds.
         #[test]
         fn a_ref_written_at_a_head_to_be_fenced_refuses_the_expand() {
