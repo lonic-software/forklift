@@ -121,7 +121,10 @@ where
 /// default (2 MiB).
 /// Reconstructing a delta chain recurses once per link up to the pack reader's depth limit, and
 /// that limit has to be reached as an error, not as a stack overflow, which aborts the process.
-pub const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// A cold read of a chain at that limit was measured at about 7.5 MiB of stack in a debug build
+/// and under 2 MiB in release, so 16 MiB leaves room for the frames above the read in both. The
+/// size is reserved address space; only the pages a thread touches are committed.
+pub const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Run `f` on a new thread named `name` with [`WORKER_STACK_SIZE`], wait for it, and return its
 /// result. `forklift`'s and `forklift-server`'s `main` hand all their work to this (through
