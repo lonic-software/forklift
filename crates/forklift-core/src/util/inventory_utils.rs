@@ -1338,9 +1338,9 @@ fn directory_has_no_untracked_content(key: &str,
 /// 10, finding #3) — the new content of every shard that needs rewriting, as `load`'s parallel
 /// walk decides per directory — then publishes through [`shard_write::publish_shards`], the
 /// funnel shared with `load`'s own `create_inventory_for_directory`. It decides every rollup from
-/// all of this pass's shards at once, so a shard decided early in this loop (say, because only its
-/// stat data drifted) never keeps a rollup over the ancestor clear a *later*-decided sibling's real
-/// content change requires (finding #1).
+/// all of this pass's shards at once, so a shard whose stat data alone drifted never keeps a
+/// rollup over the ancestor clear a sibling's real content change requires, whichever of the two
+/// comes first in metadata order (finding #1).
 ///
 /// Each decision takes its stat anchor at its start, before it stats anything, so every entry it
 /// rebuilds proves itself (see [`file_utils::StatAnchor`]); when the shard is later published
@@ -1363,9 +1363,10 @@ fn directory_has_no_untracked_content(key: &str,
 /// batch, and if finishing that batch fails — including the leaked-reservation case where a
 /// producer won a reservation but never finished staging it — `WriteBatch::finish` refuses to
 /// publish the whole batch (see the blob-batch comment below), so nothing this pass decided is
-/// published, not just the shards after that failure. A retry after a decide-loop failure only has
-/// to redo the shards from the failure onward; a retry after a blob-batch failure has to redo the
-/// whole tracked set.
+/// published, not just the shards after that failure. Because every shard is decided, a shard
+/// *after* the first failure can be the one that leaks, and then the shards before the failure
+/// are not published either. A retry after a decide-loop failure only has to redo the shards from
+/// the failure onward when the batch finished; otherwise it has to redo the whole tracked set.
 ///
 /// # Returns
 /// * `Ok(())`      - If the refresh completed.
@@ -1390,10 +1391,9 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     let blob_batch = file_utils::WriteBatch::new();
     let mut writes: BTreeMap<String, Inventory> = BTreeMap::new();
 
-    // The first failure hit while deciding a shard, if any — recorded instead of propagated
-    // immediately (see the function's own doc comment on why: everything decided before this
-    // point must still reach the publish step below, exactly as it would have under the old
-    // per-shard, immediate-write loop this replaced).
+    // The first failure in metadata order, if any — recorded instead of propagated immediately
+    // (see the function's own doc comment on why: every shard before it in metadata order must
+    // still reach the publish step below).
     let mut result: Result<(), String> = Ok(());
 
     // Every shard is decided across every core; each decision is independent of the others (its
@@ -1560,10 +1560,10 @@ pub struct PreparedInventory {
 /// skipped subtree is built as if it were never inventoried. Empty without metadata entries.
 #[derive(Default)]
 pub struct DirectoryLayout {
-    pub keys: BTreeSet<String>,
+    pub(crate) keys: BTreeSet<String>,
 
     /// Shared with every task of the tree build.
-    pub children: Arc<BTreeMap<String, Vec<String>>>,
+    pub(crate) children: Arc<BTreeMap<String, Vec<String>>>,
 }
 
 /// The subtrees a [`PreparedInventory`] proved unchanged from head, because each one's shard
