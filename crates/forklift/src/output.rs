@@ -442,6 +442,9 @@ error_codes! {
     /// The remote's pallet holds parcels this warehouse has not lowered yet, found before a lift
     /// or by the remote refusing one.
     RemoteAhead,
+
+    /// A command named a pallet this warehouse holds no ref for.
+    PalletNotFound,
 }
 
 impl ErrorCode {
@@ -475,6 +478,7 @@ impl ErrorCode {
             ErrorCode::Behind => RefusalCode::Behind.as_str(),
             ErrorCode::TargetNotCovered => RefusalCode::TargetNotCovered.as_str(),
             ErrorCode::RemoteAhead => RefusalCode::RemoteAhead.as_str(),
+            ErrorCode::PalletNotFound => RefusalCode::PalletNotFound.as_str(),
         }
     }
 
@@ -511,6 +515,7 @@ impl ErrorCode {
             ErrorCode::Behind => 26,
             ErrorCode::TargetNotCovered => 27,
             ErrorCode::RemoteAhead => 28,
+            ErrorCode::PalletNotFound => 29,
         }
     }
 
@@ -581,6 +586,10 @@ impl ErrorCode {
             ErrorCode::RemoteAhead =>
                 "The remote's pallet holds parcels this warehouse has not lowered yet; \
                  \"lower\" comes first",
+            ErrorCode::PalletNotFound =>
+                "No pallet of that name exists in this warehouse (or, for \"lower\", on the \
+                 remote); \"lower <name>\" brings in the remote's, \"palletize <name>\" creates a \
+                 new one, \"palletize --remote\" lists the remote's",
         }
     }
 
@@ -613,6 +622,7 @@ impl ErrorCode {
             RefusalCode::TargetNotCovered => ErrorCode::TargetNotCovered,
             RefusalCode::RemoteAhead => ErrorCode::RemoteAhead,
             RefusalCode::Diverged => ErrorCode::Diverged,
+            RefusalCode::PalletNotFound => ErrorCode::PalletNotFound,
         }
     }
 }
@@ -1001,6 +1011,7 @@ mod tests {
             (RefusalCode::Behind, "behind", 26),
             (RefusalCode::TargetNotCovered, "target_not_covered", 27),
             (RefusalCode::RemoteAhead, "remote_ahead", 28),
+            (RefusalCode::PalletNotFound, "pallet_not_found", 29),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

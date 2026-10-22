@@ -6098,6 +6098,55 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Judge the remote's trust from its handshake alone, writing and fetching nothing: the pin and a
+/// stripped anchor, an anchor without the office it governs, and an anchor other than the one held
+/// here. Every refusal `adopt_remote_trust` raises before its first transfer comes from here, so a
+/// caller that refuses for another reason first (a pallet the remote lacks) still refuses an
+/// untrusted remote as such.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `info`   - The remote's handshake.
+/// * `expect` - The pinned genesis (`--expect`), if any.
+///
+/// # Returns
+/// * `Ok(())`      - The remote's trust would be adopted or already matches.
+/// * `Err(String)` - The refusal `adopt_remote_trust` would raise.
+pub fn check_remote_trust(client: &RemoteClient, info: &WarehouseInfo, expect: Option<&str>) -> Result<(), String> {
+    let local = office_utils::read_trust_anchor()?;
+    judge_remote_trust(client.url(), info, local.as_ref(), expect).map(|_| ())
+}
+
+/// The read-only trust checks shared by `check_remote_trust` and `adopt_remote_trust`.
+///
+/// # Returns
+/// * `Ok(Some(head))` - The remote holds an anchor this warehouse may adopt or already holds; its
+///                      office head.
+/// * `Ok(None)`       - The remote holds no anchor (and none is held or pinned here).
+/// * `Err(String)`    - A `trust_changed` refusal, or a remote anchor without its office.
+fn judge_remote_trust<'a>(url: &str,
+                          info: &'a WarehouseInfo,
+                          local: Option<&office_utils::TrustAnchor>,
+                          expect: Option<&str>) -> Result<Option<&'a String>, String> {
+    trust_utils::check_handshake_trust(url, info, local.map(|anchor| anchor.genesis.as_str()), expect)?;
+
+    let Some(remote_trust) = &info.trust else {
+        return Ok(None);
+    };
+
+    let remote_office_head = info.pallets.get(&office_utils::office_wire_key())
+        .ok_or("The remote has a trust anchor but no office pallet; it is corrupt.".to_string())?;
+
+    if let Some(local) = local {
+        if local.genesis != remote_trust.genesis {
+            // A re-genesis (§8.7) is a conspicuous trust reset: never adopted silently.
+            return Err(trust_utils::anchor_changed(url, &local.genesis, remote_trust, "Refusing to sync.").into());
+        }
+    }
+
+    Ok(Some(remote_office_head))
+}
+
 /// What the trust/office synchronization of a lower/franchise did.
 #[derive(Default)]
 pub struct TrustSyncStats {
@@ -6137,24 +6186,12 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
     // same held anchor, and the office write below is conditioned on its bytes.
     let local_read = office_utils::read_trust_anchor_with_bytes()?;
     let local = local_read.as_ref().map(|(anchor, _)| anchor);
-    let local_genesis = local.map(|anchor| anchor.genesis.as_str());
-    trust_utils::check_handshake_trust(client.url(), info, local_genesis, expect)?;
-
+    let Some(remote_office_head) = judge_remote_trust(client.url(), info, local, expect)? else {
+        return Ok(stats);
+    };
     let Some(remote_trust) = &info.trust else {
         return Ok(stats);
     };
-
-    let remote_office_head = info.pallets.get(&office_utils::office_wire_key())
-        .ok_or("The remote has a trust anchor but no office pallet; it is corrupt.".to_string())?;
-
-    if let Some(local) = local {
-        if local.genesis != remote_trust.genesis {
-            // A re-genesis (§8.7) is a conspicuous trust reset: never adopted silently.
-            return Err(trust_utils::anchor_changed(
-                client.url(), &local.genesis, remote_trust, "Refusing to sync."
-            ).into());
-        }
-    }
 
     stats.fetch = fetch_history(client, remote_office_head, &Progress::NONE).await?;
     // Before the office head moves: an anchor is only ever held with its adopted history. A held

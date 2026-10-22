@@ -1,7 +1,9 @@
 use serde::Serialize;
 use crate::commands::shift;
 use crate::output::{self, CommandOutput};
-use forklift_core::util::pallet_utils::{self, PalletRef};
+use forklift_core::util::{file_utils, merge_utils};
+use forklift_core::util::pallet_utils::{self, PalletNamespace, PalletRef};
+use forklift_core::util::remote_utils::RemoteClient;
 
 /// Handle the palletize command.
 /// * `palletize <name>`            - Create a new pallet pointing at the current pallet's
@@ -10,18 +12,21 @@ use forklift_core::util::pallet_utils::{self, PalletRef};
 ///                                   pallet name or a parcel hash / unique hash prefix)
 ///                                   and shift to it.
 /// * `palletize`                   - List the pallets, marking the current one.
+/// * `palletize --remote`          - List the remote's pallets, each against the local one.
 ///
 /// # Arguments
 /// * `name`     - The name of the new pallet (`None` lists the pallets).
 /// * `revision` - Where the new pallet starts (`None` means the current pallet's head).
 /// * `all`      - When listing, also show the meta pallets (the office, etc.).
+/// * `remote`   - List the remote's pallets instead of the local ones.
 ///
 /// # Returns
 /// * `Ok(())`      - If the command was handled successfully.
 /// * `Err(String)` - If there was an error while handling the command.
-pub async fn handle_command(name: Option<String>, revision: Option<String>, all: bool) -> Result<(), String> {
+pub async fn handle_command(name: Option<String>, revision: Option<String>, all: bool, remote: bool) -> Result<(), String> {
     match name {
         Some(name) => create_pallet(&name, revision.as_deref()).await,
+        None if remote => list_remote_pallets(all).await,
         None => list_pallets(all),
     }
 }
@@ -236,6 +241,173 @@ impl CommandOutput for PalletList {
     }
 }
 
+/// List the remote's pallets from its handshake, each with how it relates to the local pallet of
+/// that name. Only user pallets are shown by default; `all` adds the meta pallets. Nothing is
+/// downloaded beyond the handshake, and nothing is written: the trust sync and fetch belong to
+/// `lower`, which this listing points at.
+///
+/// # Arguments
+/// * `all` - Whether to also list the meta pallets.
+///
+/// # Returns
+/// * `Ok(())`      - If the pallets were listed.
+/// * `Err(String)` - If no remote is configured, the handshake failed, or a local ref or parcel
+///                   could not be read.
+async fn list_remote_pallets(all: bool) -> Result<(), String> {
+    let client = RemoteClient::from_config()?;
+    let info = client.fetch_info().await?;
+
+    let mut pallets = Vec::new();
+    let mut meta = Vec::new();
+    let mut unnamed = Vec::new();
+
+    for (wire, remote_head) in &info.pallets {
+        // A remote with other naming rules may list names this build rejects: they are reported
+        // apart, uncompared, rather than failing the listing of every other pallet.
+        let Ok(reference) = PalletRef::parse(wire) else {
+            unnamed.push(wire.clone());
+            continue;
+        };
+
+        let entries = match reference.namespace {
+            PalletNamespace::User => &mut pallets,
+            PalletNamespace::Meta if all => &mut meta,
+            PalletNamespace::Meta => continue,
+        };
+
+        let local_head = pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)?;
+        let relation = relation_to_remote(remote_head, local_head.as_deref())?;
+
+        entries.push(RemotePalletEntry { name: reference.to_wire(), remote_head: remote_head.clone(), local_head, relation });
+    }
+
+    output::emit(&RemotePalletList { remote: client.url().to_string(), pallets, meta, unnamed });
+
+    Ok(())
+}
+
+/// How the local pallet at `local_head` relates to the remote's at `remote_head`. A remote head
+/// whose parcel is not here cannot be a local ancestor — a parcel is fetched whole, and a ref
+/// moves only once its closure is present — so it differs, without a walk; behind and diverged
+/// cannot be told apart without fetching, which `lower` does.
+fn relation_to_remote(remote_head: &str, local_head: Option<&str>) -> Result<RemoteRelation, String> {
+    let Some(local_head) = local_head else {
+        return Ok(RemoteRelation::Absent);
+    };
+
+    if local_head == remote_head {
+        return Ok(RemoteRelation::Same);
+    }
+
+    if file_utils::does_object_exist(remote_head)? && merge_utils::is_ancestor(remote_head, local_head)? {
+        return Ok(RemoteRelation::LocalAhead);
+    }
+
+    Ok(RemoteRelation::Differs)
+}
+
+/// The remote's pallets, each against the local pallet of that name.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RemotePalletList {
+    /// The remote's URL.
+    remote: String,
+
+    /// Every user pallet the remote has with something stacked.
+    pallets: Vec<RemotePalletEntry>,
+
+    /// The remote's meta pallets in their qualified form (`@office`), listed only when `--all`
+    /// was given; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    meta: Vec<RemotePalletEntry>,
+
+    /// Pallet names the remote lists that this build cannot read (another version's naming
+    /// rules), so they are not compared; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unnamed: Vec<String>,
+}
+
+/// One remote pallet.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RemotePalletEntry {
+    name: String,
+
+    /// The remote's head parcel hash.
+    remote_head: String,
+
+    /// The local pallet's head parcel hash; `null` when there is no local pallet of that name.
+    local_head: Option<String>,
+
+    relation: RemoteRelation,
+}
+
+/// How a local pallet relates to the remote's pallet of the same name.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteRelation {
+    /// There is no local pallet of that name; `lower <name>` creates it.
+    Absent,
+
+    /// The local pallet is at the remote head.
+    Same,
+
+    /// The local pallet holds the remote head and more; `lift` publishes it.
+    LocalAhead,
+
+    /// The local pallet is behind the remote or diverged from it; `lower <name>` tells which,
+    /// fast-forwarding a pallet that is behind.
+    Differs,
+}
+
+impl CommandOutput for RemotePalletList {
+    fn render_human(&self) {
+        println!("Pallets on {}:", forklift_core::error::sanitize(&self.remote));
+
+        if self.pallets.is_empty() {
+            println!("  (none)");
+        }
+
+        for entry in &self.pallets {
+            println!("  {}", describe_remote_entry(entry, PalletNamespace::User));
+        }
+
+        if !self.meta.is_empty() {
+            println!("Meta pallets:");
+
+            for entry in &self.meta {
+                println!("  {}", describe_remote_entry(entry, PalletNamespace::Meta));
+            }
+        }
+
+        if !self.unnamed.is_empty() {
+            println!("Not compared (names this version of forklift cannot read):");
+
+            for name in &self.unnamed {
+                println!("  {}", forklift_core::error::sanitize(name));
+            }
+        }
+    }
+}
+
+fn describe_remote_entry(entry: &RemotePalletEntry, namespace: PalletNamespace) -> String {
+    // A meta pallet is synced by every lower, never lowered by name.
+    if namespace == PalletNamespace::Meta {
+        return match entry.relation {
+            RemoteRelation::Same => format!("{} (same as here)", entry.name),
+            RemoteRelation::LocalAhead => format!("{} (ahead here)", entry.name),
+            RemoteRelation::Absent | RemoteRelation::Differs => format!("{} (\"forklift lower\" syncs it)", entry.name),
+        };
+    }
+
+    match entry.relation {
+        RemoteRelation::Absent => format!("{} (not here; \"forklift lower {}\" brings it in)", entry.name, entry.name),
+        RemoteRelation::Same => format!("{} (same as here)", entry.name),
+        RemoteRelation::LocalAhead => format!("{} (ahead here; \"lift\" from it publishes it)", entry.name),
+        RemoteRelation::Differs => format!("{} (differs; \"forklift lower {}\" fast-forwards or reports a divergence)", entry.name, entry.name),
+    }
+}
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
@@ -243,5 +415,6 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<Palletized>(),
         crate::docgen::OutputSchema::of::<PalletList>(),
+        crate::docgen::OutputSchema::of::<RemotePalletList>(),
     ]
 }

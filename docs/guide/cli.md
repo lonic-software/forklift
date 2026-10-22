@@ -953,6 +953,8 @@ forklift palletize                 # list pallets (the current one marked *)
 forklift palletize --all           # also list the meta pallets (@office, …) under a heading
 forklift palletize feature         # create "feature" at the current head and shift to it
 forklift palletize hotfix 1a2b3c   # create "hotfix" at a revision and shift to it
+forklift palletize --remote        # list the remote's pallets, against the ones here
+forklift palletize --remote --all  # also the remote's meta pallets
 ```
 
 The list shows user pallets only by default; `--all` adds the meta pallets (the office
@@ -976,6 +978,19 @@ special-case it):
     { "name": "main", "current": false, "head": "<hash>" }
   ] }
 ```
+
+`--remote` asks the remote which pallets it holds and sets each beside this warehouse's: `absent`
+(not here — `lower <name>` brings it in), `same`, `local_ahead` (this side holds everything the
+remote has, and more — `lift` from it publishes it) or `differs` (anything else: the remote moved
+on, or the two diverged — `lower <name>` fast-forwards it or reports the divergence). It fetches
+nothing and writes nothing. With `--json`, each entry carries `name`, `remote_head`, `local_head`
+(`null` when absent) and `relation`; with `--all` the meta pallets come under `meta`. A name the remote lists that this version cannot read (a server with other naming rules) is
+not compared, and is listed apart, under `unnamed`.
+
+A command naming a pallet this warehouse does not hold (`shift`, `consolidate`, `audit`,
+`haul open`) refuses with `pallet_not_found` (exit 29), and names `lower <name>` when a remote is
+configured, `palletize <name>` otherwise. `lower <name>` for a pallet the remote does not have
+refuses the same way, before it writes anything, naming `palletize --remote`.
 
 ### `shift` — switch pallets (`sh`)
 
@@ -1396,6 +1411,7 @@ remote that doesn't, `lift` refuses up front, before uploading anything
 
 ```sh
 forklift lower
+forklift lower feature              # bring in, or fast-forward, another pallet; this bay stays put
 forklift lower --expect <genesis>   # refuse unless the remote's trust anchor is this one
 forklift lower --keep kv:<hash>/<key>=theirs   # resolve a custom-metadata conflict
 ```
@@ -1413,6 +1429,15 @@ divergence, and you consolidate deliberately (`palletize` the remote head into
 its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
 warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
 content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
+
+`lower <pallet>` names a pallet other than the current one (`palletize --remote` lists the
+remote's). It fetches that pallet's history, then creates the pallet here at the remote's head,
+fast-forwards it, or reports it ahead or diverged, exactly as for the current pallet, but nothing
+else moves: this bay's pallet, files and inventory stay where they are, so it needs no clean
+warehouse. `shift <pallet>` then moves the bay onto it. A bay already standing on that pallet is
+left behind it and catches up with `shift`. The pallet is created or moved only once its history
+is fully fetched, so a lower that fails part-way leaves it as it was. Naming the current pallet is
+the same as a bare `lower`.
 
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
 working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`

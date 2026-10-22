@@ -62,7 +62,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
 
     if !is_office {
         let Some(head) = pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name)? else {
-            return Err(format!("No pallet named \"{}\" exists (or it has nothing stacked).", pallet_ref.to_wire()));
+            return Err(pallet_utils::pallet_not_found_refusal(&pallet_ref).into());
         };
 
         let (verified, legacy) = audit_utils::verify_pallet_history(&head, &anchor, &office_state, None)?;

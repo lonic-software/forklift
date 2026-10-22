@@ -50,20 +50,28 @@ fn signing() -> Result<(forklift_core::util::audit_utils::VerifiedOffice, forkli
 
 /// Open a haul proposing `source` (default: the current pallet) be merged into `target`.
 fn open(target: &str, source: Option<String>, title: &str, description: String) -> Result<(), String> {
-    let source = match source {
-        Some(name) => name,
-        None => pallet_utils::read_position()?.pallet,
-    };
+    let current = pallet_utils::read_position()?.pallet;
+    let source = source.unwrap_or_else(|| current.clone());
 
     if source == target {
         return Err("A haul's source and target must be different pallets.".to_string());
     }
 
-    let head = pallet_utils::get_pallet_head(&source)?
-        .ok_or(format!("Pallet \"{}\" has nothing stacked; there is nothing to propose.", source))?;
+    // Only the current pallet can be unborn: any other without a head has no ref at all.
+    let Some(head) = pallet_utils::get_pallet_head(&source)? else {
+        if source != current {
+            return Err(pallet_utils::pallet_not_found_refusal(&pallet_utils::PalletRef::user(source.as_str())).into());
+        }
+
+        return Err(format!("Pallet \"{}\" has nothing stacked; there is nothing to propose.", source));
+    };
 
     if pallet_utils::get_pallet_head(target)?.is_none() && !pallet_utils::does_pallet_exist(target) {
-        return Err(format!("No pallet named \"{}\" to merge into.", target));
+        if target == current {
+            return Err(format!("Pallet \"{}\" has nothing stacked; there is nothing to merge into.", target));
+        }
+
+        return Err(pallet_utils::pallet_not_found_refusal(&pallet_utils::PalletRef::user(target)).into());
     }
 
     let (office, actor, signer) = signing()?;
