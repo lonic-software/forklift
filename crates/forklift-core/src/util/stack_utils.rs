@@ -90,8 +90,15 @@ impl Signing {
         }
     }
 
+    /// Move `pallet` from `expected` to `new`, a parcel signed this way, conditioned on the signing
+    /// choice: an anchor established since an unsigned choice, or an office or anchor changed since
+    /// a signed one, refuses the write (see [`pallet_utils::update_pallet_head`]).
+    pub fn write_head(&self, pallet: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
+        pallet_utils::update_pallet_head(pallet, expected, new, &self.preconditions())
+    }
+
     /// The preconditions of a head write of a parcel signed this way.
-    pub fn preconditions(&self) -> RefPreconditions {
+    fn preconditions(&self) -> RefPreconditions {
         match self {
             Signing::Unsigned => RefPreconditions {
                 anchor: AnchorPrecondition::Absent,
@@ -513,10 +520,7 @@ pub async fn stack_parcel(description: Option<String>,
     // that read is refused rather than silently replaced — and against the signing choice, so an
     // anchor established meanwhile refuses an unsigned parcel, and an office or anchor changed
     // meanwhile refuses one signed under the office it replaced.
-    #[cfg(test)]
-    tests::BEFORE_HEAD_WRITE.with(|seam| seam.take().map(|seam| seam()));
-
-    match pallet_utils::update_pallet_head(&pallet, expected.as_deref(), &object.hash, &signing.preconditions()) {
+    match signing.write_head(&pallet, expected.as_deref(), &object.hash) {
         Ok(()) => {}
 
         // Another bay already moved the pallet to this very parcel: the move stands.
@@ -578,17 +582,12 @@ fn clean_up_after_stack(prepared: &inventory_utils::PreparedInventory,
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use std::cell::Cell;
 
-    thread_local! {
-        /// Run in [`super::stack_parcel`] after its parcel is durable and before its head write.
-        pub(crate) static BEFORE_HEAD_WRITE: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
-    }
-
-    // Revert: `Signing::preconditions` gives `NotConsumed` for an unsigned choice → an unsigned
-    // parcel lands under the anchor established meanwhile.
+    // Revert: `Signing::preconditions` gives `NotConsumed` for an unsigned choice, or
+    // `Signing::write_head` passes `RefPreconditions::NONE` → an unsigned parcel lands under the
+    // anchor established meanwhile.
     #[test]
     fn an_unsigned_write_whose_anchor_appeared_after_the_signing_choice_is_refused() {
         let root = std::env::temp_dir().join(format!("forklift-stack-utils-anchor-appeared-{}", std::process::id()));
@@ -603,7 +602,7 @@ pub(crate) mod tests {
             genesis: "0".repeat(64), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: None,
         }).unwrap();
 
-        let refused = pallet_utils::update_pallet_head("main", None, &"1".repeat(64), &signing.preconditions());
+        let refused = signing.write_head("main", None, &"1".repeat(64));
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), None, "the pallet must be unchanged");
         assert_eq!(refused, Err(RefUpdateError::AnchorMoved));

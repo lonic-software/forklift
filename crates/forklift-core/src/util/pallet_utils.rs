@@ -798,8 +798,8 @@ pub fn update_meta_pallet_head(name: &str,
 
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
 /// pallet ref is written. Under the warehouse's [`RefLock`](crate::util::lock_utils::RefLock),
-/// which every bay shares, the `preconditions` are checked and then the head is read; when either
-/// does not hold nothing is written and the write is refused. Otherwise the ref file is replaced
+/// which every bay shares, the head is read and then the `preconditions` are checked; when either
+/// does not hold nothing is written and the write is refused (a moved head is reported first). Otherwise the ref file is replaced
 /// atomically, created (with any subfolders a `/`-separated name needs) when the pallet is unborn.
 ///
 /// `expected` is the head the caller's work was based on, and `preconditions` the office, anchor
@@ -834,8 +834,28 @@ pub fn update_pallet_head_in(
 
     let lock = crate::util::lock_utils::RefLock::acquire()?;
 
+    // The ref's own compare goes first: a ref another writer moved, perhaps to this very parcel
+    // (which callers read as landed), reports that move, never a precondition it would mask.
+    require_head(namespace, name, expected)?;
     check_preconditions(&lock, preconditions)?;
     update_pallet_head_locked(&lock, namespace, name, expected, new)
+}
+
+/// Refuse with [`RefUpdateError::Moved`] unless the ref holds `expected`; the head it holds.
+fn require_head(namespace: PalletNamespace,
+                name: &str,
+                expected: Option<&str>) -> Result<Option<String>, RefUpdateError> {
+    let found = get_pallet_head_in(namespace, name)?;
+
+    if found.as_deref() != expected {
+        return Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace, name: name.to_string() },
+            expected: expected.map(str::to_string),
+            found,
+        }));
+    }
+
+    Ok(found)
 }
 
 /// The refusals of a head write that need no lock: an invalid name, or a value the reader would
@@ -868,15 +888,7 @@ pub(crate) fn update_pallet_head_locked(
 ) -> Result<(), RefUpdateError> {
     validate_head_write(name, new)?;
 
-    let found = get_pallet_head_in(namespace, name)?;
-
-    if found.as_deref() != expected {
-        return Err(RefUpdateError::Moved(RefMoved {
-            reference: PalletRef { namespace, name: name.to_string() },
-            expected: expected.map(str::to_string),
-            found,
-        }));
-    }
+    let found = require_head(namespace, name, expected)?;
 
     let path = get_pallet_ref_path(namespace, name);
 
@@ -1185,6 +1197,25 @@ mod tests {
         }).unwrap();
 
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('2')));
+    }
+
+    // Revert: check the preconditions before the ref's own compare → the moved office is reported,
+    // hiding that another bay already landed this very parcel.
+    #[test]
+    fn a_ref_already_moved_reports_the_move_before_a_precondition() {
+        let (_root, _scope) = scratch("moved-before-precondition");
+        update_meta_pallet_head(OFFICE, None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+
+        // Another bay lands the same parcel, then the office moves.
+        update_pallet_head("main", Some(&hash('1')), &hash('2'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head(OFFICE, Some(&hash('a')), &hash('b'), &RefPreconditions::NONE).unwrap();
+
+        assert_eq!(update_pallet_head("main", Some(&hash('1')), &hash('2'), &office_at(&hash('a'))), Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace: PalletNamespace::User, name: "main".to_string() },
+            expected: Some(hash('1')),
+            found: Some(hash('2')),
+        })));
     }
 
     // Revert: drop the boundary check → the first two land. Compare the boundary as a snapshot of

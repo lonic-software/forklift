@@ -3385,7 +3385,7 @@ mod tests {
         assert_eq!(signing.key_id(), Some(fixture.admin_key_id.as_str()));
         fixture.admit(BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
 
-        let refused = crate::util::pallet_utils::update_pallet_head("main", None, &"1".repeat(64), &signing.preconditions());
+        let refused = signing.write_head("main", None, &"1".repeat(64));
 
         assert_eq!(crate::util::pallet_utils::get_pallet_head("main").unwrap(), None, "the pallet must be unchanged");
         assert_eq!(refused, Err(RefUpdateError::OfficeMoved { found: office_head() }));

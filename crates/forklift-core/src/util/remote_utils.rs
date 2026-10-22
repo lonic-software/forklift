@@ -6407,10 +6407,14 @@ mod tests {
         let fixture = Regenesis::new("office-landed");
         office_utils::tests::OFFICE_WRITE_FAULT.with(|fault| fault.set(office_utils::tests::OfficeWriteFault::AfterLanding));
 
-        fixture.install().expect("both writes landed, so the install stands");
+        let reported = fixture.install();
 
-        assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(fixture.new.clone()));
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), Some(fixture.new.clone()), "both writes landed, so the new anchor stands");
         assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.remote_head.clone()));
+        let Err(pallet_utils::RefUpdateError::Failed(message)) = reported else {
+            panic!("a write that landed but failed is still reported: {:?}", reported);
+        };
+        assert!(message.contains("both written and stand"), "{}", message);
     }
 
     // Revert: release and re-take the ref lock between the anchor write and the office write →

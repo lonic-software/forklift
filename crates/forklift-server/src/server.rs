@@ -1001,12 +1001,22 @@ fn holds_warehouse(root: &std::path::Path) -> bool {
     matches!(bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), Ok(bay_utils::ForkliftKind::Warehouse))
 }
 
-/// Map a trust install that did not land: a `409` when what the handler read moved meanwhile (it
-/// wrote nothing, and a retry re-reads), a 500 when a write failed.
+/// Map a trust install that did not land to the answer a ref update gives for the same condition:
+/// a `409` when the office or the anchor it was judged against moved, or when a pallet head here
+/// stands outside the anchor's boundary (it wrote nothing), and a 500 when a write failed.
 fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
     match error {
+        RefUpdateError::OfficeMoved { found } => office_moved(found.as_deref()),
+        RefUpdateError::AnchorMoved => anchor_moved(),
+        // The boundary is the client's, fixed when it established trust: a retry sends the same
+        // one, so this names what is outside it and promises no way out.
+        RefUpdateError::PalletsMoved { pallet, found } => (StatusCode::CONFLICT, format!(
+            "Pallet \"{}\" here is at {}, which the trust anchor's boundary does not hold: \
+            installing the anchor would leave that history outside trust. Nothing was written.",
+            pallet.to_wire(), found
+        )),
+        moved @ RefUpdateError::Moved(_) => (StatusCode::CONFLICT, moved.to_string()),
         RefUpdateError::Failed(message) => internal(message),
-        moved => (StatusCode::CONFLICT, moved.to_string()),
     }
 }
 
@@ -1360,16 +1370,16 @@ fn office_lookup_test_checkpoint(identifier: &str) {
 #[cfg(not(test))]
 fn office_lookup_test_checkpoint(_identifier: &str) {}
 
-/// Test seam: a ref update for the armed pallet name (or `PUT /v1/trust`, armed as
-/// [`TRUST_WRITE_SEAM`]) runs the armed closure after its decision and before its write, so a test
-/// can move what the decision read in exactly that window. Keyed and a `Mutex` for the same
-/// reasons as [`OFFICE_LOOKUP_TEST_SEAM`].
 /// The key [`REF_WRITE_TEST_SEAM`] arms `PUT /v1/trust` under: no pallet name holds a `/`.
 const TRUST_WRITE_SEAM: &str = "/v1/trust";
 
 #[cfg(test)]
 type RefWriteSeam = Option<(String, Box<dyn FnOnce() + Send>)>;
 
+/// Test seam: a ref update for the armed pallet name (or `PUT /v1/trust`, armed as
+/// [`TRUST_WRITE_SEAM`]) runs the armed closure after its decision and before its write, so a test
+/// can move what the decision read in exactly that window. Keyed and a `Mutex` for the same
+/// reasons as [`OFFICE_LOOKUP_TEST_SEAM`].
 #[cfg(test)]
 static REF_WRITE_TEST_SEAM: Mutex<RefWriteSeam> = Mutex::new(None);
 
@@ -5116,7 +5126,6 @@ mod tests {
         // correct on both the passing and the panicking path.
     }
 
-    /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
     /// Arm the write seam for `name` with `run`.
     fn arm_write_seam(name: &str, run: impl FnOnce() + Send + 'static) {
         *REF_WRITE_TEST_SEAM.lock().unwrap() = Some((name.to_string(), Box::new(run)));
@@ -5240,7 +5249,7 @@ mod tests {
         assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = body_text(response).await;
-        assert!(body.contains("pallet \\\"main\\\""), "{}", body);
+        assert!(body.contains("Pallet \\\"main\\\" here is at") && body.contains("boundary does not hold"), "{}", body);
 
         let accepted = put_trust(
             State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(PathParams::new()),
@@ -5250,6 +5259,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
     fn admin_token_state(fixture: &OfficeFixture) -> Arc<AppState> {
         let mut operator_tokens = HashMap::new();
         operator_tokens.insert("tok-alice".to_string(), fixture.admin.identifier.clone());

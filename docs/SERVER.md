@@ -90,9 +90,10 @@ under the warehouse's ref lock, just before the write. If the pallet, the office
 trust anchor that verification judged it against moved meanwhile, the update is refused with
 `409` and writes nothing; a client lowers, or re-reads, and retries. `PUT /v1/trust` is
 checked the same way: the anchor and the office it governs are installed under one hold of the
-ref lock, and only while the office head and every pallet head the anchor's boundary vouches
-for are still the ones it was judged against. Otherwise it is refused with `409` and writes
-nothing.
+ref lock, and only while the office head is still the one the request was judged against and
+every pallet head here is one the anchor's boundary holds. Otherwise it is refused with `409`
+and writes nothing. A pallet outside the boundary is not a race a retry outlives: the boundary
+is fixed in the anchor, so the refusal names the pallet and its head.
 
 ## Authentication
 

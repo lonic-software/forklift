@@ -1031,8 +1031,9 @@ pub struct TrustInstall<'a> {
 /// read, then the anchor is written, then the office moves. So no other bay ever sees the new
 /// anchor beside the old office, and a refusal writes nothing. Its parcels are built and signed
 /// before, outside the hold. A write can land and still fail, so on any error both files are read
-/// back before anything is decided: both new is success, a new anchor beside the old office puts
-/// the old anchor back (still inside the hold), and anything else fails naming both.
+/// back before anything is decided: both new stands but still reports the failure (a write that
+/// landed may not be durable), a new anchor beside the old office puts the old anchor back (still
+/// inside the hold), and anything else fails naming both.
 ///
 /// An install whose anchor and office are both already in place succeeds without writing: another
 /// bay installed the same trust (accepted the same re-genesis) first.
@@ -1105,7 +1106,11 @@ pub fn install_trust(install: &TrustInstall) -> Result<(), RefUpdateError> {
     let anchor_is_new = anchor_now.as_deref() == Some(bytes.as_slice());
 
     if anchor_is_new && office_now.as_deref() == office_target {
-        return Ok(());
+        return Err(RefUpdateError::Failed(format!(
+            "{} The trust anchor and the office were both written and stand, so nothing was put \
+            back, but they may not be on disk durably yet.",
+            error
+        )));
     }
 
     if anchor_now.as_deref() == install.replaces && office_now.as_deref() == install.office {

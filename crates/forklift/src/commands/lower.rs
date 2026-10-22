@@ -612,18 +612,22 @@ async fn replay(client: &RemoteClient,
     }
 
     remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), info.chunking, &Progress::NONE).await?;
-    pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &pallet_utils::RefPreconditions::NONE)?;
+    // Conditioned on the office the replay was signed and checked under, as every meta write is.
+    pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &office.preconditions())?;
     restamped.extend(resigned);
 
     Ok(Reconciled::Replayed)
 }
 
 /// The office, verified against the anchor, and the operator's signing key in it. A converted
-/// pallet's writes are judged against the verified office, never the unverified local read.
+/// pallet's writes, and the key that signs them, are judged against the verified office, never the
+/// unverified local read.
 pub(crate) fn verified_signing_office(actor: &Operator) -> Result<(audit_utils::VerifiedOffice, String), String> {
-    let signing_key_id = office::require_signing_actor(actor)?.signing_key_id;
+    office::require_trust()?;
+    let office = audit_utils::verified_local_office()?;
+    let (_, signing_key_id) = office::signing_key_in(&office, actor)?;
 
-    Ok((audit_utils::verified_local_office()?, signing_key_id))
+    Ok((office, signing_key_id))
 }
 
 fn describe_conflicts(wire: &str,
