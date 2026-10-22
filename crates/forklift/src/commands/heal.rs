@@ -1,9 +1,11 @@
 use serde::Serialize;
+use forklift_core::util::operation_utils::{self, RecoveryOutcome};
 use forklift_core::util::recovery_utils;
 use crate::output::{self, CommandOutput};
 
 /// Handle the `heal` command: run the durability-taint recovery verb
-/// (`forklift_core::util::recovery_utils::run`).
+/// (`forklift_core::util::recovery_utils::run`), then settle an operation interrupted in this
+/// bay before it finished, if one is recorded (`forklift_core::util::operation_utils::recover`).
 ///
 /// No arguments — v1 keeps the surface minimal. See `recovery_utils`'s module doc comment for
 /// the full per-verdict behavior (restage, the closure walk, partial clears); this handler's job
@@ -22,14 +24,42 @@ pub async fn handle_command() -> Result<(), String> {
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
     // itself a no-op under `--json` (progress is never part of the result document), and
     // `forklift-core` never prints on its own (DESIGN.html §3.4) — this closure is the one bridge.
-    let outcome = recovery_utils::run(Some(&|line: &str| crate::human!("{}", line)))
-        .await.map_err(String::from)?;
+    let outcome = match recovery_utils::run(Some(&|line: &str| crate::human!("{}", line))).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // An interrupted operation waits for the taint (below), so the refusal says so: it
+            // is not the only thing left standing.
+            let error = String::from(error);
+            return Err(match operation_utils::read() {
+                Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
+                    "An interrupted {} also stands in this bay; heal finishes or undoes it once the \
+                    taint is resolved.", operation.kind.as_str(),
+                )),
+                _ => error,
+            });
+        }
+    };
+
+    // After the taint: an operation's recovery reads and writes the store the taint vouches for.
+    let operation = operation_utils::recover()?.map(|recovery| OperationRecovery {
+        operation: recovery.operation.as_str().to_string(),
+        outcome: match recovery.outcome {
+            RecoveryOutcome::Finished => OperationOutcome::Finished,
+            RecoveryOutcome::RolledForward => OperationOutcome::RolledForward,
+            RecoveryOutcome::RolledBack => OperationOutcome::RolledBack,
+            RecoveryOutcome::Cleared => OperationOutcome::Cleared,
+        },
+        pallet: recovery.position.pallet,
+        base: recovery.position.base,
+        unheld: recovery.unheld,
+    });
 
     output::emit(&HealReport {
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
         notes: outcome.notes,
+        operation,
     });
 
     Ok(())
@@ -63,10 +93,64 @@ pub(crate) struct HealReport {
     /// this field only ever appears on a fully-cleared run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
+
+    /// The operation this run settled: one interrupted in this bay before it finished, which every
+    /// command that changes the bay or commits staged content refused over until now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<OperationRecovery>,
+}
+
+/// How `heal` settled an interrupted operation.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationOutcome {
+    /// It had already finished; only its record was left.
+    Finished,
+
+    /// It was completed.
+    RolledForward,
+
+    /// It was undone: the bay is back where it started.
+    RolledBack,
+
+    /// It had changed nothing that needed undoing; its record was cleared.
+    Cleared,
+}
+
+/// An interrupted operation `heal` settled.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct OperationRecovery {
+    /// The operation: shift, park, fast-forward, lower, bay creation, import-git, merge or
+    /// cherry-pick.
+    operation: String,
+
+    outcome: OperationOutcome,
+
+    /// The pallet the bay stands on afterwards.
+    pallet: String,
+
+    /// The parcel the bay stands on afterwards (absent for an unborn pallet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+
+    /// Tracked files the working directory does not hold at their recorded content. They read as
+    /// local changes, never staged ones; `restore` brings them back.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unheld: Vec<String>,
 }
 
 impl CommandOutput for HealReport {
     fn render_human(&self) {
+        if let Some(operation) = &self.operation {
+            operation.render_human();
+
+            if !self.was_tainted {
+                return;
+            }
+        }
+
         if !self.was_tainted {
             println!("Nothing to heal — no durability taint is standing.");
             return;
@@ -86,6 +170,29 @@ impl CommandOutput for HealReport {
 
         for note in &self.notes {
             println!("Note: {}", note);
+        }
+    }
+}
+
+impl OperationRecovery {
+    fn render_human(&self) {
+        let at = match &self.base {
+            Some(base) => format!("\"{}\" at {}", self.pallet, base),
+            None => format!("\"{}\" (unborn)", self.pallet),
+        };
+
+        match self.outcome {
+            OperationOutcome::Finished => println!("The interrupted {} had already finished; the bay stands on {}.", self.operation, at),
+            OperationOutcome::RolledForward => println!("Finished the interrupted {}; the bay stands on {}.", self.operation, at),
+            OperationOutcome::RolledBack => println!("Undid the interrupted {}; the bay is back on {}.", self.operation, at),
+            OperationOutcome::Cleared => println!("The interrupted {} had changed nothing to undo; its record is cleared.", self.operation),
+        }
+
+        if !self.unheld.is_empty() {
+            println!("These tracked files do not hold their recorded content and show as local changes (\"forklift restore <path>\" brings one back):");
+            for path in &self.unheld {
+                println!("  {}", path);
+            }
         }
     }
 }

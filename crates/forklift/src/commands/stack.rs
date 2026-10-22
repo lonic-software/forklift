@@ -152,8 +152,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forklift_core::util::{file_utils, pallet_utils, shift_utils};
-    use forklift_core::util::progress_utils::Progress;
+    use forklift_core::util::pallet_utils;
     use crate::commands::{cherry_pick, consolidate, load};
     use crate::test_support::{self, Warehouse};
 
@@ -178,7 +177,7 @@ mod tests {
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         // A conflicted merge, resolved and loaded by hand.
         test_support::block_on(consolidate::handle_command("feature")).unwrap();
@@ -224,7 +223,7 @@ mod tests {
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         test_support::block_on(consolidate::handle_command("feature")).unwrap();
         std::fs::write(warehouse.root.join("a.txt"), b"resolved\n").unwrap();
@@ -264,7 +263,7 @@ mod tests {
 
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         // A conflicted pick, resolved and loaded by hand.
         test_support::block_on(cherry_pick::handle_command(&source, None)).unwrap();

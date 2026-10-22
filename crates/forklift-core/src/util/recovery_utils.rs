@@ -6641,6 +6641,7 @@ mod tests {
             });
             (key.to_string(), inventory)
         }).collect();
+        crate::util::operation_utils::raise_for_fixture();
         inventory_utils::replace_all_inventories(&shards).unwrap();
 
         (root, scope)

@@ -294,6 +294,12 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
             store_access = Some(lock_utils::StoreAccessLock::shared(announce_store_access_wait)?);
         }
 
+        // Before entry-heal: an interrupted operation's staging is `heal`'s to settle, not a
+        // command's to build on.
+        if cli.command.refused_during_interrupted_operation() {
+            forklift_core::util::operation_utils::check_none_standing()?;
+        }
+
         if !cli.command.bypasses_taint_heal() {
             forklift_core::util::heal_utils::heal_if_tainted()?;
         }

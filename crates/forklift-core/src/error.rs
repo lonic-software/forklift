@@ -162,7 +162,10 @@ refusal_codes! {
     /// started but never finished cleanly (a mid-walk crash, or an error return partway through)
     /// is still recorded (`load_guard_utils`): the staged content may be missing whatever that
     /// load never got to. Refuses rather than silently publish an incomplete parcel; the remedy
-    /// is always the same cheap re-load, or abandoning the load with `restore --staged`.
+    /// is always the same cheap re-load, or abandoning the load with `restore --staged`. Also
+    /// every command that changes the bay or commits staged content, while an operation that
+    /// rewrites the whole staging area was interrupted (`operation_utils`); there the remedy is
+    /// `forklift heal`, which finishes or undoes it.
     IncompleteLoad => "incomplete_load",
 
     /// The storage-scope entry-heal (`heal_utils`) found a durability taint it could not resolve

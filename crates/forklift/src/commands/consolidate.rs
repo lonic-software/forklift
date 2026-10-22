@@ -4,10 +4,11 @@ use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::blob::Blob;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
+use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, cherry_pick_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
-    office_utils, pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
+    office_utils, operation_utils, pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
 };
 use forklift_core::util::shift_utils::HeadWrite;
 use forklift_core::util::stack_utils::StackError;
@@ -270,6 +271,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
     // they are correctly not guarded. `stack`/`park` carry the identical check for the identical
     // reason (see `stack_utils::stack_parcel`'s doc comment).
     load_guard_utils::check_no_incomplete_load()?;
+    operation_utils::check_none_standing()?;
 
     let our_tree_hash = object_utils::load_parcel(our_head)?.tree_hash;
     let their_tree_hash = object_utils::load_parcel(their_head)?.tree_hash;
@@ -308,7 +310,15 @@ pub(crate) async fn merge_head_into_current(current: &str,
     keep_aliased_files(&mut actions, &our_tree_hash, &scope)?;
     let ledger = ensure_no_untracked_collisions(&actions, their_label)?;
 
+    // Raised here, before the merge's first change to the bay, so every caller (consolidate,
+    // haul's merge, lift's auto-merge) inherits it: a crash part-way through applying leaves a
+    // half-applied merge staged with no consolidation state yet to say so.
+    raise_merge_marker(OperationKind::Merge, current, our_head, &our_tree_hash, &their_tree_hash)?;
+
     let mut conflict_paths = apply_merge_actions(&ledger, &actions)?;
+
+    #[cfg(test)]
+    tests::AFTER_MERGE_APPLY.with(|seam| seam.take().map(|seam| seam())).transpose()?;
 
     // Record the out-of-scope skeleton BEFORE the consolidation state, and unconditionally
     // — even when it is empty (a full-bay merge, or one that resolved nothing out of scope): the
@@ -337,10 +347,27 @@ pub(crate) async fn merge_head_into_current(current: &str,
 
         Ok(MergeStatus::Merged(hash))
     } else {
+        // The consolidation state owns the bay from here.
+        operation_utils::finish()?;
         conflict_paths.sort();
 
         Ok(MergeStatus::Conflicts(conflict_paths))
     }
+}
+
+/// Raise the marker of a merge or cherry-pick of `their_tree` onto `our_head` (whose tree is
+/// `our_tree`) on `pallet`, the bay's position, before it applies anything. Its completing parcel
+/// is recorded by `stack_utils::stack_parcel`, once it exists.
+pub(crate) fn raise_merge_marker(kind: OperationKind,
+                                 pallet: &str,
+                                 our_head: &str,
+                                 our_tree: &str,
+                                 their_tree: &str) -> Result<(), String> {
+    let source = pallet_utils::BayPosition::new(pallet, Some(our_head.to_string()));
+    let mut operation = Operation::new(kind, source, Some(our_tree.to_string()), pallet_utils::BayPosition::new(pallet, None));
+    operation.their_tree = Some(their_tree.to_string());
+
+    operation_utils::raise(&operation)
 }
 
 /// Stack a merge or cherry-pick that completes inside the command that applied it, on
@@ -355,21 +382,42 @@ pub(crate) async fn stack_completion(description: Option<String>,
                                      our_head: &str,
                                      our_tree: &str,
                                      anchor: file_utils::StatAnchor) -> Result<String, String> {
+    // The merge's or pick's marker comes off once the bay is settled either way; an error before
+    // that leaves it for `forklift heal`.
     let (error, pallet, parcel, tree) = match stack_utils::stack_parcel(description, Some(our_head)).await {
-        Ok((parcel, _)) => return Ok(parcel),
-        Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => return Err(error.into()),
+        Ok((parcel, _)) => {
+            operation_utils::finish()?;
+            return Ok(parcel);
+        }
+        Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => {
+            // Refused before its parcel was recorded (a signing failure, say): the
+            // merge is applied and its consolidation state written, which owns the bay from here
+            // as at conflicts, and `stack` completes it once the cause is fixed. With a parcel
+            // recorded, the marker stays for `forklift heal`.
+            if operation_utils::read()?.map_or(false, |operation| operation.target.base.is_none()) {
+                operation_utils::finish()?;
+            }
+            return Err(error.into());
+        }
         Err(StackError::HeadWrite { error, pallet, parcel, tree }) => (error, pallet, parcel, tree),
     };
 
     match shift_utils::settle_head_write(&pallet, &parcel, error, &tree, Some(our_tree), anchor)? {
-        HeadWrite::Stands => Ok(parcel),
-        HeadWrite::Kept(error) => Err(error),
+        HeadWrite::Stands => {
+            operation_utils::finish()?;
+            Ok(parcel)
+        }
+        HeadWrite::Kept(error) => {
+            operation_utils::finish()?;
+            Err(error)
+        }
         HeadWrite::RolledBack(error) => {
             // The state comes off before the skeleton, as `stack` orders them, so no window shows
             // a consolidation without its skeleton.
             merge_utils::clear_consolidation_state()?;
             merge_utils::OutOfScopeSkeleton::clear()?;
             cherry_pick_utils::clear_state()?;
+            operation_utils::finish()?;
 
             Err(forklift_core::error::append_to_message(
                 error,
@@ -403,13 +451,24 @@ fn fast_forward(current: &str,
         &shift_utils::collect_collisions(&ops, &removed_dirs)?,
     )?;
 
+    // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
+    let mut operation = Operation::new(
+        OperationKind::FastForward,
+        pallet_utils::BayPosition::new(current, Some(our_head.to_string())),
+        Some(our_tree_hash.to_string()),
+        pallet_utils::BayPosition::new(current, Some(their_head.to_string())),
+    );
+    operation.target_tree = Some(their_tree_hash.to_string());
+    operation.expected = Some(our_head.to_string());
+    operation_utils::raise(&operation)?;
+
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
     let shards = shift_utils::build_inventories_for_tree(their_tree_hash, shift_utils::TreeProvenance::Written(anchor))?.shards;
     inventory_utils::replace_all_inventories(&shards)?;
 
     #[cfg(test)]
-    tests::BEFORE_FAST_FORWARD_WRITE.with(|seam| seam.take().map(|seam| seam()));
+    tests::BEFORE_FAST_FORWARD_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
 
     // A compare-and-set against the head this consolidation started from; the bay's work above
     // is undone if the pallet did not move (another bay moved it first, or the write failed).
@@ -735,15 +794,20 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 mod tests {
     use super::*;
     use crate::test_support::{self, Warehouse};
-    use forklift_core::util::progress_utils::Progress;
 
     thread_local! {
-        /// Runs once just before `fast_forward` writes the pallet's head.
-        pub(super) static BEFORE_FAST_FORWARD_WRITE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        /// Runs once just before `fast_forward` writes the pallet's head: an error stands for a
+        /// crash there.
+        pub(super) static BEFORE_FAST_FORWARD_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
             std::cell::Cell::new(None);
 
         /// Runs once just before a clean merge's parcel is stacked.
         pub(super) static BEFORE_MERGE_STACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            std::cell::Cell::new(None);
+
+        /// Runs once after a merge applied its output, before its consolidation state is written:
+        /// an error stands for a crash there.
+        pub(crate) static AFTER_MERGE_APPLY: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
             std::cell::Cell::new(None);
     }
 
@@ -791,13 +855,14 @@ mod tests {
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         // Another bay stacks on "main" while this consolidation is between its tree write and
         // its ref write.
         let moved_to = elsewhere.clone();
         BEFORE_FAST_FORWARD_WRITE.with(|seam| seam.set(Some(Box::new(move || {
             pallet_utils::update_pallet_head("main", Some(&our_head), &moved_to, &pallet_utils::RefPreconditions::NONE).unwrap();
+            Ok(())
         }))));
 
         let error = test_support::block_on(handle_command("feature"))
@@ -833,7 +898,7 @@ mod tests {
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         // Another bay stacks on "main" after this merge was applied, before its parcel is stacked.
         let moved_to = elsewhere.clone();
@@ -860,5 +925,258 @@ mod tests {
 
         assert!(merge_utils::read_consolidation_state().unwrap().is_none(), "no consolidation may stay in progress");
         assert!(merge_utils::OutOfScopeSkeleton::read_required().is_err(), "no skeleton may stay behind");
+    }
+
+    use forklift_core::util::operation_utils::RecoveryOutcome;
+
+    /// The two heads of a clean three-way merge: "main" (checked out) and "feature". Returns
+    /// (our_head, our_tree, their_head).
+    fn a_clean_merge_on_main() -> (String, String, String) {
+        test_support::configure_operator();
+
+        let base = test_support::store_parcel(&test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"base\n")]), &[]);
+        let our_tree = test_support::store_files(&[("a.txt", b"ours\n"), ("b.txt", b"base\n")]);
+        let our_head = test_support::store_parcel(&our_tree, &[&base]);
+        let their_head = test_support::store_parcel(
+            &test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"theirs\n"), ("new.txt", b"new\n")]),
+            &[&base],
+        );
+
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        test_support::check_out(&our_tree);
+
+        (our_head, our_tree, their_head)
+    }
+
+    fn assert_back_at_ours(root: &std::path::Path, our_head: &str, our_tree: &str) {
+        assert!(test_support::file_holds(root, "a.txt", b"ours\n")
+                && test_support::file_holds(root, "b.txt", b"base\n")
+                && !root.join("new.txt").exists(),
+            "the working tree must be back at the head the merge started from");
+
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(our_tree))).unwrap();
+        let unstaged = test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap();
+        assert!(staged.is_empty() && unstaged.is_empty(),
+            "the inventory must be back at our tree: staged {:?}, unstaged {:?}", staged.len(), unstaged.len());
+
+        assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("main", Some(our_head.to_string())));
+        assert!(merge_utils::read_consolidation_state().unwrap().is_none(), "no consolidation may stay in progress");
+        assert!(operation_utils::read().unwrap().is_none(), "recovery clears the marker");
+    }
+
+    fn assert_stack_refused() {
+        let error = test_support::block_on(crate::commands::stack::handle_command(Some("after crash".to_string())))
+            .expect_err("a stack over an interrupted merge must be refused");
+        assert!(error.contains("forklift heal"), "{}", error);
+    }
+
+    #[test]
+    fn a_merge_interrupted_part_way_through_applying_cannot_be_stacked_and_heal_rolls_it_back() {
+        let warehouse = Warehouse::with_working_tree("consolidate-merge-crash-apply");
+        let (our_head, our_tree, _) = a_clean_merge_on_main();
+
+        AFTER_MERGE_APPLY.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(handle_command("feature")).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        // The merge's output is applied and staged, with no consolidation state to say so.
+        assert!(test_support::file_holds(&warehouse.root, "new.txt", b"new\n"));
+        assert_stack_refused();
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(our_head.as_str()));
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
+        assert_back_at_ours(&warehouse.root, &our_head, &our_tree);
+    }
+
+    #[test]
+    fn rolling_back_an_interrupted_merge_keeps_an_edit_made_since_the_crash() {
+        let warehouse = Warehouse::with_working_tree("consolidate-merge-crash-edit");
+        let (our_head, our_tree, _) = a_clean_merge_on_main();
+
+        AFTER_MERGE_APPLY.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(handle_command("feature")).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        // The merge wrote their b.txt and added new.txt; the user then wrote over both, before
+        // running heal.
+        std::fs::write(warehouse.root.join("b.txt"), b"notes\n").unwrap();
+        std::fs::write(warehouse.root.join("new.txt"), b"mine\n").unwrap();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!(recovery.outcome, RecoveryOutcome::RolledBack);
+        assert_eq!(recovery.unheld, vec!["b.txt".to_string()], "the edit is reported, not overwritten");
+        assert!(test_support::file_holds(&warehouse.root, "b.txt", b"notes\n"));
+        assert!(test_support::file_holds(&warehouse.root, "new.txt", b"mine\n"), "an edited addition is not removed");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"ours\n"), "a file the merge left as it wrote it is put back");
+        assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("main", Some(our_head)));
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
+        assert!(staged.is_empty(), "staging is at our tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_whose_rollback_fails_too_cannot_be_stacked_and_heal_finishes_the_rollback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let warehouse = Warehouse::with_working_tree("consolidate-merge-rollback-fails");
+        let (our_head, our_tree, _) = a_clean_merge_on_main();
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
+
+        // Another bay stacks first, so the head write fails; and the working directory refuses
+        // the rollback's writes, so the rollback fails too.
+        let (moved_to, root) = (elsewhere.clone(), warehouse.root.clone());
+        let from = our_head.clone();
+        BEFORE_MERGE_STACK.with(|seam| seam.set(Some(Box::new(move || {
+            pallet_utils::update_pallet_head("main", Some(&from), &moved_to, &pallet_utils::RefPreconditions::NONE).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }))));
+
+        let result = test_support::block_on(handle_command("feature"));
+        std::fs::set_permissions(&warehouse.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.expect_err("a merge whose rollback failed must not report success");
+        operation_utils::forget_raised_for_tests();
+
+        assert!(operation_utils::read().unwrap().expect("the marker stands").rolling_back,
+            "the marker records that the rollback began");
+        assert_stack_refused();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!(recovery.outcome, RecoveryOutcome::RolledBack);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere), "the other bay's parcel stands");
+        assert_back_at_ours(&warehouse.root, &our_head, &our_tree);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_whose_stack_fails_before_recording_its_parcel_leaves_it_to_its_consolidation_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _warehouse = Warehouse::with_working_tree("consolidate-merge-stack-fails");
+        a_clean_merge_on_main();
+
+        // Every object directory refuses writes, so the stack fails before its parcel exists.
+        fn set_dirs(dir: &std::path::Path, mode: u32) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { set_dirs(&path, mode); }
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let objects = std::path::PathBuf::from(file_utils::get_path_objects_root());
+        let locked = objects.clone();
+        BEFORE_MERGE_STACK.with(|seam| seam.set(Some(Box::new(move || set_dirs(&locked, 0o555)))));
+
+        let result = test_support::block_on(handle_command("feature"));
+        set_dirs(&objects, 0o755);
+        result.expect_err("a merge whose stack failed must not report success");
+        operation_utils::forget_raised_for_tests();
+
+        // Its consolidation state owns the bay now, as at conflicts: `stack` completes it.
+        assert!(operation_utils::read().unwrap().is_none(), "no interrupted operation stands");
+        assert!(merge_utils::read_consolidation_state().unwrap().is_some());
+        let (parcel, _) = test_support::block_on(stack_utils::stack_parcel(None, None)).expect("stack completes the merge");
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(parcel));
+    }
+
+    /// A fast-forward of "main" (checked out) to "feature", crashed just before its head write;
+    /// `move_main` runs first, standing for another bay. Returns (our_head, our_tree, their_head).
+    fn crash_a_fast_forward(move_main: impl FnOnce(&str) + 'static) -> (String, String, String) {
+        let our_tree = test_support::store_tree("file.txt", b"ours\n");
+        let our_head = test_support::store_parcel(&our_tree, &[]);
+        let their_head = test_support::store_parcel(&test_support::store_tree("file.txt", b"theirs\n"), &[&our_head]);
+
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        test_support::check_out(&our_tree);
+
+        let from = our_head.clone();
+        BEFORE_FAST_FORWARD_WRITE.with(|seam| seam.set(Some(Box::new(move || {
+            move_main(&from);
+            Err("crashed".to_string())
+        }))));
+        assert_eq!(test_support::block_on(handle_command("feature")).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        (our_head, our_tree, their_head)
+    }
+
+    #[test]
+    fn an_interrupted_fast_forward_whose_pallet_did_not_move_is_rolled_forward() {
+        let warehouse = Warehouse::with_working_tree("consolidate-ff-crash-forward");
+        let (_, _, their_head) = crash_a_fast_forward(|_| {});
+        let their_tree = object_utils::load_parcel(&their_head).unwrap().tree_hash;
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::FastForward, RecoveryOutcome::RolledForward));
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(their_head.as_str()));
+        assert_eq!(recovery.position, pallet_utils::BayPosition::new("main", Some(their_head)));
+        assert!(test_support::file_holds(&warehouse.root, "file.txt", b"theirs\n"));
+
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&their_tree))).unwrap();
+        assert!(staged.is_empty(), "staging is at their tree");
+    }
+
+    #[test]
+    fn an_interrupted_fast_forward_whose_pallet_moved_elsewhere_is_rolled_back_to_its_start() {
+        let warehouse = Warehouse::with_working_tree("consolidate-ff-crash-back");
+        let elsewhere = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let record = elsewhere.clone();
+        let (our_head, our_tree, _) = crash_a_fast_forward(move |from| {
+            let moved_to = test_support::store_parcel(&test_support::store_tree("file.txt", b"elsewhere\n"), &[from]);
+            pallet_utils::update_pallet_head("main", Some(from), &moved_to, &pallet_utils::RefPreconditions::NONE).unwrap();
+            *record.borrow_mut() = moved_to;
+        });
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!(recovery.outcome, RecoveryOutcome::RolledBack);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere.borrow().clone()));
+        assert!(test_support::file_holds(&warehouse.root, "file.txt", b"ours\n"));
+        assert_eq!(recovery.position, pallet_utils::BayPosition::new("main", Some(our_head)));
+
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
+        let unstaged = test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap();
+        assert!(staged.is_empty() && unstaged.is_empty());
+    }
+
+    #[test]
+    fn an_operation_that_landed_and_was_built_on_is_finished_without_touching_a_file() {
+        for kind in [OperationKind::Merge, OperationKind::FastForward] {
+            let warehouse = Warehouse::with_working_tree("consolidate-landed-built-on");
+            let (our_head, our_tree, _) = a_clean_merge_on_main();
+
+            // It landed (its parcel is the head and the bay's position), and was killed before its
+            // marker came off; then another bay stacked on top.
+            let landed = test_support::store_parcel(&our_tree, &[&our_head]);
+            let mut operation = Operation::new(
+                kind,
+                pallet_utils::BayPosition::new("main", Some(our_head.clone())),
+                Some(our_tree.clone()),
+                pallet_utils::BayPosition::new("main", Some(landed.clone())),
+            );
+            operation.target_tree = Some(our_tree.clone());
+            operation.expected = Some(our_head.clone());
+            operation_utils::raise(&operation).unwrap();
+            pallet_utils::update_pallet_head("main", Some(&our_head), &landed, &pallet_utils::RefPreconditions::NONE).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(landed.clone()))).unwrap();
+            operation_utils::forget_raised_for_tests();
+
+            let later = test_support::store_parcel(&our_tree, &[&landed]);
+            pallet_utils::update_pallet_head("main", Some(&landed), &later, &pallet_utils::RefPreconditions::NONE).unwrap();
+
+            // Work the bay holds since: recovery must leave it alone.
+            std::fs::write(warehouse.root.join("a.txt"), b"since\n").unwrap();
+
+            let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+            assert_eq!(recovery.outcome, RecoveryOutcome::Finished, "{:?}", kind);
+            assert_eq!(recovery.position, pallet_utils::BayPosition::new("main", Some(landed)));
+            assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(later));
+            assert!(test_support::file_holds(&warehouse.root, "a.txt", b"since\n"), "{:?}", kind);
+
+            drop(warehouse);
+        }
     }
 }

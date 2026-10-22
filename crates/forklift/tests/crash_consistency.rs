@@ -614,6 +614,12 @@ fn parked_count(warehouse: &Path) -> usize {
     forklift_core::util::park_utils::read_parked().unwrap().len()
 }
 
+/// Whether an interrupted operation's marker stands in the warehouse's main bay.
+fn operation_standing(warehouse: &Path) -> bool {
+    let _scope = forklift_core::globals::StorageRootScope::enter(warehouse);
+    forklift_core::util::operation_utils::read().unwrap().is_some()
+}
+
 /// Run one spread of kills against `park`, asserting store consistency after every one — the
 /// `park` counterpart of [`run_load_kill_spread`]. Whether a given iteration's `park` actually
 /// committed (staged the tree/parcel object batch, wrote the signature, and appended to the
@@ -628,7 +634,8 @@ fn parked_count(warehouse: &Path) -> usize {
 /// did not commit, `park`'s reset-to-head step (the only thing that touches the working
 /// directory's tracked file *content*) never ran — it only ever runs after the parked-list write
 /// already succeeded — so the working directory still holds this iteration's rewritten content
-/// untouched, and the next iteration's rewrite is safe to proceed with no extra healing step.
+/// untouched. A kill inside park's operation bracket also leaves its marker, so `heal` settles
+/// it before the next iteration (see the loop body).
 ///
 /// Returns how many iterations produced a durably committed park.
 fn run_park_kill_spread(
@@ -663,6 +670,17 @@ fn run_park_kill_spread(
         let _ = child.wait();
 
         area.clear_stale_lock();
+
+        // A kill inside park's bracket leaves its operation marker, and every later park refuses
+        // until heal settles it: back to where it was if the parked list does not name the parcel
+        // yet, forward to the head if it does. Rolling forward finishes the reset, so the pop below
+        // runs over a clean bay either way.
+        if operation_standing(warehouse) {
+            let heal = area.run(&["heal"]);
+            assert!(heal.status.success(), "park {tag} kill #{i}: heal must settle the interrupted park, stderr: {}",
+                String::from_utf8_lossy(&heal.stderr));
+            assert!(!operation_standing(warehouse), "park {tag} kill #{i}: heal must clear the marker");
+        }
 
         let after = parked_count(warehouse);
 

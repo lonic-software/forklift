@@ -8,9 +8,10 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
-    bundle_utils, config_utils, file_utils, lock_utils, object_utils, pack_utils, pallet_utils,
-    remote_utils, scope_utils, shift_utils, trust_utils, warehouse_utils,
+    bundle_utils, config_utils, file_utils, lock_utils, object_utils, operation_utils, pack_utils,
+    pallet_utils, remote_utils, scope_utils, shift_utils, trust_utils, warehouse_utils,
 };
+use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::output::{self, CommandOutput};
 
 /// Handle the franchise command (git's "clone"): open a local franchise of a remote
@@ -302,6 +303,11 @@ async fn franchise_into_prepared_target(
         config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, url, ConfigScope::Warehouse)?;
     }
 
+    // Raised before the pallet's head is written, and finished once the tree is materialized: a
+    // franchise interrupted between the two refuses every command until the directory is removed.
+    let position = pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone()));
+    operation_utils::raise(&Operation::new(OperationKind::Franchise, position.clone(), None, position))?;
+
     // A franchise fills a fresh warehouse, so the pallet is unborn here.
     pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &pallet_utils::RefPreconditions::NONE)?;
     pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
@@ -326,6 +332,7 @@ async fn franchise_into_prepared_target(
         tree failed. A retry re-fetches from scratch rather than resuming — if the same path \
         keeps failing here, franchise --only to route around it instead of retrying as-is)",
     ))?;
+    operation_utils::finish()?;
 
     report.pallet = pallet_name;
     report.head = Some(remote_head.clone());

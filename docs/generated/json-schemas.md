@@ -1542,6 +1542,69 @@ A command not listed here either reports only the generic human-message shape `{
 
 ```json
 {
+  "$defs": {
+    "OperationOutcome": {
+      "description": "How `heal` settled an interrupted operation.",
+      "oneOf": [
+        {
+          "const": "finished",
+          "description": "It had already finished; only its record was left.",
+          "type": "string"
+        },
+        {
+          "const": "rolled_forward",
+          "description": "It was completed.",
+          "type": "string"
+        },
+        {
+          "const": "rolled_back",
+          "description": "It was undone: the bay is back where it started.",
+          "type": "string"
+        },
+        {
+          "const": "cleared",
+          "description": "It had changed nothing that needed undoing; its record was cleared.",
+          "type": "string"
+        }
+      ]
+    },
+    "OperationRecovery": {
+      "description": "An interrupted operation `heal` settled.",
+      "properties": {
+        "base": {
+          "description": "The parcel the bay stands on afterwards (absent for an unborn pallet).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "description": "The operation: shift, park, fast-forward, lower, bay creation, import-git, merge or\ncherry-pick.",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/OperationOutcome"
+        },
+        "pallet": {
+          "description": "The pallet the bay stands on afterwards.",
+          "type": "string"
+        },
+        "unheld": {
+          "description": "Tracked files the working directory does not hold at their recorded content. They read as\nlocal changes, never staged ones; `restore` brings them back.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "operation",
+        "outcome",
+        "pallet"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
@@ -1551,6 +1614,17 @@ A command not listed here either reports only the generic human-message shape `{
         "type": "string"
       },
       "type": "array"
+    },
+    "operation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OperationRecovery"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The operation this run settled: one interrupted in this bay before it finished, which every\ncommand that changes the bay or commits staged content refused over until now."
     },
     "resolved": {
       "description": "Recorded paths (or hashes) resolved without a rewrite: proven absent and unreferenced by\nthe closure walk, or a vanished inventory shard (a staging concern, never an object-trust\none — see `notes`).",

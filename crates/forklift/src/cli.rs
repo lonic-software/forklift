@@ -353,19 +353,27 @@ pub enum Command {
         action: Option<HaulAction>,
     },
 
-    /// Resolve a standing durability taint automated recovery could not clear on its own
+    /// Resolve a standing durability taint, or finish or undo an interrupted operation
     #[command(
         long_about = "Resolve a standing durability taint (\"durability_taint\" refusals, exit \
                       21): a write's final path(s) were left visible after a failed durability \
                       sync, and the automatic entry-heal every command runs could not restage \
                       every one of them on its own. This verb runs the deeper recovery pass — \
                       restage whatever it can, then walk every durable ref source (pallet heads, \
-                      parked work, tags, and staged inventory shards) to tell a vanished-but-\
+                      parked work, and staged inventory shards) to tell a vanished-but-\
                       never-referenced object (safe to drop) from one something still points at \
                       (reported, with remedies). A torn taint (its own record was cut short by a \
-                      crash) cannot be resolved this way at all and needs a heavyweight recovery \
-                      instead. Exits 0 once every recorded path is resolved; exits 21, with the \
-                      taint left standing on exactly what remains, otherwise."
+                      crash) is resolved by rescanning the whole store, which takes longer. \
+                      Exits 0 once every recorded path is resolved; exits 21, with the taint left \
+                      standing on exactly what remains, otherwise.\n\n\
+                      It then finishes or undoes an operation that rewrites the whole staging \
+                      area (shift, park, a merge, cherry-pick or fast-forward, lower, import-git, \
+                      bay creation) and was interrupted (\"incomplete_load\" refusals naming it, \
+                      exit 20): rolled forward where the bay's state shows it got far enough, \
+                      rolled back otherwise. Either way it rewrites only files that still hold \
+                      one side's content or are missing; any other file (an edit made since, or \
+                      a merge's combination of both sides) is left and reported as a local \
+                      change, never staged."
     )]
     Heal,
 
@@ -1752,6 +1760,40 @@ impl Command {
     /// * `false` - The command refuses normally while a taint stands.
     pub fn bypasses_taint_heal(&self) -> bool {
         matches!(self, Command::Heal | Command::Audit { .. })
+    }
+
+    /// Whether the command refuses while an operation interrupted before it finished is recorded
+    /// in the bay (see `operation_utils`): every command that changes the bay's files, staging or
+    /// position, or commits staged content. The staging such an operation leaves may be
+    /// incomplete, and committing it could record the removal of every tracked file. `heal` is
+    /// the way out; commands that touch only refs of other pallets, the shared store or
+    /// metadata stay usable.
+    ///
+    /// # Returns
+    /// * `true`  - The command refuses while such an operation is recorded.
+    /// * `false` - The command runs as usual.
+    pub fn refused_during_interrupted_operation(&self) -> bool {
+        matches!(
+            self,
+            Command::CherryPick { .. }
+                | Command::Consolidate { .. }
+                | Command::Expand { .. }
+                | Command::ImportGit { .. }
+                | Command::Lift
+                | Command::Load { .. }
+                | Command::Lower { .. }
+                | Command::Haul { .. }
+                | Command::Narrow { .. }
+                | Command::Palletize { .. }
+                | Command::Park { .. }
+                | Command::Remove { .. }
+                | Command::Restore { .. }
+                | Command::ScopePrune { .. }
+                | Command::Shift { .. }
+                | Command::Stack { .. }
+                | Command::Undo { .. }
+                | Command::Unload { .. }
+        )
     }
 
     /// Check whether the command mutates the warehouse (inventory, refs, objects) and

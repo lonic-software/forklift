@@ -724,6 +724,35 @@ fn lift_franchise_lower_round_trip() {
     assert!(stdout(&lowered_again).contains("Already up to date"), "{}", stdout(&lowered_again));
 }
 
+// A lower refused over an untracked file where the remote's head adds one changes nothing, and leaves
+// no interrupted operation behind. Revert: raise lower's operation marker before its collision
+// check → every later command refuses until heal, and heal completes a lower that never ran.
+#[test]
+fn a_lower_refused_over_an_untracked_file_leaves_nothing_standing() {
+    let area = TestArea::new("lower-collision");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/readme.txt", "hello\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+
+    area.write_file("a/added.txt", "theirs\n");
+    assert_success(&area.forklift("a", &["load", "added.txt"]));
+    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    area.write_file("b/added.txt", "mine\n");
+    let lowered = area.forklift("b", &["lower"]);
+    assert!(!lowered.status.success(), "the untracked file must refuse the lower");
+    assert_eq!(area.read_file("b/added.txt"), "mine\n");
+
+    let stacked = area.forklift("b", &["stack", "nothing"]);
+    assert!(stderr(&stacked).contains("Nothing to stack"), "no operation may stand: {}", stderr(&stacked));
+}
+
 // A bay whose pallet another bay already lowered to the remote's head is behind, not up to date.
 // Revert: lower's "up to date" check on the pallet's ref ahead of its currency check → it reports
 // up to date and the bay's files stay behind.

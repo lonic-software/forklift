@@ -2412,6 +2412,52 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
 }
 
+/// An `import-git` that records the bay's position and then cannot build its inventory (a file it
+/// cannot read) leaves its operation standing: every command that changes the bay or commits
+/// staged content refuses until `heal`, which builds the inventory once the file can be read.
+#[cfg(unix)]
+#[test]
+fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("import-git-unreadable");
+    let root = warehouse.root.clone();
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file("readable.txt", "hello\n");
+    warehouse.write_file("locked.txt", "locked\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let import = warehouse.run(&["import-git", "."]);
+    std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!import.status.success(), "the inventory build must fail on the unreadable file");
+
+    for args in [&["--json", "stack", "after import"][..], &["--json", "load", "."][..]] {
+        let refused = json(&warehouse.run(args));
+        assert_eq!(refused["error"]["code"], "incomplete_load", "{:?}: {}", args, refused);
+        assert_eq!(refused["error"]["next_step"], "forklift heal", "{:?}: {}", args, refused);
+        assert!(refused["error"]["message"].as_str().unwrap().contains("import-git"), "{}", refused);
+    }
+
+    let healed = json(&warehouse.run(&["--json", "heal"]));
+    assert_eq!(healed["data"]["operation"]["operation"], "import-git", "{}", healed);
+    assert_eq!(healed["data"]["operation"]["outcome"], "rolled_forward", "{}", healed);
+    assert_eq!(healed["data"]["operation"]["pallet"], "main", "{}", healed);
+
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(status["data"]["staged_count"], 0, "the inventory is built at the imported tree: {}", status);
+    // The import stopped before it added the ignore rule for `.git`, and heal only finishes the
+    // inventory, so the folder still reads as untracked.
+    assert_eq!(unstaged_changes(&warehouse), vec![("untracked".to_string(), ".git/".to_string())]);
+    let stack = warehouse.run(&["stack", "after heal"]);
+    assert!(stderr(&stack).contains("Nothing to stack"), "the bay is no longer refused: {}", stderr(&stack));
+}
+
 /// Forklift has no checkout conversion, so a file git rewrote on checkout (`eol=crlf`, `ident`,
 /// `core.autocrlf=true`, a smudge filter) does not hold the bytes `import-git` imports for it. It
 /// reads as an unstaged change from the first stocktake, and still does once its stat no longer
@@ -8719,6 +8765,41 @@ fn config_unset_removes_a_value() {
     assert_success(&json_unset);
     assert_eq!(json(&json_unset)["ok"], true);
     assert_eq!(json(&json_unset)["command"], "config");
+}
+
+// A clean merge whose parcel cannot be signed stops at its consolidation state, as at conflicts:
+// nothing reads it as an interrupted operation, and `stack` completes it once signing works.
+// Revert: record the completing parcel before signing → the stack is refused until heal, and heal
+// rolls the merge back.
+#[test]
+fn a_merge_that_cannot_be_signed_is_left_for_stack_to_complete() {
+    let warehouse = TestWarehouse::new("merge-sign-fails");
+    warehouse.write_file("a.txt", "one\n");
+    warehouse.write_file("b.txt", "two\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    let pass = [("FORKLIFT_KEY_PASSPHRASE", "correct horse")];
+    assert_success(&warehouse.run_with_env(&["office", "enroll", "--passphrase"], &pass));
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run_with_env(&["stack", "base"], &pass));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("b.txt", "theirs\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run_with_env(&["stack", "theirs"], &pass));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("a.txt", "ours\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run_with_env(&["stack", "ours"], &pass));
+
+    let wrong = warehouse.run_with_env(&["consolidate", "feature"], &[("FORKLIFT_KEY_PASSPHRASE", "wrong")]);
+    assert!(!wrong.status.success(), "a merge that cannot be signed must not land");
+    assert!(stderr(&wrong).contains("passphrase is incorrect"), "{}", stderr(&wrong));
+
+    let stacked = warehouse.run_with_env(&["stack", "--json"], &pass);
+    assert_success(&stacked);
+    assert_eq!((read(&warehouse, "a.txt"), read(&warehouse, "b.txt")), ("ours\n".to_string(), "theirs\n".to_string()));
+    assert!(changes(&warehouse, "unstaged").is_empty() && changes(&warehouse, "staged").is_empty());
 }
 
 #[test]
