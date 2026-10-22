@@ -1509,7 +1509,19 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_eq!(conflict["ours"]["value"], format!("merged as {} at head {}", merge_parcel, a_head));
     assert_eq!(conflict["theirs"]["value"], format!("open at head {}", other_head));
 
-    // Keeping ours records the merge at the head it merged, over B's move.
+    // Keeping ours records the merge at the head it merged, over B's move — once the remote's
+    // main holds the merge. Until then the replay holds the record back, and a second lower,
+    // after A's main is lifted, replays it.
+    let held = area.forklift("a", &["lower", "--keep", &format!("haul:{}/state=ours", id)]);
+    assert!(!held.status.success(), "{}", stdout(&held));
+    assert!(stderr(&held).contains("records a merge whose parcel the remote's target does not hold yet"), "{}", stderr(&held));
+    assert!(stderr(&held).contains("run \"forklift lower\" again"), "{}", stderr(&held));
+    assert!(stderr(&held).contains(&format!("\"forklift lower --keep @haul:{}=theirs\"", id)), "{}", stderr(&held));
+
+    let lifted = area.forklift("a", &["lift"]);
+    assert!(!lifted.status.success(), "@haul is still diverged: {}", stdout(&lifted));
+    assert_eq!(remote_pallet_head(&server, "main").as_deref(), Some(pallet_head(&area, "a", "main").as_str()));
+
     assert_success(&area.forklift("a", &["lower", "--keep", &format!("haul:{}/state=ours", id)]));
     let merged = show("a");
     assert_eq!((merged["status"].as_str(), merged["head"].as_str()), (Some("merged"), Some(a_head.as_str())));
@@ -1518,6 +1530,197 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_eq!(show("b")["status"], "merged");
 
     assert!(stdout(&area.forklift("b", &["audit", "@haul"])).contains("verified"));
+}
+
+/// The remote's head of a pallet (`main`, `@haul`), from its handshake.
+fn remote_pallet_head(server: &Server, pallet: &str) -> Option<String> {
+    let (_, info) = http_get(&server.url, "/v1/warehouse");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+
+    info["pallets"][pallet].as_str().map(str::to_string)
+}
+
+/// Open a haul from `feat` into `main` in a warehouse under the area, returning its id.
+fn open_haul(area: &TestArea, dir: &str, title: &str) -> String {
+    let opened = area.forklift(dir, &["--json", "haul", "open", "--target", "main", "--source", "feat", "--title", title]);
+    assert_success(&opened);
+
+    serde_json::from_str::<serde_json::Value>(&stdout(&opened)).unwrap()["data"]["id"].as_str().unwrap().to_string()
+}
+
+/// Stack `content` at `path` on the current pallet of a warehouse under the area.
+fn stack_file(area: &TestArea, dir: &str, path: &str, content: &str) {
+    area.write_file(&format!("{}/{}", dir, path), content);
+    assert_success(&area.forklift(dir, &["load", "."]));
+    assert_success(&area.forklift(dir, &["stack", path]));
+}
+
+/// A warehouse "a" on `server` with an enrolled office, `main` and `feat` lifted, standing on main.
+fn haul_warehouse(area: &TestArea, server: &Server) {
+    prepare_warehouse(area, "a", &server.url);
+    stack_file(area, "a", "base.txt", "base\n");
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift("a", &["palletize", "feat"]));
+    stack_file(area, "a", "feat.txt", "x\n");
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("a", &["shift", "main"]));
+}
+
+/// A merge record lifts with its parcel: one lift carries the target and @haul; a record whose
+/// parcel is on no target here (its merge undone) goes too; and @haul lifts with nothing stacked.
+#[test]
+fn a_haul_merge_lifts_with_its_target() {
+    let area = TestArea::new("haul-lift-order");
+    let server = Server::start(&area, None);
+    haul_warehouse(&area, &server);
+    let local_haul = || area.read_file("a/.forklift/meta/haul").trim().to_string();
+
+    let first = open_haul(&area, "a", "First");
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("a", &["haul", "merge", &first]));
+
+    let lifted = area.forklift("a", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @haul pallet"), "{}", stdout(&lifted));
+    assert_eq!(remote_pallet_head(&server, "main"), Some(pallet_head(&area, "a", "main")));
+    assert_eq!(remote_pallet_head(&server, "@haul"), Some(local_haul()));
+
+    // Undone, the merge parcel is on no target here: waiting would bring nothing, so it lifts.
+    // A clean haul merge is not journaled, so this one conflicts and a stack completes it.
+    assert_success(&area.forklift("a", &["shift", "feat"]));
+    stack_file(&area, "a", "base.txt", "feat\n");
+    assert_success(&area.forklift("a", &["shift", "main"]));
+    let second = open_haul(&area, "a", "Second");
+    stack_file(&area, "a", "base.txt", "main\n");
+    let main = pallet_head(&area, "a", "main");
+    assert_success(&area.forklift("a", &["haul", "merge", &second]));
+    stack_file(&area, "a", "base.txt", "resolved\n");
+    assert_success(&area.forklift("a", &["haul", "merge", &second]));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&stdout(&area.forklift("a", &["--json", "haul", "show", &second])))
+        .unwrap()["data"]["status"], "merged");
+    assert_success(&area.forklift("a", &["undo"]));
+    assert_eq!(pallet_head(&area, "a", "main"), main, "the undo took main back");
+
+    let lifted = area.forklift("a", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @haul pallet"), "{}", stdout(&lifted));
+    assert_eq!(remote_pallet_head(&server, "@haul"), Some(local_haul()));
+
+    // With nothing stacked on the working pallet, @haul still lifts. No command stands a bay on a
+    // pallet with no head once the warehouse has one, so the position is written by hand.
+    open_haul(&area, "a", "Third");
+    let before = remote_pallet_head(&server, "@haul");
+    let position = area.read_file("a/.forklift/position");
+    let header = position.lines().next().unwrap();
+    std::fs::write(area.path("a/.forklift/position"), format!("{}\nfresh\n\n", header)).unwrap();
+
+    let unstacked = area.forklift("a", &["lift"]);
+    assert!(!unstacked.status.success());
+    assert!(stderr(&unstacked).contains("has nothing stacked yet"), "{}", stderr(&unstacked));
+    assert!(!stderr(&unstacked).contains("@haul"), "{}", stderr(&unstacked));
+    assert_eq!(remote_pallet_head(&server, "@haul"), Some(local_haul()));
+    assert_ne!(remote_pallet_head(&server, "@haul"), before, "the new haul went");
+}
+
+/// A merge record whose parcel the remote's target does not hold waits: when the target's own
+/// lift fails, and when another operator moved the remote's target to a head not held here. The
+/// rest still lifts, and the record goes once the target does.
+#[test]
+fn a_haul_merge_waits_while_the_remote_target_lacks_its_parcel() {
+    let area = TestArea::new("haul-held");
+    let server = Server::start(&area, None);
+    haul_warehouse(&area, &server);
+
+    let first = open_haul(&area, "a", "First");
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    let remote_haul = remote_pallet_head(&server, "@haul");
+
+    // A merges and shifts away; B moves the remote's main; A's lift holds the record.
+    assert_success(&area.forklift("a", &["haul", "merge", &first]));
+    assert_success(&area.forklift("a", &["shift", "feat"]));
+    stack_file(&area, "b", "b.txt", "b\n");
+    assert_success(&area.forklift("b", &["lift"]));
+
+    let held = area.forklift("a", &["lift"]);
+    assert!(!held.status.success(), "{}", stdout(&held));
+    let why = stderr(&held);
+    assert!(why.contains("@haul was not lifted"), "{}", why);
+    assert!(why.contains(&format!("haul {} merged as", &first[..12])) && why.contains("into \"main\""), "{}", why);
+    assert!(why.contains("an operator who may write the target lifts it"), "{}", why);
+    assert_eq!(remote_pallet_head(&server, "@haul"), remote_haul, "the remote's @haul did not move");
+
+    // On main, a lower fetches B's head (and refuses the divergence); the lift then merges it,
+    // lands main, and the record goes with it.
+    assert_success(&area.forklift("a", &["shift", "main"]));
+    let _ = area.forklift("a", &["lower"]);
+    let lifted = area.forklift("a", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @haul pallet"), "{}", stdout(&lifted));
+    assert_eq!(remote_pallet_head(&server, "@haul"), Some(area.read_file("a/.forklift/meta/haul").trim().to_string()));
+
+    // The target's own lift fails on an overlap: the record is held, the rest of the meta
+    // pallets lift.
+    let second = open_haul(&area, "a", "Second");
+    assert_success(&area.forklift("a", &["lift"]));
+    let remote_haul = remote_pallet_head(&server, "@haul");
+
+    assert_success(&area.forklift("b", &["lower"]));
+    stack_file(&area, "b", "base.txt", "from b\n");
+    assert_success(&area.forklift("b", &["lift"]));
+
+    stack_file(&area, "a", "base.txt", "from a\n");
+    assert_success(&area.forklift("a", &["shift", "feat"]));
+    stack_file(&area, "a", "feat2.txt", "z\n");
+    assert_success(&area.forklift("a", &["shift", "main"]));
+    assert_success(&area.forklift("a", &["haul", "update", &second]));
+    assert_success(&area.forklift("a", &["haul", "merge", &second]));
+    assert_success(&area.forklift("a", &["tag", "create", "v1.0", "main"]));
+
+    let failed = area.forklift("a", &["lift"]);
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    let why = stderr(&failed);
+    assert!(why.contains(&format!("haul {} merged as", &second[..12])) && why.contains("into \"main\""), "{}", why);
+    assert_eq!(remote_pallet_head(&server, "@haul"), remote_haul, "the remote's @haul did not move");
+    assert_eq!(remote_pallet_head(&server, "@tags"), Some(area.read_file("a/.forklift/meta/tags").trim().to_string()));
+}
+
+/// A fresh remote admits the whole @haul history against today's office, so a merge whose signer
+/// has since lost write on the target is refused there, naming both; re-granted, it goes.
+#[test]
+fn a_rehost_refuses_a_merge_by_a_writer_since_ungranted_until_regranted() {
+    let area = TestArea::new("haul-rehost");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    stack_file(&area, "a", "base.txt", "base\n");
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["palletize", "feat"]));
+    stack_file(&area, "a", "feat.txt", "x\n");
+    assert_success(&area.forklift("a", &["shift", "main"]));
+    let id = open_haul(&area, "a", "Feat");
+
+    let dev = keygen_admit_args(&area, "dev@forklift");
+    assert_success(&area.forklift("a", &["office", "admit", &dev[0], &dev[1], &dev[2], "--role", "writer"]));
+    assert_success(&area.forklift("a", &["config", "operator.identifier", "dev@forklift"]));
+    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    assert_success(&area.forklift("a", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("a", &["office", "role", "dev@forklift", "writer", "--pallet", "feat"]));
+
+    let refused = area.forklift("a", &["lift"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("records a merge into main, but is signed by dev@forklift, who may not write it"),
+        "{}", stderr(&refused)
+    );
+    assert_eq!(remote_pallet_head(&server, "main"), Some(pallet_head(&area, "a", "main")), "the target itself lifted");
+    assert_eq!(remote_pallet_head(&server, "@haul"), None);
+
+    assert_success(&area.forklift("a", &["office", "role", "dev@forklift", "writer"]));
+    let lifted = area.forklift("a", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @haul pallet"), "{}", stdout(&lifted));
 }
 
 #[test]

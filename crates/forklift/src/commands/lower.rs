@@ -583,8 +583,9 @@ async fn replay(client: &RemoteClient,
                 .collect();
 
             return Err(format!(
-                "{}. Once an operator who may write the target has lifted it, run \"forklift lower\" \
-                again; or drop the record with {}.",
+                "{}. Once the remote's target holds the parcel (an operator who may write it lifts it \
+                there) and this warehouse holds that head (\"forklift lower\" on the target fetches \
+                it), run \"forklift lower\" again; or drop the record with {}.",
                 haul_utils::describe_held(&held), drops.join(" and ")
             ));
         }
