@@ -2224,6 +2224,27 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     }
 }
 
+/// Whether `message` reports a failure retrying may get past: a timeout or a server error (`5xx`)
+/// as this module composes them, anywhere in the message (a caller may have wrapped it). A
+/// connection that failed outright reads like any other `Error while …` and is not recognized:
+/// a caller that bounds its retries treats it as unclassified, never a local failure as transient.
+pub fn is_transient_failure(message: &str) -> bool {
+    if message.contains("Timed out while ") {
+        return true;
+    }
+
+    // `classify_remote_error`'s uncoded shape: "The remote refused <action> (<status>): …".
+    // Only the first status after the phrase is its own: a later one is the server's message.
+    message.match_indices("The remote refused ").any(|(at, _)| {
+        let tail = &message[at..];
+        let status = tail.match_indices(" (").map(|(open, _)| &tail[open + 2..]).find(|status| {
+            status.len() >= 6 && status.as_bytes()[..3].iter().all(u8::is_ascii_digit) && status[3..].starts_with("): ")
+        });
+
+        status.is_some_and(|status| status.starts_with('5'))
+    })
+}
+
 /// How a transport-level failure (one that never got as far as an HTTP status) classifies, given
 /// only `reqwest::Error::is_connect()` and `reqwest::Error::is_timeout()` — the two booleans the
 /// crate exposes for exactly this decision. A free enum plus a pure function over those two
@@ -7104,6 +7125,20 @@ mod tests {
             500, "the negotiation", "boom".to_string(), None, None,
         );
         assert_eq!(CoreError::from(classified.clone()), CoreError::Other(classified));
+    }
+
+    /// A server error is transient however it is wrapped; a refusal the server meant is not, nor
+    /// is a local failure whose text merely mentions a status.
+    #[test]
+    fn a_server_error_is_transient_and_a_refusal_is_not() {
+        let server_error = classify_remote_error(503, "fetching objects", "busy".to_string(), None, None);
+        assert!(is_transient_failure(&server_error));
+        assert!(is_transient_failure(&format!("Could not adopt the remote @office: {}", server_error)));
+
+        let refused = classify_remote_error(404, "fetching objects", "no such object (500): gone".to_string(), None, None);
+        assert!(!is_transient_failure(&refused));
+        assert!(!is_transient_failure("Error while writing \"x (500): y\": No space left on device"));
+        assert!(is_transient_failure("Timed out while fetching objects: the remote did not respond."));
     }
 
     /// A code a newer server sends that this client does not know degrades to a generic error

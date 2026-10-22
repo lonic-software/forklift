@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{alias_utils, bay_utils, config_utils, file_utils, pallet_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, pallet_utils};
 
 /// The directory the user invoked forklift from, relative to the warehouse root.
 /// Set once by [`enter_warehouse`]; empty when the user is at the root itself.
@@ -69,7 +69,8 @@ pub fn is_working_tree_root(dir: &Path) -> Result<bool, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the warehouse was entered successfully.
-/// * `Err(String)` - If no warehouse was found or the directory switch failed.
+/// * `Err(String)` - If no warehouse was found, it holds a franchise that has not finished (a
+///                   framed `franchise_incomplete` refusal), or the directory switch failed.
 pub fn enter_warehouse() -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
@@ -85,7 +86,10 @@ pub fn enter_warehouse() -> Result<(), String> {
             globals::set_bay_context(redirect.warehouse_root.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
         }
         bay_utils::ForkliftKind::OldFormatBay => return Err(bay_utils::old_format_bay_error(&root)),
-        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => (),
+        // A franchise that has not finished refuses every command, before any lock is taken: only
+        // running `franchise` again finishes it.
+        bay_utils::ForkliftKind::Warehouse => franchise_utils::gate(&root).map_err(String::from)?,
+        bay_utils::ForkliftKind::Absent => (),
     }
 
     let relative = cwd.strip_prefix(&root).unwrap_or(Path::new(""));

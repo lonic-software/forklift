@@ -221,6 +221,16 @@ refusal_codes! {
     /// have it), else `palletize <name>`; for `lower <name>`, `palletize --remote`, and for a bare
     /// `lower`, `lift`.
     PalletNotFound => "pallet_not_found",
+
+    /// The directory holds a franchise that has not finished: an attempt failed, was killed, or
+    /// is still running. Every command but `franchise` refuses to enter it; running the same
+    /// `franchise` again resumes it, keeping what was fetched (`franchise_utils`). The refusal's
+    /// details carry `{directory, remote, cause_code, retry}`.
+    FranchiseIncomplete => "franchise_incomplete",
+
+    /// A sparse franchise's `--only` prefix names no directory in the pallet's head on the remote.
+    /// Retrying gets the same answer: the prefix (or the pallet) has to change.
+    OnlyPrefixNotFound => "only_prefix_not_found",
 }
 
 impl RefusalCode {
@@ -380,6 +390,20 @@ pub fn append_to_message(error: String, extra: &str) -> String {
             details,
         }.into(),
         CoreError::Other(message) => format!("{} {}", message, extra),
+    }
+}
+
+/// Prefix an error's human-visible message with `context`, keeping a framed refusal's code, next
+/// step and details: the counterpart of [`append_to_message`] for the "Could not …: why" shape.
+pub fn prefix_message(context: &str, error: String) -> String {
+    match CoreError::from(error) {
+        CoreError::Refusal { code, message, next_step, details } => CoreError::Refusal {
+            code,
+            message: sanitize(&format!("{}: {}", context, message)),
+            next_step,
+            details,
+        }.into(),
+        CoreError::Other(message) => format!("{}: {}", context, message),
     }
 }
 

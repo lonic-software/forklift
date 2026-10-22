@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 3,
+  "schema": 4,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 3,
+  "schema": 4,
   "command": "stocktake",
   "ok": false,
   "error": {
@@ -82,7 +82,15 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 2** (current): `history` entries carry `parents` (every parcel's parents, in
+**Schema 4** (current): a franchise that fails after claiming its directory keeps it and exits
+`franchise_incomplete` (exit 30, with `details`), which every other command run there also
+refuses with until `franchise` is run again; and a sparse franchise's `--only` path that is not a
+directory in the pallet refuses with `only_prefix_not_found` (exit 31).
+
+**Schema 3**: `lower` and `franchise` report a first-contact adoption as `adopted_genesis`, and
+the `trust_changed` and `remote_protocol_violation` error codes exist.
+
+**Schema 2**: `history` entries carry `parents` (every parcel's parents, in
 stored order, always present — `[]` for a root); the `empty_history` error code exists
 (`history` on an unborn pallet); `palletize` list entries carry `head`; the `show`
 command reads a file's content at a revision in one call; `diff` accepts the reserved
@@ -415,6 +423,40 @@ a pallet the remote does not have refuses with the same code before writing anyt
 `forklift lift`.
 `forklift palletize --remote` lists what the remote holds, so an agent can tell the two apart
 before acting.
+
+### An unfinished franchise: `franchise_incomplete`
+
+A `franchise` that fails after it has claimed its directory — a dropped connection, a full disk,
+a path the working tree cannot hold, or a kill — keeps the directory with everything it fetched and
+exits `franchise_incomplete` (exit 30). Every other command run in that directory, `heal` and
+`audit` included, refuses with the same code before it takes any lock, so one code means one
+thing: this directory holds a franchise that has not finished. Running the same `franchise` again
+resumes it: the verified objects are kept, everything else is rebuilt, and `--pallet` and `--only`
+may change. An omitted `--token` reuses the one the first attempt was given, and the trust anchor
+the first attempt saw (or its `--expect` pin) stays enforced.
+
+```json
+"details": {
+  "directory": "/work/clone",
+  "remote": "https://forklift.example.com",
+  "cause_code": "error",
+  "retry": "unknown"
+}
+```
+
+- `remote` — `null` when the franchise's record cannot be read.
+- `cause_code` — the code the failure would have had on its own (`error` when it had none);
+  `null` when no attempt has failed yet (one is still running, or was killed).
+- `retry` — what to do next, `null` with `cause_code`:
+  - `same` — a transient failure (a timeout, a server error): run the same command again.
+  - `unknown` — anything else: run the same command again. When an attempt fails again in the
+    same part of the franchise with the same code and stores nothing new, it is reported as
+    `change` instead, so an agent never loops on a failure that makes no progress.
+  - `change` — the same command fails the same way (`remote_protocol_violation`,
+    `only_prefix_not_found`): change `--only` or `--pallet`, or delete the directory.
+
+`next_step` spells out the command. A sparse franchise's `--only` path that names no directory in
+the pallet is the cause `only_prefix_not_found` (exit 31 where it is raised on its own).
 
 ### Custom metadata that changed on both sides: `meta_conflict`
 
