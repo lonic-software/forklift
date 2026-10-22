@@ -1458,6 +1458,8 @@ mod tests {
         let mut not_a_delete = delete_entry("side", &hash('3'));
         not_a_delete.op = "stack".to_string();
         let current = delete_entry("main", &hash('3'));
+        let mut moved_onto = delete_entry("side", &hash('3'));
+        moved_onto.after.current_pallet = "side".to_string();
         let meta = delete_entry("@tags", &hash('3'));
         let mut two = delete_entry("side", &hash('3'));
         two.before.heads.insert("other".to_string(), Some(hash('4')));
@@ -1472,6 +1474,7 @@ mod tests {
         for (bad, reason) in [
             (not_a_delete, "with a removal it cannot have made"),
             (current, "with a removal it cannot have made"),
+            (moved_onto, "with a removal it cannot have made"),
             (meta, "with a removal it cannot have made"),
             (two, "with a removal it cannot have made"),
             (unrecorded, "with a removal it cannot have made"),
