@@ -171,7 +171,8 @@ fn present(line_ids: &[u32], count: usize) -> Vec<bool> {
 /// it to. The display diff's histogram match was measured too, and on that file credited one
 /// parcel with 312 lines where git and the longest subsequence credit it with 9. That measurement
 /// predates a fix to the histogram's anchor ranking (a run was ranked by the line that found it,
-/// not its rarest line) and was not re-run after it.
+/// not its rarest line) and was not re-run after it. The longest subsequence stays because it is
+/// what git's default (Myers) diff computes, which the slide above then places as git does.
 fn attribute_version(previous: &[BlameLine], content: &[u8], parcel: &str) -> Vec<BlameLine> {
     let new_lines = split_lines(content);
 
