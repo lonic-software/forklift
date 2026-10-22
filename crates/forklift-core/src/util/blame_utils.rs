@@ -284,6 +284,19 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_line_keeps_its_attribution_where_git_shows_it_unchanged() {
+        // `x z` becomes `z z y`. Either new `z` can be the old one. Git's diff shows the first
+        // unchanged and the second added (the added run slides down to join `y`), so the first
+        // keeps P1, not the second.
+        let previous = vec![line("x\n", "P1"), line("z\n", "P1")];
+
+        let result = attribute_version(&previous, b"z\nz\ny\n", "P2");
+        let parcels: Vec<&str> = result.iter().map(|blame| blame.parcel.as_str()).collect();
+
+        assert_eq!(parcels, vec!["P1", "P2", "P2"]);
+    }
+
+    #[test]
     fn a_blame_above_an_unreadable_merge_parent_walks_its_ancestry_a_bounded_number_of_times() {
         // A merge whose second parent is missing from the store: no parcel from it up can get a
         // commit-graph record, so a filter query on any of them walks the ancestry back to the
