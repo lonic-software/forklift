@@ -48,7 +48,8 @@ pub async fn handle_command() -> Result<(), String> {
         // The office carries the keys, so it lifts first (above); the manifest and any
         // other meta pallet follow, once the remote can verify their signatures. Each lifts
         // on its own: one that fails is reported after the rest, and the working pallet,
-        // have gone through.
+        // have gone through. @haul lifts last, after the working pallet's attempt, since a
+        // merge it records may wait for that pallet's parcel.
         let mut meta_pallets = Vec::new();
         let mut meta_failed = Vec::new();
 
@@ -68,10 +69,12 @@ pub async fn handle_command() -> Result<(), String> {
         let pallet = position.pallet.clone();
 
         let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
-            return Err(format!(
+            lift_haul(&client, &info, None, &mut meta_pallets, &mut meta_failed).await;
+
+            return Err(lower::with_meta_failures(format!(
                 "Pallet \"{}\" has nothing stacked yet; there is nothing to lift.",
                 pallet
-            ));
+            ), &meta_failed));
         };
 
         let remote_head = info.pallets.get(&pallet).cloned();
@@ -79,9 +82,18 @@ pub async fn handle_command() -> Result<(), String> {
         // If the remote diverged and the merge is clean, auto-merge and retry rather than
         // stopping. Overlapping changes fall through to the diverged error below.
         if let Some(remote) = &remote_head {
-            if remote != &head && auto_merged < MAX_AUTO_MERGES && try_auto_merge(&client, &pallet, position.base.as_deref(), &head, remote, &progress).await? {
-                auto_merged += 1;
-                continue;
+            if remote != &head && auto_merged < MAX_AUTO_MERGES {
+                match try_auto_merge(&client, &pallet, position.base.as_deref(), &head, remote, &progress).await {
+                    Ok(true) => {
+                        auto_merged += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(why) => {
+                        lift_haul(&client, &info, None, &mut meta_pallets, &mut meta_failed).await;
+                        return Err(lower::with_meta_failures(why, &meta_failed));
+                    }
+                }
             }
         }
 
@@ -99,6 +111,9 @@ pub async fn handle_command() -> Result<(), String> {
         };
 
         let lifted = remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await;
+
+        let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
+        lift_haul(&client, &info, landed, &mut report.meta_pallets, &mut report.meta_failed).await;
 
         match lifted {
             Ok(LiftResult::UpToDate) => report.up_to_date = true,
@@ -127,6 +142,25 @@ pub async fn handle_command() -> Result<(), String> {
         output::emit(&report);
 
         return Ok(());
+    }
+}
+
+/// Lift `@haul` after the working pallet's lift attempt (`landed` when that lift went through),
+/// recording the outcome with the other meta pallets'.
+async fn lift_haul(client: &RemoteClient,
+                   info: &forklift_core::model::remote::WarehouseInfo,
+                   landed: Option<(&str, &str)>,
+                   meta_pallets: &mut Vec<String>,
+                   meta_failed: &mut Vec<MetaPalletFailure>) {
+    let Some(lift) = remote_utils::lift_haul_pallet(client, info, landed).await else { return };
+
+    match lift.result {
+        Ok(LiftResult::Lifted(_)) => meta_pallets.push(lift.pallet),
+        Ok(LiftResult::UpToDate) => {}
+        Err(why) => {
+            let error = with_drop_hint(why, info, &lift.pallet);
+            meta_failed.push(MetaPalletFailure::new(lift.pallet, error));
+        }
     }
 }
 

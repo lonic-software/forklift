@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    audit_utils, config_utils, file_utils, kv_utils, merge_utils, object_utils,
+    audit_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
     pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
@@ -568,6 +568,26 @@ async fn replay(client: &RemoteClient,
     if plan.is_empty() {
         pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
         return Ok(Reconciled::Adopted);
+    }
+
+    // A replay of @haul publishes its merge records only once the remote's target holds their
+    // parcels, as a lift does. Judged after the empty plan, so dropping the records still works.
+    if name == haul_utils::HAUL_PALLET_NAME {
+        let local_cells = meta_tree::cells_at(name, &local, rules)?;
+        let remote_target_head = |target: &str| info.pallets.get(target).cloned();
+        let held = haul_utils::held_merges(plan.changes(), local_cells.as_deref(), &remote_target_head)?;
+
+        if !held.is_empty() {
+            let drops: Vec<String> = held.iter()
+                .map(|merge| format!("\"forklift lower --keep {}:{}=theirs\"", wire, merge.haul))
+                .collect();
+
+            return Err(format!(
+                "{}. Once an operator who may write the target has lifted it, run \"forklift lower\" \
+                again; or drop the record with {}.",
+                haul_utils::describe_held(&held), drops.join(" and ")
+            ));
+        }
     }
 
     let actor = config_utils::get_operator()?;

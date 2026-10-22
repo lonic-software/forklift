@@ -28,11 +28,11 @@ use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::manifest_utils::operator_leaf;
 use crate::util::meta_tree::{
-    self, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+    self, Admission, CellChange, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
 };
 use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState};
-use crate::util::object_utils;
+use crate::util::{file_utils, merge_utils, object_utils, pallet_utils};
 
 /// The name of the haul meta pallet — reached as `@haul` (DESIGN.html §3.3).
 pub const HAUL_PALLET_NAME: &str = "haul";
@@ -473,6 +473,10 @@ fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option
 /// - `state` is never removed, never changed once it reads merged, and its head is moved only by
 ///   the opener — so a merge records the head it merged, and a head move racing a merge is a
 ///   conflict on the one cell;
+/// - a state that reads merged is admitted only when its signer may write the haul's target
+///   ([`may_record_merge`]), judged against the office as it stands — under
+///   [`Admission::Admit`] only, so adopting history a remote already admitted never wedges on a
+///   merger demoted since;
 /// - `review/<op>` and `comment/<op>/…` are written or removed only by the operator `op` names;
 /// - `opened` and `state` hold exactly their own schema, since the rules read them; a review or
 ///   comment of a newer schema is carried; and no cell name this build does not know is written.
@@ -587,16 +591,32 @@ impl PalletRules for HaulRules {
                         )),
                     }
                 }
-                // A state written with its proposal is the opener's by the proposal's own rule.
-                CellName::State => if let Some((_, head)) = &before {
-                    let (_, moved) = parse_state(&envelope.value)?;
+                CellName::State => {
+                    let (status, moved) = parse_state(&envelope.value)?;
 
-                    if &moved != head && &opened.opener != operator {
+                    // A state written with its proposal is the opener's by the proposal's own rule.
+                    if let Some((_, head)) = &before {
+                        if &moved != head && &opened.opener != operator {
+                            return Err(format!(
+                                "the state at {} moves the head, but is signed by {}; only the haul's \
+                                opener, {}, moves it. A merge or close that raced the opener's update \
+                                keeps theirs at {} and runs again",
+                                cell.path, operator, opened.opener, self.display_path(&cell.path)
+                            ));
+                        }
+                    }
+
+                    if matches!(status, HaulStatus::Merged(_))
+                        && change.admission == Admission::Admit
+                        && !may_record_merge(change.office, operator, &opened.target) {
+                        let why = match change.office.find_user(operator) {
+                            Some(_) => "who may not write it",
+                            None => "who has no user record in the office",
+                        };
+
                         return Err(format!(
-                            "the state at {} moves the head, but is signed by {}; only the haul's \
-                            opener, {}, moves it. A merge or close that raced the opener's update \
-                            keeps theirs at {} and runs again",
-                            cell.path, operator, opened.opener, self.display_path(&cell.path)
+                            "the state at {} records a merge into {}, but is signed by {}, {}",
+                            cell.path, opened.target, operator, why
                         ));
                     }
                 }
@@ -648,6 +668,179 @@ impl PalletRules for HaulRules {
 
         shown.unwrap_or_else(|why| format!("(unreadable: the value {})", why))
     }
+}
+
+/// Whether `operator` may record a merge into the pallet `target`: their office record exists
+/// and may write it. A merge records that the target took the haul, so recording one is the
+/// target's writers' to do — the same predicate that authorizes moving the target itself.
+pub fn may_record_merge(office: &OfficeState, operator: &str, target: &str) -> bool {
+    office.find_user(operator).is_some_and(|user| user.may_write_pallet(target))
+}
+
+/// What the local warehouse proves about a merged haul's recorded merge. A record is a signed
+/// claim by whoever may record it; this is the evidence for it, judged on read against what this
+/// warehouse holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MergeProof {
+    /// The merge parcel contains the haul's head, and the target here contains the parcel.
+    Verified,
+
+    /// The merge parcel is held here and does not contain the haul's head.
+    Refuted,
+
+    /// Neither, for the reason given.
+    Unproven(Unproven),
+}
+
+/// Why a merge is neither verified nor refuted here. None of these says the record is false: a
+/// warehouse behind the remote reads exactly as one handed a false record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unproven {
+    /// The merge parcel is not held here.
+    ParcelNotHeld,
+
+    /// The target pallet has no head here.
+    TargetNotHeld,
+
+    /// The target here does not contain the merge parcel.
+    NotOnTarget,
+
+    /// The history the answer needs could not be read.
+    HistoryUnreadable,
+}
+
+impl MergeProof {
+    /// The verdict, as `--json` spells it: `verified`, `refuted` or `unproven`.
+    pub fn verdict(&self) -> &'static str {
+        match self {
+            MergeProof::Verified => "verified",
+            MergeProof::Refuted => "refuted",
+            MergeProof::Unproven(_) => "unproven",
+        }
+    }
+
+    /// Why the verdict is not `verified`, as `--json` spells it; `None` when it is.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            MergeProof::Verified => None,
+            MergeProof::Refuted => Some("head_not_contained"),
+            MergeProof::Unproven(Unproven::ParcelNotHeld) => Some("parcel_not_held"),
+            MergeProof::Unproven(Unproven::TargetNotHeld) => Some("target_not_held"),
+            MergeProof::Unproven(Unproven::NotOnTarget) => Some("not_on_target"),
+            MergeProof::Unproven(Unproven::HistoryUnreadable) => Some("history_unreadable"),
+        }
+    }
+}
+
+/// Judge a merged haul's record against the local warehouse; `None` for a haul not merged.
+///
+/// Refuted only from the merge parcel's own history, which `merge_utils::is_ancestor` answers
+/// `false` for only once it was read in full. A parcel absent from the target is never refuted.
+pub fn merge_proof(haul: &Haul) -> Option<MergeProof> {
+    let HaulStatus::Merged(parcel) = &haul.status else { return None };
+
+    let proof = match file_utils::does_object_exist(parcel) {
+        Ok(true) => match merge_utils::is_ancestor(&haul.head, parcel) {
+            Ok(false) => MergeProof::Refuted,
+            Err(_) => MergeProof::Unproven(Unproven::HistoryUnreadable),
+            Ok(true) => match pallet_utils::get_pallet_head(&haul.opened.target) {
+                Ok(None) => MergeProof::Unproven(Unproven::TargetNotHeld),
+                Err(_) => MergeProof::Unproven(Unproven::HistoryUnreadable),
+                Ok(Some(target_head)) => match merge_utils::is_ancestor(parcel, &target_head) {
+                    Ok(true) => MergeProof::Verified,
+                    Ok(false) => MergeProof::Unproven(Unproven::NotOnTarget),
+                    Err(_) => MergeProof::Unproven(Unproven::HistoryUnreadable),
+                },
+            },
+        },
+        Ok(false) => MergeProof::Unproven(Unproven::ParcelNotHeld),
+        Err(_) => MergeProof::Unproven(Unproven::HistoryUnreadable),
+    };
+
+    Some(proof)
+}
+
+/// A merge record a lift of `@haul` holds back: its merge parcel is on the target here, and the
+/// remote's target is not known to hold it yet.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct HeldMerge {
+    pub haul: String,
+    pub parcel: String,
+    pub target: String,
+}
+
+/// The merge records among `changes` — the cells an `@haul` lift would publish over the remote's
+/// head — that must wait for their merge parcel, so a remote never holds a final merge whose
+/// parcel was about to follow it. A record waits when its parcel is in the history of the local
+/// target and the remote's target head (`remote_target_head`, by pallet name) is absent, not held
+/// here, or held without it. A record whose parcel is not on the local target, or whose target is
+/// not held here, goes through: waiting would not bring that parcel, and a reader judges it on
+/// read ([`merge_proof`]).
+///
+/// `local_cells` is the local `@haul` cells tree, where each changed state's proposal is read.
+pub fn held_merges(changes: &[CellChange],
+                   local_cells: Option<&str>,
+                   remote_target_head: &dyn Fn(&str) -> Option<String>) -> Result<Vec<HeldMerge>, String> {
+    let mut held = Vec::new();
+
+    for change in changes {
+        let Some(after) = &change.after else { continue };
+        let Ok(CellPath { haul, name: CellName::State }) = parse_cell_path(&change.path) else { continue };
+
+        let CellRead::Readable(state) = meta_tree::read_cell_blob(after, &HaulRules)? else { continue };
+        if state.schema != SCHEMA_STATE {
+            continue;
+        }
+        let Ok((HaulStatus::Merged(parcel), _)) = parse_state(&state.value) else { continue };
+
+        let Some(opened) = opened_in(local_cells, &haul_dir(haul), &HaulRules)? else { continue };
+
+        // A target this warehouse cannot name holds nothing here, so waiting brings nothing.
+        let Ok(Some(local_target)) = pallet_utils::get_pallet_head(&opened.target) else { continue };
+        if !merge_utils::is_ancestor(&parcel, &local_target)? {
+            continue;
+        }
+
+        let contained = match remote_target_head(&opened.target) {
+            Some(remote) if file_utils::does_object_exist(&remote)? => merge_utils::is_ancestor(&parcel, &remote)?,
+            _ => false,
+        };
+
+        if !contained {
+            held.push(HeldMerge { haul: haul.to_string(), parcel, target: opened.target });
+        }
+    }
+
+    Ok(held)
+}
+
+/// The merge records a lift of the local `@haul` head `local_head` over the remote's head
+/// `remote_head` holds back ([`held_merges`]). None when the remote's head is not held here: that
+/// lift is a divergence, refused before anything is published.
+pub fn held_by_lift(local_head: &str,
+                    remote_head: Option<&str>,
+                    remote_target_head: &dyn Fn(&str) -> Option<String>) -> Result<Vec<HeldMerge>, String> {
+    let before = match remote_head {
+        Some(remote) if !file_utils::does_object_exist(remote)? => return Ok(Vec::new()),
+        Some(remote) => meta_tree::cells_at(HAUL_PALLET_NAME, remote, &HaulRules)?,
+        None => None,
+    };
+    let after = meta_tree::cells_at(HAUL_PALLET_NAME, local_head, &HaulRules)?;
+
+    let changes = meta_tree::net_diff(before.as_deref(), after.as_deref())?;
+    held_merges(&changes, after.as_deref(), remote_target_head)
+}
+
+/// The fact of held merge records, for a caller to add its way out to.
+pub fn describe_held(held: &[HeldMerge]) -> String {
+    let records: Vec<String> = held.iter().map(|merge| format!(
+        "haul {} merged as {} into \"{}\"", short(&merge.haul), short(&merge.parcel), merge.target
+    )).collect();
+
+    format!(
+        "@{} was not lifted: it records a merge whose parcel the remote's target does not hold yet ({})",
+        HAUL_PALLET_NAME, records.join("; ")
+    )
 }
 
 /// Stack edits to the local `@haul` head as one signed parcel. `None` when they changed nothing.

@@ -204,6 +204,22 @@ fn set_status(id: &str, status: HaulStatus) -> Result<(), String> {
 async fn merge(id: &str) -> Result<(), String> {
     let haul = find_open(id, "merged")?;
     let (office, actor, signer) = signing()?;
+
+    // Refused before anything lands: every head that admits the record would refuse it anyway,
+    // after the target already took the merge.
+    let operator = haul_utils::signing_operator(&office, &signer)?;
+    if !haul_utils::may_record_merge(&office, &operator, &haul.opened.target) {
+        let why = match office.find_user(&operator) {
+            Some(_) => "may not write",
+            None => "has no user record in the office, so may not write",
+        };
+
+        return Err(format!(
+            "Operator {} {} \"{}\", and only its writers record a merge into it. Nothing was merged.",
+            operator, why, haul.opened.target
+        ));
+    }
+
     // The merge is recorded at the head it merged, in the one cell a concurrent update writes.
     let record = |parcel: &str| haul_utils::record_state(
         &haul.id, &HaulStatus::Merged(parcel.to_string()), &haul.head, "Merged", &office, &actor, &signer,
@@ -358,11 +374,16 @@ pub(crate) struct HaulSummary {
 
     /// Approvals of the haul's current head; an approval of an earlier head is not counted.
     approvals: usize,
+
+    /// What this warehouse proves about the recorded merge; present exactly when merged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_proof: Option<MergeProofLine>,
 }
 
 impl HaulSummary {
     fn of(haul: &Haul) -> HaulSummary {
         HaulSummary {
+            merge_proof: MergeProofLine::of(haul),
             approvals: haul.current_reviews().filter(|r| r.verdict == ReviewVerdict::Approve).count(),
             id: haul.id.clone(),
             title: haul.opened.title.clone(),
@@ -370,6 +391,38 @@ impl HaulSummary {
             target: haul.opened.target.clone(),
             status: haul.status.as_str().to_string(),
         }
+    }
+}
+
+/// What the local warehouse proves about a merged haul's recorded merge. A merge is recorded by
+/// a writer of the target; this is judged on read, against the history held here.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct MergeProofLine {
+    /// `verified` (the merge parcel contains the haul's head, and the target here contains the
+    /// parcel), `refuted` (the merge parcel held here does not contain the head) or `unproven`.
+    /// A reader meeting any other value treats it as not verified.
+    verdict: String,
+
+    /// Absent when verified. Refuted: `head_not_contained`. Unproven: `parcel_not_held`,
+    /// `target_not_held`, `not_on_target` or `history_unreadable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl MergeProofLine {
+    fn of(haul: &Haul) -> Option<MergeProofLine> {
+        haul_utils::merge_proof(haul).map(|proof| MergeProofLine {
+            verdict: proof.verdict().to_string(),
+            reason: proof.reason().map(str::to_string),
+        })
+    }
+
+    /// The human marker for a merge that is not verified; `None` for a verified one.
+    fn marker(&self) -> Option<String> {
+        let reason = self.reason.as_ref()?;
+
+        Some(format!("{}: {}", self.verdict, reason.replace('_', " ")))
     }
 }
 
@@ -406,9 +459,11 @@ impl CommandOutput for HaulList {
 
         for haul in &self.hauls {
             let approvals = if haul.approvals > 0 { format!(" · {} approval(s)", haul.approvals) } else { String::new() };
+            let proof = haul.merge_proof.as_ref().and_then(MergeProofLine::marker)
+                .map(|marker| format!(", {}", marker)).unwrap_or_default();
             println!(
-                "{}  [{}]  {}  ({} → {}{})",
-                short(&haul.id), sanitize(&haul.status), sanitize(&haul.title), sanitize(&haul.source),
+                "{}  [{}{}]  {}  ({} → {}{})",
+                short(&haul.id), sanitize(&haul.status), proof, sanitize(&haul.title), sanitize(&haul.source),
                 sanitize(&haul.target), approvals
             );
         }
@@ -458,6 +513,10 @@ pub(crate) struct HaulDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     merge_parcel: Option<String>,
 
+    /// What this warehouse proves about the recorded merge; present exactly when merged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_proof: Option<MergeProofLine>,
+
     head: String,
     opener: String,
     opened_at: i64,
@@ -502,6 +561,7 @@ impl HaulDetail {
                 HaulStatus::Merged(parcel) => Some(parcel.clone()),
                 _ => None,
             },
+            merge_proof: MergeProofLine::of(haul),
             head: haul.head.clone(),
             opener: haul.opened.opener.clone(),
             opened_at: haul.opened.opened_at,
@@ -523,7 +583,10 @@ impl CommandOutput for HaulDetail {
         println!("head {}", short(&self.head));
 
         if let Some(parcel) = &self.merge_parcel {
-            println!("merged as {}", short(parcel));
+            match self.merge_proof.as_ref().and_then(MergeProofLine::marker) {
+                Some(marker) => println!("merged as {} ({})", short(parcel), marker),
+                None => println!("merged as {}", short(parcel)),
+            }
         }
 
         if !self.description.is_empty() {
