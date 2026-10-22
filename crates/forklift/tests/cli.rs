@@ -13210,3 +13210,79 @@ fn undo_of_a_delete_refuses_a_pallet_that_took_its_folder_and_names_undo_as() {
     assert_success(&warehouse.run(&["undo", "--as", "a-b"]));
     assert!(pallet_heads(&warehouse).contains(&("a-b".to_string(), base)));
 }
+
+// Revert: drop the haul heads from gc_root_sources → the repack drops each proposed head and both
+// merges fail on its missing parcel.
+#[test]
+fn a_repack_keeps_the_head_an_open_or_closed_haul_proposes_after_its_source_moves_off_it() {
+    let warehouse = TestWarehouse::new("haul-head-roots");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    stack_one(&warehouse, "base.txt", "base\n");
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    // Two proposals whose heads end up held by nothing but the haul: each source's stack is
+    // undone, and the change it re-stages is dropped.
+    let mut hauls = Vec::new();
+    for source in ["feature", "fix"] {
+        assert_success(&warehouse.run(&["palletize", source]));
+        let file = format!("{}.txt", source);
+        let proposed = stack_one(&warehouse, &file, &format!("{} only here\n", source));
+        let opened = warehouse.run(&["--json", "haul", "open", "--target", "main", "--source", source, "--title", source]);
+        assert_success(&opened);
+        hauls.push((json(&opened)["data"]["id"].as_str().unwrap().to_string(), proposed));
+
+        assert_success(&warehouse.run(&["undo"]));
+        std::fs::remove_file(warehouse.root.join(&file)).unwrap();
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["shift", "main"]));
+    }
+
+    let (closed, _) = &hauls[1];
+    assert_success(&warehouse.run(&["haul", "close", closed]));
+
+    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["compact", "--all"]));
+
+    for (_, proposed) in &hauls {
+        assert_success(&warehouse.run(&["peek", proposed]));
+    }
+
+    assert_success(&warehouse.run(&["haul", "reopen", closed]));
+    for (id, _) in &hauls {
+        assert_success(&warehouse.run(&["haul", "merge", id]));
+    }
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("fix.txt")).unwrap(), "fix only here\n");
+}
+
+// Revert-check: drop the presence check before `haul merge`'s ancestry test and this fails on a
+// missing-object read rather than the refusal naming the way out.
+#[test]
+fn haul_merge_of_a_head_this_warehouse_does_not_hold_names_where_to_get_it() {
+    let warehouse = TestWarehouse::new("haul-head-absent");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    stack_one(&warehouse, "base.txt", "base\n");
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    let proposed = stack_one(&warehouse, "feature.txt", "feature only here\n");
+    let opened = warehouse.run(&["--json", "haul", "open", "--target", "main", "--source", "feature", "--title", "feature"]);
+    assert_success(&opened);
+    let id = json(&opened)["data"]["id"].as_str().unwrap().to_string();
+    assert_success(&warehouse.run(&["undo"]));
+    std::fs::remove_file(warehouse.root.join("feature.txt")).unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // As if the haul had been opened elsewhere and its head never fetched here.
+    std::fs::remove_file(warehouse.root.join(".forklift/objects").join(&proposed[..2]).join(&proposed[2..])).unwrap();
+
+    let merged = warehouse.run(&["haul", "merge", &id]);
+    assert!(!merged.status.success());
+    let err = stderr(&merged);
+    assert!(err.contains("which this warehouse does not hold"), "{}", err);
+    assert!(err.contains("Lower \"feature\""), "{}", err);
+    assert!(err.contains("Nothing was merged."), "{}", err);
+    assert!(!warehouse.root.join("feature.txt").exists());
+}

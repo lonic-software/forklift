@@ -934,7 +934,10 @@ review records the head it reviewed: after `haul update` moves the haul to new w
 earlier approval is still shown, marked with the head it was of, but no longer counts. A merged
 haul stays merged — no one can reopen or close it, on any head. `merge` reuses
 `consolidate` (a clean disjoint merge auto-stacks; a conflict leaves the consolidation in
-progress — resolve, `stack`, then re-run `haul merge` to record it). A haul id is
+progress — resolve, `stack`, then re-run `haul merge` to record it). A haul opened in another
+warehouse can propose a head this one never fetched; `merge` then refuses, naming the source pallet
+to `lower` first. The head an open or closed haul proposes is kept by `gc`, `compact --all` and
+`scope-prune` even after its source pallet moves off it or is deleted. A haul id is
 content-addressed; use any unique prefix.
 
 Only an operator who may write the target records a merge: `haul merge` refuses anyone else
@@ -1544,9 +1547,10 @@ last `lower`) keeps whatever lifting it would read under the path. The report co
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
 then run the same `scope-prune` again, which frees the rest. Other work that exists only here is
 never freed either, whatever its path: content loaded but not yet stacked, parked parcels, an
-unfinished consolidation, and the history of a deleted pallet while `undo` can still bring it
-back, in any bay. The report counts that last keep apart (`kept_for_deleted`), since
-lifting cannot free it; it goes once the delete leaves the undo journal. So you can park edits
+unfinished consolidation, the head a haul not yet merged proposes, and the history of a deleted
+pallet while `undo` can still bring it back, in any bay. The report counts those last two keeps
+apart (`kept_for_hauls`, `kept_for_deleted`), since lifting cannot free them; a haul's goes once
+it is merged and its target lifted, a deleted pallet's once the delete leaves the undo journal. So you can park edits
 under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
 `expand` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
@@ -1715,7 +1719,8 @@ existing packs alone (cheap, but packs accumulate over time). `compact --all` is
 repack**: it rewrites every pack too, **dropping unreachable objects** that were stuck in
 packs (garbage from undone stacks, abandoned pushes) and **consolidating many packs into
 few**. Content you have loaded but not yet stacked is never garbage: every bay's staged files
-are kept, alongside everything reachable from a pallet. It **reuses** each object's existing
+are kept, alongside everything reachable from a pallet or from the head an open or closed haul
+proposes (so a haul still merges after its source pallet moved off that head). It **reuses** each object's existing
 delta (a byte-copy, not a re-compress), so it is
 fast and never balloons the store — but heavier than incremental; run it occasionally (auto
 does when packs pile up). Because it drops unreachable packed objects with no grace period,

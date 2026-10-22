@@ -241,7 +241,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    bay_utils, file_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
+    bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
     pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
     taint_utils,
 };
@@ -1439,8 +1439,9 @@ struct WalkRoots {
 
 /// [`gc_root_sources`]'s result — see that function's own doc comment.
 pub(crate) struct GcRootSources {
-    /// Every pallet head (both namespaces) plus every readable bay's base, parked parcels and
-    /// in-progress consolidation and cherry-pick parcels.
+    /// Every pallet head (both namespaces), the head every haul not yet merged proposes, plus
+    /// every readable bay's base, parked parcels and in-progress consolidation and cherry-pick
+    /// parcels.
     pub parcels: Vec<String>,
     /// Every trust-pin root this call could establish, each paired with its own
     /// [`office_utils::PinAbsencePolicy`] — see [`gc_root_sources`]'s own doc comment for why the
@@ -1452,8 +1453,8 @@ pub(crate) struct GcRootSources {
     /// without these leaves would let gc or a repack delete a user's loaded-but-unstacked work
     /// (FORK-156).
     pub shard_leaves: Vec<(String, DirEntryType)>,
-    /// One plain-language note per bay or office-record read this call had to skip rather than
-    /// abort on — only ever populated when both `bay_policy` and `pin_policy` were passed as
+    /// One plain-language note per haul, bay or office-record read this call had to skip rather
+    /// than abort on — only ever populated when both `bay_policy` and `pin_policy` were passed as
     /// their respective `Tolerate` variant.
     pub degraded: Vec<String>,
 }
@@ -1479,7 +1480,9 @@ pub(crate) struct GcRootSources {
 /// `bay_policy`/`pin_policy` let each caller keep its own fail-closed/tolerant contract — see
 /// [`bay_utils::BayReadPolicy`] and [`office_utils::TrustPinReadPolicy`] for the full reasoning
 /// (gc's and prune's `FailClosed`/`FailClosed`, heal's `Tolerate`/`Tolerate`). They govern the
-/// bay-scoped parcels and the office record only. The staged shards are always read fail-closed:
+/// bay-scoped parcels and the office record only, and `bay_policy` the hauls' proposed heads too
+/// ([`haul_utils::unmerged_haul_heads`]): a haul names its head in a meta cell, not a ref, so a
+/// source pallet moved or deleted off that head leaves the haul its only holder. The staged shards are always read fail-closed:
 /// a shard that exists but cannot be read or parsed may name the only copy of staged work. A
 /// shard or folder that vanishes mid-walk is no reference at all and is skipped.
 ///
@@ -1494,8 +1497,8 @@ pub(crate) struct GcRootSources {
 ///                  `distrust_boundary` pins.
 ///
 /// # Returns
-/// * `Ok(GcRootSources)` - Every pallet head, every readable bay's parked-parcel/consolidation
-///                         roots, every trust-pin root this call could establish, and every staged
+/// * `Ok(GcRootSources)` - Every pallet head, every unmerged haul's proposed head, every readable
+///                         bay's parked-parcel/consolidation roots, every trust-pin root this call could establish, and every staged
 ///                         shard leaf of every bay.
 /// * `Err(String)`        - Under either policy's fail-closed branch, if the trust file itself
 ///                         could not be read (always fail-closed regardless of `pin_policy` — see
@@ -1512,9 +1515,25 @@ pub(crate) fn gc_root_sources(
         parcels.push(head);
     }
 
+    // A haul's proposed head is merged from the recorded hash, whatever its source pallet holds
+    // now. Read under `bay_policy`: like a bay's state, it is a record outside the pallet refs
+    // that names a head a later command reads.
+    let mut degraded: Vec<String> = Vec::new();
+    match haul_utils::unmerged_haul_heads() {
+        Ok(heads) => parcels.extend(heads),
+        Err(e) => match bay_policy {
+            bay_utils::BayReadPolicy::FailClosed => return Err(e),
+            bay_utils::BayReadPolicy::Tolerate => degraded.push(format!(
+                "the hauls could not be read this run ({}); their proposed heads were treated as \
+                held by nothing rather than blocking this command. Run this command again once they read.",
+                e
+            )),
+        },
+    }
+
     let bay_scope = bay_utils::collect_bay_scoped_parcel_roots(bay_dirs, bay_policy)?;
     parcels.extend(bay_scope.roots);
-    let mut degraded = bay_scope.degraded;
+    degraded.extend(bay_scope.degraded);
 
     let trust_pins = office_utils::collect_trust_pin_roots(pin_policy)?;
     if let Some(note) = trust_pins.degraded {
@@ -1546,7 +1565,7 @@ pub(crate) fn gc_root_sources(
 ///
 /// **Invariant with [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set):**
 /// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
-/// bay's parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
+/// head a haul not yet merged proposes, every bay's parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
 /// and every trust-pin root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
 /// `distrust_boundary`, FORK-81 — and every bay's staged inventory shard leaves, FORK-156). If
 /// gc ever treats an object as live, this walk must never call the same object safe to drop —

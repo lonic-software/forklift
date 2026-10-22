@@ -4285,6 +4285,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_for_hauls": {
+      "description": "Candidates kept because lifting the unlifted history a haul not yet merged proposes reads\nthem, where no pallet reaches it any more. Lifting cannot free these; once the haul is\nmerged and its target lifted, a later prune does.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "kept_unlifted": {
       "description": "Candidates kept because lifting history the remote does not hold reads them: work stacked\nhere and never lifted, or lifted to a remote head not lowered here since. Some may be the\nonly copy, the rest are base trees the lift compares against; a later prune of the same\npath frees them once that history is lifted.",
       "format": "uint",
@@ -4340,6 +4346,7 @@ A command not listed here either reports only the generic human-message shape `{
     "still_packed",
     "retained_shared",
     "kept_unlifted",
+    "kept_for_hauls",
     "kept_for_deleted",
     "unlifted_pallets",
     "all_resumed"

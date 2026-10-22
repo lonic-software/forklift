@@ -241,6 +241,16 @@ async fn merge(id: &str) -> Result<(), String> {
     let target_head = pallet_utils::get_pallet_head(&current)?
         .ok_or(format!("Target pallet \"{}\" has nothing stacked.", current))?;
 
+    // A haul opened elsewhere can propose a head this warehouse never fetched. That is no damage:
+    // say where the head comes from instead of failing on a missing object below.
+    if !file_utils::does_object_exist(&haul.head)? {
+        return Err(format!(
+            "Haul {} proposes parcel {}, which this warehouse does not hold. Lower \"{}\" from the remote that \
+             holds it, or have the haul's opener move it with \"haul update {}\". Nothing was merged.",
+            short(&haul.id), short(&haul.head), haul.opened.source, short(&haul.id)
+        ));
+    }
+
     // Already contained (e.g. a conflicted merge that was resolved and stacked by hand, or
     // the source was consolidated another way): just record the merge.
     if merge_utils::is_ancestor(&haul.head, &target_head)? {
