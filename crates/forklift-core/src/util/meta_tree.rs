@@ -1639,6 +1639,11 @@ impl ReplayPlan {
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
+
+    /// The cells the replay would apply over the remote head.
+    pub fn changes(&self) -> &[CellChange] {
+        &self.changes
+    }
 }
 
 /// Plan the replay of the local net change since `base` (the chains' common ancestor, `None`
@@ -3301,7 +3306,7 @@ mod tests {
 
         let _scratch = Scratch::new("haul-status");
         let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
-        let office = office(&[&alice.record, &bob.record]);
+        let office = office_with_roles(&[(&alice, office_utils::Role::Writer), (&bob, office_utils::Role::Writer)]);
         let opened = proposal("alice");
         let id = opened.id();
         let dir = haul_utils::haul_dir(&id);
@@ -3366,6 +3371,184 @@ mod tests {
         let elsewhere = haul_utils::comment_path(&id, "bob", &haul_utils::comment_value("bye", 5));
         let misplaced = haul_parcel(Some(&head), &bob, &[set(&elsewhere, &haul_cell(bob.id(), haul_utils::SCHEMA_COMMENT, &comment))]);
         assert!(verify_haul(&office, Some(&head), &misplaced).unwrap_err().contains("not at the id its content derives"));
+    }
+
+    #[test]
+    fn a_merge_is_recorded_only_by_a_writer_of_its_target() {
+        use haul_utils::HaulStatus;
+        use office_utils::Role;
+
+        let _scratch = Scratch::new("haul-merge-writer");
+        let keys: Vec<Key> = ["alice", "bob", "carol", "dave", "erin", "frank"].iter().enumerate()
+            .map(|(seed, name)| Key::new(name, seed as u8 + 1))
+            .collect();
+        let [alice, bob, carol, dave, erin, frank] = &keys[..] else { unreachable!() };
+
+        // Frank's key is in the office, but no user record is.
+        let mut office = office_with_roles(&[
+            (alice, Role::Admin), (bob, Role::Writer), (carol, Role::Writer), (dave, Role::Writer), (erin, Role::Reader),
+        ]);
+        office.users[2].pallets = vec!["main".to_string()];
+        office.users[3].pallets = vec!["other".to_string()];
+        office.keys.push(frank.record.clone());
+
+        let opened = proposal("alice");
+        let state = format!("{}/state", haul_utils::haul_dir(&opened.id()));
+        let at = "ab".repeat(32);
+        let head = haul_parcel(None, alice, &open_edits(alice, &opened));
+
+        let merge_by = |key: &Key| haul_parcel(Some(&head), key, &[
+            set(&state, &state_cell(key, &HaulStatus::Merged("ef".repeat(32)), &at)),
+        ]);
+
+        // An admin, an unrestricted writer and a writer granted the target record it.
+        for key in [alice, bob, carol] {
+            verify_haul(&office, Some(&head), &merge_by(key)).unwrap();
+        }
+
+        // A writer of other pallets, a reader and an operator with no record do not.
+        for (key, why) in [(dave, "who may not write it"), (erin, "who may not write it"), (frank, "who has no user record")] {
+            let merged = merge_by(key);
+            let error = verify_haul(&office, Some(&head), &merged).unwrap_err();
+            assert!(error.contains(&format!("records a merge into main, but is signed by {}, {}", key.record.operator, why)), "{}", error);
+
+            // Adopting what a remote already admitted audits the record, not its writer.
+            verify_meta_content("haul", &haul_utils::HaulRules, &office, Admission::Audit, Some(&head), &merged).unwrap();
+        }
+
+        // Closing and reopening stay anyone's.
+        let closed = haul_parcel(Some(&head), erin, &[set(&state, &state_cell(erin, &HaulStatus::Closed, &at))]);
+        verify_haul(&office, Some(&head), &closed).unwrap();
+        let reopened = haul_parcel(Some(&closed), frank, &[set(&state, &state_cell(frank, &HaulStatus::Open, &at))]);
+        verify_haul(&office, Some(&closed), &reopened).unwrap();
+    }
+
+    /// Store a working parcel on `parents`, kept distinct by `tag`. Ancestry never reads the tree.
+    fn work_parcel(parents: &[&str], tag: &str) -> String {
+        let parcel = crate::model::parcel::Parcel {
+            tree_hash: "0".repeat(64),
+            parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            actions: vec![],
+            description: Some(tag.to_string()),
+        };
+        let mut object = crate::builder::object::loose_object_builder::LooseObjectBuilder::build_parcel(&parcel);
+        let hash = object.hash.clone();
+        object.store().unwrap();
+
+        hash
+    }
+
+    fn set_work_head(pallet: &str, head: &str) {
+        let old = pallet_utils::get_pallet_head(pallet).unwrap();
+        pallet_utils::update_pallet_head_in(
+            pallet_utils::PalletNamespace::User, pallet, old.as_deref(), head, &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+    }
+
+    #[test]
+    fn a_merge_record_is_judged_against_what_this_warehouse_holds() {
+        use haul_utils::{HaulStatus, MergeProof, Unproven};
+
+        let _scratch = Scratch::new("haul-merge-proof");
+        let base = work_parcel(&[], "base");
+        let head = work_parcel(&[&base], "feature");
+        let merge = work_parcel(&[&base, &head], "merge");
+
+        let haul = |status: HaulStatus| haul_utils::Haul {
+            id: proposal("alice").id(),
+            opened: proposal("alice"),
+            head: head.clone(),
+            status,
+            reviews: Vec::new(),
+            comments: Vec::new(),
+            unreadable: Vec::new(),
+        };
+        let proof = |parcel: &str| haul_utils::merge_proof(&haul(HaulStatus::Merged(parcel.to_string()))).unwrap();
+
+        assert_eq!(haul_utils::merge_proof(&haul(HaulStatus::Open)), None, "only a merge is judged");
+        assert_eq!(haul_utils::merge_proof(&haul(HaulStatus::Closed)), None);
+
+        assert_eq!(proof(&merge), MergeProof::Unproven(Unproven::TargetNotHeld));
+
+        set_work_head("main", &base);
+        assert_eq!(proof(&merge), MergeProof::Unproven(Unproven::NotOnTarget));
+
+        set_work_head("main", &merge);
+        assert_eq!(proof(&merge), MergeProof::Verified);
+        assert_eq!((MergeProof::Verified.verdict(), MergeProof::Verified.reason()), ("verified", None));
+
+        assert_eq!(proof(&"ef".repeat(32)), MergeProof::Unproven(Unproven::ParcelNotHeld));
+
+        // A parcel that does not contain the haul's head refutes the record, whether ancestry is
+        // answered by a plain walk or from the commit graph.
+        let unrelated = work_parcel(&[&base], "unrelated");
+        assert_eq!(proof(&unrelated), MergeProof::Refuted);
+        crate::util::graph_utils::build_from_heads(&[unrelated.clone(), head.clone(), merge.clone()]).unwrap();
+        assert_eq!(proof(&unrelated), MergeProof::Refuted);
+        assert_eq!((MergeProof::Refuted.verdict(), MergeProof::Refuted.reason()), ("refuted", Some("head_not_contained")));
+
+        // A parcel whose history is cut short is never refuted.
+        let dangling = work_parcel(&[&"12".repeat(32)], "dangling");
+        assert_eq!(proof(&dangling), MergeProof::Unproven(Unproven::HistoryUnreadable));
+        assert_eq!(MergeProof::Unproven(Unproven::HistoryUnreadable).reason(), Some("history_unreadable"));
+    }
+
+    #[test]
+    fn a_haul_lift_holds_a_merge_only_until_the_remote_target_holds_its_parcel() {
+        use haul_utils::{HaulStatus, HeldMerge};
+
+        let _scratch = Scratch::new("haul-held");
+        let alice = Key::new("alice", 1);
+        let opened = proposal("alice");
+        let id = opened.id();
+        let state = format!("{}/state", haul_utils::haul_dir(&id));
+        let at = "ab".repeat(32);
+
+        let base = work_parcel(&[], "base");
+        let feature = work_parcel(&[&base], "feature");
+        let merge = work_parcel(&[&base, &feature], "merge");
+        let later = work_parcel(&[&merge], "later");
+
+        let remote = haul_parcel(None, &alice, &open_edits(&alice, &opened));
+        let local = haul_parcel(Some(&remote), &alice, &[set(&state, &state_cell(&alice, &HaulStatus::Merged(merge.clone()), &at))]);
+        let closed = haul_parcel(Some(&remote), &alice, &[set(&state, &state_cell(&alice, &HaulStatus::Closed, &at))]);
+
+        let held = |local: &str, remote_target: Option<&str>| {
+            let target = |pallet: &str| (pallet == "main").then(|| remote_target.map(str::to_string)).flatten();
+            haul_utils::held_by_lift(local, Some(&remote), &target).unwrap()
+        };
+        let waiting = vec![HeldMerge { haul: id.clone(), parcel: merge.clone(), target: "main".to_string(), on_remote: true }];
+
+        // Through: waiting would not bring the parcel.
+        assert!(held(&local, None).is_empty(), "the target is not held here");
+        set_work_head("main", &base);
+        assert!(held(&local, None).is_empty(), "the parcel is not on the target here");
+
+        // Held: the parcel is on the target here, and the remote's target is not known to hold it.
+        set_work_head("main", &later);
+        assert_eq!(held(&local, None), waiting, "the remote has no such pallet");
+        assert_eq!(held(&local, Some(&"cd".repeat(32))), waiting, "the remote's head is not held here");
+        assert_eq!(held(&local, Some(&base)), waiting, "the remote's head lacks the parcel");
+
+        // Through once the remote's target holds it.
+        assert!(held(&local, Some(&merge)).is_empty());
+        assert!(held(&local, Some(&later)).is_empty());
+
+        // Only a merge waits.
+        assert!(held(&closed, None).is_empty());
+
+        // A remote @haul head not held here, or held but off the local history, is a divergence
+        // the lift refuses on its own, naming "lower".
+        let target = |_: &str| None;
+        assert!(haul_utils::held_by_lift(&local, Some(&"cd".repeat(32)), &target).unwrap().is_empty());
+        assert!(haul_utils::held_by_lift(&local, Some(&closed), &target).unwrap().is_empty(), "diverged");
+
+        let fresh = vec![HeldMerge { on_remote: false, ..waiting[0].clone() }];
+        assert_eq!(haul_utils::held_by_lift(&local, None, &target).unwrap(), fresh, "a remote with no @haul yet");
+
+        // Dropping keeps the remote's state where it has one, else the haul it lacks.
+        assert_eq!(haul_utils::drop_held(&waiting), format!("\"forklift lower --keep @haul:{}/state=theirs\"", id));
+        assert!(haul_utils::drop_held(&fresh).starts_with(&format!("\"forklift lower --keep @haul:{}=theirs\" (", id)));
     }
 
     #[test]

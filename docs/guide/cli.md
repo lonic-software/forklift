@@ -918,9 +918,23 @@ haul stays merged — no one can reopen or close it, on any head. `merge` reuses
 progress — resolve, `stack`, then re-run `haul merge` to record it). A haul id is
 content-addressed; use any unique prefix.
 
+Only an operator who may write the target records a merge: `haul merge` refuses anyone else
+before merging anything, and every remote refuses such a record. `haul show` and `haul list`
+judge a merged haul against this warehouse: `--json` carries `merge_proof` (`verdict`
+`verified`, `refuted` or `unproven`, with a `reason` unless verified), and the human views
+mark anything not verified — a warehouse behind its remote shows `unproven: not on target`
+until it lowers the target. `lift` sends `@haul` after the working pallet, and holds back a
+merge whose parcel the remote's target does not hold yet; lifting the target (lowering it
+first if someone else moved it) lets it go. A `lower` that replays a diverged `@haul` holds it
+the same way: once the target is lifted and lowered here, `lower` again. Either way, an
+operator who cannot lift the target drops the record instead, as the message names it:
+`lower --keep @haul:<haul>/state=theirs` puts back the remote's state of the haul and keeps
+its reviews and comments, or, for a haul the remote does not hold yet,
+`lower --keep @haul:<haul>=theirs` drops the haul.
+
 This release is **intra-warehouse** (pallet → pallet), and reviews are **recorded but not
-enforced** — anyone with write access to the target can merge (approval-gating is a later
-policy layer). Cross-warehouse forks come later. Requires an enrolled signing key.
+enforced** — any writer of the target can merge (approval-gating is a later policy layer).
+Cross-warehouse forks come later. Requires an enrolled signing key.
 
 ---
 

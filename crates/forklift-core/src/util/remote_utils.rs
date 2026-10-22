@@ -26,7 +26,7 @@ use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
-    bundle_utils, config_utils, file_utils, merge_utils, meta_tree, object_utils, office_utils,
+    bundle_utils, config_utils, file_utils, haul_utils, merge_utils, meta_tree, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils, trust_utils,
 };
 
@@ -6018,13 +6018,16 @@ pub struct MetaPalletLift {
     pub result: Result<LiftResult, String>,
 }
 
-/// Lift every *non-office* meta pallet (the manifest, and future ones) to the remote,
-/// after the office and trust are already established there. Meta pallets are ordinary
+/// Lift every meta pallet but the office and `@haul` (the manifest, tags, and future ones) to
+/// the remote, after the office and trust are already established there. Meta pallets are ordinary
 /// signed pallets from the server's point of view — object upload plus a fast-forward
 /// CAS — so this reuses `lift_pallet`; a diverged one fails (lower first), exactly like
 /// a working pallet. The office is excluded: it is lifted with the trust state
 /// (`push_local_trust`) so the remote holds the keys before any pallet that relies on
 /// them arrives.
+///
+/// `@haul` is lifted after the working pallet ([`lift_haul_pallet`]), since a merge it records
+/// may wait for that pallet's parcel.
 ///
 /// Each pallet is lifted on its own: one that fails is reported in its outcome, and the
 /// rest are still lifted.
@@ -6041,7 +6044,7 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
     let mut lifts = Vec::new();
 
     for name in pallet_utils::list_meta_pallets()? {
-        if name == OFFICE_PALLET_NAME {
+        if name == OFFICE_PALLET_NAME || name == haul_utils::HAUL_PALLET_NAME {
             continue;
         }
 
@@ -6064,6 +6067,53 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
     }
 
     Ok(lifts)
+}
+
+/// Lift the local `@haul` head, unless it would publish a merge record whose parcel the remote's
+/// target is not known to hold ([`haul_utils::held_by_lift`]): then nothing is lifted and the
+/// outcome fails naming each held record and its way out. Runs after the working pallet's lift
+/// attempt, whatever its outcome; `landed` is `(pallet, head)` when that lift landed, and stands
+/// in for the handshake's head of that pallet.
+///
+/// # Returns
+/// * `None` - There is no local `@haul` head.
+/// * `Some(MetaPalletLift)` - The lift, or why it failed or was held.
+pub async fn lift_haul_pallet(client: &RemoteClient,
+                              info: &WarehouseInfo,
+                              landed: Option<(&str, &str)>) -> Option<MetaPalletLift> {
+    let wire = pallet_utils::PalletRef::meta(haul_utils::HAUL_PALLET_NAME).to_wire();
+
+    let local_head = match pallet_utils::get_meta_pallet_head(haul_utils::HAUL_PALLET_NAME) {
+        Ok(Some(local_head)) => local_head,
+        Ok(None) => return None,
+        Err(why) => return Some(MetaPalletLift { pallet: wire, result: Err(why) }),
+    };
+
+    let remote_head = info.pallets.get(&wire).map(String::as_str);
+
+    let remote_target_head = |target: &str| match landed {
+        Some((pallet, head)) if pallet == target => Some(head.to_string()),
+        _ => info.pallets.get(target).cloned(),
+    };
+
+    let result = match haul_utils::held_by_lift(&local_head, remote_head, &remote_target_head) {
+        Err(why) => Err(why),
+        Ok(held) if !held.is_empty() => {
+            // A remote with no @haul gives "lower --keep" no remote side to keep.
+            let drop = match remote_head {
+                Some(_) => format!("; or drop the record with {}", haul_utils::drop_held(&held)),
+                None => String::new(),
+            };
+
+            Err(format!(
+                "{}. It goes once the remote's target holds the parcel: an operator who may write the target \
+                 lifts it (lowering it first when the remote's head is not held here), then lift again{}.",
+                haul_utils::describe_held(&held), drop))
+        }
+        Ok(_) => lift_pallet(client, &wire, &local_head, remote_head, info.chunking, &Progress::NONE).await,
+    };
+
+    Some(MetaPalletLift { pallet: wire, result })
 }
 
 /// Whether the local head of a meta pallet is ahead of the remote's: it descends from it and is

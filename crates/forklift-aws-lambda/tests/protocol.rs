@@ -611,6 +611,66 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
     assert!(err.message.contains("not an admin"), "{}", err.message);
 }
 
+/// A haul merge is admitted only from a writer of its target under the held office: the same
+/// @haul head is admitted under the office that let its signer write `main`, and refused under the
+/// office that ungranted it since.
+#[test]
+fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
+    let area = Area::new("haul-merge");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["palletize", "feat"]);
+    area.write_file("wh/feat.txt", "x\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "feature"]);
+    area.forklift("wh", &["shift", "main"]);
+    let opened = area.forklift_stdout("wh", &["--json", "haul", "open", "--target", "main", "--source", "feat", "--title", "Feat"]);
+    let id = serde_json::from_str::<serde_json::Value>(&opened).unwrap()["data"]["id"].as_str().unwrap().to_string();
+
+    let worker = "worker@forklift";
+    area.forklift("wh", &["config", "operator.identifier", worker]);
+    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    let admit: Vec<&str> = keygen.lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .collect();
+    area.forklift("wh", &admit);
+
+    area.forklift("wh", &["config", "operator.identifier", worker]);
+    area.forklift("wh", &["haul", "merge", &id]);
+    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+
+    let before = harvest(&area.path("wh"));
+    let office_wire = format!("@{}", OFFICE_PALLET_NAME);
+    let granting_office = before.head_of(&office_wire).expect("office head");
+    let haul = before.head_of("@haul").expect("haul head");
+
+    area.forklift("wh", &["office", "role", worker, "writer", "--pallet", "feat"]);
+    let after = harvest(&area.path("wh"));
+    let ungranting_office = after.head_of(&office_wire).expect("office head");
+
+    let lift = |office: &str| {
+        let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+        upload_all(&head, &after);
+        head.put_trust(&after.trust.clone().expect("trust")).expect("put trust");
+        head.ref_update(&office_wire, &RefUpdateRequest { old_head: None, new_head: office.to_string() })
+            .expect("lift office");
+
+        head.ref_update("@haul", &RefUpdateRequest { old_head: None, new_head: haul.clone() })
+    };
+
+    lift(&granting_office).expect("a merge by a writer of the target");
+
+    let err = lift(&ungranting_office).expect_err("a merge by a writer the held office ungranted");
+    assert_eq!(err.status, Status::Unprocessable);
+    assert!(err.message.contains("records a merge into main, but is signed by worker@forklift, who may not write it"), "{}", err.message);
+}
+
 /// FORK-220: an office parcel that oversteps its signer's privileges is a `403` on this head too,
 /// now that the chain walk finds it: a writer promoting themselves to admin. The same promotion
 /// signed by the admin is admitted, so the refusal is the signer's role and nothing else.

@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    audit_utils, config_utils, file_utils, kv_utils, merge_utils, object_utils,
+    audit_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
     pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
@@ -570,6 +570,24 @@ async fn replay(client: &RemoteClient,
         return Ok(Reconciled::Adopted);
     }
 
+    // A replay of @haul publishes its merge records only once the remote's target holds their
+    // parcels, as a lift does. Judged after the empty plan, so dropping the records still works.
+    let local_cells = meta_tree::cells_at(name, &local, rules)?;
+
+    if name == haul_utils::HAUL_PALLET_NAME {
+        let remote_target_head = |target: &str| info.pallets.get(target).cloned();
+        let held = haul_utils::held_merges(plan.changes(), local_cells.as_deref(), &remote_target_head)?;
+
+        if !held.is_empty() {
+            return Err(format!(
+                "{}. Once the remote's target holds the parcel (an operator who may write it lifts it \
+                there) and this warehouse holds that head (\"forklift lower\" on the target fetches \
+                it), run \"forklift lower\" again; or drop the record with {}.",
+                haul_utils::describe_held(&held), haul_utils::drop_held(&held)
+            ));
+        }
+    }
+
     let actor = config_utils::get_operator()?;
     let (office, signing_key_id) = verified_signing_office(&actor)?;
 
@@ -592,7 +610,6 @@ async fn replay(client: &RemoteClient,
 
     // The cells the replay re-signed: in the replayed parcel under the current key, stamped
     // with another key on the local side. Reported only once the replay is lifted.
-    let local_cells = meta_tree::cells_at(name, &local, rules)?;
     let mut resigned = Vec::new();
 
     let changes = meta_tree::net_diff(

@@ -5538,6 +5538,12 @@ fn haul_reviews_carry_signed_identity_and_merges() {
     assert_success(&warehouse.run(&["haul", "review", &id, "-m", "still good"]));
     assert_eq!(approvals(&warehouse), 1);
 
+    // Only a merged haul carries a merge proof.
+    let listed = |warehouse: &TestWarehouse| json(&warehouse.run(&["haul", "list", "--state", "all", "--json"]))["data"]["hauls"][0].clone();
+    assert!(listed(&warehouse).get("merge_proof").is_none(), "{}", listed(&warehouse));
+    assert!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"].get("merge_proof").is_none());
+    let before_merge = pallet_head_hash(&warehouse, "main");
+
     // Merge is recorded, not gated on the request-changes (MVP policy) → merged, and the
     // source's file is now on the target.
     assert_success(&warehouse.run(&["haul", "merge", &id]));
@@ -5546,12 +5552,75 @@ fn haul_reviews_carry_signed_identity_and_merges() {
     assert_eq!(shown["data"]["status"], "merged");
     assert!(shown["data"]["merge_parcel"].as_str().is_some_and(|p| p.len() == 64), "{}", shown);
 
+    // The target here holds the merge, so the record is verified, and says nothing more.
+    assert_eq!(shown["data"]["merge_proof"], serde_json::json!({"verdict": "verified"}), "{}", shown);
+    assert_eq!(listed(&warehouse)["merge_proof"], serde_json::json!({"verdict": "verified"}));
+    assert!(!stdout(&warehouse.run(&["haul", "show", &id])).contains("unproven"));
+
     // A merged haul is final.
     for action in ["reopen", "close", "update", "merge"] {
         let refused = warehouse.run(&["haul", action, &id]);
         assert!(!refused.status.success(), "haul {} of a merged haul must be refused", action);
         assert!(stderr(&refused).contains("merged"), "{}", stderr(&refused));
     }
+
+    // A target here that lacks the merge (a warehouse behind its remote, say) leaves the record
+    // unproven, and the human renders mark it.
+    std::fs::write(warehouse.root.join(".forklift").join("pallets").join("main"), format!("{}\n", before_merge)).unwrap();
+    assert_eq!(
+        json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["merge_proof"],
+        serde_json::json!({"verdict": "unproven", "reason": "not_on_target"}),
+    );
+    assert_eq!(listed(&warehouse)["merge_proof"]["reason"], "not_on_target");
+    for args in [&["haul", "show", &id][..], &["haul", "list", "--state", "merged"][..]] {
+        let rendered = stdout(&warehouse.run(args));
+        assert!(rendered.contains("unproven: not on target"), "{:?}: {}", args, rendered);
+    }
+}
+
+/// A merge records that its target took the haul, so only the target's writers record one, and a
+/// writer who may not is refused before anything is merged.
+#[test]
+fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
+    let warehouse = TestWarehouse::new("haul-merge-grant");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("base.txt", "base\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("feature.txt", "feat\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    assert_success(&warehouse.run(&["haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature"]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
+
+    let dev = keygen_admit_args(&warehouse, "dev@forklift");
+    assert_success(&warehouse.run(&["office", "admit", &dev[0], &dev[1], &dev[2], "--role", "writer", "--pallet", "feature"]));
+    let main = pallet_head_hash(&warehouse, "main");
+
+    assert_success(&warehouse.run(&["config", "operator.identifier", "dev@forklift"]));
+    let refused = warehouse.run(&["haul", "merge", &id]);
+    assert!(
+        stderr(&refused).contains("Operator dev@forklift may not write \"main\", and only its writers record a merge into it. Nothing was merged."),
+        "{}", stderr(&refused)
+    );
+    assert!(!refused.status.success());
+    assert_eq!(pallet_head_hash(&warehouse, "main"), main, "the target never took the merge");
+    assert!(!warehouse.root.join("feature.txt").exists());
+    assert!(!warehouse.root.join(".forklift/consolidation").exists());
+    assert_eq!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "open");
+
+    // Granted the target, the same writer merges.
+    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["office", "role", "dev@forklift", "writer", "--pallet", "feature", "--pallet", "main"]));
+    assert_success(&warehouse.run(&["config", "operator.identifier", "dev@forklift"]));
+    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_eq!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "merged");
 }
 
 /// Record text is authored by whoever wrote the record — a remote operator, once it syncs — so a
