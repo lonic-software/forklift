@@ -154,7 +154,7 @@ pub fn build_bundle() -> Result<BuildStats, String> {
     // deltas against it (the importer must have the base stored to reconstruct the delta).
     let order = topo_order_oldest_first(&parcels)?;
 
-    let plan = plan_emission(&order)?;
+    let plan = plan_emission(&order, PLAN_PARCEL_TREES)?;
     let mut depths: Vec<u32> = vec![0; plan.len()];
     let mut next = 0usize;
 
@@ -465,9 +465,11 @@ struct PlanWalk {
 /// its first parent's at the same path — a superset of the ones the walk will find unseen, since
 /// the parent is walked first. A tree the workers did not load (or failed to) is read by the walk.
 ///
+/// Workers load at most `parcel_trees` trees for any one parcel ([`PLAN_PARCEL_TREES`] in a build).
+///
 /// A chunked file anywhere in the closure, or a tree that cannot be read, refuses the build here,
 /// before any record is written.
-fn plan_emission(order: &[String]) -> Result<Vec<Emission>, String> {
+fn plan_emission(order: &[String], parcel_trees: usize) -> Result<Vec<Emission>, String> {
     let mut tree_of: HashMap<&str, String> = HashMap::new();
     let mut walks: Vec<(&str, String, Option<String>)> = Vec::new();
 
@@ -486,7 +488,7 @@ fn plan_emission(order: &[String]) -> Result<Vec<Emission>, String> {
         PLAN_BUDGET_ENTRIES,
         |(_, tree_hash, parent_tree)| {
             let mut changed: HashMap<String, TreeItem> = HashMap::new();
-            load_changed_trees(tree_hash, parent_tree.as_deref(), &mut changed);
+            load_changed_trees(tree_hash, parent_tree.as_deref(), parcel_trees, &mut changed);
             changed
         },
         |changed| changed.values().map(|tree| tree.get_files().len() + tree.get_subtrees().len()).sum(),
@@ -502,15 +504,16 @@ fn plan_emission(order: &[String]) -> Result<Vec<Emission>, String> {
 
 /// Load, into `changed`, the trees under `tree_hash` that differ from `parent_hash` — the tree at
 /// the same path in the parcel's first parent (`None`: there is none), stopping at
-/// [`PLAN_PARCEL_TREES`]. Best-effort: a tree that cannot be read is left out, for the walk to
+/// `limit` trees. Best-effort: a tree that cannot be read is left out, for the walk to
 /// read and refuse in order. Trees are parsed without the shared parsed-tree cache, as other
 /// one-shot walks do.
 fn load_changed_trees(tree_hash: &str,
                       parent_hash: Option<&str>,
+                      limit: usize,
                       changed: &mut HashMap<String, TreeItem>) {
     if parent_hash == Some(tree_hash)
         || changed.contains_key(tree_hash)
-        || changed.len() >= PLAN_PARCEL_TREES {
+        || changed.len() >= limit {
         return;
     }
 
@@ -521,7 +524,7 @@ fn load_changed_trees(tree_hash: &str,
         let parent_subtree = parent.as_ref()
             .and_then(|parent| parent.get_subtree(name))
             .map(|parent_subtree| parent_subtree.hash.as_str());
-        load_changed_trees(&subtree.hash, parent_subtree, changed);
+        load_changed_trees(&subtree.hash, parent_subtree, limit, changed);
     }
 
     changed.insert(tree_hash.to_string(), tree);
@@ -1935,27 +1938,44 @@ mod tests {
     }
 
     /// A parcel whose changed trees exceed what the build loads ahead for one parcel still has
-    /// every tree in its bundle: the walk reads the rest itself.
+    /// every tree in its plan: the walk reads the rest itself. (Run at a small cap, so the fixture
+    /// stays small: a build's own cap would need over a thousand stored trees.)
     #[test]
     fn a_bundle_carries_every_tree_of_a_parcel_past_the_prefetch_cap() {
         let _source = Scratch::new("bundle-prefetch-cap");
 
-        let directories: Vec<(String, String)> = (0..PLAN_PARCEL_TREES + 8)
+        const CAP: usize = 4;
+        let directories: Vec<(String, String, String)> = (0..3 * CAP)
             .map(|i| {
                 let blob = store_blob(format!("file {}", i).as_bytes());
-                (format!("d{}", i), store_tree(&[("f.txt", &blob)], &[]))
+                (format!("d{}", i), store_tree(&[("f.txt", &blob)], &[]), blob)
             })
             .collect();
         let subtrees: Vec<(&str, &str)> = directories.iter()
-            .map(|(name, hash)| (name.as_str(), hash.as_str()))
+            .map(|(name, hash, _)| (name.as_str(), hash.as_str()))
             .collect();
-        store_head_parcel(&store_tree(&[], &subtrees), &[]);
+        let root = store_tree(&[], &subtrees);
+        let parcel = store_head_parcel(&root, &[]);
 
         PLAN_WALK_READS.with(|reads| reads.set(0));
-        let stats = build_bundle().unwrap();
+        let plan = plan_emission(&[parcel.clone()], CAP).unwrap();
         assert!(PLAN_WALK_READS.with(|reads| reads.get()) > 0, "the walk read the trees past the cap");
-        // The parcel, its root, and each directory's tree and file.
-        assert_eq!(stats.objects, 2 + 2 * directories.len());
+
+        let planned = |kind: fn(&Emission) -> bool| -> HashSet<PlanHash> {
+            plan.iter().filter(|item| kind(item)).map(|item| *item.hash()).collect()
+        };
+        let hashes = |hashes: &mut dyn Iterator<Item = &String>| -> HashSet<PlanHash> {
+            hashes.map(|hash| plan_hash(hash).unwrap()).collect()
+        };
+        assert_eq!(plan.len(), 2 + 2 * directories.len(), "the parcel, its root, each tree and file");
+        assert_eq!(planned(|item| matches!(item, Emission::Parcel { .. })), hashes(&mut std::iter::once(&parcel)));
+        assert_eq!(planned(|item| matches!(item, Emission::Tree { .. })),
+                   hashes(&mut std::iter::once(&root).chain(directories.iter().map(|(_, tree, _)| tree))));
+        assert_eq!(planned(|item| matches!(item, Emission::Blob { .. })),
+                   hashes(&mut directories.iter().map(|(_, _, blob)| blob)));
+
+        let stats = build_bundle().unwrap();
+        assert_eq!(stats.objects, plan.len());
         assert_eq!(stats.deltas, 0);
     }
 
