@@ -1003,14 +1003,6 @@ pub(crate) fn require_signing_actor(actor: &Operator) -> Result<SigningActor, St
     Ok(SigningActor { state, office_head, signing_key_id, actor_id, anchor_bytes })
 }
 
-/// Require that trust is established; the error every signing command gives when it is not.
-pub(crate) fn require_trust() -> Result<(), String> {
-    match office_utils::read_trust_anchor()? {
-        Some(_) => Ok(()),
-        None => Err("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string()),
-    }
-}
-
 /// The operator's identifier in `state` and their active key present on this machine.
 pub(crate) fn signing_key_in(state: &OfficeState, actor: &Operator) -> Result<(String, String), String> {
     let Some(actor_id) = state.find_user(&actor.identifier).map(|user| user.identifier.clone()) else {

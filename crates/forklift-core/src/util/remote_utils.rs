@@ -5743,16 +5743,31 @@ pub async fn adopt_remote_trust(client: &RemoteClient,
     match &local_read {
         // First contact: the anchor and the office it governs land together, in one hold, after
         // every refusal above — an anchor written before one would stand unannounced, and the
-        // next sync, finding it held, would never announce it either. If the install fails,
-        // nothing is held, and the next sync adopts and announces it.
+        // next sync, finding it held, would never announce it either. A failed install that
+        // still landed (a write can land and fail) is announced in its error for the same reason;
+        // one that did not land holds nothing, and the next sync adopts and announces it.
         None => {
-            office_utils::install_trust(&office_utils::TrustInstall {
+            let installed = office_utils::install_trust(&office_utils::TrustInstall {
                 anchor: &remote_trust.to_anchor(),
                 replaces: None,
                 office: local_office_head.as_deref(),
                 new_office,
                 pallets: pallet_utils::PalletsPrecondition::NotConsumed,
-            })?;
+            });
+
+            if let Err(error) = installed {
+                let held = office_utils::read_trust_anchor().ok().flatten()
+                    .is_some_and(|anchor| anchor.genesis == remote_trust.genesis);
+
+                return Err(match held {
+                    true => format!(
+                        "{} This warehouse now holds the remote's trust anchor (genesis {}).",
+                        error, remote_trust.genesis
+                    ),
+                    false => error.to_string(),
+                });
+            }
+
             stats.office_moved = new_office.is_some();
             stats.adopted_genesis = Some(remote_trust.genesis.clone());
         }

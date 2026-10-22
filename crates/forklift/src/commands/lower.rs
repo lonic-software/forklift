@@ -613,7 +613,16 @@ async fn replay(client: &RemoteClient,
 
     remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), info.chunking, &Progress::NONE).await?;
     // Conditioned on the office the replay was signed and checked under, as every meta write is.
-    pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &office.preconditions())?;
+    // The remote already holds the replay, so a refusal says so rather than "nothing was written".
+    match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &office.preconditions()) {
+        Ok(()) => {}
+        Err(pallet_utils::RefUpdateError::OfficeMoved { .. } | pallet_utils::RefUpdateError::AnchorMoved) => return Err(format!(
+            "{} was lifted to the remote, but its local head was not moved: the office or the trust \
+            anchor it was signed under changed here meanwhile. Run \"forklift lower\" again to catch up.",
+            wire
+        )),
+        Err(error) => return Err(error.into()),
+    }
     restamped.extend(resigned);
 
     Ok(Reconciled::Replayed)
@@ -623,7 +632,6 @@ async fn replay(client: &RemoteClient,
 /// pallet's writes, and the key that signs them, are judged against the verified office, never the
 /// unverified local read.
 pub(crate) fn verified_signing_office(actor: &Operator) -> Result<(audit_utils::VerifiedOffice, String), String> {
-    office::require_trust()?;
     let office = audit_utils::verified_local_office()?;
     let (_, signing_key_id) = office::signing_key_in(&office, actor)?;
 
