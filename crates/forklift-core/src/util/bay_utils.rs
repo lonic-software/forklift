@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{cherry_pick_utils, file_utils, merge_utils, pallet_utils, park_utils, record_utils};
+use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, park_utils, record_utils};
 use crate::util::record_utils::RecordError;
 
 /// The file inside a bay's `.forklift` folder that names its warehouse, and so makes that folder a
@@ -616,8 +616,9 @@ pub enum BayReadPolicy {
 
 /// [`collect_bay_scoped_parcel_roots`]'s result.
 pub struct BayScopeOutcome {
-    /// Every listed dir's base, parked-parcel hashes and the parcels an in-progress consolidation
-    /// or cherry-pick records, from every bay this call could actually read.
+    /// Every listed dir's base, parked-parcel hashes, the parcels an in-progress consolidation
+    /// or cherry-pick records and the heads its journal's deletes removed, from every bay this
+    /// call could actually read.
     pub roots: Vec<String>,
     /// One plain-language note per bay skipped this call because its state could not be read —
     /// only ever populated under [`BayReadPolicy::Tolerate`] (always empty under `FailClosed`,
@@ -628,8 +629,9 @@ pub struct BayScopeOutcome {
 /// The bay-scoped parcel roots shared by **both**
 /// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots) and
 /// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set): across every entry of
-/// `dirs`, that bay's base, its parked parcels ([`park_utils::read_parked_in`]) and the parcels an
-/// in-progress consolidation or cherry-pick records — see [`read_one_bay_scoped_roots`].
+/// `dirs`, that bay's base, its parked parcels ([`park_utils::read_parked_in`]), the parcels an
+/// in-progress consolidation or cherry-pick records and the heads its undo journal's deletes
+/// removed — see [`read_one_bay_scoped_roots`].
 ///
 /// Takes the already-enumerated `dirs` — normally the caller's own [`all_bay_state_dirs`] call —
 /// rather than calling [`all_bay_state_dirs`] itself: both callers need at least one *other*
@@ -669,11 +671,12 @@ pub struct BayScopeOutcome {
 /// * `policy` - What to do with a bay whose state cannot be read — see [`BayReadPolicy`].
 ///
 /// # Returns
-/// * `Ok(BayScopeOutcome)` - Every readable dir's base, parked-parcel hashes and the parcels an
-///                           in-progress consolidation or cherry-pick records, in `dirs` order, plus (under `Tolerate`)
+/// * `Ok(BayScopeOutcome)` - Every readable dir's base, parked-parcel hashes, the parcels an
+///                           in-progress consolidation or cherry-pick records and the heads its
+///                           journal's deletes removed, in `dirs` order, plus (under `Tolerate`)
 ///                           a note for every bay that had to be skipped.
-/// * `Err(String)`         - Under `FailClosed`, some bay's `position`, `parked` or `consolidation` file
-///                           could not be read or was malformed — see above.
+/// * `Err(String)`         - Under `FailClosed`, some bay's `position`, `parked`, `consolidation`
+///                           or journal file could not be read or was malformed — see above.
 pub fn collect_bay_scoped_parcel_roots(
     dirs: &[PathBuf],
     policy: BayReadPolicy,
@@ -696,12 +699,13 @@ pub fn collect_bay_scoped_parcel_roots(
 
 /// One bay's own contribution to [`collect_bay_scoped_parcel_roots`] — the single read (the
 /// bay's base, parked parcels, then an in-progress consolidation's `their_head` and `our_head`,
-/// then an in-progress cherry-pick's `source` and `our_head`) both [`BayReadPolicy`] variants
+/// then an in-progress cherry-pick's `source` and `our_head`, then its journal's removed heads) both [`BayReadPolicy`] variants
 /// perform identically; only what happens to its `Err` differs, in the caller above. A recorded
 /// `our_head` is the completing parcel's parent, and the pallet may have moved off it since, so
 /// it is rooted in its own right. A pick's `source` is no parent of anything, yet the completing
 /// `stack` reads its authors, and no ref need still reach it. So is the base: an undo in another bay on the same pallet can
-/// put the ref back behind it, leaving the tree this bay holds reachable from no ref.
+/// put the ref back behind it, leaving the tree this bay holds reachable from no ref. So is every
+/// head a delete in the bay's journal removed: no ref reaches it, and its undo puts it back.
 fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
     let mut roots: Vec<String> = pallet_utils::read_position_in(dir)?.base.into_iter().collect();
 
@@ -716,6 +720,8 @@ fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
         roots.push(pick.source);
         roots.push(pick.our_head);
     }
+
+    roots.append(&mut journal_utils::removed_heads_in(dir)?);
 
     Ok(roots)
 }

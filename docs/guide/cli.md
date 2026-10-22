@@ -1504,8 +1504,10 @@ History those heads do not reach (stacks never lifted, or a remote that has move
 last `lower`) keeps whatever lifting it would read under the path. The report counts what was kept
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
 then run the same `scope-prune` again, which frees the rest. Other work that exists only here is
-never freed either, whatever its path: content loaded but not yet stacked, parked parcels, and an
-unfinished consolidation, in any bay. So you can park edits
+never freed either, whatever its path: content loaded but not yet stacked, parked parcels, an
+unfinished consolidation, and the history of a deleted pallet while `undo` can still bring it
+back, in any bay. The report counts that last keep apart (`kept_for_deleted`), since
+lifting cannot free it; it goes once the delete leaves the undo journal. So you can park edits
 under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
 `expand` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`

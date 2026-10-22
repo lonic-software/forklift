@@ -69,7 +69,7 @@ pub async fn handle_command() -> Result<(), String> {
     // entry left. An operation that moved no head (a consolidate or cherry-pick that stopped at
     // conflicts) takes no parcel off the pallet; undoing it only abandons what it left in progress.
     let undone = match entry.after.current_head() {
-        Some(after) if entry.before.heads.get(&entry.after.current_pallet) != Some(after) => after.clone(),
+        Some(after) if entry.before.head(&entry.after.current_pallet) != Some(after) => after.clone(),
         _ => String::new(),
     };
 

@@ -940,6 +940,12 @@ fn bulk_session_registry() -> &'static std::sync::Mutex<Option<Vec<(PathBuf, Pat
     SESSION.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Whether a [`BulkStoreSession`] is open in this process, so [`write_file_atomically`] would only
+/// stage a write rather than make it durable.
+pub(crate) fn is_bulk_session_open() -> bool {
+    bulk_session_registry().lock().expect("bulk store session lock poisoned").is_some()
+}
+
 /// A scoped bulk-store session: batches the *publish*, not just the fsync, for a burst of loose
 /// writes through [`write_file_atomically`] (only that function — `object_utils::store_object_stream`
 /// and every other writer are untouched and behave exactly as before).

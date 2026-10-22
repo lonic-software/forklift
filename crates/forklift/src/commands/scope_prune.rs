@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::error::{self, CoreError};
-use forklift_core::util::bay_utils;
+use forklift_core::util::{bay_utils, journal_utils};
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
@@ -62,7 +62,11 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     let store_access = StoreAccessLock::try_exclusive()?;
     let PruneRequest { post_prune, to_reclaim, all_resumed } = judge_request(&paths)?;
 
-    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &store_access)?;
+    // A deleted pallet's history is kept for as long as undo can bring the pallet back. Read under
+    // the hold, which keeps every delete and undo out until the prune ends: both are mutating
+    // commands, which main takes the store hold for shared (`Command::holds_store_access`).
+    let removed_heads = journal_utils::removed_heads()?;
+    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &store_access)?;
 
     if dry_run {
         output::emit(&PruneReport {
@@ -74,6 +78,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
             still_packed: plan.still_packed,
             retained_shared: plan.retained_shared,
             kept_unlifted: plan.kept_unlifted,
+            kept_for_deleted: plan.kept_for_deleted,
             unlifted_pallets: plan.unlifted_pallets.clone(),
             all_resumed,
         });
@@ -100,6 +105,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
         still_packed: plan.still_packed,
         retained_shared: plan.retained_shared,
         kept_unlifted: plan.kept_unlifted,
+        kept_for_deleted: plan.kept_for_deleted,
         unlifted_pallets: plan.unlifted_pallets,
         all_resumed,
     });
@@ -269,6 +275,11 @@ pub(crate) struct PruneReport {
     /// path frees them once that history is lifted.
     kept_unlifted: usize,
 
+    /// Candidates kept because lifting the unlifted history of a pallet deleted here reads them,
+    /// while `undo` can still bring that pallet back. Lifting cannot free these; a later prune
+    /// does once the delete can no longer be undone.
+    kept_for_deleted: usize,
+
     /// The pallets whose unlifted history changed the pruned path; lifting them (or lowering) is
     /// what lets a later prune free the rest. Pallets with unlifted work elsewhere are not listed,
     /// and it can be empty when gaps in the history hide which pallet leads to the kept work.
@@ -349,6 +360,15 @@ impl CommandOutput for PruneReport {
                 them{}; some may be the only copy. Lift that work (or lower, if the remote is \
                 ahead), then run \"scope-prune {}{}\" again to free them.",
                 self.kept_unlifted, pallets, separator, paths
+            );
+        }
+
+        if self.kept_for_deleted > 0 {
+            println!(
+                "{} object(s) were kept because they belong to unlifted history of a pallet deleted \
+                here, which \"undo\" can still bring back; a later prune frees them once that delete \
+                can no longer be undone.",
+                self.kept_for_deleted
             );
         }
 
