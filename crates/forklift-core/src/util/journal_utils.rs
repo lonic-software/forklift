@@ -1000,6 +1000,26 @@ mod tests {
         assert!(snapshot.consolidation.is_none());
     }
 
+    /// Only a delete records a removal, and it writes its entry itself: an ordinary journaled
+    /// command whose writes include one refuses to journal it, leaving the journal readable,
+    /// rather than writing an entry every later read would refuse. Mutation: drop the entry
+    /// check from `push_if_changed` → red (the journal becomes unreadable).
+    #[test]
+    fn push_if_changed_refuses_an_entry_with_a_removal() {
+        let _scratch = Scratch::new("push-removal");
+        advance("main", None, &hash('1')).unwrap();
+        pallet_utils::update_pallet_head("side", None, &hash('3'), &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let before = capture().unwrap();
+        advance("main", Some(&hash('1')), &hash('2')).unwrap();
+        pallet_utils::remove_pallet_head_in(PalletNamespace::User, "side", &hash('3'),
+                                            &pallet_utils::RefPreconditions::NONE, None).unwrap();
+
+        let refused = push_if_changed("stack", before);
+        assert!(refused.is_err_and(|error| error.contains("with a removal it cannot have made")));
+        assert!(read().unwrap().is_empty(), "the journal stays readable, with nothing journaled");
+    }
+
     #[test]
     fn push_if_changed_is_a_noop_when_the_current_pallet_is_unborn() {
         let _scratch = Scratch::new("push-unborn");
