@@ -3216,6 +3216,62 @@ mod tests {
         ]
     }
 
+    // Revert: drop the merged filter, or skip closed hauls, or skip a state that does not read in
+    // unmerged_haul_heads → the heads differ, or the unreadable state reads as no head; in
+    // gc_root_sources, tolerate it under FailClosed or refuse it under Tolerate → red.
+    #[test]
+    fn every_haul_not_yet_merged_roots_its_head_and_an_unreadable_state_refuses() {
+        use haul_utils::HaulStatus;
+
+        let _scratch = Scratch::new("haul-heads");
+        let alice = Key::new("alice", 1);
+        assert!(haul_utils::unmerged_haul_heads().unwrap().is_empty(), "an unborn @haul proposes nothing");
+
+        let haul = |title: &str| haul_utils::Opened { title: title.to_string(), ..proposal("alice") };
+        let (open, closed, merged) = ("a1".repeat(32), "c1".repeat(32), "e1".repeat(32));
+        let mut edits = Vec::new();
+
+        for (title, status, head) in [
+            ("open", HaulStatus::Open, &open),
+            ("closed", HaulStatus::Closed, &closed),
+            ("merged", HaulStatus::Merged("f1".repeat(32)), &merged),
+        ] {
+            let dir = haul_utils::haul_dir(&haul(title).id());
+            edits.push(set(&format!("{}/state", dir), &state_cell(&alice, &status, head)));
+            // A review names a head too, but never one a merge reads.
+            edits.push(set(
+                &format!("{}/review/{}", dir, "0d".repeat(32)),
+                &haul_cell(alice.id(), haul_utils::SCHEMA_REVIEW, &haul_utils::review_value(
+                    haul_utils::ReviewVerdict::Approve, "", &"0e".repeat(32), 1,
+                )),
+            ));
+        }
+
+        let head = haul_parcel(None, &alice, &edits);
+        pallet_utils::update_meta_pallet_head("haul", None, &head, &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let mut heads = haul_utils::unmerged_haul_heads().unwrap();
+        heads.sort();
+        assert_eq!(heads, vec![open.clone(), closed.clone()]);
+
+        // A newer forklift's state may name a head this build cannot see: refused, never skipped.
+        let newer = haul_utils::haul_dir(&haul("newer").id());
+        let mut value = Table::new();
+        value.insert("head", toml_edit::value("b1".repeat(32)));
+        let unreadable = haul_parcel(Some(&head), &alice, &[set(&format!("{}/state", newer), &haul_cell(alice.id(), "haul.state 2", &value))]);
+        pallet_utils::update_meta_pallet_head("haul", Some(&head), &unreadable, &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let error = haul_utils::unmerged_haul_heads().unwrap_err();
+        assert!(error.contains("haul.state 2"), "{}", error);
+
+        // gc and prune refuse on it; heal reads past it and says so.
+        use crate::util::{bay_utils::BayReadPolicy, office_utils::TrustPinReadPolicy, recovery_utils};
+        let refused = recovery_utils::gc_root_sources(&[], BayReadPolicy::FailClosed, TrustPinReadPolicy::FailClosed);
+        assert!(refused.err().unwrap_or_default().contains("haul.state 2"));
+        let tolerated = recovery_utils::gc_root_sources(&[], BayReadPolicy::Tolerate, TrustPinReadPolicy::Tolerate).unwrap();
+        assert!(tolerated.degraded.iter().any(|note| note.contains("haul.state 2")), "{:?}", tolerated.degraded);
+    }
+
     #[test]
     fn a_haul_is_opened_once_in_its_openers_name_with_a_state() {
         use haul_utils::HaulStatus;

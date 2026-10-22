@@ -77,8 +77,15 @@ pub struct PrunePlan {
     /// stacked here and never lifted, or lifted to a remote head this warehouse has not lowered
     /// since. Some may be the only copy; the rest are the base trees that lift compares against.
     /// A later prune of the same path frees them once the remote's heads reach that history.
-    /// Excludes what only a deleted pallet's history reads, counted in `kept_for_deleted`.
+    /// Excludes what only a haul's or a deleted pallet's history reads, counted in
+    /// `kept_for_hauls` and `kept_for_deleted`.
     pub kept_unlifted: usize,
+
+    /// Candidates kept because lifting the unlifted history a haul not yet merged proposes reads
+    /// them, where no pallet reaches it any more. Lifting cannot free these; merging the haul
+    /// puts that history on its target, and a prune after the target is lifted frees them. A
+    /// closed haul keeps them, since reopening it proposes the same head.
+    pub kept_for_hauls: usize,
 
     /// Candidates kept because lifting the unlifted history of a pallet deleted here, which
     /// `undo` can still put back, reads them. Lifting cannot free these; a later prune does once
@@ -123,23 +130,44 @@ pub fn plan_prune(
     removed_heads: &[String],
     _store_access: &StoreAccessExclusive,
 ) -> Result<PrunePlan, String> {
+    plan_from(pruned_prefixes, post_prune, remote_heads, removed_heads, root_sources()?)
+}
+
+/// [`plan_prune`] over root sources already read, the haul heads among them: one read serves
+/// both the history a haul holds and the local roots.
+fn plan_from(
+    pruned_prefixes: &[String],
+    post_prune: &MaterializationScope,
+    remote_heads: &[String],
+    removed_heads: &[String],
+    sources: recovery_utils::GcRootSources,
+) -> Result<PrunePlan, String> {
     let (live_parcels, meta_parcels) = reachable_parcels()?;
-    let user_parcels = with_removed(&live_parcels, removed_heads)?;
-    let local = local_roots(&user_parcels, &meta_parcels)?;
+    // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
+    // recorded head, which no ref need still reach.
+    let proposed = gc_utils::collect_reachable_for_sweep(&sources.haul_heads)?;
+    let removed = gc_utils::collect_reachable_for_sweep(removed_heads)?;
+    let user_parcels = with_held(&live_parcels, proposed.iter().chain(&removed));
+    let local = local_roots(&user_parcels, &meta_parcels, sources)?;
 
     let mut retained = collect_retained(&user_parcels, &meta_parcels, post_prune)?;
     retain_local_closure(&local, post_prune, &mut retained)?;
 
     let unlifted = unlifted_parcels(&user_parcels, remote_heads)?;
 
-    // The live pallets' unlifted history and a deleted pallet's are judged apart, each once: the
-    // report counts the second apart because lifting cannot free it. retain_unlifted judges one
-    // parcel at a time, so the two keeps together are exactly the keep of the whole.
+    // The live pallets' unlifted history, a haul's and a deleted pallet's are judged apart, each
+    // once: the report counts the last two apart because lifting cannot free them. A parcel both
+    // a haul and a delete hold counts for the haul. retain_unlifted judges one parcel at a time,
+    // so the keeps together are exactly the keep of the whole.
     let live: HashSet<&String> = live_parcels.iter().collect();
-    let (live_unlifted, deleted_unlifted): (HashSet<String>, HashSet<String>) =
+    let (live_unlifted, held_unlifted): (HashSet<String>, HashSet<String>) =
         unlifted.iter().cloned().partition(|parcel| live.contains(parcel));
+    let (haul_unlifted, deleted_unlifted): (HashSet<String>, HashSet<String>) =
+        held_unlifted.into_iter().partition(|parcel| proposed.contains(parcel));
     let (kept_for_live, mut touching) = retain_unlifted(&live_unlifted, pruned_prefixes)?;
+    let (kept_for_proposed, touching_proposed) = retain_unlifted(&haul_unlifted, pruned_prefixes)?;
     let (kept_for_removed, touching_removed) = retain_unlifted(&deleted_unlifted, pruned_prefixes)?;
+    touching.extend(touching_proposed);
     touching.extend(touching_removed);
 
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
@@ -151,6 +179,7 @@ pub fn plan_prune(
     let mut still_packed = 0usize;
     let mut retained_shared = 0usize;
     let mut kept_unlifted = 0usize;
+    let mut kept_for_hauls = 0usize;
     let mut kept_for_deleted = 0usize;
 
     for hash in &targets {
@@ -170,6 +199,11 @@ pub fn plan_prune(
         // Lifting history the remote is not known to hold reads it: it may be the only copy.
         if kept_for_live.contains(hash) {
             kept_unlifted += 1;
+            continue;
+        }
+
+        if kept_for_proposed.contains(hash) {
+            kept_for_hauls += 1;
             continue;
         }
 
@@ -198,19 +232,17 @@ pub fn plan_prune(
         }
     }
 
-    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_deleted, unlifted_pallets })
+    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_deleted, unlifted_pallets })
 }
 
-/// `live_parcels`, then every parcel the removed heads reach that they do not: the user history a
-/// prune judges once deleted pallets that can still be restored count as pallets.
-fn with_removed(live_parcels: &[String], removed_heads: &[String]) -> Result<Vec<String>, String> {
-    let live: HashSet<&String> = live_parcels.iter().collect();
-    let extra: Vec<String> = gc_utils::collect_reachable_for_sweep(removed_heads)?
-        .into_iter()
-        .filter(|parcel| !live.contains(parcel))
-        .collect();
+/// `live_parcels`, then every `held` parcel they do not reach, once: the user history a prune
+/// judges once deleted pallets that can still be restored, and hauls not yet merged, count as
+/// pallets.
+fn with_held<'a>(live_parcels: &[String], held: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut seen: HashSet<&String> = live_parcels.iter().collect();
+    let extra: Vec<String> = held.filter(|parcel| seen.insert(*parcel)).cloned().collect();
 
-    Ok(live_parcels.iter().cloned().chain(extra).collect())
+    live_parcels.iter().cloned().chain(extra).collect()
 }
 
 /// The user-pallet parcels the remote is not known to hold: every one that no remote head
@@ -462,8 +494,16 @@ struct LocalRoots {
     staged: Vec<(String, DirEntryType)>,
 }
 
-/// Collect [`LocalRoots`] from [`recovery_utils::gc_root_sources`], fail-closed: a bay, shard or
-/// office record that cannot be read aborts the prune before anything is narrowed or freed.
+/// The gc root sources a prune reads, fail-closed: a haul, bay, shard or office record that
+/// cannot be read aborts the prune before anything is narrowed or freed.
+fn root_sources() -> Result<recovery_utils::GcRootSources, String> {
+    let bay_dirs = bay_utils::all_bay_state_dirs()?;
+    recovery_utils::gc_root_sources(
+        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+    )
+}
+
+/// Collect [`LocalRoots`] from the [`root_sources`] the plan read.
 ///
 /// These used to be omitted on the argument that whatever a transient state references under
 /// the pruned path is out of scope after the prune. That holds per path but not per object:
@@ -474,12 +514,8 @@ struct LocalRoots {
 /// # Arguments
 /// * `user_parcels` - The parcels the user pallet heads reach, already retained.
 /// * `meta_parcels` - The parcels the meta pallet heads reach, already retained.
-fn local_roots(user_parcels: &[String], meta_parcels: &[String]) -> Result<LocalRoots, String> {
-    let bay_dirs = bay_utils::all_bay_state_dirs()?;
-    let sources = recovery_utils::gc_root_sources(
-        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
-    )?;
-
+/// * `sources`      - The root sources; their haul heads are already in `user_parcels`.
+fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recovery_utils::GcRootSources) -> Result<LocalRoots, String> {
     let known: HashSet<&String> = user_parcels.iter().chain(meta_parcels).collect();
     let mut roots: Vec<String> = sources.parcels.into_iter().filter(|p| !known.contains(p)).collect();
     roots.extend(sources.pin_parcels.into_iter().map(|(p, _)| p).filter(|p| !known.contains(p)));
@@ -1124,11 +1160,27 @@ mod tests {
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access()).unwrap();
         assert!(plan.to_free.contains(&f.web_tree), "with no removed head the parent's web tree is freed");
 
+        // A haul proposing that head keeps the same history, counted apart; held by both, it
+        // counts for the haul. Mutation: leave the haul heads out of the held heads → the parent's
+        // web tree is freed.
+        let proposing = |head: &String| {
+            let mut sources = root_sources().unwrap();
+            sources.haul_heads = vec![head.clone()];
+            sources
+        };
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], proposing(&deleted)).unwrap();
+        assert_eq!(plan.to_free, vec![f.web_blob.clone()], "a haul's proposed history is kept like a deleted pallet's");
+        assert_eq!((plan.kept_for_hauls, plan.kept_for_deleted, plan.kept_unlifted), (3, 0, 0));
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], proposing(&deleted)).unwrap();
+        assert_eq!((plan.kept_for_hauls, plan.kept_for_deleted), (3, 0));
+
         // A live pallet sharing the unlifted history counts it as its own.
         pallet_utils::update_pallet_head("feature", None, &deleted, &pallet_utils::RefPreconditions::NONE).unwrap();
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], &store_access())
             .unwrap();
         assert_eq!((plan.kept_unlifted, plan.kept_for_deleted), (3, 0));
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], proposing(&deleted)).unwrap();
+        assert_eq!((plan.kept_unlifted, plan.kept_for_hauls), (3, 0), "a live pallet's own history counts for it");
     }
 
     #[test]

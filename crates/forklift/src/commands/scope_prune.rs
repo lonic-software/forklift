@@ -65,6 +65,8 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     // A deleted pallet's history is kept for as long as undo can bring the pallet back. Read under
     // the hold, which keeps every delete and undo out until the prune ends: both are mutating
     // commands, which main takes the store hold for shared (`Command::holds_store_access`).
+    // The plan reads the head a haul not yet merged proposes under the same hold: every haul
+    // write takes it shared.
     let removed_heads = journal_utils::removed_heads()?;
     let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &store_access)?;
 
@@ -78,6 +80,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
             still_packed: plan.still_packed,
             retained_shared: plan.retained_shared,
             kept_unlifted: plan.kept_unlifted,
+            kept_for_hauls: plan.kept_for_hauls,
             kept_for_deleted: plan.kept_for_deleted,
             unlifted_pallets: plan.unlifted_pallets.clone(),
             all_resumed,
@@ -105,6 +108,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
         still_packed: plan.still_packed,
         retained_shared: plan.retained_shared,
         kept_unlifted: plan.kept_unlifted,
+        kept_for_hauls: plan.kept_for_hauls,
         kept_for_deleted: plan.kept_for_deleted,
         unlifted_pallets: plan.unlifted_pallets,
         all_resumed,
@@ -275,6 +279,12 @@ pub(crate) struct PruneReport {
     /// path frees them once that history is lifted.
     kept_unlifted: usize,
 
+    /// Candidates kept because lifting the unlifted history a haul not yet merged proposes reads
+    /// them, where no pallet reaches it any more. Lifting cannot free these; once the haul is
+    /// merged and its target lifted, a later prune does. A closed haul keeps them, since
+    /// reopening it proposes the same head.
+    kept_for_hauls: usize,
+
     /// Candidates kept because lifting the unlifted history of a pallet deleted here reads them,
     /// while `undo` can still bring that pallet back. Lifting cannot free these; a later prune
     /// does once the delete can no longer be undone.
@@ -360,6 +370,16 @@ impl CommandOutput for PruneReport {
                 them{}; some may be the only copy. Lift that work (or lower, if the remote is \
                 ahead), then run \"scope-prune {}{}\" again to free them.",
                 self.kept_unlifted, pallets, separator, paths
+            );
+        }
+
+        if self.kept_for_hauls > 0 {
+            println!(
+                "{} object(s) were kept because they belong to unlifted history that a haul not yet \
+                merged proposes and no pallet holds; a later prune frees them once that haul is \
+                merged and its target lifted. A closed haul keeps them, since reopening it proposes \
+                the same head.",
+                self.kept_for_hauls
             );
         }
 

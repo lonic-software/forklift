@@ -1,8 +1,8 @@
 //! Garbage collection of unreferenced objects (DESIGN.html §4.5).
 //!
 //! A failed or abandoned lift leaves verified objects with no ref pointing at them.
-//! The collector marks everything reachable from the GC roots — every pallet head and
-//! trust pin, plus every bay's base, parked parcels, in-progress consolidation or cherry-pick
+//! The collector marks everything reachable from the GC roots — every pallet head, trust pin
+//! and head a haul not yet merged proposes, plus every bay's base, parked parcels, in-progress consolidation or cherry-pick
 //! and staged inventory, when those local states exist — and sweeps the rest, with an mtime grace
 //! period protecting the objects of in-flight lifts.
 //!
@@ -169,8 +169,8 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// allowed to differ here the way they already differ on an unreadable bay
 /// (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
-    // Pallet heads (both namespaces), bay-scoped parcel roots, trust-pin roots and staged shard
-    // leaves: the sources this function shares, hash for hash, with
+    // Pallet heads (both namespaces), haul heads, bay-scoped parcel roots, trust-pin roots and
+    // staged shard leaves: the sources this function shares, hash for hash, with
     // `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`, so the two
     // cannot drift apart (see that function's doc comment, and `collect_walk_roots`' for the
     // superset invariant this list must stay a subset of). GC does
@@ -190,6 +190,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     )?;
 
     let mut roots: Vec<String> = sources.parcels;
+    roots.extend(sources.haul_heads);
     roots.extend(sources.pin_parcels.into_iter().map(|(hash, _policy)| hash));
 
     let parcels = collect_reachable_for_sweep(&roots)?;

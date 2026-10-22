@@ -988,6 +988,42 @@ pub fn record_state(haul_id: &str,
     stack(&[edit], office, actor, &format!("{} haul {}.", action, short(haul_id)), signer)
 }
 
+/// The heads every haul not yet merged proposes, at the local `@haul` head: the gc roots a haul
+/// adds. `haul merge` merges the recorded head, not the source pallet's current one, and no ref
+/// need still reach it once the source moves on, so it stays live while the haul can still be
+/// merged — a closed haul included, since reopening it proposes the same head again.
+///
+/// Only the `state` cells are read, and each must read: a state this build cannot read may name
+/// a head, so it is an error, never a haul taken to propose nothing. Every other cell, and any
+/// path outside a haul's known shape, names no head the haul merges, and is not read.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The proposed heads, in path order; empty while `@haul` is unborn.
+/// * `Err(String)`     - If the `@haul` head could not be read, or a state cell could not be.
+pub fn unmerged_haul_heads() -> Result<Vec<String>, String> {
+    let Some(state) = meta_tree::read_meta_head(HAUL_PALLET_NAME, &HaulRules)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut heads = Vec::new();
+
+    for (path, cell) in &state.cells {
+        let Ok(CellPath { haul, name: CellName::State }) = parse_cell_path(path) else {
+            continue;
+        };
+
+        let (status, head) = readable(path, cell, SCHEMA_STATE)
+            .and_then(|envelope| parse_state(&envelope.value).map_err(|why| format!("the state of haul {} {}", short(haul), why)))
+            .map_err(|why| format!("The proposed head of a haul could not be read: {}.", why))?;
+
+        if !matches!(status, HaulStatus::Merged(_)) {
+            heads.push(head);
+        }
+    }
+
+    Ok(heads)
+}
+
 /// A short display form of a haul id.
 fn short(id: &str) -> String {
     id.chars().take(12).collect()

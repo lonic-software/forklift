@@ -675,8 +675,8 @@ pub struct BayScopeOutcome {
 /// data loss (`heal` clearing a taint over an object `gc` still refuses to delete, or `gc`
 /// deleting an object `heal` would have called live). Both additionally add every bay's staged
 /// inventory shard leaves (FORK-156) and the shared trust-pin roots (`adopts`, the enrollment
-/// `boundary` snapshot, and every key's revocation `distrust_boundary` — FORK-81), via
-/// `recovery_utils::gc_root_sources`. Neither of those is part of this helper — only the portion
+/// `boundary` snapshot, and every key's revocation `distrust_boundary` — FORK-81) and the head
+/// every haul not yet merged proposes (FORK-256), via `recovery_utils::gc_root_sources`. Neither of those is part of this helper — only the portion
 /// the two loops had in common.
 ///
 /// **`policy` decides what an unreadable bay does — see [`BayReadPolicy`].** gc's call site

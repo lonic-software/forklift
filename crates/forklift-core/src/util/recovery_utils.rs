@@ -241,7 +241,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    bay_utils, file_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
+    bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
     pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
     taint_utils,
 };
@@ -1421,6 +1421,12 @@ struct WalkRoots {
     /// tolerance, exactly like any other reachable parcel — the gc⊆heal superset invariant (see
     /// this struct's own home, [`collect_walk_roots`]'s doc comment) requires it.
     pin_parcels: Vec<(String, office_utils::PinAbsencePolicy)>,
+    /// The head every haul not yet merged proposes ([`GcRootSources::haul_heads`]), walked like a
+    /// `Gap`-policy pin: a haul opened elsewhere declares a head this warehouse may never have
+    /// fetched, so its absence is never reported as a dangling reference. No note names one
+    /// either: `haul merge` says so when it needs the head. Like a `Gap` pin, this cannot tell a
+    /// head never fetched from one held here and then lost to damage: both read as absent.
+    haul_heads: Vec<String>,
     /// Object hashes a staged inventory shard (of any bay) references directly (never through a
     /// parcel), with the entry's type (so a chunked file's recipe is still descended into for its
     /// chunks).
@@ -1442,6 +1448,10 @@ pub(crate) struct GcRootSources {
     /// Every pallet head (both namespaces) plus every readable bay's base, parked parcels and
     /// in-progress consolidation and cherry-pick parcels.
     pub parcels: Vec<String>,
+    /// The head every haul not yet merged proposes ([`haul_utils::unmerged_haul_heads`]). Kept
+    /// apart from [`Self::parcels`] because a haul opened elsewhere *declares* its head, which
+    /// this warehouse may never have fetched: its absence is a gap, never lost data.
+    pub haul_heads: Vec<String>,
     /// Every trust-pin root this call could establish, each paired with its own
     /// [`office_utils::PinAbsencePolicy`] — see [`gc_root_sources`]'s own doc comment for why the
     /// policy tag rides along instead of being stripped here.
@@ -1452,9 +1462,9 @@ pub(crate) struct GcRootSources {
     /// without these leaves would let gc or a repack delete a user's loaded-but-unstacked work
     /// (FORK-156).
     pub shard_leaves: Vec<(String, DirEntryType)>,
-    /// One plain-language note per bay or office-record read this call had to skip rather than
-    /// abort on — only ever populated when both `bay_policy` and `pin_policy` were passed as
-    /// their respective `Tolerate` variant.
+    /// One plain-language note per haul, bay or office-record read this call had to skip rather
+    /// than abort on: a haul or bay note only under `bay_policy`'s `Tolerate`, an office-record
+    /// note only under `pin_policy`'s.
     pub degraded: Vec<String>,
 }
 
@@ -1479,9 +1489,12 @@ pub(crate) struct GcRootSources {
 /// `bay_policy`/`pin_policy` let each caller keep its own fail-closed/tolerant contract — see
 /// [`bay_utils::BayReadPolicy`] and [`office_utils::TrustPinReadPolicy`] for the full reasoning
 /// (gc's and prune's `FailClosed`/`FailClosed`, heal's `Tolerate`/`Tolerate`). They govern the
-/// bay-scoped parcels and the office record only. The staged shards are always read fail-closed:
-/// a shard that exists but cannot be read or parsed may name the only copy of staged work. A
-/// shard or folder that vanishes mid-walk is no reference at all and is skipped.
+/// bay-scoped parcels and the office record only, and `bay_policy` the hauls' proposed heads too
+/// ([`haul_utils::unmerged_haul_heads`]): a haul names its head in a meta cell, not a ref, so a
+/// source pallet moved or deleted off that head leaves the haul its only holder. The staged
+/// shards are always read fail-closed: a shard that exists but cannot be read or parsed may name
+/// the only copy of staged work. A shard or folder that vanishes mid-walk is no reference at all
+/// and is skipped.
 ///
 /// # Arguments
 /// * `bay_dirs`   - The bay-local state dirs to read, in order — the caller's own
@@ -1494,8 +1507,8 @@ pub(crate) struct GcRootSources {
 ///                  `distrust_boundary` pins.
 ///
 /// # Returns
-/// * `Ok(GcRootSources)` - Every pallet head, every readable bay's parked-parcel/consolidation
-///                         roots, every trust-pin root this call could establish, and every staged
+/// * `Ok(GcRootSources)` - Every pallet head, every haul's proposed head not yet merged, every
+///                         readable bay's parked-parcel/consolidation roots, every trust-pin root this call could establish, and every staged
 ///                         shard leaf of every bay.
 /// * `Err(String)`        - Under either policy's fail-closed branch, if the trust file itself
 ///                         could not be read (always fail-closed regardless of `pin_policy` — see
@@ -1512,9 +1525,29 @@ pub(crate) fn gc_root_sources(
         parcels.push(head);
     }
 
+    // A haul's proposed head is merged from the recorded hash, whatever its source pallet holds
+    // now. Read under `bay_policy`: like a bay's state, it is a record outside the pallet refs
+    // that names a head a later command reads.
+    let mut degraded: Vec<String> = Vec::new();
+    let haul_heads = match haul_utils::unmerged_haul_heads() {
+        Ok(heads) => heads,
+        Err(e) => match bay_policy {
+            bay_utils::BayReadPolicy::FailClosed => return Err(e),
+            bay_utils::BayReadPolicy::Tolerate => {
+                degraded.push(format!(
+                    "the hauls could not be read this run ({}); their proposed heads were treated as \
+                    held by nothing rather than blocking this command. If a newer forklift wrote them, \
+                    upgrade, then run this command again.",
+                    e
+                ));
+                Vec::new()
+            }
+        },
+    };
+
     let bay_scope = bay_utils::collect_bay_scoped_parcel_roots(bay_dirs, bay_policy)?;
     parcels.extend(bay_scope.roots);
-    let mut degraded = bay_scope.degraded;
+    degraded.extend(bay_scope.degraded);
 
     let trust_pins = office_utils::collect_trust_pin_roots(pin_policy)?;
     if let Some(note) = trust_pins.degraded {
@@ -1529,7 +1562,7 @@ pub(crate) fn gc_root_sources(
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_leaves)?;
     }
 
-    Ok(GcRootSources { parcels, pin_parcels: trust_pins.roots, shard_leaves, degraded })
+    Ok(GcRootSources { parcels, haul_heads, pin_parcels: trust_pins.roots, shard_leaves, degraded })
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -1546,7 +1579,7 @@ pub(crate) fn gc_root_sources(
 ///
 /// **Invariant with [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set):**
 /// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
-/// bay's parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
+/// head a haul not yet merged proposes, every bay's parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
 /// and every trust-pin root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
 /// `distrust_boundary`, FORK-81 — and every bay's staged inventory shard leaves, FORK-156). If
 /// gc ever treats an object as live, this walk must never call the same object safe to drop —
@@ -1608,6 +1641,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         tag_subjects,
         tags_unread,
         pin_parcels: sources.pin_parcels,
+        haul_heads: sources.haul_heads,
         shard_referenced: sources.shard_leaves,
         degraded_sources: sources.degraded,
     })
@@ -2017,6 +2051,7 @@ fn walk_closure_for(
         .cloned()
         .map(|hash| (hash, AbsencePolicy::Report))
         .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
+        .chain(roots.haul_heads.iter().map(|hash| (hash.clone(), AbsencePolicy::Gap)))
         .collect();
 
     drain_parcel_queue(
@@ -4343,6 +4378,57 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// FORK-256: a haul's proposed head is declared, so heal never reports it absent, while a
+    /// present one's history is walked like any root: its lost parent is reported. Mutation: queue
+    /// `roots.haul_heads` with `AbsencePolicy::Report` in `walk_closure_for` → the absent head
+    /// reaches the sink → red; drop them from the queue → the lost parent is never reported → red.
+    #[test]
+    fn an_absent_haul_head_is_a_gap_and_a_present_one_is_walked() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-haul-heads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+
+        let mut tree_object = LooseObjectBuilder::build_tree(
+            &TreeItem::new(String::new(), String::new(), DirEntryType::Tree),
+        );
+        tree_object.store().unwrap();
+        let lost_parent = "b".repeat(64);
+        let mut proposed = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_object.hash.clone(), parents: vec![lost_parent.clone()],
+            actions: Vec::new(), description: None,
+        });
+        proposed.store().unwrap();
+
+        let never_fetched = "a".repeat(64);
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: Vec::new(),
+            haul_heads: vec![never_fetched.clone(), proposed.hash.clone()],
+            shard_referenced: Vec::new(),
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: Vec<String> = Vec::new();
+        {
+            let mut sink = |hash: &str| reported.push(hash.to_string());
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), Some(&mut sink)).unwrap();
+        }
+        assert_eq!(reported, vec![lost_parent.clone()]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// FORK-83: tags are never walked, only classified for notes. A present tag-only parcel's
     /// own absent parent is never reported and never counts as a referenced target (gc may
     /// collect anything only a tag reaches), and neither does an absent tag subject that is
@@ -4390,6 +4476,7 @@ mod tests {
             ],
             tags_unread: None,
             pin_parcels: Vec::new(),
+            haul_heads: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
         };
