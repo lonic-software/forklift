@@ -474,10 +474,11 @@ upgrade the remote, or keep the file under the 8 MiB threshold.
 
 ```sh
 forklift undo
+forklift undo --as rescued   # undo a pallet delete, bringing the pallet back as "rescued"
 ```
 
 Reverses the **last state-changing operation**, using an undo journal — not just the
-last `stack`. Each `stack`, `consolidate`, `cherry-pick` and `shift` records the state
+last `stack`. Each `stack`, `consolidate`, `cherry-pick`, `shift` and `palletize --delete` records the state
 before and after it (the current pallet, the pallet refs it moved, and any consolidation or
 cherry-pick left in progress — all tiny, since the objects are content-addressed and already
 stored), so `undo` can walk them back one at a time. Only the refs the command itself wrote are
@@ -490,6 +491,17 @@ reverts it.
   parcels are no longer refused.
 - Reversing a **`shift`** moves back to the previous pallet and re-materializes its tree (it
   refuses on a dirty working directory, just like a forward `shift`).
+- Reversing a **`palletize --delete`** recreates the pallet at the head it was deleted at, and
+  touches nothing else — not the current pallet, not the working directory. If a pallet of that
+  name exists again at another head, `undo` refuses rather than overwrite it, and keeps the entry:
+  `undo --as <new-name>` brings the deleted pallet back under another name instead (`--as` is
+  refused for any other operation). A pallet already back at exactly the deleted head counts as
+  restored. It also refuses, keeping the entry, while a checkout stands on the name at another
+  head (or at none) — the new ref would be out of step with its files; when the deleted history is
+  no longer complete here (it names `lower <name>` to bring it back from a remote); and, in a
+  warehouse with trust, when that history no longer passes the trust check as it stands now. After
+  `undo --as`, older entries still name the old pallet: undoing them acts on whatever that name
+  holds then.
 
 Re-`stack` to redo (e.g. with a corrected message). An empty journal means there is nothing
 to undo. Undoing a pallet's *very first* parcel, pure-staging (`load`/`remove`/`unload`)
@@ -955,6 +967,8 @@ forklift palletize feature         # create "feature" at the current head and sh
 forklift palletize hotfix 1a2b3c   # create "hotfix" at a revision and shift to it
 forklift palletize --remote        # list the remote's pallets, against the ones here
 forklift palletize --remote --all  # also the remote's meta pallets
+forklift palletize --delete old    # delete "old" (its parcels stay; `undo` brings it back)
+forklift palletize --delete old --force  # ...even when nothing else holds its work
 ```
 
 The list shows user pallets only by default; `--all` adds the meta pallets (the office
@@ -991,6 +1005,28 @@ A command naming a pallet this warehouse does not hold (`shift`, `consolidate`, 
 `haul open`) refuses with `pallet_not_found` (exit 29), and names `lower <name>` when a remote is
 configured, `palletize <name>` otherwise. `lower <name>` for a pallet the remote does not have
 refuses the same way, before it writes anything, naming `palletize --remote`.
+
+`--delete <name>` removes a pallet's ref and nothing else: its parcels stay, and the delete is
+journaled, so [`undo`](#undo--reverse-the-last-operation) brings the pallet back at the head it
+was deleted at. It refuses:
+
+- a meta pallet (`@office`, the hauls, the tags) — those are never deleted;
+- a pallet any checkout stands on — the main working tree or any bay; shift it elsewhere first;
+- the source or target of an open haul, or any delete while a haul cannot be read (it might name
+  the pallet). A *merged* haul whose target was the pallet does not refuse; the delete names it,
+  since its proof then reads as unproven — no pallet holds the target any more;
+- a pallet whose work nothing else holds, unless `--force`. "Held" means another local pallet
+  reaches its head — that pallet must still be where it was when the delete writes, so two bays
+  cannot each delete the other's only copy — or, when a remote is configured, one of the
+  remote's heads reaches it (the delete asks the remote, after its usual trust check, and walks
+  the history held here). The output says what holds it.
+
+While the delete is in the bay's undo journal, its head is kept by `gc`, by automatic and manual
+repacks and by `scope prune`, so `undo` can always bring it back. That window ends when the
+delete is undone, when 100 later journaled operations in that bay push it out, or when the bay is
+removed (`bay remove`); after that, work no other pallet holds is collectable. With `--json` the
+delete reports `pallet`, `head`, `contained_by` (`pallet "<name>"`, `the remote`, or `null`
+when forced) and, when any, `merged_hauls`.
 
 ### `shift` — switch pallets (`sh`)
 

@@ -7567,3 +7567,24 @@ fn scope_prune_keeps_unlifted_history_behind_a_deleted_pallet_for_its_undo() {
     assert_success(&area.forklift("sparse", &["undo"]));
     assert_eq!(pallet_head(&area, "sparse", "side"), head);
 }
+
+// A remote whose trust changed is not asked what it holds: the delete refuses before reading its
+// heads, which still name the pallet's head.
+#[test]
+fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
+    let area = TestArea::new("delete-remote-regenesis");
+    let _server = regenesis_on_remote(&area, |server| {
+        assert_success(&area.forklift("a", &["palletize", "feat"]));
+        stack_file(&area, "a", "feat.txt", "feat v1\n");
+        assert_success(&area.forklift("a", &["lift"]));
+        assert_success(&area.forklift("a", &["shift", "main"]));
+        assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "root"]));
+        assert_success(&area.forklift("b", &["lower", "feat"]));
+    });
+
+    let refused = area.forklift("b", &["palletize", "--delete", "feat"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("CHANGED"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("nothing was deleted"), "{}", stderr(&refused));
+    assert!(area.path("b/.forklift/pallets/feat").exists());
+}

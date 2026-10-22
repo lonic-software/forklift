@@ -6,8 +6,8 @@ use crate::commands::shift;
 use crate::output::{self, CommandOutput};
 
 /// Handle the undo command (§7.8): reverse the last state-changing operation, using the
-/// undo journal. `undo` spans `stack`, `consolidate`, `cherry-pick` and `shift` — not just the
-/// last stack — because each of those journals the state on both sides of it.
+/// undo journal. `undo` spans `stack`, `consolidate`, `cherry-pick`, `shift` and a pallet delete —
+/// not just the last stack — because each of those journals the state on both sides of it.
 ///
 /// * Reversing a `stack`, `consolidate` or `cherry-pick` is a **soft reset**: the pallet head
 ///   moves back while the working directory and inventory are kept, so the undone changes end

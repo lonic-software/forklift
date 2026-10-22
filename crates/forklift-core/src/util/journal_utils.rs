@@ -2264,4 +2264,27 @@ mod tests {
         assert!(refused.contains("fetched only part-way"), "{}", refused);
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
     }
+
+    #[test]
+    fn a_restore_without_trust_pins_the_anchor_absent() {
+        let _scratch = Scratch::new("restore-no-anchor");
+
+        // An enrollment between the trust read and the write must make the create lose.
+        let preconditions = trust_preconditions("side", &hash('a')).unwrap();
+        assert!(matches!(preconditions.anchor, pallet_utils::AnchorPrecondition::Absent));
+    }
+
+    #[test]
+    fn a_delete_made_during_a_pick_undoes_after_the_picked_parcel_is_gone() {
+        let _scratch = Scratch::new("delete-during-pick");
+
+        advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &hash('2')).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('2')))).unwrap();
+        cherry_pick_utils::write_state(&CherryPickState { source: hash('6'), our_head: hash('2'), our_pallet: "main".to_string(), description: None }).unwrap();
+
+        // The delete leaves the pick in progress as it found it, so undoing it puts no pick back.
+        let deleted = super::delete_entry("side", &hash('3')).unwrap();
+        assert!(deleted.before.cherry_pick.is_some());
+        check_undoable(&deleted).unwrap();
+    }
 }

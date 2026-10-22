@@ -188,7 +188,7 @@ async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
         ));
     }
 
-    let merged_hauls = refuse_an_open_haul(&reference.name)?;
+    let merged_hauls = refuse_an_open_haul(&reference.name, &haul_utils::read_hauls()?)?;
 
     let (contained_by, preconditions) = if force {
         (None, RefPreconditions::NONE)
@@ -228,12 +228,10 @@ async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a delete of `pallet` while an open haul names it as its source or target, or while a
-/// haul cannot be read (it might). Returns the merged hauls whose target it is: their proof will
+/// Refuse a delete of `pallet` while an open haul in `hauls` names it as its source or target, or
+/// while a haul cannot be read (it might). Returns the merged hauls whose target it is: their proof will
 /// read as unproven once the target is gone.
-fn refuse_an_open_haul(pallet: &str) -> Result<Vec<String>, String> {
-    let hauls = haul_utils::read_hauls()?;
-
+fn refuse_an_open_haul(pallet: &str, hauls: &haul_utils::HaulsRead) -> Result<Vec<String>, String> {
     if let Some(unreadable) = hauls.unreadable.first() {
         return Err(format!(
             "Cannot tell whether haul {} names pallet \"{}\": {} Nothing was deleted.",
@@ -665,5 +663,17 @@ mod tests {
         assert_eq!(pallet_utils::get_pallet_head("x").unwrap(), Some(shared), "x stays");
         assert_eq!(pallet_utils::get_pallet_head("y").unwrap(), None);
         assert_eq!(journal_utils::removed_heads().unwrap().len(), 1, "only the landed delete is journaled");
+    }
+
+    #[test]
+    fn a_delete_refuses_while_any_haul_cannot_be_read() {
+        let hauls = haul_utils::HaulsRead {
+            unreadable: vec![haul_utils::UnreadableHaul { id: "0123abcd".to_string(), reason: "its opened cell is damaged.".to_string() }],
+            ..Default::default()
+        };
+
+        let refused = refuse_an_open_haul("side", &hauls).unwrap_err();
+        assert!(refused.contains("Cannot tell whether haul 0123abcd names pallet \"side\""), "{}", refused);
+        assert_eq!(refuse_an_open_haul("side", &haul_utils::HaulsRead::default()), Ok(Vec::new()));
     }
 }
