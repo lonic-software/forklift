@@ -408,7 +408,10 @@ and follows the step.
 pallet) refuse a pallet name this warehouse holds no ref for with `pallet_not_found` (exit 29). The
 remedy depends on where the pallet might be: with a remote configured, `next_step` is
 `forklift lower <name>`, which brings the remote's pallet in without moving this bay; without
-one it is `forklift palletize <name>`. A missing meta pallet names `forklift palletize --all`.
+one it is `forklift palletize <name>`. A missing meta pallet names `forklift lower` (which syncs
+the remote's meta pallets) with a remote, `forklift palletize --all` without one. `lower <name>` for
+a pallet the remote does not have refuses with the same code before writing anything, naming
+`forklift palletize --remote`.
 `forklift palletize --remote` lists what the remote holds, so an agent can tell the two apart
 before acting.
 
