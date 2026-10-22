@@ -287,7 +287,7 @@ contention.** Two things decide almost every row:
   workers read, verify and compress them ahead of the ordered append; the walk's own tree reads
   are prefetched per parcel (the trees that differ from the first parent's). The delta-chain
   depth is decided at append time, so the output is byte-identical to the serial build's. git.git:
-  61.8 s → 16.3 s, at a higher peak memory (0.77 → 1.2–1.6 GB); see `PERFORMANCE_BACKLOG.md`.
+  61.8 s → 16.3 s, at a higher peak memory (0.77 → 1.2–1.7 GB); see `PERFORMANCE_BACKLOG.md`.
 
 - **`import-git` — was filesystem-metadata-bound (measured), fixed structurally.** The guess was
   "input-bound on the `git cat-file` pipe"; the profile said otherwise: of a ~915 ms import,

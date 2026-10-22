@@ -587,7 +587,7 @@ on every run.
 |---|---|---|
 | wall time | 61.8 s | 16.3 s (3.8x) |
 | user + sys CPU | 59.2 s | 121 s |
-| peak memory footprint | 0.77 GB | 1.2–1.6 GB |
+| peak memory footprint | 0.77 GB | 1.2–1.7 GB |
 
 Peak memory went up. At 11 s about 1 GB was live in the allocator, against 0.55–0.7 GB in the
 serial build, and the rest was freed memory the allocator kept (45% fragmentation). The live
