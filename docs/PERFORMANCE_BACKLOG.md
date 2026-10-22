@@ -256,7 +256,7 @@ counted with a throwaway build that logged each shard write; after it, with the 
 Peak memory rose because the filter workers each hold the trees they diff. A cold blame now
 costs about what a warm one does (16.5 s). That remaining time is blame itself,
 attributing the versions that touch the file: git blames the same file in 0.68 s, which is
-FORK-190.
+FORK-190 (fixed; see its section below).
 
 The same change fixed a latent dirty-tracking bug. A shard's version was a per-shard counter
 reset to 0 on load, so a shard evicted and reloaded between a persist's snapshot and its
@@ -478,6 +478,55 @@ writes one. But dropping it would require every writer, `restore` included, to r
 and that is the kind of invariant FORK-173 declined for a 3% walk.
 
 ---
+
+## FORK-190 + FORK-191: blame's line matching, and the self-heal above an unreadable parent (2026-10-22)
+
+**Measured** on the benchmark's git.git warehouse (24,411-parcel first-parent chain, after
+`compact --all --redelta`), with a warm commit-graph, blaming `Makefile` (about 4,100 lines,
+changed in a few thousand of those parcels). macOS `sample` over a warm run: about 5,000 of
+5,800 main-thread samples were in `lcs::lcs_matches`. Blob loads, tree parsing and the graph
+were each a few percent. The first suspect in the ticket (a full LCS per changed version) was
+the cost. The second (per-version blob loads) was not.
+
+- **Why it was slow:** `attribute_version` filled the exact O(n·m) LCS table for every version:
+  about 16 million cells for each of a few thousand versions.
+- **Tried and rejected: the display diff.** `diff`'s histogram-style match anchors on rare
+  lines. It took the blame to 1.13 s, but it changed the attribution of 984 lines. One 2017
+  parcel was credited with 312 lines where git's blame (Myers or histogram) and the exact LCS
+  credit it with 9. A blame that credits lines git's does not is worse than a slow one.
+- **Fix:** `lcs::myers_matches`, Myers' O((n+m)·D) algorithm in linear space (common prefix and
+  suffix first, then a middle-snake split). It finds a subsequence as long as the exact table's;
+  a randomized test checks it against the table on 20,000 inputs. Then `lcs::slide_changes`, git's
+  hunk sliding (`xdl_change_compact`, without the indent heuristic), chooses among equally long
+  subsequences the one git's diff shows. Without that step, Myers alone agreed with git's
+  blame less often than the old table did. The merge (diff3) keeps the exact table: it must
+  stay exact, and its inputs are already bounded.
+- **Attribution against `git blame --first-parent`** (lines whose author email and date both
+  match; the identity mapping makes this a noisy measure, so compare the rows, not the
+  absolute numbers): exact table 3,041 of 4,143; Myers alone 2,916; Myers then slide 3,085.
+  On the lines where the new and old output differ, git agrees with the new output on 65
+  and with the old on 21.
+
+| Warm `blame Makefile` (hyperfine) | before | after |
+|---|---|---|
+| wall time | 12.91 ± 0.22 s | 0.88 ± 0.01 s (14.6x) |
+| peak memory | 1.4 GiB | 1.1 GiB |
+| `git blame --first-parent Makefile` | 0.30 s (42.6x faster) | 0.30 s (2.9x faster) |
+
+What is left: about 45% of the remaining samples rebuild trees through delta chains
+(`resolve_tree_file` → `reconstruct_record`, a chain of a dozen deltas or more). That is the
+next target if the gap matters, and it is not blame-specific. `bin/benchmark` now has a blame
+row, so the gap stays visible.
+
+**FORK-191.** When the newest parcel's `ensure` fails (a merge whose other parent is missing
+from a partial or damaged store), no parcel above that point can get a graph record. Each
+filter query above it walked the ancestry back to the missing parcel again: quadratic in the
+chain above it. `ensure_path_filters` now returns how many parcels, from the front, have a
+record. Blame sends every parcel past that count straight to its tree check, which is what a
+failing query fell back to anyway. A test counts the `ensure` calls: a blame of 50 parcels above
+such a merge makes at most 8. The fix is scoped to the blame walk, not a process-wide negative
+cache, because a negative cache would go stale in the long-running server once the parent
+arrives.
 
 ## Remaining items
 

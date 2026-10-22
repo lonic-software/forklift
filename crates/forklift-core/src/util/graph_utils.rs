@@ -565,12 +565,19 @@ fn mark_clean(root: &str, prefix: &str, version: u64) -> Result<(), String> {
 
 // ---- generation computation (iterative — survives 85k-deep chains) ------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`ensure`] ran on this thread — a test can count the ancestry walks a
+    /// pass or a query made without racing the other tests in the process.
+    pub(crate) static ENSURE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Ensure `hash` and every ancestor lacking a record get one, computing generation numbers by
 /// an **iterative** post-order DAG walk (no recursion — the parent chain can be tens of
 /// thousands deep). Returns the freshly computed records, already persisted.
 fn ensure(root: &str, hash: &str) -> Result<HashMap<String, Record>, String> {
     #[cfg(test)]
-    tests::ENSURE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    ENSURE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut computed: HashMap<String, Record> = HashMap::new();
     // DFS state per node: `gray` = on the stack (being expanded); a node is "known" once it is
     // in `computed` or already stored. A gray parent encountered while expanding is a cycle.
@@ -915,9 +922,12 @@ const PARALLEL_FILTER_THRESHOLD: usize = 64;
 ///   may be batched when an ancestry cannot be resolved.
 ///
 /// # Returns
-/// * `Ok(())`      - Every filter that could be computed is stored.
+/// * `Ok(usize)`   - How many of `parcels`, from the front, have a record; every filter among them
+///   that could be computed is stored. On a first-parent chain, no parcel past that count can
+///   ever get a record in this store: its ancestry holds the one that could not be resolved, so
+///   [`path_maybe_changed`] on it walks that ancestry again only to fail where this pass did.
 /// * `Err(String)` - If the cache lock was poisoned.
-pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
+pub fn ensure_path_filters(parcels: &[String]) -> Result<usize, String> {
     let root = file_utils::get_path_graph_root();
 
     // Records first. Along a first-parent chain each parcel's ancestry contains every older
@@ -929,6 +939,7 @@ pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
     // same unreadable parent once per parcel above it — quadratic in the chain. Parcels left
     // without a record are left to the per-query path. (`ensure` on a recorded parcel is a
     // single lookup.)
+    let mut recorded = parcels.len();
     if let Some(newest) = parcels.len().checked_sub(1) {
         if ensure(&root, &parcels[newest]).is_err() {
             // Invariant: every parcel below `resolved` is recorded; `parcels[unresolved]` fails.
@@ -941,6 +952,7 @@ pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
                     unresolved = mid;
                 }
             }
+            recorded = resolved;
         }
     }
 
@@ -976,7 +988,7 @@ pub fn ensure_path_filters(parcels: &[String]) -> Result<(), String> {
             .collect();
         persist_records(&root, &updated)?;
     }
-    Ok(())
+    Ok(recorded)
 }
 
 /// Compute a parcel's changed-path filter: the file paths that differ between the parcel's tree
@@ -1421,12 +1433,6 @@ mod tests {
         assert_eq!(after, original, "an unreadable shard must never be written over");
     }
 
-    thread_local! {
-        /// How many times [`ensure`] ran on this thread — a test can count the ancestry walks a
-        /// pass made without racing the other tests in the process.
-        pub(super) static ENSURE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
     #[test]
     fn the_filter_pass_records_below_an_unresolvable_ancestry_in_logarithmic_walks() {
         // A merge whose second parent is not in the store: every parcel from it up has an
@@ -1476,7 +1482,8 @@ mod tests {
         drop(_scope);
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert!(result.is_ok(), "an unresolvable ancestry is not an error of the pass: {:?}", result);
+        assert_eq!(result, Ok(BELOW),
+            "the pass must report the parcels below the unreadable merge as the recorded ones");
         // One failed walk from the newest parcel, then a binary search over the rest: about
         // log2(81) more, against one per parcel above the merge if every parcel retried.
         assert!(walks <= 1 + 8, "the pass must find the resolvable boundary in a logarithmic number of walks; it made {walks}");

@@ -10,17 +10,20 @@
 //!
 //! The walk follows the **first-parent chain** from the revision back to the root, exactly
 //! git's `blame --first-parent`. Each parcel where the file's blob changed is a *version*;
-//! successive versions are matched line by line with the same LCS the merge uses, so a line
+//! successive versions are matched line by line under a longest common subsequence, so a line
 //! unchanged from the previous version keeps its older attribution and a genuinely new line
 //! is attributed to the version that introduced it. Lines a merge parcel brought in from a
 //! side line (its second parent) are attributed to the merge — the honest limit of a
 //! first-parent walk, and the natural reading of "where did this line enter this pallet".
 
+use std::collections::HashMap;
 use crate::util::{graph_utils, lcs, object_utils};
 
 /// Above this many lines (per side), the line-level attribution is skipped for a version
-/// and its whole content is attributed to the introducing parcel. The quadratic LCS table
-/// is the cost being bounded — the same guard the merge applies (`merge_utils`).
+/// and its whole content is attributed to the introducing parcel. Myers' cost grows with the
+/// lines that changed, so a long file edited lightly is cheap; this bounds the case it is not
+/// cheap for, a long file rewritten wholesale, where the cost approaches the product of the
+/// two versions' lengths.
 const MAX_BLAME_LINES: usize = 20_000;
 
 /// One attributed line of the blamed file.
@@ -78,8 +81,12 @@ pub fn blame(head: &str, path: &str) -> Result<FileBlame, String> {
 
     // Fill the filters the walk below queries in one batched pass, so a cold graph is written a
     // shard at a time per batch rather than once per parcel. Best-effort: each query still
-    // computes whatever this left missing.
-    let _ = graph_utils::ensure_path_filters(chain.get(1..).unwrap_or(&[]));
+    // computes whatever this left missing. Past the parcels it could record (a merge whose other
+    // parent is missing from a partial or damaged store), a query would walk the same ancestry
+    // back to the same missing parcel, once per parcel above it; those parcels go straight to the
+    // tree check instead.
+    let recorded = graph_utils::ensure_path_filters(chain.get(1..).unwrap_or(&[]))
+        .map_or(chain.len(), |count| count + 1);
 
     // Walk the versions oldest to newest, carrying the current attribution forward. A line
     // unchanged from the previous version (an LCS match) keeps its attribution; a new line
@@ -95,7 +102,7 @@ pub fn blame(head: &str, path: &str) -> Result<FileBlame, String> {
         // exactly this walk's "changed vs the previous version". A `false` is definitive (no
         // false negatives); the oldest parcel has no in-chain parent, so it is always examined;
         // and any graph hiccup falls back to the real tree check below — never a wrong answer.
-        if index > 0 && !graph_utils::path_maybe_changed(parcel, path).unwrap_or(true) {
+        if index > 0 && index < recorded && !graph_utils::path_maybe_changed(parcel, path).unwrap_or(true) {
             continue;
         }
 
@@ -135,25 +142,43 @@ pub fn blame(head: &str, path: &str) -> Result<FileBlame, String> {
     Ok(FileBlame { path: path.to_string(), revision: head.to_string(), lines: current })
 }
 
+/// The id of `line` in `ids`, giving it the next unused one if it has none yet.
+fn intern<'a>(ids: &mut HashMap<&'a [u8], u32>, line: &'a [u8]) -> u32 {
+    let next = ids.len() as u32;
+    *ids.entry(line).or_insert(next)
+}
+
 /// Attribute the lines of a new version of the file: a line that matches one of the
-/// previous version's lines (under their LCS) inherits its attribution; every other line is
-/// attributed to `parcel`, which introduced it.
+/// previous version's lines (under a longest common subsequence) inherits its attribution;
+/// every other line is attributed to `parcel`, which introduced it.
+///
+/// The subsequence comes from Myers' algorithm, whose cost grows with the lines that changed
+/// rather than with the product of the two versions' lengths: the exact table it replaced
+/// spent nearly all of a 13 s blame of git.git's 4,000-line Makefile. Where several
+/// subsequences are equally long, the changed runs are then slid to where git's diff puts them,
+/// so a repeated line (a blank, a closing brace) mostly keeps the parcel git's blame credits
+/// it to.
+/// The display diff's histogram match was measured too and rejected: on that file it credited
+/// one parcel with 312 lines where git and the longest subsequence credit it with 9.
 fn attribute_version(previous: &[BlameLine], content: &[u8], parcel: &str) -> Vec<BlameLine> {
     let new_lines = split_lines(content);
 
-    // Over the guard, skip the quadratic match and attribute the whole version to the
-    // introducing parcel — coarse, but bounded (large generated/data files, rarely blamed).
+    // Over the guard, skip the match and attribute the whole version to the introducing
+    // parcel: coarse, but bounded (large generated/data files, rarely blamed).
     if previous.len() > MAX_BLAME_LINES || new_lines.len() > MAX_BLAME_LINES {
         return new_lines.into_iter()
             .map(|line| BlameLine { content: line.to_vec(), parcel: parcel.to_string() })
             .collect();
     }
 
-    let old_lines: Vec<&[u8]> = previous.iter().map(|line| line.content.as_slice()).collect();
+    // Lines as small integer ids, so the matcher compares integers, not line bytes.
+    let mut ids: HashMap<&[u8], u32> = HashMap::new();
+    let old_ids: Vec<u32> = previous.iter().map(|line| intern(&mut ids, &line.content)).collect();
+    let new_ids: Vec<u32> = new_lines.iter().map(|line| intern(&mut ids, line)).collect();
 
-    // For each old line, the new line it maps to under the LCS (or none). A new line so
-    // matched inherits the old line's attribution.
-    let matches = lcs::lcs_matches(&old_lines, &new_lines);
+    // For each old line, the new line it maps to (or none). A new line so matched inherits
+    // the old line's attribution.
+    let matches = lcs::slide_changes(&old_ids, &new_ids, &lcs::myers_matches(&old_ids, &new_ids));
 
     let mut inherited: Vec<Option<&str>> = vec![None; new_lines.len()];
 
@@ -256,6 +281,93 @@ mod tests {
         assert_eq!(result[0].parcel, "P1");
         assert_eq!(result[1].parcel, "P2");
         assert_eq!(result[2].parcel, "P1");
+    }
+
+    #[test]
+    fn a_blame_above_an_unreadable_merge_parent_walks_its_ancestry_a_bounded_number_of_times() {
+        // A merge whose second parent is missing from the store: no parcel from it up can get a
+        // commit-graph record, so a filter query on any of them walks the ancestry back to the
+        // missing parcel and fails. The blame must not pay that walk once per parcel above the
+        // merge (quadratic in the chain), and its attribution must still be right.
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, Tree};
+        use crate::globals::StorageRootScope;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-blame-unresolvable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = StorageRootScope::enter(&dir);
+
+        let store_file_tree = |content: &str| -> String {
+            let mut blob = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
+            blob.store().unwrap();
+            let mut tree = TreeItem::new(String::new(), String::new(), Tree);
+            tree.add_child(TreeItem::new("notes.txt".to_string(), blob.hash.clone(), Normal));
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            object.hash
+        };
+        let store_parcel = |tree_hash: &str, parents: Vec<String>, tag: &str| -> String {
+            let parcel = Parcel {
+                tree_hash: tree_hash.to_string(),
+                parents,
+                actions: vec![],
+                description: Some(tag.to_string()),
+            };
+            let mut object = LooseObjectBuilder::build_parcel(&parcel);
+            object.store().unwrap();
+            object.hash
+        };
+
+        let first = store_file_tree("one\n");
+        let second = store_file_tree("one\ntwo\n");
+        let third = store_file_tree("one\ntwo\nthree\n");
+
+        const BELOW: usize = 10;
+        const ABOVE: usize = 40;
+        let root = store_parcel(&first, vec![], "root");
+        let mut tip = root.clone();
+        for i in 0..BELOW {
+            tip = store_parcel(&first, vec![tip], &format!("below {i}"));
+        }
+        let merge = store_parcel(&second, vec![tip, "f".repeat(64)], "merge");
+        tip = merge.clone();
+        for i in 0..ABOVE {
+            tip = store_parcel(&second, vec![tip], &format!("above {i}"));
+        }
+        let last = store_parcel(&third, vec![tip], "last");
+
+        graph_utils::ENSURE_CALLS.with(|calls| calls.set(0));
+        let result = blame(&last, "notes.txt");
+        let walks = graph_utils::ENSURE_CALLS.with(|calls| calls.get());
+        drop(scope);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let lines = result.expect("an unreadable merge parent must not fail a first-parent blame");
+        let parcels: Vec<&str> = lines.lines.iter().map(|line| line.parcel.as_str()).collect();
+        assert_eq!(parcels, vec![root.as_str(), merge.as_str(), last.as_str()],
+            "each line must be attributed to the parcel that introduced it");
+        // The filter pass: one failed walk from the newest parcel and a binary search over the
+        // chain (about log2(52)). One more walk per parcel above the merge would be 41 more.
+        assert!(walks <= 1 + 7,
+            "the blame must not walk the unresolvable ancestry once per parcel above it; it made {walks}");
+    }
+
+    #[test]
+    fn attribution_keeps_the_most_lines_a_rare_line_anchor_would_drop() {
+        // A rare-line anchor (the display diff's) keeps the moved unique line and calls the
+        // three braces new. The longest common subsequence keeps the three braces: only the
+        // moved line is the second parcel's.
+        let previous = vec![line("unique\n", "P1"), line("}\n", "P1"), line("}\n", "P1"), line("}\n", "P1")];
+
+        let result = attribute_version(&previous, b"}\n}\n}\nunique\n", "P2");
+        let parcels: Vec<&str> = result.iter().map(|blame| blame.parcel.as_str()).collect();
+
+        assert_eq!(parcels, vec!["P1", "P1", "P1", "P2"]);
     }
 
     #[test]
