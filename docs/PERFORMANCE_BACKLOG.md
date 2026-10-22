@@ -287,7 +287,7 @@ A/B tests against saved binaries on a quiet machine.
 | peak memory, full tree | 676 MiB | 740 MiB (+9%) |
 
 The memory rise does not depend on the window: a window of 32 measured the same. Remaining
-work, a stat-clean worktree read and the other commands' serial loads, is FORK-192.
+work, a stat-clean worktree read and the other commands' serial loads, was FORK-192 (below).
 
 ## FORK-188: delta chains hash only the object asked for (2026-10-18)
 
@@ -534,7 +534,7 @@ such a merge makes at most 8. The fix is scoped to the blame walk, not a process
 cache, because a negative cache would go stale in the long-running server once the parent
 arrives.
 
-## FORK-192: the bundle build on worker threads; single-flight reads measured, not worth doing (2026-10-22)
+## FORK-192: the bundle build on worker threads; single-flight and stat-clean reads measured, not worth doing (2026-10-22)
 
 **Measured** on the benchmark's git.git warehouse (imported, then `compact --all --redelta`),
 release build, 18 cores.
@@ -602,9 +602,27 @@ Two smaller fixes came with it. `sign_utils::to_hex` made 32 `format!` allocatio
 same output. With the slow versions, the compact plan's hash conversions cost 6 s (23.3 s
 against 16.3 s).
 
-**Stat-clean worktree reads** (comparing a file's stat record instead of decompressing its blob)
-are the third part of the ticket. They depend on a decision about hash verification, so they
-need a design first. They are not started.
+**Stat-clean worktree reads: measured, not worth doing.** The idea was to read a working file
+instead of its stored blob whenever the inventory's stat record says the two match, in the
+readers that need the content of a version the worktree also holds: `diff --staged`'s new side,
+and a pallet `diff` or `show` whose new side is the bay's base. A three-way merge's "ours" and
+blame's newest version are one load each per file, so they gain less still. To bound the gain,
+a throwaway build replaced those loads with a plain `fs::read` of the path: no stat check, no
+inventory read and no hash, so a real implementation can only be slower.
+
+| Run (git.git, release, 18 cores) | stored blobs | plain file read (ceiling) |
+|---|---|---|
+| `diff master old`, bay at `old`: 5,089 files, packed blobs | 400.4 ms | 376.6 ms (−6.0%) |
+| `diff --staged`, 1,265 freshly loaded files, loose blobs | 53.1 ms | 49.7 ms (−6.5%) |
+
+After FORK-188 (a chain hashes only its target) and the fan-out, reading the stored side is no
+longer where these commands spend their time. The ceiling would shrink further in a real version.
+The pallet diff reads no inventory today, so it would have to load the shards and stat each file.
+And a read that keeps today's guarantee must hash what it reads, which `load_blob` already does.
+That leaves only the decompression share of the 6%. Trusting the stat without a hash would keep
+more of it, but a stat collision would then print the wrong content as the stored version. That
+is not worth 3 ms on 1,265 files. Nothing was changed. One caveat for any future attempt: a plain
+read follows a symlink, so the 5,089-file run's output differed at the one symlink in the range.
 
 ## Remaining items
 

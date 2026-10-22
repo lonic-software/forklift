@@ -96,8 +96,9 @@ contention.** Two things decide almost every row:
    +9%. `restore`'s directory loop still runs serially; it writes only the files that differ from
    their entries, but reads in full every file the stat cache cannot vouch for and whose size
    matches (FORK-181); `restore --staged` likewise stats each file under the path, and reads
-   in full the ones its current entry cannot settle by stat (FORK-182), on one thread;
-   the rest of both commands' serial cost is FORK-192.
+   in full the ones its current entry cannot settle by stat (FORK-182), on one thread.
+   Neither loop is ticketed: both now touch only what the stat cache cannot settle, so
+   measure one on a large dirty tree before fanning it out.
 
 3. **`diff` — done, 1.4–5.7× on 18 cores (`diff_pallets`).** A cross-revision diff is one
    independent unit per changed file: load the two blobs, run the histogram diff, format the block.
