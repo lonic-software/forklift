@@ -245,8 +245,9 @@ async fn merge(id: &str) -> Result<(), String> {
     // say where the head comes from instead of failing on a missing object below.
     if !file_utils::does_object_exist(&haul.head)? {
         return Err(format!(
-            "Haul {} proposes parcel {}, which this warehouse does not hold. Lower \"{}\" from the remote that \
-             holds it, or have the haul's opener move it with \"haul update {}\". Nothing was merged.",
+            "Haul {} proposes parcel {}, which this warehouse does not hold. Lower \"{}\" from the remote the \
+             haul came from; if that pallet has moved off the parcel there too, have the haul's opener propose \
+             its current head with \"haul update {}\". Nothing was merged.",
             short(&haul.id), short(&haul.head), haul.opened.source, short(&haul.id)
         ));
     }

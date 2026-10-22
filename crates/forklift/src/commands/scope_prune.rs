@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::error::{self, CoreError};
-use forklift_core::util::{bay_utils, haul_utils, journal_utils};
+use forklift_core::util::{bay_utils, journal_utils};
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
@@ -65,11 +65,10 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     // A deleted pallet's history is kept for as long as undo can bring the pallet back. Read under
     // the hold, which keeps every delete and undo out until the prune ends: both are mutating
     // commands, which main takes the store hold for shared (`Command::holds_store_access`).
-    // So is the head a haul not yet merged proposes, which its merge reads; every haul write
-    // takes the same shared hold.
+    // The plan reads the head a haul not yet merged proposes under the same hold: every haul
+    // write takes it shared.
     let removed_heads = journal_utils::removed_heads()?;
-    let haul_heads = haul_utils::unmerged_haul_heads()?;
-    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &haul_heads, &store_access)?;
+    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &store_access)?;
 
     if dry_run {
         output::emit(&PruneReport {
@@ -282,7 +281,8 @@ pub(crate) struct PruneReport {
 
     /// Candidates kept because lifting the unlifted history a haul not yet merged proposes reads
     /// them, where no pallet reaches it any more. Lifting cannot free these; once the haul is
-    /// merged and its target lifted, a later prune does.
+    /// merged and its target lifted, a later prune does. A closed haul keeps them, since
+    /// reopening it proposes the same head.
     kept_for_hauls: usize,
 
     /// Candidates kept because lifting the unlifted history of a pallet deleted here reads them,
@@ -377,7 +377,8 @@ impl CommandOutput for PruneReport {
             println!(
                 "{} object(s) were kept because they belong to unlifted history that a haul not yet \
                 merged proposes and no pallet holds; a later prune frees them once that haul is \
-                merged and its target lifted.",
+                merged and its target lifted. A closed haul keeps them, since reopening it proposes \
+                the same head.",
                 self.kept_for_hauls
             );
         }
