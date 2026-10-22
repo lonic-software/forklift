@@ -41,7 +41,7 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
-use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust};
+use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust, VerifiedOffice};
 use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustAnchor};
 use crate::util::sign_utils::ParcelSignature;
 use crate::util::{haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, sign_utils, tag_utils};
@@ -1131,18 +1131,20 @@ fn stack_signed_parcel(tree_hash: String,
 
 /// Apply edits to a meta pallet's local head and stack the result as one signed parcel, then
 /// move the head. The new parcel passes [`verify_meta_content`] before the head moves, so a
-/// write can never leave a head its own reader would refuse. Writes edit only the paths they
-/// name: every other cell, including ones this build cannot read, is carried through byte for
-/// byte. The caller holds the warehouse lock.
+/// write can never leave a head its own reader would refuse — and the head moves only while the
+/// office it was checked against still stands (its head and the trust anchor), so a key retired
+/// or a re-genesis in another bay meanwhile refuses the write rather than landing one. Writes
+/// edit only the paths they name: every other cell, including ones this build cannot read, is
+/// carried through byte for byte. The caller holds the warehouse lock.
 ///
 /// # Returns
 /// * `Ok(Some(hash))` - The new head.
 /// * `Ok(None)`       - The edits changed nothing, so nothing was stacked.
-/// * `Err(String)`    - If the head cannot be read, an edit is refused, or the parcel fails
-///                      the content check.
+/// * `Err(String)`    - If the head cannot be read, an edit is refused, the parcel fails
+///                      the content check, or the head or the office moved meanwhile.
 pub fn stack_meta_edits(pallet: &str,
                         rules: &dyn PalletRules,
-                        office: &OfficeState,
+                        office: &VerifiedOffice,
                         edits: &[CellEdit],
                         actor: &Operator,
                         description: &str,
@@ -1164,7 +1166,7 @@ pub fn stack_meta_edits(pallet: &str,
     let parcel = stack_signed_parcel(tree, head.iter().cloned().collect(), actor, description, signer)?;
 
     verify_meta_content(pallet, rules, office, Admission::Admit, head.as_deref(), &parcel)?;
-    pallet_utils::update_meta_pallet_head(pallet, head.as_deref(), &parcel)?;
+    pallet_utils::update_meta_pallet_head(pallet, head.as_deref(), &parcel, &office.preconditions())?;
 
     Ok(Some(parcel))
 }
@@ -1905,7 +1907,7 @@ mod tests {
     }
 
     fn write(office: &OfficeState, key: &Key, edits: &[CellEdit]) -> Result<Option<String>, String> {
-        stack_meta_edits(PALLET, &TestRules, office, edits, &actor(&key.record.operator), "write", &key.signer())
+        stack_meta_edits(PALLET, &TestRules, &VerifiedOffice::unconditioned(office.clone()), edits, &actor(&key.record.operator), "write", &key.signer())
     }
 
     fn signer_of(read: &CellRead) -> &str {
@@ -2456,6 +2458,7 @@ mod tests {
             PALLET,
             pallet_utils::get_meta_pallet_head(PALLET).unwrap().as_deref(),
             &old,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         let office = office(&[&alice.record]);
         assert!(write(&office, &alice, &[set("y", &cell(alice.id(), "2"))]).unwrap_err().contains("older forklift"));
@@ -2855,6 +2858,7 @@ mod tests {
             PALLET,
             pallet_utils::get_meta_pallet_head(PALLET).unwrap().as_deref(),
             &adopted,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         let ours = write(&office, &alice, &[set("a", &cell(alice.id(), "alice's"))]).unwrap().unwrap();
 
@@ -3374,7 +3378,7 @@ mod tests {
         let subject = "ab".repeat(32);
         let newer = store_blob(&encode_cell(alice.id(), "tags.tag 2", &text("from a newer forklift"))).unwrap();
 
-        stack_meta_edits("tags", &tag_utils::TagsRules, &office, &[
+        stack_meta_edits("tags", &tag_utils::TagsRules, &VerifiedOffice::unconditioned(office.clone()), &[
             set("v1.0", &tag_cell(alice.id(), &subject)),
             set("v2.0", &newer),
         ], &actor("alice"), "tags", &alice.signer()).unwrap().unwrap();
@@ -3391,7 +3395,7 @@ mod tests {
         let newer_path = format!("{}/{}/review/{}", &subject[..2], subject, manifest_utils::operator_leaf("alice"));
         let newer = store_blob(&encode_cell(alice.id(), "manifest.review 1", &text("a newer kind"))).unwrap();
 
-        stack_meta_edits("manifest", &manifest_utils::ManifestRules, &office, &[
+        stack_meta_edits("manifest", &manifest_utils::ManifestRules, &VerifiedOffice::unconditioned(office.clone()), &[
             set(&cell_path("alice", &note), &note_cell(alice.id(), ManifestKind::Note, "lgtm")),
             set(&newer_path, &newer),
         ], &actor("alice"), "manifest", &alice.signer()).unwrap().unwrap();
@@ -3418,6 +3422,7 @@ mod tests {
             "haul",
             pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::Meta, "haul").unwrap().as_deref(),
             &forged,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let haul = haul_utils::find_haul(&id[..8]).unwrap();

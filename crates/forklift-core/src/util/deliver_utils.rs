@@ -71,14 +71,15 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
 
     // Delivery records the trail as signed post-metadata, so it needs an enrolled key —
     // there is no unsigned delivery (the evidence is the point).
-    let signing_key_id = stack_utils::resolve_signing_key(&operator)?.ok_or(
-        "Deliver records the checkpoint trail as signed post-metadata, so it needs an \
-        enrolled key. Establish trust with \"office enroll\" first.".to_string()
-    )?;
-
-    // The delivery record is judged against the verified office. A reader may write no pallet,
-    // so is refused before anything is written.
-    let office = audit_utils::verified_local_office()?;
+    // The delivery record is judged against the verified office the key is chosen from, and the
+    // delivered head is written only while that office stands. A reader may write no pallet, so
+    // is refused before anything is written.
+    let stack_utils::Signing::Signed { key_id: signing_key_id, office } = stack_utils::resolve_signing_key(&operator)? else {
+        return Err(
+            "Deliver records the checkpoint trail as signed post-metadata, so it needs an \
+            enrolled key. Establish trust with \"office enroll\" first.".to_string()
+        );
+    };
 
     if office.find_user(&operator.identifier).is_some_and(|user| matches!(user.role, Role::Reader)) {
         return Err(format!(
@@ -197,7 +198,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         None => pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?.unwrap_or_default(),
     };
 
-    pallet_utils::update_pallet_head(target, target_head.as_deref(), &object.hash)?;
+    pallet_utils::update_pallet_head(target, target_head.as_deref(), &object.hash, &office.preconditions())?;
 
     // The delivered tree equals the draft's, so switching the current pallet needs no
     // materialization — the working directory already matches, and the bay stands on the

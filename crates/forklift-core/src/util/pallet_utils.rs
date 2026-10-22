@@ -567,6 +567,27 @@ pub enum RefUpdateError {
     /// The ref moved under the writer (see [`RefMoved`]).
     Moved(RefMoved),
 
+    /// The office pallet no longer held the head the writer's decision was based on
+    /// ([`OfficePrecondition::At`]); nothing was written.
+    OfficeMoved {
+        /// The head the office held instead (`None`: unborn).
+        found: Option<String>,
+    },
+
+    /// The trust anchor was no longer what the writer's decision read
+    /// ([`AnchorPrecondition`]); nothing was written.
+    AnchorMoved,
+
+    /// A pallet head was outside the boundary the writer recorded
+    /// ([`PalletsPrecondition::WithinBoundary`]); nothing was written.
+    PalletsMoved {
+        /// The pallet whose head is not in the boundary.
+        pallet: PalletRef,
+
+        /// Its head.
+        found: String,
+    },
+
     /// Anything else: an invalid name or value, or the ref could not be read or written.
     Failed(String),
 }
@@ -575,9 +596,153 @@ impl std::fmt::Display for RefUpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RefUpdateError::Moved(moved) => moved.fmt(f),
+            RefUpdateError::OfficeMoved { found } => write!(
+                f,
+                "Another bay or process changed the office while this command ran (its head is now \
+                {}); this command wrote nothing. Run it again.",
+                found.as_deref().unwrap_or("unborn")
+            ),
+            RefUpdateError::AnchorMoved => f.write_str(
+                "Another bay or process changed this warehouse's trust anchor while this command \
+                ran; this command wrote nothing. Run it again."
+            ),
+            RefUpdateError::PalletsMoved { pallet, found } => write!(
+                f,
+                "Another bay or process moved pallet \"{}\" to {} while this command ran, after it \
+                recorded the pallet heads it vouches for; this command wrote nothing. Run it again.",
+                pallet.to_wire(), found
+            ),
             RefUpdateError::Failed(message) => f.write_str(message),
         }
     }
+}
+
+/// What a ref write's decision consumed besides the ref itself, re-checked under the
+/// [`RefLock`](crate::util::lock_utils::RefLock) hold of the write: a decision judged against an
+/// office, an anchor or a set of pallet heads is only written while they still hold. Read once,
+/// earlier in the same command, from the same storage root as the target.
+///
+/// There is no default: every writer states what it consumed, and [`RefPreconditions::NONE`] is
+/// the explicit spelling for a decision that consumed none of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefPreconditions {
+    pub office: OfficePrecondition,
+    pub anchor: AnchorPrecondition,
+    pub pallets: PalletsPrecondition,
+}
+
+impl RefPreconditions {
+    /// A decision that consumed neither the office, the anchor nor any other pallet head.
+    pub const NONE: RefPreconditions = RefPreconditions {
+        office: OfficePrecondition::NotConsumed,
+        anchor: AnchorPrecondition::NotConsumed,
+        pallets: PalletsPrecondition::NotConsumed,
+    };
+}
+
+/// The office head a write's decision was based on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OfficePrecondition {
+    /// The decision did not read the office.
+    NotConsumed,
+
+    /// The office must still be at this head (`None`: unborn).
+    At(Option<String>),
+}
+
+/// The trust anchor a write's decision was based on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnchorPrecondition {
+    /// The decision did not read the anchor.
+    NotConsumed,
+
+    /// The decision read no anchor: there must still be none.
+    Absent,
+
+    /// The anchor file must still hold exactly these bytes. Compared as bytes, not as a decoded
+    /// anchor: any rewrite refuses.
+    Bytes(Vec<u8>),
+}
+
+/// The pallet heads a trust write recorded as its boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PalletsPrecondition {
+    /// The decision recorded no boundary.
+    NotConsumed,
+
+    /// Every head of the scope's pallets must be a member of `boundary`. Membership, not a
+    /// snapshot: a boundary head no pallet holds (a remote's, or a deleted pallet's) never
+    /// refuses, while a moved head or a new pallet always does.
+    WithinBoundary {
+        boundary: Vec<String>,
+        scope: BoundaryScope,
+    },
+}
+
+/// The pallets a boundary was read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryScope {
+    /// The user pallets.
+    UserPallets,
+
+    /// The user pallets and every meta pallet except the office.
+    AllButOffice,
+}
+
+/// Check `preconditions` against the warehouse as it is now. Lock-free: the caller holds the
+/// [`RefLock`](crate::util::lock_utils::RefLock) the write that follows takes place under.
+///
+/// # Returns
+/// * `Ok(())`              - Every precondition holds.
+/// * `Err(RefUpdateError)` - `OfficeMoved`, `AnchorMoved` or `PalletsMoved` for the first one
+///                           that does not (checked in that order), or `Failed` if one could not
+///                           be read.
+pub(crate) fn check_preconditions(_lock: &crate::util::lock_utils::RefLock,
+                                  preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    if let OfficePrecondition::At(expected) = &preconditions.office {
+        let found = get_pallet_head_in(PalletNamespace::Meta, crate::util::office_utils::OFFICE_PALLET_NAME)?;
+
+        if &found != expected {
+            return Err(RefUpdateError::OfficeMoved { found });
+        }
+    }
+
+    let anchor = match &preconditions.anchor {
+        AnchorPrecondition::NotConsumed => None,
+        AnchorPrecondition::Absent => Some(None),
+        AnchorPrecondition::Bytes(bytes) => Some(Some(bytes.as_slice())),
+    };
+
+    if let Some(expected) = anchor {
+        if crate::util::office_utils::read_trust_anchor_bytes()?.as_deref() != expected {
+            return Err(RefUpdateError::AnchorMoved);
+        }
+    }
+
+    if let PalletsPrecondition::WithinBoundary { boundary, scope } = &preconditions.pallets {
+        let boundary: std::collections::HashSet<&str> = boundary.iter().map(String::as_str).collect();
+
+        let namespaces: &[PalletNamespace] = match scope {
+            BoundaryScope::UserPallets => &[PalletNamespace::User],
+            BoundaryScope::AllButOffice => &[PalletNamespace::User, PalletNamespace::Meta],
+        };
+
+        for &namespace in namespaces {
+            for name in list_pallets_in(namespace)? {
+                if namespace == PalletNamespace::Meta && name == crate::util::office_utils::OFFICE_PALLET_NAME {
+                    continue;
+                }
+
+                if let Some(found) = get_pallet_head_in(namespace, &name)? {
+                    if !boundary.contains(found.as_str()) {
+                        return Err(RefUpdateError::PalletsMoved { pallet: PalletRef { namespace, name }, found });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl From<String> for RefUpdateError {
@@ -598,12 +763,17 @@ impl From<RefUpdateError> for String {
 /// * `name`     - The name of the pallet. Must be a valid pallet name.
 /// * `expected` - The head the caller's work was based on (`None`: the pallet is unborn).
 /// * `new`      - The hash of the new head parcel.
+/// * `preconditions` - What the caller's decision consumed besides the ref.
 ///
 /// # Returns
 /// * `Ok(())`                - The head was moved.
-/// * `Err(RefUpdateError)`   - The ref moved under the caller, or the write failed.
-pub fn update_pallet_head(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_in(PalletNamespace::User, name, expected, new)
+/// * `Err(RefUpdateError)`   - The ref or a precondition moved under the caller, or the write
+///                             failed.
+pub fn update_pallet_head(name: &str,
+                          expected: Option<&str>,
+                          new: &str,
+                          preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    update_pallet_head_in(PalletNamespace::User, name, expected, new, preconditions)
 }
 
 /// Move the head of the given meta pallet from `expected` to `new` (see
@@ -613,41 +783,84 @@ pub fn update_pallet_head(name: &str, expected: Option<&str>, new: &str) -> Resu
 /// * `name`     - The name of the meta pallet. Must be a valid pallet name.
 /// * `expected` - The head the caller's work was based on (`None`: the pallet is unborn).
 /// * `new`      - The hash of the new head parcel.
+/// * `preconditions` - What the caller's decision consumed besides the ref.
 ///
 /// # Returns
 /// * `Ok(())`                - The head was moved.
-/// * `Err(RefUpdateError)`   - The ref moved under the caller, or the write failed.
-pub fn update_meta_pallet_head(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_in(PalletNamespace::Meta, name, expected, new)
+/// * `Err(RefUpdateError)`   - The ref or a precondition moved under the caller, or the write
+///                             failed.
+pub fn update_meta_pallet_head(name: &str,
+                               expected: Option<&str>,
+                               new: &str,
+                               preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    update_pallet_head_in(PalletNamespace::Meta, name, expected, new, preconditions)
 }
 
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
 /// pallet ref is written. Under the warehouse's [`RefLock`](crate::util::lock_utils::RefLock),
-/// which every bay shares, the head is read; when it is not `expected` nothing is written and
-/// the write is refused with [`RefMoved`]. Otherwise the ref file is replaced atomically, created
-/// (with any subfolders a `/`-separated name needs) when the pallet is unborn.
+/// which every bay shares, the head is read and then the `preconditions` are checked; when either
+/// does not hold nothing is written and the write is refused (a moved head is reported first). Otherwise the ref file is replaced
+/// atomically, created (with any subfolders a `/`-separated name needs) when the pallet is unborn.
 ///
-/// `expected` is the head the caller's work was based on, read earlier in the same command, so a
-/// move by another bay or process anywhere between that read and this write is refused rather
-/// than overwritten.
+/// `expected` is the head the caller's work was based on, and `preconditions` the office, anchor
+/// and boundary its decision consumed, all read earlier in the same command, so a move by another
+/// bay or process anywhere between those reads and this write is refused rather than overwritten.
+/// A target that is the office itself may carry an [`OfficePrecondition::At`] too; both must hold.
 ///
 /// # Arguments
-/// * `namespace` - The pallet namespace.
-/// * `name`      - The name of the pallet. Must be a valid pallet name.
-/// * `expected`  - The head the ref must hold (`None`: the ref must not exist).
-/// * `new`       - The hash of the new head parcel.
+/// * `namespace`     - The pallet namespace.
+/// * `name`          - The name of the pallet. Must be a valid pallet name.
+/// * `expected`      - The head the ref must hold (`None`: the ref must not exist).
+/// * `new`           - The hash of the new head parcel.
+/// * `preconditions` - What the caller's decision consumed besides the ref.
 ///
 /// # Returns
 /// * `Ok(())`                         - The head was moved.
 /// * `Err(RefUpdateError::Moved)`     - The ref did not hold `expected`; nothing was written.
+/// * `Err(RefUpdateError::OfficeMoved | AnchorMoved | PalletsMoved)`
+///                                    - A precondition did not hold; nothing was written.
 /// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
-///                                      ref could not be locked, read or written.
+///                                      ref could not be locked, read or written (the write may
+///                                      still have landed: read the ref back to tell).
 pub fn update_pallet_head_in(
     namespace: PalletNamespace,
     name: &str,
     expected: Option<&str>,
     new: &str,
+    preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
+    // Checked before the lock too, so an invalid write never waits for it.
+    validate_head_write(name, new)?;
+
+    let lock = crate::util::lock_utils::RefLock::acquire()?;
+
+    // The ref's own compare goes first: a ref another writer moved, perhaps to this very parcel
+    // (which callers read as landed), reports that move, never a precondition it would mask.
+    require_head(namespace, name, expected)?;
+    check_preconditions(&lock, preconditions)?;
+    update_pallet_head_locked(&lock, namespace, name, expected, new)
+}
+
+/// Refuse with [`RefUpdateError::Moved`] unless the ref holds `expected`; the head it holds.
+fn require_head(namespace: PalletNamespace,
+                name: &str,
+                expected: Option<&str>) -> Result<Option<String>, RefUpdateError> {
+    let found = get_pallet_head_in(namespace, name)?;
+
+    if found.as_deref() != expected {
+        return Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace, name: name.to_string() },
+            expected: expected.map(str::to_string),
+            found,
+        }));
+    }
+
+    Ok(found)
+}
+
+/// The refusals of a head write that need no lock: an invalid name, or a value the reader would
+/// refuse.
+fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
     validate_pallet_name(name)?;
 
     // The writer holds the reader's rule: a ref `get_pallet_head_in` would refuse is never stored.
@@ -659,17 +872,23 @@ pub fn update_pallet_head_in(
         )));
     }
 
-    let _lock = crate::util::lock_utils::RefLock::acquire()?;
+    Ok(())
+}
 
-    let found = get_pallet_head_in(namespace, name)?;
+/// [`update_pallet_head_in`]'s compare-and-set without its lock or its preconditions, for a writer
+/// that already holds the [`RefLock`](crate::util::lock_utils::RefLock) and checked what it
+/// consumed under it (a trust install, which writes the anchor and the office in one hold). Keeps
+/// the readback and the write log.
+pub(crate) fn update_pallet_head_locked(
+    _lock: &crate::util::lock_utils::RefLock,
+    namespace: PalletNamespace,
+    name: &str,
+    expected: Option<&str>,
+    new: &str,
+) -> Result<(), RefUpdateError> {
+    validate_head_write(name, new)?;
 
-    if found.as_deref() != expected {
-        return Err(RefUpdateError::Moved(RefMoved {
-            reference: PalletRef { namespace, name: name.to_string() },
-            expected: expected.map(str::to_string),
-            found,
-        }));
-    }
+    let found = require_head(namespace, name, expected)?;
 
     let path = get_pallet_ref_path(namespace, name);
 
@@ -862,6 +1081,190 @@ mod tests {
         std::fs::read(get_pallet_ref_path(PalletNamespace::User, name)).unwrap()
     }
 
+    const OFFICE: &str = crate::util::office_utils::OFFICE_PALLET_NAME;
+
+    /// Plant a trust anchor; returns the trust file's bytes.
+    fn plant_anchor(genesis: char) -> Vec<u8> {
+        crate::util::office_utils::write_trust_anchor(&crate::util::office_utils::TrustAnchor {
+            genesis: hash(genesis), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: None,
+        }).unwrap();
+
+        crate::util::office_utils::read_trust_anchor_bytes().unwrap().unwrap()
+    }
+
+    fn office_at(head: &str) -> RefPreconditions {
+        RefPreconditions { office: OfficePrecondition::At(Some(head.to_string())), ..RefPreconditions::NONE }
+    }
+
+    fn anchor_is(anchor: AnchorPrecondition) -> RefPreconditions {
+        RefPreconditions { anchor, ..RefPreconditions::NONE }
+    }
+
+    fn within(boundary: &[&str], scope: BoundaryScope) -> RefPreconditions {
+        RefPreconditions {
+            pallets: PalletsPrecondition::WithinBoundary { boundary: boundary.iter().map(|h| h.to_string()).collect(), scope },
+            ..RefPreconditions::NONE
+        }
+    }
+
+    // Revert: drop the office comparison in `check_preconditions` → the write lands.
+    #[test]
+    fn a_write_judged_against_an_office_that_moved_is_refused_and_writes_nothing() {
+        let (_root, _scope) = scratch("office-moved");
+        update_meta_pallet_head(OFFICE, None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head(OFFICE, Some(&hash('a')), &hash('b'), &RefPreconditions::NONE).unwrap();
+
+        let refused = update_pallet_head("main", Some(&hash('1')), &hash('2'), &office_at(&hash('a')));
+
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::OfficeMoved { found: Some(hash('b')) }));
+    }
+
+    // Revert: skip the office check when the target is the office itself → the write lands.
+    #[test]
+    fn an_office_write_whose_office_precondition_disagrees_is_refused() {
+        let (_root, _scope) = scratch("office-on-itself");
+        update_meta_pallet_head(OFFICE, None, &hash('a'), &RefPreconditions::NONE).unwrap();
+
+        let refused = update_meta_pallet_head(OFFICE, Some(&hash('a')), &hash('c'), &office_at(&hash('b')));
+
+        assert_eq!(get_meta_pallet_head(OFFICE).unwrap(), Some(hash('a')), "the office must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::OfficeMoved { found: Some(hash('a')) }));
+    }
+
+    // Revert: drop the anchor comparison in `check_preconditions` → the write lands.
+    #[test]
+    fn a_write_judged_against_an_anchor_that_was_replaced_is_refused() {
+        let (root, _scope) = scratch("anchor-replaced");
+        let read = plant_anchor('0');
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        std::fs::write(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("trust"),
+            crate::util::office_utils::encode_trust_anchor(&crate::util::office_utils::TrustAnchor {
+                genesis: hash('9'), enabled_at: 2, boundary: Vec::new(), prior_genesis: Some(hash('0')), adopts: None,
+            })).unwrap();
+
+        let refused = update_pallet_head("main", Some(&hash('1')), &hash('2'), &anchor_is(AnchorPrecondition::Bytes(read)));
+
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+    }
+
+    // Revert: compare the decoded anchors rather than the bytes → the write lands.
+    #[test]
+    fn a_write_judged_against_an_anchor_respelled_in_other_bytes_is_refused() {
+        let (root, _scope) = scratch("anchor-respelled");
+        let read = plant_anchor('0');
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        let trust = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("trust");
+        let mut respelled = read.clone();
+        respelled.extend_from_slice(b"# respelled\n");
+        std::fs::write(&trust, &respelled).unwrap();
+        assert_eq!(crate::util::office_utils::read_trust_anchor().unwrap().map(|anchor| anchor.genesis), Some(hash('0')),
+            "the respelled file must decode to the same anchor");
+
+        let refused = update_pallet_head("main", Some(&hash('1')), &hash('2'), &anchor_is(AnchorPrecondition::Bytes(read)));
+
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+    }
+
+    // Revert: treat `Absent` as `NotConsumed` → an unsigned write lands under an anchor.
+    #[test]
+    fn a_write_judged_without_an_anchor_is_refused_once_one_exists() {
+        let (_root, _scope) = scratch("anchor-appeared");
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        plant_anchor('0');
+
+        let refused = update_pallet_head("main", Some(&hash('1')), &hash('2'), &anchor_is(AnchorPrecondition::Absent));
+
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('1')), "the target must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+    }
+
+    // Guards against an always-refusing check.
+    #[test]
+    fn a_write_whose_preconditions_all_hold_lands() {
+        let (_root, _scope) = scratch("preconditions-hold");
+        let read = plant_anchor('0');
+        update_meta_pallet_head(OFFICE, None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+
+        update_pallet_head("main", Some(&hash('1')), &hash('2'), &RefPreconditions {
+            office: OfficePrecondition::At(Some(hash('a'))),
+            anchor: AnchorPrecondition::Bytes(read),
+            pallets: PalletsPrecondition::WithinBoundary { boundary: vec![hash('1')], scope: BoundaryScope::AllButOffice },
+        }).unwrap();
+
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('2')));
+    }
+
+    // Revert: check the preconditions before the ref's own compare → the moved office is reported,
+    // hiding that another bay already landed this very parcel.
+    #[test]
+    fn a_ref_already_moved_reports_the_move_before_a_precondition() {
+        let (_root, _scope) = scratch("moved-before-precondition");
+        update_meta_pallet_head(OFFICE, None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+
+        // Another bay lands the same parcel, then the office moves.
+        update_pallet_head("main", Some(&hash('1')), &hash('2'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head(OFFICE, Some(&hash('a')), &hash('b'), &RefPreconditions::NONE).unwrap();
+
+        assert_eq!(update_pallet_head("main", Some(&hash('1')), &hash('2'), &office_at(&hash('a'))), Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace: PalletNamespace::User, name: "main".to_string() },
+            expected: Some(hash('1')),
+            found: Some(hash('2')),
+        })));
+    }
+
+    // Revert: drop the boundary check → the first two land. Compare the boundary as a snapshot of
+    // the heads rather than by membership → the last two are refused.
+    #[test]
+    fn a_boundary_refuses_a_moved_or_new_pallet_and_tolerates_a_deleted_one_or_an_extra_head() {
+        let (_root, _scope) = scratch("boundary");
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("side", None, &hash('2'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head(OFFICE, None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        let boundary = [hash('1'), hash('2')];
+        let boundary: Vec<&str> = boundary.iter().map(String::as_str).collect();
+        let write = |preconditions: &RefPreconditions| update_meta_pallet_head(OFFICE, Some(&hash('a')), &hash('b'), preconditions);
+
+        update_pallet_head("main", Some(&hash('1')), &hash('3'), &RefPreconditions::NONE).unwrap();
+        assert_eq!(write(&within(&boundary, BoundaryScope::UserPallets)), Err(RefUpdateError::PalletsMoved {
+            pallet: PalletRef { namespace: PalletNamespace::User, name: "main".to_string() }, found: hash('3'),
+        }), "a moved head");
+        update_pallet_head("main", Some(&hash('3')), &hash('1'), &RefPreconditions::NONE).unwrap();
+
+        update_pallet_head("new", None, &hash('4'), &RefPreconditions::NONE).unwrap();
+        assert!(matches!(write(&within(&boundary, BoundaryScope::UserPallets)), Err(RefUpdateError::PalletsMoved { .. })),
+            "a new pallet");
+        assert_eq!(get_meta_pallet_head(OFFICE).unwrap(), Some(hash('a')), "a refusal writes nothing");
+        std::fs::remove_file(get_pallet_ref_path(PalletNamespace::User, "new")).unwrap();
+
+        std::fs::remove_file(get_pallet_ref_path(PalletNamespace::User, "side")).unwrap();
+        let remote_only = hash('e');
+        let extra = [boundary.as_slice(), &[remote_only.as_str()]].concat();
+        assert_eq!(write(&within(&extra, BoundaryScope::UserPallets)), Ok(()),
+            "a deleted pallet and a head only the remote holds stand inside the boundary");
+    }
+
+    // Revert: let `AllButOffice` read the user namespace only → a moved meta pallet passes.
+    #[test]
+    fn an_all_but_office_boundary_holds_meta_pallets_but_not_the_office() {
+        let (_root, _scope) = scratch("boundary-meta");
+        update_meta_pallet_head(OFFICE, None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head("kv", None, &hash('c'), &RefPreconditions::NONE).unwrap();
+        let boundary = [hash('c')];
+        let boundary: Vec<&str> = boundary.iter().map(String::as_str).collect();
+
+        update_meta_pallet_head("kv", Some(&hash('c')), &hash('d'), &RefPreconditions::NONE).unwrap();
+        let refused = update_pallet_head("main", None, &hash('1'), &within(&boundary, BoundaryScope::AllButOffice));
+
+        assert!(matches!(&refused, Err(RefUpdateError::PalletsMoved { pallet, .. }) if pallet.name == "kv"), "{:?}", refused);
+        assert_eq!(get_pallet_head("main").unwrap(), None);
+    }
+
     /// A loose file whose name is respelled in uppercase resolves, by prefix, to its lowercase hash
     /// where reads open it under that hash, and is not a match where they do not. Matching the
     /// listed name, it was missed on a case-insensitive file system (`CD…` never starts with `cd`),
@@ -892,7 +1295,7 @@ mod tests {
     #[test]
     fn a_position_that_cannot_be_recorded_after_the_ref_moved_says_the_parcel_stands() {
         let (root, _scope) = scratch("record-landed");
-        update_pallet_head("main", None, &hash('a')).unwrap();
+        update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
 
         // A non-empty directory where the position goes: the atomic rename onto it fails.
         std::fs::create_dir_all(get_position_path().join("blocker")).unwrap();
@@ -909,20 +1312,20 @@ mod tests {
         let (root, _scope) = scratch("write-log");
 
         // Written before recording started: not logged.
-        update_pallet_head("main", None, &hash('a')).unwrap();
+        update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
 
         start_write_log();
-        update_pallet_head("main", Some(&hash('a')), &hash('b')).unwrap();
-        update_pallet_head("main", Some(&hash('b')), &hash('c')).unwrap();
-        update_meta_pallet_head("office", None, &hash('d')).unwrap();
+        update_pallet_head("main", Some(&hash('a')), &hash('b'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("main", Some(&hash('b')), &hash('c'), &RefPreconditions::NONE).unwrap();
+        update_meta_pallet_head("office", None, &hash('d'), &RefPreconditions::NONE).unwrap();
 
         // A refused write moved nothing, so it is not logged.
-        assert!(update_pallet_head("main", Some(&hash('a')), &hash('e')).is_err());
+        assert!(update_pallet_head("main", Some(&hash('a')), &hash('e'), &RefPreconditions::NONE).is_err());
 
         {
             // Another warehouse, not recording: its writes go nowhere, and it reads back nothing.
             let (other, _other_scope) = scratch("write-log-other");
-            update_pallet_head("main", None, &hash('f')).unwrap();
+            update_pallet_head("main", None, &hash('f'), &RefPreconditions::NONE).unwrap();
             assert!(take_write_log().is_empty(), "a root that is not recording must read back nothing");
             let _ = std::fs::remove_dir_all(&other);
         }
@@ -934,7 +1337,7 @@ mod tests {
         ]);
 
         // Taking the log stopped recording.
-        update_pallet_head("main", Some(&hash('c')), &hash('a')).unwrap();
+        update_pallet_head("main", Some(&hash('c')), &hash('a'), &RefPreconditions::NONE).unwrap();
         assert!(take_write_log().is_empty(), "taking the log must stop recording");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -944,10 +1347,10 @@ mod tests {
     fn a_head_write_with_a_stale_expectation_is_refused_and_leaves_the_ref_unchanged() {
         let (root, _scope) = scratch("cas-mismatch");
 
-        update_pallet_head("main", None, &hash('a')).unwrap();
+        update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         let before = ref_bytes("main");
 
-        match update_pallet_head("main", Some(&hash('b')), &hash('c')) {
+        match update_pallet_head("main", Some(&hash('b')), &hash('c'), &RefPreconditions::NONE) {
             Err(RefUpdateError::Moved(moved)) => {
                 assert_eq!(moved.reference, PalletRef::user("main"));
                 assert_eq!(moved.expected, Some(hash('b')));
@@ -959,11 +1362,11 @@ mod tests {
         assert_eq!(ref_bytes("main"), before, "a refused write must leave the ref byte-identical");
 
         // Expecting no head against a ref that exists is a stale expectation too.
-        assert!(matches!(update_pallet_head("main", None, &hash('c')), Err(RefUpdateError::Moved(_))));
+        assert!(matches!(update_pallet_head("main", None, &hash('c'), &RefPreconditions::NONE), Err(RefUpdateError::Moved(_))));
         assert_eq!(ref_bytes("main"), before);
 
         // A matching expectation writes.
-        update_pallet_head("main", Some(&hash('a')), &hash('c')).unwrap();
+        update_pallet_head("main", Some(&hash('a')), &hash('c'), &RefPreconditions::NONE).unwrap();
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('c')));
 
         std::fs::remove_dir_all(&root).ok();
@@ -973,7 +1376,7 @@ mod tests {
     fn a_head_write_waits_for_the_ref_lock() {
         let (root, _scope) = scratch("cas-lock");
 
-        update_pallet_head("main", None, &hash('a')).unwrap();
+        update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
 
         let held = crate::util::lock_utils::RefLock::acquire().unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -982,7 +1385,7 @@ mod tests {
             let root = root.clone();
             std::thread::spawn(move || {
                 let _scope = StorageRootScope::enter(&root);
-                let result = update_pallet_head("main", Some(&hash('a')), &hash('b')).map_err(String::from);
+                let result = update_pallet_head("main", Some(&hash('a')), &hash('b'), &RefPreconditions::NONE).map_err(String::from);
                 done_tx.send(()).unwrap();
                 result
             })
@@ -1092,8 +1495,8 @@ mod tests {
     #[test]
     fn a_ref_file_with_an_invalid_name_fails_the_listing_naming_it() {
         let (root, _scope) = scratch("invalid-ref-entry");
-        update_pallet_head("main", None, &hash('a')).unwrap();
-        update_pallet_head("mainline", None, &hash('b')).unwrap();
+        update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("mainline", None, &hash('b'), &RefPreconditions::NONE).unwrap();
         assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["main", "mainline"]);
 
         let folder = get_pallets_folder().join("feature");
@@ -1118,7 +1521,7 @@ mod tests {
     #[test]
     fn os_litter_in_the_pallets_folder_is_not_a_pallet() {
         let (root, _scope) = scratch("pallet-os-litter");
-        update_pallet_head("feature/x", None, &hash('a')).unwrap();
+        update_pallet_head("feature/x", None, &hash('a'), &RefPreconditions::NONE).unwrap();
 
         let folder = get_pallets_folder();
         for litter in [folder.join(".DS_Store"), folder.join("feature").join(".DS_Store"), folder.join("Thumbs.db")] {
@@ -1162,8 +1565,8 @@ mod tests {
     #[test]
     fn a_killed_ref_write_leaves_no_pallet_behind() {
         let (root, _scope) = scratch("temp-litter");
-        update_pallet_head("main", None, &hash('a')).unwrap();
-        update_pallet_head("a-b/x", None, &hash('b')).unwrap();
+        update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        update_pallet_head("a-b/x", None, &hash('b'), &RefPreconditions::NONE).unwrap();
 
         for name in ["main", "a-b/x"] {
             let temp = file_utils::temp_path_for(&get_pallet_ref_path(PalletNamespace::User, name)).unwrap();
@@ -1185,7 +1588,7 @@ mod tests {
     #[test]
     fn a_ref_write_never_consumes_a_neighbouring_pallet() {
         let (root, _scope) = scratch("temp-clobber");
-        update_pallet_head("x", None, &hash('a')).unwrap();
+        update_pallet_head("x", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         let next_write_id = || {
             let probe = file_utils::temp_path_for(&get_pallet_ref_path(PalletNamespace::User, "x")).unwrap();
             probe.file_name().unwrap().to_str().unwrap().rsplit_once('-').unwrap().1.parse::<u64>().unwrap() + 1
@@ -1202,7 +1605,7 @@ mod tests {
             }
 
             let (old, new) = if attempt % 2 == 0 { (hash('a'), hash('b')) } else { (hash('b'), hash('a')) };
-            update_pallet_head("x", Some(&old), &new).unwrap();
+            update_pallet_head("x", Some(&old), &new, &RefPreconditions::NONE).unwrap();
             let in_window = next_write_id() <= next + 64;
 
             let listed = list_pallets_in(PalletNamespace::User).unwrap();
@@ -1230,7 +1633,7 @@ mod tests {
     fn a_name_that_only_resembles_a_temp_still_fails_the_listing() {
         for impostor in ["x~", "main.tmp~1-", "Main.tmp~1-2", "-x.tmp~1-1", "bad name.tmp~3-4"] {
             let (root, _scope) = scratch("temp-impostor");
-            update_pallet_head("main", None, &hash('a')).unwrap();
+            update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
             std::fs::write(get_pallets_folder().join(impostor), format!("{}\n", hash('c'))).unwrap();
 
             let error = list_pallets_in(PalletNamespace::User).unwrap_err();

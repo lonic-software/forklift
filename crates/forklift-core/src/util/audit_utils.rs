@@ -10,6 +10,7 @@ use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
+use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
 /// inauthentic chain is bad input, while an authentic parcel that oversteps its signer's
@@ -895,15 +896,61 @@ impl OfficeChainMemo {
     }
 }
 
+/// An office verified against the trust anchor, with what it was read from: the office head
+/// and the trust file's bytes. A write judged against the office is conditioned on both through
+/// [`VerifiedOffice::preconditions`], so it lands only while the office it was judged against
+/// still stands.
+#[derive(Clone)]
+pub struct VerifiedOffice {
+    /// The verified office state.
+    pub state: OfficeState,
+
+    /// The office still at the head it was read from, the anchor still the bytes it was decoded
+    /// from.
+    preconditions: RefPreconditions,
+}
+
+impl VerifiedOffice {
+    /// The preconditions of a write judged against this office: the office still at its head,
+    /// the anchor still these bytes.
+    pub fn preconditions(&self) -> RefPreconditions {
+        self.preconditions.clone()
+    }
+
+    /// An office state that was never read from disk, for tests that judge writes against an
+    /// in-memory office: its writes condition on nothing.
+    #[cfg(test)]
+    pub(crate) fn unconditioned(state: OfficeState) -> VerifiedOffice {
+        VerifiedOffice { state, preconditions: RefPreconditions::NONE }
+    }
+}
+
+impl std::ops::Deref for VerifiedOffice {
+    type Target = OfficeState;
+
+    fn deref(&self) -> &OfficeState {
+        &self.state
+    }
+}
+
 /// This warehouse's office, verified against its trust anchor. A meta pallet's writes
 /// are judged against the verified office, never the unverified local read.
-pub fn verified_local_office() -> Result<OfficeState, String> {
-    let anchor = office_utils::read_trust_anchor()?
+pub fn verified_local_office() -> Result<VerifiedOffice, String> {
+    let (anchor, anchor_bytes) = office_utils::read_trust_anchor_with_bytes()?
         .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?;
-    let office_head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
+    let head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
         .ok_or("The office pallet is unborn; use \"office enroll\" first.".to_string())?;
 
-    Ok(verify_office_chain_memoized(&anchor, &office_head)?)
+    let state = verify_office_chain_memoized(&anchor, &head)?;
+
+    Ok(VerifiedOffice {
+        state,
+        preconditions: RefPreconditions {
+            office: OfficePrecondition::At(Some(head)),
+            anchor: AnchorPrecondition::Bytes(anchor_bytes),
+            pallets: PalletsPrecondition::NotConsumed,
+        },
+    })
 }
 
 /// [`verify_office_chain`], remembered for the life of the process.
@@ -2413,6 +2460,7 @@ mod tests {
         key_endorsement_payload, key_pop_payload, KeyRecord, Role, UserRecord,
     };
     use crate::util::sign_utils::to_hex;
+    use crate::util::pallet_utils::RefUpdateError;
 
     /// The office's current head: the base each test's office parcel stacks on.
     fn office_head() -> Option<String> {
@@ -3232,7 +3280,8 @@ mod tests {
             };
 
             let genesis = crate::util::office_utils::stack_office_parcel(
-                &state, &admin, "genesis".to_string(), &admin_key_id, office_head().as_deref()
+                &state, &admin, "genesis".to_string(), &admin_key_id, office_head().as_deref(),
+                &crate::util::pallet_utils::RefPreconditions::NONE,
             ).unwrap();
 
             let anchor = TrustAnchor {
@@ -3278,7 +3327,8 @@ mod tests {
             state.keys.push(key);
 
             let head = crate::util::office_utils::stack_office_parcel(
-                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id, office_head().as_deref()
+                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id, office_head().as_deref(),
+                &crate::util::pallet_utils::RefPreconditions::NONE,
             ).unwrap();
 
             (key_id, head)
@@ -3293,6 +3343,116 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The trust file's bytes as they stand.
+    fn anchor_bytes() -> Vec<u8> {
+        crate::util::office_utils::read_trust_anchor_bytes().unwrap().unwrap()
+    }
+
+    // Revert: `stack_meta_edits` writes with `RefPreconditions::NONE` → the edit lands under an
+    // office that no longer stands.
+    #[test]
+    fn a_meta_write_judged_against_an_office_that_moved_is_refused_and_writes_nothing() {
+        use crate::util::{kv_utils, meta_tree};
+
+        let fixture = PrivilegeFixture::new("meta-office-moved");
+        let office = verified_local_office().unwrap();
+        fixture.admit(BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
+        let moved = office_head();
+
+        let edit = meta_tree::set_cell(
+            &kv_utils::cell_path(&"c".repeat(64), "ci"), &fixture.admin_key_id, kv_utils::KV_TEXT_SCHEMA,
+            &kv_utils::text_value("green"),
+        ).unwrap();
+        let refused = meta_tree::stack_meta_edits(
+            kv_utils::KV_PALLET_NAME, &kv_utils::KvRules, &office, &[edit], &fixture.admin, "ci",
+            &meta_tree::MetaSigner::local(&fixture.admin_key_id),
+        );
+
+        assert_eq!(crate::util::pallet_utils::get_meta_pallet_head(kv_utils::KV_PALLET_NAME).unwrap(), None,
+            "the meta pallet must be unchanged");
+        let error = refused.expect_err("an office moved since it was verified must refuse the write");
+        assert_eq!(error, RefUpdateError::OfficeMoved { found: moved }.to_string());
+    }
+
+    // Revert: `Signing::preconditions` gives `NotConsumed` for a signed choice → the parcel lands
+    // signed under an office that no longer stands.
+    #[test]
+    fn a_signed_write_whose_office_moved_after_the_signing_choice_is_refused() {
+        let fixture = PrivilegeFixture::new("signed-office-moved");
+        let signing = crate::util::stack_utils::resolve_signing_key(&fixture.admin).unwrap();
+        assert_eq!(signing.key_id(), Some(fixture.admin_key_id.as_str()));
+        fixture.admit(BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
+
+        let refused = signing.write_head("main", None, &"1".repeat(64));
+
+        assert_eq!(crate::util::pallet_utils::get_pallet_head("main").unwrap(), None, "the pallet must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::OfficeMoved { found: office_head() }));
+    }
+
+    // Revert: `resolve_signing_key` reads the office without verifying it against the anchor → a
+    // key is chosen from an office the anchor does not govern.
+    #[test]
+    fn a_signing_choice_refuses_an_office_the_anchor_does_not_govern() {
+        let fixture = PrivilegeFixture::new("signing-unverified-office");
+        let old_office = office_head().unwrap();
+
+        // A new-chain anchor beside the old-chain office.
+        crate::util::office_utils::install_trust(&crate::util::office_utils::TrustInstall {
+            anchor: &TrustAnchor {
+                genesis: "f".repeat(64),
+                enabled_at: 1_700_000_002,
+                boundary: Vec::new(),
+                prior_genesis: Some(fixture.anchor.genesis.clone()),
+                adopts: Some(old_office.clone()),
+            },
+            replaces: Some(&anchor_bytes()),
+            office: Some(&old_office),
+            new_office: None,
+            pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
+        }).unwrap();
+
+        let error = crate::util::stack_utils::resolve_signing_key(&fixture.admin).err()
+            .expect("an office the anchor does not govern must not choose a key");
+
+        assert_eq!(Err(error), verified_local_office().map(|_| ()), "the refusal is the audit's own");
+    }
+
+    // Revert: an office writer passes `AnchorPrecondition::NotConsumed` → the office moves under
+    // an anchor its parcel was not judged against.
+    #[test]
+    fn an_office_write_judged_against_an_anchor_that_was_replaced_is_refused() {
+        let fixture = PrivilegeFixture::new("office-anchor-moved");
+        let head = office_head();
+        let read = anchor_bytes();
+        let state = crate::util::office_utils::read_office_state().unwrap();
+
+        crate::util::office_utils::install_trust(&crate::util::office_utils::TrustInstall {
+            anchor: &TrustAnchor {
+                genesis: "f".repeat(64),
+                enabled_at: 1_700_000_002,
+                boundary: Vec::new(),
+                prior_genesis: Some(fixture.anchor.genesis.clone()),
+                adopts: head.clone(),
+            },
+            replaces: Some(&read),
+            office: head.as_deref(),
+            new_office: None,
+            pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
+        }).unwrap();
+
+        let refused = crate::util::office_utils::stack_office_parcel(
+            &state, &fixture.admin, "late".to_string(), &fixture.admin_key_id, head.as_deref(),
+            &crate::util::pallet_utils::RefPreconditions {
+                office: crate::util::pallet_utils::OfficePrecondition::At(head.clone()),
+                anchor: crate::util::pallet_utils::AnchorPrecondition::Bytes(read),
+                pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
+            },
+        );
+
+        assert_eq!(office_head(), head, "the office must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
     }
 
     /// Falsifies the leak this fixture used to have: `FORKLIFT_KEYS_DIR` is
@@ -3365,7 +3525,8 @@ mod tests {
         mutate(bob_record);
 
         let hostile = crate::util::office_utils::stack_office_parcel(
-            &state, &bob, "self-service edit".to_string(), &bob_key_id, office_head().as_deref()
+            &state, &bob, "self-service edit".to_string(), &bob_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let error = match verify_office_chain(&fixture.anchor, &hostile) {
@@ -3433,7 +3594,8 @@ mod tests {
         }
 
         let approved = crate::util::office_utils::stack_office_parcel(
-            &state, &fixture.admin, "admin reclassifies bob".to_string(), &fixture.admin_key_id, office_head().as_deref()
+            &state, &fixture.admin, "admin reclassifies bob".to_string(), &fixture.admin_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         assert!(verify_office_chain(&fixture.anchor, &approved).is_ok());
@@ -3470,7 +3632,8 @@ mod tests {
         state.keys.push(new_key);
 
         let rotated = crate::util::office_utils::stack_office_parcel(
-            &state, &bob, "bob rotates his own key".to_string(), &bob_key_id, office_head().as_deref()
+            &state, &bob, "bob rotates his own key".to_string(), &bob_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         assert!(verify_office_chain(&fixture.anchor, &rotated).is_ok());
@@ -3497,7 +3660,8 @@ mod tests {
         state.keys.push(device_key);
 
         let linked = crate::util::office_utils::stack_office_parcel(
-            &state, &bob, "bob links a second device".to_string(), &bob_key_id, office_head().as_deref()
+            &state, &bob, "bob links a second device".to_string(), &bob_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         assert!(verify_office_chain(&fixture.anchor, &linked).is_ok());
@@ -3572,7 +3736,8 @@ mod tests {
         carol_key.distrust_boundary = Vec::new();
 
         let revoked_head = crate::util::office_utils::stack_office_parcel(
-            &revoked, &fixture.admin, "revoke carol".to_string(), &fixture.admin_key_id, office_head().as_deref()
+            &revoked, &fixture.admin, "revoke carol".to_string(), &fixture.admin_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         assert!(verify_office_chain(&fixture.anchor, &revoked_head).is_ok());
 
@@ -3614,7 +3779,8 @@ mod tests {
         promoted.users.iter_mut().find(|user| user.identifier == BOB).unwrap().role = Role::Admin;
 
         let hostile = crate::util::office_utils::stack_office_parcel(
-            &promoted, &bob, "bob promotes himself".to_string(), &bob_key_id, office_head().as_deref()
+            &promoted, &bob, "bob promotes himself".to_string(), &bob_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // An admin admission on top: legitimate in itself.
@@ -3672,7 +3838,8 @@ mod tests {
         carol_key.revocation_reason = Some(crate::util::office_utils::RevocationReason::Compromise);
 
         let overstep = crate::util::office_utils::stack_office_parcel(
-            &revoked, &bob, "bob revokes carol".to_string(), &bob_key_id, office_head().as_deref()
+            &revoked, &bob, "bob revokes carol".to_string(), &bob_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // Carol's own key is really active: only the refused parcel says otherwise.
@@ -3716,7 +3883,8 @@ mod tests {
         ).unwrap());
 
         let hostile = crate::util::office_utils::stack_office_parcel(
-            &state, &fixture.admin, "add a key for carol".to_string(), &fixture.admin_key_id, office_head().as_deref()
+            &state, &fixture.admin, "add a key for carol".to_string(), &fixture.admin_key_id, office_head().as_deref(),
+            &crate::util::pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         match verify_office_chain(&fixture.anchor, &hostile) {

@@ -30,6 +30,7 @@ use crate::util::manifest_utils::operator_leaf;
 use crate::util::meta_tree::{
     self, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
 };
+use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState};
 use crate::util::object_utils;
 
@@ -651,7 +652,7 @@ impl PalletRules for HaulRules {
 
 /// Stack edits to the local `@haul` head as one signed parcel. `None` when they changed nothing.
 fn stack(edits: &[CellEdit],
-         office: &OfficeState,
+         office: &VerifiedOffice,
          actor: &Operator,
          description: &str,
          signer: &MetaSigner) -> Result<Option<String>, String> {
@@ -673,7 +674,7 @@ pub fn open_haul(source: &str,
                  head: &str,
                  title: &str,
                  description: &str,
-                 office: &OfficeState,
+                 office: &VerifiedOffice,
                  actor: &Operator,
                  signer: &MetaSigner) -> Result<String, String> {
     let opened = Opened {
@@ -702,7 +703,7 @@ pub fn open_haul(source: &str,
 /// Record a comment on a haul.
 pub fn record_comment(haul_id: &str,
                       body: &str,
-                      office: &OfficeState,
+                      office: &VerifiedOffice,
                       actor: &Operator,
                       signer: &MetaSigner) -> Result<Option<String>, String> {
     let comment = comment_value(body, Utc::now().timestamp());
@@ -717,7 +718,7 @@ pub fn record_review(haul_id: &str,
                      verdict: ReviewVerdict,
                      body: &str,
                      head: &str,
-                     office: &OfficeState,
+                     office: &VerifiedOffice,
                      actor: &Operator,
                      signer: &MetaSigner) -> Result<Option<String>, String> {
     let path = format!("{}/{}/{}", haul_dir(haul_id), DIR_REVIEW, operator_leaf(&signing_operator(office, signer)?));
@@ -734,7 +735,7 @@ pub fn record_state(haul_id: &str,
                     status: &HaulStatus,
                     head: &str,
                     action: &str,
-                    office: &OfficeState,
+                    office: &VerifiedOffice,
                     actor: &Operator,
                     signer: &MetaSigner) -> Result<Option<String>, String> {
     let path = format!("{}/{}", haul_dir(haul_id), CELL_STATE);

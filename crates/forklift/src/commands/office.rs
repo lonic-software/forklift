@@ -4,6 +4,7 @@ use forklift_core::error::sanitize;
 use forklift_core::model::operator::Operator;
 use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Role, TrustAnchor, UserRecord};
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
+use forklift_core::util::pallet_utils::{AnchorPrecondition, BoundaryScope, PalletsPrecondition, RefPreconditions};
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{config_utils, office_utils, pallet_utils, sign_utils, trust_utils};
 use crate::output::{self, CommandOutput};
@@ -30,6 +31,10 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         );
     }
 
+    // The office head the genesis extends, read before anything: the install moves the office
+    // only while it still holds it.
+    let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
+
     // Everything reachable from the current pallet heads is the pre-trust history:
     // audit will allow it to be unsigned, and require signatures on everything else.
     let mut boundary: Vec<String> = Vec::new();
@@ -39,6 +44,9 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
             boundary.push(head);
         }
     }
+
+    #[cfg(test)]
+    tests::AFTER_BOUNDARY_READ.with(|seam| seam.take().map(|seam| seam()));
 
     let has_remote =
         config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.is_some();
@@ -93,15 +101,24 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     };
 
     let description = format!("Enrolled operator \"{}\" (genesis).", operator.identifier);
-    let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
-    let genesis = office_utils::stack_office_parcel(&state, &operator, description, &key_id, office_head.as_deref())?;
+    let genesis = office_utils::build_and_sign_office_parcel(
+        &state, &operator, description, &key_id, office_head.iter().cloned().collect(),
+    )?;
 
-    office_utils::write_trust_anchor(&TrustAnchor {
-        genesis: genesis.clone(),
-        enabled_at: now,
-        boundary,
-        prior_genesis: None,
-        adopts: None,
+    // The anchor and the genesis land together, and only while no other bay moved a pallet since
+    // the boundary was read: a parcel stacked meanwhile would stand outside it, unsigned.
+    office_utils::install_trust(&office_utils::TrustInstall {
+        anchor: &TrustAnchor {
+            genesis: genesis.clone(),
+            enabled_at: now,
+            boundary: boundary.clone(),
+            prior_genesis: None,
+            adopts: None,
+        },
+        replaces: None,
+        office: office_head.as_deref(),
+        new_office: Some(&genesis),
+        pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::UserPallets },
     })?;
 
     output::message(format!(
@@ -153,7 +170,7 @@ pub fn admit(operator_id: &str,
              class: IdentityClass,
              supervisor: Option<String>) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let SigningActor { mut state, office_head, signing_key_id, actor_id, anchor_bytes } = require_signing_actor(&actor)?;
     require_admin(&state, &actor_id)?;
 
     let role = Role::parse(role)?;
@@ -224,7 +241,10 @@ pub fn admit(operator_id: &str,
         "Admitted operator \"{}\" as {}{} (identity root {}), by \"{}\".",
         operator_id, role.as_str(), marked, key_id, actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
+    let parcel = office_utils::stack_office_parcel(
+        &state, &actor, description, &signing_key_id, office_head.as_deref(),
+        &office_change_preconditions(&anchor_bytes, PalletsPrecondition::NotConsumed),
+    )?;
 
     output::message(format!(
         "Admitted \"{}\" as {}{} with identity root {} (office parcel {}).",
@@ -253,7 +273,7 @@ fn describe_class(class: IdentityClass, supervisor: Option<&str>) -> String {
 /// endorsing key.
 pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let SigningActor { mut state, office_head, signing_key_id, actor_id, anchor_bytes } = require_signing_actor(&actor)?;
 
     let key_bytes = sign_utils::from_hex(public_key)
         .map_err(|_| "The public key is not valid hex.".to_string())?;
@@ -282,7 +302,10 @@ pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
         "Linked key {} to \"{}\" (endorsed by key {}).",
         key_id, actor_id, signing_key_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
+    let parcel = office_utils::stack_office_parcel(
+        &state, &actor, description, &signing_key_id, office_head.as_deref(),
+        &office_change_preconditions(&anchor_bytes, PalletsPrecondition::NotConsumed),
+    )?;
 
     output::message(format!(
         "Linked key {} to your identity (office parcel {}).", key_id, parcel
@@ -297,7 +320,7 @@ pub fn link(public_key: &str, pop: &str) -> Result<(), String> {
 /// one can be attributed a key they do not hold).
 pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let SigningActor { mut state, office_head, signing_key_id, actor_id, anchor_bytes } = require_signing_actor(&actor)?;
 
     if operator_id == actor_id {
         return Err(
@@ -341,7 +364,10 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
         "Authorized key {} for \"{}\", by admin \"{}\".",
         key_id, operator_id, actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
+    let parcel = office_utils::stack_office_parcel(
+        &state, &actor, description, &signing_key_id, office_head.as_deref(),
+        &office_change_preconditions(&anchor_bytes, PalletsPrecondition::NotConsumed),
+    )?;
 
     output::message(format!(
         "Authorized key {} for \"{}\" (office parcel {}).",
@@ -355,7 +381,7 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
 /// lockout protection: the office must always retain at least one admin.
 pub fn role(identifier: &str, role: &str, pallets: Vec<String>) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let SigningActor { mut state, office_head, signing_key_id, actor_id, anchor_bytes } = require_signing_actor(&actor)?;
     require_admin(&state, &actor_id)?;
 
     let role = Role::parse(role)?;
@@ -390,7 +416,10 @@ pub fn role(identifier: &str, role: &str, pallets: Vec<String>) -> Result<(), St
         "Changed the role of \"{}\" to {}, by \"{}\".",
         identifier, role.as_str(), actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
+    let parcel = office_utils::stack_office_parcel(
+        &state, &actor, description, &signing_key_id, office_head.as_deref(),
+        &office_change_preconditions(&anchor_bytes, PalletsPrecondition::NotConsumed),
+    )?;
 
     output::message(format!(
         "\"{}\" is now a(n) {} (office parcel {}).", identifier, role.as_str(), parcel
@@ -406,7 +435,7 @@ pub fn role(identifier: &str, role: &str, pallets: Vec<String>) -> Result<(), St
 /// so the old keys cannot silently sign anything new.
 pub async fn rotate(offline: bool, passphrase: bool) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, office_head, old_key_id, actor_id) = require_signing_actor(&actor)?;
+    let SigningActor { mut state, office_head, signing_key_id: old_key_id, actor_id, anchor_bytes } = require_signing_actor(&actor)?;
 
     let boundary = revocation_boundary(offline).await?;
 
@@ -432,7 +461,14 @@ pub async fn rotate(offline: bool, passphrase: bool) -> Result<(), String> {
         "Rotated the keys of \"{}\": {} replaces {}.",
         actor_id, new_key_id, old_key_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &old_key_id, office_head.as_deref())?;
+    // Written only while every user pallet head is still one the boundary vouches for: a parcel
+    // the retired key signed in another bay meanwhile would stand outside it.
+    let parcel = office_utils::stack_office_parcel(
+        &state, &actor, description, &old_key_id, office_head.as_deref(),
+        &office_change_preconditions(
+            &anchor_bytes, PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::UserPallets },
+        ),
+    )?;
 
     output::message(format!(
         "Rotated keys (office parcel {}).\nNew key id: {}", parcel, new_key_id
@@ -448,7 +484,7 @@ pub async fn rotate(offline: bool, passphrase: bool) -> Result<(), String> {
 /// a shifted clock changes nothing.
 pub async fn retire(key_id: &str, compromised: bool, offline: bool) -> Result<(), String> {
     let actor = config_utils::get_operator()?;
-    let (mut state, office_head, signing_key_id, actor_id) = require_signing_actor(&actor)?;
+    let SigningActor { mut state, office_head, signing_key_id, actor_id, anchor_bytes } = require_signing_actor(&actor)?;
 
     let Some(target) = state.find_key(key_id) else {
         return Err(format!("No key {} is tracked.", key_id));
@@ -505,7 +541,13 @@ pub async fn retire(key_id: &str, compromised: bool, offline: bool) -> Result<()
         "Revoked key {} of \"{}\" ({}), by \"{}\".",
         key_id, target_operator, reason.as_str(), actor_id
     );
-    let parcel = office_utils::stack_office_parcel(&state, &actor, description, &signing_key_id, office_head.as_deref())?;
+    // Written only while every user pallet head is still one the boundary vouches for (see rotate).
+    let parcel = office_utils::stack_office_parcel(
+        &state, &actor, description, &signing_key_id, office_head.as_deref(),
+        &office_change_preconditions(
+            &anchor_bytes, PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::UserPallets },
+        ),
+    )?;
 
     let mut report = format!("Revoked key {} ({}; office parcel {}).", key_id, reason.as_str(), parcel);
 
@@ -533,6 +575,9 @@ async fn revocation_boundary(offline: bool) -> Result<Vec<String>, String> {
             boundary.push(head);
         }
     }
+
+    #[cfg(test)]
+    tests::AFTER_BOUNDARY_READ.with(|seam| seam.take().map(|seam| seam()));
 
     let has_remote =
         config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.is_some();
@@ -718,7 +763,7 @@ impl CommandOutput for OfficeListing {
 pub fn regenesis(confirm: bool) -> Result<(), String> {
     let operator = config_utils::get_operator()?;
 
-    let Some(old_anchor) = office_utils::read_trust_anchor()? else {
+    let Some((old_anchor, old_anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
         return Err(
             "Trust is not established for this warehouse; there is nothing to reset. \
             Use \"office enroll\".".to_string()
@@ -730,8 +775,9 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
     };
 
     // A working admin has every self-service and admin tool available; a trust reset
-    // is strictly for the chain nobody can extend anymore.
-    let state = office_utils::read_office_state()?;
+    // is strictly for the chain nobody can extend anymore. Judged at the head the reset adopts,
+    // which the install below conditions on.
+    let state = office_utils::read_office_state_of(&old_office_head)?;
 
     if let Some(user) = state.find_user(&operator.identifier) {
         if user.role == Role::Admin && state.signing_key_of(&operator.identifier).is_some() {
@@ -768,6 +814,9 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         boundary.push(head);
     }
 
+    #[cfg(test)]
+    tests::AFTER_BOUNDARY_READ.with(|seam| seam.take().map(|seam| seam()));
+
     let now = Utc::now().timestamp();
     let (key_id, public_key) = sign_utils::generate_keypair(&operator.identifier)?;
     let pop = office_utils::sign_key_pop(&key_id, &public_key, &operator.identifier)?;
@@ -791,16 +840,25 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         "Re-genesis: new trust root for operator \"{}\" (adopts office head {}).",
         operator.identifier, old_office_head
     );
-    let genesis = office_utils::stack_office_genesis(
-        &new_state, &operator, description, &key_id, Some(&old_office_head)
-    )?;
+    // A parentless genesis: the new chain must not descend from the old one, which the anchor's
+    // `adopts` pins instead of extending.
+    let genesis = office_utils::build_and_sign_office_parcel(&new_state, &operator, description, &key_id, Vec::new())?;
 
-    office_utils::replace_trust_anchor(&office_utils::TrustAnchor {
-        genesis: genesis.clone(),
-        enabled_at: now,
-        boundary,
-        prior_genesis: Some(old_anchor.genesis.clone()),
-        adopts: Some(old_office_head.clone()),
+    // The new anchor and the new office land together, and only while the old ones and every
+    // pallet head the boundary vouches for still stand: no other bay ever sees the new anchor
+    // beside the old office, and a refusal leaves both as they were.
+    office_utils::install_trust(&office_utils::TrustInstall {
+        anchor: &TrustAnchor {
+            genesis: genesis.clone(),
+            enabled_at: now,
+            boundary: boundary.clone(),
+            prior_genesis: Some(old_anchor.genesis.clone()),
+            adopts: Some(old_office_head.clone()),
+        },
+        replaces: Some(&old_anchor_bytes),
+        office: Some(&old_office_head),
+        new_office: Some(&genesis),
+        pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::AllButOffice },
     })?;
 
     output::message(format!(
@@ -897,27 +955,56 @@ fn generate_operator_key(owner: &str, passphrase: bool) -> Result<(String, Strin
     }
 }
 
+/// An operator who can sign office changes, and what that was decided from.
+pub(crate) struct SigningActor {
+    /// The current office state.
+    pub(crate) state: OfficeState,
+
+    /// The office head it was read from: the base of the actor's next office parcel.
+    pub(crate) office_head: Option<String>,
+
+    /// The actor's signing key id.
+    pub(crate) signing_key_id: String,
+
+    /// The actor's operator id.
+    pub(crate) actor_id: String,
+
+    /// The trust file's bytes the change is judged under: its office parcel is written only
+    /// while they stand.
+    pub(crate) anchor_bytes: Vec<u8>,
+}
+
+/// The preconditions of an office parcel judged under the trust file's `anchor_bytes`: the
+/// anchor still those bytes, and the boundary it records, if any.
+fn office_change_preconditions(anchor_bytes: &[u8], pallets: PalletsPrecondition) -> RefPreconditions {
+    RefPreconditions {
+        anchor: AnchorPrecondition::Bytes(anchor_bytes.to_vec()),
+        pallets,
+        ..RefPreconditions::NONE
+    }
+}
+
 /// Require that the configured operator is enrolled and can sign right now: trust is
 /// established and one of their active keys is present on this machine.
 ///
 /// # Returns
-/// * `Ok((OfficeState, Option<String>, String, String))` - The current office state, the
-///                                                         office head it was read from (the
-///                                                         base of the actor's next office
-///                                                         parcel), the signing key id, and
-///                                                         the actor's operator id.
-/// * `Err(String)`                                       - If trust is missing, or the
-///                                                         operator cannot sign.
-pub(crate) fn require_signing_actor(actor: &Operator)
-    -> Result<(OfficeState, Option<String>, String, String), String> {
-    if office_utils::read_trust_anchor()?.is_none() {
+/// * `Ok(SigningActor)` - The actor, the office state and head, the key, and the anchor bytes.
+/// * `Err(String)`      - If trust is missing, or the operator cannot sign.
+pub(crate) fn require_signing_actor(actor: &Operator) -> Result<SigningActor, String> {
+    let Some((_, anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
         return Err(
             "Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string()
         );
-    }
+    };
 
     let (state, office_head) = office_utils::read_office_state_and_head()?;
+    let (actor_id, signing_key_id) = signing_key_in(&state, actor)?;
 
+    Ok(SigningActor { state, office_head, signing_key_id, actor_id, anchor_bytes })
+}
+
+/// The operator's identifier in `state` and their active key present on this machine.
+pub(crate) fn signing_key_in(state: &OfficeState, actor: &Operator) -> Result<(String, String), String> {
     let Some(actor_id) = state.find_user(&actor.identifier).map(|user| user.identifier.clone()) else {
         return Err(format!(
             "\"{}\" is not enrolled; ask an enrolled operator to admit you.",
@@ -932,7 +1019,7 @@ pub(crate) fn require_signing_actor(actor: &Operator)
             actor_id
         ))?;
 
-    Ok((state, office_head, signing_key_id, actor_id))
+    Ok((actor_id, signing_key_id))
 }
 
 /// Require that the operator is an office admin (admissions, roles, others' keys).
@@ -954,6 +1041,128 @@ fn require_admin(state: &OfficeState, actor_id: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::{Mutex, MutexGuard};
+    use crate::test_support::{self, Warehouse};
+
+    thread_local! {
+        /// Run after a trust write's boundary is read from the local pallet heads, before the
+        /// write that records it.
+        pub(crate) static AFTER_BOUNDARY_READ: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    }
+
+    /// `FORKLIFT_KEYS_DIR` is process-wide: a test that signs holds this for its duration.
+    static KEYS_DIR: Mutex<()> = Mutex::new(());
+
+    /// A warehouse with an operator, a pallet "main" at a parcel, and a private-key folder of its
+    /// own.
+    struct Office {
+        _warehouse: Warehouse,
+        main: String,
+        _keys: MutexGuard<'static, ()>,
+    }
+
+    impl Office {
+        fn new(name: &str) -> Office {
+            let keys = KEYS_DIR.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let warehouse = Warehouse::storage_only(name);
+            std::env::set_var("FORKLIFT_KEYS_DIR", warehouse.root.join("keys"));
+            test_support::configure_operator();
+
+            let main = test_support::store_parcel(&test_support::store_tree("a.txt", b"a\n"), &[]);
+            pallet_utils::update_pallet_head("main", None, &main, &RefPreconditions::NONE).unwrap();
+
+            Office { _warehouse: warehouse, main, _keys: keys }
+        }
+
+        /// Arm the boundary seam to stack on "main" the way another bay would.
+        fn stack_after_boundary_read(&self) -> String {
+            let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"b\n"), &[&self.main]);
+            let (from, to) = (self.main.clone(), elsewhere.clone());
+
+            AFTER_BOUNDARY_READ.with(|seam| seam.set(Some(Box::new(move || {
+                pallet_utils::update_pallet_head("main", Some(&from), &to, &RefPreconditions::NONE).unwrap();
+            }))));
+
+            elsewhere
+        }
+
+        fn enroll(&self) -> Result<(), String> {
+            test_support::block_on(enroll(true, false))
+        }
+    }
+
+    impl Drop for Office {
+        fn drop(&mut self) {
+            AFTER_BOUNDARY_READ.with(|seam| seam.set(None));
+            std::env::remove_var("FORKLIFT_KEYS_DIR");
+        }
+    }
+
+    // Revert: enroll installs with `PalletsPrecondition::NotConsumed` → the anchor is written over
+    // a boundary that no longer vouches for "main".
+    #[test]
+    fn an_enroll_whose_boundary_moved_writes_nothing_and_a_rerun_succeeds() {
+        let office = Office::new("office-enroll-moved");
+        let elsewhere = office.stack_after_boundary_read();
+
+        let error = office.enroll().expect_err("a pallet moved after the boundary read must refuse the enroll");
+
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
+        assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), None, "the office must stay unborn");
+        assert!(error.contains("moved pallet \"main\""), "{}", error);
+
+        office.enroll().expect("a re-run reads the moved head into its boundary");
+        let anchor = office_utils::read_trust_anchor().unwrap().expect("the re-run establishes trust");
+        assert_eq!(anchor.boundary, vec![elsewhere]);
+    }
+
+    // Revert: rotate passes `PalletsPrecondition::NotConsumed` → the office moves past a boundary
+    // that does not vouch for the new head of "main".
+    #[test]
+    fn a_rotate_whose_boundary_moved_writes_nothing() {
+        let office = Office::new("office-rotate-moved");
+        office.enroll().unwrap();
+        let before = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
+        office.stack_after_boundary_read();
+
+        let error = test_support::block_on(rotate(true, false))
+            .expect_err("a pallet moved after the boundary read must refuse the rotation");
+
+        assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), before, "the office must not move");
+        assert!(error.contains("moved pallet \"main\""), "{}", error);
+    }
+
+    // Revert: regenesis installs with `PalletsPrecondition::NotConsumed` → the reset lands over a
+    // boundary that does not vouch for the new head of "main".
+    #[test]
+    fn a_regenesis_whose_boundary_moved_writes_nothing_and_a_rerun_succeeds() {
+        let office = Office::new("office-regenesis-moved");
+        office.enroll().unwrap();
+        let anchor_before = office_utils::read_trust_anchor_with_bytes().unwrap().unwrap().1;
+        let office_before = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
+
+        // A recovering operator: not the admin whose usable key would refuse a re-genesis.
+        config_utils::set_value(
+            config_utils::KEY_OPERATOR_IDENTIFIER, "recoverer", forklift_core::enums::config_scope::ConfigScope::Warehouse,
+        ).unwrap();
+        office.stack_after_boundary_read();
+
+        let error = regenesis(true).expect_err("a pallet moved after the boundary read must refuse the re-genesis");
+
+        assert_eq!(office_utils::read_trust_anchor_with_bytes().unwrap().map(|(_, bytes)| bytes), Some(anchor_before),
+            "the old anchor must stand");
+        assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), office_before,
+            "the old office must stand");
+        assert!(error.contains("moved pallet \"main\""), "{}", error);
+
+        regenesis(true).expect("a re-run reads the moved head into its boundary");
+        assert_ne!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), office_before);
+    }
+}
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]

@@ -48,7 +48,7 @@ fn subject_of(revision: &str) -> Result<String, String> {
 }
 
 /// The verified office, the signing key and the operator id of a writer, refusing a reader.
-fn require_writer() -> Result<(forklift_core::util::office_utils::OfficeState, String, String,
+fn require_writer() -> Result<(forklift_core::util::audit_utils::VerifiedOffice, String, String,
                                forklift_core::model::operator::Operator), String> {
     let actor = config_utils::get_operator()?;
     let (office, signing_key_id) = lower::verified_signing_office(&actor)?;

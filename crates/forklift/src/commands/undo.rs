@@ -179,20 +179,20 @@ mod tests {
         let one = test_support::store_parcel(&tree, &[]);
         let two = test_support::store_parcel(&tree, &[&one]);
         let three = test_support::store_parcel(&tree, &[&two]);
-        pallet_utils::update_pallet_head("zeta", None, &one).unwrap();
+        pallet_utils::update_pallet_head("zeta", None, &one, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(one.clone()))).unwrap();
-        pallet_utils::update_pallet_head("alpha", None, &hash('a')).unwrap();
+        pallet_utils::update_pallet_head("alpha", None, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap();
 
         let before = journal_utils::capture().unwrap();
-        pallet_utils::update_pallet_head("zeta", Some(&one), &two).unwrap();
+        pallet_utils::update_pallet_head("zeta", Some(&one), &two, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(two.clone()))).unwrap();
-        pallet_utils::update_pallet_head("alpha", Some(&hash('a')), &hash('b')).unwrap();
+        pallet_utils::update_pallet_head("alpha", Some(&hash('a')), &hash('b'), &pallet_utils::RefPreconditions::NONE).unwrap();
         journal_utils::push_if_changed("stack", before).unwrap();
 
         // Another bay stacks on "zeta" between the gate and the restore.
         let (on, moved_to) = (two.clone(), three.clone());
         AFTER_GATE.with(|seam| seam.set(Some(Box::new(move || {
-            pallet_utils::update_pallet_head("zeta", Some(&on), &moved_to).unwrap();
+            pallet_utils::update_pallet_head("zeta", Some(&on), &moved_to, &pallet_utils::RefPreconditions::NONE).unwrap();
         }))));
 
         let error = test_support::block_on(handle_command()).expect_err("the undo must be refused");

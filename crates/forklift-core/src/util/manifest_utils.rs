@@ -18,6 +18,7 @@ use crate::model::operator::Operator;
 use crate::util::meta_tree::{
     self, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
 };
+use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState};
 use crate::util::object_utils;
 
@@ -470,7 +471,7 @@ impl PalletRules for ManifestRules {
 /// * `Ok(Some(hash))` - The new head.
 /// * `Ok(None)`       - The signer had already recorded exactly this entry.
 pub fn record_entry(entry: &ManifestEntry,
-                    office: &OfficeState,
+                    office: &VerifiedOffice,
                     actor: &Operator,
                     description: &str,
                     signer: &MetaSigner) -> Result<Option<String>, String> {

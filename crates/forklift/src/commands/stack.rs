@@ -175,9 +175,9 @@ mod tests {
             &[&our_head],
         );
 
-        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
-        pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
         // A conflicted merge, resolved and loaded by hand.
@@ -187,7 +187,7 @@ mod tests {
         test_support::block_on(load::handle_command("a.txt")).unwrap();
 
         // Another bay stacks on "main" before the merge is completed.
-        pallet_utils::update_pallet_head("main", Some(&our_head), &elsewhere).unwrap();
+        pallet_utils::update_pallet_head("main", Some(&our_head), &elsewhere, &pallet_utils::RefPreconditions::NONE).unwrap();
 
         // The bay is behind "main" now, so the merge is refused before anything is written, with
         // the way out: abort, discard, delete what restore leaves untracked, catch up, merge again.
@@ -221,9 +221,9 @@ mod tests {
         let our_head = test_support::store_parcel(&our_tree, &[&base]);
         let their_head = test_support::store_parcel(&test_support::store_tree("a.txt", b"theirs\n"), &[&base]);
 
-        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
-        pallet_utils::update_pallet_head("feature", None, &their_head).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
         test_support::block_on(consolidate::handle_command("feature")).unwrap();
@@ -237,7 +237,7 @@ mod tests {
         assert!(!pallet_utils::does_pallet_exist("side"), "a refused palletize must leave no pallet behind");
 
         // Any other switch to a pallet at the very same head: the merge must not land there.
-        pallet_utils::update_pallet_head("side", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("side", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("side", pallet_utils::get_pallet_head("side").unwrap())).unwrap();
 
         let error = test_support::block_on(handle_command(None))
@@ -262,7 +262,7 @@ mod tests {
         );
         let elsewhere = test_support::store_parcel(&test_support::store_tree("a.txt", b"elsewhere\n"), &[&our_head]);
 
-        pallet_utils::update_pallet_head("main", None, &our_head).unwrap();
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
 
@@ -273,7 +273,7 @@ mod tests {
         test_support::block_on(load::handle_command("a.txt")).unwrap();
 
         // Another bay stacks on "main" before the pick is completed.
-        pallet_utils::update_pallet_head("main", Some(&our_head), &elsewhere).unwrap();
+        pallet_utils::update_pallet_head("main", Some(&our_head), &elsewhere, &pallet_utils::RefPreconditions::NONE).unwrap();
 
         let error = test_support::block_on(handle_command(None))
             .expect_err("completing a pick over a moved pallet must be refused");

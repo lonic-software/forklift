@@ -9,7 +9,8 @@ use crate::util::{
     cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils,
     object_utils, office_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
 };
-use crate::util::pallet_utils::RefUpdateError;
+use crate::util::audit_utils::{self, VerifiedOffice};
+use crate::util::pallet_utils::{AnchorPrecondition, RefPreconditions, RefUpdateError};
 
 /// Why [`stack_parcel`] failed: its head write did not go through (which a merge or pick
 /// completion has to settle, see `consolidate`'s caller), or anything else.
@@ -65,25 +66,69 @@ impl From<StackError> for String {
     }
 }
 
-/// Resolve the key a parcel must be signed with: `None` while trust is not established,
-/// the operator's local active key afterwards (an error when they have none — signing
-/// is mandatory once trust exists).
+/// How a parcel is signed, and what the choice was made from: a head write of the parcel is
+/// conditioned on it ([`Signing::preconditions`]), so a parcel signed under an office that changed
+/// meanwhile, or left unsigned while trust was being established, is refused rather than landed.
+pub enum Signing {
+    /// Trust is not established: the parcel is not signed, and no anchor may appear before its
+    /// head is written.
+    Unsigned,
+
+    /// The parcel is signed with `key_id`, the operator's active key in the verified `office`.
+    Signed {
+        key_id: String,
+        office: VerifiedOffice,
+    },
+}
+
+impl Signing {
+    /// The signing key (`None`: unsigned).
+    pub fn key_id(&self) -> Option<&str> {
+        match self {
+            Signing::Unsigned => None,
+            Signing::Signed { key_id, .. } => Some(key_id),
+        }
+    }
+
+    /// Move `pallet` from `expected` to `new`, a parcel signed this way, conditioned on the signing
+    /// choice: an anchor established since an unsigned choice, or an office or anchor changed since
+    /// a signed one, refuses the write (see [`pallet_utils::update_pallet_head`]).
+    pub fn write_head(&self, pallet: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
+        pallet_utils::update_pallet_head(pallet, expected, new, &self.preconditions())
+    }
+
+    /// The preconditions of a head write of a parcel signed this way.
+    fn preconditions(&self) -> RefPreconditions {
+        match self {
+            Signing::Unsigned => RefPreconditions {
+                anchor: AnchorPrecondition::Absent,
+                ..RefPreconditions::NONE
+            },
+            Signing::Signed { office, .. } => office.preconditions(),
+        }
+    }
+}
+
+/// Resolve how a parcel must be signed: unsigned while trust is not established, with the
+/// operator's local active key in the verified office afterwards (an error when they have none —
+/// signing is mandatory once trust exists). The key is chosen from the office verified against
+/// the anchor, never the raw office read, so an anchor and an office that disagree refuse here.
 ///
 /// # Arguments
 /// * `operator` - The configured operator.
 ///
 /// # Returns
-/// * `Ok(Some(String))` - The signing key id.
-/// * `Ok(None)`         - Trust is not established; parcels are not signed yet.
-/// * `Err(String)`      - Trust is established but the operator cannot sign.
-pub fn resolve_signing_key(operator: &Operator) -> Result<Option<String>, String> {
-    if office_utils::read_trust_anchor()?.is_none() {
-        return Ok(None);
+/// * `Ok(Signing)` - The signing choice.
+/// * `Err(String)` - Trust is established but the office does not verify, or the operator cannot
+///                   sign.
+pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
+    if office_utils::read_trust_anchor_bytes()?.is_none() {
+        return Ok(Signing::Unsigned);
     }
 
-    let state = office_utils::read_office_state()?;
+    let office = audit_utils::verified_local_office()?;
 
-    if state.find_user(&operator.identifier).is_none() {
+    if office.find_user(&operator.identifier).is_none() {
         return Err(format!(
             "Trust is established for this warehouse, and \"{}\" is not enrolled: \
             parcels cannot be stacked without a signature. Ask an enrolled operator to \
@@ -92,13 +137,15 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Option<String>, String
         ));
     }
 
-    state.signing_key_of(&operator.identifier)
-        .map(|key| Some(key.key_id.clone()))
+    let key_id = office.signing_key_of(&operator.identifier)
+        .map(|key| key.key_id.clone())
         .ok_or(format!(
             "No active key of \"{}\" is present on this machine; parcels cannot be \
             stacked without a signature.",
             operator.identifier
-        ))
+        ))?;
+
+    Ok(Signing::Signed { key_id, office })
 }
 
 /// Stack the inventory as a new parcel on the current pallet: build the tree objects,
@@ -141,7 +188,7 @@ pub async fn stack_parcel(description: Option<String>,
     // Once trust is established, every parcel must be signed — there is no unsigned
     // escape hatch. The signing key is resolved up front so a missing key aborts the
     // stack before objects are written.
-    let signing_key_id = resolve_signing_key(&operator)?;
+    let signing = resolve_signing_key(&operator)?;
 
     // Computed before the inventory is read, because the read skips every subtree whose rollup
     // already matches the head (see `inventory_utils::prepare_stack_inventory`), and the scope
@@ -455,7 +502,7 @@ pub async fn stack_parcel(description: Option<String>,
     // out of this same batch (see the crash-ordering note on the ref write below).
     batch.finish()?;
 
-    if let Some(key_id) = &signing_key_id {
+    if let Some(key_id) = signing.key_id() {
         let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;
         sign_utils::store_parcel_signature(&object.hash, &signature)?;
     }
@@ -470,8 +517,10 @@ pub async fn stack_parcel(description: Option<String>,
     // guarantee for a few more saved fsyncs, which is not a trade this makes.
     //
     // It is a compare-and-set against this bay's base, so a move by another bay or process since
-    // that read is refused rather than silently replaced.
-    match pallet_utils::update_pallet_head(&pallet, expected.as_deref(), &object.hash) {
+    // that read is refused rather than silently replaced — and against the signing choice, so an
+    // anchor established meanwhile refuses an unsigned parcel, and an office or anchor changed
+    // meanwhile refuses one signed under the office it replaced.
+    match signing.write_head(&pallet, expected.as_deref(), &object.hash) {
         Ok(()) => {}
 
         // Another bay already moved the pallet to this very parcel: the move stands.
@@ -530,4 +579,33 @@ fn clean_up_after_stack(prepared: &inventory_utils::PreparedInventory,
     merge_utils::clear_consolidation_state()?;
     merge_utils::OutOfScopeSkeleton::clear()?;
     cherry_pick_utils::clear_state()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Revert: `Signing::preconditions` gives `NotConsumed` for an unsigned choice, or
+    // `Signing::write_head` passes `RefPreconditions::NONE` → an unsigned parcel lands under the
+    // anchor established meanwhile.
+    #[test]
+    fn an_unsigned_write_whose_anchor_appeared_after_the_signing_choice_is_refused() {
+        let root = std::env::temp_dir().join(format!("forklift-stack-utils-anchor-appeared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = crate::globals::StorageRootScope::enter(&root);
+        let operator = Operator { name: "Test".to_string(), identifier: "test".to_string() };
+
+        let signing = resolve_signing_key(&operator).unwrap();
+        assert_eq!(signing.key_id(), None, "no anchor: the choice is unsigned");
+        office_utils::write_trust_anchor(&office_utils::TrustAnchor {
+            genesis: "0".repeat(64), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: None,
+        }).unwrap();
+
+        let refused = signing.write_head("main", None, &"1".repeat(64));
+
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), None, "the pallet must be unchanged");
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

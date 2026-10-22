@@ -594,16 +594,17 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
 
         let reference = PalletRef::parse(wire)?;
 
-        match pallet_utils::update_pallet_head_in(reference.namespace, &reference.name, Some(post_head), pre_head) {
+        match pallet_utils::update_pallet_head_in(reference.namespace, &reference.name, Some(post_head), pre_head, &pallet_utils::RefPreconditions::NONE) {
             Ok(()) => {}
             Err(RefUpdateError::Moved(_)) if wire == current => {
                 return Err(current_pallet_moved(current, &entry.op));
             }
             // Another writer moved it after the operation: theirs stands.
             Err(RefUpdateError::Moved(_)) => {}
-            // The write failed: put the current pallet back where the operation left it, so the
-            // bay still matches the entry and a retried undo passes the gate again.
-            Err(RefUpdateError::Failed(e)) => return Err(un_restore_current(entry, e)),
+            // The write failed (no precondition is consumed, so nothing else refuses it): put the
+            // current pallet back where the operation left it, so the bay still matches the entry
+            // and a retried undo passes the gate again.
+            Err(e) => return Err(un_restore_current(entry, e.to_string())),
         }
     }
 
@@ -620,9 +621,9 @@ fn un_restore_current(entry: &JournalEntry, error: String) -> String {
         return error;
     };
 
-    let e = match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head) {
+    let e = match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head, &pallet_utils::RefPreconditions::NONE) {
         Ok(()) | Err(RefUpdateError::Moved(_)) => return error,
-        Err(RefUpdateError::Failed(e)) => e,
+        Err(e) => e.to_string(),
     };
 
     // A write can fail after landing (not known durable); what the ref holds now decides.
@@ -932,6 +933,7 @@ mod tests {
             "office",
             pallet_utils::get_meta_pallet_head("office").unwrap().as_deref(),
             &hash('f'),
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
         advance(
             "side",
@@ -962,7 +964,7 @@ mod tests {
     /// Move `pallet` to `new` as an operation in this bay does: the ref, and this bay's position
     /// with it when `pallet` is the one it stands on.
     fn advance(pallet: &str, expected: Option<&str>, new: &str) -> Result<(), pallet_utils::RefUpdateError> {
-        pallet_utils::update_pallet_head(pallet, expected, new)?;
+        pallet_utils::update_pallet_head(pallet, expected, new, &pallet_utils::RefPreconditions::NONE)?;
 
         if pallet_utils::read_position().unwrap().pallet == pallet {
             pallet_utils::write_position(&pallet_utils::BayPosition::new(pallet, Some(new.to_string()))).unwrap();
@@ -1422,6 +1424,7 @@ mod tests {
             "office",
             pallet_utils::get_meta_pallet_head("office").unwrap().as_deref(),
             &hash('4'),
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         let mut restored = entry("consolidate", "main", &hash('a'), &hash('2'));
@@ -1508,11 +1511,11 @@ mod tests {
 
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
         advance("main", None, &hash('1')).unwrap();
-        pallet_utils::update_meta_pallet_head("kv", None, &hash('a')).unwrap();
+        pallet_utils::update_meta_pallet_head("kv", None, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap();
 
         let before = capture().unwrap();
         advance("main", Some(&hash('1')), &hash('2')).unwrap();
-        pallet_utils::update_meta_pallet_head("kv", Some(&hash('a')), &hash('b')).unwrap();
+        pallet_utils::update_meta_pallet_head("kv", Some(&hash('a')), &hash('b'), &pallet_utils::RefPreconditions::NONE).unwrap();
         push_if_changed("stack", before).unwrap();
         let entry = peek().unwrap().unwrap();
 
@@ -1594,6 +1597,7 @@ mod tests {
             "office",
             pallet_utils::get_meta_pallet_head("office").unwrap().as_deref(),
             &hash('8'),
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
         // "@office" existed before the op but not after it (deleted by it); something has

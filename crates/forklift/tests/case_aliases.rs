@@ -112,6 +112,7 @@ impl Warehouse {
             name,
             pallet_utils::get_pallet_head(name).unwrap().as_deref(),
             &parcel_hash,
+            &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
     }
 

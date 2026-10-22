@@ -41,7 +41,7 @@ pub async fn handle_command(action: Option<HaulAction>) -> Result<(), String> {
 }
 
 /// The verified office and a signer for the configured operator.
-fn signing() -> Result<(OfficeState, forklift_core::model::operator::Operator, MetaSigner<'static>), String> {
+fn signing() -> Result<(forklift_core::util::audit_utils::VerifiedOffice, forklift_core::model::operator::Operator, MetaSigner<'static>), String> {
     let actor = config_utils::get_operator()?;
     let (office, signing_key_id) = lower::verified_signing_office(&actor)?;
 

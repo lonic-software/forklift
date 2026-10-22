@@ -1535,7 +1535,7 @@ pub fn write_head_or_roll_back(pallet: &str,
                                written_tree: &str,
                                start_tree: Option<&str>,
                                anchor: file_utils::StatAnchor) -> Result<(), String> {
-    let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new) else {
+    let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new, &crate::util::pallet_utils::RefPreconditions::NONE) else {
         return crate::util::pallet_utils::record_landed(pallet, new);
     };
 
@@ -1593,6 +1593,9 @@ pub fn settle_head_write(pallet: &str,
         // another writer's move has left the bay behind it.
         RefUpdateError::Moved(moved) => (moved.to_string(), moved.behind_refusal().into()),
         RefUpdateError::Failed(error) => (error.clone(), error),
+        // A precondition refused the write, so nothing was written; the tree goes back like any
+        // other refused write's.
+        refused => (refused.to_string(), refused.to_string()),
     };
 
     match pallet_utils::get_pallet_head(pallet) {
@@ -1639,10 +1642,10 @@ mod tests {
         let scope = crate::globals::StorageRootScope::enter(&root);
 
         let (start, new) = ("a".repeat(64), "b".repeat(64));
-        crate::util::pallet_utils::update_pallet_head("main", None, &start).unwrap();
+        crate::util::pallet_utils::update_pallet_head("main", None, &start, &crate::util::pallet_utils::RefPreconditions::NONE).unwrap();
 
         // Another bay makes the very same move first.
-        crate::util::pallet_utils::update_pallet_head("main", Some(&start), &new).unwrap();
+        crate::util::pallet_utils::update_pallet_head("main", Some(&start), &new, &crate::util::pallet_utils::RefPreconditions::NONE).unwrap();
 
         // The trees name no stored objects: a rollback would fail loudly, so Ok proves none ran.
         write_head_or_roll_back("main", Some(&start), &new, &"c".repeat(64), Some(&"d".repeat(64)),

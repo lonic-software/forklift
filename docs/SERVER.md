@@ -84,6 +84,17 @@ objects were deleted between its requests is refused at the ref update (`422`) a
 retried; nothing is ever left pointing at a deleted object. The auto-rebuild lift count
 (`rebuild_after_lifts`) starts again from zero when a warehouse is let go.
 
+A warehouse's storage can also be written by a local bay or process, which the server's own
+serialization of requests does not hold out. So a ref update's verification is checked again,
+under the warehouse's ref lock, just before the write. If the pallet, the office head or the
+trust anchor that verification judged it against moved meanwhile, the update is refused with
+`409` and writes nothing; a client lowers, or re-reads, and retries. `PUT /v1/trust` is
+checked the same way: the anchor and the office it governs are installed under one hold of the
+ref lock, and only while the office head is still the one the request was judged against and
+every pallet head here is one the anchor's boundary holds. Otherwise it is refused with `409`
+and writes nothing. A pallet outside the boundary is not a race a retry outlives: the boundary
+is fixed in the anchor, so the refusal names the pallet and its head.
+
 ## Authentication
 
 **Some authentication is required to start the server at all.** Configure at least one of a
