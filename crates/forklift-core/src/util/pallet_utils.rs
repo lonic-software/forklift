@@ -925,7 +925,7 @@ pub fn update_meta_pallet_head(name: &str,
 /// # Returns
 /// * `Ok(())`                         - The head was moved.
 /// * `Err(RefUpdateError::Moved)`     - The ref did not hold `expected`; nothing was written.
-/// * `Err(RefUpdateError::OfficeMoved | AnchorMoved | PalletsMoved)`
+/// * `Err(RefUpdateError::OfficeMoved | AnchorMoved | PalletsMoved | WitnessMoved)`
 ///                                    - A precondition did not hold; nothing was written.
 /// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
 ///                                      ref could not be locked, read or written (the write may
@@ -1092,22 +1092,25 @@ pub(crate) fn update_pallet_head_locked(
 /// * `name`          - The name of the pallet. Must be a valid pallet name.
 /// * `expected`      - The head the ref must hold.
 /// * `preconditions` - What the caller's decision consumed besides the ref.
-/// * `journal`       - The undo entry to append in the hold, if the removal is journaled.
+/// * `journal`       - The undo entry to append in the hold. It must record exactly this removal
+///                     (`name` at `expected`): the entry is what keeps the head rooted while the
+///                     delete can be undone, so a removal it does not record is refused.
 ///
 /// # Returns
 /// * `Ok(())`                       - The ref was removed.
 /// * `Err(RefUpdateError::Moved)`   - The ref did not hold `expected`; nothing was written.
 /// * `Err(RefUpdateError::OfficeMoved | AnchorMoved | PalletsMoved | WitnessMoved)`
 ///                                  - A precondition did not hold; nothing was written.
-/// * `Err(RefUpdateError::Failed)`  - The pallet is a meta pallet, the name is invalid, a bulk
-///                                    store session is open, or a read or write failed (the
+/// * `Err(RefUpdateError::Failed)`  - The pallet is a meta pallet, the name is invalid, `journal`
+///                                    does not record this removal, a bulk store session is
+///                                    open, or a read or write failed (the
 ///                                    removal may still have landed: read the ref back to tell).
 pub fn remove_pallet_head_in(
     namespace: PalletNamespace,
     name: &str,
     expected: &str,
     preconditions: &RefPreconditions,
-    journal: Option<&crate::util::journal_utils::JournalEntry>,
+    journal: &crate::util::journal_utils::JournalEntry,
 ) -> Result<(), RefUpdateError> {
     if namespace == PalletNamespace::Meta {
         return Err(RefUpdateError::Failed(format!(
@@ -1118,6 +1121,16 @@ pub fn remove_pallet_head_in(
     }
 
     validate_pallet_name(name)?;
+
+    let wire = PalletRef { namespace, name: name.to_string() }.to_wire();
+
+    if crate::util::journal_utils::removed_by(journal) != vec![(wire.clone(), expected.to_string())] {
+        return Err(RefUpdateError::Failed(format!(
+            "Refusing to remove pallet \"{}\": the undo entry written with the removal does not \
+            record removing it at {}.",
+            wire, expected
+        )));
+    }
 
     // The journal entry must be durable before the unlink; a bulk session would only stage it.
     if file_utils::is_bulk_session_open() {
@@ -1139,17 +1152,14 @@ pub fn remove_pallet_head_in(
         crate::util::fetch_ledger::record_fetch(&lock, expected, name)?;
     }
 
-    let read_before_append = match journal {
-        Some(entry) => Some(crate::util::journal_utils::append_in_hold(&lock, entry)?),
-        None => None,
-    };
+    let read_before_append = crate::util::journal_utils::append_in_hold(&lock, journal)?;
 
     let path = get_pallet_ref_path(namespace, name);
     let unlinked = unlink_ref(namespace, &path);
 
     match get_pallet_head_in(namespace, name) {
         Ok(None) => {
-            log_write(PalletRef { namespace, name: name.to_string() }.to_wire(), Some(expected.to_string()), None);
+            log_write(wire, Some(expected.to_string()), None);
             unlinked.map_err(RefUpdateError::Failed)
         }
         Ok(Some(_)) => {
@@ -1158,10 +1168,7 @@ pub fn remove_pallet_head_in(
             ));
 
             // Not removed: the journal goes back to what it held before the append.
-            let restored = match read_before_append {
-                Some(entries) => crate::util::journal_utils::write_back_in_hold(&lock, &entries),
-                None => Ok(()),
-            };
+            let restored = crate::util::journal_utils::write_back_in_hold(&lock, &read_before_append);
 
             Err(RefUpdateError::Failed(match restored {
                 Ok(()) => error,
@@ -1961,6 +1968,11 @@ mod tests {
         }
     }
 
+    /// The undo entry of deleting `name` at `head`.
+    fn deleting(name: &str, head: &str) -> crate::util::journal_utils::JournalEntry {
+        crate::util::journal_utils::delete_entry_for_test(name, head)
+    }
+
     fn witness(pallet: &str, head: &str) -> RefPreconditions {
         RefPreconditions {
             office: OfficePrecondition::NotConsumed,
@@ -1976,13 +1988,13 @@ mod tests {
         update_pallet_head("team/y", None, &hash('b'), &RefPreconditions::NONE).unwrap();
         let pallets = get_pallet_ref_path(PalletNamespace::User, "team").parent().unwrap().to_path_buf();
 
-        remove_pallet_head_in(PalletNamespace::User, "team/web/x", &hash('a'), &RefPreconditions::NONE, None).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "team/web/x", &hash('a'), &RefPreconditions::NONE, &deleting("team/web/x", &hash('a'))).unwrap();
 
         assert!(!pallets.join("team").join("web").exists(), "the emptied folder of a nested name goes with it");
         assert!(pallets.join("team").join("y").is_file(), "a folder still holding a ref stays");
         assert_eq!(get_pallet_head("team/web/x").unwrap(), None);
 
-        remove_pallet_head_in(PalletNamespace::User, "team/y", &hash('b'), &RefPreconditions::NONE, None).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "team/y", &hash('b'), &RefPreconditions::NONE, &deleting("team/y", &hash('b'))).unwrap();
         assert!(!pallets.join("team").exists());
         assert!(pallets.is_dir(), "the pallets folder itself is never removed");
         assert!(all_pallet_refs().unwrap().is_empty());
@@ -1996,7 +2008,7 @@ mod tests {
         update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         start_write_log();
 
-        remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, None).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, &deleting("gone", &hash('a'))).unwrap();
 
         assert_eq!(take_write_log(), vec![("gone".to_string(), Some(hash('a')), None)]);
         let _ = std::fs::remove_dir_all(&root);
@@ -2008,16 +2020,25 @@ mod tests {
         update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         update_meta_pallet_head("tags", None, &hash('b'), &RefPreconditions::NONE).unwrap();
 
-        let meta = remove_pallet_head_in(PalletNamespace::Meta, "tags", &hash('b'), &RefPreconditions::NONE, None);
+        let meta = remove_pallet_head_in(PalletNamespace::Meta, "tags", &hash('b'), &RefPreconditions::NONE, &deleting("tags", &hash('b')));
         assert!(matches!(&meta, Err(RefUpdateError::Failed(message)) if message.contains("never removed")), "{:?}", meta);
         assert_eq!(get_meta_pallet_head("tags").unwrap(), Some(hash('b')));
 
-        let moved = remove_pallet_head_in(PalletNamespace::User, "main", &hash('c'), &RefPreconditions::NONE, None);
+        let moved = remove_pallet_head_in(PalletNamespace::User, "main", &hash('c'), &RefPreconditions::NONE, &deleting("main", &hash('c')));
         assert!(matches!(&moved, Err(RefUpdateError::Moved(m)) if m.found == Some(hash('a'))), "{:?}", moved);
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('a')));
 
-        let missing = remove_pallet_head_in(PalletNamespace::User, "absent", &hash('a'), &RefPreconditions::NONE, None);
+        let missing = remove_pallet_head_in(PalletNamespace::User, "absent", &hash('a'), &RefPreconditions::NONE, &deleting("absent", &hash('a')));
         assert!(matches!(&missing, Err(RefUpdateError::Moved(m)) if m.found.is_none()), "{:?}", missing);
+
+        // The entry is what roots the removed head, so one recording another removal is refused.
+        for entry in [deleting("other", &hash('a')), deleting("main", &hash('c'))] {
+            let unrecorded = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, &entry);
+            assert!(matches!(&unrecorded, Err(RefUpdateError::Failed(message)) if message.contains("does not record")),
+                    "{:?}", unrecorded);
+        }
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('a')));
+        assert_eq!(crate::util::journal_utils::peek().unwrap(), None, "nothing is journaled");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2028,7 +2049,7 @@ mod tests {
         update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
 
         let session = file_utils::BulkStoreSession::open().unwrap();
-        let refused = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, None);
+        let refused = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, &deleting("main", &hash('a')));
         drop(session);
 
         assert!(matches!(&refused, Err(RefUpdateError::Failed(message)) if message.contains("bulk store session")), "{:?}", refused);
@@ -2043,21 +2064,21 @@ mod tests {
         update_pallet_head("holder", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         update_pallet_head("holder", Some(&hash('a')), &hash('c'), &RefPreconditions::NONE).unwrap();
 
-        let refused = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('a')), None);
+        let refused = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('a')), &deleting("victim", &hash('a')));
         assert_eq!(refused, Err(RefUpdateError::WitnessMoved {
             pallet: "holder".to_string(), expected: hash('a'), found: Some(hash('c')),
         }));
         assert_eq!(get_pallet_head("victim").unwrap(), Some(hash('a')), "a refused removal writes nothing");
 
         // An absent witness is a moved one too.
-        let gone = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("nobody", &hash('a')), None);
+        let gone = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("nobody", &hash('a')), &deleting("victim", &hash('a')));
         assert!(matches!(gone, Err(RefUpdateError::WitnessMoved { found: None, .. })));
 
         // The same precondition guards an ordinary write.
         let write = update_pallet_head("victim", Some(&hash('a')), &hash('d'), &witness("holder", &hash('a')));
         assert!(matches!(write, Err(RefUpdateError::WitnessMoved { .. })));
 
-        remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('c')), None).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('c')), &deleting("victim", &hash('a'))).unwrap();
         assert_eq!(get_pallet_head("victim").unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2068,11 +2089,11 @@ mod tests {
         update_pallet_head("full", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         update_pallet_head("sparse", None, &hash('b'), &RefPreconditions::NONE).unwrap();
 
-        remove_pallet_head_in(PalletNamespace::User, "full", &hash('a'), &RefPreconditions::NONE, None).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "full", &hash('a'), &RefPreconditions::NONE, &deleting("full", &hash('a'))).unwrap();
         assert!(crate::util::fetch_ledger::read_ledger().unwrap().is_empty(), "a full warehouse keeps no ledger");
 
         crate::util::scope_utils::set_fetch_scope(&crate::util::scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
-        remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, None).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, &deleting("sparse", &hash('b'))).unwrap();
 
         let ledger = crate::util::fetch_ledger::read_ledger().unwrap();
         assert!(ledger.iter().any(|entry| entry.head == hash('b') && entry.pallet == "sparse"), "{:?}", ledger);
@@ -2094,7 +2115,7 @@ mod tests {
         assert!(get_pallet_ref_path(PalletNamespace::User, "team/x").is_file(), "the folder's ref is untouched");
 
         // So does an empty one, left by a removal that could not take its folder.
-        remove_pallet_head_in(PalletNamespace::User, "team/x", &hash('a'), &RefPreconditions::NONE, None).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "team/x", &hash('a'), &RefPreconditions::NONE, &deleting("team/x", &hash('a'))).unwrap();
         std::fs::create_dir_all(get_pallet_ref_path(PalletNamespace::User, "team")).unwrap();
         assert!(all_pallet_refs().unwrap().is_empty());
         assert!(matches!(update_pallet_head("team", None, &hash('b'), &RefPreconditions::NONE),

@@ -616,8 +616,9 @@ pub enum BayReadPolicy {
 
 /// [`collect_bay_scoped_parcel_roots`]'s result.
 pub struct BayScopeOutcome {
-    /// Every listed dir's base, parked-parcel hashes and the parcels an in-progress consolidation
-    /// or cherry-pick records, from every bay this call could actually read.
+    /// Every listed dir's base, parked-parcel hashes, the parcels an in-progress consolidation
+    /// or cherry-pick records and the heads its journal's deletes removed, from every bay this
+    /// call could actually read.
     pub roots: Vec<String>,
     /// One plain-language note per bay skipped this call because its state could not be read —
     /// only ever populated under [`BayReadPolicy::Tolerate`] (always empty under `FailClosed`,
@@ -628,8 +629,9 @@ pub struct BayScopeOutcome {
 /// The bay-scoped parcel roots shared by **both**
 /// [`recovery_utils::collect_walk_roots`](crate::util::recovery_utils::collect_walk_roots) and
 /// [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set): across every entry of
-/// `dirs`, that bay's base, its parked parcels ([`park_utils::read_parked_in`]) and the parcels an
-/// in-progress consolidation or cherry-pick records — see [`read_one_bay_scoped_roots`].
+/// `dirs`, that bay's base, its parked parcels ([`park_utils::read_parked_in`]), the parcels an
+/// in-progress consolidation or cherry-pick records and the heads its undo journal's deletes
+/// removed — see [`read_one_bay_scoped_roots`].
 ///
 /// Takes the already-enumerated `dirs` — normally the caller's own [`all_bay_state_dirs`] call —
 /// rather than calling [`all_bay_state_dirs`] itself: both callers need at least one *other*
@@ -697,7 +699,7 @@ pub fn collect_bay_scoped_parcel_roots(
 
 /// One bay's own contribution to [`collect_bay_scoped_parcel_roots`] — the single read (the
 /// bay's base, parked parcels, then an in-progress consolidation's `their_head` and `our_head`,
-/// then an in-progress cherry-pick's `source` and `our_head`) both [`BayReadPolicy`] variants
+/// then an in-progress cherry-pick's `source` and `our_head`, then its journal's removed heads) both [`BayReadPolicy`] variants
 /// perform identically; only what happens to its `Err` differs, in the caller above. A recorded
 /// `our_head` is the completing parcel's parent, and the pallet may have moved off it since, so
 /// it is rooted in its own right. A pick's `source` is no parent of anything, yet the completing

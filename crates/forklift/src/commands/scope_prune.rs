@@ -63,7 +63,8 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     let PruneRequest { post_prune, to_reclaim, all_resumed } = judge_request(&paths)?;
 
     // A deleted pallet's history is kept for as long as undo can bring the pallet back. Read under
-    // the hold, which keeps every delete and undo (both take it shared) out until the prune ends.
+    // the hold, which keeps every delete and undo out until the prune ends: both are mutating
+    // commands, which main takes the store hold for shared (`Command::holds_store_access`).
     let removed_heads = journal_utils::removed_heads()?;
     let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &store_access)?;
 

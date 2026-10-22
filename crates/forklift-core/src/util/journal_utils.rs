@@ -408,6 +408,24 @@ pub fn removed_by(entry: &JournalEntry) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A delete entry removing `victim` at `head`, from a bay on pallet "current".
+#[cfg(test)]
+pub(crate) fn delete_entry_for_test(victim: &str, head: &str) -> JournalEntry {
+    let current = "0".repeat(64);
+    let mut before = BTreeMap::new();
+    before.insert("current".to_string(), Some(current.clone()));
+    before.insert(victim.to_string(), Some(head.to_string()));
+    let mut after = BTreeMap::new();
+    after.insert("current".to_string(), Some(current));
+    after.insert(victim.to_string(), None);
+
+    JournalEntry {
+        op: DELETE_OP.to_string(),
+        before: Snapshot { current_pallet: "current".to_string(), heads: before, consolidation: None, cherry_pick: None },
+        after: Snapshot { current_pallet: "current".to_string(), heads: after, consolidation: None, cherry_pick: None },
+    }
+}
+
 /// Look at the most recent journal entry without consuming it. The caller (`undo`) must
 /// validate — and, for a soft reset, actually restore — an entry *before* it commits to
 /// removing it from the journal: `pop` throws the entry away the moment it is called, so a
@@ -855,15 +873,15 @@ fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
     let version = match value.get("version") {
         Some(version) => version.as_u64().ok_or_else(|| unreadable(&path, &format!(
             "has an unreadable format version ({}), which this forklift does not understand \
-            (it reads version {})", version, JOURNAL_VERSION
+            (it reads versions {} and {})", version, OLDER_JOURNAL_VERSION, JOURNAL_VERSION
         )))?,
         None => return Err(unreadable(&path, "is not a readable journal (it records no format version)")),
     };
 
     if version != JOURNAL_VERSION && version != OLDER_JOURNAL_VERSION {
         return Err(unreadable(&path, &format!(
-            "has format version {}, which this forklift does not understand (it reads version {})",
-            version, JOURNAL_VERSION
+            "has format version {}, which this forklift does not understand (it reads versions {} and {})",
+            version, OLDER_JOURNAL_VERSION, JOURNAL_VERSION
         )));
     }
 
@@ -873,6 +891,14 @@ fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
     for entry in &contents.entries {
         validate_entry(entry)
             .map_err(|reason| unreadable(&path, &format!("is malformed (an entry {})", reason)))?;
+
+        // A version-2 entry means exactly what it meant before: it cannot record a removal.
+        if version == OLDER_JOURNAL_VERSION && !removed_by(entry).is_empty() {
+            return Err(unreadable(&path, &format!(
+                "is malformed (an entry records a removed ref, which a version {} journal cannot hold)",
+                OLDER_JOURNAL_VERSION
+            )));
+        }
     }
 
     Ok(contents.entries)
@@ -1012,12 +1038,13 @@ mod tests {
 
         let before = capture().unwrap();
         advance("main", Some(&hash('1')), &hash('2')).unwrap();
+        let delete = delete_entry("side", &hash('3'));
         pallet_utils::remove_pallet_head_in(PalletNamespace::User, "side", &hash('3'),
-                                            &pallet_utils::RefPreconditions::NONE, None).unwrap();
+                                            &pallet_utils::RefPreconditions::NONE, &delete).unwrap();
 
         let refused = push_if_changed("stack", before);
         assert!(refused.is_err_and(|error| error.contains("with a removal it cannot have made")));
-        assert!(read().unwrap().is_empty(), "the journal stays readable, with nothing journaled");
+        assert_eq!(read().unwrap(), vec![delete], "the journal stays readable, with nothing more journaled");
     }
 
     #[test]
@@ -1502,6 +1529,10 @@ mod tests {
         write(&entries).unwrap();
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
         assert_eq!(value["version"], 3);
+
+        // The same delete entry a version-3 journal holds is refused by name at version 2.
+        let delete = serde_json::to_string(&JournalFile { version: OLDER_JOURNAL_VERSION, entries: &[delete_entry("side", &hash('3'))] }).unwrap();
+        assert_refused_everywhere(&delete, "which a version 2 journal cannot hold");
     }
 
     #[test]
@@ -1511,7 +1542,7 @@ mod tests {
         let delete = delete_entry("victim", &hash('5'));
 
         pallet_utils::remove_pallet_head_in(PalletNamespace::User, "victim", &hash('5'),
-                                            &pallet_utils::RefPreconditions::NONE, Some(&delete)).unwrap();
+                                            &pallet_utils::RefPreconditions::NONE, &delete).unwrap();
 
         assert_eq!(pallet_utils::get_pallet_head("victim").unwrap(), None);
         assert_eq!(read().unwrap().last(), Some(&delete));
@@ -1546,7 +1577,7 @@ mod tests {
         std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o555)).unwrap();
         let refused = pallet_utils::remove_pallet_head_in(PalletNamespace::User, "victim", &hash('5'),
                                                           &pallet_utils::RefPreconditions::NONE,
-                                                          Some(&delete_entry("victim", &hash('5'))));
+                                                          &delete_entry("victim", &hash('5')));
         std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);

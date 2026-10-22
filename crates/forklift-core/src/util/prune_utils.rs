@@ -131,17 +131,16 @@ pub fn plan_prune(
     retain_local_closure(&local, post_prune, &mut retained)?;
 
     let unlifted = unlifted_parcels(&user_parcels, remote_heads)?;
-    let (kept_for_unlifted, touching) = retain_unlifted(&unlifted, pruned_prefixes)?;
 
-    // What the live pallets' unlifted history alone reads; the rest of the keep is a deleted
-    // pallet's, which the report counts apart because lifting cannot free it.
-    let kept_for_live = if user_parcels.len() == live_parcels.len() {
-        kept_for_unlifted.clone()
-    } else {
-        let live: HashSet<&String> = live_parcels.iter().collect();
-        let live_unlifted: HashSet<String> = unlifted.iter().filter(|parcel| live.contains(parcel)).cloned().collect();
-        retain_unlifted(&live_unlifted, pruned_prefixes)?.0
-    };
+    // The live pallets' unlifted history and a deleted pallet's are judged apart, each once: the
+    // report counts the second apart because lifting cannot free it. retain_unlifted judges one
+    // parcel at a time, so the two keeps together are exactly the keep of the whole.
+    let live: HashSet<&String> = live_parcels.iter().collect();
+    let (live_unlifted, deleted_unlifted): (HashSet<String>, HashSet<String>) =
+        unlifted.iter().cloned().partition(|parcel| live.contains(parcel));
+    let (kept_for_live, mut touching) = retain_unlifted(&live_unlifted, pruned_prefixes)?;
+    let (kept_for_removed, touching_removed) = retain_unlifted(&deleted_unlifted, pruned_prefixes)?;
+    touching.extend(touching_removed);
 
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
     // reordering it) preserves that property in `to_free`, which is what makes a partial
@@ -169,13 +168,13 @@ pub fn plan_prune(
         }
 
         // Lifting history the remote is not known to hold reads it: it may be the only copy.
-        if kept_for_unlifted.contains(hash) {
-            if kept_for_live.contains(hash) {
-                kept_unlifted += 1;
-            } else {
-                kept_for_deleted += 1;
-            }
+        if kept_for_live.contains(hash) {
+            kept_unlifted += 1;
+            continue;
+        }
 
+        if kept_for_removed.contains(hash) {
+            kept_for_deleted += 1;
             continue;
         }
 
