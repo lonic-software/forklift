@@ -401,6 +401,9 @@ fi
 BLAME_ARG=$(printf '%q' "${BLAME_FILE:-}")
 if [ -z "$BLAME_FILE" ]; then
     echo "  (no tracked file to blame; skipping the row)"
+elif [ "${BLAME_ARG#\$\'}" != "$BLAME_ARG" ]; then
+    # %q falls back to $'...' for bytes the locale cannot print, which hyperfine cannot read.
+    echo "  ($BLAME_FILE needs quoting hyperfine cannot read; set BLAME_FILE; skipping the row)"
 elif ! ( cd "$B" && eval "forklift blame $BLAME_ARG" ) >/dev/null 2>&1; then
     # A file forklift cannot blame (one stored in chunks, say) costs this row, not the run.
     echo "  (forklift cannot blame $BLAME_FILE; skipping the row)"

@@ -322,16 +322,19 @@ mod tests {
 
     #[test]
     fn a_long_file_edited_lightly_keeps_its_line_level_attribution() {
-        // 30,000 lines, one of them changed: the match costs about the file's length, so its
-        // length alone must not send the version to the whole-file fallback.
-        let previous: Vec<BlameLine> = (0..30_000).map(|i| line(&format!("line {i}\n"), "P1")).collect();
-        let mut content: String = (0..30_000).map(|i| format!("line {i}\n")).collect();
-        content = content.replacen("line 15000\n", "changed\n", 1);
+        // 30,000 lines, a third of them a repeated `}`, and 4,000 more `}` inserted in the
+        // middle. The braces are shared, so they survive the drop of one-sided lines and the
+        // search must place them (D = 4,000): a cost of a few million steps, well inside the
+        // budget, so the file's length must not send the version to the whole-file fallback.
+        let text = |i: usize| if i % 3 == 0 { "}\n".to_string() } else { format!("line {i}\n") };
+        let previous: Vec<BlameLine> = (0..30_000).map(|i| line(&text(i), "P1")).collect();
+        let mut content: String = (0..15_000).map(text).collect();
+        content.push_str(&"}\n".repeat(4_000));
+        content.extend((15_000..30_000).map(text));
 
         let result = attribute_version(&previous, content.as_bytes(), "P2");
 
-        assert_eq!(result.iter().filter(|blame| blame.parcel == "P2").count(), 1);
-        assert_eq!(result[15_000].parcel, "P2");
+        assert_eq!(result.iter().filter(|blame| blame.parcel == "P2").count(), 4_000);
     }
 
     #[test]

@@ -67,8 +67,8 @@ pub fn myers_matches<T: Eq>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
     myers_matches_within(a, b, u64::MAX).expect("an unbounded search always finishes")
 }
 
-/// [`myers_matches`], giving up once the search has taken `budget` steps (a step being one
-/// diagonal visited or one equal pair walked). Two long inputs with little in common cost
+/// [`myers_matches`], giving up once the search has taken `budget` steps: each diagonal visited
+/// and each equal pair walked along one costs a step, so the count is the work done. Two long inputs with little in common cost
 /// about the product of their lengths even under Myers; a caller with a fallback for that case
 /// bounds it here instead of by the inputs' lengths, which would also refuse a long input
 /// edited lightly.
@@ -314,10 +314,6 @@ fn middle_snake<T: Eq>(a: &[T], b: &[T], budget: &mut u64) -> Option<(usize, usi
     };
 
     for d in 0..=max {
-        // Each round visits 2d + 2 diagonals and walks at most n + m equal pairs between them.
-        let round = 2 * d as u64 + 2 + (n + m) as u64;
-        *budget = budget.checked_sub(round)?;
-
         let mut k = -d;
         while k <= d {
             let x_start = step(&forward, k, d);
@@ -328,6 +324,7 @@ fn middle_snake<T: Eq>(a: &[T], b: &[T], budget: &mut u64) -> Option<(usize, usi
                 y += 1;
             }
             forward[(k + offset) as usize] = x;
+            *budget = budget.checked_sub(1 + (x - x_start) as u64)?;
 
             // An odd delta meets a reverse path of d - 1 steps on this diagonal.
             let reverse_k = delta - k;
@@ -347,6 +344,7 @@ fn middle_snake<T: Eq>(a: &[T], b: &[T], budget: &mut u64) -> Option<(usize, usi
                 s += 1;
             }
             reverse[(k + offset) as usize] = r;
+            *budget = budget.checked_sub(1 + (r - r_start) as u64)?;
 
             // An even delta meets a forward path of d steps on this diagonal.
             let forward_k = delta - k;
