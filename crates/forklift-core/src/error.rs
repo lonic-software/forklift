@@ -213,9 +213,10 @@ refusal_codes! {
     /// lowered; the next step names how to merge the two.
     Diverged => "diverged",
 
-    /// A command named a pallet this warehouse holds no ref for — or, for `lower <name>`, one the
-    /// remote does not have. The next step is `lower <name>` when a remote is configured (the
-    /// remote may have it), else `palletize <name>`; for `lower`, `palletize --remote`.
+    /// A command named a pallet this warehouse holds no ref for — or, for `lower`, one the remote
+    /// does not have. The next step is `lower <name>` when a remote is configured (the remote may
+    /// have it), else `palletize <name>`; for `lower <name>`, `palletize --remote`, and for a bare
+    /// `lower`, `lift`.
     PalletNotFound => "pallet_not_found",
 }
 
