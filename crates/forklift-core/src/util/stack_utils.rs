@@ -505,14 +505,15 @@ pub async fn stack_parcel(description: Option<String>,
     // out of this same batch (see the crash-ordering note on the ref write below).
     batch.finish()?;
 
-    // A merge or cherry-pick completing inside the command that applied it records this parcel
-    // before the head write that lands it, so recovery can tell whether it landed.
-    operation_utils::record_completing_parcel(&object.hash)?;
-
     if let Some(key_id) = signing.key_id() {
         let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;
         sign_utils::store_parcel_signature(&object.hash, &signature)?;
     }
+
+    // A merge or cherry-pick completing inside the command that applied it records this parcel
+    // as the last step before the head write that lands it, so recovery can tell whether it
+    // landed; every refusal before this one leaves the bay to its consolidation or pick state.
+    operation_utils::record_completing_parcel(&object.hash)?;
 
     // Deliberately its own separate atomic write (unbatched, exactly as every other ref write),
     // not folded into `batch` above: `WriteBatch::finish` offers no

@@ -8767,6 +8767,41 @@ fn config_unset_removes_a_value() {
     assert_eq!(json(&json_unset)["command"], "config");
 }
 
+// A clean merge whose parcel cannot be signed stops at its consolidation state, as at conflicts:
+// nothing reads it as an interrupted operation, and `stack` completes it once signing works.
+// Revert: record the completing parcel before signing → the stack is refused until heal, and heal
+// rolls the merge back.
+#[test]
+fn a_merge_that_cannot_be_signed_is_left_for_stack_to_complete() {
+    let warehouse = TestWarehouse::new("merge-sign-fails");
+    warehouse.write_file("a.txt", "one\n");
+    warehouse.write_file("b.txt", "two\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    let pass = [("FORKLIFT_KEY_PASSPHRASE", "correct horse")];
+    assert_success(&warehouse.run_with_env(&["office", "enroll", "--passphrase"], &pass));
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run_with_env(&["stack", "base"], &pass));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("b.txt", "theirs\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run_with_env(&["stack", "theirs"], &pass));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("a.txt", "ours\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run_with_env(&["stack", "ours"], &pass));
+
+    let wrong = warehouse.run_with_env(&["consolidate", "feature"], &[("FORKLIFT_KEY_PASSPHRASE", "wrong")]);
+    assert!(!wrong.status.success(), "a merge that cannot be signed must not land");
+    assert!(stderr(&wrong).contains("passphrase is incorrect"), "{}", stderr(&wrong));
+
+    let stacked = warehouse.run_with_env(&["stack", "--json"], &pass);
+    assert_success(&stacked);
+    assert_eq!((read(&warehouse, "a.txt"), read(&warehouse, "b.txt")), ("ours\n".to_string(), "theirs\n".to_string()));
+    assert!(changes(&warehouse, "unstaged").is_empty() && changes(&warehouse, "staged").is_empty());
+}
+
 #[test]
 fn a_passphrase_protected_key_needs_the_passphrase_to_sign() {
     let warehouse = TestWarehouse::new("passphrase");

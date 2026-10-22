@@ -390,7 +390,7 @@ pub(crate) async fn stack_completion(description: Option<String>,
             return Ok(parcel);
         }
         Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => {
-            // Refused before its parcel was recorded (a signing or trust refusal, say): the
+            // Refused before its parcel was recorded (a signing failure, say): the
             // merge is applied and its consolidation state written, which owns the bay from here
             // as at conflicts, and `stack` completes it once the cause is fixed. With a parcel
             // recorded, the marker stays for `forklift heal`.
