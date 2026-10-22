@@ -588,6 +588,14 @@ pub enum RefUpdateError {
         found: String,
     },
 
+    /// The new head of a user pallet is a parcel a sparse warehouse fetched only part-way, and
+    /// whose remote could not serve the rest when `expand` widened the fetch scope (see
+    /// [`fetch_ledger`](crate::util::fetch_ledger)); nothing was written.
+    Fenced {
+        /// The fenced parcel.
+        head: String,
+    },
+
     /// Anything else: an invalid name or value, or the ref could not be read or written.
     Failed(String),
 }
@@ -601,6 +609,12 @@ impl std::fmt::Display for RefUpdateError {
                 "Another bay or process changed the office while this command ran (its head is now \
                 {}); this command wrote nothing. Run it again.",
                 found.as_deref().unwrap_or("unborn")
+            ),
+            RefUpdateError::Fenced { head } => write!(
+                f,
+                "Parcel {} was fetched only part-way; lower it from a remote that has it. Nothing was \
+                written.",
+                &head[..head.len().min(12)]
             ),
             RefUpdateError::AnchorMoved => f.write_str(
                 "Another bay or process changed this warehouse's trust anchor while this command \
@@ -879,6 +893,9 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 /// that already holds the [`RefLock`](crate::util::lock_utils::RefLock) and checked what it
 /// consumed under it (a trust install, which writes the anchor and the office in one hold). Keeps
 /// the readback and the write log.
+///
+/// Every head write passes through here, so this is where a fenced parcel is refused as a new
+/// user-pallet head ([`RefUpdateError::Fenced`]). A ref that already holds it may keep it.
 pub(crate) fn update_pallet_head_locked(
     _lock: &crate::util::lock_utils::RefLock,
     namespace: PalletNamespace,
@@ -889,6 +906,13 @@ pub(crate) fn update_pallet_head_locked(
     validate_head_write(name, new)?;
 
     let found = require_head(namespace, name, expected)?;
+
+    if namespace == PalletNamespace::User
+        && found.as_deref() != Some(new)
+        && crate::util::fetch_ledger::is_fenced(new)?
+    {
+        return Err(RefUpdateError::Fenced { head: new.to_string() });
+    }
 
     let path = get_pallet_ref_path(namespace, name);
 

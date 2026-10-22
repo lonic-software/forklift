@@ -5,7 +5,7 @@
 //! Transfers are parallel by design (DESIGN.html §4.1): object fetches and uploads fan
 //! out over concurrent connections, bounded by [`CONCURRENT_TRANSFERS`].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use tokio::sync::Semaphore;
@@ -20,13 +20,14 @@ use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, StorageRootScope};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
+use crate::util::lock_utils::RefLock;
 use crate::util::pallet_utils::RefPreconditions;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
-    bundle_utils, config_utils, file_utils, haul_utils, merge_utils, meta_tree, object_utils, office_utils,
+    bundle_utils, config_utils, fetch_ledger, file_utils, haul_utils, merge_utils, meta_tree, object_utils, office_utils,
     pack_utils, pallet_utils, sign_utils, trust_utils,
 };
 
@@ -4116,16 +4117,24 @@ pub async fn fetch_history(client: &RemoteClient,
     Ok(stats)
 }
 
-/// Fetch a parcel head's history like [`fetch_history`], but path-prune the **content** walk
-/// to a fetch `scope`: the full parcel graph, every signature, and the tree spine down to each
+/// Fetch a user pallet's head like [`fetch_history`], but path-prune the **content** walk to the
+/// warehouse fetch scope: the full parcel graph, every signature, and the tree spine down to each
 /// in-scope prefix are fetched, along with the in-scope subtrees and blobs in full; out-of-scope
 /// subtree objects and blobs are skipped — they stay sealed by the hash the spine tree already
 /// carries. Only the user pallet's content is fetched this way; office and other meta pallets
 /// keep routing through the unscoped [`fetch_history`], because their audit reads full content.
 ///
-/// A full (empty) scope is the whole store, so this delegates to [`fetch_history`] verbatim —
-/// a full franchise or lower stays byte-for-byte identical, and the pruning below runs only for
-/// a genuinely sparse warehouse.
+/// A full warehouse delegates to [`fetch_history`] verbatim and records nothing. A full warehouse
+/// never becomes sparse (`scope-prune` refuses one, and `franchise` writes a scope only into a new
+/// warehouse), so that check needs no lock.
+///
+/// In a sparse warehouse the fetch is recorded before anything transfers: under the
+/// [`RefLock`], in one hold, it reads the fetch scope and adds the head to the fetched-heads
+/// ledger ([`fetch_ledger`]), so an `expand` that commits while this fetch runs walks the head at
+/// the widened scope. Once the transfer completes it takes the lock again and re-reads the scope;
+/// if an `expand` widened it meanwhile, it records the head again and fetches at the new scope,
+/// until the scope it fetched at is still current. Only then does it return and let the caller
+/// write its ref.
 ///
 /// Like [`fetch_history`], it heals an interrupted earlier sync: the ref is unmoved until the
 /// whole scoped closure is present, so re-running re-walks only what is still missing (the
@@ -4134,81 +4143,443 @@ pub async fn fetch_history(client: &RemoteClient,
 /// # Arguments
 /// * `client` - The remote.
 /// * `head`   - The parcel hash to fetch from.
-/// * `scope`  - The warehouse fetch scope (the in-scope path prefixes).
+/// * `pallet` - The pallet the head is fetched for, as its wire name (recorded in the ledger).
 ///
 /// # Returns
 /// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
 /// * `Err(String)`    - If a transfer or verification failed.
 pub async fn fetch_history_scoped(client: &RemoteClient,
                                   head: &str,
-                                  scope: &MaterializationScope,
+                                  pallet: &str,
                                   progress: &Progress) -> Result<FetchStats, String> {
+    if scope_utils::read_fetch_scope()?.is_full() {
+        return fetch_history(client, head, progress).await;
+    }
+
+    fetch_recorded(head, pallet, async |scope: &MaterializationScope| {
+        fetch_bounded_at(client, head, scope, progress).await
+    }).await
+}
+
+/// [`fetch_history_scoped`] at a scope the caller names rather than the one on disk — for
+/// `franchise`, which fetches before it writes any scope, so that an `--only` naming nothing is
+/// refused with nothing left behind. A sparse scope records the head in the ledger the same way,
+/// under the [`RefLock`], before anything transfers. It does not re-check the scope afterwards:
+/// no scope exists on disk for an `expand` to widen until the caller writes this one.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to fetch from.
+/// * `pallet` - The pallet the head is fetched for, as its wire name.
+/// * `scope`  - The fetch scope to fetch at.
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
+/// * `Err(String)`    - If a transfer or verification failed.
+pub async fn fetch_history_at(client: &RemoteClient,
+                              head: &str,
+                              pallet: &str,
+                              scope: &MaterializationScope,
+                              progress: &Progress) -> Result<FetchStats, String> {
+    if !scope.is_full() {
+        let lock = RefLock::acquire()?;
+        fetch_ledger::record_fetch(&lock, head, pallet)?;
+    }
+
+    fetch_bounded_at(client, head, scope, progress).await
+}
+
+/// One transfer of a scoped fetch: the whole history at a full scope, otherwise the path-pruned
+/// walk bounded at every local ref head (a closure already known complete at this scope needs
+/// neither fetching nor walking).
+async fn fetch_bounded_at(client: &RemoteClient,
+                          head: &str,
+                          scope: &MaterializationScope,
+                          progress: &Progress) -> Result<FetchStats, String> {
     if scope.is_full() {
         return fetch_history(client, head, progress).await;
     }
 
-    // Bound the walk at local ref heads, exactly like `fetch_history`: a closure already known
-    // complete at this scope needs neither fetching nor walking.
-    let complete: Vec<String> = pallet_utils::all_pallet_refs()?
-        .into_iter()
-        .map(|(_, head)| head)
-        .collect();
-
-    fetch_scoped_from(client, head, scope, &complete, progress).await
+    fetch_scoped_from(client, head, scope, &ref_heads()?, &WalkSeen::default(), &mut WalkSeen::default(), progress).await
 }
 
-/// Fetch the content newly brought into `scope` across a head's whole history — the walk behind
-/// `expand`. Unlike [`fetch_history_scoped`], it is **not** bounded at local ref heads: widening
-/// the scope invalidates the "reachable from a ref ⟹ closure complete" invariant for the
-/// newly in-scope paths (that content was sealed, not fetched, behind those very refs), so the
-/// history is re-walked in full. The fetch primitives still skip every object already on disk, so
-/// only the genuinely newly in-scope objects transfer.
+/// The record-and-recheck loop of [`fetch_history_scoped`], with the transfer passed in so a test
+/// can change the scope while it runs.
+async fn fetch_recorded<F>(head: &str, pallet: &str, mut transfer: F) -> Result<FetchStats, String>
+where
+    F: AsyncFnMut(&MaterializationScope) -> Result<FetchStats, String>,
+{
+    let mut scope = {
+        let lock = RefLock::acquire()?;
+        let scope = scope_utils::read_fetch_scope()?;
+        fetch_ledger::record_fetch(&lock, head, pallet)?;
+        scope
+    };
+
+    let mut stats = FetchStats::default();
+
+    loop {
+        stats.add(&transfer(&scope).await?);
+
+        let lock = RefLock::acquire()?;
+        let current = scope_utils::read_fetch_scope()?;
+
+        if current == scope {
+            return Ok(stats);
+        }
+
+        // An `expand` committed while this fetch ran: it may have dropped or never seen this
+        // head, so record it again before fetching what the widened scope adds.
+        fetch_ledger::record_fetch(&lock, head, pallet)?;
+        drop(lock);
+
+        scope = current;
+    }
+}
+
+/// Every local ref head, user and meta pallets alike.
+fn ref_heads() -> Result<Vec<String>, String> {
+    Ok(pallet_utils::all_pallet_refs()?.into_iter().map(|(_, head)| head).collect())
+}
+
+impl FetchStats {
+    fn add(&mut self, other: &FetchStats) {
+        self.fetched_objects += other.fetched_objects;
+        self.fetched_signatures += other.fetched_signatures;
+        self.walked_parcels += other.walked_parcels;
+    }
+}
+
+/// How many times `expand` walks and tries to commit before it gives up on a warehouse that keeps
+/// changing under it.
+pub const EXPAND_ATTEMPTS: usize = 3;
+
+/// The outcome of one [`Expansion::commit`].
+pub enum ExpandCommit {
+    /// The widened scope, the pruned ledger and the fence list were written.
+    Written(MaterializationScope),
+
+    /// Another `expand` already brought every added prefix into scope; nothing was written.
+    Covered(MaterializationScope),
+
+    /// The warehouse changed since the walk: walk again, then commit again.
+    Retry,
+}
+
+/// The engine behind `expand`: widen a sparse warehouse's fetch scope, fetching the newly
+/// in-scope content of every closure the warehouse holds first.
 ///
-/// # Arguments
-/// * `client` - The remote.
-/// * `head`   - The parcel hash to widen from.
-/// * `scope`  - The widened fetch scope.
+/// Every closure means the bay's base, every local ref head and every present head in the
+/// fetched-heads ledger ([`fetch_ledger`]): a ref's closure is complete only at the scope it was
+/// fetched at, and a fetched head without a ref can become a ref later through a write that
+/// fetches nothing. The heads are walked one at a time over shared dedup sets, so a history they
+/// share is walked once.
 ///
-/// # Returns
-/// * `Ok(FetchStats)` - What was actually transferred.
-/// * `Err(String)`    - If a transfer or verification failed.
-pub async fn fetch_expanded(client: &RemoteClient,
-                            head: &str,
-                            scope: &MaterializationScope) -> Result<FetchStats, String> {
-    if scope.is_full() {
-        return fetch_history(client, head, &Progress::NONE).await;
+/// A ledger head that no ref reaches and whose walk fails is moved to the fence list rather than
+/// failing the expand: its fetch went only part-way, and the ref compare-and-set refuses it as a
+/// new head until a fetch of it completes. The walk failing for a reason that is not the remote
+/// lacking the head (a dropped connection) fences it too; a later fetch of it lifts the fence.
+/// A base or ref head whose walk fails refuses the expand, naming the pallet.
+///
+/// The steps are separate so that a test can change the warehouse between them: [`walk`] fetches,
+/// [`walk_new_ref_heads_locally`] covers ref heads that appeared since without the network, and
+/// [`commit`] compares and writes under the [`RefLock`], never walking inside the hold.
+///
+/// [`walk`]: Expansion::walk
+/// [`walk_new_ref_heads_locally`]: Expansion::walk_new_ref_heads_locally
+/// [`commit`]: Expansion::commit
+pub struct Expansion {
+    /// The bay's pallet and base parcel.
+    pallet: String,
+    base: String,
+
+    /// The prefixes being added, none of them in `from`.
+    added: Vec<String>,
+
+    /// The fetch scope the walk widens from, and the widened scope it walks at.
+    from: MaterializationScope,
+    widened: MaterializationScope,
+
+    /// What the successful walks visited, shared across heads.
+    seen: WalkSeen,
+
+    /// Whether the base and the ref heads have had their network walk.
+    refs_walked: bool,
+
+    /// The heads walked successfully.
+    walked_heads: HashSet<String>,
+
+    /// Parcels covered by the local walk: built here, from parents in `seen` or in this set.
+    local_parcels: HashSet<String>,
+
+    /// Ledger heads whose walk failed, to be fenced at the commit.
+    fence_candidates: BTreeSet<String>,
+
+    /// Objects fetched so far.
+    fetched_objects: usize,
+}
+
+impl Expansion {
+    /// Start an expansion of the scope `from` by `added`, for the bay standing on `pallet` at
+    /// `base`. No prefix in `added` may already be in `from`.
+    pub fn new(pallet: &str, base: &str, from: MaterializationScope, added: Vec<String>) -> Expansion {
+        let mut prefixes: Vec<String> = from.prefixes().to_vec();
+        prefixes.extend(added.iter().cloned());
+
+        Expansion {
+            pallet: pallet.to_string(),
+            base: base.to_string(),
+            added,
+            widened: MaterializationScope::from_prefixes(prefixes),
+            from,
+            seen: WalkSeen::default(),
+            refs_walked: false,
+            walked_heads: HashSet::new(),
+            local_parcels: HashSet::new(),
+            fence_candidates: BTreeSet::new(),
+            fetched_objects: 0,
+        }
     }
 
-    fetch_scoped_from(client, head, scope, &[], &Progress::NONE).await
+    /// The prefixes this expansion adds.
+    pub fn added(&self) -> &[String] {
+        &self.added
+    }
+
+    /// The objects fetched so far.
+    pub fn fetched_objects(&self) -> usize {
+        self.fetched_objects
+    }
+
+    /// Fetch at the widened scope: the base and every ref head on the first call, then every
+    /// present ledger head not yet walked or fenced. A ledger head whose parcel is absent is not
+    /// walked, since walking it would download it again.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Every head was walked or marked to be fenced.
+    /// * `Err(String)` - The base or a ref head could not be walked; the error names its pallet.
+    pub async fn walk(&mut self, client: &RemoteClient) -> Result<(), String> {
+        if !self.refs_walked {
+            let base = self.base.clone();
+            self.walk_head(client, &base).await
+                .map_err(|e| unservable(&self.pallet, &e))?;
+
+            for (pallet, head) in pallet_utils::all_pallet_refs()? {
+                self.walk_head(client, &head).await
+                    .map_err(|e| unservable(&pallet.to_wire(), &e))?;
+            }
+
+            self.refs_walked = true;
+        }
+
+        for entry in fetch_ledger::read_ledger()? {
+            if self.walked_heads.contains(&entry.head)
+                || self.fence_candidates.contains(&entry.head)
+                || !file_utils::does_object_exist(&entry.head)?
+            {
+                continue;
+            }
+
+            // A head a ref reaches is in `seen` already, so its walk succeeds without fetching;
+            // one that fails is reached by no ref.
+            if self.walk_head(client, &entry.head).await.is_err() {
+                self.fence_candidates.insert(entry.head);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cover every ref head outside the walked set without the network, by walking its parcels
+    /// back to that set. Such a head was written after the walk, by a fetch whose head the ledger
+    /// holds or by a local build whose out-of-scope subtrees come from its parents, so walking the
+    /// parcel graph is enough. Runs outside the lock.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - Every ref head is covered.
+    /// * `Err(String)` - A ref head reaches a head marked to be fenced; the error names its pallet.
+    pub fn walk_new_ref_heads_locally(&mut self) -> Result<(), String> {
+        for (pallet, head) in pallet_utils::all_pallet_refs()? {
+            let mut frontier: Vec<String> = vec![head];
+            let mut visited: HashSet<String> = HashSet::new();
+
+            while let Some(hash) = frontier.pop() {
+                if self.seen.parcels.contains(&hash) || self.local_parcels.contains(&hash) {
+                    continue;
+                }
+
+                if self.fence_candidates.contains(&hash) {
+                    return Err(unservable(&pallet.to_wire(), &format!(
+                        "its history holds parcel {}, which was fetched only part-way and which the \
+                        remote cannot serve.", short_hash(&hash)
+                    )));
+                }
+
+                if visited.insert(hash.clone()) {
+                    frontier.extend(object_utils::load_parcel(&hash)?.parents);
+                }
+            }
+
+            self.local_parcels.extend(visited);
+        }
+
+        Ok(())
+    }
+
+    /// Under the [`RefLock`], check that nothing changed that the walks missed, and if so write the
+    /// fence list, the pruned ledger and the widened scope, in that order. Only compares and writes
+    /// inside the hold.
+    ///
+    /// It retries when the on-disk scope differs from the one the walk widened (re-widening from
+    /// it first), when the ledger holds a present head that was neither walked nor marked to be
+    /// fenced, or when a ref head lies outside the walked set. A ledger head whose parcel is still
+    /// absent now is dropped: a fetch still in flight re-records it when it sees the new scope.
+    ///
+    /// # Returns
+    /// * `Ok(ExpandCommit)` - What the commit did.
+    /// * `Err(String)`      - If a record could not be read or written.
+    pub fn commit(&mut self) -> Result<ExpandCommit, String> {
+        let lock = RefLock::acquire()?;
+        let current = scope_utils::read_fetch_scope()?;
+
+        if current != self.from {
+            // A concurrent expand committed: widen its scope instead. What the walk saw was
+            // classified against the old scope, so start the walk again.
+            let still: Vec<String> = self.added.iter()
+                .filter(|prefix| current.classify(prefix) != ScopeClass::InScope)
+                .cloned()
+                .collect();
+
+            if still.is_empty() {
+                return Ok(ExpandCommit::Covered(current));
+            }
+
+            let (pallet, base, fetched_objects) = (self.pallet.clone(), self.base.clone(), self.fetched_objects);
+            *self = Expansion::new(&pallet, &base, current, still);
+            self.fetched_objects = fetched_objects;
+
+            return Ok(ExpandCommit::Retry);
+        }
+
+        let mut ledger: Vec<fetch_ledger::LedgerEntry> = Vec::new();
+
+        for entry in fetch_ledger::read_ledger()? {
+            if !file_utils::does_object_exist(&entry.head)? || self.fence_candidates.contains(&entry.head) {
+                continue;
+            }
+
+            if !self.walked_heads.contains(&entry.head) {
+                return Ok(ExpandCommit::Retry);
+            }
+
+            ledger.push(entry);
+        }
+
+        for (_, head) in pallet_utils::all_pallet_refs()? {
+            if !self.seen.parcels.contains(&head) && !self.local_parcels.contains(&head) {
+                return Ok(ExpandCommit::Retry);
+            }
+        }
+
+        // A head walked whole at the widened scope is no longer part-way; a fenced head whose
+        // parcel is gone has nothing left to guard.
+        let old_fence = fetch_ledger::read_fence()?;
+        let mut fence: Vec<String> = Vec::new();
+
+        for head in old_fence.iter().filter(|head| !self.walked_heads.contains(*head)).chain(&self.fence_candidates) {
+            if !fence.contains(head) && file_utils::does_object_exist(head)? {
+                fence.push(head.clone());
+            }
+        }
+
+        if fence != old_fence {
+            fetch_ledger::write_fence(&lock, &fence)?;
+        }
+
+        if ledger != fetch_ledger::read_ledger()? {
+            fetch_ledger::write_ledger(&lock, &ledger)?;
+        }
+
+        scope_utils::set_fetch_scope(&self.widened)?;
+
+        Ok(ExpandCommit::Written(self.widened.clone()))
+    }
+
+    /// Walk one head at the widened scope, merging what it saw into the shared sets only if the
+    /// whole walk succeeded, so a failed head does not hide parcels from the heads after it.
+    async fn walk_head(&mut self, client: &RemoteClient, head: &str) -> Result<(), String> {
+        let mut seen = WalkSeen::default();
+        let stats = fetch_scoped_from(client, head, &self.widened, &[], &self.seen, &mut seen, &Progress::NONE).await?;
+
+        self.seen.absorb(seen);
+        self.fetched_objects += stats.fetched_objects;
+        self.walked_heads.insert(head.to_string());
+
+        Ok(())
+    }
 }
 
-/// The shared path-pruned walk behind [`fetch_history_scoped`] and [`fetch_expanded`]: fetch the
-/// full parcel graph and signatures, the tree spine to each in-scope prefix, and the in-scope
-/// subtrees and blobs in full, sealing out-of-scope objects by hash. `complete` bounds the
-/// parcel walk at closures already known complete at this scope (empty for a full re-walk).
+/// The refusal for a closure `expand` cannot widen.
+fn unservable(pallet: &str, error: &str) -> String {
+    format!(
+        "Pallet \"{}\" cannot be fetched at the widened scope: {} Nothing was recorded.",
+        pallet, error
+    )
+}
+
+fn short_hash(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
+/// The dedup sets of a scoped walk, kept apart on purpose. A spine node's classification depends
+/// on its *path* (the same tree hash at two paths seals different siblings), so spine visits are
+/// keyed by (hash, path). An in-scope subtree's whole closure is fetched regardless of where it
+/// sits, so it is keyed by hash alone.
+#[derive(Default)]
+struct WalkSeen {
+    parcels: HashSet<String>,
+    spine: HashSet<(String, String)>,
+    full: HashSet<String>,
+    blobs: HashSet<String>,
+}
+
+impl WalkSeen {
+    fn absorb(&mut self, other: WalkSeen) {
+        self.parcels.extend(other.parcels);
+        self.spine.extend(other.spine);
+        self.full.extend(other.full);
+        self.blobs.extend(other.blobs);
+    }
+}
+
+/// Whether `key` is visited for the first time: in neither the committed `prior` set nor this
+/// walk's own `seen`, which records it.
+fn first_visit<K: Eq + std::hash::Hash + Clone>(prior: &HashSet<K>, seen: &mut HashSet<K>, key: &K) -> bool {
+    !prior.contains(key) && seen.insert(key.clone())
+}
+
+/// The path-pruned walk behind [`fetch_history_scoped`] and [`Expansion`]: fetch the full parcel
+/// graph and signatures, the tree spine to each in-scope prefix, and the in-scope subtrees and
+/// blobs in full, sealing out-of-scope objects by hash. `complete` bounds the parcel walk at
+/// closures already known complete at this scope (empty for a full re-walk). `prior` holds what
+/// earlier walks at the same scope visited, which this one skips; `seen` collects what this one
+/// visits.
 async fn fetch_scoped_from(client: &RemoteClient,
                            head: &str,
                            scope: &MaterializationScope,
                            complete: &[String],
+                           prior: &WalkSeen,
+                           seen: &mut WalkSeen,
                            progress: &Progress) -> Result<FetchStats, String> {
     let mut stats = FetchStats::default();
 
     progress.status("Fetching history");
 
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
-    let mut seen_parcels: HashSet<String> = HashSet::new();
-
-    // Two dedup ledgers, kept apart on purpose. A spine node's classification depends on its
-    // *path* (the same tree hash at two paths seals different siblings), so spine visits are keyed
-    // by (hash, path). An in-scope subtree's whole closure is fetched regardless of where it
-    // sits, so it is keyed by hash alone.
-    let mut walked_spine: HashSet<(String, String)> = HashSet::new();
-    let mut walked_full: HashSet<String> = HashSet::new();
-    let mut seen_blobs: HashSet<String> = HashSet::new();
 
     while !parcel_frontier.is_empty() {
         let candidates: Vec<String> = parcel_frontier.drain(..)
-            .filter(|hash| seen_parcels.insert(hash.clone()))
+            .filter(|hash| first_visit(&prior.parcels, &mut seen.parcels, hash))
             .collect();
 
         let mut wave: Vec<String> = Vec::new();
@@ -4242,7 +4613,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
         // The spine is narrow (the depth to each in-scope prefix), so this sequential descent is
         // cheap; the parallel bulk is the in-scope closure walk that follows.
         while let Some((tree_hash, path)) = spine_frontier.pop() {
-            if !walked_spine.insert((tree_hash.clone(), path.clone())) {
+            if !first_visit(&prior.spine, &mut seen.spine, &(tree_hash.clone(), path.clone())) {
                 continue;
             }
 
@@ -4267,7 +4638,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
                 // it is sealed, unless the classifier holds it in scope: the root ignore file is in
                 // every scope, though every declared prefix names a directory.
                 if scope.classify(&scope_join(&path, name)) == ScopeClass::InScope
-                    && seen_blobs.insert(file.hash.clone())
+                    && first_visit(&prior.blobs, &mut seen.blobs, &file.hash)
                 {
                     spine_blobs.push(file.hash.clone());
 
@@ -4291,7 +4662,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
 
         while !tree_frontier.is_empty() {
             let tree_wave: Vec<String> = tree_frontier.drain(..)
-                .filter(|hash| walked_full.insert(hash.clone()))
+                .filter(|hash| first_visit(&prior.full, &mut seen.full, hash))
                 .collect();
 
             if tree_wave.is_empty() {
@@ -4307,7 +4678,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
                 let tree = object_utils::load_tree(tree_hash)?;
 
                 for (_, file) in tree.get_files() {
-                    if seen_blobs.insert(file.hash.clone()) {
+                    if first_visit(&prior.blobs, &mut seen.blobs, &file.hash) {
                         blob_wave.push(file.hash.clone());
 
                         // Everything under an in-scope prefix is in scope, so every chunked file
@@ -13600,5 +13971,271 @@ mod tests {
             message.contains(&format!("{:?}", budget)),
             "must name the actual budget that governed, not a generic phrase: {}", message
         );
+    }
+
+    /// The scoped fetch's ledger record and `expand`'s engine, in a sparse warehouse whose objects
+    /// are all local and signed, so the walks never need the remote; the client points where
+    /// nothing listens, so a walk that does reach for it fails.
+    mod scoped_fetch {
+        use super::*;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::fetch_ledger::{self, LedgerEntry};
+        use crate::util::pallet_utils::RefUpdateError;
+
+        fn unreachable() -> RemoteClient {
+            RemoteClient::new("http://127.0.0.1:1", None).unwrap()
+        }
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        }
+
+        fn blob(content: &str) -> String {
+            let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
+            object.store().unwrap();
+            object.hash
+        }
+
+        fn tree(entries: &[(&str, &str, DirEntryType)]) -> String {
+            let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            for (name, hash, item_type) in entries {
+                tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *item_type));
+            }
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            object.hash
+        }
+
+        /// A tree with `src/a` and `web/b`, each holding `content`. With the scope `src`, `web` is
+        /// out of scope.
+        fn content_tree(content: &str) -> String {
+            let src = tree(&[("a", &blob(&format!("a {}", content)), DirEntryType::Normal)]);
+            let web = tree(&[("b", &blob(&format!("b {}", content)), DirEntryType::Normal)]);
+            tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)])
+        }
+
+        /// A signed parcel over `content_tree(content)`: the signature sidecar is what keeps the
+        /// walk from asking the remote for one.
+        fn parcel(content: &str, parents: Vec<String>) -> String {
+            let parcel = crate::model::parcel::Parcel {
+                tree_hash: content_tree(content),
+                parents,
+                actions: Vec::new(),
+                description: Some(content.to_string()),
+            };
+            let mut object = LooseObjectBuilder::build_parcel(&parcel);
+            object.store().unwrap();
+            sign_utils::store_parcel_signature(&object.hash, &sign_utils::ParcelSignature {
+                key_id: "k".repeat(64),
+                signature: vec![0; 64],
+            }).unwrap();
+            object.hash
+        }
+
+        /// A sparse warehouse scoped to `src` whose `main` holds one parcel. Returns that parcel.
+        fn sparse_main() -> String {
+            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let head = parcel("main", Vec::new());
+            pallet_utils::update_pallet_head("main", None, &head, &RefPreconditions::NONE).unwrap();
+            head
+        }
+
+        fn record(head: &str, pallet: &str) {
+            let lock = RefLock::acquire().unwrap();
+            fetch_ledger::record_fetch(&lock, head, pallet).unwrap();
+        }
+
+        fn ledger_heads() -> Vec<String> {
+            fetch_ledger::read_ledger().unwrap().into_iter().map(|entry| entry.head).collect()
+        }
+
+        fn expand(base: &str, added: &[&str]) -> Expansion {
+            Expansion::new("main", base, scope_utils::read_fetch_scope().unwrap(),
+                           added.iter().map(|prefix| prefix.to_string()).collect())
+        }
+
+        // T11. Revert: record the head only after the transfer succeeds → the ledger stays empty.
+        #[test]
+        fn a_scoped_fetch_that_fails_leaves_its_head_in_the_ledger() {
+            let _scratch = Scratch::new("ledger-on-failure");
+            sparse_main();
+            let head = "c".repeat(64);
+
+            let error = runtime().block_on(fetch_history_scoped(&unreachable(), &head, "other", &Progress::NONE));
+
+            assert!(error.is_err(), "nothing serves the head");
+            assert_eq!(fetch_ledger::read_ledger().unwrap(), vec![LedgerEntry { head, pallet: "other".to_string() }]);
+        }
+
+        #[test]
+        fn a_full_warehouse_records_nothing() {
+            let _scratch = Scratch::new("ledger-full");
+
+            let _ = runtime().block_on(fetch_history_scoped(&unreachable(), &"c".repeat(64), "main", &Progress::NONE));
+
+            assert!(!globals::forklift_root().join("fetched-heads").exists());
+        }
+
+        // T17. Revert: return after the first transfer → one transfer, and the head the expand
+        // dropped is not recorded again.
+        #[test]
+        fn a_scope_widened_mid_fetch_is_fetched_again_and_the_head_recorded_again() {
+            let _scratch = Scratch::new("recheck");
+            sparse_main();
+            let head = "c".repeat(64);
+            let mut scopes: Vec<Vec<String>> = Vec::new();
+
+            runtime().block_on(fetch_recorded(&head, "other", async |scope: &MaterializationScope| {
+                scopes.push(scope.prefixes().to_vec());
+
+                if scopes.len() == 1 {
+                    // An expand commits while this transfer runs, dropping the head it found absent.
+                    let lock = RefLock::acquire().unwrap();
+                    fetch_ledger::write_ledger(&lock, &[]).unwrap();
+                    scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
+                }
+
+                Ok(FetchStats::default())
+            })).unwrap();
+
+            assert_eq!(scopes, vec![vec!["src".to_string()], vec!["src".to_string(), "web".to_string()]]);
+            assert_eq!(ledger_heads(), vec![head]);
+        }
+
+        #[test]
+        fn expand_walks_every_ref_head_and_writes_the_widened_scope() {
+            let _scratch = Scratch::new("expand-refs");
+            let base = sparse_main();
+            let other = parcel("other", Vec::new());
+            pallet_utils::update_pallet_head("other", None, &other, &RefPreconditions::NONE).unwrap();
+
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            expansion.walk_new_ref_heads_locally().unwrap();
+
+            assert!(expansion.walked_heads.contains(&base) && expansion.walked_heads.contains(&other));
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert_eq!(scope_utils::read_fetch_scope().unwrap().prefixes(), ["src", "web"]);
+        }
+
+        // T12. Revert: drop the commit's check for unwalked ledger heads → it writes at once.
+        #[test]
+        fn a_ledger_head_recorded_after_the_walk_is_walked_before_the_commit() {
+            let _scratch = Scratch::new("expand-late-ledger");
+            let base = sparse_main();
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+
+            let late = parcel("late", vec![base.clone()]);
+            record(&late, "late");
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Retry));
+            assert_eq!(scope_utils::read_fetch_scope().unwrap().prefixes(), ["src"], "nothing written");
+
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            assert!(expansion.walked_heads.contains(&late));
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert_eq!(ledger_heads(), vec![late]);
+        }
+
+        // T13. Revert: drop the commit's scope compare → it writes `src, web` over `src, docs`.
+        #[test]
+        fn a_scope_another_expand_widened_is_widened_again_not_overwritten() {
+            let _scratch = Scratch::new("expand-concurrent");
+            let base = sparse_main();
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+
+            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "docs"])).unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Retry));
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert_eq!(scope_utils::read_fetch_scope().unwrap().prefixes(), ["docs", "src", "web"]);
+        }
+
+        #[test]
+        fn a_prefix_another_expand_already_added_writes_nothing() {
+            let _scratch = Scratch::new("expand-covered");
+            let base = sparse_main();
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+
+            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Covered(_)));
+        }
+
+        // T15. Revert: walk absent ledger heads → the walk reaches for the remote and marks it.
+        #[test]
+        fn an_absent_ledger_head_is_dropped_without_a_walk() {
+            let _scratch = Scratch::new("expand-absent");
+            let base = sparse_main();
+            let absent = "e".repeat(64);
+            record(&absent, "gone");
+
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+
+            assert!(!expansion.walked_heads.contains(&absent) && !expansion.fence_candidates.contains(&absent));
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert!(ledger_heads().is_empty());
+            assert!(fetch_ledger::read_fence().unwrap().is_empty());
+            assert!(!file_utils::does_object_exist(&absent).unwrap(), "nothing fetched it");
+        }
+
+        /// A ledger head whose parcel is here but whose tree is not: a fetch that stopped
+        /// part-way, which the remote can no longer complete.
+        fn part_way(base: &str) -> String {
+            let head = parcel("part-way", vec![base.to_string()]);
+            let tree = object_utils::load_parcel(&head).unwrap().tree_hash;
+            let (folder, file) = file_utils::get_path_for_object(&tree).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+            record(&head, "part-way");
+            head
+        }
+
+        // Revert: let the head compare-and-set skip the fence → the palletize lands.
+        #[test]
+        fn an_unservable_ledger_head_is_fenced_and_refused_as_a_new_head() {
+            let _scratch = Scratch::new("expand-fence");
+            let base = sparse_main();
+            let head = part_way(&base);
+
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            expansion.walk_new_ref_heads_locally().unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert_eq!(fetch_ledger::read_fence().unwrap(), vec![head.clone()]);
+            assert!(ledger_heads().is_empty());
+
+            let refused = pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE);
+            assert!(matches!(refused, Err(RefUpdateError::Fenced { .. })), "{:?}", refused.map_err(|e| e.to_string()));
+
+            // A fetch of the head lifts the fence.
+            record(&head, "part-way");
+            pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE).unwrap();
+        }
+
+        // Revert: drop the local walk's fence check → the commit fences a head a ref now holds.
+        #[test]
+        fn a_ref_written_at_a_head_to_be_fenced_refuses_the_expand() {
+            let _scratch = Scratch::new("expand-fence-ref");
+            let base = sparse_main();
+            let head = part_way(&base);
+
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            assert!(expansion.fence_candidates.contains(&head));
+
+            pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE).unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Retry));
+            let error = expansion.walk_new_ref_heads_locally().unwrap_err();
+            assert!(error.contains("\"x\"") && error.contains("part-way"), "{}", error);
+        }
     }
 }

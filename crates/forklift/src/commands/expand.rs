@@ -1,17 +1,19 @@
 use serde::Serialize;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::remote_utils::RemoteClient;
-use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
+use forklift_core::util::remote_utils::{ExpandCommit, RemoteClient};
+use forklift_core::util::scope_utils::ScopeClass;
 use forklift_core::util::{object_utils, pallet_utils, remote_utils, scope_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the expand command (§7.6): widen a sparse warehouse's fetch scope and download the
-/// newly in-scope subtree(s) across the current pallet's whole history.
+/// newly in-scope subtree(s) across every closure the warehouse holds.
 ///
-/// The content is fetched from the configured remote and hash-verified against the seals the
-/// history already commits, so widening from any remote is safe — only publishing (`lift`) is
-/// origin-bound. A full (non-sparse) warehouse already holds everything, so there is nothing to
-/// expand.
+/// A ref's closure is complete only at the scope it was fetched at, so widening the scope
+/// re-walks the bay's base, every local ref head and every head a fetch recorded without a ref
+/// yet ([`remote_utils::Expansion`]); the shared history is walked once. The content is fetched
+/// from the configured remote and hash-verified against the seals the history already commits, so
+/// widening from any remote is safe — only publishing (`lift`) is origin-bound. A full
+/// (non-sparse) warehouse already holds everything, so there is nothing to expand.
 ///
 /// # Arguments
 /// * `paths` - The subtree path(s) to add to the warehouse fetch scope.
@@ -19,7 +21,8 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - If the fetch scope was widened (and any newly in-scope content fetched).
 /// * `Err(String)` - If the warehouse is not sparse, no remote is configured, a path is
-///                   malformed or names nothing, or a transfer failed.
+///                   malformed or names nothing, a closure cannot be fetched, the warehouse kept
+///                   changing, or a transfer failed.
 pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     let current = scope_utils::read_fetch_scope()?;
 
@@ -30,8 +33,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         );
     }
 
-    // Union the requested prefixes into the current fetch scope, skipping any already in scope.
-    let mut prefixes: Vec<String> = current.prefixes().to_vec();
+    // The requested prefixes not already in scope.
     let mut added: Vec<String> = Vec::new();
 
     for raw in &paths {
@@ -46,11 +48,10 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
         let key = path.as_key().to_string();
 
-        if current.classify(&key) == ScopeClass::InScope {
+        if current.classify(&key) == ScopeClass::InScope || added.contains(&key) {
             continue;
         }
 
-        prefixes.push(key.clone());
         added.push(key);
     }
 
@@ -65,8 +66,6 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let widened = MaterializationScope::from_prefixes(prefixes);
-
     let client = RemoteClient::from_config()?;
     // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
     let position = pallet_utils::read_position()?;
@@ -75,42 +74,62 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         "Pallet \"{}\" has nothing stacked yet; there is nothing to expand.", pallet
     ))?;
 
-    // Fetch the newly in-scope content FIRST, using the widened scope directly — nothing is
-    // written to disk yet. This mirrors the property `franchise`/`lower` already rely on (a ref
-    // never moves until its whole closure is present): here, the fetch scope never claims a path
-    // is in scope until it is actually, fully fetched. A transfer error, or a hard crash mid-
-    // fetch, therefore leaves the on-disk scope exactly as it was — "not yet in scope" — so a
-    // plain re-run (once the remote is reachable again) retries the fetch and self-heals, the
-    // same wave-resumability every other fetch here has. There is nothing to roll back, because
-    // nothing was written until this succeeded.
-    let stats = remote_utils::fetch_expanded(&client, &head, &widened).await?;
+    // Fetch the newly in-scope content FIRST, at the widened scope, and only then record it: the
+    // fetch scope never claims a path is in scope until it is fully fetched. A transfer error, or
+    // a hard crash mid-fetch, leaves the on-disk scope as it was, so a plain re-run retries the
+    // fetch and self-heals; the fetch primitives skip what already landed.
+    let mut expansion = remote_utils::Expansion::new(&pallet, &head, current, added);
 
-    // Each added path must name a real directory at the head — the spine (and the subtree
-    // itself) is fetched now, so the walk resolves without touching anything absent. A typo that
-    // named nothing is rejected here, before the scope is ever written, so it leaves no trace.
-    let tree = object_utils::load_parcel(&head)?.tree_hash;
+    for attempt in 0..remote_utils::EXPAND_ATTEMPTS {
+        expansion.walk(&client).await?;
 
-    for prefix in &added {
-        if !is_directory_in_tree(&tree, prefix)? {
-            return Err(format!(
-                "\"{}\" is not a directory in pallet \"{}\" at its head, so it cannot be a fetch \
-                scope. Nothing was recorded.",
-                prefix, pallet
-            ));
+        // Each added path must name a real directory at the head — the spine (and the subtree
+        // itself) is fetched now, so the walk resolves without touching anything absent. A typo
+        // that named nothing is rejected before the scope is ever written, so it leaves no trace.
+        // A retry only ever narrows the added paths, so the first check covers every attempt.
+        if attempt == 0 {
+            let tree = object_utils::load_parcel(&head)?.tree_hash;
+
+            for prefix in expansion.added() {
+                if !is_directory_in_tree(&tree, prefix)? {
+                    return Err(format!(
+                        "\"{}\" is not a directory in pallet \"{}\" at its head, so it cannot be a \
+                        fetch scope. Nothing was recorded.",
+                        prefix, pallet
+                    ));
+                }
+            }
+        }
+
+        expansion.walk_new_ref_heads_locally()?;
+
+        match expansion.commit()? {
+            ExpandCommit::Written(scope) => {
+                output::emit(&ExpandReport {
+                    added: expansion.added().to_vec(),
+                    scope: scope.prefixes().to_vec(),
+                    fetched_objects: expansion.fetched_objects(),
+                });
+
+                return Ok(());
+            }
+            ExpandCommit::Covered(scope) => {
+                output::emit(&ExpandReport {
+                    added: Vec::new(),
+                    scope: scope.prefixes().to_vec(),
+                    fetched_objects: expansion.fetched_objects(),
+                });
+
+                return Ok(());
+            }
+            ExpandCommit::Retry => {}
         }
     }
 
-    // Only now — after the fetch fully landed and every path validated — record the widened
-    // scope.
-    scope_utils::set_fetch_scope(&widened)?;
-
-    output::emit(&ExpandReport {
-        added,
-        scope: widened.prefixes().to_vec(),
-        fetched_objects: stats.fetched_objects,
-    });
-
-    Ok(())
+    Err(
+        "The warehouse kept changing while expand ran, so the fetch scope was not widened; run it \
+        again.".to_string()
+    )
 }
 
 /// Whether a warehouse path resolves to a subtree (directory) in the given root tree.

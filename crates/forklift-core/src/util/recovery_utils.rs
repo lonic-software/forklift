@@ -2510,7 +2510,7 @@ async fn attempt_heal_driven_refetch(
             for (wire, remote_head) in &info.pallets {
                 let fetched = match (wire.strip_prefix(pallet_utils::META_QUALIFIER), &fetch_scope) {
                     (Some(_), _) => remote_utils::fetch_history(&client, remote_head, &Progress::NONE).await,
-                    (None, Ok(scope)) => remote_utils::fetch_history_scoped(&client, remote_head, scope, &Progress::NONE).await,
+                    (None, Ok(_)) => remote_utils::fetch_history_scoped(&client, remote_head, wire, &Progress::NONE).await,
                     (None, Err(reason)) => {
                         scope_failure = Some(reason.clone());
                         continue;

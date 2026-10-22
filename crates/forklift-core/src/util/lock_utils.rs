@@ -420,11 +420,17 @@ impl BaseServeLock {
 /// nothing else, so the wait is short and is not announced; a holder stalled inside a write
 /// stalls every ref writer.
 ///
+/// It also orders the fetched-heads ledger and fence list of a sparse warehouse
+/// ([`fetch_ledger`](crate::util::fetch_ledger)) against the ref writes and the fetch scope: a
+/// scoped fetch records its head, and re-checks the scope when its transfer completes, under it;
+/// `expand` compares and writes the scope, the ledger and the fence list under it. Neither holds
+/// it across a transfer or a walk.
+///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
-/// ref compare-and-set, the trust install and `heal`'s restage of a ref or the anchor take it,
-/// and none of them calls another: work inside a hold uses the lock-free variants, which take
-/// the held lock as an argument.
+/// ref compare-and-set, the trust install, `heal`'s restage of a ref or the anchor, the scoped
+/// fetch's record and re-check, and `expand`'s commit take it, and none of them calls another:
+/// work inside a hold uses the lock-free variants, which take the held lock as an argument.
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.
     _file: std::fs::File,

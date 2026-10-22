@@ -228,8 +228,7 @@ async fn try_auto_merge(client: &RemoteClient,
     // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
     // optimistic auto-merge stays as sparse as the workspace it runs in.
     if !file_utils::does_object_exist(remote_head)? {
-        let fetch_scope = scope_utils::read_fetch_scope()?;
-        remote_utils::fetch_history_scoped(client, remote_head, &fetch_scope, progress).await?;
+        remote_utils::fetch_history_scoped(client, remote_head, pallet, progress).await?;
     }
 
     let diverged = !merge_utils::is_ancestor(remote_head, head)?   // we do not already contain them
