@@ -123,7 +123,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
         ));
     }
 
-    // Through a batch rather than `update_shard`: recording only stat data keeps the rollups.
+    // Recording only stat data keeps the rollups (see `ShardMutationBatch`).
     let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
 
     let message = match restore_entry(parent.as_key(), &item)? {
@@ -454,8 +454,8 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
             let current = ledger.inventory(parent.as_key()).unwrap_or(None);
             let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref())?;
 
-            // Through a batch rather than `update_shard`: an entry that already matched the head
-            // changes only its stat data, which keeps the rollups.
+            // An entry that already matched the head changes only its stat data, which keeps the
+            // rollups (see `ShardMutationBatch`).
             let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
             batch.update(parent.as_key(), |inventory| inventory.add_item(entry))?;
             batch.publish()?;

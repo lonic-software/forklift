@@ -863,6 +863,9 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 /// wrote is a trustworthy rollup — kept as one function so the (subtle) rule can never drift
 /// between the two copies.
 ///
+/// The caller vouches that `tree_hash` is `tree`'s hash and that the shard holds exactly what it
+/// built from `tree`; this checks neither.
+///
 /// A rewrite is only trustworthy when both hold:
 /// * it is a *complete* materialization of `tree` — the whole tree (an unscoped bay), or a
 ///   directory already fully in scope (see [`MaterializationScope::classify`]). A spine

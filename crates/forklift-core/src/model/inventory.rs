@@ -25,6 +25,9 @@ pub struct Inventory {
 /// `tree_utils::rollup_stamp`, which decides whether the rebuild is a complete materialization of
 /// that tree, so no tree-to-shard builder can stamp without that check. Inside this crate it is also
 /// minted from a hash already trusted: one read off a shard on disk, or one `stack` just built.
+///
+/// The type confines who mints a stamp, not whether the hash is right: neither mint can check that
+/// the hash names the content the shard holds, so each trusts its caller for that.
 pub struct RollupStamp(String);
 
 impl RollupStamp {

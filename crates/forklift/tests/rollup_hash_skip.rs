@@ -707,8 +707,8 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
     warehouse.write_file("(marketing)/page.tsx", "page v2 -- a real edit\n");
     // ...and a same-*content* rewrite of a root-level file: its shard entry is rebuilt (the
     // rewrite moves its mtime, so the stat-cache fast path cannot trust it), but the rebuilt hash matches the old one exactly, so this is "changed" without being
-    // "content_changed" — the exact combination that hit the buggy `save_inventory` path
-    // (as opposed to the ancestor-clearing `write_shard_mutation` path) for the root shard.
+    // "content_changed" — the exact combination that once let the root shard be republished with
+    // its stale rollup over a clear another change in the same pass had already made.
     warehouse.write_file("README.md", "readme v1\n");
 
     let park = warehouse.run(&["park"]);

@@ -57,7 +57,7 @@
 //!   walk's own blob-publish batch, the walk's first durable mutation — see that function's own
 //!   doc comment for the crash-ordering argument.
 //! * `inventory_utils::add_file_to_inventory` (a single-file `load`) folds it into the loaded
-//!   file's own shard-content publish via `inventory_utils::write_shard_mutation_with_extra`.
+//!   file's own shard-content publish, as `inventory_utils::shard_write::publish_shards`'s `extra`.
 //!   That shard write is not this path's first durable mutation when the parent directory is new:
 //!   the parent is registered first (see `inventory_utils::ShardLedger`). A crash between the two
 //!   leaves the parent registered with no shard and no marker, which is still consistent: a

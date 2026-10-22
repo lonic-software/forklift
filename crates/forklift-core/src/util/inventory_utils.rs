@@ -19,7 +19,7 @@ use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 
 mod shard_write;
 
-use shard_write::{publish_shards, write_shard_mutation, write_shard_mutation_with_extra};
+use shard_write::{publish_shards, write_shard_mutation, ShardPublish};
 pub use shard_write::{cleanup_after_stack_with, remove_inventories_under, replace_all_inventories};
 
 /// The metadata entry used for the warehouse root (its key is the empty string,
@@ -254,15 +254,15 @@ fn live_file_paths() -> Result<BTreeSet<String>, String> {
 /// * `Ok(())`      - If the operation was successful.
 /// * `Err(String)` - If there was an error.
 pub fn stage_removal(path: &WarehousePath) -> Result<(), String> {
-    let ledger = ShardLedger::read()?;
+    let mut ledger = ShardLedger::read()?;
 
     if path.is_root() {
-        return stage_removal_for_directory(&ledger, path);
+        return stage_removal_for_directory(&mut ledger, path);
     }
 
     match tracked_kind(&ledger, path)? {
-        TrackedKind::Directory => stage_removal_for_directory(&ledger, path),
-        TrackedKind::File => stage_removal_for_file(&ledger, path),
+        TrackedKind::Directory => stage_removal_for_directory(&mut ledger, path),
+        TrackedKind::File => stage_removal_for_file(&mut ledger, path),
         TrackedKind::UntrackedDirectory => Err(format!("No inventory found for folder \"{}\".", path.as_key())),
     }
 }
@@ -621,31 +621,35 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         }
     }
 
-    // Steps 1-3 (registration, then phase A ancestor clears, then phase B shard content). Every
-    // directory whose task finished is registered first, in one durable metadata write, before
-    // any shard of this walk is published: a shard only ever lands at a key already registered
-    // (see `ShardLedger`). A directory that was not registered before this walk always has an
-    // outcome here (its baseline was empty), and one that was already registered is skipped by
-    // the registration, so this registers exactly the directories about to be published.
+    // Phase A ancestor clears, then registration, then phase B shard content — all in
+    // `shard_write::publish_shards`. Every directory whose task finished is registered in one
+    // durable metadata write before any shard of this walk is published: a shard only ever lands at
+    // a key already registered (see `ShardLedger`). A directory that was not registered before this
+    // walk always has an outcome here (its baseline was empty), and one that was already registered
+    // is skipped by the registration, so this registers exactly the directories about to be
+    // published.
     //
     // Only attempted when phase 0 (the blob barrier above) fully succeeded — see its own comment
-    // for why a blob-batch failure must not let any shard content publish at all. A failed
-    // registration publishes nothing: it may have cleared and registered some of the keys, which
-    // then read as empty directories until a later load publishes them, never as a shard nobody
-    // registered. A failure in phase A or phase B (see `shard_write::publish_shards`) is folded into
-    // `result` the same way; a key registered whose shard did not land reads as empty too.
+    // for why a blob-batch failure must not let any shard content publish at all. Any failure is
+    // folded into `result`. A failed registration publishes nothing: it may have cleared and
+    // registered some of the keys, which then read as empty directories until a later load
+    // publishes them, never as a shard nobody registered; a key registered whose shard did not land
+    // reads as empty too.
     if blob_batch_published {
         let new_inventory_paths = context.new_inventory_paths.lock().await.clone();
 
-        // A stale key's shard is already gone, so it is unregistered in the same write, before
-        // anything publishes. A failed write leaves it registered with no shard, which reads as an
-        // empty directory until the next load finds it stale again. A blob-batch failure needs no
-        // such write: it sets `result` before the dirty-path pass, which then never runs, so there
-        // are no stale keys to unregister.
-        let published = ShardLedger::read().and_then(|mut ledger| {
-            ledger.update(&stale_keys, &new_inventory_paths)?;
-            publish_shards(&ledger, writes, &stale_keys, None)
-        });
+        // A stale key's shard is already gone. It is unregistered in the same metadata write, once
+        // every rollup above it is cleared. A failure before that leaves it registered with no
+        // shard, which reads as an empty directory until the next load finds it stale again. A
+        // blob-batch failure needs no such write: it sets `result` before the dirty-path pass,
+        // which then never runs, so there are no stale keys to unregister.
+        let published = ShardLedger::read().and_then(|mut ledger| publish_shards(&mut ledger, ShardPublish {
+            writes,
+            removed: stale_keys,
+            register: new_inventory_paths,
+            expected: None,
+            extra: None,
+        }));
 
         if let Err(e) = published {
             if result.is_ok() { result = Err(Some(e)); }
@@ -721,7 +725,7 @@ fn key_to_metadata_entry(key: &str) -> String {
 /// # Returns
 /// * `Ok(())`      - If the removals were staged successfully.
 /// * `Err(String)` - If no inventory exists for the folder, or there was an error.
-fn stage_removal_for_directory(ledger: &ShardLedger, path: &WarehousePath) -> Result<(), String> {
+fn stage_removal_for_directory(ledger: &mut ShardLedger, path: &WarehousePath) -> Result<(), String> {
     // Only registered keys hold staged content: an unregistered address is nobody's shard.
     let keys: BTreeSet<String> = ledger.keys()
         .filter(|key| path_utils::covers(path.as_key(), key))
@@ -729,10 +733,18 @@ fn stage_removal_for_directory(ledger: &ShardLedger, path: &WarehousePath) -> Re
         .collect();
 
     let mut found_any_shard = false;
+    let mut writes: BTreeMap<String, Inventory> = BTreeMap::new();
 
-    for key in &keys {
-        if mark_shard_entries_deleted(ledger, key)? {
-            found_any_shard = true;
+    for key in keys {
+        let Some(mut inventory) = ledger.inventory(&key)? else {
+            continue;
+        };
+
+        found_any_shard = true;
+
+        // A shard is only rewritten when an entry actually changed state.
+        if inventory.mark_all_items_deleted() {
+            writes.insert(key, inventory);
         }
     }
 
@@ -743,31 +755,7 @@ fn stage_removal_for_directory(ledger: &ShardLedger, path: &WarehousePath) -> Re
         ));
     }
 
-    Ok(())
-}
-
-/// Mark every entry of the inventory shard with the given key as `Deleted`.
-/// The shard is only rewritten when an entry actually changed state.
-///
-/// # Arguments
-/// * `ledger` - The registered set.
-/// * `key`    - The warehouse path key of the directory whose shard should be marked.
-///
-/// # Returns
-/// * `Ok(true)`    - If the key is registered and its shard exists (whether or not entries changed
-///                   state).
-/// * `Ok(false)`   - If the key is not registered, or has no shard.
-/// * `Err(String)` - If the shard could not be read, parsed or written.
-fn mark_shard_entries_deleted(ledger: &ShardLedger, key: &str) -> Result<bool, String> {
-    let Some(mut inventory) = ledger.inventory(key)? else {
-        return Ok(false);
-    };
-
-    if inventory.mark_all_items_deleted() {
-        write_shard_mutation(ledger, key, &mut inventory)?;
-    }
-
-    Ok(true)
+    publish_shards(ledger, ShardPublish::of(writes))
 }
 
 /// Split a warehouse path into the key of the shard that lists it and its name in that shard.
@@ -924,12 +912,11 @@ impl<'l> ShardMutationBatch<'l> {
         self.update(parent_key, |inventory| inventory.add_item(entry))
     }
 
-    /// Register any touched key the metadata does not list yet, then publish every touched shard.
+    /// Publish every touched shard, registering any touched key the metadata does not list yet.
     ///
-    /// Each shard is re-read first, under the shard-write lock, through a ledger read afresh: if any
-    /// changed since this batch read it, nothing is published and an error is returned — the batch
-    /// would otherwise overwrite that change, or carry a rollup decided against bytes no longer
-    /// there. An unregistered key reads as no shard both times, whatever its address holds, so a
+    /// Each shard is re-read first, under the shard-write lock: if any changed since this batch
+    /// read it, nothing is registered or published and an error is returned — the batch would
+    /// otherwise overwrite that change, or carry a rollup decided against bytes no longer there. An unregistered key reads as no shard both times, whatever its address holds, so a
     /// shard nobody registered never blocks the batch; a key registered and written since this
     /// batch read it does. Within a command (which holds the warehouse lock) that can only be a
     /// caller writing a touched shard some other way before publishing.
@@ -958,12 +945,15 @@ impl<'l> ShardMutationBatch<'l> {
             writes.insert(key, shard.inventory);
         }
 
-        // A key new to the metadata reads as no shard before and after its registration (which
-        // clears its address), so registering first leaves the comparison unchanged; one that
-        // fails it leaves only registered keys with no shard, which read as empty directories.
-        ledger.register(&writes.keys().cloned().collect())?;
+        let register = writes.keys().cloned().collect();
 
-        publish_shards(&ledger, writes, &BTreeSet::new(), Some(&expected))
+        publish_shards(&mut ledger, ShardPublish {
+            writes,
+            removed: BTreeSet::new(),
+            register,
+            expected: Some(expected),
+            extra: None,
+        })
     }
 }
 
@@ -1386,7 +1376,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     };
 
     // Every key this pass decides is one it read from the metadata.
-    let ledger = ShardLedger { entries: metadata.clone() };
+    let mut ledger = ShardLedger { entries: metadata.clone() };
 
     // Pass 1: decide every shard's new content without writing any of it yet — see the function's
     // own doc comment for why this mirrors `load`'s per-directory decisions rather than the old
@@ -1503,7 +1493,7 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     // comment for the exact ordering (and how it closes finding #1, per this function's own doc
     // comment above).
     if blob_batch_published {
-        if let Err(e) = publish_shards(&ledger, writes, &BTreeSet::new(), None) {
+        if let Err(e) = publish_shards(&mut ledger, ShardPublish::of(writes)) {
             if result.is_ok() { result = Err(e); }
         }
     }
@@ -1965,9 +1955,10 @@ impl ShardLedger {
 
         change(&mut inventory)?;
 
-        self.register(&BTreeSet::from([key.to_string()]))?;
-
-        write_shard_mutation(self, key, &mut inventory)
+        publish_shards(self, ShardPublish {
+            register: BTreeSet::from([key.to_string()]),
+            ..ShardPublish::one(key, inventory)
+        })
     }
 }
 
@@ -2865,20 +2856,22 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
 
     inventory.add_item(item);
 
-    // The parent is registered before its shard is written (see `ShardLedger`). A crash between
-    // the two leaves it registered with no shard, which stages nothing.
-    ledger.register(&BTreeSet::from([parent.as_key().to_string()]))?;
-
     // The incomplete-load marker for `path` rides this shard's own content-write barrier
     // (below) instead of paying a second, standalone one — this shard write is the first of this
     // load's durable mutations that stages anything, so folding the marker into it is free. See
-    // `load_guard_utils`'s doc comment (folding section) and `write_shard_mutation_with_extra`'s
-    // own doc comment for the crash-ordering argument.
+    // `load_guard_utils`'s doc comment (folding section) for the crash-ordering argument.
+    //
+    // The parent is registered before its shard is written (see `ShardLedger`). A crash between
+    // the two leaves it registered with no shard, which stages nothing.
     let marker_path = load_guard_utils::marker_path();
     let marker_bytes = load_guard_utils::pending_start_marker(path.as_key());
     let extra = marker_bytes.as_deref().map(|bytes| (marker_path.as_path(), bytes));
 
-    write_shard_mutation_with_extra(&ledger, parent.as_key(), &mut inventory, extra)
+    publish_shards(&mut ledger, ShardPublish {
+        register: BTreeSet::from([parent.as_key().to_string()]),
+        extra,
+        ..ShardPublish::one(parent.as_key(), inventory)
+    })
 }
 
 /// Stage the removal of a single file: mark its entry in its parent's inventory as `Deleted`.
@@ -2892,7 +2885,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
 /// # Returns
 /// * `Ok(())`      - If the removal was staged successfully.
 /// * `Err(String)` - If the file is not in the inventory, or there was an error.
-fn stage_removal_for_file(ledger: &ShardLedger, path: &WarehousePath) -> Result<(), String> {
+fn stage_removal_for_file(ledger: &mut ShardLedger, path: &WarehousePath) -> Result<(), String> {
     let (parent, file_name) = path.split_parent()?;
 
     let Some(mut inventory) = ledger.inventory(parent.as_key())? else {
@@ -2903,9 +2896,7 @@ fn stage_removal_for_file(ledger: &ShardLedger, path: &WarehousePath) -> Result<
         return Err(format!("\"{}\" is not in the inventory.", path.as_key()));
     }
 
-    write_shard_mutation(ledger, parent.as_key(), &mut inventory)?;
-
-    Ok(())
+    write_shard_mutation(ledger, parent.as_key(), inventory)
 }
 
 #[cfg(test)]
@@ -3227,7 +3218,7 @@ mod tests {
         let writes = writes.into_iter().map(|(key, inventory)| (key.to_string(), inventory)).collect();
         let removed = removed.iter().map(|key| key.to_string()).collect();
 
-        publish_shards(&ShardLedger::read().unwrap(), writes, &removed, None)
+        publish_shards(&mut ShardLedger::read().unwrap(), ShardPublish { removed, ..ShardPublish::of(writes) })
     }
 
     /// The funnel decides every rollup from the shard on disk: a stat-only rewrite keeps the one on
@@ -3268,6 +3259,33 @@ mod tests {
         assert_eq!(registered_inode("a", "file.txt"), 7, "the carried shard is still published");
     }
 
+    /// A carried ancestor of a change has its rollup cleared on disk before any shard of the call
+    /// is written: the shards' own barrier renames in no order, so the ancestor's clear cannot
+    /// ride its own rewrite there.
+    #[cfg(unix)]
+    #[test]
+    fn publish_shards_clears_a_carried_ancestor_of_a_change_before_writing_any_shard() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _scratch = Scratch::new("publish-ancestor-first");
+        stamped_chain_with_sibling();
+
+        // The change's own shard folder refuses the staged write, so no shard of the call lands.
+        let folder = file_utils::get_inventory_data_path_for_key("a/b").unwrap().parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let published = publish(vec![
+            ("a", forged_shard(7, InventoryItemState::Normal)),
+            ("a/b", forged_shard(1, InventoryItemState::FirstParentConflict)),
+        ], &[]);
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(read_rollup("a"), None, "the carried ancestor's clear is durable before the shards' barrier");
+        assert_eq!(read_rollup("a/b").as_deref(), Some("rollup"), "the change's shard did not land");
+        assert!(published.is_err(), "the change's shard could not be staged");
+    }
+
     /// A removed shard leaves no rollup standing above it, a carried one in the same call included.
     #[test]
     fn publish_shards_clears_every_ancestor_of_a_removed_key() {
@@ -3279,6 +3297,27 @@ mod tests {
         assert_eq!(read_rollup(""), None, "the root is above the removal");
         assert_eq!(read_rollup("a"), None, "a carried shard above the removal keeps no rollup");
         assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "an unrelated sibling keeps its rollup");
+    }
+
+    /// A removed key is unregistered only once every rollup above it is cleared: when the clear
+    /// fails, the key stays registered, so the next load still finds it stale and owes the clear.
+    #[cfg(unix)]
+    #[test]
+    fn publish_shards_unregisters_a_removed_key_only_after_its_ancestors_are_cleared() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _scratch = Scratch::new("publish-unregister-after-clear");
+        stamped_chain_with_sibling();
+
+        let folder = file_utils::get_inventory_data_path_for_key("").unwrap().parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let published = publish(vec![], &["a/b"]);
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(ShardLedger::read().unwrap().holds("a/b"), "a removal whose ancestor clear failed stays registered");
+        assert!(published.is_err(), "the root's clear could not be staged");
     }
 
     /// A shard on disk that does not parse is an error, never a new shard to overwrite: nothing of
@@ -4237,7 +4276,7 @@ mod tests {
         let _scratch = Scratch::new("adopt-file-removal");
         plant_ghost_at("ghost");
 
-        let error = stage_removal_for_file(&ShardLedger::read().unwrap(), &WarehousePath::from_user_input("ghost/file.txt").unwrap()).unwrap_err();
+        let error = stage_removal_for_file(&mut ShardLedger::read().unwrap(), &WarehousePath::from_user_input("ghost/file.txt").unwrap()).unwrap_err();
 
         assert!(error.contains("is not in the inventory"), "{error}");
         assert!(!is_registered("ghost"));
@@ -4355,11 +4394,30 @@ mod tests {
         assert_eq!(registered_names("late"), ["other.txt"], "the other writer's shard must not be overwritten");
     }
 
+    /// A batch whose shard was removed since it read it refuses before it registers anything: the
+    /// key another writer dropped is not registered again.
+    #[test]
+    fn a_batch_refusing_over_a_removed_shard_registers_nothing() {
+        let _scratch = Scratch::new("batch-removed-since-read");
+        stamped_chain_with_sibling();
+
+        let mut batch = ShardMutationBatch::new();
+        batch.update("a/b", |inventory| {
+            inventory.add_item(item("new.txt", 2, InventoryItemState::Normal));
+        }).unwrap();
+
+        remove_inventories_under("a/b").unwrap();
+
+        let error = batch.publish().unwrap_err();
+        assert!(error.contains("changed while it was being updated"), "unexpected error: {error}");
+        assert!(!ShardLedger::read().unwrap().holds("a/b"), "the dropped key is not registered again");
+    }
+
     #[test]
     fn the_shard_writers_refuse_an_unregistered_key() {
         let _scratch = Scratch::new("writers-refuse");
         stamped_chain_with_sibling();
-        let ledger = ShardLedger::read().unwrap();
+        let mut ledger = ShardLedger::read().unwrap();
 
         let mut inventory = Inventory::new();
         inventory.add_item(item("new.txt", 2, InventoryItemState::Normal));
@@ -4368,8 +4426,7 @@ mod tests {
             let error = result.unwrap_err();
             assert!(error.contains("not registered in the inventory metadata"), "{error}");
         };
-        refused(write_shard_mutation(&ledger, "stray", &mut inventory));
-        refused(publish_shards(&ledger, BTreeMap::from([("stray".to_string(), inventory)]), &BTreeSet::new(), None));
+        refused(write_shard_mutation(&mut ledger, "stray", inventory));
 
         assert!(file_utils::retrieve_inventory_or_none_by_key("stray").unwrap().1.is_none(), "nothing was written");
         assert_eq!(read_rollup(""), Some("rollup".to_string()), "a refused write clears no rollup");
@@ -4551,10 +4608,10 @@ mod tests {
 
             let behind = if is_dir { outside.join(data_path.strip_prefix(&linked).unwrap()) } else { outside.clone() };
             let shard_behind = std::fs::read(&behind).unwrap();
-            let ledger = ShardLedger::read().unwrap();
+            let mut ledger = ShardLedger::read().unwrap();
 
             let read = ledger.retrieve("a/b");
-            let written = publish_shards(&ledger, BTreeMap::from([("a/b".to_string(), Inventory::new())]), &BTreeSet::new(), None);
+            let written = write_shard_mutation(&mut ledger, "a/b", Inventory::new());
             let updated = ShardLedger::read().unwrap().update_shard("a/b", add_new_txt);
 
             assert_eq!(std::fs::read(&behind).unwrap(), shard_behind, "{level}: nothing is written behind the link");
