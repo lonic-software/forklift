@@ -7519,14 +7519,17 @@ pub(crate) mod tests {
     /// On a thread with `WORKER_STACK_SIZE`, a cold read of a chain one delta past
     /// `MAX_RECONSTRUCT_DEPTH` fails with the depth-limit error, and one exactly at the limit reads
     /// back: the recursion to the limit fits that stack, so the backstop is reached as an error and
-    /// not as a stack overflow, which aborts the process. The past-limit read starts beneath 4 MiB
-    /// of used stack, standing in for the frames above a real read (the async entry point, the
-    /// command, clap's), so the test pins headroom and not only a fit at the top of a fresh
-    /// thread. It goes first because the limit bounds one reconstruction's recursion: once the
-    /// at-limit read has cached the bases, the deeper object is a single delta away.
+    /// not as a stack overflow, which aborts the process. Both reads start beneath 4 MiB of used
+    /// stack, standing in for the frames above a real read (the async entry point, the command,
+    /// clap's), so the test pins headroom and not only a fit at the top of a fresh thread. The
+    /// at-limit read is the deeper one: it recurses all the way and decodes on the way back. The
+    /// past-limit read goes first because the limit bounds one reconstruction's recursion: once the
+    /// at-limit read has cached the bases, the deeper object is a single delta away. The
+    /// past-limit read fails before decoding anything, so the at-limit read after it is still cold.
     ///
-    /// Mutation: `WORKER_STACK_SIZE` back to 8 MiB → the debug-build read (about 7.5 MiB) overflows
-    /// beneath the 4 MiB → red.
+    /// Mutation (debug build, which is what `cargo test` and CI run): `WORKER_STACK_SIZE` back to
+    /// 8 MiB → the read (about 7.5 MiB) overflows beneath the 4 MiB → red. In a release build the
+    /// read takes under 2 MiB and the mutation stays green.
     #[test]
     fn a_chain_at_the_depth_limit_reads_and_one_past_it_fails_cleanly_on_the_worker_stack() {
         let temp = fresh_root("delta-chain-depth-limit");
@@ -7549,7 +7552,8 @@ pub(crate) mod tests {
             let top = 0u8;
             let past_limit = beneath_used_stack(&top as *const u8 as usize, 4 * 1024 * 1024,
                                                 &|| file_utils::retrieve_object_by_hash(&hashes[links]));
-            let at_limit = file_utils::retrieve_object_by_hash(&hashes[links - 1]);
+            let at_limit = beneath_used_stack(&top as *const u8 as usize, 4 * 1024 * 1024,
+                                              &|| file_utils::retrieve_object_by_hash(&hashes[links - 1]));
             (at_limit, past_limit)
         });
 

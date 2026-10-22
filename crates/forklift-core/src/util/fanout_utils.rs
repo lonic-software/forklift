@@ -122,8 +122,10 @@ where
 /// Reconstructing a delta chain recurses once per link up to the pack reader's depth limit, and
 /// that limit has to be reached as an error, not as a stack overflow, which aborts the process.
 /// A cold read of a chain at that limit was measured at about 7.5 MiB of stack in a debug build
-/// and under 2 MiB in release, so 16 MiB leaves room for the frames above the read in both. The
-/// size is reserved address space; only the pages a thread touches are committed.
+/// and under 2 MiB in release, so 16 MiB leaves room for the frames above the read in both. On
+/// Windows the size is a reservation, and Linux and macOS map it lazily, so only the pages a thread
+/// touches use memory; under Linux's strict overcommit mode (`vm.overcommit_memory=2`) the whole
+/// size counts against the commit limit for each thread.
 pub const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Run `f` on a new thread named `name` with [`WORKER_STACK_SIZE`], wait for it, and return its
