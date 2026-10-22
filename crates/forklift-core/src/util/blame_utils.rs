@@ -19,11 +19,13 @@
 use std::collections::HashMap;
 use crate::util::{graph_utils, lcs, object_utils};
 
-/// The most steps the match of one version may take (see [`lcs::myers_matches_within`]), a
-/// fraction of a second. A version whose match would take more (two long versions with many
+/// The most steps the search for one version's match may take (see
+/// [`lcs::myers_matches_within`]), a fraction of a second per version; it bounds each version,
+/// not the whole blame. A version whose search would take more (two long versions with many
 /// shared lines in a thoroughly different order) skips the line-level attribution, and its
 /// whole content is attributed to the introducing parcel. Its length alone never does: a long
-/// file edited lightly costs about its length.
+/// file edited lightly costs about its length. The slide that follows the search is not
+/// counted; like git's, it can cost more than linear on long runs of a repeated line.
 const MAX_BLAME_STEPS: u64 = 50_000_000;
 
 /// One attributed line of the blamed file.
