@@ -263,10 +263,25 @@ fn refuse_an_open_haul(pallet: &str, hauls: &haul_utils::HaulsRead) -> Result<Ve
 /// here (no local write can remove a remote head, so that needs no precondition). Neither is a
 /// refusal naming `--force`.
 async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPreconditions), String> {
-    let reaches = |other: &str| other == head || merge_utils::is_ancestor(head, other).unwrap_or(false);
+    // A history that cannot be read is reported, never taken as "does not hold it": that answer
+    // would steer the user to "--force".
+    let reaches = |which: &str, other: &str| -> Result<bool, String> {
+        if other == head {
+            return Ok(true);
+        }
+
+        merge_utils::is_ancestor(head, other).map_err(|e| format!(
+            "Cannot tell whether {} holds the work on pallet \"{}\": {} Nothing was deleted.",
+            which, pallet, e
+        ))
+    };
 
     for (reference, other) in pallet_utils::all_pallet_refs()? {
-        if reference.namespace == PalletNamespace::User && reference.name != pallet && reaches(&other) {
+        if reference.namespace != PalletNamespace::User || reference.name == pallet {
+            continue;
+        }
+
+        if reaches(&format!("pallet \"{}\"", reference.name), &other)? {
             let preconditions = RefPreconditions {
                 pallets: PalletsPrecondition::Witness { pallet: reference.name.clone(), head: other },
                 ..RefPreconditions::NONE
@@ -280,9 +295,9 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
         "No other pallet here holds the work on pallet \"{}\" ({}), so deleting it could lose \
         that work. Merge it somewhere first, or rerun with \"--force\": the work then stays \
         recoverable by \"forklift undo\" only while the delete is in this bay's undo journal (until \
-        it is undone, pushed out by 100 later journaled operations here, or this bay is removed), and \
+        it is undone, pushed out by {} later journaled operations here, or this bay is removed), and \
         is collectable after that.",
-        pallet, head
+        pallet, head, journal_utils::MAX_ENTRIES
     );
 
     if !RemoteClient::is_configured() {
@@ -294,8 +309,13 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
     remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
 
-    let held = info.pallets.values()
-        .any(|other| file_utils::does_object_exist(other).unwrap_or(false) && reaches(other));
+    let mut held = false;
+    for (wire, other) in &info.pallets {
+        if file_utils::does_object_exist(other)? && reaches(&format!("the remote's pallet \"{}\"", wire), other)? {
+            held = true;
+            break;
+        }
+    }
 
     if held {
         return Ok((Some("the remote".to_string()), RefPreconditions::NONE));
@@ -663,6 +683,27 @@ mod tests {
         assert_eq!(pallet_utils::get_pallet_head("x").unwrap(), Some(shared), "x stays");
         assert_eq!(pallet_utils::get_pallet_head("y").unwrap(), None);
         assert_eq!(journal_utils::removed_heads().unwrap().len(), 1, "only the landed delete is journaled");
+    }
+
+    #[test]
+    fn a_delete_reports_a_witness_history_it_cannot_read() {
+        let _warehouse = Warehouse::storage_only("delete-unreadable-witness");
+        let none = RefPreconditions::NONE;
+
+        let main = test_support::store_parcel(&test_support::store_tree("a.txt", b"a\n"), &[]);
+        pallet_utils::update_pallet_head("main", None, &main, &none).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
+        let side = test_support::store_parcel(&test_support::store_tree("s.txt", b"s\n"), &[]);
+        pallet_utils::update_pallet_head("side", None, &side, &none).unwrap();
+
+        // "x" stands on a parcel whose parent this store does not hold.
+        let missing = "9".repeat(64);
+        let x = test_support::store_parcel(&test_support::store_tree("x.txt", b"x\n"), &[missing.as_str()]);
+        pallet_utils::update_pallet_head("x", None, &x, &none).unwrap();
+
+        let refused = test_support::block_on(delete_pallet("side", false)).unwrap_err();
+        assert!(refused.contains("Cannot tell whether pallet \"x\" holds the work"), "{}", refused);
+        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(side));
     }
 
     #[test]

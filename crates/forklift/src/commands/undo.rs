@@ -20,7 +20,8 @@ use crate::output::{self, CommandOutput};
 /// An empty journal means there is nothing to undo. An entry is reversed only while the bay is
 /// still where its operation left it (`journal_utils::check_undoable`); otherwise an operation
 /// outside the journal ran since, and reversing the entry would undo an older operation than
-/// the user's last. Nor is one reversed that would put back a cherry-pick whose source is gone.
+/// the user's last. Nor is one reversed that would put back a cherry-pick whose source is gone. A
+/// delete changed no bay state, so nothing the bay did since stops its undo.
 ///
 /// The journal entry is only ever consumed (`journal_utils::pop`) once its undo has fully
 /// succeeded — `peek` looks at it first. A refused or failed undo must leave the journal exactly
@@ -60,16 +61,18 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
     tests::AFTER_GATE.with(|seam| seam.take().map(|seam| seam()));
 
     if entry.op == journal_utils::DELETE_OP {
-        // The bay is left alone: a delete changed none of its state.
+        // The bay is left alone: a delete changed none of its state. It is read first, so nothing
+        // after the pop can fail.
+        let position = pallet_utils::read_position()?;
         let restored = journal_utils::restore_deleted(&entry, as_name)?;
         journal_utils::pop()?;
 
         output::emit(&Undone {
             op: entry.op,
-            pallet: entry.after.current_pallet,
+            pallet: position.pallet,
             left: String::new(),
             undone: String::new(),
-            head: pallet_utils::read_position()?.base.unwrap_or_default(),
+            head: position.base.unwrap_or_default(),
             description: String::new(),
             restored: restored.deleted,
             restored_as: restored.name,

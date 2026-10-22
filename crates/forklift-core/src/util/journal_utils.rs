@@ -33,7 +33,7 @@ pub const DELETE_OP: &str = "delete";
 
 /// Cap the journal so it cannot grow without bound; the oldest entries fall off (undo is
 /// a recent-history convenience, not an audit trail — that is what `history`/`audit` are).
-const MAX_ENTRIES: usize = 100;
+pub const MAX_ENTRIES: usize = 100;
 
 /// The mutable warehouse state on one side of a journaled operation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -519,8 +519,31 @@ pub fn restore_deleted(entry: &JournalEntry, as_name: Option<&str>) -> Result<Re
 
     let restored = |outcome| RestoredPallet { deleted: wire.clone(), name: name.clone(), head: head.clone(), outcome };
 
-    if let Some(found) = pallet_utils::get_pallet_head(&name)? {
-        return settle_on(&wire, &name, as_name.is_some(), &head, Some(found)).map(restored);
+    let refs = pallet_utils::all_pallet_refs()?;
+    let users = || refs.iter().filter(|(reference, _)| reference.namespace == PalletNamespace::User);
+
+    if let Some((_, found)) = users().find(|(reference, _)| reference.name == name) {
+        return settle_on(&wire, &name, as_name.is_some(), &head, Some(found.clone())).map(restored);
+    }
+
+    // The delete pruned emptied ref folders, so a pallet created since can stand where the ref
+    // would go: a folder of the name, or under it.
+    let nested = |outer: &str, inner: &str| inner.starts_with(&format!("{}/", outer));
+    if let Some((other, _)) = users().find(|(reference, _)| nested(&reference.name, &name) || nested(&name, &reference.name)) {
+        return Err(match as_name {
+            Some(_) => format!(
+                "Pallet name \"{}\" collides with pallet \"{}\" (one name is a folder of the \
+                other); bring deleted pallet \"{}\" back under another name. Nothing was undone.",
+                name, other.name, wire
+            ),
+            None => format!(
+                "Pallet \"{}\" was deleted at {}, and pallet \"{}\" now stands where its ref \
+                would go (one name is a folder of the other). Undo will not overwrite it. To bring \
+                the deleted pallet back under another name, run \"forklift undo --as <new-name>\". \
+                Nothing was undone.",
+                wire, head, other.name
+            ),
+        });
     }
 
     refuse_a_bay_out_of_step(&name, &head, as_name)?;
@@ -702,8 +725,9 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     let now = BayState::read()?;
     let after = entry.after.bay_state();
 
-    // A delete changes no bay state and puts back no pick.
-    if now == after && entry.op == DELETE_OP {
+    // A delete changed no bay state and puts back none, so nothing the bay did since stands in
+    // the way of bringing its pallet back.
+    if entry.op == DELETE_OP {
         return Ok(());
     }
 

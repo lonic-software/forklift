@@ -13163,3 +13163,46 @@ fn older_entries_after_undo_as_act_on_whatever_the_old_name_holds() {
     assert!(!moved.status.success());
     assert!(stderr(&moved).contains("has moved since"), "{}", stderr(&moved));
 }
+
+// A delete changes no bay state, so a pallet switch after it does not stand in the way of its undo.
+#[test]
+fn undo_of_a_delete_reaches_past_a_switch_of_pallets() {
+    let (warehouse, base) = warehouse_with_side("delete-undo-after-switch");
+
+    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
+    assert_success(&warehouse.run(&["palletize", "next"]));
+
+    let undone = warehouse.run(&["--json", "undo"]);
+    assert_success(&undone);
+    let value = json(&undone);
+    assert_eq!(value["data"]["pallet"], "next", "the bay as it stands now: {}", value);
+    assert!(pallet_heads(&warehouse).contains(&("side".to_string(), base)));
+}
+
+// Deleting "a/b" prunes the emptied "a/" folder, so "a" can be created there since.
+#[test]
+fn undo_of_a_delete_refuses_a_pallet_that_took_its_folder_and_names_undo_as() {
+    let warehouse = TestWarehouse::new("delete-undo-nested");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    let base = stack_one(&warehouse, "a.txt", "one\n");
+    assert_success(&warehouse.run(&["palletize", "a/b"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    assert_success(&warehouse.run(&["palletize", "--delete", "a/b"]));
+    // A bay creates pallet "a" without journaling anything here.
+    let _bay = open_bay(&warehouse, "a");
+    let entries = journal_len(&warehouse);
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("now stands where its ref would go"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("forklift undo --as <new-name>"), "{}", stderr(&refused));
+    assert_eq!(journal_len(&warehouse), entries, "a refused undo keeps its entry");
+
+    let refused = warehouse.run(&["undo", "--as", "a/c"]);
+    assert!(stderr(&refused).contains("collides with pallet \"a\""), "{}", stderr(&refused));
+
+    assert_success(&warehouse.run(&["undo", "--as", "a-b"]));
+    assert!(pallet_heads(&warehouse).contains(&("a-b".to_string(), base)));
+}

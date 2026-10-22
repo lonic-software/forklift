@@ -509,8 +509,9 @@ and trust/remote commands are out of scope; `park` is reversed with `park pop`. 
 happened between the journaled operation and the `undo` but was never journaled itself stays
 exactly as it is — trust operations such as a key retirement are preserved, never rolled back.
 
-`undo` reverses only your *last* operation, never an older one behind it. It refuses
-outright when the bay no longer matches what the journaled operation left: the current
+`undo` reverses only your *last* operation, never an older one behind it. Except for a delete,
+which changed nothing in the bay, it refuses outright when the bay no longer matches what the
+journaled operation left: the current
 pallet was switched since (`palletize` and `deliver` switch pallets without being
 journaled), the current pallet's head moved (a merged haul, a fast-forwarding `lower`), or a
 consolidation or cherry-pick was started or finished. It also refuses to undo the `stack` that
