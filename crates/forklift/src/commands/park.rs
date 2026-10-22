@@ -412,4 +412,70 @@ mod tests {
         pub(crate) static AFTER_PARKED_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
             std::cell::Cell::new(None);
     }
+
+    use super::*;
+    use crate::test_support::{self, Warehouse};
+    use forklift_core::util::operation_utils::RecoveryOutcome;
+    use forklift_core::util::stocktake_utils;
+
+    /// "main" at a tree of a.txt, checked out, with a.txt edited and loaded. Returns the head's tree.
+    fn work_in_progress_on_main(root: &std::path::Path) -> String {
+        test_support::configure_operator();
+
+        let tree = test_support::store_tree("a.txt", b"one\n");
+        let head = test_support::store_parcel(&tree, &[]);
+        pallet_utils::update_pallet_head("main", None, &head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(head))).unwrap();
+        test_support::check_out(&tree);
+
+        std::fs::write(root.join("a.txt"), b"work\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+
+        tree
+    }
+
+    fn staged_paths(tree: &str) -> Vec<String> {
+        test_support::block_on(stocktake_utils::collect_staged_changes(Some(tree))).unwrap()
+            .into_iter().map(|change| change.path).collect()
+    }
+
+    #[test]
+    fn a_park_interrupted_before_the_parked_list_names_its_parcel_leaves_the_work_in_place() {
+        let warehouse = Warehouse::with_working_tree("park-crash-before-list");
+        let tree = work_in_progress_on_main(&warehouse.root);
+
+        BEFORE_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Park, RecoveryOutcome::Cleared));
+
+        assert!(park_utils::read_parked().unwrap().is_empty(), "nothing was parked");
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"), "the work stays in the file");
+        assert_eq!(staged_paths(&tree), vec!["a.txt".to_string()], "and staged, as it was");
+    }
+
+    #[test]
+    fn a_park_interrupted_after_the_parked_list_names_its_parcel_resets_staging_to_the_head() {
+        let warehouse = Warehouse::with_working_tree("park-crash-after-list");
+        let tree = work_in_progress_on_main(&warehouse.root);
+
+        AFTER_PARKED_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        assert_eq!(test_support::block_on(park_changes()).unwrap_err(), "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Park, RecoveryOutcome::RolledForward));
+
+        let parked = park_utils::read_parked().unwrap();
+        assert_eq!(parked.len(), 1, "the work is safe in the parked list");
+        let parked_tree = object_utils::load_parcel(&parked[0]).unwrap().tree_hash;
+        assert!(object_utils::load_tree(&parked_tree).is_ok(), "the parked parcel's tree is stored");
+        assert!(staged_paths(&tree).is_empty(), "staging is back at the head");
+
+        // The file was never reset: it reads as a local change, never as staged content.
+        assert_eq!(recovery.unheld, vec!["a.txt".to_string()]);
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"work\n"));
+    }
 }

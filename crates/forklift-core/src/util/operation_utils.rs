@@ -370,7 +370,7 @@ fn read_at(path: &Path) -> Result<Option<Operation>, String> {
 fn standing_refusal_message(path: &Path) -> String {
     match read_at(path) {
         Ok(Some(operation)) => format!(
-            "A {} in this bay was interrupted before it finished, so the staged inventory may be \
+            "The {} that ran in this bay was interrupted before it finished, so the staged inventory may be \
             incomplete; changing the bay or committing now could record a wrong result. Run \
             \"forklift heal\" to finish or undo it.",
             operation.kind.as_str()
@@ -707,5 +707,32 @@ mod tests {
 
         let short = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0.to_string() + "\n";
         assert_eq!(Operation::from_bytes(short.as_bytes()), Err("is malformed.".to_string()));
+    }
+
+    #[test]
+    fn a_wholesale_rewrite_of_staging_refuses_unless_this_process_raised_a_marker() {
+        let root = std::env::temp_dir().join(format!("forklift-operation-required-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+
+        let error = crate::util::inventory_utils::replace_all_inventories(&Default::default())
+            .expect_err("a rewrite with no marker must refuse");
+        assert!(error.contains("Nothing was changed"), "{}", error);
+
+        // A marker another process left does not authorize it either.
+        raise(&operation()).unwrap();
+        forget_raised_for_tests();
+        crate::util::inventory_utils::replace_all_inventories(&Default::default())
+            .expect_err("a marker this process did not raise must not authorize a rewrite");
+
+        set_raised(Some(&marker_path()));
+        crate::util::inventory_utils::replace_all_inventories(&Default::default())
+            .expect("the owner of the marker may rewrite");
+        finish().unwrap();
+        assert!(read().unwrap().is_none());
+
+        drop(scope);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

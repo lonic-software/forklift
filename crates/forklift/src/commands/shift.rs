@@ -321,4 +321,92 @@ mod tests {
         pub(crate) static BEFORE_SHIFT_POSITION_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
             std::cell::Cell::new(None);
     }
+
+    use super::*;
+    use crate::test_support::{self, Warehouse};
+    use forklift_core::util::operation_utils::RecoveryOutcome;
+
+    /// "main" at a tree of a.txt and b.txt, checked out; "feature" at another. Returns the
+    /// feature's head and tree.
+    fn main_checked_out_beside_feature() -> (String, String) {
+        test_support::configure_operator();
+
+        let main_tree = test_support::store_files(&[("a.txt", b"one\n"), ("b.txt", b"two\n")]);
+        let main_head = test_support::store_parcel(&main_tree, &[]);
+        let feature_tree = test_support::store_files(&[("a.txt", b"one\n"), ("b.txt", b"feature\n")]);
+        let feature_head = test_support::store_parcel(&feature_tree, &[&main_head]);
+
+        pallet_utils::update_pallet_head("main", None, &main_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &feature_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main_head))).unwrap();
+        test_support::check_out(&main_tree);
+
+        (feature_head, feature_tree)
+    }
+
+    /// Shift to "feature" and crash after staging is rewritten, before the position is recorded;
+    /// then stand in for the next process.
+    fn crash_a_shift_before_its_position_write() {
+        BEFORE_SHIFT_POSITION_WRITE.with(|seam| seam.set(Some(Box::new(|| Err("crashed".to_string())))));
+        let error = test_support::block_on(handle_command("feature")).expect_err("the seam crashes the shift");
+        assert_eq!(error, "crashed");
+        operation_utils::forget_raised_for_tests();
+    }
+
+    async fn assert_bay_clean_at(tree: &str) {
+        let staged = stocktake_utils::collect_staged_changes(Some(tree)).await.unwrap();
+        let unstaged = stocktake_utils::collect_unstaged_changes().await.unwrap();
+        assert!(staged.is_empty() && unstaged.is_empty(),
+            "the bay must be clean at the tree: staged {:?}, unstaged {:?}",
+            staged.iter().map(|change| &change.path).collect::<Vec<_>>(),
+            unstaged.iter().map(|change| &change.path).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_rewrite_killed_after_the_shard_store_went_cannot_be_stacked_and_heal_recovers_it() {
+        let warehouse = Warehouse::with_working_tree("shift-shape-five");
+        let (feature_head, feature_tree) = main_checked_out_beside_feature();
+        let main_head = pallet_utils::get_pallet_head("main").unwrap();
+
+        crash_a_shift_before_its_position_write();
+
+        // The state a kill inside the rewrite leaves: the shard store removed, its metadata kept,
+        // so every registered key reads as empty.
+        std::fs::remove_dir_all(file_utils::get_inventory_store_root().unwrap()).unwrap();
+
+        let error = test_support::block_on(crate::commands::stack::handle_command(Some("after crash".to_string())))
+            .expect_err("a stack over an interrupted rewrite must be refused");
+        assert!(error.contains("forklift heal"), "{}", error);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), main_head, "nothing may be stacked");
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Shift, RecoveryOutcome::RolledForward));
+        assert!(recovery.unheld.is_empty(), "{:?}", recovery.unheld);
+        assert_eq!(recovery.position, pallet_utils::BayPosition::new("feature", Some(feature_head)));
+        assert!(operation_utils::read().unwrap().is_none(), "recovery clears the marker");
+
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"one\n")
+            && test_support::file_holds(&warehouse.root, "b.txt", b"feature\n"));
+        test_support::block_on(assert_bay_clean_at(&feature_tree));
+    }
+
+    #[test]
+    fn a_load_over_an_interrupted_shift_leaves_its_marker_and_heal_rolls_it_forward() {
+        let _warehouse = Warehouse::with_working_tree("shift-load-keeps-marker");
+        let (feature_head, feature_tree) = main_checked_out_beside_feature();
+
+        crash_a_shift_before_its_position_write();
+
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        assert!(operation_utils::read().unwrap().is_some(), "a load must not clear the marker");
+
+        let error = test_support::block_on(crate::commands::stack::handle_command(Some("after load".to_string())))
+            .expect_err("a stack over an interrupted shift must be refused, load or not");
+        assert!(error.contains("forklift heal"), "{}", error);
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!(recovery.outcome, RecoveryOutcome::RolledForward);
+        assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("feature", Some(feature_head)));
+        test_support::block_on(assert_bay_clean_at(&feature_tree));
+    }
 }
