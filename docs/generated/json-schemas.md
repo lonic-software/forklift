@@ -1969,7 +1969,7 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "LowerOutcome": {
-      "description": "What a lower did to the current pallet.",
+      "description": "What a lower did to the pallet it lowered.",
       "oneOf": [
         {
           "const": "up_to_date",
@@ -1984,6 +1984,11 @@ A command not listed here either reports only the generic human-message shape `{
         {
           "const": "lowered",
           "description": "The local pallet fast-forwarded to the remote head.",
+          "type": "string"
+        },
+        {
+          "const": "created",
+          "description": "The pallet did not exist here, and now points at the remote head. Only a named lower, of a\npallet other than the current one, creates one.",
           "type": "string"
         }
       ]
@@ -2138,7 +2143,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "What happened to the current pallet; always present in a successful report."
+      "description": "What happened to the pallet lowered (`pallet`); always present in a successful report."
     },
     "pallet": {
       "type": "string"
@@ -2797,6 +2802,97 @@ A command not listed here either reports only the generic human-message shape `{
     "pallets"
   ],
   "title": "PalletList",
+  "type": "object"
+}
+```
+
+### `RemotePalletList`
+
+```json
+{
+  "$defs": {
+    "RemotePalletEntry": {
+      "description": "One remote pallet.",
+      "properties": {
+        "local_head": {
+          "description": "The local pallet's head parcel hash; `null` when there is no local pallet of that name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/RemoteRelation"
+        },
+        "remote_head": {
+          "description": "The remote's head parcel hash.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "remote_head",
+        "local_head",
+        "relation"
+      ],
+      "type": "object"
+    },
+    "RemoteRelation": {
+      "description": "How a local pallet relates to the remote's pallet of the same name.",
+      "oneOf": [
+        {
+          "const": "absent",
+          "description": "There is no local pallet of that name; `lower <name>` creates it.",
+          "type": "string"
+        },
+        {
+          "const": "same",
+          "description": "The local pallet is at the remote head.",
+          "type": "string"
+        },
+        {
+          "const": "local_ahead",
+          "description": "The local pallet holds the remote head and more; `lift` publishes it.",
+          "type": "string"
+        },
+        {
+          "const": "differs",
+          "description": "The local pallet is behind the remote or diverged from it; `lower <name>` tells which,\nfast-forwarding a pallet that is behind.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The remote's pallets, each against the local pallet of that name.",
+  "properties": {
+    "meta": {
+      "description": "The remote's meta pallets in their qualified form (`@office`), present only when `--all`\nwas given.",
+      "items": {
+        "$ref": "#/$defs/RemotePalletEntry"
+      },
+      "type": "array"
+    },
+    "pallets": {
+      "description": "Every user pallet the remote has with something stacked.",
+      "items": {
+        "$ref": "#/$defs/RemotePalletEntry"
+      },
+      "type": "array"
+    },
+    "remote": {
+      "description": "The remote's URL.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "remote",
+    "pallets"
+  ],
+  "title": "RemotePalletList",
   "type": "object"
 }
 ```

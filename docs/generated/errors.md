@@ -40,4 +40,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `behind` | 26 | Another bay or process moved the pallet past the parcel this bay stands on; nothing was moved, and "shift" catches the bay up |
 | `target_not_covered` | 27 | "deliver" was aimed at a target holding changes the draft has not seen; consolidating the target into the draft comes first |
 | `remote_ahead` | 28 | The remote's pallet holds parcels this warehouse has not lowered yet; "lower" comes first |
+| `pallet_not_found` | 29 | No pallet of that name exists in this warehouse; "lower <name>" brings in the remote's, "palletize <name>" creates a new one |
 

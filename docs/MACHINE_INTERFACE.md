@@ -402,6 +402,16 @@ and follows the step.
 `diverged` used to be described as a remote ref moving under a lift. That case is now
 `remote_ahead`, and `diverged` means only a true divergence.
 
+### A pallet this warehouse does not hold: `pallet_not_found`
+
+`shift`, `consolidate`, `audit` and `haul open` (its target, and a source other than the current
+pallet) refuse a pallet name this warehouse holds no ref for with `pallet_not_found` (exit 29). The
+remedy depends on where the pallet might be: with a remote configured, `next_step` is
+`forklift lower <name>`, which brings the remote's pallet in without moving this bay; without
+one it is `forklift palletize <name>`. A missing meta pallet names `forklift palletize --all`.
+`forklift palletize --remote` lists what the remote holds, so an agent can tell the two apart
+before acting.
+
 ### Custom metadata that changed on both sides: `meta_conflict`
 
 `lower` reconciles a diverged `@kv` path by path: changes to different keys replay onto the
