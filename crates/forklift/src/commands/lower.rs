@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    audit_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
+    audit_utils, bay_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
     pallet_utils, remote_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
@@ -60,6 +60,15 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     let progress = events::progress();
     let client = RemoteClient::from_config()?;
     let info = client.fetch_info().await?;
+
+    // A named pallet the remote lacks is refused before trust or a meta pallet is written: it is
+    // where a missing pallet's refusal sends an operator, so it must fail cleanly and coded.
+    if let Some(name) = &named {
+        if !info.pallets.contains_key(name) {
+            return Err(CoreError::refusal(RefusalCode::PalletNotFound, remote_lacks_pallet(&info, name),
+                "forklift palletize --remote").into());
+        }
+    }
 
     // Checks the pin (and a stripped anchor) against the handshake before anything is fetched.
     let trust = remote_utils::adopt_remote_trust(&client, &info, expect.as_deref()).await?;
@@ -192,19 +201,22 @@ async fn lower_working_pallet(client: &RemoteClient,
 /// The remote's head of user pallet `pallet`, or the refusal that it has none. The refusal lists
 /// only the remote's user pallets: a meta pallet is synced by every lower and never named.
 fn remote_pallet_head<'a>(info: &'a forklift_core::model::remote::WarehouseInfo, pallet: &str) -> Result<&'a String, String> {
-    info.pallets.get(pallet).ok_or_else(|| {
-        let user: Vec<&str> = info.pallets.keys()
-            .map(String::as_str)
-            .filter(|name| !name.starts_with(pallet_utils::META_QUALIFIER))
-            .collect();
+    info.pallets.get(pallet).ok_or_else(|| remote_lacks_pallet(info, pallet))
+}
 
-        format!(
-            "The remote has no pallet \"{}\" (it has: {}). \"forklift palletize --remote\" lists \
-            them.",
-            pallet,
-            if user.is_empty() { "none".to_string() } else { user.join(", ") }
-        )
-    })
+/// The message for a remote that has no user pallet `pallet`, naming the ones it has.
+fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, pallet: &str) -> String {
+    let user: Vec<&str> = info.pallets.keys()
+        .map(String::as_str)
+        .filter(|name| !name.starts_with(pallet_utils::META_QUALIFIER))
+        .collect();
+
+    format!(
+        "The remote has no pallet \"{}\" (it has: {}). \"forklift palletize --remote\" lists \
+        them.",
+        pallet,
+        if user.is_empty() { "none".to_string() } else { user.join(", ") }
+    )
 }
 
 /// Lower a pallet other than the current one: fetch the remote head's closure, then move the
@@ -233,6 +245,22 @@ async fn lower_named_pallet(client: &RemoteClient,
         return Ok(());
     }
 
+    // A bay standing on the pallet while it is unborn has no base to catch up from: created
+    // under it, the pallet would refuse that bay's stack as behind, and its catch-up would read
+    // all of its files as changes to overwrite.
+    if local_head.is_none() {
+        for dir in bay_utils::all_bay_state_dirs()? {
+            if pallet_utils::read_position_in(&dir)?.pallet == pallet {
+                return Err(format!(
+                    "A bay stands on pallet \"{p}\", which has nothing stacked here; creating it at \
+                    the remote's head would leave that bay nothing to catch up from. Run \"forklift \
+                    lower\" in that bay instead.",
+                    p = pallet
+                ));
+            }
+        }
+    }
+
     let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, progress).await?;
     report.fetched_objects = stats.fetched_objects;
     report.fetched_signatures = stats.fetched_signatures;
@@ -243,8 +271,19 @@ async fn lower_named_pallet(client: &RemoteClient,
             return Ok(());
         }
 
+        // Not the working pallet's refusal: its remedy palletizes and shifts this bay, which a
+        // named lower promised to leave alone. The reconciliation happens on the pallet itself.
         if !merge_utils::is_ancestor(local, remote_head)? {
-            return Err(remote_utils::diverged_refusal(&pallet, remote_head).into());
+            return Err(CoreError::refusal(
+                RefusalCode::Diverged,
+                format!(
+                    "The local pallet \"{p}\" and the remote have diverged; the remote parcels are \
+                    fetched. Reconcile it on the pallet: shift onto it (\"forklift shift {p}\"), then \
+                    \"forklift lower\" names the steps.",
+                    p = pallet
+                ),
+                format!("forklift shift {}; then forklift lower", pallet),
+            ).into());
         }
     }
 

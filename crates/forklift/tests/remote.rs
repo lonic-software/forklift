@@ -7116,7 +7116,9 @@ fn lowering_another_pallet_fast_forwards_keeps_ahead_and_refuses_diverged() {
     advance_remote(&area, "feat", "feat.txt", "feat v3\n");
     let diverged = area.forklift("b", &["--json", "lower", "feat"]);
     assert_eq!(diverged.status.code(), Some(5), "{}{}", stdout(&diverged), stderr(&diverged));
-    assert_eq!(json_of(&diverged)["error"]["code"], "diverged");
+    let value = json_of(&diverged);
+    assert_eq!(value["error"]["code"], "diverged");
+    assert_eq!(value["error"]["next_step"], "forklift shift feat; then forklift lower", "{}", value);
     assert_eq!(pallet_head(&area, "b", "feat"), ahead_head, "a diverged lower moves nothing");
 }
 
@@ -7202,6 +7204,10 @@ fn a_missing_pallet_is_a_coded_refusal_naming_lower_only_with_a_remote() {
         assert_eq!(value["error"]["next_step"], "forklift lower nope", "{:?}: {}", args, value);
     }
 
+    let refused = area.forklift("b", &["--json", "audit", "@haul"]);
+    assert_eq!(refused.status.code(), Some(29), "{}{}", stdout(&refused), stderr(&refused));
+    assert_eq!(json_of(&refused)["error"]["next_step"], "forklift lower", "a bare lower syncs meta pallets");
+
     std::fs::create_dir_all(area.path("solo")).unwrap();
     assert_success(&area.forklift("solo", &["prepare"]));
     stack_file(&area, "solo", "x.txt", "x\n");
@@ -7226,6 +7232,34 @@ fn lowering_a_pallet_the_remote_lacks_names_only_user_pallets() {
     let message = stderr(&refused);
     assert!(message.contains("feat") && message.contains("palletize --remote"), "{}", message);
     assert!(!message.contains('@'), "{}", message);
+    assert!(!message.contains("FIRST CONTACT"), "refused before the remote's trust is adopted: {}", message);
+
+    let refused = area.forklift("b", &["--json", "lower", "nope"]);
+    assert_eq!(refused.status.code(), Some(29), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json_of(&refused);
+    assert_eq!((value["error"]["code"].as_str(), value["error"]["next_step"].as_str()),
+        (Some("pallet_not_found"), Some("forklift palletize --remote")), "{}", value);
+}
+
+// Revert: drop the unborn-bay check → the lower creates feat under the bay standing on it.
+#[test]
+fn a_named_lower_does_not_create_a_pallet_a_bay_stands_on_unborn() {
+    let area = TestArea::new("lower-named-unborn-bay");
+    let server = Server::start(&area, None);
+    remote_with_a_side_pallet(&area, &server);
+
+    let bay_dir = area.path("b-bay");
+    assert_success(&area.forklift("b", &["bay", "add", "w", bay_dir.to_str().unwrap()]));
+    // No command puts a bay on an unborn pallet other than a fresh warehouse's first, so the
+    // position is written by hand.
+    let position = area.read_file("b/.forklift/bays/w/position");
+    let header = position.lines().next().unwrap();
+    std::fs::write(area.path("b/.forklift/bays/w/position"), format!("{}\nfeat\n\n", header)).unwrap();
+
+    let refused = area.forklift("b", &["lower", "feat"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("A bay stands on pallet \"feat\""), "{}", stderr(&refused));
+    assert!(!area.path("b/.forklift/pallets/feat").exists());
 }
 
 // Revert: let the named lower re-point the bay → the other bay's stack is not behind.

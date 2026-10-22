@@ -67,6 +67,10 @@ fn open(target: &str, source: Option<String>, title: &str, description: String) 
     };
 
     if pallet_utils::get_pallet_head(target)?.is_none() && !pallet_utils::does_pallet_exist(target) {
+        if target == current {
+            return Err(format!("Pallet \"{}\" has nothing stacked; there is nothing to merge into.", target));
+        }
+
         return Err(pallet_utils::pallet_not_found_refusal(&pallet_utils::PalletRef::user(target)).into());
     }
 

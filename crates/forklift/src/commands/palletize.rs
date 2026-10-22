@@ -251,18 +251,23 @@ impl CommandOutput for PalletList {
 ///
 /// # Returns
 /// * `Ok(())`      - If the pallets were listed.
-/// * `Err(String)` - If no remote is configured, the handshake failed, the remote named an invalid
-///                   pallet, or a local ref or parcel could not be read.
+/// * `Err(String)` - If no remote is configured, the handshake failed, or a local ref or parcel
+///                   could not be read.
 async fn list_remote_pallets(all: bool) -> Result<(), String> {
     let client = RemoteClient::from_config()?;
     let info = client.fetch_info().await?;
 
     let mut pallets = Vec::new();
     let mut meta = Vec::new();
+    let mut unnamed = Vec::new();
 
     for (wire, remote_head) in &info.pallets {
-        let reference = PalletRef::parse(wire)
-            .map_err(|why| format!("The remote lists a pallet this build cannot name: {}", why))?;
+        // A remote with other naming rules may list names this build rejects: they are reported
+        // apart, uncompared, rather than failing the listing of every other pallet.
+        let Ok(reference) = PalletRef::parse(wire) else {
+            unnamed.push(wire.clone());
+            continue;
+        };
 
         let entries = match reference.namespace {
             PalletNamespace::User => &mut pallets,
@@ -276,7 +281,7 @@ async fn list_remote_pallets(all: bool) -> Result<(), String> {
         entries.push(RemotePalletEntry { name: reference.to_wire(), remote_head: remote_head.clone(), local_head, relation });
     }
 
-    output::emit(&RemotePalletList { remote: client.url().to_string(), pallets, meta });
+    output::emit(&RemotePalletList { remote: client.url().to_string(), pallets, meta, unnamed });
 
     Ok(())
 }
@@ -311,10 +316,15 @@ pub(crate) struct RemotePalletList {
     /// Every user pallet the remote has with something stacked.
     pallets: Vec<RemotePalletEntry>,
 
-    /// The remote's meta pallets in their qualified form (`@office`), present only when `--all`
-    /// was given.
+    /// The remote's meta pallets in their qualified form (`@office`), listed only when `--all`
+    /// was given; omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     meta: Vec<RemotePalletEntry>,
+
+    /// Pallet names the remote lists that this build cannot read (another version's naming
+    /// rules), so they are not compared; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unnamed: Vec<String>,
 }
 
 /// One remote pallet.
@@ -360,22 +370,30 @@ impl CommandOutput for RemotePalletList {
         }
 
         for entry in &self.pallets {
-            println!("  {}", describe_remote_entry(entry));
+            println!("  {}", describe_remote_entry(entry, PalletNamespace::User));
         }
 
         if !self.meta.is_empty() {
             println!("Meta pallets:");
 
             for entry in &self.meta {
-                println!("  {}", describe_remote_entry(entry));
+                println!("  {}", describe_remote_entry(entry, PalletNamespace::Meta));
+            }
+        }
+
+        if !self.unnamed.is_empty() {
+            println!("Not compared (names this version of forklift cannot read):");
+
+            for name in &self.unnamed {
+                println!("  {}", forklift_core::error::sanitize(name));
             }
         }
     }
 }
 
-fn describe_remote_entry(entry: &RemotePalletEntry) -> String {
+fn describe_remote_entry(entry: &RemotePalletEntry, namespace: PalletNamespace) -> String {
     // A meta pallet is synced by every lower, never lowered by name.
-    if entry.name.starts_with(pallet_utils::META_QUALIFIER) {
+    if namespace == PalletNamespace::Meta {
         return match entry.relation {
             RemoteRelation::Same => format!("{} (same as here)", entry.name),
             RemoteRelation::LocalAhead => format!("{} (ahead here)", entry.name),

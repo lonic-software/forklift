@@ -587,8 +587,9 @@ impl ErrorCode {
                 "The remote's pallet holds parcels this warehouse has not lowered yet; \
                  \"lower\" comes first",
             ErrorCode::PalletNotFound =>
-                "No pallet of that name exists in this warehouse; \"lower <name>\" brings in the \
-                 remote's, \"palletize <name>\" creates a new one",
+                "No pallet of that name exists in this warehouse (or, for \"lower <name>\", on the \
+                 remote); \"lower <name>\" brings in the remote's, \"palletize <name>\" creates a \
+                 new one, \"palletize --remote\" lists the remote's",
         }
     }
 
