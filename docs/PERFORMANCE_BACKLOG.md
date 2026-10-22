@@ -202,7 +202,7 @@ isn't sampled on macOS, so wall-clock attribution also came from `hyperfine` A/B
 | Line interning hasher (`diff::lines`, SipHash) | ~0.2–0.6 ms per 20 files | Not worth a ticket alone. It now runs fanned out, so the wall-clock share is smaller still. | < 0.3 ms |
 
 **FORK-163.** This change covered that ticket's `diff` sites. Its materialize half is the
-FORK-163 section below, and the rest is FORK-192.
+FORK-163 section below, and the rest was FORK-192 (below).
 
 **Found on the way:**
 - FORK-187: `import-git` records git's LF blob against the stat of a CRLF-converted working
@@ -287,7 +287,8 @@ A/B tests against saved binaries on a quiet machine.
 | peak memory, full tree | 676 MiB | 740 MiB (+9%) |
 
 The memory rise does not depend on the window: a window of 32 measured the same. Remaining
-work, a stat-clean worktree read and the other commands' serial loads, was FORK-192 (below).
+work, a stat-clean worktree read and the other commands' serial loads, was FORK-192 (below),
+except `restore`'s serial blob loads, which are FORK-246.
 
 ## FORK-188: delta chains hash only the object asked for (2026-10-18)
 
@@ -605,8 +606,9 @@ against 16.3 s).
 **Stat-clean worktree reads: measured, not worth doing.** The idea was to read a working file
 instead of its stored blob whenever the inventory's stat record says the two match, in the
 readers that need the content of a version the worktree also holds: `diff --staged`'s new side,
-and a pallet `diff` or `show` whose new side is the bay's base. A three-way merge's "ours" and
-blame's newest version are one load each per file, so they gain less still. To bound the gain,
+and either side of a pallet `diff` when that side is the bay's base (`diff_block` loads both
+sides alike). A three-way merge's "ours", blame's newest version and `show` are one load each per
+file, so they gain less still. To bound the gain,
 a throwaway build replaced those loads with a plain `fs::read` of the path: no stat check, no
 inventory read and no hash, so a real implementation can only be slower.
 
@@ -619,9 +621,14 @@ After FORK-188 (a chain hashes only its target) and the fan-out, reading the sto
 longer where these commands spend their time. The ceiling would shrink further in a real version.
 The pallet diff reads no inventory today, so it would have to load the shards and stat each file.
 And a read that keeps today's guarantee must hash what it reads, which `load_blob` already does.
-That leaves only the decompression share of the 6%. Trusting the stat without a hash would keep
-more of it, but a stat collision would then print the wrong content as the stored version. That
-is not worth 3 ms on 1,265 files. Nothing was changed. One caveat for any future attempt: a plain
+That would keep the share spent on the pack lookup, delta apply and decompression, but not the
+hash. Trusting the stat without a hash would keep more of it, but a stat collision would then
+print the wrong content as the stored version. Neither is worth at most 6% (24 ms on the
+5,089-file diff, 3 ms on the 1,265-file one). Nothing was changed.
+
+Not measured: materializers writing a file whose content already sits, stat-clean, at another
+worktree path (a large rename in `shift` or `consolidate`). That is a different idea, a copy from
+the moved file, with the same verification question; it was not pursued. One caveat for any future attempt: a plain
 read follows a symlink, so the 5,089-file run's output differed at the one symlink in the range.
 
 ## Remaining items

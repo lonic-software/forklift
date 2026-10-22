@@ -30,7 +30,7 @@ contention.** Two things decide almost every row:
 | **tree build (stack)** | hot | build+store tree, per dir | bottom-up join (parent waits on children) | `built`/`pending` mutexes | **Already** (`TaskExecutor`) | — |
 | **fetch / franchise / lift / lower** | occasional | GET+store object, per object | parallel within a wave, barrier between waves | `Semaphore(24)`; wave ordering; lift's serial negotiate + signature-upload loop | **Already** (network `JoinSet`) | — |
 | **audit** | occasional | sig read + ed25519 verify, per parcel | office chain sequential; **pallet history independent** | phase-2 per-parcel object reads (loose `.sig` sidecars, parcel bodies) share the object caches — the read ceiling, not the ed25519 CPU | **Done — ~2.4×** (18 cores; read-bound, so sub-linear) | — |
-| **checkout / materialize** (`shift`, `lower`, `restore`, `franchise`, `park`, `bay`) | hot–occasional | `load_blob` + `fs::write`, per changed file | independent per file at forklift's level | **the filesystem serializes the writes** — concurrent create/write/`chmod` of many small files contend on APFS inode/dirent metadata locks | **Reads done — 2.4×; parallel writes tried, reverted** (writes: ~0.87×, 341→391 ms for 8000 files). The blob loads now run on workers ahead of the serial, in-order writes (`prefetch_in_order`): full-tree `shift` on git.git 1.20 s → 0.50 s | — |
+| **checkout / materialize** (`shift`, `lower`, `restore`, `franchise`, `park`, `bay`; `restore`'s reads are still serial, FORK-246) | hot–occasional | `load_blob` + `fs::write`, per changed file | independent per file at forklift's level | **the filesystem serializes the writes** — concurrent create/write/`chmod` of many small files contend on APFS inode/dirent metadata locks | **Reads done — 2.4×; parallel writes tried, reverted** (writes: ~0.87×, 341→391 ms for 8000 files). The blob loads now run on workers ahead of the serial, in-order writes (`prefetch_in_order`): full-tree `shift` on git.git 1.20 s → 0.50 s | — |
 | **diff** (cross-revision) | occasional | histogram diff, per changed file | **independent per file** | output must be path-ordered (collect-then-print); blob reads hit the read-cache | **Done — 1.4–5.7×** (18 cores; scales with per-file diff size — compute-bound at the high end) | — |
 | **consolidate / merge** | occasional | 3-way LCS, per *divergent* file | **independent per file** | walk records deferred jobs; end-to-end diluted by the sequential apply-writes + stack | **Done — 6.4× merge / 2.5× end-to-end** (18 cores; compute-bound; only wide merges) | — |
 | **compact** | occasional (auto) | zstd delta-compress, per object | path-deltas independent; window + `PackWriter` sequential | the sliding delta `window` (each object deltas against just-packed neighbours) and the single-file append stay serial | **Done — ~2.1×** (18 cores; **byte-identical output**; read-cache-bound below the CPU ceiling) | — |
@@ -97,8 +97,8 @@ contention.** Two things decide almost every row:
    their entries, but reads in full every file the stat cache cannot vouch for and whose size
    matches (FORK-181); `restore --staged` likewise stats each file under the path, and reads
    in full the ones its current entry cannot settle by stat (FORK-182), on one thread.
-   Neither loop is ticketed: both now touch only what the stat cache cannot settle, so
-   measure one on a large dirty tree before fanning it out.
+   Both still load the blob of each file they rewrite or read one at a time, with no
+   `prefetch_in_order`: FORK-246, to be measured on a large dirty tree first.
 
 3. **`diff` — done, 1.4–5.7× on 18 cores (`diff_pallets`).** A cross-revision diff is one
    independent unit per changed file: load the two blobs, run the histogram diff, format the block.
