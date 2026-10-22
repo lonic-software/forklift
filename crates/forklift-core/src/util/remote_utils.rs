@@ -14383,6 +14383,28 @@ mod tests {
             assert_eq!(ledger_heads(), vec![healed]);
         }
 
+        // Revert: lift the fence only of heads walked as heads → `fenced`, walked whole as the
+        // parent of a ref head, stays fenced.
+        #[test]
+        fn a_fenced_head_walked_through_a_ref_is_unfenced() {
+            let _scratch = Scratch::new("expand-unfence-ancestor");
+            let base = sparse_main();
+            let fenced = parcel("fenced", vec![base.clone()]);
+            let child = parcel("child", vec![fenced.clone()]);
+            pallet_utils::update_pallet_head("y", None, &child, &RefPreconditions::NONE).unwrap();
+            {
+                let lock = RefLock::acquire().unwrap();
+                fetch_ledger::write_fence(&lock, &[fenced.clone()]).unwrap();
+            }
+
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            expansion.walk_new_ref_heads_locally().unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert!(fetch_ledger::read_fence().unwrap().is_empty());
+        }
+
         // Revert: drop the local walk's fence check → the commit fences a head a ref now holds.
         #[test]
         fn a_ref_written_at_a_head_to_be_fenced_refuses_the_expand() {
