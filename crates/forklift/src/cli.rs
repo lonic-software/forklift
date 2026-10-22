@@ -917,8 +917,11 @@ pub enum Command {
                       reachable history that garbage collection correctly keeps; scope-prune \
                       forgets a path warehouse-wide and reclaims its disk. It is multi-bay-aware: \
                       it refuses to free a path any checkout (the main tree or a bay) still \
-                      materializes. The pruned content is sealed by hash afterwards — re-fetchable \
-                      from the origin with \"expand\". A full (non-sparse) warehouse has nothing to \
+                      materializes. It frees only history the remote holds, so it asks the remote \
+                      first and refuses, changing nothing, when it cannot; work never lifted keeps \
+                      its content until it is lifted and the prune is run again. What it frees is \
+                      sealed by hash afterwards — re-fetchable from the origin with \"expand\". A \
+                      full (non-sparse) warehouse has nothing to \
                       prune. If an earlier prune was interrupted before it finished freeing \
                       everything, running it again on the same path resumes and finishes the job \
                       rather than refusing. Use --dry-run to see what it would free without \

@@ -12748,3 +12748,16 @@ fn import_git_lowercases_a_branch_and_keeps_a_lowercase_one() {
     assert!(pallets.lines().any(|line| line.starts_with('*') && line.trim_start_matches('*').trim() == "main"),
         "the default branch is checked out: {}", pallets);
 }
+
+#[test]
+fn scope_prune_reports_a_local_refusal_before_asking_the_remote() {
+    // A full warehouse with no remote configured: the prune is refused for what it is, not for
+    // the remote it never got as far as asking (FORK-251).
+    let warehouse = TestWarehouse::new("scope-prune-full");
+    warehouse.write_file("docs/guide.md", "guide\n");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let refused = warehouse.run(&["scope-prune", "docs"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("holds the full tree"), "{}", stderr(&refused));
+}
