@@ -104,6 +104,18 @@ pub(crate) fn store_parcel(tree: &str, parents: &[&str]) -> String {
     object.hash
 }
 
+/// Check `tree` out into the empty working directory and staging, as a fixture: under an operation
+/// marker of its own, since every wholesale rewrite of staging needs one.
+pub(crate) fn check_out(tree: &str) {
+    use forklift_core::util::operation_utils::{self, Operation, OperationKind};
+    use forklift_core::util::{file_utils, pallet_utils::BayPosition, progress_utils::Progress, shift_utils};
+
+    let position = BayPosition::new("main", None);
+    operation_utils::raise(&Operation::new(OperationKind::Shift, position.clone(), None, position)).unwrap();
+    shift_utils::materialize_tree(None, tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+    operation_utils::finish().unwrap();
+}
+
 /// Run an async command to completion on this thread, so the thread's storage scope applies.
 pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)

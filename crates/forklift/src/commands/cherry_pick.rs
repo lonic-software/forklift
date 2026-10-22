@@ -1,8 +1,9 @@
 use serde::Serialize;
 use forklift_core::util::cherry_pick_utils::{self, CherryPickState};
 use forklift_core::util::{
-    file_utils, load_guard_utils, merge_utils, object_utils, office_utils, pallet_utils,
+    file_utils, load_guard_utils, merge_utils, object_utils, office_utils, operation_utils, pallet_utils,
 };
+use forklift_core::util::operation_utils::OperationKind;
 use crate::commands::consolidate;
 use crate::output::{self, CommandOutput};
 
@@ -31,6 +32,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // while a load that started but never finished cleanly is still recorded
     // (`load_guard_utils`).
     load_guard_utils::check_no_incomplete_load()?;
+    operation_utils::check_none_standing()?;
 
     // A pick applies a diff (the merge machinery) into the working directory, which could
     // touch out-of-scope paths a scoped bay never materialized, so it refuses here.
@@ -127,6 +129,8 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     consolidate::keep_aliased_files(&mut actions, &our_tree, &scope)?;
     let ledger = consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
 
+    consolidate::raise_merge_marker(OperationKind::CherryPick, &current, &our_head, &our_tree, &theirs_tree)?;
+
     let mut conflicts = consolidate::apply_merge_actions(&ledger, &actions)?;
 
     // The completing parcel's message: the -m override, else the source's own message.
@@ -149,6 +153,8 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
         output::emit(&CherryPicked::applied(&source, &current, &parcel));
     } else {
+        // The pick state owns the bay from here.
+        operation_utils::finish()?;
         conflicts.sort();
 
         output::emit(&CherryPicked::conflicts(&source, &current, conflicts));
@@ -255,8 +261,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forklift_core::util::progress_utils::Progress;
-    use forklift_core::util::{shift_utils, stocktake_utils};
+    use forklift_core::util::stocktake_utils;
     use crate::test_support::{self, Warehouse};
 
     thread_local! {
@@ -278,7 +283,7 @@ mod tests {
 
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         // Another bay stacks on "main" after the pick was applied, before its parcel is stacked.
         let moved_to = elsewhere.clone();

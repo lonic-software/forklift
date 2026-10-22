@@ -1536,10 +1536,16 @@ pub fn write_head_or_roll_back(pallet: &str,
                                start_tree: Option<&str>,
                                anchor: file_utils::StatAnchor) -> Result<(), String> {
     let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new, &crate::util::pallet_utils::RefPreconditions::NONE) else {
-        return crate::util::pallet_utils::record_landed(pallet, new);
+        crate::util::pallet_utils::record_landed(pallet, new)?;
+        return crate::util::operation_utils::finish();
     };
 
-    match settle_head_write(pallet, new, error, written_tree, start_tree, anchor)? {
+    // Every outcome settles the bay, so the operation's marker comes off; an error from the
+    // settling itself leaves it for `forklift heal`.
+    let settled = settle_head_write(pallet, new, error, written_tree, start_tree, anchor)?;
+    crate::util::operation_utils::finish()?;
+
+    match settled {
         HeadWrite::Stands => Ok(()),
         HeadWrite::Kept(error) | HeadWrite::RolledBack(error) => Err(error),
     }
@@ -1616,7 +1622,10 @@ pub fn settle_head_write(pallet: &str,
         None => crate::util::object_utils::empty_tree_hash(),
     };
 
+    // Flagged before the rewrite starts: this branch never moves the position, so a crash inside
+    // it must not read as an operation that finished.
     let rolled_back = start.and_then(|start| {
+        crate::util::operation_utils::mark_rolling_back()?;
         materialize_tree(Some(written_tree), &start, "Rolling back", anchor, &Progress::NONE)
     });
 

@@ -4087,6 +4087,7 @@ mod tests {
         stamped_chain_with_sibling();
         plant_ghost();
 
+        crate::util::operation_utils::raise_for_fixture();
         replace_all_inventories(&BTreeMap::from([("".to_string(), Inventory::new())])).unwrap();
 
         assert_only_registered_shards_remain();
@@ -4267,6 +4268,7 @@ mod tests {
         std::fs::remove_dir_all(&store_root).unwrap();
         std::fs::write(&store_root, b"not a folder").unwrap();
 
+        crate::util::operation_utils::raise_for_fixture();
         replace_all_inventories(&BTreeMap::from([("".to_string(), Inventory::new())]))
             .expect("a file in place of the store must not block the reset");
 
@@ -4295,6 +4297,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"not a metadata record").unwrap();
 
+        crate::util::operation_utils::raise_for_fixture();
         replace_all_inventories(&std::collections::BTreeMap::new())
             .expect("a wholesale reset must not depend on the metadata it replaces");
 

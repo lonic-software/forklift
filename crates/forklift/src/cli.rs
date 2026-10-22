@@ -1754,6 +1754,40 @@ impl Command {
         matches!(self, Command::Heal | Command::Audit { .. })
     }
 
+    /// Whether the command refuses while an operation interrupted before it finished is recorded
+    /// in the bay (see `operation_utils`): every command that changes the bay's files, staging or
+    /// position, or commits staged content. The staging such an operation leaves may be
+    /// incomplete, and committing it could record the removal of every tracked file. `heal` is
+    /// the way out; commands that touch only refs of other pallets, the shared store or
+    /// metadata stay usable.
+    ///
+    /// # Returns
+    /// * `true`  - The command refuses while such an operation is recorded.
+    /// * `false` - The command runs as usual.
+    pub fn refused_during_interrupted_operation(&self) -> bool {
+        matches!(
+            self,
+            Command::CherryPick { .. }
+                | Command::Consolidate { .. }
+                | Command::Expand { .. }
+                | Command::ImportGit { .. }
+                | Command::Lift
+                | Command::Load { .. }
+                | Command::Lower { .. }
+                | Command::Haul { .. }
+                | Command::Narrow { .. }
+                | Command::Palletize { .. }
+                | Command::Park { .. }
+                | Command::Remove { .. }
+                | Command::Restore { .. }
+                | Command::ScopePrune { .. }
+                | Command::Shift { .. }
+                | Command::Stack { .. }
+                | Command::Undo { .. }
+                | Command::Unload { .. }
+        )
+    }
+
     /// Check whether the command mutates the warehouse (inventory, refs, objects) and
     /// therefore has to hold the warehouse lock while it runs (see `WarehouseLock`). A command
     /// that writes the working directory belongs here too, unless it takes the lock itself, as

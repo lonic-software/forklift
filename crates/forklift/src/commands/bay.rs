@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use serde::Serialize;
 use forklift_core::globals;
+use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
 use forklift_core::util::{
-    bay_utils, file_utils, lock_utils, object_utils, pallet_utils, scope_utils, shift_utils,
-    warehouse_utils,
+    bay_utils, file_utils, lock_utils, object_utils, operation_utils, pallet_utils, scope_utils,
+    shift_utils, warehouse_utils,
 };
 use crate::cli::BayAction;
 use crate::output::{self, CommandOutput};
@@ -89,6 +90,12 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     std::fs::create_dir_all(&bay_dir)
         .map_err(|e| format!("Error while creating the bay directory \"{}\": {}", bay_dir.to_string_lossy(), e))?;
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
+    // Raised in the new bay before its position, and finished once its tree is materialized: a
+    // bay interrupted between the two is filled in by `forklift heal` (or dropped by `bay remove`).
+    let position = pallet_utils::BayPosition::new(name, Some(head.clone()));
+    let mut operation = Operation::new(OperationKind::BayCreation, position.clone(), Some(tree.clone()), position);
+    operation.target_tree = Some(tree.clone());
+    operation_utils::raise_in(&bay_utils::bay_state_dir(name), &operation)?;
     // The position goes in first, so a listed bay always has one for collection to root; a bay
     // interrupted before it is named by collection's refusal until `bay remove` drops it.
     pallet_utils::write_position_in(&bay_utils::bay_state_dir(name), &pallet_utils::BayPosition::new(name, Some(head.clone())))?;
@@ -117,6 +124,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     }
 
     shift_utils::materialize_tree(None, &tree, "Creating the bay", file_utils::take_stat_anchor()?, &Progress::NONE)?;
+    operation_utils::finish()?;
 
     output::emit(&BayCreated {
         name: name.to_string(),

@@ -1,6 +1,7 @@
 use serde::Serialize;
 use forklift_core::util::stocktake_utils::ChangeKind;
-use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, pallet_utils, shift_utils, stocktake_utils};
+use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, operation_utils, pallet_utils, shift_utils, stocktake_utils};
+use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
@@ -239,6 +240,15 @@ fn move_files(from_tree: Option<&str>,
     // the move with the warehouse unchanged.
     alias_utils::refuse_collisions(doing, &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
 
+    // Raised before the first file moves and finished only once the position records the target:
+    // a crash anywhere between leaves files and staging at the target under a position still on
+    // the source, which nothing may commit.
+    let mut operation = Operation::new(
+        OperationKind::Shift, pallet_utils::read_position()?, from_tree.map(str::to_string), position.clone(),
+    );
+    operation.target_tree = Some(to_tree.to_string());
+    operation_utils::raise(&operation)?;
+
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
     // Repopulate the staging area from the target tree ("repopulate on shift"): entries
@@ -247,7 +257,11 @@ fn move_files(from_tree: Option<&str>,
     let shards = shift_utils::build_inventories_for_tree(to_tree, shift_utils::TreeProvenance::Written(anchor))?.shards;
     inventory_utils::replace_all_inventories(&shards)?;
 
-    pallet_utils::write_position(position)
+    #[cfg(test)]
+    tests::BEFORE_SHIFT_POSITION_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
+    pallet_utils::write_position(position)?;
+    operation_utils::finish()
 }
 
 /// Ensure there are no staged or unstaged changes (untracked files are allowed).
@@ -297,4 +311,14 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
         crate::docgen::OutputSchema::of::<Shifted>(),
         crate::docgen::OutputSchema::of::<CaughtUp>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    thread_local! {
+        /// Runs once after a shift rewrote staging, before it records its position: an error
+        /// stands for a crash there.
+        pub(crate) static BEFORE_SHIFT_POSITION_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
+            std::cell::Cell::new(None);
+    }
 }

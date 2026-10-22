@@ -4,10 +4,11 @@ use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::blob::Blob;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
+use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, cherry_pick_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
-    office_utils, pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
+    office_utils, operation_utils, pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
 };
 use forklift_core::util::shift_utils::HeadWrite;
 use forklift_core::util::stack_utils::StackError;
@@ -270,6 +271,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
     // they are correctly not guarded. `stack`/`park` carry the identical check for the identical
     // reason (see `stack_utils::stack_parcel`'s doc comment).
     load_guard_utils::check_no_incomplete_load()?;
+    operation_utils::check_none_standing()?;
 
     let our_tree_hash = object_utils::load_parcel(our_head)?.tree_hash;
     let their_tree_hash = object_utils::load_parcel(their_head)?.tree_hash;
@@ -308,7 +310,15 @@ pub(crate) async fn merge_head_into_current(current: &str,
     keep_aliased_files(&mut actions, &our_tree_hash, &scope)?;
     let ledger = ensure_no_untracked_collisions(&actions, their_label)?;
 
+    // Raised here, before the merge's first change to the bay, so every caller (consolidate,
+    // haul's merge, lift's auto-merge) inherits it: a crash part-way through applying leaves a
+    // half-applied merge staged with no consolidation state yet to say so.
+    raise_merge_marker(OperationKind::Merge, current, our_head, &our_tree_hash, &their_tree_hash)?;
+
     let mut conflict_paths = apply_merge_actions(&ledger, &actions)?;
+
+    #[cfg(test)]
+    tests::AFTER_MERGE_APPLY.with(|seam| seam.take().map(|seam| seam())).transpose()?;
 
     // Record the out-of-scope skeleton BEFORE the consolidation state, and unconditionally
     // — even when it is empty (a full-bay merge, or one that resolved nothing out of scope): the
@@ -337,10 +347,27 @@ pub(crate) async fn merge_head_into_current(current: &str,
 
         Ok(MergeStatus::Merged(hash))
     } else {
+        // The consolidation state owns the bay from here.
+        operation_utils::finish()?;
         conflict_paths.sort();
 
         Ok(MergeStatus::Conflicts(conflict_paths))
     }
+}
+
+/// Raise the marker of a merge or cherry-pick of `their_tree` onto `our_head` (whose tree is
+/// `our_tree`) on `pallet`, the bay's position, before it applies anything. Its completing parcel
+/// is recorded by `stack_utils::stack_parcel`, once it exists.
+pub(crate) fn raise_merge_marker(kind: OperationKind,
+                                 pallet: &str,
+                                 our_head: &str,
+                                 our_tree: &str,
+                                 their_tree: &str) -> Result<(), String> {
+    let source = pallet_utils::BayPosition::new(pallet, Some(our_head.to_string()));
+    let mut operation = Operation::new(kind, source, Some(our_tree.to_string()), pallet_utils::BayPosition::new(pallet, None));
+    operation.their_tree = Some(their_tree.to_string());
+
+    operation_utils::raise(&operation)
 }
 
 /// Stack a merge or cherry-pick that completes inside the command that applied it, on
@@ -355,21 +382,33 @@ pub(crate) async fn stack_completion(description: Option<String>,
                                      our_head: &str,
                                      our_tree: &str,
                                      anchor: file_utils::StatAnchor) -> Result<String, String> {
+    // The merge's or pick's marker comes off once the bay is settled either way; an error before
+    // that leaves it for `forklift heal`.
     let (error, pallet, parcel, tree) = match stack_utils::stack_parcel(description, Some(our_head)).await {
-        Ok((parcel, _)) => return Ok(parcel),
+        Ok((parcel, _)) => {
+            operation_utils::finish()?;
+            return Ok(parcel);
+        }
         Err(error @ (StackError::Other(_) | StackError::Behind { .. })) => return Err(error.into()),
         Err(StackError::HeadWrite { error, pallet, parcel, tree }) => (error, pallet, parcel, tree),
     };
 
     match shift_utils::settle_head_write(&pallet, &parcel, error, &tree, Some(our_tree), anchor)? {
-        HeadWrite::Stands => Ok(parcel),
-        HeadWrite::Kept(error) => Err(error),
+        HeadWrite::Stands => {
+            operation_utils::finish()?;
+            Ok(parcel)
+        }
+        HeadWrite::Kept(error) => {
+            operation_utils::finish()?;
+            Err(error)
+        }
         HeadWrite::RolledBack(error) => {
             // The state comes off before the skeleton, as `stack` orders them, so no window shows
             // a consolidation without its skeleton.
             merge_utils::clear_consolidation_state()?;
             merge_utils::OutOfScopeSkeleton::clear()?;
             cherry_pick_utils::clear_state()?;
+            operation_utils::finish()?;
 
             Err(forklift_core::error::append_to_message(
                 error,
@@ -402,6 +441,17 @@ fn fast_forward(current: &str,
         &format!("Consolidating \"{}\"", target),
         &shift_utils::collect_collisions(&ops, &removed_dirs)?,
     )?;
+
+    // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
+    let mut operation = Operation::new(
+        OperationKind::FastForward,
+        pallet_utils::BayPosition::new(current, Some(our_head.to_string())),
+        Some(our_tree_hash.to_string()),
+        pallet_utils::BayPosition::new(current, Some(their_head.to_string())),
+    );
+    operation.target_tree = Some(their_tree_hash.to_string());
+    operation.expected = Some(our_head.to_string());
+    operation_utils::raise(&operation)?;
 
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
@@ -735,7 +785,6 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 mod tests {
     use super::*;
     use crate::test_support::{self, Warehouse};
-    use forklift_core::util::progress_utils::Progress;
 
     thread_local! {
         /// Runs once just before `fast_forward` writes the pallet's head.
@@ -744,6 +793,11 @@ mod tests {
 
         /// Runs once just before a clean merge's parcel is stacked.
         pub(super) static BEFORE_MERGE_STACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            std::cell::Cell::new(None);
+
+        /// Runs once after a merge applied its output, before its consolidation state is written:
+        /// an error stands for a crash there.
+        pub(crate) static AFTER_MERGE_APPLY: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
             std::cell::Cell::new(None);
     }
 
@@ -791,7 +845,7 @@ mod tests {
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         // Another bay stacks on "main" while this consolidation is between its tree write and
         // its ref write.
@@ -833,7 +887,7 @@ mod tests {
         pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
         pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
-        shift_utils::materialize_tree(None, &our_tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+        test_support::check_out(&our_tree);
 
         // Another bay stacks on "main" after this merge was applied, before its parcel is stacked.
         let moved_to = elsewhere.clone();

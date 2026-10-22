@@ -17,7 +17,8 @@ use forklift_core::model::tree_item::TreeItem;
 use forklift_core::parser::object::tree::tree_parser;
 use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
-use forklift_core::util::{file_utils, inventory_utils, object_utils, office_utils, pallet_utils, shift_utils};
+use forklift_core::util::{file_utils, inventory_utils, object_utils, office_utils, operation_utils, pallet_utils, shift_utils};
+use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -142,16 +143,25 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
 
     if let Some(pallet) = &current {
         let head = pallet_utils::get_pallet_head(pallet)?;
+        let tree = head.as_deref().map(|head| object_utils::load_parcel(head).map(|parcel| parcel.tree_hash)).transpose()?;
 
-        pallet_utils::write_position(&pallet_utils::BayPosition::new(pallet, head.clone()))?;
+        // Raised before the position, which comes before the inventory build, and that build can
+        // fail on a file it cannot read: until staging is built, nothing may commit it.
+        let position = pallet_utils::BayPosition::new(pallet, head.clone());
+        let mut operation = Operation::new(OperationKind::ImportGit, position.clone(), tree.clone(), position.clone());
+        operation.target_tree = tree.clone();
+        operation_utils::raise(&operation)?;
 
-        if let Some(head) = head {
+        pallet_utils::write_position(&position)?;
+
+        if let Some(tree) = tree {
             progress.status("Building the inventory");
-            let tree = object_utils::load_parcel(&head)?.tree_hash;
             let built = shift_utils::build_inventories_for_tree(&tree, shift_utils::TreeProvenance::Verify)?;
             inventory_utils::replace_all_inventories(&built.shards)?;
             unheld = built.unheld;
         }
+
+        operation_utils::finish()?;
     }
 
     // A colocated git repo keeps its `.git` folder in the working tree; forklift should never

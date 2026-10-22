@@ -361,13 +361,21 @@ impl ShardLedger {
 /// every previously recorded incomplete-load root is now moot; see
 /// `load_guard_utils::clear_all_recorded`'s doc comment.
 ///
+/// An error or a crash after the store goes and before every shard lands leaves registered keys
+/// with no shard, which read as empty directories: committed, that is the removal of every tracked
+/// file. So this refuses unless the operation it belongs to raised its marker first
+/// (`operation_utils`), which keeps every command that could commit refusing until `forklift
+/// heal` has finished or undone the operation.
+///
 /// # Arguments
 /// * `shards` - Warehouse path key → inventory, for every tracked directory.
 ///
 /// # Returns
 /// * `Ok(())`      - If the staging area was replaced.
-/// * `Err(String)` - If a folder or file operation failed.
+/// * `Err(String)` - If no operation marker stands, or a folder or file operation failed.
 pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
+    crate::util::operation_utils::require_raised("Rewriting the whole staged inventory")?;
+
     // The whole store goes, not the root key's shard, and the new set is registered before any
     // shard lands. The old metadata is replaced, not read, so a damaged one cannot block the reset.
     let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

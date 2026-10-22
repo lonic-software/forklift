@@ -7,7 +7,7 @@ use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::{
     cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils,
-    object_utils, office_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
+    object_utils, office_utils, operation_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
 };
 use crate::util::audit_utils::{self, VerifiedOffice};
 use crate::util::pallet_utils::{AnchorPrecondition, RefPreconditions, RefUpdateError};
@@ -179,7 +179,10 @@ pub async fn stack_parcel(description: Option<String>,
     // (`load_guard_utils`), and stacking now could silently commit an incomplete inventory as a
     // durable parcel. Refuses before even resolving the operator identity below. `park`'s push
     // carries the identical check for the identical reason — see its own doc comment.
+    // An operation interrupted before it finished (`operation_utils`) left staging that may be
+    // incomplete in the same way; a merge or pick completing here raised its own, which passes.
     load_guard_utils::check_no_incomplete_load()?;
+    operation_utils::check_none_standing()?;
 
     // The operator identity is resolved before any work happens, so a missing
     // configuration aborts the stack before objects are written.
@@ -501,6 +504,10 @@ pub async fn stack_parcel(description: Option<String>,
     // sidecar and the pallet head are both written only from this point on, deliberately kept
     // out of this same batch (see the crash-ordering note on the ref write below).
     batch.finish()?;
+
+    // A merge or cherry-pick completing inside the command that applied it records this parcel
+    // before the head write that lands it, so recovery can tell whether it landed.
+    operation_utils::record_completing_parcel(&object.hash)?;
 
     if let Some(key_id) = signing.key_id() {
         let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;

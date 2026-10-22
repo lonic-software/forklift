@@ -8,8 +8,9 @@ use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
     alias_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
-    pallet_utils, park_utils, scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
+    operation_utils, pallet_utils, park_utils, scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
 };
+use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::output::{self, CommandOutput};
 
 // The park command (git's "stash"; a forklift operator parks the truck). One public
@@ -26,6 +27,7 @@ pub async fn park_changes() -> Result<(), String> {
     // already permanent) — so it must refuse exactly like `stack` while a load that started but
     // never finished cleanly is still recorded (`load_guard_utils`).
     load_guard_utils::check_no_incomplete_load()?;
+    operation_utils::check_none_standing()?;
 
     let operator = config_utils::get_operator()?;
 
@@ -183,15 +185,32 @@ pub async fn park_changes() -> Result<(), String> {
         sign_utils::store_parcel_signature(&object.hash, &signature)?;
     }
 
+    // Raised before the parked list names the parcel, and finished once staging is back at the
+    // head. Recovery tells the two sides of the list write apart by the parcel's hash: before it
+    // the work was never moved, after it the work is safe in the list.
+    let mut operation = Operation::new(
+        OperationKind::Park, position.clone(), Some(head_tree_hash.clone()), position.clone(),
+    );
+    operation.target_tree = Some(head_tree_hash.clone());
+    operation.parked = Some(object.hash.clone());
+    operation_utils::raise(&operation)?;
+
+    #[cfg(test)]
+    tests::BEFORE_PARKED_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
+
     let mut parked = park_utils::read_parked()?;
     parked.push(object.hash.clone());
     park_utils::write_parked(&parked)?;
+
+    #[cfg(test)]
+    tests::AFTER_PARKED_WRITE.with(|seam| seam.take().map(|seam| seam())).transpose()?;
 
     // Reset the working directory and the inventory to the pallet head.
     shift_utils::apply_ops(&ops, &removed_dirs)?;
 
     let shards = shift_utils::build_inventories_for_tree(&head_tree_hash, shift_utils::TreeProvenance::Written(anchor))?.shards;
     inventory_utils::replace_all_inventories(&shards)?;
+    operation_utils::finish()?;
 
     output::message(format!(
         "Parked the work in progress as {} and reset to the pallet head.", object.hash
@@ -378,4 +397,19 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<ParkedList>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    thread_local! {
+        /// Runs once after park raised its marker, before the parked list names the parcel: an
+        /// error stands for a crash there.
+        pub(crate) static BEFORE_PARKED_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
+            std::cell::Cell::new(None);
+
+        /// Runs once after the parked list names the parcel, before the bay is reset: an error
+        /// stands for a crash there.
+        pub(crate) static AFTER_PARKED_WRITE: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<(), String>>>> =
+            std::cell::Cell::new(None);
+    }
 }
