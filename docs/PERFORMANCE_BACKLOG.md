@@ -534,6 +534,78 @@ such a merge makes at most 8. The fix is scoped to the blame walk, not a process
 cache, because a negative cache would go stale in the long-running server once the parent
 arrives.
 
+## FORK-192: the bundle build on worker threads; single-flight reads measured, not worth doing (2026-10-22)
+
+**Measured** on the benchmark's git.git warehouse (imported, then `compact --all --redelta`),
+release build, 18 cores.
+
+**A single-flight read per hash: not worth it.** The fan-out readers (`shift`'s blob loads,
+`diff`'s per-file loads) can reconstruct the same delta base on two threads at once. To count how
+often, an instrumented build counted reconstructions per hash, and was run with its workers and
+then with one worker forced:
+
+| Run | reconstructions (distinct) | repeats, parallel | repeats, one worker | wall, parallel / one worker |
+|---|---|---|---|---|
+| full-tree `shift` old → master | ~50k (47,040) | 2,865–2,988 | 2,788 | 0.50 s / 0.81 s |
+| `shift` master → old | ~27k (26,287) | 728–736 | 672 | 0.43 s / 0.57 s |
+| `diff old master` | ~63k (59,721) | 3,336–3,364 | 3,402 | 0.44 s / 0.97 s |
+
+The repeats a single-flight lock could remove are the ones parallelism adds: 0–200 per run, a few
+milliseconds of CPU and under 1% of the wall time. Most repeats happen with one worker too
+(about 2% of the serial CPU). Their likely sources are a base first rebuilt into the unverified
+cache and read later as a verified target, or cache eviction. Neither is worth a change.
+
+**The other serial per-file loads.** `audit`'s phase 2 and `query`'s verified resolve already run
+on `fanout_map`. `peek` reads one object. `blame`'s per-version blob loads were a few percent in
+FORK-190, and parallel blame stays ruled out (the blame row of `PARALLELIZATION_PLAN.md`).
+`restore` goes with FORK-181. That left the bundle build, which was entirely single-threaded:
+61.8 s wall, 56.6 s user. In a `sample` of its first 25 s, compression was about half the time
+(zstd 7,382 of 18.1k samples; the delta encoder 3,375), tree loads about a quarter (`load_tree`
+4,283), and the rest was reading and hash-verifying objects. Each record's work is independent.
+
+**Fix.** `build_bundle` now runs in two stages. Both use `prefetch_in_order`:
+
+1. **Plan.** A serial walk lists every record in the old order: each parcel, then its tree's
+   files, then its subtrees. Each blob names the plan index of the previous version at its path
+   as its delta base. The walk's tree reads are loaded ahead on workers: for each parcel, the
+   trees that differ from its first parent's at the same path. That set contains every tree the
+   walk will find unseen, because the parent is walked first. A tree the workers skipped (past
+   1,024 per parcel) or failed to read is read by the walk, so errors still surface in order.
+   The plan holds binary hashes and shared paths, with no allocation per record. A first
+   version kept `String`s and had about 2 million more live allocations; its peak was
+   1.6–2.3 GB.
+2. **Emit.** Workers read, verify and compress each record. A blob with a base gets its delta
+   tried, and is also compressed in full when the delta is not smaller. The consumer appends in
+   plan order and keeps each blob's chain depth. It only decides whether a delta is still
+   allowed under `MAX_DELTA_CHAIN`. In the rare case where the chain is too deep and the worker
+   kept only the delta, the consumer compresses the full record itself.
+
+The bundle is **byte-identical** to the serial build's: same sha256 over all 2,745,384,138 bytes
+on every run.
+
+| `forklift-server bundle`, git.git | before | after |
+|---|---|---|
+| wall time | 61.8 s | 16.3 s (3.8x) |
+| user + sys CPU | 59.2 s | 121 s |
+| peak memory footprint | 0.77 GB | 1.2–1.6 GB |
+
+Peak memory went up. At 11 s about 1 GB was live in the allocator, against 0.55–0.7 GB in the
+serial build, and the rest was freed memory the allocator kept (45% fragmentation). The live
+part is the records in flight (the emit stage holds up to 64 MiB of compressed records ahead)
+and the per-thread working sets of 18 workers. Routing the walk's trees through the shared
+parsed-tree cache made the build faster (14.1 s) but its memory varied more. The walk keeps the
+uncached parse, as other one-shot walks do, because the server rebuilds bundles in the
+background while it keeps serving.
+
+Two smaller fixes came with it. `sign_utils::to_hex` made 32 `format!` allocations per call, and
+`pack_utils::hash_to_bytes` allocated a `Vec` per decode. Both are now allocation-free with the
+same output. With the slow versions, the compact plan's hash conversions cost 6 s (23.3 s
+against 16.3 s).
+
+**Stat-clean worktree reads** (comparing a file's stat record instead of decompressing its blob)
+are the third part of the ticket. They depend on a decision about hash verification, so they
+need a design first. They are not started.
+
 ## Remaining items
 
 ### b. Pack-index validation tax — fixed (FORK-118, 2026-10-18)
