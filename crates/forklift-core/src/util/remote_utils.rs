@@ -4388,8 +4388,10 @@ impl Expansion {
     pub async fn walk_base(&mut self, client: &RemoteClient) -> Result<(), String> {
         if !self.base_walked {
             let base = self.base.clone();
-            self.walk_head(client, &base).await
+            let added = self.walk_head(client, &base).await
                 .map_err(|e| unservable(&self.pallet, &e))?;
+            // The base is normally its pallet's ref head, whose own walk then adds nothing.
+            self.reached.push((base, added));
             self.base_walked = true;
         }
 
@@ -4547,13 +4549,14 @@ impl Expansion {
             }
         }
 
-        // A head walked whole at the widened scope is no longer part-way; a fenced head whose
-        // parcel is gone has nothing left to guard.
+        // A head walked whole at the widened scope is no longer part-way, even one whose own walk
+        // failed but a later head's walk passed through; a fenced head whose parcel is gone has
+        // nothing left to guard.
         let old_fence = fetch_ledger::read_fence()?;
         let mut fence: Vec<String> = Vec::new();
 
-        for head in old_fence.iter().filter(|head| !self.seen.parcels.contains(*head)).chain(&self.fence_candidates) {
-            if !fence.contains(head) && file_utils::does_object_exist(head)? {
+        for head in old_fence.iter().chain(&self.fence_candidates) {
+            if !self.seen.parcels.contains(head) && !fence.contains(head) && file_utils::does_object_exist(head)? {
                 fence.push(head.clone());
             }
         }
@@ -14381,6 +14384,49 @@ mod tests {
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
             assert!(fetch_ledger::read_fence().unwrap().is_empty());
             assert_eq!(ledger_heads(), vec![healed]);
+        }
+
+        // Revert: leave the base walk out of `reached` → `main`'s own walk adds nothing after
+        // it, so the ledger head in the current pallet's history is kept.
+        #[test]
+        fn a_ledger_head_in_the_bay_base_history_is_dropped() {
+            let _scratch = Scratch::new("ledger-prune-base");
+            let base = sparse_main();
+            let child = parcel("child", vec![base.clone()]);
+            pallet_utils::update_pallet_head("main", Some(&base), &child, &RefPreconditions::NONE).unwrap();
+            record(&base, "main");
+
+            let mut expansion = expand(&child, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            expansion.walk_new_ref_heads_locally().unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert!(ledger_heads().is_empty());
+        }
+
+        // Revert: fence every candidate unfiltered → `head`, walked whole through `descendant`
+        // after its own walk failed, is fenced anyway.
+        #[test]
+        fn a_head_to_be_fenced_that_a_later_walk_passes_through_is_not_fenced() {
+            let _scratch = Scratch::new("expand-fence-passed");
+            let base = sparse_main();
+            let head = part_way(&base);
+
+            let mut expansion = expand(&base, &["web"]);
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            assert!(expansion.fence_candidates.contains(&head));
+
+            // A lower of a descendant completes the head meanwhile.
+            content_tree("part-way");
+            let descendant = parcel("descendant", vec![head.clone()]);
+            record(&descendant, "other");
+
+            runtime().block_on(expansion.walk(&unreachable())).unwrap();
+            assert!(expansion.seen.parcels.contains(&head));
+            expansion.walk_new_ref_heads_locally().unwrap();
+
+            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
+            assert!(fetch_ledger::read_fence().unwrap().is_empty());
         }
 
         // Revert: lift the fence only of heads walked as heads → `fenced`, walked whole as the

@@ -1160,7 +1160,7 @@ fn write_trust_install(lock: &crate::util::lock_utils::RefLock,
     }
 
     let written = pallet_utils::update_pallet_head_locked(
-        lock, pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new_office,
+        lock, pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new_office, None,
     );
 
     #[cfg(test)]

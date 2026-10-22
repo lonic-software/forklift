@@ -846,13 +846,38 @@ pub fn update_pallet_head_in(
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
 
+    // Worked out before the lock, since it can walk history: the compare-and-set pins the ref to
+    // `expected`, so what it says about `expected` holds inside the hold too.
+    let left = left_unreached(namespace, expected, new)?;
+
     let lock = crate::util::lock_utils::RefLock::acquire()?;
 
     // The ref's own compare goes first: a ref another writer moved, perhaps to this very parcel
     // (which callers read as landed), reports that move, never a precondition it would mask.
     require_head(namespace, name, expected)?;
     check_preconditions(&lock, preconditions)?;
-    update_pallet_head_locked(&lock, namespace, name, expected, new)
+    update_pallet_head_locked(&lock, namespace, name, expected, new, left)
+}
+
+/// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
+/// matters: a user-pallet ref in a sparse warehouse moving to a parcel that does not descend from
+/// its old head. Such a head goes into the fetched-heads ledger with the write, so an `expand`
+/// walks it before an `undo` can write it back.
+fn left_unreached<'a>(namespace: PalletNamespace,
+                      expected: Option<&'a str>,
+                      new: &str) -> Result<Option<&'a str>, String> {
+    let old = match expected {
+        Some(old) if namespace == PalletNamespace::User && old != new => old,
+        _ => return Ok(None),
+    };
+
+    if crate::util::scope_utils::read_fetch_scope()?.is_full()
+        || crate::util::merge_utils::is_ancestor(old, new)?
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(old))
 }
 
 /// Refuse with [`RefUpdateError::Moved`] unless the ref holds `expected`; the head it holds.
@@ -895,16 +920,16 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 /// the readback and the write log.
 ///
 /// Every head write passes through here, so this is where a fenced parcel is refused as a new
-/// user-pallet head ([`RefUpdateError::Fenced`]); a ref that already holds it may keep it. In a
-/// sparse warehouse it is also where a user-pallet head the write leaves unreached from its ref
-/// is recorded in the fetched-heads ledger, so that an `expand` walks it before an `undo` can
-/// write it back.
+/// user-pallet head ([`RefUpdateError::Fenced`]); a ref that already holds it may keep it. It is
+/// also where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
+/// the hold), is recorded in the fetched-heads ledger, in the same hold as the write.
 pub(crate) fn update_pallet_head_locked(
     lock: &crate::util::lock_utils::RefLock,
     namespace: PalletNamespace,
     name: &str,
     expected: Option<&str>,
     new: &str,
+    left: Option<&str>,
 ) -> Result<(), RefUpdateError> {
     validate_head_write(name, new)?;
 
@@ -917,15 +942,8 @@ pub(crate) fn update_pallet_head_locked(
         return Err(RefUpdateError::Fenced { head: new.to_string() });
     }
 
-    if namespace == PalletNamespace::User {
-        if let Some(old) = found.as_deref() {
-            if old != new
-                && !crate::util::scope_utils::read_fetch_scope()?.is_full()
-                && !crate::util::merge_utils::is_ancestor(old, new)?
-            {
-                crate::util::fetch_ledger::record_fetch(lock, old, name)?;
-            }
-        }
+    if let Some(old) = left {
+        crate::util::fetch_ledger::record_fetch(lock, old, name)?;
     }
 
     let path = get_pallet_ref_path(namespace, name);
