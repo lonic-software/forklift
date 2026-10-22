@@ -8,7 +8,7 @@ use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     audit_utils, bay_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
-    office_utils, pallet_utils, remote_utils, shift_utils, stocktake_utils, trust_utils,
+    pallet_utils, remote_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use crate::commands::office;
 use crate::events;
@@ -63,13 +63,11 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
 
     // A named pallet the remote lacks is refused before trust or a meta pallet is written: it is
     // where a missing pallet's refusal sends an operator, so it must fail cleanly and coded. The
-    // remote's trust is judged first, read-only, so a pinned or changed anchor still refuses as
-    // such rather than as another remote's pallet list.
+    // remote's trust is judged first, read-only, so a pinned, stripped or changed anchor still
+    // refuses as such rather than as another remote's pallet list.
     if let Some(name) = &named {
         if !info.pallets.contains_key(name) {
-            let held = office_utils::read_trust_anchor()?;
-            trust_utils::check_handshake_trust(client.url(), &info, held.as_ref().map(|anchor| anchor.genesis.as_str()),
-                expect.as_deref())?;
+            remote_utils::check_remote_trust(&client, &info, expect.as_deref())?;
 
             return Err(remote_lacks_pallet(&info, name, "forklift palletize --remote").into());
         }
@@ -142,7 +140,17 @@ async fn lower_working_pallet(client: &RemoteClient,
                               report: &mut LowerReport,
                               progress: &Progress) -> Result<(), String> {
     let pallet = report.pallet.clone();
-    let remote_head = remote_pallet_head(info, &pallet, "forklift lift")?;
+    // Lifting creates the pallet on the remote only when there is something stacked to lift.
+    let remote_head = match info.pallets.get(&pallet) {
+        Some(head) => head,
+        None => {
+            let next_step = match pallet_utils::get_pallet_head(&pallet)? {
+                Some(_) => "forklift lift",
+                None => "forklift palletize --remote",
+            };
+            return Err(remote_lacks_pallet(info, &pallet, next_step).into());
+        }
+    };
 
     report.head = remote_head.clone();
 
@@ -212,8 +220,8 @@ fn remote_pallet_head<'a>(info: &'a forklift_core::model::remote::WarehouseInfo,
 }
 
 /// The [`RefusalCode::PalletNotFound`] refusal for a remote that has no user pallet `pallet`,
-/// naming the ones it has. `next_step` is the remedy at the site: `lift` publishes the current
-/// pallet, `palletize --remote` lists what another name could be.
+/// naming the ones it has. `next_step` is the remedy at the site: `lift` publishes a current
+/// pallet with something stacked, `palletize --remote` lists what another name could be.
 fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, pallet: &str, next_step: &str) -> CoreError {
     let user: Vec<&str> = info.pallets.keys()
         .map(String::as_str)

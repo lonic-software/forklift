@@ -7252,6 +7252,23 @@ fn lowering_a_pallet_the_remote_lacks_names_only_user_pallets() {
     assert_eq!(json_of(&bare)["error"]["next_step"], "forklift lift");
 }
 
+// Revert: judge only the handshake's pin before the missing-pallet refusal → it reports the
+// other warehouse's pallet list instead of its changed anchor.
+#[test]
+fn lowering_a_missing_pallet_from_a_remote_with_another_anchor_refuses_the_anchor() {
+    let area = TestArea::new("lower-named-missing-anchor");
+    let server = Server::start(&area, None);
+    remote_with_a_side_pallet(&area, &server);
+    // B enrolls an anchor of its own before A publishes one, so the remote's is a different one —
+    // unpinned, the handshake alone does not tell them apart.
+    assert_success(&area.forklift("b", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let refused = area.forklift("b", &["--json", "lower", "nope"]);
+    trust_changed_details(&refused);
+}
+
 // Revert: drop the unborn-bay check → the lower creates feat under the bay standing on it.
 #[test]
 fn a_named_lower_does_not_create_a_pallet_a_bay_stands_on_unborn() {
