@@ -1814,6 +1814,130 @@ mod tests {
         assert_eq!(kept, local, "the local sidecar survives the import untouched");
     }
 
+    /// Store a tree of `files` (name, blob hash) and `subtrees` (name, tree hash).
+    fn store_tree(files: &[(&str, &str)], subtrees: &[(&str, &str)]) -> String {
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        for (name, hash) in files {
+            tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), DirEntryType::Normal));
+        }
+        for (name, hash) in subtrees {
+            tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), DirEntryType::Tree));
+        }
+        let mut tree_object = LooseObjectBuilder::build_tree(&tree);
+        tree_object.store().unwrap();
+        tree_object.hash
+    }
+
+    fn store_blob(content: &[u8]) -> String {
+        let mut blob_object = LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() });
+        blob_object.store().unwrap();
+        blob_object.hash
+    }
+
+    /// Store a parcel of `tree_hash` on `parents` and make it `main`'s head.
+    fn store_head_parcel(tree_hash: &str, parents: &[&str]) -> String {
+        let parcel = Parcel {
+            tree_hash: tree_hash.to_string(),
+            parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            actions: Vec::new(),
+            description: None,
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+
+        pallet_utils::update_pallet_head(
+            "main",
+            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+            &parcel_object.hash,
+            &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+
+        parcel_object.hash
+    }
+
+    /// Each version of a file is stored as a delta against the version emitted before it at the
+    /// same path, until the chain reaches `MAX_DELTA_CHAIN`; the next version starts over in full.
+    /// A version seen again (a revert, in a tree that is itself new) is not stored twice, but
+    /// becomes the base the following version deltas against — here one at the end of a chain, so
+    /// that version is stored full.
+    /// The bundle imports, every version reading back.
+    #[test]
+    fn a_bundle_deltas_each_version_against_the_last_at_its_path_and_caps_the_chain() {
+        let source = Scratch::new("bundle-delta-chain");
+
+        let shared: Vec<u8> = (0..4096u32).map(|i| b'a' + (i.wrapping_mul(2654435761) >> 27) as u8).collect();
+        let version = |k: usize| [shared.as_slice(), format!("\nversion {}\n", k).as_bytes()].concat();
+
+        let unchanged = store_blob(b"never changes");
+        let dir = store_tree(&[("g.txt", &unchanged)], &[]);
+
+        let mut versions: Vec<usize> = (0..MAX_DELTA_CHAIN as usize + 3).collect();
+        // The revert to the chain's last delta (depth `MAX_DELTA_CHAIN`), then one new version.
+        versions.push(MAX_DELTA_CHAIN as usize);
+        versions.push(MAX_DELTA_CHAIN as usize + 3);
+
+        let revert = versions.len() - 2;
+        let note = store_blob(b"the revert parcel's own file");
+
+        let mut parent: Option<String> = None;
+        for (index, &k) in versions.iter().enumerate() {
+            let f = store_blob(&version(k));
+            // The revert's root differs from version 50's, so the walk visits it.
+            let files: Vec<(&str, &str)> = if index == revert {
+                vec![("f.txt", &f), ("note.txt", &note)]
+            } else {
+                vec![("f.txt", &f)]
+            };
+            let root = store_tree(&files, &[("dir", &dir)]);
+            let parents: Vec<&str> = parent.iter().map(String::as_str).collect();
+            parent = Some(store_head_parcel(&root, &parents));
+        }
+
+        let stats = build_bundle().unwrap();
+
+        // Versions 0..=52 and 53: 0 full, 1..=50 deltas (depths 1..=50), 51 full (its base is 50
+        // deep), 52 a delta, the revert to 50 no record, and 53 full (its base, 50, is 50 deep).
+        assert_eq!(stats.deltas, MAX_DELTA_CHAIN as usize + 1, "deltas");
+        // 55 parcels, 55 roots and `dir`, and the full blobs: versions 0, 51 and 53, `g.txt` and
+        // `note.txt`.
+        assert_eq!(stats.objects, 55 + 56 + 5, "full records");
+
+        let bundle = std::fs::read(&stats.path).unwrap();
+        drop(source);
+
+        let _destination = Scratch::new("bundle-delta-chain-dst");
+        let imported = import_bundle_bytes(&bundle).unwrap();
+        assert_eq!(imported.stored_objects, stats.objects + stats.deltas);
+        for k in 0..MAX_DELTA_CHAIN as usize + 4 {
+            let content = version(k);
+            let hash = LooseObjectBuilder::build_blob(&Blob { content: content.clone() }).hash;
+            assert_eq!(object_utils::load_blob(&hash).unwrap().content, content, "version {}", k);
+        }
+    }
+
+    /// A parcel whose changed trees exceed what the build loads ahead for one parcel still has
+    /// every tree in its bundle: the walk reads the rest itself.
+    #[test]
+    fn a_bundle_carries_every_tree_of_a_parcel_past_the_prefetch_cap() {
+        let _source = Scratch::new("bundle-prefetch-cap");
+
+        let directories: Vec<(String, String)> = (0..PLAN_PARCEL_TREES + 8)
+            .map(|i| {
+                let blob = store_blob(format!("file {}", i).as_bytes());
+                (format!("d{}", i), store_tree(&[("f.txt", &blob)], &[]))
+            })
+            .collect();
+        let subtrees: Vec<(&str, &str)> = directories.iter()
+            .map(|(name, hash)| (name.as_str(), hash.as_str()))
+            .collect();
+        store_head_parcel(&store_tree(&[], &subtrees), &[]);
+
+        let stats = build_bundle().unwrap();
+        // The parcel, its root, and each directory's tree and file.
+        assert_eq!(stats.objects, 2 + 2 * directories.len());
+        assert_eq!(stats.deltas, 0);
+    }
+
     /// A warehouse with a chunked file anywhere in reachable history refuses to bundle: chunk
     /// transport has not shipped, so a bundle carrying only the recipe (never its chunks,
     /// structurally) would be silently incomplete. The refusal carries the stable code and
