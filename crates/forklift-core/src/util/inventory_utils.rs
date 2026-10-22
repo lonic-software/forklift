@@ -3111,11 +3111,10 @@ mod tests {
     #[test]
     fn prepare_stack_inventory_reports_a_conflict_found_before_a_later_corrupt_shard() {
         // Regression: a single up-front parse pass must not let an unrelated corrupt shard mask
-        // a real, actionable conflict discovered earlier in the (sorted) scan. The old
-        // `has_conflict_entries` short-circuits — check, then parse, then check, one shard at a
-        // time — so a conflict in an earlier-sorting shard is always what the user sees, even
-        // when a later shard happens to be corrupt. `prepare_stack_inventory` must reproduce
-        // that prioritization, not just accidentally match it when there is nothing corrupt.
+        // a real, actionable conflict discovered earlier in the (sorted) scan. A conflict in an
+        // earlier-sorting shard is what the user sees, even when a later shard happens to be
+        // corrupt, from both `prepare_stack_inventory` and `has_conflict_entries` (park's check),
+        // though both read every shard in parallel.
         let _scratch = Scratch::new("conflict-before-corrupt");
 
         // "aaa" sorts before "zzz" and has a genuine unresolved conflict.
@@ -3133,6 +3132,9 @@ mod tests {
         metadata.insert("zzz".to_string());
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        assert_eq!(has_conflict_entries(), Ok(true),
+            "park's check must report the conflict in \"aaa\", not \"zzz\"'s parse error");
 
         let prepared = prepare_stack_inventory(None)
             .expect("the conflict in \"aaa\" must be reported, not \"zzz\"'s parse error");
@@ -3172,6 +3174,64 @@ mod tests {
             Err(message) => message,
         };
         assert!(error.contains("zzz"), "the error should name the offending shard, got: {error}");
+    }
+
+    #[test]
+    fn has_conflict_entries_fails_on_a_corrupt_shard_before_any_conflict() {
+        // The parallel read must not let a later conflict mask an earlier corrupt shard: in key
+        // order the corrupt "aaa" comes first, so the check fails rather than answering.
+        let _scratch = Scratch::new("corrupt-before-conflict");
+
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("aaa").unwrap();
+        std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
+
+        let mut conflicted = Inventory::new();
+        conflicted.add_item(item("file.txt", 1, InventoryItemState::FirstParentConflict));
+        plant_shard(&conflicted, "zzz");
+
+        let mut metadata: BTreeSet<String> = BTreeSet::new();
+        metadata.insert("aaa".to_string());
+        metadata.insert("zzz".to_string());
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        match has_conflict_entries() {
+            Ok(answer) => panic!("a corrupt shard before the conflict must fail the check, got Ok({answer})"),
+            Err(message) => assert!(message.contains("aaa"), "the error should name \"aaa\", got: {message}"),
+        }
+    }
+
+    #[test]
+    fn a_refresh_publishes_the_shards_before_a_failing_one_and_none_after() {
+        // Every shard is decided in parallel, but they are taken up in metadata order: the corrupt
+        // "bbb" ends the pass, so "aaa"'s refresh is published and "ccc"'s is not.
+        let _scratch = Scratch::new("refresh-stops-at-failure");
+
+        for key in ["aaa", "ccc"] {
+            let mut tracked = Inventory::new();
+            tracked.add_item(item("gone-from-disk.txt", 1, InventoryItemState::Normal));
+            plant_shard(&tracked, key);
+        }
+
+        let corrupt_path = file_utils::get_inventory_data_path_for_key("bbb").unwrap();
+        std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt_path, b"not a valid inventory shard").unwrap();
+
+        let metadata: BTreeSet<String> = ["aaa", "bbb", "ccc"].iter().map(|key| key.to_string()).collect();
+        let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
+        write_metadata_to_file(&metadata_path, &metadata).unwrap();
+
+        let error = refresh_tracked_entries().expect_err("the corrupt shard must fail the refresh");
+        assert!(error.contains("bbb"), "the error should name \"bbb\", got: {error}");
+
+        let state_of = |key: &str| {
+            let (_, bytes) = file_utils::retrieve_inventory_or_none_by_key(key).unwrap();
+            let shard = parser::inventory::inventory_parser::parse_inventory(&bytes.unwrap()).unwrap();
+            shard.get_item_by_name("gone-from-disk.txt").unwrap().state
+        };
+        assert!(state_of("aaa") == InventoryItemState::Deleted, "the shard before the failure must be published");
+        assert!(state_of("ccc") == InventoryItemState::Normal, "no shard after the failure may be published");
     }
 
     /// Write a shard straight to `key`'s address, registered or not: a fixture placing one, never
