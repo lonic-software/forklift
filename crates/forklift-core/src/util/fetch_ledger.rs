@@ -8,11 +8,12 @@
 //! nothing. If an `expand` ran in between, that head's newly in-scope content would never be
 //! fetched. So every scoped fetch records its head here, under the
 //! [`RefLock`](crate::util::lock_utils::RefLock), before it transfers anything, and `expand` walks
-//! the recorded heads as well as the ref heads.
+//! the recorded heads as well as the ref heads. A ref write that leaves a head no longer reached
+//! from its ref records that head too, since an `undo` can write it back without fetching.
 //!
 //! A recorded head that no ref reaches and that the remote can no longer serve cannot be walked.
 //! `expand` moves it to the fence list instead of failing, and the ref compare-and-set refuses a
-//! fenced head as a new user-pallet head, until a scoped fetch of that head records it again.
+//! fenced head as a new user-pallet head, until a scoped fetch of that head completes.
 //!
 //! Both files live in the shared forklift root, so every bay sees the same ones, and both are
 //! [`record_utils`] files: the ledger one `<head> <pallet>` entry per line, the fence list one
@@ -33,7 +34,8 @@ const FILE_NAME_FENCE: &str = "fenced-heads";
 const FENCE_RECORD: &str = "fenced-heads";
 const FENCE_VERSION: u32 = 1;
 
-/// One scoped fetch the ledger recorded: the head it fetched, and the pallet it fetched it for.
+/// One head the ledger recorded: the head, and the pallet it was fetched for or left by. The
+/// pallet is kept for diagnosis; the ledger holds each head once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerEntry {
     /// The parcel hash the fetch walked from.
@@ -111,23 +113,28 @@ pub fn write_fence(_lock: &RefLock, heads: &[String]) -> Result<(), String> {
     file_utils::write_file_atomically(&fence_path(), &record_utils::to_bytes(FENCE_RECORD, FENCE_VERSION, heads))
 }
 
-/// Record that a scoped fetch of `head` for `pallet` is about to run: add it to the ledger, unless
-/// it is there already, and take it off the fence list, since this fetch is what makes it whole.
-/// Only under the ref lock, in the same hold that read the fetch scope the fetch will use.
+/// Add `head` to the ledger, unless it is there already: a scoped fetch about to run, in the same
+/// hold that read the fetch scope it will use, or a head a ref write is leaving. Only under the
+/// ref lock. It does not lift a fence: only a fetch that completed does ([`lift_fence`]).
 ///
 /// # Arguments
 /// * `lock`   - The held ref lock.
-/// * `head`   - The parcel hash about to be fetched.
-/// * `pallet` - The pallet it is fetched for, as its wire name.
+/// * `head`   - The parcel hash.
+/// * `pallet` - The pallet it is fetched for or left by, as its wire name.
 pub fn record_fetch(lock: &RefLock, head: &str, pallet: &str) -> Result<(), String> {
     let mut ledger = read_ledger()?;
-    let entry = LedgerEntry { head: head.to_string(), pallet: pallet.to_string() };
 
-    if !ledger.contains(&entry) {
-        ledger.push(entry);
+    if !ledger.iter().any(|entry| entry.head == head) {
+        ledger.push(LedgerEntry { head: head.to_string(), pallet: pallet.to_string() });
         write_ledger(lock, &ledger)?;
     }
 
+    Ok(())
+}
+
+/// Take `head` off the fence list: a scoped fetch of it completed at the current fetch scope, so it
+/// is whole. Only under the ref lock, in the hold that confirmed the scope.
+pub fn lift_fence(lock: &RefLock, head: &str) -> Result<(), String> {
     let mut fence = read_fence()?;
 
     if fence.iter().any(|fenced| fenced == head) {
@@ -171,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_fetch_is_listed_once_and_leaves_the_fence() {
+    fn a_recorded_head_is_listed_once_and_only_a_lifted_one_leaves_the_fence() {
         let _scratch = Scratch::new("record");
         let head = "a".repeat(64);
         let other = "b".repeat(64);
@@ -181,11 +188,13 @@ mod tests {
         let lock = RefLock::acquire().unwrap();
         write_fence(&lock, &[head.clone(), other.clone()]).unwrap();
         record_fetch(&lock, &head, "main").unwrap();
-        record_fetch(&lock, &head, "main").unwrap();
+        record_fetch(&lock, &head, "side").unwrap();
+        assert!(is_fenced(&head).unwrap(), "recording a fetch about to run lifts nothing");
+        lift_fence(&lock, &head).unwrap();
         drop(lock);
 
         assert_eq!(read_ledger().unwrap(), vec![LedgerEntry { head: head.clone(), pallet: "main".to_string() }]);
-        assert_eq!(read_fence().unwrap(), vec![other.clone()], "only the fetched head leaves the fence");
+        assert_eq!(read_fence().unwrap(), vec![other.clone()], "only the lifted head leaves the fence");
         assert!(!is_fenced(&head).unwrap());
         assert!(is_fenced(&other).unwrap());
     }

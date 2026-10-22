@@ -4343,6 +4343,22 @@ fn expand_fences_a_fetched_head_the_remote_can_no_longer_serve() {
     assert!(!area.path("sparse/.forklift/pallets/x").exists());
 }
 
+// Revert: walk every closure before checking the added paths → the unservable ref refuses the
+// expand first, hiding the typo.
+#[test]
+fn expand_checks_its_paths_before_walking_other_histories() {
+    let area = TestArea::new("sparse-expand-typo");
+    let server = Server::start(&area, None);
+    let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
+
+    assert_success(&area.forklift("sparse", &["palletize", "x", &up_head]));
+    std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
+
+    let refused = area.forklift("sparse", &["expand", "src/wbe"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("\"src/wbe\" is not a directory"), "{}", stderr(&refused));
+}
+
 // Revert: franchise fetches through the scope on disk, which does not exist yet → the whole
 // tree is fetched and nothing is recorded.
 #[test]

@@ -422,9 +422,10 @@ impl BaseServeLock {
 ///
 /// It also orders the fetched-heads ledger and fence list of a sparse warehouse
 /// ([`fetch_ledger`](crate::util::fetch_ledger)) against the ref writes and the fetch scope: a
-/// scoped fetch records its head, and re-checks the scope when its transfer completes, under it;
-/// `expand` compares and writes the scope, the ledger and the fence list under it. Neither holds
-/// it across a transfer or a walk.
+/// scoped fetch records its head, and re-checks the scope and lifts the head's fence when its
+/// transfer completes, under it; a ref write records a head it leaves unreached in the same hold
+/// as the write; `expand` compares and writes the scope, the ledger and the fence list under it.
+/// None of them holds it across a transfer or a walk.
 ///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the

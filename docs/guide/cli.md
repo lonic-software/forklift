@@ -1435,9 +1435,10 @@ already holds everything, so there is nothing to expand.
 
 Every history the warehouse holds is widened, not just the current pallet's: every pallet, and
 every remote head a `lower` or `lift` fetched without a pallet yet (such as the head of a
-diverged `lower`, which you may palletize later). If the remote can no longer serve one of
-those unpalletized heads, `expand` still succeeds, and that head is refused as a pallet head
-("fetched only part-way") until a `lower` from a remote that has it fetches it again. If it
+diverged `lower`, which you may palletize later), and every head a pallet moved off that `undo`
+could bring back. If the remote can no longer serve one of those unpalletized heads, `expand`
+still succeeds, and that head is refused as a pallet head ("fetched only part-way") until a
+`lower` from a remote that has it fetches it in full. If it
 cannot serve a pallet's history, `expand` refuses and names the pallet. When another command
 changes the warehouse while `expand` runs, it walks the change and tries again, and after three
 tries it asks you to run it again.

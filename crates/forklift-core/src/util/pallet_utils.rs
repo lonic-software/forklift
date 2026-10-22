@@ -895,9 +895,12 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 /// the readback and the write log.
 ///
 /// Every head write passes through here, so this is where a fenced parcel is refused as a new
-/// user-pallet head ([`RefUpdateError::Fenced`]). A ref that already holds it may keep it.
+/// user-pallet head ([`RefUpdateError::Fenced`]); a ref that already holds it may keep it. In a
+/// sparse warehouse it is also where a user-pallet head the write leaves unreached from its ref
+/// is recorded in the fetched-heads ledger, so that an `expand` walks it before an `undo` can
+/// write it back.
 pub(crate) fn update_pallet_head_locked(
-    _lock: &crate::util::lock_utils::RefLock,
+    lock: &crate::util::lock_utils::RefLock,
     namespace: PalletNamespace,
     name: &str,
     expected: Option<&str>,
@@ -912,6 +915,17 @@ pub(crate) fn update_pallet_head_locked(
         && crate::util::fetch_ledger::is_fenced(new)?
     {
         return Err(RefUpdateError::Fenced { head: new.to_string() });
+    }
+
+    if namespace == PalletNamespace::User {
+        if let Some(old) = found.as_deref() {
+            if old != new
+                && !crate::util::scope_utils::read_fetch_scope()?.is_full()
+                && !crate::util::merge_utils::is_ancestor(old, new)?
+            {
+                crate::util::fetch_ledger::record_fetch(lock, old, name)?;
+            }
+        }
     }
 
     let path = get_pallet_ref_path(namespace, name);

@@ -80,27 +80,26 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     // fetch and self-heals; the fetch primitives skip what already landed.
     let mut expansion = remote_utils::Expansion::new(&pallet, &head, current, added);
 
-    for attempt in 0..remote_utils::EXPAND_ATTEMPTS {
-        expansion.walk(&client).await?;
+    expansion.walk_base(&client).await?;
 
-        // Each added path must name a real directory at the head — the spine (and the subtree
-        // itself) is fetched now, so the walk resolves without touching anything absent. A typo
-        // that named nothing is rejected before the scope is ever written, so it leaves no trace.
-        // A retry only ever narrows the added paths, so the first check covers every attempt.
-        if attempt == 0 {
-            let tree = object_utils::load_parcel(&head)?.tree_hash;
+    // Each added path must name a real directory at the head — the spine (and the subtree itself)
+    // is fetched now, so the walk resolves without touching anything absent. A typo that named
+    // nothing is rejected before any other history is fetched or the scope written, so it leaves
+    // no trace. A retry only ever narrows the added paths, so this check covers every attempt.
+    let tree = object_utils::load_parcel(&head)?.tree_hash;
 
-            for prefix in expansion.added() {
-                if !is_directory_in_tree(&tree, prefix)? {
-                    return Err(format!(
-                        "\"{}\" is not a directory in pallet \"{}\" at its head, so it cannot be a \
-                        fetch scope. Nothing was recorded.",
-                        prefix, pallet
-                    ));
-                }
-            }
+    for prefix in expansion.added() {
+        if !is_directory_in_tree(&tree, prefix)? {
+            return Err(format!(
+                "\"{}\" is not a directory in pallet \"{}\" at its head, so it cannot be a fetch \
+                scope. Nothing was recorded.",
+                prefix, pallet
+            ));
         }
+    }
 
+    for _ in 0..remote_utils::EXPAND_ATTEMPTS {
+        expansion.walk(&client).await?;
         expansion.walk_new_ref_heads_locally()?;
 
         match expansion.commit()? {
