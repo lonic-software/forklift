@@ -51,13 +51,20 @@ const MAX_DELTA_CHAIN: u32 = 50;
 const EMIT_WINDOW: usize = 256;
 const EMIT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// How many parcels the build's workers may load trees for ahead of the walk, the parsed trees
-/// held ahead at which they pause, and the most loaded for any one parcel (the walk reads the rest
-/// itself). A parcel usually changes a handful of trees, so the window binds first; the caps bound
-/// a run of large merges, and a first parcel over a tree of many directories.
+/// How many parcels the build's workers may load trees for ahead of the walk, the entries of the
+/// parsed trees held ahead at which they pause, and the most trees loaded for any one parcel (the
+/// walk reads the rest itself). A parcel usually changes a handful of trees, so the window binds
+/// first; the caps bound a run of large merges or wide directories, and a first parcel over a
+/// tree of many directories.
 const PLAN_WINDOW: usize = 256;
-const PLAN_BUDGET_TREES: usize = 8 * 1024;
+const PLAN_BUDGET_ENTRIES: usize = 256 * 1024;
 const PLAN_PARCEL_TREES: usize = 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// How many trees the plan walk read itself because no worker had loaded them.
+    static PLAN_WALK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The folder (inside the forklift root) where bundles live.
 const FOLDER_NAME_BUNDLES: &str = "bundles";
@@ -476,13 +483,13 @@ fn plan_emission(order: &[String]) -> Result<Vec<Emission>, String> {
     fanout_utils::prefetch_in_order(
         &walks,
         PLAN_WINDOW,
-        PLAN_BUDGET_TREES,
+        PLAN_BUDGET_ENTRIES,
         |(_, tree_hash, parent_tree)| {
             let mut changed: HashMap<String, TreeItem> = HashMap::new();
             load_changed_trees(tree_hash, parent_tree.as_deref(), &mut changed);
             changed
         },
-        HashMap::len,
+        |changed| changed.values().map(|tree| tree.get_files().len() + tree.get_subtrees().len()).sum(),
         |(parcel_hash, tree_hash, _), mut prefetched| {
             walk.plan.push(Emission::Parcel { hash: plan_hash(parcel_hash)? });
 
@@ -541,7 +548,11 @@ fn plan_tree_closure(walk: &mut PlanWalk,
 
     let tree = match prefetched.remove(tree_hash) {
         Some(tree) => tree,
-        None => object_utils::load_tree(tree_hash)?,
+        None => {
+            #[cfg(test)]
+            PLAN_WALK_READS.with(|reads| reads.set(reads.get() + 1));
+            object_utils::load_tree(tree_hash)?
+        }
     };
 
     for (name, file) in tree.get_files() {
@@ -634,7 +645,9 @@ fn load_emission(plan: &[Emission], item: &Emission) -> Result<Loaded, String> {
 
     match item {
         Emission::Parcel { .. } => {
-            let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+            // Parcels are stored full and read once: keep them out of the read cache the blobs'
+            // delta bases come from.
+            let bytes = file_utils::retrieve_object_by_hash_uncached(hash)?;
             refuse_if_transporting_over_ceiling(&format!("parcel {}", hash), bytes.len())?;
             let compressed = pack_utils::TransportPackBuilder::compress_full(hash, &bytes)?;
 
@@ -1893,7 +1906,10 @@ mod tests {
             parent = Some(store_head_parcel(&root, &parents));
         }
 
+        PLAN_WALK_READS.with(|reads| reads.set(0));
         let stats = build_bundle().unwrap();
+        // On a linear history the workers load every tree the walk reads.
+        assert_eq!(PLAN_WALK_READS.with(|reads| reads.get()), 0, "trees the walk read itself");
 
         // Versions 0..=52 and 53: 0 full, 1..=50 deltas (depths 1..=50), 51 full (its base is 50
         // deep), 52 a delta, the revert to 50 no record, and 53 full (its base, 50, is 50 deep).
@@ -1903,6 +1919,9 @@ mod tests {
         assert_eq!(stats.objects, 55 + 56 + 5, "full records");
 
         let bundle = std::fs::read(&stats.path).unwrap();
+        // The order records are loaded in never reaches the bytes.
+        build_bundle().unwrap();
+        assert!(std::fs::read(&stats.path).unwrap() == bundle, "a rebuild writes the same bundle");
         drop(source);
 
         let _destination = Scratch::new("bundle-delta-chain-dst");
@@ -1932,7 +1951,9 @@ mod tests {
             .collect();
         store_head_parcel(&store_tree(&[], &subtrees), &[]);
 
+        PLAN_WALK_READS.with(|reads| reads.set(0));
         let stats = build_bundle().unwrap();
+        assert!(PLAN_WALK_READS.with(|reads| reads.get()) > 0, "the walk read the trees past the cap");
         // The parcel, its root, and each directory's tree and file.
         assert_eq!(stats.objects, 2 + 2 * directories.len());
         assert_eq!(stats.deltas, 0);
