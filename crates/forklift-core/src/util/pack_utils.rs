@@ -7523,8 +7523,10 @@ pub(crate) mod tests {
     /// stack, standing in for the frames above a real read (the async entry point, the command,
     /// clap's), so the test pins headroom and not only a fit at the top of a fresh thread. In a
     /// debug build the failing read was measured at about 7.5 MiB and the at-limit read under
-    /// 4 MiB, so the failure path is the deeper one. The past-limit read goes first because the limit bounds one reconstruction's recursion: once the
-    /// at-limit read has cached the bases, the deeper object is a single delta away. The
+    /// 4 MiB: the at-limit read succeeds on the unverified attempt, while the failing one also
+    /// redoes the chain on the verified route, the deeper of the two. The past-limit read goes
+    /// first because the limit bounds one reconstruction's recursion: once the at-limit read has
+    /// cached the bases, the deeper object is a single delta away. The
     /// past-limit read fails before decoding anything, so the at-limit read after it is still cold.
     ///
     /// Mutation (debug build, which is what `cargo test` and CI run): `WORKER_STACK_SIZE` back to
