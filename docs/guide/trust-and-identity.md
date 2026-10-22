@@ -63,6 +63,10 @@ this warehouse must be signed** — this cannot be undone.
 - If a remote is configured, its pallet heads are folded into the trust boundary
   (history the remote already has stays valid unsigned), so the remote must be
   reachable — or pass `--offline` if it's gone for good.
+- The boundary is what `enroll` vouches for, so it is checked again at the moment
+  the anchor is written. If another bay of the warehouse moves a pallet past it,
+  or writes an office of its own meanwhile, `enroll` is refused and writes
+  nothing; run it again.
 - A gap in that boundary does not by itself make `audit` refuse: a fully-signed
   pallet never asks the question, and an unsigned parcel still reachable from a
   boundary head this store holds is counted as legacy as usual. It is when an
@@ -324,6 +328,9 @@ forklift office retire <key-id> --compromised   # revoke a key that may be in ot
   parcels reachable from that boundary — decided by **exact ancestry, never
   timestamps**, so a shifted clock can't forge validity. A `--compromised` key's
   signatures beyond the boundary fail every future audit.
+- That boundary is checked again when the revocation is written: a pallet that
+  another bay moved past it meanwhile refuses the `rotate` or `retire`, which
+  then writes nothing; run it again.
 - A parcel that a boundary head this store *does* hold already vouches for passes
   regardless of what else is missing — that question is asked first, and a yes is
   trustworthy however incomplete the store is. It is only for a parcel that is
@@ -365,6 +372,12 @@ and replaces the anchor — pinning the old office head as **attested** history
 deliberately **loud**: every clone refuses to sync until its holder consciously
 re-accepts, and a remote accepts the reset only from the server operator's static
 token.
+
+The new anchor and the new office genesis are written together, with nothing able
+to write a ref between them. If another bay of the warehouse moves the office, the
+anchor or a pallet the reset vouches for while it runs, the reset is refused and
+writes nothing; run it again. Accepting a reset is refused the same way when the
+office or the anchor moved while it ran.
 
 The attested history travels with the anchor. Accepting the reset, or franchising
 from the remote after it, fetches the old office chain. Lifting a re-genesis to a
