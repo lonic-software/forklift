@@ -412,6 +412,18 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_run_stays_across_from_the_run_that_replaced_it() {
+        // `z z` becomes `x z`: the removed `z` could be either one. Git's diff shows the first
+        // replaced by `x` (a run that can sit across from a run on the other side stays there)
+        // rather than sliding it down past the equal second one.
+        let a = ["z", "z"];
+        let b = ["x", "z"];
+
+        assert_eq!(slide_changes(&a, &b, &[None, Some(1)]), vec![None, Some(1)]);
+        assert_eq!(slide_changes(&a, &b, &[Some(1), None]), vec![None, Some(1)]);
+    }
+
+    #[test]
     fn myers_matches_long_similar_inputs_without_a_quadratic_table() {
         // 200,000 elements a side: the exact table would be 40 billion cells. A few scattered
         // edits leave every other element matched.
