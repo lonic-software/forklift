@@ -40,7 +40,7 @@ use forklift_core::util::pallet_utils::{
 };
 use forklift_core::util::lock_utils::{self, BaseServeLock, ServeLock, StoreAccessLock};
 use forklift_core::util::{
-    audit_utils, body_utils, bay_utils, bundle_utils, file_utils, hook_utils, merge_utils, meta_tree,
+    audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
     object_utils, office_utils, pack_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
@@ -652,6 +652,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
                     root.to_string_lossy(), root.to_string_lossy()
                 )),
             }
+
+            // A franchise that has not finished is no warehouse yet: it is resumed or deleted first.
+            franchise_utils::gate(&root).map_err(String::from)?;
 
             // Hold the serve lock for the served root for the process lifetime: a second
             // server on the same root is refused here rather than silently breaking the CAS.

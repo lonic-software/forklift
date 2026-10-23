@@ -374,9 +374,10 @@ pub fn is_staging_leftover(name: &OsStr) -> bool {
 /// Claim `target`, which [`admit`] judged [`Admission::Fresh`], for a new franchise: create it
 /// (and any missing ancestor) if absent, then put its `.forklift` folder in place with `record`
 /// already inside. The folder is built under a temp name and renamed into place only if no
-/// `.forklift` exists, so the directory is never a warehouse without its record: a kill at any
-/// point leaves either no `.forklift` (only a staging leftover, which [`admit`] ignores) or one
-/// the gate refuses. Two franchises racing for one directory cannot both claim it.
+/// `.forklift` exists ([`file_utils::rename_no_replace`]), so the directory is never a warehouse
+/// without its record: a kill at any point leaves either no `.forklift` (only a staging leftover,
+/// which [`admit`] ignores) or one the gate refuses. Two franchises racing for one directory
+/// cannot both claim it.
 ///
 /// An ancestor is created with the tolerant `create_dir_all` and never removed: an empty one never
 /// blocks a retry.
@@ -405,18 +406,14 @@ pub fn claim(target: &Path, record: &FranchiseRecord) -> Result<(), String> {
     std::fs::create_dir(&staging)
         .map_err(|e| format!("Error while creating \"{}\": {}", staging.to_string_lossy(), e))?;
 
-    let placed = write(&staging, record)
-        .and_then(|()| match std::fs::symlink_metadata(&forklift) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Ok(_) => Err(format!(
-                "\"{}\" was claimed by another franchise while this one was connecting; franchise into \
-                a new or empty directory.", target.to_string_lossy()
-            )),
-            Err(e) => Err(format!("Error while checking \"{}\": {}", forklift.to_string_lossy(), e)),
-        })
-        .and_then(|()| std::fs::rename(&staging, &forklift).map_err(|e| format!(
-            "Error while moving \"{}\" into place: {}", forklift.to_string_lossy(), e
-        )));
+    let placed = write(&staging, record).and_then(|()| match file_utils::rename_no_replace(&staging, &forklift) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "\"{}\" was claimed by another franchise while this one was connecting; franchise into \
+            a new or empty directory.", target.to_string_lossy()
+        )),
+        Err(e) => Err(format!("Error while moving \"{}\" into place: {}", forklift.to_string_lossy(), e)),
+    });
 
     if let Err(e) = placed {
         // A real folder this call created, so the recursive removal follows nothing it did not make.
@@ -501,6 +498,12 @@ pub fn admit(target: &Path) -> Result<Admission, String> {
     }
 
     let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+    // Never judged through a link: a resume deletes inside it.
+    if !is_real_dir(&forklift)? {
+        return Err(not_empty());
+    }
+
     let only_debris = names.len() == 1 && holds_only_debris(&forklift)?;
 
     match read(&forklift) {
@@ -519,13 +522,18 @@ pub fn admit(target: &Path) -> Result<Admission, String> {
 /// Whether `forklift` holds nothing but the lock, the record and its temps: the shape a run
 /// killed before its record was durable leaves.
 fn holds_only_debris(forklift: &Path) -> Result<bool, String> {
-    if !forklift.is_dir() {
-        return Ok(false);
-    }
-
     Ok(list_names(forklift)?.iter().all(|name| {
         name == FILE_NAME_LOCK || name == FILE_NAME_FRANCHISE || is_temp_of(name, FILE_NAME_FRANCHISE)
     }))
+}
+
+/// Whether `path` is a folder itself, not a link to one. An absent path is not.
+fn is_real_dir(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Error while checking \"{}\": {}", path.to_string_lossy(), e)),
+    }
 }
 
 fn list_names(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
@@ -538,27 +546,49 @@ fn list_names(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
 /// the target. In order:
 ///
 /// 1. The object store's durability taints: a torn taint discards the whole store, otherwise each
-///    recorded path is deleted. Without an anchor to verify against (`record` is `None`, or
-///    recorded no genesis), every kept signature sidecar is deleted too, so the resume fetches
-///    them again exactly as a fresh franchise would.
+///    recorded path is deleted, and each deletion is made durable before step 2 drops the taint
+///    records. Without an anchor to verify against (`record` is `None`, or recorded no genesis),
+///    every kept signature sidecar is deleted too, so the resume fetches them again exactly as a
+///    fresh franchise would.
 /// 2. Every entry of `.forklift` but the object store, the record, the held lock and, when
 ///    `keep_bundles`, the bundles. Refs above all: the history walk stops at any parcel a local
 ///    ref holds, and a ref an earlier attempt wrote is complete only at that attempt's scope.
 /// 3. Every entry of the target but `.forklift`: the partial working tree.
 ///
-/// Nothing is followed through a link: a link is removed as itself.
-pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bundles: bool) -> Result<(), String> {
+/// Nothing is followed through a link at any level below the target, which the user named: a
+/// `.forklift` that is not a real folder is refused, an object store or fan-out folder that is
+/// not one is removed as itself, and every other link is removed as itself.
+///
+/// Returns whether the object store was discarded, so nothing an earlier attempt stored is kept.
+pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bundles: bool) -> Result<bool, String> {
     let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
     let objects = forklift.join(FOLDER_NAME_OBJECTS_ROOT);
 
-    let taints = taint_utils::read_taints(&forklift)?;
+    if !is_real_dir(&forklift)? {
+        return Err(format!("\"{}\" is not a folder; delete \"{}\" and franchise again.",
+                           forklift.to_string_lossy(), target.to_string_lossy()));
+    }
 
-    if taints.torn {
+    let taints = taint_utils::read_taints(&forklift)?;
+    let discarded = taints.torn || (std::fs::symlink_metadata(&objects).is_ok() && !is_real_dir(&objects)?);
+
+    if discarded {
         remove_unfollowed(&objects)?;
+        file_utils::sync_dir(&forklift)?;
     } else {
+        let mut touched = std::collections::BTreeSet::new();
+
         for recorded in &taints.recorded {
             if is_object_store_path(recorded) {
-                remove_unfollowed(&forklift.join(recorded))?;
+                touched.insert(remove_in_store(&forklift, recorded)?);
+            }
+        }
+
+        for folder in touched {
+            match file_utils::sync_dir(&folder) {
+                // A folder an earlier removal in this loop took with it.
+                Err(_) if std::fs::symlink_metadata(&folder).is_err() => (),
+                synced => synced?,
             }
         }
     }
@@ -585,7 +615,30 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bund
     }
 
     file_utils::sync_dir(&forklift)?;
-    file_utils::sync_dir(target)
+    file_utils::sync_dir(target)?;
+
+    Ok(discarded)
+}
+
+/// Remove `recorded`, a path inside the object store relative to `forklift`, judging every level
+/// unfollowed: where a folder on the way is not a real one, that entry is removed as itself instead
+/// (nothing beneath it is the store's). Returns the folder whose entry was removed.
+fn remove_in_store(forklift: &Path, recorded: &Path) -> Result<PathBuf, String> {
+    let mut parent = forklift.to_path_buf();
+    let mut components = recorded.components().peekable();
+
+    while let Some(component) = components.next() {
+        let path = parent.join(component);
+
+        if components.peek().is_none() || !is_real_dir(&path)? {
+            remove_unfollowed(&path)?;
+            return Ok(parent);
+        }
+
+        parent = path;
+    }
+
+    Ok(parent)
 }
 
 /// Whether `path`, relative to `.forklift`, names something inside the object store.
@@ -712,11 +765,13 @@ fn quote(arg: &str) -> String {
 fn failed_next_step(command: &str, directory: &str, retry: Retry) -> String {
     match retry {
         Retry::Same | Retry::Unknown => format!(
-            "Run \"{}\" to resume it; what was fetched is kept. Or delete \"{}\".", command, directory
+            "Run \"{}\" to resume it: what was fetched is kept, and everything else in \"{}\" is \
+            replaced. Or delete \"{}\".", command, directory, directory
         ),
         Retry::Change => format!(
             "Running it unchanged fails the same way. Run \"{}\" with a different --only or --pallet \
-            (what was fetched is kept), or delete \"{}\".", command, directory
+            (what was fetched is kept, and everything else in \"{}\" is replaced), or delete \"{}\".",
+            command, directory, directory
         ),
     }
 }
@@ -738,7 +793,9 @@ pub fn failure_refusal(directory: &str, record: &FranchiseRecord, cause: &str, f
     )
 }
 
-fn details(directory: &str, remote: Option<&str>, failure: Option<&Failure>) -> serde_json::Value {
+/// The `franchise_incomplete` details: the directory, the remote when known, and the last
+/// failure's code and retry advice when there is one.
+pub fn details(directory: &str, remote: Option<&str>, failure: Option<&Failure>) -> serde_json::Value {
     serde_json::json!({
         "directory": directory,
         "remote": remote,
@@ -753,13 +810,22 @@ fn details(directory: &str, remote: Option<&str>, failure: Option<&Failure>) -> 
 pub fn gate(root: &Path) -> Result<(), CoreError> {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
 
+    let directory = root.to_string_lossy().into_owned();
+
+    // Whether a franchise is unfinished cannot be told: refused, never guessed either way.
+    let unknowable = |why: String| CoreError::refusal_with_details(
+        RefusalCode::FranchiseIncomplete,
+        format!("Whether \"{}\" holds a franchise that has not finished cannot be checked: {}", directory, why),
+        format!("Make \"{}\" readable and run the command again.", forklift.to_string_lossy()),
+        details(&directory, None, None),
+    );
+
     let record = match read(&forklift) {
         Ok(Some(record)) => Some(record),
-        Ok(None) if record_temps(&forklift).map_err(CoreError::Other)?.is_empty() => return Ok(()),
-        Ok(None) | Err(_) => None,
+        Ok(None) if record_temps(&forklift).map_err(unknowable)?.is_empty() => return Ok(()),
+        Ok(None) | Err(MarkerError::Torn(_) | MarkerError::Foreign(_)) => None,
+        Err(e) => return Err(unknowable(e.describe(&record_path(&forklift)))),
     };
-
-    let directory = root.to_string_lossy().into_owned();
     let lock = forklift.join(FILE_NAME_LOCK);
     let locked = std::fs::symlink_metadata(&lock).is_ok();
 
@@ -811,7 +877,7 @@ pub fn gate(root: &Path) -> Result<(), CoreError> {
     } else {
         match failure {
             Some(failure) => failed_next_step(&command, &directory, failure.retry),
-            None => format!("Run \"{}\" to resume it; what was fetched is kept. Or delete \"{}\".", command, directory),
+            None => failed_next_step(&command, &directory, Retry::Same),
         }
     };
 
@@ -1090,6 +1156,83 @@ mod tests {
         assert_eq!(read(&target.join(FOLDER_NAME_FORKLIFT_ROOT)), Ok(None), "the existing folder is untouched");
         assert!(list_names(&target).unwrap().iter().all(|name| !is_staging_leftover(name)),
             "a refused claim removes its staging folder");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The claim's rename never replaces a `.forklift` that appeared after the admission, not even
+    /// an empty one, which a plain rename onto a folder would.
+    #[test]
+    fn the_claim_rename_never_replaces_an_empty_folder() {
+        let root = temp_dir("rename-no-replace");
+        let (staged, placed) = (root.join("staged"), root.join("placed"));
+        std::fs::create_dir_all(staged.join("inside")).unwrap();
+        std::fs::create_dir_all(&placed).unwrap();
+
+        let refused = file_utils::rename_no_replace(&staged, &placed).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(staged.join("inside").is_dir() && list_names(&placed).unwrap().is_empty());
+
+        std::fs::remove_dir(&placed).unwrap();
+        file_utils::rename_no_replace(&staged, &placed).unwrap();
+        assert!(placed.join("inside").is_dir() && !staged.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No level below the target is followed: a linked `.forklift` is refused by admission and by
+    /// the resume, a linked object store is discarded as itself, and a taint under a linked fan-out
+    /// folder removes the link, never what it points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_never_deletes_through_a_link() {
+        let root = temp_dir("links");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("ab")).unwrap();
+        std::fs::write(outside.join("ab").join("cdef"), b"keep").unwrap();
+
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        assert!(admit(&linked).is_err());
+        assert!(prepare_resume(&linked, Some(&record()), false).is_err());
+
+        let store_linked = root.join("store-linked");
+        let forklift = store_linked.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+        write(&forklift, &record()).unwrap();
+        std::os::unix::fs::symlink(&outside, forklift.join(FOLDER_NAME_OBJECTS_ROOT)).unwrap();
+        assert_eq!(prepare_resume(&store_linked, Some(&record()), false), Ok(true));
+        assert!(std::fs::symlink_metadata(forklift.join(FOLDER_NAME_OBJECTS_ROOT)).is_err());
+
+        let fan_out_linked = root.join("fan-out-linked");
+        let objects = fan_out_linked.join(FOLDER_NAME_FORKLIFT_ROOT).join(FOLDER_NAME_OBJECTS_ROOT);
+        std::fs::create_dir_all(&objects).unwrap();
+        std::os::unix::fs::symlink(outside.join("ab"), objects.join("ab")).unwrap();
+        let removed_from = remove_in_store(
+            &fan_out_linked.join(FOLDER_NAME_FORKLIFT_ROOT), Path::new("objects/ab/cdef")
+        ).unwrap();
+        assert_eq!(removed_from, objects);
+        assert!(std::fs::symlink_metadata(objects.join("ab")).is_err());
+
+        assert_eq!(std::fs::read(outside.join("ab").join("cdef")).unwrap(), b"keep");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `.forklift` whose record cannot be read for a reason other than its content is refused
+    /// with the franchise's code, saying it cannot be checked: never waved through, never told to
+    /// prepare a warehouse.
+    #[test]
+    fn the_gate_refuses_what_it_cannot_check() {
+        let root = temp_dir("gate-unreadable");
+        std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_FRANCHISE)).unwrap();
+
+        match gate(&root) {
+            Err(CoreError::Refusal { code: RefusalCode::FranchiseIncomplete, message, .. }) => {
+                assert!(message.contains("cannot be checked"), "{}", message);
+            }
+            other => panic!("{:?}", other),
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -166,6 +166,7 @@ pub async fn handle_command(url: &str,
         record,
         phase: Phase::Prepare,
         bundle_imported_at_start: false,
+        finishing: false,
     };
 
     let outcome = enter_and_franchise(
@@ -222,12 +223,7 @@ fn same_remote(a: &str, b: &str) -> bool {
 fn franchise_details(directory: &str, record: &FranchiseRecord) -> serde_json::Value {
     let failure = record.last_failure.as_ref().filter(|_| record.attempt == Attempt::Failed);
 
-    serde_json::json!({
-        "directory": directory,
-        "remote": record.url,
-        "cause_code": failure.map(|failure| failure.cause_code.as_str()),
-        "retry": failure.map(|failure| failure.retry.as_str()),
-    })
+    franchise_utils::details(directory, Some(&record.url), failure)
 }
 
 /// Point a resume's `trust_changed` refusal at the only way out: the directory is bound to the
@@ -277,6 +273,10 @@ struct FranchiseAttempt {
     /// Whether the bundle was imported when this attempt started, so importing it counts as
     /// progress.
     bundle_imported_at_start: bool,
+
+    /// Whether the franchise has begun removing its record: past that point the warehouse is
+    /// complete, and a failure must never write the record back.
+    finishing: bool,
 }
 
 impl FranchiseAttempt {
@@ -285,6 +285,10 @@ impl FranchiseAttempt {
     /// failure that repeats without storing anything is reported as `change`. Recording is best
     /// effort, and its failure is appended rather than hiding the cause.
     fn fail(&mut self, error: String) -> String {
+        if self.finishing {
+            return error;
+        }
+
         let (cause_code, retry) = franchise_utils::classify_failure(&error);
         let mut failure = Failure { request: self.record.request.clone(), phase: self.phase, cause_code, retry };
 
@@ -325,8 +329,8 @@ async fn enter_and_franchise(
     std::env::set_current_dir(absolute_target)
         .map_err(|e| format!("Error while switching to \"{}\": {}", attempt.directory, e))?;
 
-    // Held until the franchise finishes or its failure is recorded: a resume run meanwhile waits
-    // for it rather than clearing an attempt in flight.
+    // Held until the franchise finishes or its failure is recorded: a resume run meanwhile is
+    // refused (the lock is never waited for) rather than clearing an attempt in flight.
     let _lock = lock_utils::WarehouseLock::acquire()?;
 
     let previous = readmit(&attempt.directory, absolute_target, &attempt.record.url, &expected)?;
@@ -364,11 +368,22 @@ fn readmit(directory: &str, absolute_target: &Path, url: &str, expected: &Expect
 
 /// Clear what an earlier attempt left (see `franchise_utils::prepare_resume`) and record this
 /// attempt's start: its request, its trust binding, and the census its progress is measured from.
+/// Until the start is recorded, a failure records the earlier attempt's import and census, so a
+/// resume that fails while clearing claims nothing it did not keep.
 fn start_attempt(attempt: &mut FranchiseAttempt,
                  absolute_target: &Path,
                  previous: Option<&FranchiseRecord>,
                  keep_bundles: bool) -> Result<(), String> {
-    franchise_utils::prepare_resume(absolute_target, previous, keep_bundles)?;
+    if let Some(previous) = previous {
+        attempt.record.bundle_imported = previous.bundle_imported;
+        attempt.record.start_census = previous.start_census;
+        attempt.bundle_imported_at_start = previous.bundle_imported;
+    }
+
+    let discarded = franchise_utils::prepare_resume(absolute_target, previous, keep_bundles)?;
+
+    // A discarded store took the imported objects with it: the bundle is imported again.
+    let keep_bundles = keep_bundles && !discarded;
 
     attempt.record.bundle_imported = keep_bundles;
     attempt.bundle_imported_at_start = keep_bundles;
@@ -486,6 +501,7 @@ async fn franchise_into_prepared_target(
             config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, &url, ConfigScope::Warehouse)?;
         }
 
+        attempt.finishing = true;
         franchise_utils::finish(&attempt.forklift)?;
 
         report.pallet = pallet_name;
@@ -546,6 +562,7 @@ async fn franchise_into_prepared_target(
         tree failed. If the same path keeps failing, resume with --only to route around it)",
     ))?;
     operation_utils::finish()?;
+    attempt.finishing = true;
     franchise_utils::finish(&attempt.forklift)?;
 
     report.pallet = pallet_name;
@@ -826,5 +843,63 @@ mod tests {
 
         let other = CoreError::Other("connection refused".to_string());
         assert_eq!(repin_advice(other.clone(), "clone"), other);
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-franchise-cmd-{}-{}", label, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn attempt(forklift: PathBuf) -> FranchiseAttempt {
+        FranchiseAttempt {
+            directory: "clone".to_string(),
+            forklift,
+            record: FranchiseRecord { attempt: Attempt::Running, last_failure: None, start_census: 0, ..record() },
+            phase: Phase::Prepare,
+            bundle_imported_at_start: false,
+            finishing: false,
+        }
+    }
+
+    /// Once the franchise has begun removing its record the warehouse is complete: a failure past
+    /// that point is reported as it is, and never puts the record back.
+    #[test]
+    fn a_failure_while_finishing_never_writes_the_record_back() {
+        let forklift = temp_dir("finishing").join(".forklift");
+        std::fs::create_dir_all(&forklift).unwrap();
+
+        let mut finishing = attempt(forklift.clone());
+        finishing.finishing = true;
+        assert_eq!(finishing.fail("Error while syncing: EIO".to_string()), "Error while syncing: EIO");
+        assert!(matches!(franchise_utils::read(&forklift), Ok(None)));
+
+        let mut failing = attempt(forklift.clone());
+        let refusal = failing.fail("Error while writing: No space left on device".to_string());
+        assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::FranchiseIncomplete, .. }));
+        assert!(franchise_utils::read(&forklift).unwrap().is_some());
+    }
+
+    /// A resume that fails while clearing what the earlier attempt left records that attempt's
+    /// import and census, never a fresh start it did not make.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_that_fails_while_clearing_keeps_the_earlier_import_and_census() {
+        let root = temp_dir("clearing");
+        let target = root.join("clone");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // A `.forklift` that is a link: the resume refuses to clear through it.
+        std::os::unix::fs::symlink(&elsewhere, target.join(".forklift")).unwrap();
+
+        let previous = FranchiseRecord { bundle_imported: true, start_census: 7, ..record() };
+        let mut resumed = attempt(root.join("record"));
+
+        assert!(start_attempt(&mut resumed, &target, Some(&previous), true).is_err());
+        assert!(resumed.record.bundle_imported);
+        assert!(resumed.bundle_imported_at_start);
+        assert_eq!(resumed.record.start_census, 7);
     }
 }

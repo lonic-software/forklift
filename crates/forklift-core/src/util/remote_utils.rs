@@ -2224,12 +2224,16 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     }
 }
 
-/// Whether `message` reports a failure retrying may get past: a timeout or a server error (`5xx`)
-/// as this module composes them, anywhere in the message (a caller may have wrapped it). A
-/// connection that failed outright reads like any other `Error while …` and is not recognized:
-/// a caller that bounds its retries treats it as unclassified, never a local failure as transient.
+/// What a transport failure that is not a timeout says after its action: a reset, a refused
+/// connect, a DNS or TLS failure. Its own words, so [`is_transient_failure`] can tell it from a
+/// local `Error while …`.
+const CONNECTION_FAILED: &str = "the connection to the remote failed: ";
+
+/// Whether `message` reports a failure retrying may get past: a timeout, a connection that failed
+/// or a server error (`5xx`) as this module composes them, anywhere in the message (a caller may
+/// have wrapped it). Never a local failure, whatever its text quotes.
 pub fn is_transient_failure(message: &str) -> bool {
-    if message.contains("Timed out while ") {
+    if message.contains("Timed out while ") || message.contains(&format!(": {}", CONNECTION_FAILED)) {
         return true;
     }
 
@@ -2623,7 +2627,7 @@ impl RemoteClient {
                     action
                 ),
             },
-            TransportFailure::Other => format!("Error while {}: {}", action, Self::root_cause(&e)),
+            TransportFailure::Other => format!("Error while {}: {}{}", action, CONNECTION_FAILED, Self::root_cause(&e)),
         }
     }
 
@@ -2664,7 +2668,7 @@ impl RemoteClient {
                 action, self.budgets.connect
             ),
             TransportFailure::ReadTimedOut => Self::mutation_read_timeout_message(action),
-            TransportFailure::Other => format!("Error while {}: {}", action, Self::root_cause(&e)),
+            TransportFailure::Other => format!("Error while {}: {}{}", action, CONNECTION_FAILED, Self::root_cause(&e)),
         }
     }
 
@@ -7139,6 +7143,7 @@ mod tests {
         assert!(!is_transient_failure(&refused));
         assert!(!is_transient_failure("Error while writing \"x (500): y\": No space left on device"));
         assert!(is_transient_failure("Timed out while fetching objects: the remote did not respond."));
+        assert!(is_transient_failure(&format!("Error while downloading the bundle: {}connection reset", CONNECTION_FAILED)));
     }
 
     /// A code a newer server sends that this client does not know degrades to a generic error
@@ -9782,6 +9787,7 @@ mod tests {
             "must name something useful about the actual cause, not a generic wrapper message: {}",
             message
         );
+        assert!(is_transient_failure(&message), "a refused connection is worth retrying as is: {}", message);
     }
 
     /// A remote that accepts the connection, reads the request in full, and then genuinely goes

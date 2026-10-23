@@ -1393,6 +1393,8 @@ changed its anchor in between is refused with `trust_changed`, never adopted. A 
 URL is refused before anything is contacted. The `retry` field of the error's `details` says
 whether running the same command again can help (`same`, `unknown`) or whether it fails the same
 way (`change`), and `next_step` spells out the command. To give up instead, delete the directory.
+Until the franchise finishes the directory belongs to it: a resume deletes everything in it but the
+fetched objects (and a finished bundle download), files added there since the failure included.
 
 Any *parent* directories needed for a nested target path (e.g. `some/new/path`) are created the
 ordinary way and left standing. Claiming the target directory is exclusive: franchise builds
