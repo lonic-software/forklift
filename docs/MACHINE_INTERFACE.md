@@ -748,7 +748,7 @@ Example session:
   held-heads record (`.forklift/held-heads`, the remote heads it lifted to or adopted) writes a
   `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
   result stands and its exit code is unchanged.
-* The same stderr channel carries one other warning, in the same shape:
+* The same stderr channel also carries a maintenance warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
   "Resolve the reported cause; …" }`. It means background auto-maintenance could not even decide
   whether it was **due**, so nothing was attempted. The commonest cause is a configuration file
