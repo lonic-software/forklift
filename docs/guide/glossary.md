@@ -174,7 +174,8 @@ past it, the bay is **behind** until `shift` catches it up.
 
 **Incomplete load.** A `load` that was interrupted. It leaves a record behind, and the commands that
 record a parcel (`stack`, `park`, `consolidate`, `cherry-pick`) refuse until the load is finished
-(exit 20), so a half-staged change is never recorded.
+(exit 20), so a half-staged change is never recorded. The same exit code also means an
+interrupted [operation](#durability-and-recovery) is still standing; `heal` resolves that one.
 
 **Ignore file** (git: `.gitignore`). `.forkliftignore`, the patterns of files Forklift should not
 track.
@@ -202,8 +203,9 @@ back to it.
 an agent) stack checkpoints on a draft pallet. Delivering it squashes them into one parcel, and the
 draft's history (the trail) stays browsable.
 
-**Optimistic lift** (git: none). When `lift` finds the remote has moved, and the two sides changed
-disjoint files, it lowers, consolidates and retries on its own.
+**Optimistic lift** (git: none). When `lift` finds the remote has moved, the working directory is
+clean, and the two sides merge without conflict, it lowers, consolidates and retries on its own.
+Edits that overlap still stop with *diverged*.
 
 **Park** (git: `stash`). Saves staged and unstaged changes as a **parked parcel** and resets to the
 head. `park pop` re-applies them, and reports a conflict if the files they touch changed since.
@@ -240,8 +242,9 @@ content is still ordinary history.
 
 **scope-prune** (git: none). Narrows the fetch scope and deletes the content that falls out of it,
 to free disk. This is safe only for content the remote still holds, because the remote is where
-`expand` gets it back. So `scope-prune` checks with the remote first, and keeps anything it cannot
-confirm.
+`expand` gets it back. So `scope-prune` asks the remote first, keeps history that was never
+lifted, and refuses, changing nothing, when it cannot reach the remote. It also refuses a path any
+checkout still materializes.
 
 **Held-heads record.** `.forklift/held-heads`: for each working pallet, up to 16 heads this
 warehouse saw the remote accept or serve. Each entry is only a candidate to ask the remote about,
@@ -442,9 +445,10 @@ The report says what changed, such as a re-genesis or an unrelated warehouse.
 
 **Re-genesis** (trust reset). Recovery for an office no one can sign any more: a new genesis, with
 the old history kept as **attested** (readable, but no longer verified). It is deliberately loud.
-An admin runs `office regenesis --confirm` (without `--confirm` it only explains what would
-happen), and each clone must accept it explicitly with
-`office accept-regenesis --confirm <genesis>`.
+`office regenesis --confirm` creates a new root for the configured operator; it needs no admin,
+since there is none left (without `--confirm` it only explains what would happen). A remote accepts
+the reset only from the server operator's static token. Each clone must then accept it explicitly
+with `office accept-regenesis --confirm <genesis>`.
 
 **Audit** (git: none; loosely `verify-commit` plus `fsck`). Checks signed history offline: the
 office chain from genesis, then every parcel's signature against the office. A server runs the same
@@ -468,7 +472,9 @@ provenance. It never changes the parcel itself.
 **Cell.** One signed value at one path in a meta pallet. Every changed cell must be stamped with the
 key that signed the parcel changing it.
 
-**Replay** (git: none). How meta pallets sync. Diverged meta pallets are never merged: your net
+**Replay** (git: none). How `@kv`, `@manifest`, `@tags` and `@haul` sync. (`@office` is not
+replayed: it syncs as trust, and a diverged office is a trust refusal.) Diverged meta pallets are
+never merged: your net
 change since the common ancestor is replayed onto the remote's head as one new parcel, re-signed
 with your current key.
 
@@ -492,7 +498,8 @@ a parcel. Only an admin can create one, and it can never be moved or deleted.
 **Haul** (git: none; like a pull request). A reviewable proposal to merge one pallet into another
 in the same warehouse, stored as signed cells on `@haul`. It is open, closed or merged.
 
-**Haul id.** The hash of the haul's opening record. Any unique prefix works.
+**Haul id.** The hash of the haul's opening record. Most `haul` commands accept a unique prefix;
+`lower --keep` needs the full 64-character id.
 
 **Opener.** The operator who opened a haul, and the only one who may move its proposed head
 (`haul update`).
@@ -533,8 +540,10 @@ Context Protocol.
 **Exit code.** The number a command exits with, which scripts switch on. 0 is success, 1
 unclassified, 2 a usage error. 128+n means the process was killed by signal n (130 is Ctrl-C);
 Forklift never exits 130 on its own, and stdout may then be empty. Forklift's own refusals have
-stable codes from 3 upward, such as 6 (warehouse locked), 21 (durability taint) and 22 (trust changed). The full list is
-in [errors.md](../generated/errors.md).
+stable codes from 3 upward, such as 6 (warehouse locked), 21 (durability taint) and 22 (trust
+changed). Only a script that runs `forklift` directly should switch on those numbers; one that runs
+it through another tool, such as Pult, classifies by the tool name and error code instead. The full
+list is in [errors.md](../generated/errors.md).
 
 **Error code.** The stable name of a refusal in `--json` output, such as `warehouse_locked`. Each
 has an exit code.
