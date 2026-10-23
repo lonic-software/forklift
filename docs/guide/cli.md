@@ -1606,6 +1606,13 @@ scope has already narrowed but some objects are left behind. Running `scope-prun
 *same* path resumes rather than refusing "not a fetched path" — it finishes freeing whatever is
 left, or reports there is nothing left to free.
 
+`lift` and `lower` keep a small record of the remote heads they landed or were served
+(`.forklift/held-heads`, at most 16 per pallet), so that a prune can later ask the remote about
+history its current heads no longer reach; nothing reads it yet. A `lift` or `lower` that cannot
+write the record prints a `held_head_unrecorded` warning and keeps its result and exit code. A
+record that does not parse can be removed: it only names heads to ask the remote about, and the
+next `lift` or `lower` starts a new one.
+
 ---
 
 ## 7. Identity, signing, and agents

@@ -851,6 +851,33 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
     }
 }
 
+/// The `--json` warning code for a remote head that a lift landed or a lower was served but that
+/// could not be added to the held-heads record.
+pub const CODE_HELD_HEAD_UNRECORDED: &str = "held_head_unrecorded";
+
+/// What to do about [`CODE_HELD_HEAD_UNRECORDED`]. The record only nominates heads for a later
+/// prune to ask the remote about, so the command's own work stands.
+pub const HELD_HEAD_UNRECORDED_NEXT_STEP: &str =
+    "Resolve the reported cause; a held-heads record that does not parse can be removed, and the \
+     next lift or lower starts a new one. The command's own work is unaffected.";
+
+/// Surface a remote head left out of the held-heads record, on the stderr side-channel the other
+/// warnings use: the command succeeded, and the exit code stays its own.
+pub fn warn_held_head_unrecorded(error: &str) {
+    eprintln!("{}", held_head_unrecorded_warning_text(mode(), error));
+}
+
+/// The pure half of [`warn_held_head_unrecorded`], asserted in both modes without capturing stderr.
+fn held_head_unrecorded_warning_text(mode: OutputMode, error: &str) -> String {
+    match mode {
+        OutputMode::Human => format!(
+            "Warning: the remote head was not recorded for a later prune. {} {}",
+            forklift_core::error::sanitize_lines(error), HELD_HEAD_UNRECORDED_NEXT_STEP
+        ),
+        OutputMode::Json => warning_envelope(CODE_HELD_HEAD_UNRECORDED, error, HELD_HEAD_UNRECORDED_NEXT_STEP, None),
+    }
+}
+
 /// Announce a trust anchor adopted on first contact (`lower`, `franchise`). Adoption is never
 /// silent: this names the adopted value, so a reader can check it out of band, and under `--json`
 /// it is a warning document on stderr whose `details` carry the value — the command's own result
@@ -1103,6 +1130,21 @@ mod tests {
             value["next_step"].as_str().unwrap().contains("forklift heal"),
             "next_step: {}", value["next_step"]
         );
+    }
+
+    #[test]
+    fn the_held_head_unrecorded_warning_carries_the_cause_in_both_modes() {
+        let error = "Error while reading \"/warehouse/.forklift/held-heads\": permission denied";
+
+        let human = held_head_unrecorded_warning_text(OutputMode::Human, error);
+        assert!(human.contains(error), "the human line must carry the cause: {}", human);
+        assert!(human.contains("not recorded for a later prune"), "human text: {}", human);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&held_head_unrecorded_warning_text(OutputMode::Json, error)).unwrap();
+        assert_eq!(value["warning"], "held_head_unrecorded");
+        assert_eq!(value["message"], error);
+        assert!(value["next_step"].as_str().unwrap().contains("unaffected"), "next_step: {}", value["next_step"]);
     }
 
     /// The sibling of the test above, for the second warning on the same channel. The `Human` arm
