@@ -11,9 +11,9 @@
 //! The file lives in the shared forklift root beside the fetched-heads ledger, so every bay records
 //! into one, and is a [`record_utils`] file of `<head> <pallet>` lines, oldest first. Per pallet it
 //! keeps at most [`CAP_PER_PALLET`] heads: a new head replaces the recorded heads it descends from,
-//! and past the cap the oldest go. Writes are serialized by the
-//! [`RefLock`](crate::util::lock_utils::RefLock) and replace the file atomically, so a lock-free
-//! reader sees one whole version. A file that does not parse is an error, never an empty record.
+//! a head recorded again moves to the newest, and past the cap the oldest go. Writes are
+//! serialized by the [`RefLock`](crate::util::lock_utils::RefLock) and replace the file
+//! atomically, so a lock-free reader sees one whole version. A file that does not parse is an error, never an empty record.
 
 use std::path::PathBuf;
 use crate::globals;
@@ -177,9 +177,9 @@ mod tests {
         record_held_head("@office", &hash(4)).unwrap();
 
         assert_eq!(read_held_heads().unwrap(), vec![
-            HeldHead { head: hash(1), pallet: "main".to_string() },
             HeldHead { head: hash(2), pallet: "feature/x".to_string() },
-        ]);
+            HeldHead { head: hash(1), pallet: "main".to_string() },
+        ], "recording a head again keeps one entry, moved to the newest");
         assert_eq!(candidates("main").unwrap(), vec![hash(1)]);
         assert_eq!(candidates("feature/x").unwrap(), vec![hash(2)]);
     }
