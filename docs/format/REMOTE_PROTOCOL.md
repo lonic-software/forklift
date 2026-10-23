@@ -231,8 +231,10 @@ changes what is fetchable, only how fast.
 
 The raw (uncompressed) object bytes, or `404`. The client verifies the hash before
 storing. A client that falls back from the batch endpoint sends many of these at once, so a
-rate-limited head may answer `429`; the client retries after `Retry-After` (delta-seconds, never
-sooner than its own backoff) for a bounded time, then fails with that answer.
+rate-limited head may answer `429`. The client retries after `Retry-After` (delta-seconds, never
+sooner than its own backoff, plus a random share of it so a wave of refused fetches does not
+return at once) for a bounded time, then fails with that answer. It treats a `429` on
+`POST /v1/objects/batch` and on the subtree endpoint the same way.
 
 ### `PUT /v1/objects/{hash}[?session={id}]`
 

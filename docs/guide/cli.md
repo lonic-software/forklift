@@ -1495,7 +1495,7 @@ content and leaves out-of-scope changes sealed by hash, exactly as the franchise
 **A slow or busy remote.** Objects normally arrive in a few large batches. A remote that takes
 longer than about 45 seconds to start answering a batch does not fail the command: the rest of
 that command fetches one object at a time, which is slower but still finishes. A remote that
-rate-limits those single fetches is waited out, for up to 30 seconds per object. The same holds
+rate-limits its fetches is waited out, for up to 30 seconds per request. The same holds
 for every command that fetches (`franchise`, `lower`, `expand`).
 
 `lower <pallet>` names a pallet other than the current one (`palletize --remote` lists the
