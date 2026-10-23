@@ -38,9 +38,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::remote::{
-    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo,
-    LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
+    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
+    PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
@@ -871,8 +872,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ///
     /// Large blobs are only checked for *presence at their canonical key*, which is itself
     /// the proof they were verified: the staging verifier promotes a blob only after the
-    /// same `Blake3(bytes) == hash` check. A blob still sitting in staging simply reads as
-    /// absent, and the client retries once the verifier has caught up.
+    /// same `Blake3(bytes) == hash` check. A blob absent there is probed in the session's
+    /// staging area: still staged means the verifier has not caught up, answered as a `503`
+    /// with `Forklift-Commit: not-ready` that the client retries; gone from both places means
+    /// the upload was discarded (the verifier rejected it) or never sent, a terminal `422`
+    /// whose next step is running the lift again.
     ///
     /// Promotion is idempotent, so a retried commit is safe. Once everything is promoted the
     /// session's staging prefix is swept — but only on the **final** batch (`more == false`). A
@@ -896,40 +900,25 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             match outcome {
                 PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => {}
                 PromoteOutcome::Missing => {
-                    return Err(HeadError::unprocessable(format!(
-                        "Object {} was not uploaded; the lift session is not ready to commit.",
+                    // Not "never arrived": an earlier attempt of this commit whose answer was
+                    // lost may have discarded it as corrupt or too large.
+                    return Err(upload_discarded(format!(
+                        "Object {} is not on the remote: its upload was discarded (rejected as \
+                        corrupt or too large) or never arrived. The lift session cannot commit.",
                         hash
                     )))
                 }
                 PromoteOutcome::Corrupt { actual } => {
-                    return Err(HeadError::unprocessable(format!(
+                    return Err(upload_discarded(format!(
                         "Staged object {} is corrupt (it hashes to {}); it was discarded, not \
-                        promoted, and the lift will not commit.",
+                        promoted, and the lift session cannot commit.",
                         hash, actual
                     )))
                 }
             }
         }
 
-        // One bulk probe instead of one `exists` per blob: a large chunked commit batch can name
-        // thousands of blobs, and a serial walk of them is exactly the pattern that blows API
-        // Gateway's 29 s ceiling. Still reports only the *first* not-yet-promoted blob in `blobs`
-        // order, with the identical message — a bulk probe means every blob is checked (not just
-        // the ones before the first miss), but the response is unchanged: the same one hash named,
-        // in the same case.
-        let not_ready: HashSet<String> =
-            self.objects.objects_missing(blobs).map_err(HeadError::internal)?.into_iter().collect();
-
-        if let Some(hash) = blobs.iter().find(|hash| not_ready.contains(hash.as_str())) {
-            // The one *transient* commit failure: the staging verifier has not promoted this
-            // blob to its canonical key yet. The message embeds `LIFT_SESSION_BLOB_NOT_READY`
-            // so the client can tell this retriable case apart from a terminal one (a
-            // control-plane object never uploaded, or a corrupt staged object) and back off.
-            return Err(HeadError::unprocessable(format!(
-                "Blob {} is {}; the lift session is not ready to commit.",
-                hash, LIFT_SESSION_BLOB_NOT_READY
-            )));
-        }
+        self.check_blobs_promoted(session, blobs)?;
 
         // Sweep the session's staging prefix only when this is the final batch. An intermediate
         // batch (`more`) leaves staging intact so a later batch's still-staged chunks survive to
@@ -946,6 +935,60 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             self.objects.discard_session(session).map_err(HeadError::internal)?;
         }
 
+        Ok(())
+    }
+
+    /// Whether every one of a lift commit's `blobs` is at its canonical key, and if not, which
+    /// answer the commit gets: a terminal `422` (`staged_upload_discarded`) when some blob is in
+    /// neither place, else the retriable `503` not-ready while some blob is still staged. Each
+    /// names the first such blob in `blobs` order.
+    ///
+    /// The probes run canonical, then staged, then canonical again for the blobs found in neither,
+    /// and the last probe is what makes "in neither" sound: a blob promoted between the first two
+    /// probes has left staging, and would otherwise read as discarded. That needs promotion to
+    /// write the canonical key before it drops the staged copy, which S3's `verify_and_promote`
+    /// does on every promoting path; the in-memory store does both under the `objects` lock.
+    ///
+    /// Bulk probes, not one `exists` per blob: a large chunked commit batch can name thousands of
+    /// blobs, and a serial walk of them is exactly the pattern that blows API Gateway's 29 s
+    /// ceiling. The staging and re-probe passes cost nothing unless some blob is missing.
+    fn check_blobs_promoted(&self, session: &str, blobs: &[String]) -> HeadResult<()> {
+        let missing = self.objects.objects_missing(blobs).map_err(HeadError::internal)?;
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let staged: HashSet<String> = self
+            .objects
+            .objects_staged(session, &missing)
+            .map_err(HeadError::internal)?
+            .into_iter()
+            .collect();
+
+        let unstaged: Vec<String> =
+            missing.into_iter().filter(|hash| !staged.contains(hash)).collect();
+
+        let gone: HashSet<String> =
+            self.objects.objects_missing(&unstaged).map_err(HeadError::internal)?.into_iter().collect();
+
+        if let Some(hash) = blobs.iter().find(|hash| gone.contains(hash.as_str())) {
+            return Err(upload_discarded(format!(
+                "Blob {} is not on the remote: its upload was discarded (rejected as corrupt or too \
+                large) or never arrived. The lift session cannot commit.",
+                hash
+            )));
+        }
+
+        if let Some(hash) = blobs.iter().find(|hash| staged.contains(hash.as_str())) {
+            return Err(HeadError::commit_not_ready(format!(
+                "Blob {} is uploaded but the remote has not accepted it into the warehouse yet; \
+                the lift session is not ready to commit.",
+                hash
+            )));
+        }
+
+        // Every blob missing at the first probe was promoted before the re-probe.
         Ok(())
     }
 
@@ -996,8 +1039,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// **The message must not promise automation this crate does not have** (PR #116 review,
     /// finding 4). No client-side retry loop or classifier recognizes this status yet — the
     /// client's `update_ref` (`forklift-core`'s `remote_utils.rs`) has no retry path at all to
-    /// extend, unlike `commit_lift`'s blob-not-ready case, which already owns one
-    /// (`is_transient_commit_failure` plus `commit_one_batch`'s bounded backoff loop); building
+    /// extend, unlike the lift commit, which already owns one (`commit_one_batch`'s deadline-bounded
+    /// loop, keyed on the `Forklift-Commit: not-ready` header this answer never carries); building
     /// an equivalent for ref updates is new retry machinery this design gives to FORK-95 slice
     /// 3 (arm two, claim C14), not this one. So the wording below says "run the push again",
     /// never "retry" bare — an instruction a human (or a script) can act on without implying a
@@ -1088,4 +1131,15 @@ fn require_object_hash(hash: &str) -> HeadResult<()> {
     }
 
     Err(HeadError::unprocessable(REFUSAL_NOT_AN_OBJECT_HASH))
+}
+
+/// A lift commit's terminal refusal for an upload the remote does not hold: discarded by
+/// verification, or never received. Retrying the commit cannot help; running the lift again
+/// uploads it afresh.
+fn upload_discarded(message: String) -> HeadError {
+    HeadError::unprocessable(String::from(CoreError::refusal(
+        RefusalCode::StagedUploadDiscarded,
+        message,
+        "Run the lift again; it uploads the object afresh.",
+    )))
 }

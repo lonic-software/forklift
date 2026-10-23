@@ -67,37 +67,44 @@ impl Status {
 pub struct HeadError {
     pub status: Status,
     pub message: String,
+    /// Set only by [`HeadError::commit_not_ready`]: the adapter answers it with `Retry-After` and
+    /// `Forklift-Commit: not-ready`, the headers a client classifies a lift commit by.
+    pub commit_not_ready: bool,
 }
 
 /// The result of a handler.
 pub type HeadResult<T> = Result<T, HeadError>;
 
 impl HeadError {
+    fn with(status: Status, message: impl Into<String>) -> HeadError {
+        HeadError { status, message: message.into(), commit_not_ready: false }
+    }
+
     /// A `404 Not Found`.
     pub fn not_found(message: impl Into<String>) -> HeadError {
-        HeadError { status: Status::NotFound, message: message.into() }
+        HeadError::with(Status::NotFound, message)
     }
 
     /// A `409 Conflict` — a CAS race or a one-way-door violation.
     pub fn conflict(message: impl Into<String>) -> HeadError {
-        HeadError { status: Status::Conflict, message: message.into() }
+        HeadError::with(Status::Conflict, message)
     }
 
     /// A `401 Unauthorized` — no valid bearer token was presented. The message is the same
     /// whether the header was missing, malformed, or simply wrong: the seam that emits this
     /// must never let a caller distinguish "no token configured" from "wrong token".
     pub fn unauthorized(message: impl Into<String>) -> HeadError {
-        HeadError { status: Status::Unauthorized, message: message.into() }
+        HeadError::with(Status::Unauthorized, message)
     }
 
     /// A `422 Unprocessable Entity` — a verification failure.
     pub fn unprocessable(message: impl Into<String>) -> HeadError {
-        HeadError { status: Status::Unprocessable, message: message.into() }
+        HeadError::with(Status::Unprocessable, message)
     }
 
     /// A `403 Forbidden` — an authorization failure.
     pub fn forbidden(message: impl Into<String>) -> HeadError {
-        HeadError { status: Status::Forbidden, message: message.into() }
+        HeadError::with(Status::Forbidden, message)
     }
 
     /// A lifted office chain that did not verify: a `403` when a parcel the lift brings
@@ -115,13 +122,20 @@ impl HeadError {
 
     /// A `503 Service Unavailable` — a transient refusal (contention, not a moved value).
     pub fn service_unavailable(message: impl Into<String>) -> HeadError {
-        HeadError { status: Status::ServiceUnavailable, message: message.into() }
+        HeadError::with(Status::ServiceUnavailable, message)
+    }
+
+    /// The `503` a lift commit answers while a blob it names is still staged and not yet promoted:
+    /// the one answer a client retries on the remote's word. The signal is the header the adapter
+    /// adds, never the message, so a body that is cut short or rewritten cannot hide it.
+    pub fn commit_not_ready(message: impl Into<String>) -> HeadError {
+        HeadError { commit_not_ready: true, ..HeadError::with(Status::ServiceUnavailable, message) }
     }
 
     /// A `500 Internal Server Error` — a storage-layer failure. Storage errors bubble up
     /// as strings from the traits; this is where they become a status.
     pub fn internal(message: impl Into<String>) -> HeadError {
-        HeadError { status: Status::Internal, message: message.into() }
+        HeadError::with(Status::Internal, message)
     }
 }
 

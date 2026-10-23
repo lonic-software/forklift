@@ -377,12 +377,40 @@ lift is refused (`422`); it never becomes fetchable, because it was never at the
 begin with. Large blobs are **checked for presence at the canonical key only** — which is
 itself the proof they were verified, since the staging verifier (an out-of-band worker
 running the same verify-and-promote) is the only thing that could have put them there. A
-blob still sitting in staging simply reads as absent, and the client retries once the
-verifier has caught up.
+blob absent there is looked up in the session's staging area: still staged means the
+verifier has not caught up yet; in neither place means its upload was discarded (the
+verifier rejected it) or never arrived. The head probes the canonical key once more before
+calling a blob gone, so a blob promoted between the two probes is never refused.
 
-`200` when the session is ready to commit; `422` with the offending hash when an object is
-missing, still unverified, or corrupt. Promotion is idempotent, so a retried commit is safe.
-On success the session's staging prefix is swept.
+The answers:
+
+| Status | Meaning | Client |
+|---|---|---|
+| `200` | The session is ready to commit. On the final batch the staging prefix is swept. | Proceed to the ref update. |
+| `503` with `Forklift-Commit: not-ready` and `Retry-After` | Some blob is still staged, not yet verified. | Retry the identical request. |
+| `422` with code `staged_upload_discarded` | An object is in neither place, or a control-plane object was corrupt and has been discarded. Retrying can never succeed. | Stop; running the lift again uploads it afresh. |
+| `429` | Rate limited. | Retry after `Retry-After` (delta-seconds). |
+| other `5xx` | Says nothing about the session. | Retry. |
+
+A refusal is always a `4xx`; no `5xx` from this endpoint is one. A client classifies the
+answer from the **status line and headers alone**: the not-ready
+signal is the header, never the body, so a `503` whose body is cut off is still a not-ready
+answer. Only a terminal `4xx` body is read, for its framed code. Promotion is idempotent, so
+every retry is safe, and the reference client bounds its retrying with one deadline per
+commit batch rather than a fixed attempt count. It also retries a `408` (an intermediary gave
+up before the remote answered), any connect that failed before sending anything (refused,
+unreachable, a name that did not resolve) other than a TLS handshake it rejected, and a
+connection reset or cut off after sending; it does not retry a rejected TLS handshake or an
+answer it cannot parse, which would only repeat. The commit never moves a ref; whatever its
+outcome, the remote pallet is untouched until the ref update that follows.
+
+**Mismatched versions, both directions.** An older client retried only a `422` carrying its
+not-ready marker in the body, so it fails at once on the `503` rather than waiting for the
+verifier, and reads a discarded upload's `422` as an ordinary refusal. An older head answers
+a still-staged blob with that marked `422`, which a newer client treats as terminal: the lift
+again fails at once. Either way the remedy is running the lift again once the verifier has
+caught up. Neither direction can move a ref or lose data; the head
+and the client should still be deployed together.
 
 The endpoint is **additive and head-specific**: the `forklift-server` head verifies every
 `PUT` inline (a returned `PUT` means the object is present and verified), so it does not

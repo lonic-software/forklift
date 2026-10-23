@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 4,
+  "schema": 5,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 4,
+  "schema": 5,
   "command": "stocktake",
   "ok": false,
   "error": {
@@ -82,7 +82,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 4** (current): a franchise that fails after claiming its directory keeps it and exits
+**Schema 5** (current): the `staged_upload_discarded` error code exists (exit 32), and a lift
+whose commit the remote keeps answering "not ready" fails at a deadline instead of after a fixed
+attempt count.
+
+**Schema 4**: a franchise that fails after claiming its directory keeps it and exits
 `franchise_incomplete` (exit 30, with `details`), which every other command run there also
 refuses with until `franchise` is run again; and a sparse franchise's `--only` path that is not a
 directory in the pallet refuses with `only_prefix_not_found` (exit 31).
@@ -389,6 +393,16 @@ pallet head that is not an object hash in its canonical spelling (64 lowercase h
 is refused with `remote_protocol_violation` (exit 23). It is not a transport failure: retrying
 gets the same answer, so an agent stops and reports it instead. The message does not repeat the
 remote's value.
+
+### A lift whose upload the remote lost: `staged_upload_discarded`
+
+Against a remote where uploads go straight to storage, a lift commits its uploads before it moves
+the pallet. When the remote no longer holds one of them — its verifier rejected the bytes, or they
+never arrived — the lift is refused with `staged_upload_discarded` (exit 32). The remote's pallet
+was not moved, and retrying the same commit can never succeed; running the lift again uploads the
+object afresh. A remote that is merely slow to accept an upload is waited for instead, up to a
+deadline; running out of it is an unclassified, retryable failure that also leaves the remote's
+pallet unmoved.
 
 A first-contact adoption is not a refusal: the command succeeds, reports the genesis as
 `data.adopted_genesis`, and writes a `trust_adopted` warning (below) with the same `details`

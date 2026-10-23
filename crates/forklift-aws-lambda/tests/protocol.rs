@@ -25,6 +25,7 @@ use forklift_aws_lambda::store::{
 };
 use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
 
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{RefUpdateRequest, TrustAnchorDto};
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
@@ -972,6 +973,7 @@ fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
         .commit_lift("lift-1", &[good_hash.clone(), corrupt_hash.clone()], &[], false)
         .expect_err("corrupt control-plane object");
     assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::StagedUploadDiscarded), "{}", err.message);
 
     // ...and the corrupt bytes are gone, never having reached the hash key.
     let err = head.object_get(&corrupt_hash).expect_err("corrupt bytes were discarded");
@@ -991,13 +993,24 @@ fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
     assert_eq!(head.objects.staged_count(), 0, "staging is swept after a commit");
     head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[], false).expect("retried commit");
 
-    // A commit naming an object that was never staged is "not ready".
+    // A commit naming an object that was never staged is refused the same way: its upload is
+    // not on the remote, and only running the lift again can put it there.
     let err = head.commit_lift("lift-1", &["f".repeat(64)], &[], false).expect_err("missing object");
     assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::StagedUploadDiscarded), "{}", err.message);
+}
+
+/// The discarded-upload refusal's framed code, read back the way the client reads it.
+fn refusal_code(message: &str) -> Option<RefusalCode> {
+    match CoreError::from(message.to_string()) {
+        CoreError::Refusal { code, .. } => Some(code),
+        CoreError::Other(_) => None,
+    }
 }
 
 /// A blob is presence-checked at its *canonical* key, which is the proof the staging
-/// verifier already hash-checked it: a blob still in staging reads as not-yet-ready.
+/// verifier already hash-checked it: a blob still in staging is not ready yet, which the head
+/// answers with the retryable not-ready `503`, never a terminal refusal.
 #[test]
 fn a_blob_still_in_staging_is_not_ready_to_commit() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
@@ -1011,7 +1024,9 @@ fn a_blob_still_in_staging_is_not_ready_to_commit() {
     let err = head
         .commit_lift("lift-1", &[], std::slice::from_ref(&blob_hash), false)
         .expect_err("unpromoted blob");
-    assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert!(err.commit_not_ready, "the adapter answers it with the not-ready header");
+    assert!(err.message.contains(&blob_hash), "{}", err.message);
 
     // The staging verifier promotes it out of band — the same trait operation the control
     // plane uses for small objects — and the commit then succeeds.
@@ -1019,6 +1034,96 @@ fn a_blob_still_in_staging_is_not_ready_to_commit() {
     assert_eq!(outcome, PromoteOutcome::Promoted);
 
     head.commit_lift("lift-1", &[], &[blob_hash], false).expect("the blob is verified and present");
+}
+
+/// A blob in neither place — its upload discarded by the verifier, or never sent — can never
+/// commit, and the head says so with the framed discarded code rather than "not ready".
+#[test]
+fn a_blob_in_neither_place_is_refused_as_discarded() {
+    let head = Head::new(MemoryObjectStore::with_redirect("https://s3.example/bucket"), MemoryRefStore::new());
+    let blob_hash = object_utils::hash_object_bytes(b"never uploaded");
+
+    let err = head
+        .commit_lift("lift-1", &[], std::slice::from_ref(&blob_hash), false)
+        .expect_err("absent blob");
+
+    assert_eq!(err.status, Status::Unprocessable);
+    assert!(!err.commit_not_ready, "a discarded upload is terminal");
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::StagedUploadDiscarded), "{}", err.message);
+    assert!(err.message.contains(&blob_hash), "{}", err.message);
+}
+
+/// A staged blob whose bytes the verifier rejects goes from not-ready to discarded, and the lift
+/// run again — uploading it afresh — commits.
+#[test]
+fn a_corrupt_staged_blob_turns_not_ready_into_discarded_and_a_fresh_upload_commits() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+    let blob = b"the declared blob".to_vec();
+    let blob_hash = object_utils::hash_object_bytes(&blob);
+    store.stage("lift-1", &blob_hash, b"bytes that are not it".to_vec());
+    let head = Head::new(store, MemoryRefStore::new());
+    let commit = || head.commit_lift("lift-1", &[], std::slice::from_ref(&blob_hash), false);
+
+    assert_eq!(commit().expect_err("still staged").status, Status::ServiceUnavailable);
+
+    let outcome = head.objects.verify_and_promote("lift-1", &blob_hash).expect("verify");
+    assert!(matches!(outcome, PromoteOutcome::Corrupt { .. }), "{:?}", outcome);
+    let err = commit().expect_err("the upload was discarded");
+    assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::StagedUploadDiscarded), "{}", err.message);
+
+    head.objects.stage("lift-2", &blob_hash, blob);
+    head.objects.verify_and_promote("lift-2", &blob_hash).expect("verify the fresh upload");
+    head.commit_lift("lift-2", &[], &[blob_hash], false).expect("the fresh upload commits");
+}
+
+/// A store whose staged-upload probe sees the verifier promote every blob it is asked about just
+/// before it answers, in the order the verifier writes: canonical copy first, staged copy dropped
+/// after. A blob absent at canonical and no longer staged may have been promoted in between.
+struct PromotesDuringTheStagedProbe {
+    inner: MemoryObjectStore,
+}
+
+impl ObjectStore for PromotesDuringTheStagedProbe {
+    fn exists(&self, hash: &str) -> Result<bool, String> {
+        self.inner.exists(hash)
+    }
+
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        for hash in hashes {
+            self.inner.verify_and_promote(session, hash)?;
+        }
+        self.inner.objects_staged(session, hashes)
+    }
+
+    fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.get(hash)
+    }
+
+    fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {
+        self.inner.put_verified(hash, bytes)
+    }
+
+    fn get_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.get_signature(parcel_hash)
+    }
+
+    fn put_signature(&self, parcel_hash: &str, bytes: &[u8]) -> Result<SignatureOutcome, String> {
+        self.inner.put_signature(parcel_hash, bytes)
+    }
+}
+
+/// A blob promoted between the canonical probe and the staged probe is found by the canonical
+/// re-probe: the commit succeeds, and is never refused as discarded.
+#[test]
+fn a_blob_promoted_between_the_probes_commits() {
+    let inner = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+    let blob = b"a blob the verifier is about to promote".to_vec();
+    let blob_hash = object_utils::hash_object_bytes(&blob);
+    inner.stage("lift-1", &blob_hash, blob);
+    let head = Head::new(PromotesDuringTheStagedProbe { inner }, MemoryRefStore::new());
+
+    head.commit_lift("lift-1", &[], &[blob_hash], false).expect("promoted mid-check");
 }
 
 /// The commit-pagination sweep-ordering fix (§9.4b Stage 3): an intermediate commit batch
@@ -1571,11 +1676,9 @@ fn upload_targets_negotiates_a_large_batch_matching_current_semantics() {
     assert_eq!(answer.targets.len(), expected_direct.len());
 }
 
-/// `Head::commit_lift`'s blob-presence loop now resolves via the same bulk probe instead of one
-/// `exists` per blob. Over a batch of hundreds with a scattered few not yet promoted, the error
-/// must be byte-for-byte what the old per-hash loop produced: refused, naming exactly the
-/// *first* not-ready blob in `blobs` order (the loop's early-exit behavior, not "every missing
-/// blob" — unlike the chunk-closure audit, this endpoint's contract is unchanged).
+/// `Head::commit_lift`'s blob-presence check resolves via the same bulk probe instead of one
+/// `exists` per blob. Over a batch of hundreds with a scattered few in neither place, the
+/// refusal names exactly the *first* such blob in `blobs` order, not every missing blob.
 #[test]
 fn commit_lift_blobs_presence_check_matches_current_semantics_over_a_large_batch() {
     let store = MemoryObjectStore::new();
@@ -1597,6 +1700,7 @@ fn commit_lift_blobs_presence_check_matches_current_semantics_over_a_large_batch
         .commit_lift("lift-1", &[], &blobs, false)
         .expect_err("not every blob is promoted yet");
     assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::StagedUploadDiscarded), "{}", err.message);
     // The *first* absent blob in `blobs` order — index 12, not 200 or 480.
     assert!(err.message.contains(&blobs[absent_indices[0]]), "{}", err.message);
     assert!(!err.message.contains(&blobs[absent_indices[1]]), "{}", err.message);
@@ -1637,6 +1741,10 @@ impl ObjectStore for AsyncObjectStore {
 
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         self.bridge.block_on(suspending(|| self.inner.get(hash)))
+    }
+
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        self.bridge.block_on(suspending(|| self.inner.objects_staged(session, hashes)))
     }
 
     fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {

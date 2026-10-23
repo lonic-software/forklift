@@ -30,14 +30,18 @@ pub const MAX_MISSING_BATCH: usize = 10_000;
 /// (`forklift-server`) all read this one number so they can never drift.
 pub const MAX_UPLOAD_TARGETS_BATCH: usize = 1_000;
 
-/// The stable, refactor-safe marker every storage-backed head embeds in the `422` it answers
-/// when a lift session's blob is still being verified and promoted out of band (the staging
-/// verifier has not caught up yet). It is the one *transient* commit failure — distinct from a
-/// control-plane object that was never uploaded, or a corrupt staged object, both of which are
-/// terminal — so the client keys its bounded commit retry on this phrase rather than the exact
-/// wording of the whole message. The head builds its message around this constant; the client
-/// (`remote_utils::commit_lift`) matches on it. Changing it changes both sides at once.
-pub const LIFT_SESSION_BLOB_NOT_READY: &str = "not yet verified and promoted";
+/// The response header a storage-backed head sets, with the value [`LIFT_COMMIT_NOT_READY`], on the
+/// `503` it answers a lift commit while a blob the batch names is still staged and not yet promoted
+/// (the staging verifier has not caught up). It is the remote's own word that retrying can help,
+/// and it lives in the header section rather than the body so that a body cut short or rewritten
+/// in transit cannot turn a retriable answer into a terminal one. A client classifies a commit from
+/// the status line and headers alone: a `503` without this header is still retried, but as an
+/// answer of undetermined meaning. Header names are case-insensitive; this is the lower-case form.
+pub const LIFT_COMMIT_HEADER: &str = "forklift-commit";
+
+/// The value of [`LIFT_COMMIT_HEADER`] meaning "a staged copy exists and is not promoted yet". It
+/// promises only that the copy exists, not that it will ever be promoted.
+pub const LIFT_COMMIT_NOT_READY: &str = "not-ready";
 
 /// The `GET /v1/warehouse` handshake: protocol version, refs and trust in one round trip.
 #[derive(Serialize, Deserialize)]

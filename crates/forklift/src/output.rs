@@ -34,7 +34,9 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 4 (this one): the `franchise_incomplete` (with `details`) and `only_prefix_not_found`
+/// Version 5 (this one): the `staged_upload_discarded` error code exists, and a lift whose commit
+/// the remote keeps answering "not ready" fails at a deadline instead of after a fixed attempt count.
+/// Version 4: the `franchise_incomplete` (with `details`) and `only_prefix_not_found`
 /// error codes exist. A failed franchise keeps its directory and exits `franchise_incomplete`.
 /// Version 3: `lower` and `franchise` report the adopted trust anchor as
 /// `adopted_genesis` (present only on first contact) in place of the `adopted_anchor` flag, and
@@ -44,7 +46,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -457,6 +459,10 @@ error_codes! {
 
     /// A sparse franchise's `--only` prefix names no directory in the pallet on the remote.
     OnlyPrefixNotFound,
+
+    /// A lift's commit named a blob the remote holds neither staged nor in the warehouse: the
+    /// upload was discarded or never arrived. Running the lift again uploads it afresh.
+    StagedUploadDiscarded,
 }
 
 impl ErrorCode {
@@ -493,6 +499,7 @@ impl ErrorCode {
             ErrorCode::PalletNotFound => RefusalCode::PalletNotFound.as_str(),
             ErrorCode::FranchiseIncomplete => RefusalCode::FranchiseIncomplete.as_str(),
             ErrorCode::OnlyPrefixNotFound => RefusalCode::OnlyPrefixNotFound.as_str(),
+            ErrorCode::StagedUploadDiscarded => RefusalCode::StagedUploadDiscarded.as_str(),
         }
     }
 
@@ -532,6 +539,7 @@ impl ErrorCode {
             ErrorCode::PalletNotFound => 29,
             ErrorCode::FranchiseIncomplete => 30,
             ErrorCode::OnlyPrefixNotFound => 31,
+            ErrorCode::StagedUploadDiscarded => 32,
         }
     }
 
@@ -612,6 +620,9 @@ impl ErrorCode {
                  \"franchise\" again resumes it and keeps what was fetched",
             ErrorCode::OnlyPrefixNotFound =>
                 "A sparse franchise's --only path is not a directory in the pallet on the remote",
+            ErrorCode::StagedUploadDiscarded =>
+                "A lift's commit named an upload the remote no longer holds (discarded or never \
+                 received); running the lift again uploads it afresh",
         }
     }
 
@@ -647,6 +658,7 @@ impl ErrorCode {
             RefusalCode::PalletNotFound => ErrorCode::PalletNotFound,
             RefusalCode::FranchiseIncomplete => ErrorCode::FranchiseIncomplete,
             RefusalCode::OnlyPrefixNotFound => ErrorCode::OnlyPrefixNotFound,
+            RefusalCode::StagedUploadDiscarded => ErrorCode::StagedUploadDiscarded,
         }
     }
 }
@@ -1038,6 +1050,7 @@ mod tests {
             (RefusalCode::PalletNotFound, "pallet_not_found", 29),
             (RefusalCode::FranchiseIncomplete, "franchise_incomplete", 30),
             (RefusalCode::OnlyPrefixNotFound, "only_prefix_not_found", 31),
+            (RefusalCode::StagedUploadDiscarded, "staged_upload_discarded", 32),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

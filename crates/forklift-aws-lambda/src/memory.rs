@@ -98,6 +98,16 @@ impl ObjectStore for MemoryObjectStore {
         Ok(self.objects.lock().unwrap().contains_key(hash))
     }
 
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        let staged = self.staged.lock().unwrap();
+
+        Ok(hashes
+            .iter()
+            .filter(|hash| staged.contains_key(&(session.to_string(), hash.to_string())))
+            .cloned()
+            .collect())
+    }
+
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         self.reads.fetch_add(1, Ordering::Relaxed);
 

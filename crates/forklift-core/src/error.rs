@@ -231,6 +231,12 @@ refusal_codes! {
     /// A sparse franchise's `--only` prefix names no directory in the pallet's head on the remote.
     /// Retrying gets the same answer: the prefix (or the pallet) has to change.
     OnlyPrefixNotFound => "only_prefix_not_found",
+
+    /// A lift's commit named a blob the remote holds neither in its staging area nor in the
+    /// warehouse: the upload was discarded (the remote rejected it as corrupt or too large) or never
+    /// arrived. Retrying the commit gets the same answer; running the lift again uploads the blob
+    /// afresh.
+    StagedUploadDiscarded => "staged_upload_discarded",
 }
 
 impl RefusalCode {

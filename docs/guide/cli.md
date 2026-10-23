@@ -1461,6 +1461,14 @@ lot of small tracked files at once) needs a remote that understands paginated co
 remote that doesn't, `lift` refuses up front, before uploading anything
 (`commit_pagination_unsupported`, exit 16) — upgrade the remote, or lift in smaller stages.
 
+**Lifting to a serverless remote.** There, uploads go straight to storage and the remote checks
+them before the lift may move the pallet. A remote that has not finished checking an upload is
+waited for, up to about two minutes (for each batch of the commit, when a very large lift sends
+several); past that, the lift fails without moving the remote's
+pallet, and running it again is safe. An upload the remote rejected or never received fails the
+lift at once (`staged_upload_discarded`, exit 32), again without moving anything: run the lift
+again, which uploads it afresh.
+
 ### `lower` — pull (`lo`)
 
 ```sh

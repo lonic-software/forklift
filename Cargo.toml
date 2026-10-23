@@ -55,6 +55,13 @@ rand = "0.8"
 # zstd decoder's window (up to 128 MiB under a hostile frame) would sit beneath every response
 # cap in util/body_utils.rs. gzip's window is a fixed 32 KiB (FORK-80).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "socks", "stream"] }
+# Already in the tree under reqwest, at the same version; named directly only so a transport
+# error's source chain can be asked whether the remote closed before its answer was complete.
+hyper = { version = "1", default-features = false }
+# Likewise under reqwest, and for the same reason: so a transport error's source chain can be
+# asked whether the TLS handshake was rejected. No features: the crypto provider stays reqwest's
+# choice (and aws-lc stays out of the tree).
+rustls = { version = "0.23", default-features = false }
 percent-encoding = "2"
 regex = "1.10.6"
 # Canonical decomposition for the case-alias candidate key (alias_utils::fold_key).

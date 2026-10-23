@@ -26,6 +26,8 @@ crc32fast = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+hyper = { workspace = true }
+rustls = { workspace = true }
 percent-encoding = { workspace = true }
 regex = { workspace = true }
 unicode-normalization = { workspace = true }
