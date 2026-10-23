@@ -107,8 +107,8 @@ Entry types are normal file, executable, symbolic link, tree, and the chunked fo
 two.
 
 **Recipe** (git: none; the closest is a Git LFS pointer, but this is built in). The index of a large
-file (8 MiB or more): its total size and the ordered list of its chunks. A tree entry for a large
-file points at its recipe.
+file (8 MiB or more): the whole file's content hash, its total size, and the ordered list of its
+chunks. A tree entry for a large file points at its recipe.
 
 **Chunk.** One content-defined piece of a large file, stored as its own object type. Because chunk
 boundaries follow the content, an edit to a large file only stores the chunks it changed.
@@ -126,7 +126,7 @@ previous version of the same file. It is checked against its hash when rebuilt.
 
 **Compact** (git: `repack`). Moves loose objects into packs. Plain `compact` adds a pack and drops
 nothing, so it is safe beside a running server. `compact --all` rewrites every pack and drops
-unreachable objects. `--redelta` re-chooses delta bases for the whole store.
+unreachable objects. `compact --all --redelta` also re-chooses delta bases for the whole store.
 
 **Maintenance / auto-compaction** (git: `gc --auto`). The automatic `compact` a mutating command
 runs once the store passes its thresholds (`maintenance.loose`, `maintenance.packs`).
@@ -272,8 +272,9 @@ refuse (exit 21).
 **Torn taint.** A taint record that was itself cut off by a crash. Its scope is unknown, so `heal`
 rescans the whole store.
 
-**Restage.** Reading an object back, checking its hash and rewriting it durably. Every command
-restages any verified loose object recorded in a taint on entry, before it starts.
+**Restage.** Reading an object back, checking its hash and rewriting it durably. Every command that
+opens a warehouse, except `heal` and `audit`, first restages any verified loose object recorded in a
+taint.
 
 **heal** (git: none; loosely `fsck`). The recovery command. It resolves a durability taint, and
 finishes, rolls forward or rolls back an operation a crash interrupted.
@@ -301,7 +302,7 @@ Forklift has several locks. Each guards a different thing.
 | Config lock (`<config file>.lock`) | one config file | every config edit; a second editor waits rather than failing |
 | Serve lock (`.forklift/serve.lock`) | a warehouse being served | `forklift-server`; blocks gc and full repack |
 | Server base lock (`.forklift-server.lock`) | a server's base folder | one server per folder |
-| Build lock (`lock`, in `prepare`'s temporary folder) | a warehouse being built | `prepare`, until the finished folder is renamed into place |
+| Build lock (`lock`, in a temporary `.tmp~` folder) | a warehouse being built | `prepare` and `franchise`, until the finished folder is renamed into place |
 
 ## Remotes
 
@@ -474,8 +475,8 @@ key that signed the parcel changing it.
 
 **Replay** (git: none). How `@kv`, `@manifest`, `@tags` and `@haul` sync. (`@office` is not
 replayed: it syncs as trust, and a diverged office is a trust refusal.) Diverged meta pallets are
-never merged: your net
-change since the common ancestor is replayed onto the remote's head as one new parcel, re-signed
+never merged: your net change since the common ancestor is replayed onto the remote's head as one
+new parcel, re-signed
 with your current key.
 
 **Meta conflict.** Both sides changed the same meta path differently (exit 24). You pick a side
@@ -512,8 +513,9 @@ contains it), refuted, or unproven (the evidence is not held locally).
 
 ## Querying history
 
-**Query** (git: `log` filters; jj revsets). `query` filters history on signed facts: identity
-class, supervisor, signer, provenance, tag and paths touched.
+**Query** (git: `log` filters; jj revsets). `query` filters history, above all on signed facts:
+identity class, supervisor, signer, provenance, tag and paths touched. It also filters on
+description text, authoring dates and merges, like `history`.
 
 **Verified by default.** Unless told otherwise, `query` never matches an identity filter against a
 value it has not checked. It filters cheaply first, then verifies every survivor's signature.
@@ -529,10 +531,10 @@ every answer `recorded`.
 
 **`--json`.** Every command's machine-readable output, for scripts and AI agents.
 
-**Schema version.** The version number carried in all `--json` output. It changes when a command's
-output or the set of error codes changes incompatibly, so a script can pin it. It is also how a
-script detects capabilities: check `schema` before relying on a field, rather than looking for the
-field itself.
+**Schema version.** The version number carried in all `--json` output. It changes on an
+incompatible change to a command's output, and whenever an error code is added, so a script can pin
+it. It is also how a script detects capabilities: check `schema` before relying on a field, rather
+than looking for the field itself.
 
 **MCP server** (`forklift mcp`). Serves Forklift's commands as tools to an AI client over the Model
 Context Protocol.
