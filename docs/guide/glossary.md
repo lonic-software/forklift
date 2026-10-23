@@ -1,8 +1,9 @@
 # Forklift glossary
 
 The terms Forklift uses, what each means, and its git equivalent where there is one. This page only
-defines words. Flags, refusals and edge cases belong to the guides: each entry links to the
-section of [cli.md](cli.md) or [trust-and-identity.md](trust-and-identity.md) that covers it.
+defines words. Flags, refusals and edge cases belong to the guides, [cli.md](cli.md) and
+[trust-and-identity.md](trust-and-identity.md); where a guide section covers a term in depth, the
+entry links to it.
 
 Terms are grouped by topic, with the more basic terms first. A few words mean different things in
 different places; [Overloaded words](#overloaded-words) lists them. Terms for features that are
@@ -123,7 +124,8 @@ its thresholds.
 **Commit-graph** (git: commit-graph). A derived cache that speeds up history walks. It is never a
 source of truth.
 
-**Salvage.** Recovering the readable objects out of a damaged pack during compaction.
+**Salvage.** Recovering the readable objects out of a damaged pack, which `compact --all` does.
+See [`compact`](cli.md#compact--pack-the-object-store).
 
 **Object ceiling.** The largest object Forklift will write. Large files are chunked well below it.
 
@@ -153,7 +155,7 @@ inventory and current pallet. See [`bay`](cli.md#bay--parallel-working-directori
 **behind**.
 
 **Incomplete load.** A `load` that was interrupted. Recording a parcel is refused until it is
-finished, so a half-staged change is never stacked.
+finished, so a half-staged change is never stacked. See [`stack`](cli.md#stack--commit-s).
 
 **Ignore file** (git: `.gitignore`). `.forkliftignore`; see
 [`.forkliftignore`](cli.md#forkliftignore--files-forklift-shouldnt-track).
@@ -181,8 +183,8 @@ one signed parcel, keeping a link back to the draft. See
 pallet, and after delivery the draft's history (the trail) stays browsable.
 
 **Optimistic lift** (git: none). A `lift` that finds the remote moved merges and retries on its
-own, when the working directory is clean and the merge has no conflicts. Otherwise it stops with
-*diverged*. See [`lift`](cli.md#lift--push-li).
+own, when the working directory is clean and the merge has no conflicts. See
+[`lift`](cli.md#lift--push-li).
 
 **Park** (git: `stash`). Sets staged and unstaged changes to tracked files aside as a **parked
 parcel**; untracked files are left alone. `park pop` brings the changes back. See
@@ -201,7 +203,8 @@ but file content only for some paths. See [`franchise`](cli.md#franchise--clone-
 **Materialization scope** (git: sparse-checkout). The paths one checkout writes to disk, always
 within the fetch scope. See [`scope`](cli.md#scope--show-the-sparse-workspace-scope).
 
-**Sealed.** Content outside the fetch scope: not on disk, but pinned by the signed parcel's hash.
+**Sealed.** Content outside the fetch scope: not on disk, but pinned by the hashes of the trees
+that hold it.
 
 **Spine.** The trees from the root down to each scoped folder, which a sparse warehouse always
 holds.
@@ -226,10 +229,12 @@ in, and of those the remote can no longer serve.
 ## Durability and recovery
 
 **visible ⟹ durable.** Forklift's core durability rule: once an object's final name is visible on
-disk, the object is safely on disk.
+disk, the object should be safely on disk. Where a write fails in a way that leaves this unproven,
+a durability taint records it.
 
-**Durability taint** (git: none). A record of objects whose durability could not be proven, such as
-after a crash mid-write.
+**Durability taint** (git: none). A record of paths whose durability could not be proven after a
+rare kind of write failure. See
+[`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation).
 
 **Torn taint.** A taint record that was itself cut off by a crash.
 
@@ -319,7 +324,8 @@ office; the private half stays on your machine.
 
 **Identity root.** The one key per operator that every other key of that operator chains back to.
 
-**Endorsement.** A signed statement by a key you already have that a new key is also you.
+**Endorsement.** A key's signature vouching for another key: one of your keys vouching for your
+new device, or an admin's key vouching for a newly admitted operator.
 
 **Proof of possession.** A new key's own signature, so nobody can enroll a key they do not hold.
 
@@ -333,7 +339,8 @@ hands. See [Rotating and revoking keys](trust-and-identity.md#8-rotating-and-rev
 
 **Distrust boundary.** The pallet heads vouched for when a key was revoked. The revoked key's
 signatures still count only on parcels reachable from those heads, decided by ancestry rather
-than timestamps.
+than timestamps. See
+[Rotating and revoking keys](trust-and-identity.md#8-rotating-and-revoking-keys).
 
 **Role** (git: none; like a host's collaborator permissions). *admin*, *writer* or *reader*.
 
@@ -343,8 +350,7 @@ than timestamps.
 **Identity class.** Whether an operator is a *human*, *agent*, *bot* or *service*.
 
 **Agent, supervisor.** An agent is an operator marked as an AI; each names a human supervisor.
-Automation signs as itself, never as a human. See
-[Agents, bots, and services](trust-and-identity.md#7-agents-bots-and-services).
+See [Agents, bots, and services](trust-and-identity.md#7-agents-bots-and-services).
 
 ## The office and trust
 
@@ -357,10 +363,11 @@ was allowed to do what. See [Concepts](trust-and-identity.md#1-concepts).
 **Genesis.** The first office parcel, which signs itself.
 
 **Trust anchor.** The record that pins genesis. Once a warehouse has one, new parcels must be
-signed.
+signed. See [Establishing trust](trust-and-identity.md#2-establishing-trust).
 
 **Trust boundary.** The pallet heads at the moment trust was switched on. Parcels before it, the
-**legacy parcels**, may be unsigned.
+**legacy parcels**, may be unsigned. See
+[Establishing trust](trust-and-identity.md#2-establishing-trust).
 
 **Trust pin.** A point in history the trust state keeps alive, so gc never deletes what it reaches.
 
@@ -395,7 +402,8 @@ like everything else.
 
 **Replay** (git: none). What happens when a meta pallet other than `@office` has diverged from
 the remote: instead of merging, your change is re-applied onto the remote's head as a new parcel.
-A meta pallet that has not diverged fast-forwards like any other.
+A meta pallet that has not diverged fast-forwards like any other. See
+[`lower`](cli.md#lower--pull-lo).
 
 **Meta conflict.** Both sides changed the same meta value differently. See
 [`lower`](cli.md#lower--pull-lo).
