@@ -235,8 +235,8 @@ async fn lower_working_pallet(client: &RemoteClient,
     Ok(())
 }
 
-/// Add the remote head a lower was served to the held-heads record, once `pallet`'s ref holds it or
-/// a head descending from it. Every outcome that leaves the ref there records, up to date and ahead
+/// Add the remote head a lower was served to the held-heads record, once `pallet`'s ref or the
+/// bay's base holds it or a head descending from it. Every outcome that leaves the ref there records, up to date and ahead
 /// included, so the next lower renews an entry a failed write lost. The ref stands either way, so a
 /// failure only warns.
 fn record_served_head(pallet: &str, remote_head: &str) {

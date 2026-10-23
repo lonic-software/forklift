@@ -851,8 +851,8 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
     }
 }
 
-/// The `--json` warning code for a remote head that landed (a lift's compare-and-set, a lower's
-/// adoption) but could not be added to the held-heads record.
+/// The `--json` warning code for a remote head that a lift landed or a lower was served but that
+/// could not be added to the held-heads record.
 pub const CODE_HELD_HEAD_UNRECORDED: &str = "held_head_unrecorded";
 
 /// What to do about [`CODE_HELD_HEAD_UNRECORDED`]. The record only nominates heads for a later

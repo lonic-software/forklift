@@ -81,8 +81,8 @@ pub fn candidates(pallet: &str) -> Result<Vec<String>, String> {
 /// meta pallet records nothing: prune's unlifted walk covers only user parcels.
 ///
 /// Call it only once the remote has accepted the head (a lift's compare-and-set returned) or, on a
-/// `lower`, the local ref holds the head served or one descending from it; never before a refusal
-/// check: an entry for a head the remote never took is harmless to a prune, which asks the remote,
+/// `lower`, the remote served it and this warehouse holds its history (the ref or the bay's base is
+/// at it or past it); never before a refusal check: an entry for a head the remote never took is harmless to a prune, which asks the remote,
 /// but it is a false record. The caller treats an error as a warning, because the head has landed either way and a lost entry
 /// only leaves prune as conservative as it is without one.
 ///

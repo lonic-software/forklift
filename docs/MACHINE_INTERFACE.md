@@ -744,9 +744,9 @@ Example session:
   [Trust refusals](#trust-refusals-trust_changed). `lower` writes it as soon as the anchor is
   adopted, since the adoption stands even if the pull then fails; `franchise` only on success,
   since a failed franchise removes the warehouse it adopted into.
-* A `lift` or `lower` whose remote head landed but could not be added to the warehouse's
-  held-heads record (`.forklift/held-heads`, the remote heads it lifted to or adopted) writes a
-  `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
+* A `lift` or `lower` whose remote head could not be added to the warehouse's held-heads record
+  (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower, up to date or
+  ahead included) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
   result stands and its exit code is unchanged.
 * The same stderr channel also carries a maintenance warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
