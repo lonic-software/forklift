@@ -1,4 +1,4 @@
-//! The held-heads record: remote heads of working pallets this warehouse lifted to or adopted.
+//! The held-heads record: remote heads of working pallets this warehouse lifted to or lowered.
 //!
 //! `scope-prune` counts as held by the remote only history it reaches from the remote's current
 //! heads, so once another warehouse lifts past every head held here, this warehouse's history of
@@ -80,10 +80,10 @@ pub fn candidates(pallet: &str) -> Result<Vec<String>, String> {
 /// Record that the remote accepted or served `head` as the head of `pallet` (its wire name). A
 /// meta pallet records nothing: prune's unlifted walk covers only user parcels.
 ///
-/// Call it only once the remote has accepted the head (a lift's compare-and-set returned) or the
-/// local ref has adopted it (a `lower`), never before a refusal check: an entry for a head the
-/// remote never took is harmless to a prune, which asks the remote, but it is a false record. The
-/// caller treats an error as a warning, because the head has landed either way and a lost entry
+/// Call it only once the remote has accepted the head (a lift's compare-and-set returned) or, on a
+/// `lower`, the local ref holds the head served or one descending from it; never before a refusal
+/// check: an entry for a head the remote never took is harmless to a prune, which asks the remote,
+/// but it is a false record. The caller treats an error as a warning, because the head has landed either way and a lost entry
 /// only leaves prune as conservative as it is without one.
 ///
 /// Which recorded heads `head` descends from is decided before the lock is taken, since it walks

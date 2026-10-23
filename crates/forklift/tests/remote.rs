@@ -5335,7 +5335,7 @@ fn held_heads(area: &TestArea, name: &str) -> Vec<String> {
 #[test]
 fn a_landed_lift_or_lower_records_its_head_and_a_refused_lift_records_nothing() {
     // FORK-254: lift records the head the remote accepted, replacing the recorded heads it descends
-    // from; lower records the head it adopted. A lift the remote refuses records nothing, since
+    // from; lower records the head it was served. A lift the remote refuses records nothing, since
     // the record is written only after the compare-and-set.
     let area = TestArea::new("held-heads-record");
     let server = sparse_with_docs(&area);
@@ -5363,6 +5363,12 @@ fn a_landed_lift_or_lower_records_its_head_and_a_refused_lift_records_nothing() 
     assert_success(&area.forklift("clone", &["lower"]));
     assert_eq!(pallet_head(&area, "clone", "main"), ahead);
     assert_eq!(held_heads(&area, "clone"), vec![format!("{} main", ahead)], "lower records the head it adopted");
+
+    // The record only names heads to ask about, so removing it is a way out of one that does not
+    // parse; an up-to-date lower writes it again.
+    std::fs::remove_file(area.path("clone/.forklift/held-heads")).unwrap();
+    assert_success(&area.forklift("clone", &["lower"]));
+    assert_eq!(held_heads(&area, "clone"), vec![format!("{} main", ahead)], "an up-to-date lower records the head too");
 }
 
 #[test]

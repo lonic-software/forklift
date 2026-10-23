@@ -162,6 +162,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     position.require_current("lowered")?;
 
     if position.base.as_deref() == Some(remote_head.as_str()) {
+        record_served_head(&pallet, remote_head);
         report.outcome = Some(LowerOutcome::UpToDate);
         return Ok(());
     }
@@ -190,6 +191,7 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     if let Some(local) = &local_head {
         if merge_utils::is_ancestor(remote_head, local)? {
+            record_served_head(&pallet, remote_head);
             report.outcome = Some(LowerOutcome::Ahead);
             return Ok(());
         }
@@ -221,17 +223,23 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     // A compare-and-set against the head this lower started from; the working tree goes back to
     // where it was if the pallet did not move (another bay moved it first, or the write failed).
-    shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &remote_tree, local_tree.as_deref(), anchor)?;
-    record_adopted_head(&pallet, remote_head);
+    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &remote_tree, local_tree.as_deref(), anchor);
+    // A write that reported an error can still have landed; the ref read back decides.
+    if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(remote_head.as_str()) {
+        record_served_head(&pallet, remote_head);
+    }
+    written?;
 
     report.outcome = Some(LowerOutcome::Lowered);
 
     Ok(())
 }
 
-/// Add the remote head a lower just adopted into `pallet`'s ref to the held-heads record. The ref
-/// has moved either way, so a failure only warns.
-fn record_adopted_head(pallet: &str, remote_head: &str) {
+/// Add the remote head a lower was served to the held-heads record, once `pallet`'s ref holds it or
+/// a head descending from it. Every outcome that leaves the ref there records, up to date and ahead
+/// included, so the next lower renews an entry a failed write lost. The ref stands either way, so a
+/// failure only warns.
+fn record_served_head(pallet: &str, remote_head: &str) {
     if let Err(why) = held_heads::record_held_head(pallet, remote_head) {
         output::warn_held_head_unrecorded(&why);
     }
@@ -288,6 +296,7 @@ async fn lower_named_pallet(client: &RemoteClient,
     let local_head = pallet_utils::get_pallet_head(&pallet)?;
 
     if local_head.as_deref() == Some(remote_head.as_str()) {
+        record_served_head(&pallet, remote_head);
         report.outcome = Some(LowerOutcome::UpToDate);
         return Ok(());
     }
@@ -298,6 +307,7 @@ async fn lower_named_pallet(client: &RemoteClient,
 
     if let Some(local) = &local_head {
         if merge_utils::is_ancestor(remote_head, local)? {
+            record_served_head(&pallet, remote_head);
             report.outcome = Some(LowerOutcome::Ahead);
             return Ok(());
         }
@@ -333,7 +343,7 @@ async fn lower_named_pallet(client: &RemoteClient,
 
     let error = match pallet_utils::update_pallet_head(&pallet, local_head.as_deref(), remote_head, &pallet_utils::RefPreconditions::NONE) {
         Ok(()) => {
-            record_adopted_head(&pallet, remote_head);
+            record_served_head(&pallet, remote_head);
             report.outcome = Some(moved);
             return Ok(());
         }
@@ -343,6 +353,7 @@ async fn lower_named_pallet(client: &RemoteClient,
     match error {
         // Another writer already put the pallet where this lower would have.
         pallet_utils::RefUpdateError::Moved(found) if found.found.as_deref() == Some(remote_head.as_str()) => {
+            record_served_head(&pallet, remote_head);
             report.outcome = Some(LowerOutcome::UpToDate);
             Ok(())
         }
@@ -352,10 +363,10 @@ async fn lower_named_pallet(client: &RemoteClient,
         )),
         // A failed write can still have landed: decided by reading the ref back.
         pallet_utils::RefUpdateError::Failed(error) => match pallet_utils::get_pallet_head(&pallet) {
-            Ok(head) if head.as_deref() == Some(remote_head.as_str()) => Err(format!(
-                "Pallet \"{}\" now holds parcel {}, but its write reported an error: {}",
-                pallet, remote_head, error
-            )),
+            Ok(head) if head.as_deref() == Some(remote_head.as_str()) => {
+                record_served_head(&pallet, remote_head);
+                Err(format!("Pallet \"{}\" now holds parcel {}, but its write reported an error: {}", pallet, remote_head, error))
+            }
             Ok(_) => Err(format!("Pallet \"{}\" was not moved: {}", pallet, error)),
             Err(read) => Err(format!(
                 "Writing pallet \"{}\" failed ({}), and reading it back failed too ({}); it may or may \
