@@ -504,51 +504,50 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// lookup, or serving an already-built file) before writing anything, so a flat 10s pre-first-byte
 /// budget is honest. `fetch_object` needs a much looser budget of its own
 /// ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
-/// `fetch_batch` and `fetch_subtree` share the reason neither may ride *this* budget — their
-/// server sides build a bundle, every requested object fully into memory, *before* the first byte,
-/// work whose cost depends on object sizes the client cannot know in advance, so no flat silence
-/// budget over their responses is honest. Both took the other exit named just above: each is
-/// bounded *before the status line* by a different mechanism entirely — a head-wait timer carried
-/// on [`Posture::HeadDeadlineNoRedirect`] and sized by [`BATCH_HEAD_PATIENCE`] — which prices no
-/// server-side build work at all, and *after* the status
-/// line by a client-level silence budget of its own, [`FETCH_OBJECT_READ_TIMEOUT`] rather than this
-/// constant (see that constant's doc for why the looser figure, and
-/// [`Posture::HeadDeadlineNoRedirect`]'s for how the two phases hand off). That split is what keeps
-/// the second budget from ever pricing the build: the head timer is strictly the tighter of the
-/// two, so no client-level read timeout can fire before the status line. See the comment at each
-/// call site.
-/// `missing_objects`/`upload_targets` differ in exactly the property that matters here: their
-/// server sides only walk up to `MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH` *hashes* — a cost
-/// this client can size from its own request body, unlike an object's byte size it doesn't have yet
-/// — before the first byte, so like `resolve` they ride [`Posture::TotalDeadline`] rather than
-/// staying unbounded, sized per call by [`RemoteClient::presence_negotiation_budget`] (see that
-/// method's own doc for the arithmetic and accepted residual). `resolve` is unbounded by *this*
-/// mechanism too (no client-level `read_timeout`), but is not left unbounded outright: it rides
+/// `fetch_batch` and `fetch_subtree` share the reason neither may ride *this* budget — their server
+/// sides build a bundle, every requested object fully into memory, *before* the first byte, work
+/// whose cost depends on object sizes the client cannot know in advance, so no flat silence budget
+/// over their responses is honest. Both took the other exit named just above: each is bounded
+/// *before the status line* by a different mechanism entirely — a head-wait timer carried on
+/// [`Posture::HeadDeadlineNoRedirect`] and sized by [`BATCH_HEAD_PATIENCE`] — which prices no
+/// server-side build work at all, and *after* the status line by a client-level silence budget of
+/// its own, [`FETCH_OBJECT_READ_TIMEOUT`] rather than this constant (see that constant's doc for
+/// why the looser figure, and [`Posture::HeadDeadlineNoRedirect`]'s for how the two phases hand
+/// off). That split is what keeps the second budget from ever pricing the build: the head timer is
+/// strictly the tighter of the two, so no client-level read timeout can fire before the status
+/// line. See the comment at each call site. `missing_objects`/`upload_targets` differ in exactly
+/// the property that matters here: their server sides only walk up to
+/// `MAX_MISSING_BATCH`/`MAX_UPLOAD_TARGETS_BATCH` *hashes* — a cost this client can size from its
+/// own request body, unlike an object's byte size it doesn't have yet — before the first byte, so
+/// like `resolve` they ride [`Posture::TotalDeadline`] rather than staying unbounded, sized per
+/// call by [`RemoteClient::presence_negotiation_budget`] (see that method's own doc for the
+/// arithmetic and accepted residual). `resolve` is unbounded by *this* mechanism too (no
+/// client-level `read_timeout`), but is not left unbounded outright: it rides
 /// [`Posture::TotalDeadline`] instead, a genuine per-request `RequestBuilder::timeout` the module
 /// applies itself rather than the call site — sized at `connect_timeout + REMOTE_READ_TIMEOUT`,
 /// reusing this constant's *value* for that arithmetic without joining the class of calls it
 /// silence-bounds (see that variant's own doc for why a *total* deadline, not a silence budget, is
-/// the right shape for `resolve` specifically).
-/// `update_ref` and the streamed-upload paths (`upload_object`, `put_presigned`) are unbounded
-/// for reasons of their own — see each call's own doc, and
-/// [`clients::Clients::send_with_watchdog`]'s for the uploads.
+/// the right shape for `resolve` specifically). `update_ref` and the streamed-upload paths
+/// (`upload_object`, `put_presigned`) are unbounded for reasons of their own — see each call's own
+/// doc, and [`clients::Clients::send_with_watchdog`]'s for the uploads.
 ///
 /// `read_timeout` is a `ClientBuilder`-level setting with no per-request override — it cannot be
 /// switched off for one specific request — so a call carries one exactly when the client its
 /// posture selects was built with one. [`clients::Clients`]'s field docs are the enumeration that
 /// stays current; what matters here is that the client `update_ref` rides
 /// ([`Posture::UnboundedNoRedirect`]'s, shared with [`Posture::TotalDeadlineNoRedirect`]) carries
-/// none, and must not be given one. **`update_ref` must never move to [`Posture::BoundedReads`]**
-/// — nor may the client it already rides acquire a `read_timeout`, which is the same hazard by a
+/// none, and must not be given one. **`update_ref` must never move to [`Posture::BoundedReads`]** —
+/// nor may the client it already rides acquire a `read_timeout`, which is the same hazard by a
 /// shorter route, and the cheaper-looking one now that a client combining no-auto-redirect *with* a
 /// silence budget exists to copy from: `update_ref`'s server side legitimately runs a
-/// parcel-closure audit walk — scoped by the history segment being pushed, which on a first lift into an empty pallet is the whole history — before its
-/// first response byte; that can take minutes with *no* bytes moving at all, which this constant
-/// would (correctly) call silence if it applied there. This is not an accident of wiring — FORK-94
-/// found `update_ref`'s pre-first-byte cost is a *derived* quantity (an audit walk), unlike
-/// `missing_objects`/`upload_targets`, whose priced quantity is the request body's own enumerated
-/// content; giving it a flat silence budget before that walk-equivalence question is settled would
-/// be exactly the kind of guess this module's bounded clients exist to avoid.
+/// parcel-closure audit walk — scoped by the history segment being pushed, which on a first lift
+/// into an empty pallet is the whole history — before its first response byte; that can take
+/// minutes with *no* bytes moving at all, which this constant would (correctly) call silence if it
+/// applied there. This is not an accident of wiring — FORK-94 found `update_ref`'s pre-first-byte
+/// cost is a *derived* quantity (an audit walk), unlike `missing_objects`/`upload_targets`, whose
+/// priced quantity is the request body's own enumerated content; giving it a flat silence budget
+/// before that walk-equivalence question is settled would be exactly the kind of guess this
+/// module's bounded clients exist to avoid.
 ///
 /// This is client patience, not a bound derived from any specific head's measured cost: 10s of
 /// silence, on top of whichever connect budget applies, is a policy choice about how long this
@@ -669,11 +668,10 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// [`RemoteClient::fetch_batch`]'s doc), which is slower than the bundle would have been but does
 /// not fail, while `fetch_subtree`, which has no such lane, fails loudly. And an expiry abandons
 /// the in-flight request, so the head may finish the build anyway — harmless, since the result is
-/// ephemeral, but worth saying once. (The third residual an earlier version of this list
-/// carried — an unbounded body read — is closed: see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for the
-/// budget that closed it and
-/// the terms it is honest on.) The falsifier that reopens **the number, not the mechanism**: a
-/// measured legitimate build exceeding this patience against a real deployment.
+/// ephemeral, but worth saying once. (The third residual an earlier version of this list carried —
+/// an unbounded body read — is closed: see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for the budget that
+/// closed it and the terms it is honest on.) The falsifier that reopens **the number, not the
+/// mechanism**: a measured legitimate build exceeding this patience against a real deployment.
 ///
 /// **What acting on that falsifier now costs, which it did not when the sentence was written.**
 /// These two constants used to be independent; the phase-precedence assertion below has since made
@@ -2517,9 +2515,9 @@ impl RemoteClient {
     ///
     /// Always attaches the bearer token, if one is configured: this is the authenticated,
     /// relative-path shape almost every call needs. The one exception —
-    /// [`Self::fetch_batch`]'s redirect-follow `GET`, an absolute presigned URL that must *not*
-    /// carry this remote's token — goes through [`Self::send_on_presigned`] instead; see that
-    /// function's own doc.
+    /// [`Self::follow_bundle_redirect`]'s `GET` to another origin, an absolute presigned URL that
+    /// must *not* carry this remote's token — goes through [`Self::send_on_presigned`] instead;
+    /// see that function's own doc.
     async fn send_on(&self,
                      posture: Posture,
                      method: reqwest::Method,
@@ -2534,7 +2532,7 @@ impl RemoteClient {
 
     /// The presigned counterpart of [`Self::send_on`] — same posture, same payload guarantee,
     /// but sending to an absolute, self-authorizing URL with **no** bearer token attached. Down
-    /// to one live caller — [`Self::fetch_batch`]'s redirect-follow `GET` (a presigned storage URL
+    /// to one live caller — [`Self::follow_bundle_redirect`]'s cross-origin `GET` (a presigned storage URL
     /// is self-authorizing; forwarding a bearer token meant for the control plane would be a
     /// needless credential leak) — since [`Self::put_presigned`], this shape's other historical
     /// caller, moved onto [`clients::Clients::send_with_watchdog`], which builds its own
@@ -2642,19 +2640,18 @@ impl RemoteClient {
     /// [`Posture::BoundedObjectReads`] report a *lower* bound ("at least") on
     /// [`bounded_read_timeout`]'s own value, unchanged from before this reshape, since a
     /// resetting silence budget only ever guarantees the wait went on at least that long.
-    /// [`Posture::TotalDeadline`] instead reports its own payload verbatim, with no "at least" —
-    /// a non-resetting `RequestBuilder::timeout` is a genuine upper bound the call could never
-    /// have exceeded, so the exact figure is honest. (The `debug_assert!` in
+    /// [`Posture::TotalDeadline`] instead reports its own payload verbatim, with no "at least" — a
+    /// non-resetting `RequestBuilder::timeout` is a genuine upper bound the call could never have
+    /// exceeded, so the exact figure is honest. (The `debug_assert!` in
     /// [`clients::check_total_deadline_payload`], which [`clients::Clients::send_on`]'s
-    /// `TotalDeadline` arm calls, guards this arm's *wording*, not its
-    /// figure — see that function's own doc for why the number stays correct either way.)
-    /// [`Posture::UnboundedNoRedirect`] names no figure at all — nothing was armed, so
-    /// [`TransportFailure::ReadTimedOut`]'s own doc's ambiguity (a client `read_timeout` vs. a
-    /// genuine multi-minute kernel `ETIMEDOUT`) applies at full
-    /// force here, the one case this function cannot narrow at all.
-    /// [`Posture::TotalDeadlineNoRedirect`]'s
-    /// arm exists only so this match stays exhaustive — every call riding it is a mutation and
-    /// never reaches this function at all (see [`Self::describe_mutation_transport_error`]'s doc).
+    /// `TotalDeadline` arm calls, guards this arm's *wording*, not its figure — see that function's
+    /// own doc for why the number stays correct either way.) [`Posture::UnboundedNoRedirect`] names
+    /// no figure at all — nothing was armed, so [`TransportFailure::ReadTimedOut`]'s own doc's
+    /// ambiguity (a client `read_timeout` vs. a genuine multi-minute kernel `ETIMEDOUT`) applies at
+    /// full force here, the one case this function cannot narrow at all.
+    /// [`Posture::TotalDeadlineNoRedirect`]'s arm exists only so this match stays exhaustive —
+    /// every call riding it is a mutation and never reaches this function at all (see
+    /// [`Self::describe_mutation_transport_error`]'s doc).
     ///
     /// **[`Posture::HeadDeadlineNoRedirect`]'s arm has to be distinguishable by its words, because
     /// its figure is already taken.** It reports the same lower bound
@@ -3040,9 +3037,9 @@ impl RemoteClient {
     /// Fetch the warehouse handshake and check the protocol version.
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
         let posture = Posture::BoundedReads;
-        let outcome = self.send_on(
-            posture, reqwest::Method::GET, "/v1/warehouse", SendBody::Empty
-        ).await;
+        let outcome = self.send_waiting_out_throttle(
+            posture, reqwest::Method::GET, "/v1/warehouse", SendBody::Empty, "the handshake"
+        ).await?;
         let response = self.response_from_send(
             &format!("reaching the remote {}", self.base), posture, outcome
         )?;
@@ -3130,11 +3127,12 @@ impl RemoteClient {
 
         for batch in hashes.chunks(MAX_MISSING_BATCH) {
             let posture = Posture::TotalDeadline(self.presence_negotiation_budget(batch.len()));
-            let outcome = self.send_on(
+            let outcome = self.send_waiting_out_throttle(
                 posture,
                 reqwest::Method::POST, "/v1/objects/missing",
                 SendBody::json(&MissingObjectsRequest { hashes: batch.to_vec() })?,
-            ).await;
+                "the presence check",
+            ).await?;
             let response = self.response_from_send(
                 "negotiating with the remote", posture, outcome
             )?;
@@ -3450,12 +3448,14 @@ impl RemoteClient {
     }
 
     /// [`Self::send_on`], re-sending while the remote answers `429`: every route of the hosted API
-    /// shares one throttle, so a fetch that meets it is expected to wait rather than fail the
-    /// command. Each wait is the remote's `Retry-After` floored at the backoff (see
-    /// [`throttle_wait`]), [`jittered`]; once the next one would overrun
-    /// [`Budgets::throttle_patience`] from the first attempt, the last `429` is the error, named
-    /// as `refused` (`what`, the refused request) with the patience it outlasted. Every other
-    /// outcome, transport failures and head-wait expiries included, is handed back untouched.
+    /// shares one throttle, so a read that meets it is expected to wait rather than fail the
+    /// command. Every read rides this but [`Self::resolve`], which is best-effort and treats any
+    /// refusal as "nothing resolved"; mutations do not (a staged lift's commit has its own retry).
+    /// Each wait is the remote's `Retry-After` floored at the backoff (see [`throttle_wait`]),
+    /// [`jittered`]; once the next one would overrun [`Budgets::throttle_patience`] from the first
+    /// attempt, the last `429` is the error, named as `refused` (`what`, the refused request) with
+    /// the patience it outlasted. Every other outcome, transport failures and head-wait expiries
+    /// included, is handed back untouched.
     async fn send_waiting_out_throttle(&self,
                                        posture: Posture,
                                        method: reqwest::Method,
@@ -3468,7 +3468,8 @@ impl RemoteClient {
         loop {
             let outcome = self.send_on(posture, method.clone(), path, body.clone()).await;
             let response = match outcome {
-                SendOutcome::Sent(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => response,
+                SendOutcome::Sent(response)
+                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => response,
                 outcome => return Ok(outcome),
             };
 
@@ -3489,8 +3490,10 @@ impl RemoteClient {
 
     /// Follow an offloading head's redirect of a bundle response (`what` names it in the
     /// messages) by hand, or hand back `response` and `posture` unchanged when it is not one.
-    /// Any `301`/`302`/`303`/`307`/`308` is followed with a bare `GET`: no `Authorization` header (the URL is
-    /// self-authorizing) and no body — the request the target is actually presigned for. On
+    /// Any `301`/`302`/`303`/`307`/`308` is followed with a bodyless `GET`. To another origin (a
+    /// presigned storage URL, which is self-authorizing) it carries no `Authorization` header, so
+    /// a token meant for this remote never leaves it; to this remote's own origin it carries the
+    /// token, as an auto-following client would have — that route may well require it. On
     /// [`Posture::BoundedObjectReads`], reaching the same silence budget the head-wait posture's
     /// client carries, but on its own grounds — see [`Self::fetch_batch`]'s doc for why this
     /// station's cost shape matches [`Self::fetch_object`]'s, not the request's.
@@ -3513,13 +3516,28 @@ impl RemoteClient {
                     .get(reqwest::header::LOCATION)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| response.url().join(value).ok())
-                    .ok_or_else(|| format!("The remote's {} redirect carried no usable Location header.", what))?
-                    .to_string();
+                    .ok_or_else(|| {
+                        format!("The remote's {} redirect carried no usable Location header.", what)
+                    })?;
 
                 let redirect_posture = Posture::BoundedObjectReads;
-                let outcome = self.send_on_presigned(
-                    redirect_posture, reqwest::Method::GET, &location, SendBody::Empty
-                ).await;
+                let own_origin = reqwest::Url::parse(&self.base)
+                    .map_or(false, |base| base.origin() == location.origin());
+                let outcome = if own_origin {
+                    let origin = location.origin().ascii_serialization();
+                    let path = &location.as_str()[origin.len()..];
+                    self.clients.send_on(
+                        redirect_posture, &self.budgets, reqwest::Method::GET,
+                        RequestDestination::Authenticated {
+                            base: &origin, token: self.token.as_deref(), path
+                        },
+                        SendBody::Empty,
+                    ).await
+                } else {
+                    self.send_on_presigned(
+                        redirect_posture, reqwest::Method::GET, location.as_str(), SendBody::Empty
+                    ).await
+                };
                 let response = self.response_from_send(
                     &format!("following the {} redirect", what), redirect_posture, outcome
                 )?;
@@ -3763,13 +3781,14 @@ impl RemoteClient {
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
             let posture = Posture::TotalDeadline(self.presence_negotiation_budget(batch.len()));
-            let outcome = self.send_on(
+            let outcome = self.send_waiting_out_throttle(
                 posture,
                 reqwest::Method::POST, "/v1/objects/upload-targets",
                 SendBody::json(&UploadTargetsRequest {
                     session: session.to_string(), hashes: batch.to_vec()
                 })?,
-            ).await;
+                "the upload-target request",
+            ).await?;
             let response = self.response_from_send(
                 "negotiating upload targets", posture, outcome
             )?;
@@ -3950,10 +3969,10 @@ impl RemoteClient {
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
     pub async fn fetch_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
         let posture = Posture::BoundedReads;
-        let outcome = self.send_on(
+        let outcome = self.send_waiting_out_throttle(
             posture, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash),
-            SendBody::Empty,
-        ).await;
+            SendBody::Empty, &format!("the signature of {}", parcel_hash),
+        ).await?;
         let response = self.response_from_send(
             &format!("fetching the signature of {}", parcel_hash), posture, outcome
         )?;
@@ -4146,9 +4165,9 @@ impl RemoteClient {
     /// * `Err(String)` - On any other failure.
     pub async fn fetch_bundle_to(&self, path: &std::path::Path) -> Result<bool, String> {
         let posture = Posture::BoundedReads;
-        let outcome = self.send_on(
-            posture, reqwest::Method::GET, "/v1/bundles/latest", SendBody::Empty
-        ).await;
+        let outcome = self.send_waiting_out_throttle(
+            posture, reqwest::Method::GET, "/v1/bundles/latest", SendBody::Empty, "the bundle fetch"
+        ).await?;
         let mut response = self.response_from_send("fetching the bundle", posture, outcome)?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -8752,25 +8771,35 @@ mod tests {
         ) -> FakeOffloadingRemote {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
+            // The presigned target lives on its own listener — another origin, as storage is.
+            let storage_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let storage = format!("http://{}", storage_listener.local_addr().unwrap());
             let hits: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
-            let accepted_hits = Arc::clone(&hits);
-            let base = url.clone();
             let bundle = Arc::new(bundle);
             let objects = Arc::new(objects);
 
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(stream) = stream else { continue };
-                    let hits = Arc::clone(&accepted_hits);
-                    let base = base.clone();
-                    let bundle = Arc::clone(&bundle);
-                    let objects = Arc::clone(&objects);
+            for (listener, at_storage) in [(listener, false), (storage_listener, true)] {
+                let hits = Arc::clone(&hits);
+                let storage = storage.clone();
+                let bundle = Arc::clone(&bundle);
+                let objects = Arc::clone(&objects);
 
-                    std::thread::spawn(move || {
-                        handle_offloading_request(stream, redirect_status, &base, &bundle, &objects, &hits);
-                    });
-                }
-            });
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        let Ok(stream) = stream else { continue };
+                        let hits = Arc::clone(&hits);
+                        let storage = storage.clone();
+                        let bundle = Arc::clone(&bundle);
+                        let objects = Arc::clone(&objects);
+
+                        std::thread::spawn(move || {
+                            handle_offloading_request(
+                                stream, redirect_status, &storage, at_storage, &bundle, &objects, &hits
+                            );
+                        });
+                    }
+                });
+            }
 
             FakeOffloadingRemote { url, hits }
         }
@@ -8795,7 +8824,8 @@ mod tests {
     fn handle_offloading_request(
         mut stream: std::net::TcpStream,
         redirect_status: u16,
-        base: &str,
+        storage: &str,
+        at_storage: bool,
         bundle: &[u8],
         objects: &HashMap<String, Vec<u8>>,
         hits: &Mutex<Vec<(String, String, bool)>>,
@@ -8816,17 +8846,24 @@ mod tests {
                 308 => "Permanent Redirect",
                 _ => "Redirect",
             };
-            // A `301`/`302` answers with a relative `Location`, so those runs also pin that one is
-            // resolved against the request rather than sent as is.
+            // A `301`/`302` answers with a relative `Location` — this remote's own origin, which
+            // serves the bundle only to its token — so those runs also pin that one is resolved
+            // against the request and followed authenticated. The rest point at storage.
             let location = match redirect_status {
                 301 | 302 => "/responses/bundle".to_string(),
-                _ => format!("{}/responses/bundle", base),
+                _ => format!("{}/responses/bundle", storage),
             };
             let _ = write!(
                 stream,
                 "HTTP/1.1 {} {}\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 redirect_status, reason, location
             );
+            let _ = stream.flush();
+            return;
+        }
+
+        if method == "GET" && path == "/responses/bundle" && !at_storage && !had_auth {
+            let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             let _ = stream.flush();
             return;
         }
@@ -8919,8 +8956,9 @@ mod tests {
 
     /// The subtree endpoint may be offloaded the same way: `REMOTE_PROTOCOL.md` lets a
     /// storage-backed head answer it with a `307` to a presigned bundle. It rides a no-redirect
-    /// client, so the follow is by hand, and the bearer token stays with the remote. Every
-    /// redirect status an auto-following client took is still taken, a relative `Location` too.
+    /// client, so the follow is by hand, and the bearer token never leaves the remote's origin —
+    /// but goes along to it, where the fake refuses the bundle without one. Every redirect status
+    /// an auto-following client took is still taken, a relative `Location` too.
     #[test]
     fn fetch_subtree_follows_a_redirect_by_hand_without_leaking_auth() {
         use crate::enums::dir_entry_type::DirEntryType;
@@ -8949,10 +8987,11 @@ mod tests {
             assert_eq!(remote.hits_for(&subtree_path), 1, "status {}", redirect_status);
             assert_eq!(remote.hits_for("/responses/bundle"), 1, "status {}", redirect_status);
             assert!(remote.any_had_auth(&subtree_path), "status {}", redirect_status);
-            assert!(
-                !remote.any_had_auth("/responses/bundle"),
-                "the presigned-URL follow-up must not carry this remote's bearer token, status {}",
-                redirect_status
+            let same_origin = matches!(redirect_status, 301 | 302);
+            assert_eq!(
+                remote.any_had_auth("/responses/bundle"), same_origin,
+                "status {}: the follow-up carries this remote's bearer token to its own origin and \
+                never to another one", redirect_status
             );
         }
     }
@@ -9070,12 +9109,12 @@ mod tests {
         (url, requests)
     }
 
-    /// Every route of the hosted API shares one throttle, so the batch `POST` and the subtree `GET`
-    /// meet the same `429`s the loose GETs do: each waits one out and re-sends, and only the answer
-    /// after it decides (here a `404`, the absence signal). Without the retry the first `429` is
+    /// Every route of the hosted API shares one throttle, so every read meets the same `429`s the
+    /// loose GETs do: each waits one out and re-sends, and only the answer after it decides (here a
+    /// `404`, which each of these reads takes as an answer). Without the retry the first `429` is
     /// the command's error.
     #[test]
-    fn the_batch_and_subtree_fetches_wait_out_a_throttle() {
+    fn the_reads_wait_out_a_throttle() {
         const THROTTLED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n\
             Content-Length: 0\r\nConnection: close\r\n\r\n";
         const ABSENT: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -9093,6 +9132,27 @@ mod tests {
         let outcome = runtime.block_on(client.fetch_subtree(&"p".repeat(64), "src", &"t".repeat(64)))
             .expect("a throttled subtree GET is re-sent, not failed");
         assert!(outcome.is_none(), "the 404 after the throttle is the absence signal");
+        assert_eq!(*requests.lock().unwrap(), 2);
+
+        let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
+        let client = fast_client(&url);
+        let signature = runtime.block_on(client.fetch_signature(&"p".repeat(64)))
+            .expect("a throttled signature GET is re-sent, not failed");
+        assert!(signature.is_none(), "the 404 after the throttle is an unsigned parcel");
+        assert_eq!(*requests.lock().unwrap(), 2);
+
+        let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
+        let client = fast_client(&url);
+        let scratch = Scratch::new("throttled-bundle");
+        let fetched = runtime.block_on(client.fetch_bundle_to(&scratch.root.join("bundle")))
+            .expect("a throttled bundle GET is re-sent, not failed");
+        assert!(!fetched, "the 404 after the throttle is no bundle");
+        assert_eq!(*requests.lock().unwrap(), 2);
+
+        let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
+        let client = fast_client(&url);
+        let Err(error) = runtime.block_on(client.fetch_info()) else { panic!("the handshake 404 is an error") };
+        assert!(error.contains("404"), "the answer after the throttle decides, not the 429: {}", error);
         assert_eq!(*requests.lock().unwrap(), 2);
     }
 
