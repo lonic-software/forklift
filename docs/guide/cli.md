@@ -1463,7 +1463,8 @@ remote that doesn't, `lift` refuses up front, before uploading anything
 
 **Lifting to a serverless remote.** There, uploads go straight to storage and the remote checks
 them before the lift may move the pallet. A remote that has not finished checking an upload is
-waited for, up to about two minutes; past that, the lift fails without moving the remote's
+waited for, up to about two minutes (for each batch of the commit, when a very large lift sends
+several); past that, the lift fails without moving the remote's
 pallet, and running it again is safe. An upload the remote rejected or never received fails the
 lift at once (`staged_upload_discarded`, exit 32), again without moving anything: run the lift
 again, which uploads it afresh.

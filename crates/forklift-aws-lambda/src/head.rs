@@ -40,7 +40,8 @@ use std::sync::Arc;
 
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::remote::{
-    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH, PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
+    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
+    PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
@@ -899,9 +900,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             match outcome {
                 PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => {}
                 PromoteOutcome::Missing => {
+                    // Not "never arrived": an earlier attempt of this commit whose answer was
+                    // lost may have discarded it as corrupt or too large.
                     return Err(upload_discarded(format!(
-                        "Object {} is not on the remote: its upload never arrived. The lift session \
-                        cannot commit.",
+                        "Object {} is not on the remote: its upload was discarded (rejected as \
+                        corrupt or too large) or never arrived. The lift session cannot commit.",
                         hash
                     )))
                 }

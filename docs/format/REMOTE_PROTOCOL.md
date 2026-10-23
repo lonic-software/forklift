@@ -392,11 +392,14 @@ The answers:
 | `429` | Rate limited. | Retry after `Retry-After` (delta-seconds). |
 | other `5xx` | Says nothing about the session. | Retry. |
 
-A client classifies the answer from the **status line and headers alone**: the not-ready
+A refusal is always a `4xx`; no `5xx` from this endpoint is one. A client classifies the
+answer from the **status line and headers alone**: the not-ready
 signal is the header, never the body, so a `503` whose body is cut off is still a not-ready
 answer. Only a terminal `4xx` body is read, for its framed code. Promotion is idempotent, so
 every retry is safe, and the reference client bounds its retrying with one deadline per
-commit batch rather than a fixed attempt count. The commit never moves a ref; whatever its
+commit batch rather than a fixed attempt count. It also retries a `408` (an intermediary gave
+up before the remote answered) and a connection refused, reset or cut off, but not a DNS, TLS
+or protocol failure, which would only repeat. The commit never moves a ref; whatever its
 outcome, the remote pallet is untouched until the ref update that follows.
 
 **Mismatched versions, both directions.** An older client retried only a `422` carrying its

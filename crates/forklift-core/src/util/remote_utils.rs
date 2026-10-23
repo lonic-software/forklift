@@ -13,8 +13,8 @@ use tokio::task::JoinSet;
 use crate::model::remote::{
     CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
     RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest,
-    UploadTargetsResponse, WarehouseInfo, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_MISSING_BATCH,
-    MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
+    UploadTargetsResponse, WarehouseInfo, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
+    MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
 use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
@@ -1359,10 +1359,10 @@ mod clients {
         /// enumerates every call with an unbounded response phase, and this call is simply no
         /// longer one of them.
         ///
-        /// **Only the no-redirect twin exists.** Its one consumer, `fetch_batch`'s `POST`, rides
-        /// a no-auto-follow client so that a `307`/`308` cannot re-`POST` its body at a URL
+        /// **Only the no-redirect twin exists.** Both consumers ride a no-auto-follow client:
+        /// `fetch_batch`'s `POST` so that a `307`/`308` cannot re-`POST` its body at a URL
         /// presigned for `GET` only (see [`super::RemoteClient::fetch_batch`]'s own doc), and
-        /// bounding either phase must not disturb that. *Bounded negative:* head-deadline
+        /// `commit_lift` because it is a mutation; bounding either phase must not disturb that. *Bounded negative:* head-deadline
         /// variants number exactly one; the domain is this enum; re-check by reading it. The
         /// trigger for minting the follows-redirects twin is a consumer appearing — most
         /// plausibly `fetch_subtree` gaining a production caller.
@@ -1556,9 +1556,10 @@ mod clients {
         /// `read_timeout` of
         /// [`bounded_read_timeout`]`(connect_timeout, `[`FETCH_OBJECT_READ_TIMEOUT`]`)` (exactly as
         /// [`Self::bounded_object_reads`] has it). Selected only by
-        /// [`Posture::HeadDeadlineNoRedirect`], whose one consumer — `fetch_batch`'s `POST` —
-        /// needs both at once: it must not let a `307`/`308` replay its body at a `GET`-only
-        /// presigned URL, and its response body must not be able to stall forever.
+        /// [`Posture::HeadDeadlineNoRedirect`], whose consumers need both at once: `fetch_batch`'s
+        /// `POST` must not let a `307`/`308` replay its body at a `GET`-only presigned URL, and its
+        /// response body must not be able to stall forever; `commit_lift` is a mutation, so it
+        /// never follows a redirect, and its retry deadline needs the head-wait bounded.
         ///
         /// **Its own client rather than one more line on an existing one**, because neither
         /// existing client could be given the axis it lacks. [`Self::no_redirect`] cannot take a
@@ -2547,8 +2548,8 @@ impl RemoteClient {
     /// something worth showing a CLI operator; this instead surfaces just the innermost cause's
     /// own message, which for an I/O failure is normally the OS's own wording (e.g. "Connection
     /// refused (os error 61)").
-    /// [`CONNECTION_FAILED`] when `e` is a connection that was refused, reset or cut off mid-body,
-    /// which retrying unchanged may get past; nothing for any other transport failure (DNS, TLS, a
+    /// [`CONNECTION_FAILED`] when `e` is a connection that was refused, reset or cut off before
+    /// or during the answer, which retrying unchanged may get past; nothing for any other transport failure (DNS, TLS, a
     /// body that cannot be decoded, a redirect loop), which retrying unchanged repeats.
     fn connection_failed(e: &reqwest::Error) -> &'static str {
         use std::io::ErrorKind;
@@ -2561,6 +2562,13 @@ impl RemoteClient {
                 dropped |= matches!(io.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
                     | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
                     | ErrorKind::NotConnected);
+            }
+
+            // A remote that closes before its answer is complete (a restart, a dropped connection
+            // before the status line) fails as hyper's incomplete message, with no `io::Error`
+            // beneath it.
+            if let Some(hyper) = error.downcast_ref::<hyper::Error>() {
+                dropped |= hyper.is_incomplete_message();
             }
 
             current = error.source();
@@ -2681,8 +2689,8 @@ impl RemoteClient {
 
     /// The mutation counterpart of [`Self::describe_transport_error`], reached by five mutations
     /// (`update_ref`, `upload_object`, `put_presigned`, `upload_signature`, `put_trust`), none of
-    /// which auto-follows a redirect. `commit_lift` does not come here: it retries a transport
-    /// failure, so it classifies one itself ([`Self::unanswered_commit`]). Takes no `Posture`
+    /// which auto-follows a redirect, and by `commit_lift` for the transport failures it does not
+    /// retry ([`Self::unanswered_commit`]). Takes no `Posture`
     /// because its wording does not vary by one: unlike the read path, a mutation's `ReadTimedOut`
     /// is always the same uncertain shape regardless of which bound (if any) actually fired, so
     /// every one of the five funnels through the identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`]
@@ -3737,17 +3745,19 @@ impl RemoteClient {
             more,
         };
 
+        // A head-wait bound, not a total one: `budget` covers connect, the request and the wait
+        // for the status line, which is all a retried attempt ever waits on. Only a terminal `4xx`
+        // reads a body, under the error-body budget of its own, so an attempt that starts late in
+        // the deadline still reads the refusal's code whole.
         let outcome = self.send_on(
-            Posture::TotalDeadlineNoRedirect(budget),
+            Posture::HeadDeadlineNoRedirect { head: budget },
             reqwest::Method::POST, &format!("/v1/lift/{}/commit", session),
             SendBody::json(&body)?,
         ).await;
 
         let response = match outcome {
             SendOutcome::Sent(response) => response,
-            SendOutcome::Transport(e) => return Ok(Self::unanswered_commit(&e, budget)),
-            // No head-wait timer is armed on this posture; a total deadline that fires arrives as
-            // a transport error above. Classified for totality, as the lost answer it would be.
+            SendOutcome::Transport(e) => return self.unanswered_commit(e, budget),
             SendOutcome::HeadWaitExpired { budget } => return Ok(CommitAttempt::Lost {
                 detail: format!("no answer arrived within {:?}", budget),
             }),
@@ -3774,30 +3784,38 @@ impl RemoteClient {
             return Ok(CommitAttempt::Throttled { retry_after: retry_after_seconds(&response) });
         }
 
-        if status.is_server_error() {
+        // A `408` is an intermediary giving up on the request before the remote answered it: no
+        // more an answer about the session than a `5xx` is.
+        if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
             return Ok(CommitAttempt::Undetermined { status: status.as_u16() });
         }
 
         Err(self.error_of(response, "the lift commit").await)
     }
 
-    /// Classify a commit attempt that got no status line. A connection that could not be made sent
-    /// nothing — `is_connect()` covers a refused or timed-out connect and a DNS or TLS failure,
-    /// all before a request byte is written. Anything else may have reached the remote.
-    fn unanswered_commit(e: &reqwest::Error, budget: std::time::Duration) -> CommitAttempt {
+    /// Classify a commit attempt that got no status line. Only a timeout or a connection refused,
+    /// reset or cut off is retried: a DNS, TLS or protocol failure repeats unchanged, so it ends
+    /// the commit at once rather than at the deadline. Of the retried ones, a failed connect sent
+    /// nothing (`is_connect()` is decided before a request byte is written); anything else may
+    /// have reached the remote.
+    fn unanswered_commit(&self, e: reqwest::Error, budget: std::time::Duration) -> Result<CommitAttempt, String> {
+        if !e.is_timeout() && Self::connection_failed(&e).is_empty() {
+            return Err(self.describe_mutation_transport_error("committing the lift session", e));
+        }
+
         if e.is_connect() {
-            return CommitAttempt::NotSent {
-                detail: format!("could not connect to the remote ({}); nothing was sent", Self::root_cause(e)),
-            };
+            return Ok(CommitAttempt::NotSent {
+                detail: format!("could not connect to the remote ({}); nothing was sent", Self::root_cause(&e)),
+            });
         }
 
         if e.is_timeout() {
-            return CommitAttempt::Lost { detail: format!("no answer arrived within {:?}", budget) };
+            return Ok(CommitAttempt::Lost { detail: format!("no answer arrived within {:?}", budget) });
         }
 
-        CommitAttempt::Lost {
-            detail: format!("the connection to the remote failed before an answer arrived ({})", Self::root_cause(e)),
-        }
+        Ok(CommitAttempt::Lost {
+            detail: format!("the connection to the remote failed before an answer arrived ({})", Self::root_cause(&e)),
+        })
     }
 
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
@@ -6011,7 +6029,8 @@ async fn commit_one_batch(client: &RemoteClient,
 
         let wait = match &attempt {
             CommitAttempt::Committed => return Ok(()),
-            CommitAttempt::Throttled { retry_after: Some(retry_after) } => *retry_after,
+            // Never shorter than the backoff: a `Retry-After: 0` must not become a tight loop.
+            CommitAttempt::Throttled { retry_after: Some(retry_after) } => (*retry_after).max(delay),
             _ => delay,
         };
         delay = (delay * 2).min(COMMIT_BACKOFF_CAP);
@@ -6050,21 +6069,25 @@ fn commit_deadline_message(last_answer: Option<&CommitAttempt>,
         n => format!(" ({} attempts got no answer.)", n),
     };
 
+    let missed = format!("the commit did not go through within its {:?} deadline", window);
+
     let headline = match last_answer {
         Some(CommitAttempt::NotReady) => format!(
-            "the remote still holds a staged upload of this lift that it has not accepted into the \
-            warehouse within {:?}. {}. Running the lift again uploads it afresh and usually clears \
-            this; if it keeps happening, the remote's staging verifier is failing and its operator \
-            needs to know.",
-            window, unchanged
+            "{}; the remote's last answer was that it still holds a staged upload of this lift it \
+            has not accepted into the warehouse. {}. Running the lift again uploads it afresh and \
+            usually clears this; if it keeps happening, the remote's staging verifier is failing \
+            and its operator needs to know.",
+            missed, unchanged
         ),
-        Some(CommitAttempt::Throttled { .. }) => format!(
-            "the remote rate-limited the commit (429) for {:?}. {}; running the lift again is safe.",
-            window, unchanged
+        Some(CommitAttempt::Throttled { retry_after }) => format!(
+            "{}; the remote's last answer was 429 (rate limited){}. {}; running the lift again is safe.",
+            missed,
+            retry_after.map(|wait| format!(", asking for a wait of {:?}", wait)).unwrap_or_default(),
+            unchanged
         ),
         Some(CommitAttempt::Undetermined { status }) => format!(
-            "the remote kept answering {} for {:?}. {}; running the lift again is safe.",
-            status, window, unchanged
+            "{}; the remote's last answer was {}. {}; running the lift again is safe.",
+            missed, status, unchanged
         ),
         _ => {
             let last = match last_unanswered {
@@ -9875,6 +9898,20 @@ mod tests {
         );
     }
 
+    /// A remote that accepts, reads the request and closes without a byte of answer (a restart)
+    /// is a dropped connection worth retrying, not an unknown failure.
+    #[test]
+    fn fetch_info_against_a_remote_that_closes_without_answering_reads_as_a_dropped_connection() {
+        let remote = CommitRemote::start(vec![CommitAnswer::Drop]);
+        let client = RemoteClient::new_test_with_budgets(&remote.url, FAST);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let message = runtime.block_on(client.fetch_info()).err().expect("no answer is not a success");
+
+        assert!(message.contains(CONNECTION_FAILED), "{}", message);
+        assert!(is_transient_failure(&message), "{}", message);
+    }
+
     /// A refused connection is `is_connect() == true` but never `is_timeout() ==
     /// true` — checking `is_connect()` alone (as an earlier version of `describe_transport_error`
     /// did) wrongly reports it as "could not connect ... within {connect_timeout}", discarding
@@ -11649,17 +11686,19 @@ mod tests {
     }
 
     /// A lift commit's terminal refusal whose body stalls fails under the error-body budget, not
-    /// the attempt's own (looser) total deadline and not never. Bracketed like the
-    /// `missing_objects` test above: at least the injected budget (no shorter bound fired), under
-    /// the midpoint toward the nearest longer budget a misarm could fire at, and under an outer
-    /// ceiling. A `422` because a `5xx` is retried without its body being read at all. The message
-    /// is the status reason that stands in for an unread body.
+    /// the attempt's head-wait bound, not the client's silence budget, and not never. Bracketed
+    /// like the `missing_objects` test above: at least the injected budget (no shorter bound
+    /// fired), under the midpoint toward the nearest longer budget a misarm could fire at, and
+    /// under an outer ceiling. A `422` because a `5xx` is retried without its body being read at
+    /// all. The message is the status reason that stands in for an unread body.
     #[test]
     fn commit_lift_bounds_the_error_body_read_after_a_wedged_422() {
         let remote = SilentErrorBodyRemote::start_with("HTTP/1.1 422 Unprocessable Entity");
-        let budgets = stalled_error_body_budgets();
+        // The silence budget the commit's client carries (connect + `object_read`) above the
+        // error-body budget, as production's is; the shared fixture's is below it.
+        let budgets = Budgets { object_read: std::time::Duration::from_millis(15_700), ..stalled_error_body_budgets() }.checked();
         let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
-        // The attempt's total deadline, looser than the error-body budget as production's is.
+        // The attempt's head-wait bound, looser than the error-body budget as production's can be.
         let attempt = std::time::Duration::from_millis(16_300);
         let Bracket { lower_bound, upper_bound, nearest_rival, outer_ceiling } =
             error_body_bracket(budgets, &[attempt]);
@@ -12684,6 +12723,14 @@ mod tests {
         Wedge,
         /// Read the request and close the connection without a byte of answer.
         Drop,
+        /// Write this status line and these headers after `head_after`, then this body after a
+        /// further `body_after`, and close.
+        Slow {
+            head: &'static str,
+            head_after: std::time::Duration,
+            body: &'static str,
+            body_after: std::time::Duration,
+        },
     }
 
     /// A remote answering lift commits from a script, counting the connections it accepts.
@@ -12723,6 +12770,13 @@ mod tests {
                         }
                         CommitAnswer::Wedge => held.push(stream),
                         CommitAnswer::Drop => {}
+                        CommitAnswer::Slow { head, head_after, body, body_after } => {
+                            std::thread::sleep(head_after);
+                            let _ = write!(stream, "{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", head, body.len());
+                            let _ = stream.flush();
+                            std::thread::sleep(body_after);
+                            let _ = stream.write_all(body.as_bytes());
+                        }
                     }
                 }
             });
@@ -12866,7 +12920,7 @@ mod tests {
         let (outcome, elapsed) = commit_batch(&remote.url, commit_budgets(5_230));
 
         let message = outcome.expect_err("the wait does not fit");
-        assert!(message.contains("rate-limited the commit (429)"), "{}", message);
+        assert!(message.contains("last answer was 429 (rate limited), asking for a wait of 30s"), "{}", message);
         assert!(elapsed < std::time::Duration::from_secs(1), "the wait was taken ({:?})", elapsed);
         assert_eq!(remote.connections(), 1);
     }
@@ -12894,16 +12948,28 @@ mod tests {
             listener.local_addr().unwrap()
         };
         let url = format!("http://{}", address);
-        // Listening only after the first attempt was refused, and before the backoff ends.
+        // Listening only after the first attempt was refused, and before the backoff ends. The
+        // bind is retried briefly rather than unwrapped, so a slow release of the port cannot
+        // fail the test for a reason unrelated to the commit.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             std::thread::sleep(COMMIT_BACKOFF_START / 2);
-            let listener = std::net::TcpListener::bind(address).unwrap();
-            tx.send(CommitRemote::serve(listener, vec![CommitAnswer::Reply(COMMITTED)])).unwrap();
+            let started = std::time::Instant::now();
+            let listener = loop {
+                match std::net::TcpListener::bind(address) {
+                    Ok(listener) => break listener,
+                    Err(e) if started.elapsed() < std::time::Duration::from_secs(1) => {
+                        let _ = e;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("could not listen on {} again: {}", address, e),
+                }
+            };
+            let _ = tx.send(CommitRemote::serve(listener, vec![CommitAnswer::Reply(COMMITTED)]));
         });
 
         let (outcome, _) = commit_batch(&url, commit_budgets(5_230));
-        let remote = rx.recv().unwrap();
+        let remote = rx.recv().expect("the remote listened again");
 
         assert_eq!(outcome, Ok(()));
         assert_eq!(remote.connections(), 1, "the refused attempt never reached the listener");
@@ -12959,12 +13025,81 @@ mod tests {
         assert!(then_not_ready.contains("still holds a staged upload"), "{}", then_not_ready);
 
         let then_500 = headline(vec![CommitAnswer::Reply(NOT_READY), CommitAnswer::Reply(BARE_500)]);
-        assert!(then_500.contains("kept answering 500"), "{}", then_500);
+        assert!(then_500.contains("last answer was 500"), "{}", then_500);
 
         for message in [&cut_short, &then_not_ready, &then_500] {
             assert!(message.contains("The remote's pallet was not moved"), "{}", message);
             assert!(!message.contains("upload is safe") && !message.contains("uploads are safe"), "{}", message);
             assert!(is_transient_failure(message), "{}", message);
+        }
+    }
+
+    /// A `408` is an intermediary giving up before the remote answered: retried, not terminal.
+    #[test]
+    fn a_408_is_retried() {
+        let remote = CommitRemote::start(vec![
+            CommitAnswer::Reply("HTTP/1.1 408 Request Timeout"),
+            CommitAnswer::Reply(COMMITTED),
+        ]);
+
+        let (outcome, _) = commit_batch(&remote.url, commit_budgets(5_230));
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(remote.connections(), 2);
+    }
+
+    /// A `Retry-After: 0` waits the backoff anyway, so a remote that keeps asking for no wait does
+    /// not get the commit resent in a tight loop.
+    #[test]
+    fn a_zero_retry_after_still_backs_off() {
+        let remote = CommitRemote::start(vec![CommitAnswer::Reply("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0")]);
+
+        let (outcome, _) = commit_batch(&remote.url, commit_budgets(1_870));
+
+        let message = outcome.expect_err("never commits");
+        assert!(message.contains("asking for a wait of 0ns"), "{}", message);
+        // About 1.8 s of room under a backoff of 200 ms, 400 ms, 800 ms: four attempts at most.
+        assert!(remote.connections() <= 5, "{} attempts: the backoff was skipped", remote.connections());
+    }
+
+    /// An answer the client cannot parse as HTTP repeats on a retry, so it ends the commit at
+    /// once instead of at the deadline.
+    #[test]
+    fn a_garbled_answer_ends_the_commit_at_once() {
+        let remote = CommitRemote::start(vec![CommitAnswer::CutOff("this is not HTTP at all\r\n\r\n")]);
+
+        let (outcome, elapsed) = commit_batch(&remote.url, commit_budgets(5_230));
+
+        let message = outcome.expect_err("garbage never commits");
+        assert!(message.starts_with("Error while committing the lift session:"), "{}", message);
+        assert!(!is_transient_failure(&message), "{}", message);
+        assert_eq!(remote.connections(), 1);
+        assert!(elapsed < std::time::Duration::from_secs(1), "{:?}", elapsed);
+    }
+
+    /// A refusal whose status line arrives late in an attempt still has its body read whole, under
+    /// the error-body budget rather than what was left of the attempt, so its code survives.
+    #[test]
+    fn a_refusal_arriving_late_in_an_attempt_keeps_its_code() {
+        const BODY: &str = r#"{"error":"Blob x is gone.","code":"staged_upload_discarded","next_step":"Run it again."}"#;
+        let remote = CommitRemote::start(vec![CommitAnswer::Slow {
+            head: "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json",
+            head_after: std::time::Duration::from_millis(600),
+            body: BODY,
+            body_after: std::time::Duration::from_millis(600),
+        }]);
+        // One attempt of connect + 570 ms = 900 ms: the status line lands inside it, and the body
+        // only after it, though well inside the error-body budget counted from the status line.
+        let budgets = commit_budgets(570);
+        assert!(budgets.connect + budgets.commit_deadline < std::time::Duration::from_millis(1_200));
+        assert!(error_body_read_budget(&budgets) > std::time::Duration::from_millis(900));
+
+        let (outcome, _) = commit_batch(&remote.url, budgets);
+
+        let message = outcome.expect_err("a refusal");
+        match CoreError::from(message.clone()) {
+            CoreError::Refusal { code, .. } => assert_eq!(code, RefusalCode::StagedUploadDiscarded),
+            CoreError::Other(_) => panic!("the code was cut off with the body: {}", message),
         }
     }
 

@@ -1242,6 +1242,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "flume",
+ "hyper",
  "libc",
  "memmap2",
  "num_cpus",
