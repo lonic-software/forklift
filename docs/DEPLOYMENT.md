@@ -725,10 +725,11 @@ at all, and only `forklift-server` ships it.
 
 * **What to alarm on:**
   * **Verifier Lambda errors or elevated duration.** A staged object that never gets promoted
-    means a lift session can never commit its large blobs — the client's `commit_lift` retry
-    keeps seeing the `LIFT_SESSION_BLOB_NOT_READY` marker and backs off, which reads as a hung
-    lift from the outside. Verifier errors are the earliest signal something is wrong upstream
-    of that symptom.
+    means a lift session can never commit its large blobs — the head keeps answering the
+    client's commit with `503` and `Forklift-Commit: not-ready`, and the client retries until
+    its commit deadline (about two minutes) runs out, then fails saying the remote has not
+    accepted a staged upload. Verifier errors are the earliest signal something is wrong
+    upstream of that symptom; a run of `503`s on `/lift/{session}/commit` is the next one.
   * **Control-plane 5xx rate.** By design, only a genuine storage-layer failure maps to `500`
     (`error_response` in `entrypoint.rs`) — every protocol-legible failure (a bad hash, a stale
     ref, a missing closure) is a `4xx` the client is meant to read and act on. A `500` is always

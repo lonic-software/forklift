@@ -47,7 +47,7 @@ use subtle::ConstantTimeEq;
 use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
     RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
-    MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers,
+    MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
 use forklift_core::util::pallet_utils::{validate_pallet_name, DEFAULT_PALLET_NAME};
 use forklift_core::util::warehouse_utils;
@@ -720,6 +720,10 @@ fn empty(status: StatusCode) -> Response<Vec<u8>> {
     Response::builder().status(status).body(Vec::new()).expect("a valid empty response")
 }
 
+/// The `Retry-After` a not-ready lift commit carries, in seconds: about how long a staged blob takes
+/// the verifier, and short enough that a generic retrying proxy does not stall a lift.
+const COMMIT_NOT_READY_RETRY_AFTER_SECONDS: &str = "1";
+
 /// A failed request as the protocol's JSON error body, at the status the head chose.
 ///
 /// A raw `500`'s message is the one the client never sees as written. `Head`'s internal errors wrap
@@ -737,6 +741,8 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
     let status = StatusCode::from_u16(error.status.as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+    let commit_not_ready = error.commit_not_ready;
+
     let body = serde_json::to_vec(&error_body(status, error.message))
         .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
 
@@ -747,6 +753,15 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
         // RFC 6750 §3: a resource server refusing a bearer-authenticated request challenges
         // with this header so a well-behaved client knows which scheme to retry.
         builder = builder.header(header::WWW_AUTHENTICATE, "Bearer");
+    }
+
+    if commit_not_ready {
+        // The lift commit's retry signal travels in the header section, which a client reads
+        // before (and without) the body. `Retry-After` is a hint for generic tooling; the client
+        // paces not-ready retries with its own backoff.
+        builder = builder
+            .header(header::RETRY_AFTER, COMMIT_NOT_READY_RETRY_AFTER_SECONDS)
+            .header(LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY);
     }
 
     builder.body(body).expect("a valid error response")

@@ -266,6 +266,16 @@ pub trait ObjectStore {
         Ok(missing)
     }
 
+    /// Which of `hashes` still have a staged upload under lift `session` — the probe a lift commit
+    /// runs for the blobs it found absent at their canonical key, to tell "the verifier has not
+    /// caught up" (staged: retry) from "the upload is gone" (discarded or never sent: terminal).
+    /// Returns the staged subset in an unspecified order.
+    ///
+    /// Deliberately without a default: a store that answered "nothing staged" without looking
+    /// would turn every blob the verifier has not caught up on into a terminal refusal. A store
+    /// that never stages says so itself, with `Ok(Vec::new())`.
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String>;
+
     /// The uncompressed object bytes, or `None` if absent.
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String>;
 

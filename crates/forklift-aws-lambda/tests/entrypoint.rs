@@ -30,7 +30,7 @@ use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{
     CommitLiftRequest, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse, WarehouseInfo,
-    MAX_MISSING_BATCH,
+    LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_MISSING_BATCH,
 };
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{self, PalletNamespace};
@@ -49,6 +49,9 @@ struct SharedObjects(Arc<MemoryObjectStore>);
 impl ObjectStore for SharedObjects {
     fn exists(&self, hash: &str) -> Result<bool, String> {
         self.0.exists(hash)
+    }
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        self.0.objects_staged(session, hashes)
     }
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         self.0.get(hash)
@@ -503,6 +506,31 @@ fn commit_lift_verifies_and_promotes_over_http() {
     let response = fixture.call(get(&format!("/v1/objects/{}", good_hash)));
     assert_eq!(status(&response), 307);
     assert_eq!(location(&response), format!("https://s3.example/bucket/objects/{}", good_hash));
+}
+
+/// A blob still staged gets the retryable not-ready answer over HTTP: a `503` carrying the commit
+/// header the client keys on and a `Retry-After`. A blob in neither place gets a plain `422`
+/// with neither header, since retrying it can never succeed.
+#[test]
+fn a_not_ready_commit_is_a_503_with_the_commit_header_and_retry_after() {
+    let fixture = Fixture::staging();
+    let staged = object_utils::hash_object_bytes(b"a blob the verifier has not reached");
+    fixture.objects.stage("lift-1", &staged, b"a blob the verifier has not reached".to_vec());
+
+    let commit = CommitLiftRequest { control_plane: vec![], blobs: vec![staged], more: false };
+    let response = fixture.call(post_json("/v1/lift/lift-1/commit", &commit));
+    assert_eq!(status(&response), 503);
+    assert_eq!(response.headers().get(LIFT_COMMIT_HEADER).and_then(|v| v.to_str().ok()), Some(LIFT_COMMIT_NOT_READY));
+    assert_eq!(response.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("1"));
+
+    let gone = object_utils::hash_object_bytes(b"never uploaded");
+    let commit = CommitLiftRequest { control_plane: vec![], blobs: vec![gone], more: false };
+    let response = fixture.call(post_json("/v1/lift/lift-1/commit", &commit));
+    assert_eq!(status(&response), 422);
+    assert!(response.headers().get(LIFT_COMMIT_HEADER).is_none());
+    assert!(response.headers().get("retry-after").is_none());
+    let error: serde_json::Value = body_json(&response);
+    assert_eq!(error["code"].as_str(), Some("staged_upload_discarded"), "{}", error);
 }
 
 /// Review fix: `commit_lift` had no batch cap at all (every other list-taking route enforces the

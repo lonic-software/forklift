@@ -525,6 +525,25 @@ impl ObjectStore for S3ObjectStore {
         })
     }
 
+    /// The staging-key twin of [`objects_missing`](ObjectStore::objects_missing): the same bounded
+    /// batch of `HeadObject`s, against `staging/{session}/{hash}`, returning the hashes present.
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        self.bridge.block_on(async {
+            stream::iter(hashes.iter())
+                .map(|hash| async move {
+                    let present = self.key_exists(&staging_key(session, hash)).await?;
+
+                    Ok::<Option<String>, String>(present.then(|| hash.clone()))
+                })
+                .buffer_unordered(MISSING_PROBE_CONCURRENCY)
+                .try_filter_map(|staged| async move { Ok(staged) })
+                .try_collect()
+                .await
+        })
+    }
+
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         self.bridge.block_on(self.key_bytes(&object_key(hash)))
     }
