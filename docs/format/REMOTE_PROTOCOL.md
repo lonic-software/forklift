@@ -398,8 +398,10 @@ signal is the header, never the body, so a `503` whose body is cut off is still 
 answer. Only a terminal `4xx` body is read, for its framed code. Promotion is idempotent, so
 every retry is safe, and the reference client bounds its retrying with one deadline per
 commit batch rather than a fixed attempt count. It also retries a `408` (an intermediary gave
-up before the remote answered) and a connection refused, reset or cut off, but not a DNS, TLS
-or protocol failure, which would only repeat. The commit never moves a ref; whatever its
+up before the remote answered), any connect that failed before sending anything (refused,
+unreachable, a name that did not resolve) other than a TLS handshake it rejected, and a
+connection reset or cut off after sending; it does not retry a rejected TLS handshake or an
+answer it cannot parse, which would only repeat. The commit never moves a ref; whatever its
 outcome, the remote pallet is untouched until the ref update that follows.
 
 **Mismatched versions, both directions.** An older client retried only a `422` carrying its

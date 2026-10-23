@@ -170,6 +170,15 @@ const COMMIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120)
 /// with the gateway's own answer rather than this bound.
 const COMMIT_ATTEMPT_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// `commit_lift` rides [`Posture::HeadDeadlineNoRedirect`] with at most this as its head budget, so
+/// the same ordering [`BATCH_HEAD_PATIENCE`]'s assert pins for `fetch_batch` binds here: the attempt
+/// bound has to fire before the client-level read_timeout on the same request.
+const _: () = assert!(
+    COMMIT_ATTEMPT_ALLOWANCE.as_nanos() < FETCH_OBJECT_READ_TIMEOUT.as_nanos(),
+    "COMMIT_ATTEMPT_ALLOWANCE must stay strictly under FETCH_OBJECT_READ_TIMEOUT: a commit \
+    attempt's head-wait timer has to fire before the client-level read_timeout on the same request"
+);
+
 /// The least post-connect time an attempt must have to be started: enough for a status line to
 /// come back from a head that is already answering. Also what keeps every attempt's total deadline
 /// strictly above the connect bound (`check_total_deadline_payload`), so a connect-phase stall
@@ -959,9 +968,9 @@ impl Budgets {
         }
     }
 
-    /// The phase-precedence pin, for budgets that are not the production ones: the compile-time
-    /// assert beside [`BATCH_HEAD_PATIENCE`] holds the production pair, and this holds any other
-    /// pair a test builds, so no test runs against an ordering production can never have.
+    /// The phase-precedence pins, for budgets that are not the production ones: the compile-time
+    /// asserts beside [`BATCH_HEAD_PATIENCE`] and [`COMMIT_ATTEMPT_ALLOWANCE`] hold the production
+    /// pairs, and this holds any other pair a test builds, so no test runs against an ordering production can never have.
     #[cfg(test)]
     fn checked(self) -> Budgets {
         assert!(
@@ -969,6 +978,12 @@ impl Budgets {
             "batch_head_patience ({:?}) must stay strictly under object_read ({:?}), as the \
             production pair is pinned to",
             self.batch_head_patience, self.object_read
+        );
+        assert!(
+            self.commit_attempt_allowance < self.object_read,
+            "commit_attempt_allowance ({:?}) must stay strictly under object_read ({:?}), as the \
+            production pair is pinned to",
+            self.commit_attempt_allowance, self.object_read
         );
         self
     }
@@ -1362,8 +1377,9 @@ mod clients {
         /// **Only the no-redirect twin exists.** Both consumers ride a no-auto-follow client:
         /// `fetch_batch`'s `POST` so that a `307`/`308` cannot re-`POST` its body at a URL
         /// presigned for `GET` only (see [`super::RemoteClient::fetch_batch`]'s own doc), and
-        /// `commit_lift` because it is a mutation; bounding either phase must not disturb that. *Bounded negative:* head-deadline
-        /// variants number exactly one; the domain is this enum; re-check by reading it. The
+        /// `commit_lift` because it is a mutation; bounding either phase must not disturb that.
+        /// *Bounded negative:* head-deadline variants number exactly one; the domain is this
+        /// enum; re-check by reading it. The
         /// trigger for minting the follows-redirects twin is a consumer appearing — most
         /// plausibly `fetch_subtree` gaining a production caller.
         HeadDeadlineNoRedirect {
@@ -2549,8 +2565,9 @@ impl RemoteClient {
     /// own message, which for an I/O failure is normally the OS's own wording (e.g. "Connection
     /// refused (os error 61)").
     /// [`CONNECTION_FAILED`] when `e` is a connection that was refused, reset or cut off before
-    /// or during the answer, which retrying unchanged may get past; nothing for any other transport failure (DNS, TLS, a
-    /// body that cannot be decoded, a redirect loop), which retrying unchanged repeats.
+    /// or during the answer, which retrying unchanged may get past; nothing for any other
+    /// transport failure (DNS, TLS, a body that cannot be decoded, a redirect loop), which
+    /// retrying unchanged repeats.
     fn connection_failed(e: &reqwest::Error) -> &'static str {
         use std::io::ErrorKind;
 
@@ -2575,6 +2592,26 @@ impl RemoteClient {
         }
 
         if dropped { CONNECTION_FAILED } else { "" }
+    }
+
+    /// Whether `e` failed in the TLS handshake (a certificate the client rejected, a peer that
+    /// does not speak TLS): rustls's own error somewhere in the chain. It arrives wrapped in
+    /// `io::Error`s, whose `source()` skips the error they wrap, so the walk steps into each.
+    fn tls_rejected(e: &reqwest::Error) -> bool {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+
+        while let Some(error) = current {
+            if error.is::<rustls::Error>() {
+                return true;
+            }
+
+            current = match error.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()) {
+                Some(wrapped) => Some(wrapped),
+                None => error.source(),
+            };
+        }
+
+        false
     }
 
     fn root_cause(e: &(dyn std::error::Error + 'static)) -> String {
@@ -2693,7 +2730,7 @@ impl RemoteClient {
     /// retry ([`Self::unanswered_commit`]). Takes no `Posture`
     /// because its wording does not vary by one: unlike the read path, a mutation's `ReadTimedOut`
     /// is always the same uncertain shape regardless of which bound (if any) actually fired, so
-    /// every one of the five funnels through the identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`]
+    /// every one of them funnels through the identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`]
     /// (moved off the auto-following client by FORK-89); `upload_signature`/`put_trust` ride
     /// [`Posture::TotalDeadlineNoRedirect`] — bounded, but on the identical never-auto-follow
     /// client, so their transport failures land here the same way; `upload_object`/`put_presigned`
@@ -2703,7 +2740,7 @@ impl RemoteClient {
     /// watchdog was actually applied). `upload_object`/`put_presigned`'s
     /// watchdog also produces a genuine `reqwest::Error` for an actual transport failure (as
     /// opposed to a watchdog kill, which produces no `reqwest::Error` at all — see
-    /// [`clients::WatchdogOutcome::Transport`]'s doc), so a transport failure on any of the five
+    /// [`clients::WatchdogOutcome::Transport`]'s doc), so a transport failure on any of them
     /// still lands here for anything `classify` can actually see (a connect failure, or a
     /// `reqwest::Error`-bearing timeout on the response side — a fired
     /// [`Posture::TotalDeadlineNoRedirect`] deadline is exactly such a `reqwest::Error`, `is_timeout()`
@@ -2941,8 +2978,8 @@ impl RemoteClient {
     /// The actual error-body-read bound to arm for *this* client instance — folds this
     /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
     /// its own `&self` method, rather than inlining the call to the free function at its call
-    /// site (`error_of`, which `commit_lift` reaches for its terminal refusals), so a test can pin that the right instance field is
-    /// read without waiting a budget out: `error_body_budget_reads_this_field_not_a_rival_constant`
+    /// site (`error_of`, which `commit_lift` reaches for its terminal refusals), so a test can pin
+    /// that the right instance field is read without waiting a budget out: `error_body_budget_reads_this_field_not_a_rival_constant`
     /// reads it from an instance whose `connect_timeout` no production constructor could have
     /// produced, so a hardcoded direct (5s) or Tor (60s) connect bound cannot coincide with it. The
     /// timed tests of both call sites catch the direct hardcode as well, by elapsed time.
@@ -3729,7 +3766,9 @@ impl RemoteClient {
     /// - any other `4xx` → a terminal refusal (auth, an absent endpoint, a corrupt, missing or
     ///   discarded object), its body read under the error-body budget only to word it;
     /// - `5xx` without the header → `Undetermined`;
-    /// - a transport failure → `NotSent` when the connection could not be made, else `Lost`.
+    /// - a transport failure → `NotSent` when the connection could not be made (unless the TLS
+    ///   handshake was rejected), `Lost` when it was reset or cut off after sending, and a
+    ///   terminal error for anything else (a rejected TLS handshake, an answer that is not HTTP).
     ///
     /// `budget` is this attempt's total deadline, connect included; the caller keeps it strictly
     /// above the connect bound.
@@ -3799,14 +3838,18 @@ impl RemoteClient {
     /// nothing (`is_connect()` is decided before a request byte is written); anything else may
     /// have reached the remote.
     fn unanswered_commit(&self, e: reqwest::Error, budget: std::time::Duration) -> Result<CommitAttempt, String> {
-        if !e.is_timeout() && Self::connection_failed(&e).is_empty() {
-            return Err(self.describe_mutation_transport_error("committing the lift session", e));
-        }
-
-        if e.is_connect() {
+        // A failed connect sent nothing, so another attempt costs only time, and the lift's uploads
+        // already reached this remote: a connect failure now is far likelier passing (a network
+        // gone for a moment, a resolver timing out, a Tor circuit that did not build) than
+        // permanent. The exception is a TLS handshake this client rejected, which repeats.
+        if e.is_connect() && !Self::tls_rejected(&e) {
             return Ok(CommitAttempt::NotSent {
                 detail: format!("could not connect to the remote ({}); nothing was sent", Self::root_cause(&e)),
             });
+        }
+
+        if !e.is_timeout() && Self::connection_failed(&e).is_empty() {
+            return Err(self.describe_mutation_transport_error("committing the lift session", e));
         }
 
         if e.is_timeout() {
@@ -6082,7 +6125,8 @@ fn commit_deadline_message(last_answer: Option<&CommitAttempt>,
         Some(CommitAttempt::Throttled { retry_after }) => format!(
             "{}; the remote's last answer was 429 (rate limited){}. {}; running the lift again is safe.",
             missed,
-            retry_after.map(|wait| format!(", asking for a wait of {:?}", wait)).unwrap_or_default(),
+            retry_after.filter(|wait| wait.as_secs() > 0)
+                .map(|wait| format!(", asking for a wait of {}s", wait.as_secs())).unwrap_or_default(),
             unchanged
         ),
         Some(CommitAttempt::Undetermined { status }) => format!(
@@ -9844,6 +9888,9 @@ mod tests {
         let inverted = Budgets { batch_head_patience: FAST.object_read, ..FAST };
         let refused = std::panic::catch_unwind(|| inverted.checked());
         assert!(refused.is_err(), "a head patience equal to the object silence budget must be refused");
+        let inverted = Budgets { commit_attempt_allowance: FAST.object_read, ..FAST };
+        let refused = std::panic::catch_unwind(|| inverted.checked());
+        assert!(refused.is_err(), "a commit attempt allowance equal to the object silence budget must be refused");
     }
 
     /// Each budget accessor sums the connect bound with *its own* allowance. [`FAST`]'s figures
@@ -13057,7 +13104,7 @@ mod tests {
         let (outcome, _) = commit_batch(&remote.url, commit_budgets(1_870));
 
         let message = outcome.expect_err("never commits");
-        assert!(message.contains("asking for a wait of 0ns"), "{}", message);
+        assert!(message.contains("last answer was 429 (rate limited). "), "a zero wait is not quoted: {}", message);
         // About 1.8 s of room under a backoff of 200 ms, 400 ms, 800 ms: four attempts at most.
         assert!(remote.connections() <= 5, "{} attempts: the backoff was skipped", remote.connections());
     }
@@ -13074,6 +13121,44 @@ mod tests {
         assert!(message.starts_with("Error while committing the lift session:"), "{}", message);
         assert!(!is_transient_failure(&message), "{}", message);
         assert_eq!(remote.connections(), 1);
+        assert!(elapsed < std::time::Duration::from_secs(1), "{:?}", elapsed);
+    }
+
+    /// A connect that fails before sending anything is retried whatever its cause, here a name
+    /// that does not resolve: the lift's uploads already reached the remote, so such a failure at
+    /// commit time is far likelier passing than permanent.
+    #[test]
+    fn a_connect_that_fails_for_any_reason_is_retried() {
+        let (outcome, _) = commit_batch("http://forklift-commit-test.invalid", commit_budgets(900));
+
+        let message = outcome.expect_err("the name never resolves");
+        assert!(message.contains("could not connect to the remote") && message.contains("nothing was sent"), "{}", message);
+        assert!(is_transient_failure(&message), "{}", message);
+    }
+
+    /// A TLS handshake the client rejects repeats on a retry, so it ends the commit at once.
+    #[test]
+    fn a_rejected_tls_handshake_ends_the_commit_at_once() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+
+        let (outcome, elapsed) = commit_batch(&format!("https://{}", address), commit_budgets(5_230));
+
+        let message = outcome.expect_err("plain HTTP is no TLS handshake");
+        assert!(message.starts_with("Error while committing the lift session:"), "{}", message);
+        assert!(!is_transient_failure(&message), "{}", message);
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(elapsed < std::time::Duration::from_secs(1), "{:?}", elapsed);
     }
 
