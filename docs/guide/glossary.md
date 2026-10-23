@@ -95,8 +95,8 @@ Every command, with its short alias, is listed in
 
 ## Objects and storage
 
-**Object** (git: object). An immutable piece of stored content, named by the Blake3 hash of its
-bytes, so identical content is stored once.
+**Object** (git: object). An immutable piece of stored content, named by a Blake3 hash of its
+type and content, so identical content is stored once.
 
 **Blob** (git: blob). A file's contents.
 
@@ -154,8 +154,8 @@ inventory and current pallet. See [`bay`](cli.md#bay--parallel-working-directori
 **Position.** The parcel a bay's files currently stand on. A bay whose pallet another bay moved is
 **behind**.
 
-**Incomplete load.** A `load` that was interrupted. Recording a parcel is refused until it is
-finished, so a half-staged change is never stacked. See [`stack`](cli.md#stack--commit-s).
+**Incomplete load.** A `load` that was interrupted. Recording a parcel is refused while it stands,
+so a half-staged change is never stacked. See [`load`](cli.md#load--stage-changes-l).
 
 **Ignore file** (git: `.gitignore`). `.forkliftignore`; see
 [`.forkliftignore`](cli.md#forkliftignore--files-forklift-shouldnt-track).
@@ -204,7 +204,7 @@ but file content only for some paths. See [`franchise`](cli.md#franchise--clone-
 within the fetch scope. See [`scope`](cli.md#scope--show-the-sparse-workspace-scope).
 
 **Sealed.** Content outside the fetch scope: not on disk, but pinned by the hashes of the trees
-that hold it.
+that hold it. See [`franchise`](cli.md#franchise--clone-fr).
 
 **Spine.** The trees from the root down to each scoped folder, which a sparse warehouse always
 holds.
@@ -215,11 +215,12 @@ holds.
 **Narrow.** Shrinks a checkout's materialization scope without freeing storage. See
 [`narrow`](cli.md#narrow--shrink-this-checkouts-materialization-scope).
 
-**scope-prune** (git: none). Shrinks the fetch scope and deletes the dropped content to free disk.
+**scope-prune** (git: none). Shrinks the fetch scope and deletes dropped content it can safely
+fetch back, to free disk.
 See [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
-**Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. It is
-written today; nothing reads it yet.
+**Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. See
+[`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
 **Fetched-heads ledger, fence list.** A sparse warehouse's record of the heads its fetches brought
 in, and of those the remote can no longer serve.
@@ -240,7 +241,7 @@ rare kind of write failure. See
 
 **Restage.** Reading an object back, checking its hash, and rewriting it durably.
 
-**heal** (git: none; loosely `fsck`). The recovery command for taints and interrupted operations.
+**heal** (git: none). The recovery command for taints and interrupted operations.
 See [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation).
 
 **Operation marker.** A record a multi-step command writes before it starts and removes when it
@@ -269,21 +270,25 @@ Forklift has several locks, each guarding a different thing.
 **Remote** (git: remote). Another warehouse you sync with, treated as untrusted storage. See
 [Working with remotes](cli.md#6-working-with-remotes).
 
-**Franchise** (git: `clone`). Copies a remote warehouse.
+**Franchise** (git: `clone`). Copies a remote warehouse. See
+[`franchise`](cli.md#franchise--clone-fr).
 
-**Lift** (git: `push`, never forced). Uploads a pallet and moves the remote's head.
+**Lift** (git: `push`, never forced). Uploads a pallet and moves the remote's head. See
+[`lift`](cli.md#lift--push-li).
 
 **Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A diverged working pallet is
-reported, never merged on its own.
+reported, never merged on its own. See [`lower`](cli.md#lower--pull-lo).
 
 **Diverged, remote ahead.** Refusals meaning the remote's history moved: *diverged* when both sides
 have parcels the other lacks, *remote ahead* when you need to lower first.
 
 **Bundle** (git: bundle, or a packfile in transit). Many objects downloaded as one package, for a
-`franchise`, a `lower` or a sparse fetch. It is never a source of truth.
+`franchise`, a `lower` or a sparse fetch. It is never a source of truth. See
+[Working with remotes](cli.md#6-working-with-remotes).
 
 **Batch endpoint, batch lane.** The request that fetches many objects at once. A client that finds
-it missing or slow **closes the lane** and fetches one at a time.
+it missing or slow **closes the lane** and fetches one at a time. See
+[`lower`](cli.md#lower--pull-lo).
 
 **Tor.** A transport for reaching remotes behind NAT; see
 [Reaching a remote over Tor](cli.md#reaching-a-remote-over-tor).
@@ -322,7 +327,8 @@ anywhere.
 **Key** (git: GPG or SSH signing key). An Ed25519 key pair. The public half is recorded in the
 office; the private half stays on your machine.
 
-**Identity root.** The one key per operator that every other key of that operator chains back to.
+**Identity root.** The key the office pins for each operator. The operator's other keys are
+vouched for by it, or by an admin. See [Concepts](trust-and-identity.md#1-concepts).
 
 **Endorsement.** A key's signature vouching for another key: one of your keys vouching for your
 new device, or an admin's key vouching for a newly admitted operator.
@@ -370,6 +376,7 @@ signed. See [Establishing trust](trust-and-identity.md#2-establishing-trust).
 [Establishing trust](trust-and-identity.md#2-establishing-trust).
 
 **Trust pin.** A point in history the trust state keeps alive, so gc never deletes what it reaches.
+See [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation).
 
 **First contact, TOFU** (like an SSH host key). Adopting a remote's genesis the first time you
 connect. See [First contact](trust-and-identity.md#joining-a-trusted-warehouse-first-contact).
@@ -382,7 +389,7 @@ different genesis. See
 the old history kept as **attested** but no longer verified. See
 [Recovery: re-genesis](trust-and-identity.md#9-recovery-re-genesis).
 
-**Audit** (git: none; loosely `verify-commit` plus `fsck`). Checks signed history offline. See
+**Audit** (git: none; loosely `verify-commit`). Checks signed history offline. See
 [`audit`](cli.md#audit--verify-signed-history-offline-a).
 
 **Parcel signature.** An Ed25519 signature over a parcel's hash, stored beside the parcel rather
