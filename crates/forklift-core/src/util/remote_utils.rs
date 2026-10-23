@@ -970,7 +970,8 @@ impl Budgets {
 
     /// The phase-precedence pins, for budgets that are not the production ones: the compile-time
     /// asserts beside [`BATCH_HEAD_PATIENCE`] and [`COMMIT_ATTEMPT_ALLOWANCE`] hold the production
-    /// pairs, and this holds any other pair a test builds, so no test runs against an ordering production can never have.
+    /// pairs, and this holds any other pair a test builds, so no test runs against an ordering
+    /// production can never have.
     #[cfg(test)]
     fn checked(self) -> Budgets {
         assert!(
@@ -2727,11 +2728,11 @@ impl RemoteClient {
     /// The mutation counterpart of [`Self::describe_transport_error`], reached by five mutations
     /// (`update_ref`, `upload_object`, `put_presigned`, `upload_signature`, `put_trust`), none of
     /// which auto-follows a redirect, and by `commit_lift` for the transport failures it does not
-    /// retry ([`Self::unanswered_commit`]). Takes no `Posture`
-    /// because its wording does not vary by one: unlike the read path, a mutation's `ReadTimedOut`
-    /// is always the same uncertain shape regardless of which bound (if any) actually fired, so
-    /// every one of them funnels through the identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`]
-    /// (moved off the auto-following client by FORK-89); `upload_signature`/`put_trust` ride
+    /// retry ([`Self::unanswered_commit`]). Takes no `Posture` because its wording does not vary
+    /// by one: unlike the read path, a mutation's `ReadTimedOut` is always the same uncertain
+    /// shape regardless of which bound (if any) actually fired, so every one of them funnels
+    /// through the identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`] (moved
+    /// off the auto-following client by FORK-89); `upload_signature`/`put_trust` ride
     /// [`Posture::TotalDeadlineNoRedirect`] — bounded, but on the identical never-auto-follow
     /// client, so their transport failures land here the same way; `upload_object`/`put_presigned`
     /// ride [`clients::Clients::send_with_watchdog`] directly, on the same never-auto-follow
@@ -2979,8 +2980,9 @@ impl RemoteClient {
     /// instance's own `connect_timeout` into [`error_body_read_budget`]'s arithmetic. Split out as
     /// its own `&self` method, rather than inlining the call to the free function at its call
     /// site (`error_of`, which `commit_lift` reaches for its terminal refusals), so a test can pin
-    /// that the right instance field is read without waiting a budget out: `error_body_budget_reads_this_field_not_a_rival_constant`
-    /// reads it from an instance whose `connect_timeout` no production constructor could have
+    /// that the right instance field is read without waiting a budget out:
+    /// `error_body_budget_reads_this_field_not_a_rival_constant` reads it from an instance whose
+    /// `connect_timeout` no production constructor could have
     /// produced, so a hardcoded direct (5s) or Tor (60s) connect bound cannot coincide with it. The
     /// timed tests of both call sites catch the direct hardcode as well, by elapsed time.
     fn error_body_budget(&self) -> std::time::Duration {
@@ -3832,14 +3834,15 @@ impl RemoteClient {
         Err(self.error_of(response, "the lift commit").await)
     }
 
-    /// Classify a commit attempt that got no status line. Only a timeout or a connection refused,
-    /// reset or cut off is retried: a DNS, TLS or protocol failure repeats unchanged, so it ends
-    /// the commit at once rather than at the deadline. Of the retried ones, a failed connect sent
-    /// nothing (`is_connect()` is decided before a request byte is written); anything else may
-    /// have reached the remote.
+    /// Classify a commit attempt that got no status line. A failed connect is retried, whatever
+    /// its cause, unless the TLS handshake was rejected; once connected, only a timeout or a
+    /// connection reset or cut off is retried. A rejected handshake or an answer that is not HTTP
+    /// repeats unchanged, so it ends the commit at once rather than at the deadline. Of the
+    /// retried ones, a failed connect sent nothing (`is_connect()` is decided before a request
+    /// byte is written); anything else may have reached the remote.
     fn unanswered_commit(&self, e: reqwest::Error, budget: std::time::Duration) -> Result<CommitAttempt, String> {
-        // A failed connect sent nothing, so another attempt costs only time, and the lift's uploads
-        // already reached this remote: a connect failure now is far likelier passing (a network
+        // A failed connect sent nothing, so another attempt costs only time, and the lift talked to
+        // this remote moments ago: a connect failure now is far likelier passing (a network
         // gone for a moment, a resolver timing out, a Tor circuit that did not build) than
         // permanent. The exception is a TLS handshake this client rejected, which repeats.
         if e.is_connect() && !Self::tls_rejected(&e) {
@@ -13125,7 +13128,7 @@ mod tests {
     }
 
     /// A connect that fails before sending anything is retried whatever its cause, here a name
-    /// that does not resolve: the lift's uploads already reached the remote, so such a failure at
+    /// that does not resolve: the lift talked to the remote moments ago, so such a failure at
     /// commit time is far likelier passing than permanent.
     #[test]
     fn a_connect_that_fails_for_any_reason_is_retried() {
