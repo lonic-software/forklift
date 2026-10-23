@@ -1,6 +1,6 @@
 # Forklift glossary
 
-Every term Forklift uses, what it means, and its git equivalent where there is one. The
+The terms Forklift uses, what each means, and its git equivalent where there is one. The
 [guides](README.md) explain how to *use* each thing; this page only says what each word means.
 
 Terms are grouped by topic. Within a topic, the more basic terms come first. A few words mean
@@ -56,8 +56,9 @@ head; see [Overloaded words](#overloaded-words).
 **Default pallet** (git: default branch). The pallet a new clone starts on.
 
 **Revision** (git: revision). Any way of naming a point in history: a pallet name, an `@`-qualified
-meta pallet, or a parcel hash prefix of at least 4 hex characters. `:empty` names the empty tree.
-`<revision>:<path>` names one file at that revision.
+meta pallet, or a parcel hash prefix of at least 4 hex characters. Two forms belong to one command
+each. `diff` also accepts `:empty`, the empty tree, so a root parcel can be compared against a
+clean slate. `show` takes `<revision>:<path>` to name one file at that revision.
 
 **Operator** (git: author). Whoever authored a parcel. History stores an opaque operator id, never
 a name or email; see [Identity and keys](#identity-and-keys).
@@ -83,8 +84,16 @@ The everyday verbs map one to one onto git:
 | `franchise` | `clone` | copy a remote warehouse |
 | `lift` | `push` | upload to a remote |
 | `lower` | `pull --ff-only` | fetch and fast-forward |
+| `diff` | `diff` | line-by-line changes |
+| `restore` | `restore` | discard working-directory changes |
+| `show` | `show <rev>:<path>` | a file's content at a revision |
+| `peek` | `cat-file` | inspect one object |
+| `blame` | `blame` | who wrote each line |
+| `import-git` / `export-git` | none | migrate a git repository in, or back out |
 
-The full command list with aliases is in [cli.md](cli.md#10-command--alias-reference).
+Most commands have a short alias (`st` for `stocktake`, `s` for `stack`), and `fl` can be set up as
+a short name for `forklift` itself (`alias`). The full command list with aliases is in
+[cli.md](cli.md#10-command--alias-reference).
 
 ## Objects and storage
 
@@ -129,7 +138,8 @@ truth and repairs itself.
 **Salvage.** What `compact --all` does with a damaged pack: it reads the pack record by record into
 loose objects, and deletes the pack only once every live object it may hold has another copy.
 
-**Object ceiling.** 64 MiB, the largest single object. Bigger files are split into chunks.
+**Object ceiling.** 64 MiB, the largest single object. It is a hard limit; files are already split
+into chunks from 8 MiB up, well below it.
 
 **gc** (git: `gc` / `prune`). Garbage collection: deleting objects nothing reaches any more. On a
 server it is `forklift-server gc`, which keeps a grace period so lifts still in flight are safe.
@@ -222,16 +232,23 @@ always holds them.
 
 **Expand.** Widens the fetch scope and fetches the newly included content, across all history held.
 
-**Narrow.** Shrinks one bay's materialization scope. It frees no disk space.
+**Narrow.** Shrinks one checkout's materialization scope (a bay's, or a sparse main tree's) and
+removes the dropped files from the working directory. It frees nothing in the object store: that
+content is still ordinary history.
 
 **scope-prune** (git: none). Narrows the fetch scope and deletes the content that falls out of it,
 to free disk. This is safe only for content the remote still holds, because the remote is where
 `expand` gets it back. So `scope-prune` checks with the remote first, and keeps anything it cannot
 confirm.
 
-**Held-heads record.** `.forklift/held-heads`: for each pallet, up to 16 heads this warehouse saw
-the remote accept or serve. Each entry is only a candidate to ask the remote about, never proof on
+**Held-heads record.** `.forklift/held-heads`: for each working pallet, up to 16 heads this
+warehouse saw the remote accept or serve. Each entry is only a candidate to ask the remote about, never proof on
 its own. It is written today. Nothing reads it yet.
+
+**Fetched-heads ledger, fence list.** A sparse warehouse's record of every head a scoped fetch
+brought in, including heads no pallet points at any more, so `expand` can widen their history too.
+A recorded head the remote can no longer serve moves to the *fence list*, and no pallet may be
+moved onto a fenced head until a scoped fetch of it completes.
 
 **Origin.** The remote a sparse warehouse fetched from. A sparse warehouse may lift only to its
 origin.
@@ -271,12 +288,14 @@ Forklift has several locks. Each guards a different thing.
 
 | Lock | Guards | Taken by |
 |------|--------|----------|
-| Warehouse lock (`lock`, per bay) (git: `index.lock`) | the bay's staging and refs | every mutating command; a killed process leaves it behind |
+| Warehouse lock (`lock`, per bay) (git: `index.lock`) | one bay's inventory and working directory | every mutating command in that bay; a killed process leaves it behind. It does not guard refs, which every bay shares |
+| Ref lock (`refs.lock`) | state shared by every bay | each pallet ref compare-and-set, trust installs, the fetched-heads ledger and fence list, `expand`'s scope commit, and the held-heads record |
 | Object-store lock (`store.lock`) | the object store | compaction, so two never overlap |
 | Store-access lock (`store-access.lock`) | whole-store rewrites | `compact --all`, `scope-prune` and server gc, against mutating commands |
-| Ref lock (`refs.lock`) | ref writes | pallet updates, the held-heads record |
+| Config lock (`<config file>.lock`) | one config file | every config edit; a second editor waits rather than failing |
 | Serve lock (`.forklift/serve.lock`) | a warehouse being served | `forklift-server`; blocks gc and full repack |
 | Server base lock (`.forklift-server.lock`) | a server's base folder | one server per folder |
+| Build lock (`lock`, in `prepare`'s temporary folder) | a warehouse being built | `prepare`, until the finished folder is renamed into place |
 
 ## Remotes
 
@@ -365,12 +384,12 @@ you add a new device.
 **Proof of possession.** The new key's own signature over the operator id, so nobody can enroll a
 key they do not hold.
 
-**`admit`, `link`, `authorize`.** The ways a key enters the office. `admit`: an admin adds a new
-operator. `link`: you add a device of your own. `authorize`: an admin re-keys an operator who lost
-every device.
+**`office admit`, `office link`, `office authorize`.** The ways a key enters the office. `admit`: an
+admin adds a new operator. `link`: you add a device of your own. `authorize`: an admin re-keys an
+operator who lost every device. `office keygen` makes the key and prints the lines to hand over.
 
-**Rotate, retire, compromised.** `rotate` replaces a key with a fresh one, signed by the old.
-`retire` revokes a key. `--compromised` marks it as possibly in other hands. Retired keys are kept
+**Rotate, retire, compromised.** `office rotate` replaces a key with a fresh one, signed by the old.
+`office retire` revokes a key. `--compromised` marks it as possibly in other hands. Retired keys are kept
 forever, so old signatures can still be checked.
 
 **Distrust boundary.** The pallet heads vouched for at the moment a key was revoked. The revoked
@@ -419,7 +438,8 @@ The report says what changed, such as a re-genesis or an unrelated warehouse.
 
 **Re-genesis** (trust reset). Recovery for an office no one can sign any more: a new genesis, with
 the old history kept as **attested** (readable, but no longer verified). It is deliberately loud.
-Each clone must accept it explicitly with `accept-regenesis --confirm <genesis>`.
+An admin runs `office regenesis`, and each clone must accept it explicitly with
+`office accept-regenesis --confirm <genesis>`.
 
 **Audit** (git: none; loosely `verify-commit` plus `fsck`). Checks signed history offline: the
 office chain from genesis, then every parcel's signature against the office. A server runs the same
@@ -483,11 +503,12 @@ contains it), refuted, or unproven (the evidence is not held locally).
 **Query** (git: `log` filters; jj revsets). `query` filters history on signed facts: identity
 class, supervisor, signer, provenance, tag and paths touched.
 
-**Verified by default.** `query` never matches an identity filter against a value it has not
-checked. It filters cheaply first, then verifies every survivor's signature.
+**Verified by default.** Unless told otherwise, `query` never matches an identity filter against a
+value it has not checked. It filters cheaply first, then verifies every survivor's signature.
 
 **Recorded.** The cheap reading of identity: what a parcel says about itself, which can be forged.
-`history --class` reads it this way; `query --class` verifies.
+`history --class` always reads it this way. `query` does so only with `--recorded`, and then labels
+every answer `recorded`.
 
 **Trust label.** How far a parcel's identity was confirmed: *verified*, *signed-revoked*,
 *unsigned*, *unknown-key* or *recorded*.
@@ -496,8 +517,12 @@ checked. It filters cheaply first, then verifies every survivor's signature.
 
 **`--json`.** Every command's machine-readable output, for scripts and AI agents.
 
-**Schema version.** The version number carried in all `--json` output. It changes whenever the
-output's shape or the set of error codes changes, so a script can detect what it is talking to.
+**Schema version.** The version number carried in all `--json` output. It changes when a command's
+output or the set of error codes changes incompatibly, so a script can pin it. A new field can
+appear without a change, so a parser should ignore fields it does not know.
+
+**MCP server** (`forklift mcp`). Serves Forklift's commands as tools to an AI client over the Model
+Context Protocol.
 
 **Exit code.** The number a command exits with, which scripts switch on. 0 is success, 1
 unclassified, 2 a usage error, 130 cancelled. Forklift's own refusals have stable codes from 3
@@ -519,13 +544,13 @@ separate Lonic tool that drives command-line tools.
 |------|----------|
 | head | (1) the parcel a pallet points at; (2) a server program: `forklift-server` or the Lambda head |
 | scope | (1) fetch scope, what the warehouse holds; (2) materialization scope, what one bay writes to disk |
-| lock | six different locks; see [Locks](#locks) |
+| lock | several different locks; see [Locks](#locks) |
 | marker | the warehouse marker; the operation marker; the incomplete-load record; conflict markers inside a file |
 | staging | (1) the inventory; (2) the Lambda head's holding area for unverified uploads |
 | gc | (1) the general idea of deleting unreachable objects; (2) the `forklift-server gc` command |
 | admission | (1) the server's `admission` hook; (2) admitting an operator to the office (`office admit`) |
 | redirect | (1) a bay's redirect file; (2) an HTTP redirect in the remote protocol |
-| `--class` | recorded on `history`, verified on `query` |
+| `--class` | recorded on `history`; verified on `query`, unless `--recorded` is given |
 
 ## Planned, not shipped
 
