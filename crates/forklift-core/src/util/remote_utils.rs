@@ -253,6 +253,15 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<std::time::Durati
     value.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
+/// `url`'s path and query, the part after its origin. Built from the parts rather than by slicing
+/// the serialization, which keeps any userinfo the origin leaves out.
+fn origin_relative_path(url: &reqwest::Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{}", url.path(), query),
+        None => url.path().to_string(),
+    }
+}
+
 /// Whether a status means the remote does not implement an endpoint at all (an older build):
 /// a `404` (no such route) or `405` (the path exists for other methods only). The caller falls
 /// back to the legacy path. Any other non-success status is a real error, not an absence.
@@ -2530,6 +2539,22 @@ impl RemoteClient {
         ).await
     }
 
+    /// [`Self::send_on`] to an absolute `url` on this remote's own origin (a same-origin redirect
+    /// target), with the bearer token, and with no body. The base is the URL's origin, not
+    /// [`Self::base`], since the target's path is already complete.
+    async fn send_on_own_origin(&self,
+                                posture: Posture,
+                                method: reqwest::Method,
+                                url: &reqwest::Url) -> SendOutcome {
+        let origin = url.origin().ascii_serialization();
+        let path = origin_relative_path(url);
+        self.clients.send_on(
+            posture, &self.budgets, method,
+            RequestDestination::Authenticated { base: &origin, token: self.token.as_deref(), path: &path },
+            SendBody::Empty,
+        ).await
+    }
+
     /// The presigned counterpart of [`Self::send_on`] — same posture, same payload guarantee,
     /// but sending to an absolute, self-authorizing URL with **no** bearer token attached. Down
     /// to one live caller — [`Self::follow_bundle_redirect`]'s cross-origin `GET` (a presigned storage URL
@@ -3524,15 +3549,7 @@ impl RemoteClient {
                 let own_origin = reqwest::Url::parse(&self.base)
                     .map_or(false, |base| base.origin() == location.origin());
                 let outcome = if own_origin {
-                    let origin = location.origin().ascii_serialization();
-                    let path = &location.as_str()[origin.len()..];
-                    self.clients.send_on(
-                        redirect_posture, &self.budgets, reqwest::Method::GET,
-                        RequestDestination::Authenticated {
-                            base: &origin, token: self.token.as_deref(), path
-                        },
-                        SendBody::Empty,
-                    ).await
+                    self.send_on_own_origin(redirect_posture, reqwest::Method::GET, &location).await
                 } else {
                     self.send_on_presigned(
                         redirect_posture, reqwest::Method::GET, location.as_str(), SendBody::Empty
@@ -9154,6 +9171,14 @@ mod tests {
         let Err(error) = runtime.block_on(client.fetch_info()) else { panic!("the handshake 404 is an error") };
         assert!(error.contains("404"), "the answer after the throttle decides, not the 429: {}", error);
         assert_eq!(*requests.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn origin_relative_path_keeps_path_and_query_and_drops_userinfo() {
+        let url = reqwest::Url::parse("http://user:pw@127.0.0.1:9/responses/bundle?sig=a%2Fb").unwrap();
+        assert_eq!(origin_relative_path(&url), "/responses/bundle?sig=a%2Fb");
+        let url = reqwest::Url::parse("http://127.0.0.1:9/responses/bundle").unwrap();
+        assert_eq!(origin_relative_path(&url), "/responses/bundle");
     }
 
     /// The wait only ever grows by up to half the backoff, and it does vary: a wave of fetches
