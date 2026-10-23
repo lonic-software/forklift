@@ -350,22 +350,29 @@ impl ShardLedger {
     }
 }
 
-/// Replace the whole staging area with the given shards: the existing inventory folders
-/// are removed, the given shards are written, and the metadata file is rewritten to list
-/// exactly their directories. Used when `shift` repopulates the inventory from the target
-/// pallet's tree, `park`'s push resets to the pallet head, a `consolidate` fast-forward
-/// repopulates from the target pallet, `import-git` checks out its initial branch, and
+/// Replace the whole staging area with the given shards, so that the store holds exactly them and
+/// the metadata registers exactly their directories. Used when `shift` repopulates the inventory
+/// from the target pallet's tree, `park`'s push resets to the pallet head, a `consolidate`
+/// fast-forward repopulates from the target pallet, `import-git` checks out its initial branch, and
 /// `lower`/`franchise` materialize a fetched tree (`shift_utils::materialize_tree`).
 ///
-/// The whole staging area is now rebuilt wholesale from `shards` — a known-good source — so
-/// every previously recorded incomplete-load root is now moot; see
-/// `load_guard_utils::clear_all_recorded`'s doc comment.
+/// Only the shards whose bytes differ are written (see [`replace_differing_inventories`]): a
+/// switch between two trees that share most directories leaves those directories' shards, and the
+/// rollups on them, untouched. A store this cannot trust — metadata missing, damaged or
+/// unreadable, a store root that is not a folder, a registered shard that cannot be read or does
+/// not parse — is wiped and rewritten whole instead ([`replace_every_inventory`]), so damage never
+/// blocks the reset.
 ///
-/// An error or a crash after the store goes and before every shard lands leaves registered keys
-/// with no shard, which read as empty directories: committed, that is the removal of every tracked
-/// file. So this refuses unless the operation it belongs to raised its marker first
-/// (`operation_utils`), which keeps every command that could commit refusing until `forklift
-/// heal` has finished or undone the operation.
+/// The whole staging area is now rebuilt from `shards` — a known-good source — so every previously
+/// recorded incomplete-load root is now moot; see `load_guard_utils::clear_all_recorded`'s doc
+/// comment.
+///
+/// Either way, an error or a crash part-way leaves a staging area that is neither the old one nor
+/// the new one: some shards already the new content, others still the old, and (after a wipe)
+/// registered keys with no shard, which read as empty directories. Committed, that is a tree nobody
+/// staged. So this refuses unless the operation it belongs to raised its marker first
+/// (`operation_utils`), which keeps every command that could commit refusing until `forklift heal`
+/// has finished or undone the operation.
 ///
 /// # Arguments
 /// * `shards` - Warehouse path key → inventory, for every tracked directory.
@@ -373,13 +380,167 @@ impl ShardLedger {
 /// # Returns
 /// * `Ok(())`      - If the staging area was replaced.
 /// * `Err(String)` - If no operation marker stands, or a folder or file operation failed.
-pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inventory>) -> Result<(), String> {
+pub fn replace_all_inventories(shards: &BTreeMap<String, Inventory>) -> Result<(), String> {
     crate::util::operation_utils::require_raised("Rewriting the whole staged inventory")?;
 
-    // The whole store goes, not the root key's shard, and the new set is registered before any
-    // shard lands. The old metadata is replaced, not read, so a damaged one cannot block the reset.
     let _guard = SHARD_MUTATION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
+    if !replace_differing_inventories(shards)? {
+        replace_every_inventory(shards)?;
+    }
+
+    // Only once every shard has landed: the markers must not go while registered keys still have
+    // no shard.
+    load_guard_utils::clear_all_recorded();
+
+    Ok(())
+}
+
+/// One key's shard as [`replace_differing_inventories`] compares it: registered, wanted, or both.
+struct ShardDiff {
+    /// Whether the freshly built shard's bytes differ from the shard on disk (no shard on either
+    /// side counts as equal).
+    differs: bool,
+    /// The shard on disk, parsed, when it exists and `differs`.
+    on_disk: Option<Inventory>,
+    /// The freshly built shard's bytes, when the key has a shard in the new set.
+    fresh: Option<Vec<u8>>,
+}
+
+/// [`replace_all_inventories`] over a store it can trust: every shard whose bytes would change is
+/// written, every other is left alone, and the registered set becomes exactly the new one.
+///
+/// Every registered and every wanted key is read and compared across every core, against the
+/// store as it stands before anything is written. Then, in three steps, each durable before the
+/// next starts:
+///
+/// 1. **Phase A** — the rollup of every shard on disk whose stamp is going (a stamp the new set
+///    does not carry for that key, or a key the new set drops) is cleared, as one batched barrier.
+///    A stamp is a tree hash, so it changes exactly when content under it changes: every stamped
+///    ancestor of a content change or a removal is cleared here, before phase B lands that change
+///    (R1). A shard whose only change is stat data keeps its ancestors' bytes, and so their rollups,
+///    untouched: they still name the same tree. A shard this does not rewrite is never cleared.
+/// 2. **Registration** — the dropped keys are unregistered and the new ones registered, in one
+///    metadata write. A key the new set keeps registered with no shard of its own, whose old shard
+///    is on disk, is unregistered and registered again in the same write, which clears and syncs
+///    its address.
+/// 3. **Phase B** — every shard whose bytes differ, as a second barrier; then the dropped keys'
+///    shards are removed, and any unregistered shard swept.
+///
+/// # Arguments
+/// * `shards` - Warehouse path key → inventory, for every tracked directory.
+///
+/// # Returns
+/// * `Ok(true)`    - The staging area holds exactly `shards`.
+/// * `Ok(false)`   - The store cannot be trusted, and nothing was written: the caller wipes it.
+/// * `Err(String)` - A failed phase or metadata write; the marker the caller holds still stands.
+fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result<bool, String> {
+    let Ok((_, Some(metadata))) = file_utils::retrieve_inventory_metadata_or_none() else {
+        return Ok(false);
+    };
+
+    // A store root that is anything but a real folder — a link included — is never entered.
+    match std::fs::symlink_metadata(file_utils::get_inventory_store_root()?) {
+        Ok(store) if store.is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Ok(false),
+    }
+
+    let mut ledger = ShardLedger { entries: metadata };
+
+    let wanted = close_under_ancestors(&shards.keys().map(|key| key_to_metadata_entry(key)).collect());
+    let keys: Vec<String> = ledger.entries.union(&wanted)
+        .map(|entry| metadata_entry_to_key(entry).to_string())
+        .collect();
+
+    // A wanted key not registered yet reads as no shard: its address is cleared when it registers.
+    let compared = fanout_utils::fanout_map(&keys, |key| -> Option<ShardDiff> {
+        let on_disk = ledger.retrieve(key).ok()?;
+        let fresh = shards.get(key).map(InventoryBuilder::build);
+        let differs = on_disk != fresh;
+
+        let on_disk = match on_disk {
+            Some(bytes) if differs => Some(parser::inventory::inventory_parser::parse_inventory(&bytes).ok()?),
+            _ => None,
+        };
+
+        Some(ShardDiff { differs, on_disk, fresh })
+    });
+
+    let Some(compared) = compared.into_iter().collect::<Option<Vec<ShardDiff>>>() else {
+        return Ok(false);
+    };
+
+    let mut clears: Vec<(&str, Inventory)> = Vec::new();
+    let mut writes: Vec<(&str, Vec<u8>)> = Vec::new();
+    let mut unregistered: BTreeSet<String> = BTreeSet::new();
+    let mut dropped: Vec<&str> = Vec::new();
+
+    for (key, diff) in keys.iter().zip(compared) {
+        if !diff.differs {
+            continue;
+        }
+
+        let kept = wanted.contains(&key_to_metadata_entry(key));
+
+        if let Some(mut on_disk) = diff.on_disk {
+            let fresh_stamp = shards.get(key.as_str()).and_then(Inventory::get_rollup_hash);
+
+            if on_disk.get_rollup_hash().is_some() && (!kept || on_disk.get_rollup_hash() != fresh_stamp) {
+                on_disk.clear_rollup();
+                clears.push((key, on_disk));
+            }
+        }
+
+        match diff.fresh {
+            Some(bytes) => writes.push((key, bytes)),
+            None => {
+                unregistered.insert(key.clone());
+
+                if !kept {
+                    dropped.push(key);
+                }
+            }
+        }
+    }
+
+    let phase_a_batch = file_utils::WriteBatch::new();
+
+    for (key, inventory) in &clears {
+        stage_shard_at(&ledger.shard_path_for_write(key)?, inventory, &phase_a_batch)?;
+    }
+
+    phase_a_batch.finish()?;
+
+    ledger.update(&unregistered, &shards.keys().cloned().collect())?;
+
+    let phase_b_batch = file_utils::WriteBatch::new();
+
+    for (key, bytes) in &writes {
+        let shard_path = ledger.shard_path_for_write(key)?;
+
+        if let Some(parent) = shard_path.parent() {
+            file_utils::create_folder_if_not_exists(parent)?;
+        }
+
+        phase_b_batch.stage(&shard_path, bytes)?;
+    }
+
+    phase_b_batch.finish()?;
+
+    for key in dropped {
+        remove_shard_folder(key)?;
+    }
+
+    sweep_unregistered_shards();
+
+    Ok(true)
+}
+
+/// [`replace_all_inventories`] over a store it cannot trust: the whole store goes, the new set is
+/// registered, and only then does any shard land. The old metadata is replaced, not read, so a
+/// damaged one cannot block the reset.
+fn replace_every_inventory(shards: &BTreeMap<String, Inventory>) -> Result<(), String> {
     let ledger = ShardLedger::replace(&shards.keys().cloned().collect())?;
 
     // One durability barrier for the whole warehouse instead of one per shard (DESIGN.html
@@ -391,13 +552,7 @@ pub fn replace_all_inventories(shards: &std::collections::BTreeMap<String, Inven
         save_inventory_deferred(&ledger, key, inventory, &batch)?;
     }
 
-    batch.finish()?;
-
-    // Only once every shard has landed: the markers must not go while registered keys still have
-    // no shard.
-    load_guard_utils::clear_all_recorded();
-
-    Ok(())
+    batch.finish()
 }
 
 /// Clean up the staged state after a parcel was stacked, so the inventory describes exactly the

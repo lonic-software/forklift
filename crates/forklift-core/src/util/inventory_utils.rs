@@ -4305,6 +4305,211 @@ mod tests {
         assert_eq!(read.unwrap(), BTreeSet::new());
     }
 
+    /// A shard as `stamped_chain_with_sibling` writes one — `file.txt` at inode 1 — with `extra`
+    /// listed beside it when given, at `inode`, stamped `stamp`.
+    fn chain_shard(inode: u64, extra: Option<&str>, stamp: Option<&str>) -> Inventory {
+        let mut inventory = Inventory::new();
+        inventory.add_item(item("file.txt", inode, InventoryItemState::Normal));
+        if let Some(name) = extra {
+            inventory.add_item(item(name, 2, InventoryItemState::Normal));
+        }
+        if let Some(hash) = stamp {
+            inventory.stamp_rollup(RollupStamp::trusted(hash.to_string()));
+        }
+        inventory
+    }
+
+    /// The new set for a whole-inventory rewrite, by key.
+    fn new_set(shards: Vec<(&str, Inventory)>) -> BTreeMap<String, Inventory> {
+        shards.into_iter().map(|(key, inventory)| (key.to_string(), inventory)).collect()
+    }
+
+    /// What any write of `key`'s shard file changes: its inode (a write renames a new file over it)
+    /// and its mtime.
+    fn shard_file_identity(key: &str) -> (u64, std::time::SystemTime) {
+        let metadata = std::fs::metadata(file_utils::get_inventory_data_path_for_key(key).unwrap()).unwrap();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+        #[cfg(not(unix))]
+        let inode = 0;
+        (inode, metadata.modified().unwrap())
+    }
+
+    /// Every shard in the store belongs to a registered key; a registered key that is only an
+    /// ancestor of another may have none.
+    fn assert_no_unregistered_shards() {
+        let stored = stored_shards();
+        assert!(stored.is_subset(&registered_shards()), "unregistered shards remain: {:?}",
+            stored.difference(&registered_shards()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn replacing_every_inventory_leaves_a_shard_with_equal_bytes_untouched() {
+        let _scratch = Scratch::new("diff-equal-untouched");
+        stamped_chain_with_sibling();
+        let sibling = shard_file_identity("x");
+        let ancestor = shard_file_identity("a");
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![
+            ("", chain_shard(1, None, Some("rollup2"))),
+            ("a", chain_shard(1, None, Some("rollup2"))),
+            ("a/b", chain_shard(1, Some("new.txt"), Some("rollup2"))),
+            ("x", chain_shard(1, None, Some("rollup"))),
+        ])).unwrap();
+
+        assert_eq!(shard_file_identity("x"), sibling, "a shard whose bytes are equal is never rewritten");
+        assert_eq!(read_rollup("x").as_deref(), Some("rollup"));
+        assert_ne!(shard_file_identity("a"), ancestor, "a shard whose bytes differ is rewritten");
+        assert_eq!(registered_names("a/b"), vec!["file.txt".to_string(), "new.txt".to_string()]);
+        for key in ["", "a", "a/b"] {
+            assert_eq!(read_rollup(key).as_deref(), Some("rollup2"), "\"{key}\" carries its fresh stamp");
+        }
+    }
+
+    /// A stat refresh changes a shard's bytes but no tree, so it rewrites that shard alone: every
+    /// ancestor's stamp still names the same tree, and stands.
+    #[test]
+    fn a_stat_only_change_rewrites_only_its_own_shard_and_keeps_every_rollup() {
+        let _scratch = Scratch::new("diff-stat-only");
+        stamped_chain_with_sibling();
+        let untouched: Vec<_> = ["", "a", "x"].iter().map(|key| (*key, shard_file_identity(key))).collect();
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![
+            ("", chain_shard(1, None, Some("rollup"))),
+            ("a", chain_shard(1, None, Some("rollup"))),
+            ("a/b", chain_shard(7, None, Some("rollup"))),
+            ("x", chain_shard(1, None, Some("rollup"))),
+        ])).unwrap();
+
+        assert_eq!(registered_inode("a/b", "file.txt"), 7, "the stat refresh is written");
+        for (key, identity) in untouched {
+            assert_eq!(shard_file_identity(key), identity, "\"{key}\" is not rewritten");
+        }
+        for key in ["", "a", "a/b", "x"] {
+            assert_eq!(read_rollup(key).as_deref(), Some("rollup"), "\"{key}\" keeps its rollup");
+        }
+    }
+
+    /// Phase B's renames are durable only together, so a crash may keep a changed shard and lose
+    /// its ancestor's rewrite: every stamp that is going must already be gone from disk before any
+    /// of phase B can land. The fault stops the rewrite at the registration between the phases.
+    #[test]
+    fn a_rewrite_clears_every_stale_rollup_before_any_new_content_can_land() {
+        let _scratch = Scratch::new("diff-phase-a");
+        stamped_chain_with_sibling();
+
+        crate::util::operation_utils::raise_for_fixture();
+        let fault = MetadataWriteFaultGuard::failing();
+        replace_all_inventories(&new_set(vec![
+            ("", chain_shard(1, None, Some("rollup2"))),
+            ("a", chain_shard(1, None, Some("rollup2"))),
+            ("a/b", chain_shard(1, Some("new.txt"), Some("rollup2"))),
+            ("a/b/c", chain_shard(1, None, Some("rollup2"))),
+            ("x", chain_shard(1, None, Some("rollup"))),
+        ])).expect_err("the registration of a/b/c fails");
+        drop(fault);
+
+        assert_eq!(registered_names("a/b"), vec!["file.txt".to_string()], "no new content landed");
+        for key in ["", "a", "a/b"] {
+            assert_eq!(read_rollup(key), None, "the going stamp of \"{key}\" is cleared first");
+        }
+        assert_eq!(read_rollup("x").as_deref(), Some("rollup"), "a stamp that stays is never cleared");
+    }
+
+    #[test]
+    fn a_shard_that_does_not_parse_falls_back_to_rewriting_every_shard() {
+        let _scratch = Scratch::new("diff-unparseable");
+        stamped_chain_with_sibling();
+        let ancestor = shard_file_identity("a");
+        std::fs::write(file_utils::get_inventory_data_path_for_key("x").unwrap(), b"not a shard").unwrap();
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![
+            ("", chain_shard(1, None, Some("rollup"))),
+            ("a", chain_shard(1, None, Some("rollup"))),
+            ("x", chain_shard(1, None, Some("rollup"))),
+        ])).expect("a shard that does not parse must not block the reset");
+
+        assert_eq!(registered_names("x"), vec!["file.txt".to_string()]);
+        assert_ne!(shard_file_identity("a"), ancestor, "the store was rewritten whole");
+        assert!(!is_registered("a/b"));
+        assert_only_registered_shards_remain();
+    }
+
+    #[test]
+    fn a_shard_address_that_cannot_be_read_falls_back_to_rewriting_every_shard() {
+        let _scratch = Scratch::new("diff-unreadable");
+        stamped_chain_with_sibling();
+        let folder = file_utils::get_inventory_folder_for_key("x").unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::fs::write(&folder, b"not a folder").unwrap();
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![
+            ("", chain_shard(1, None, Some("rollup"))),
+            ("x", chain_shard(1, None, Some("rollup"))),
+        ])).expect("a damaged shard address must not block the reset");
+
+        assert_eq!(registered_names("x"), vec!["file.txt".to_string()]);
+        assert_only_registered_shards_remain();
+    }
+
+    #[test]
+    fn replacing_every_inventory_resets_damaged_metadata_over_a_populated_store() {
+        let _scratch = Scratch::new("diff-metadata-damaged");
+        stamped_chain_with_sibling();
+        std::fs::write(file_utils::get_inventory_metadata_path(), b"not a metadata record").unwrap();
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![("a", chain_shard(1, None, Some("rollup")))]))
+            .expect("damaged metadata must not block the reset");
+
+        assert!(is_registered("a") && is_registered(""));
+        assert!(!is_registered("a/b") && !is_registered("x"));
+        assert_no_unregistered_shards();
+    }
+
+    #[test]
+    fn a_rewrite_unregisters_and_sweeps_a_dropped_directory() {
+        let _scratch = Scratch::new("diff-dropped");
+        stamped_chain_with_sibling();
+        plant_ghost();
+        let sibling = shard_file_identity("x");
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![
+            ("", chain_shard(1, None, Some("rollup2"))),
+            ("a", chain_shard(1, None, Some("rollup2"))),
+            ("x", chain_shard(1, None, Some("rollup"))),
+        ])).unwrap();
+
+        assert!(!is_registered("a/b"), "the dropped directory is unregistered");
+        assert!(!file_utils::get_inventory_folder_for_key("a/b").unwrap().exists(), "and its shard is gone");
+        assert_eq!(shard_file_identity("x"), sibling);
+        assert_only_registered_shards_remain();
+    }
+
+    /// A directory the new set keeps only as an ancestor has no shard of its own: whatever it held
+    /// before must not still read as staged.
+    #[test]
+    fn a_kept_directory_with_no_shard_of_its_own_loses_its_old_shard() {
+        let _scratch = Scratch::new("diff-ancestor-only");
+        stamped_chain_with_sibling();
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![
+            ("", chain_shard(1, None, Some("rollup2"))),
+            ("a/b", chain_shard(1, None, Some("rollup"))),
+            ("x", chain_shard(1, None, Some("rollup"))),
+        ])).unwrap();
+
+        assert!(is_registered("a"), "the ancestor stays registered");
+        assert!(ShardLedger::read().unwrap().retrieve("a").unwrap().is_none(), "with no shard");
+        assert_no_unregistered_shards();
+    }
+
     /// The names the registered shard at `key` lists, read through the ledger as every writer reads.
     fn registered_names(key: &str) -> Vec<String> {
         ShardLedger::read().unwrap().inventory(key).unwrap()
