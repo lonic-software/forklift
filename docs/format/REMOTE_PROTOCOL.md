@@ -174,6 +174,12 @@ lacks are simply absent — the client notices what did not land and falls back 
 fall back entirely. Every imported record is hash-verified before it lands, exactly
 like a bundle import.
 
+A head builds the whole bundle before its first byte, so a large request can take a while to
+start answering. A client that has had no status line within its own patience (the reference
+client waits 45 s past connecting) abandons the batch and falls back to loose `GET`s, exactly as
+for a `404`, and does not ask this endpoint again for the rest of the command. A failure after
+the status line, or a `5xx`, is an error, not a fallback.
+
 The bundle is the one response with no small upper bound — it is as large as the objects
 asked for. A storage-backed head may therefore answer `303 See Other` with a `Location` of a
 presigned `GET` for the bundle rather than streaming megabytes back through the control
@@ -224,7 +230,11 @@ changes what is fetchable, only how fast.
 ### `GET /v1/objects/{hash}`
 
 The raw (uncompressed) object bytes, or `404`. The client verifies the hash before
-storing.
+storing. A client that falls back from the batch endpoint sends many of these at once, so a
+rate-limited head may answer `429`. The client retries after `Retry-After` (delta-seconds, never
+sooner than its own backoff, plus a random share of it so a wave of refused fetches does not
+return at once) for a bounded time, then fails with that answer. It treats a `429` on
+`POST /v1/objects/batch` and on the subtree endpoint the same way.
 
 ### `PUT /v1/objects/{hash}[?session={id}]`
 

@@ -1492,6 +1492,12 @@ its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
 warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
 content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
 
+**A slow or busy remote.** Objects normally arrive in a few large batches. A remote that takes
+longer than about 45 seconds to start answering a batch does not fail the command: the rest of
+that command fetches one object at a time, which is slower but still finishes. A remote that
+rate-limits its fetches is waited out, for up to 30 seconds per request. The same holds
+for every command that fetches (`franchise`, `lower`, `expand`).
+
 `lower <pallet>` names a pallet other than the current one (`palletize --remote` lists the
 remote's). It fetches that pallet's history, then creates the pallet here at the remote's head,
 fast-forwards it, or reports it ahead or diverged, exactly as for the current pallet, but nothing
