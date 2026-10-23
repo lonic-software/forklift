@@ -5352,11 +5352,12 @@ fn a_landed_lift_or_lower_records_its_head_and_a_refused_lift_records_nothing() 
     assert_ne!(ahead, base);
     assert_eq!(held_heads(&area, "dev"), vec![format!("{} main", ahead)], "the new head replaces its ancestor");
 
-    area.write_file("sparse/src/api/b.txt", "local\n");
+    // The same file as dev's change, so the lift cannot auto-merge past the remote's head.
+    area.write_file("sparse/src/api/a.txt", "api local\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "local"]));
     let refused = area.forklift("sparse", &["lift"]);
-    assert!(!refused.status.success(), "the remote is ahead, so the lift is refused");
+    assert!(!refused.status.success(), "the remote diverged, so the lift is refused: {}", stdout(&refused));
     assert_eq!(held_heads(&area, "sparse"), Vec::<String>::new(), "a refused lift records nothing");
 
     assert_success(&area.forklift("clone", &["lower"]));
