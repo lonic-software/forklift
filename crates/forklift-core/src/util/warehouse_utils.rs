@@ -230,25 +230,14 @@ fn write_warehouse_marker(forklift: &Path) -> Result<(), String> {
 pub fn prepare_warehouse() -> Result<Vec<String>, String> {
     let forklift = forklift_root();
 
-    // A bay's `.forklift` is a folder too: filling it with warehouse pieces would report success
-    // while leaving a directory that is neither.
-    match bay_utils::classify_forklift(&forklift)? {
-        bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => return Err(format!(
-            "\"{}\" belongs to a bay, so a warehouse cannot be prepared there. Remove the bay from its \
-            warehouse first.", forklift.to_string_lossy()
-        )),
-        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => (),
-    }
+    refuse_bay(&forklift)?;
 
     // An empty folder holds nothing to keep; it is replaced by a built one rather than filled, so
     // the folder is never a warehouse with pieces missing. Removing it is non-recursive, so a
-    // folder something was put in since is filled in place instead.
+    // folder something was put in since is filled in place instead, and so is one that cannot be
+    // removed (a mount point, or in a directory this may not write).
     if is_empty_real_folder(&forklift)? {
-        if let Err(e) = std::fs::remove_dir(&forklift) {
-            if is_empty_real_folder(&forklift)? {
-                return Err(format!("Error while replacing the empty folder \"{}\": {}", forklift.to_string_lossy(), e));
-            }
-        }
+        let _ = std::fs::remove_dir(&forklift);
     }
 
     match std::fs::symlink_metadata(&forklift) {
@@ -279,8 +268,20 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
             notes.insert(0, format!("Created folder \"{}\".", FOLDER_NAME_FORKLIFT_ROOT));
             Ok(notes)
         }
-        // Another prepare put its own in place first.
-        Placement::Taken => fill_in_place(&forklift),
+        // Something else was put in place first: another prepare's, or a bay's redirect folder.
+        Placement::Taken => refuse_bay(&forklift).and_then(|()| fill_in_place(&forklift)),
+    }
+}
+
+/// Refuse a `.forklift` that is a bay's: filling it with warehouse pieces would report success
+/// while leaving a directory that is neither.
+fn refuse_bay(forklift: &Path) -> Result<(), String> {
+    match bay_utils::classify_forklift(forklift)? {
+        bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => Err(format!(
+            "\"{}\" belongs to a bay, so a warehouse cannot be prepared there. Remove the bay from its \
+            warehouse first.", forklift.to_string_lossy()
+        )),
+        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => Ok(()),
     }
 }
 
@@ -290,18 +291,14 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
 fn fill_in_place(forklift: &Path) -> Result<Vec<String>, String> {
     let (mut notes, created) = fill(forklift, forklift)?;
 
-    for folder in &created {
-        let mut parent = folder.parent();
+    // Each created folder and every folder between it and `forklift`, once each, deepest first.
+    let mut folders: Vec<&Path> = created.iter()
+        .flat_map(|folder| folder.ancestors().take_while(|dir| dir.starts_with(forklift)))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    folders.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
 
-        while let Some(dir) = parent {
-            file_utils::sync_dir(dir)?;
-
-            if dir == forklift {
-                break;
-            }
-
-            parent = dir.parent();
-        }
+    for dir in folders {
+        file_utils::sync_dir(dir)?;
     }
 
     if !has_warehouse_marker(forklift)? {
@@ -389,6 +386,9 @@ thread_local! {
     /// When set, the next [`place_forklift`] on this thread stops just before its rename and leaves
     /// its staging folder as a killed process would. Cleared when it fires.
     static STOP_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When set, the next [`place_forklift`] on this thread runs it just before its rename, as
+    /// another process would. Cleared when it fires.
+    static BEFORE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Put a new `.forklift` folder in place at `forklift`, which must be absent: create a staging
@@ -414,7 +414,6 @@ thread_local! {
 /// * `Err(String)`   - The staging folder could not be made, `build` failed, or the rename failed
 ///                     for another reason; nothing is in place.
 pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Result<(), String>) -> Result<Placement, String> {
-    static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let name = forklift.file_name()
         .ok_or(format!("Cannot create \"{}\": it has no name.", forklift.to_string_lossy()))?
@@ -423,7 +422,7 @@ pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Resul
 
     sweep_staging_leftovers(parent, &name);
 
-    let staging = file_utils::create_first_new_folder(file_utils::pid_numbered(&NEXT_STAGING, |pid, n| {
+    let staging = file_utils::create_first_new_folder(file_utils::pid_numbered(&file_utils::TEMP_COUNTER, |pid, n| {
         parent.join(format!("{}.tmp~{}-{}", name, pid, n))
     })).map_err(|e| format!("Error while creating a staging folder beside \"{}\": {}", forklift.to_string_lossy(), e))?;
 
@@ -433,8 +432,11 @@ pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Resul
         .and_then(|file| match file.try_lock() {
             Ok(()) => Ok(file),
             // Only a sweep takes a staging folder's lock, and it is clearing this one.
-            Err(e) => Err(format!(
-                "Error while locking \"{}\": {}. Try again.", lock_path.to_string_lossy(), std::io::Error::from(e)
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "\"{}\" was being cleared away as it was created. Try again.", staging.to_string_lossy()
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(format!(
+                "Error while locking \"{}\": {}", lock_path.to_string_lossy(), e
             )),
         });
 
@@ -459,6 +461,11 @@ pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Resul
         return Err("stopped before the rename".to_string());
     }
 
+    #[cfg(test)]
+    if let Some(before) = BEFORE_RENAME.with(|before| before.borrow_mut().take()) {
+        before();
+    }
+
     let placed = built.and_then(|()| match file_utils::rename_no_replace(&staged, forklift) {
         Ok(()) => Ok(Placement::Placed),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Placement::Taken),
@@ -467,7 +474,7 @@ pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Resul
 
     // Still holding the lock, so no sweep is in the folder. A real folder this call created, so the
     // removal follows nothing it did not make; gone already once placed.
-    let _ = franchise_utils::remove_unfollowed(&staged);
+    let _ = file_utils::remove_unfollowed(&staged);
     drop(lock);
     let _ = std::fs::remove_file(&lock_path);
     let _ = std::fs::remove_dir(&staging);
@@ -513,7 +520,7 @@ fn sweep_staging_leftovers(parent: &Path, name: &str) {
                 if let Ok(names) = std::fs::read_dir(&staging) {
                     for name in names.flatten().map(|entry| entry.file_name()) {
                         if name != FILE_NAME_STAGING_LOCK {
-                            let _ = franchise_utils::remove_unfollowed(&staging.join(name));
+                            let _ = file_utils::remove_unfollowed(&staging.join(name));
                         }
                     }
                 }
@@ -784,6 +791,27 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&outer).ok();
+    }
+
+    /// A bay's folder put at `.forklift` while a prepare builds its own is refused, never filled.
+    #[test]
+    fn a_bay_put_in_place_during_a_prepare_is_refused_not_filled() {
+        let root = fresh_dir("bay-race");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+        let bay = forklift.clone();
+        BEFORE_RENAME.with(|before| *before.borrow_mut() = Some(Box::new(move || {
+            std::fs::create_dir(&bay).unwrap();
+            std::fs::write(bay.join(bay_utils::FILE_NAME_BAY_REDIRECT), "elsewhere\n").unwrap();
+        })));
+
+        let error = prepare_at(&root).unwrap_err();
+        assert!(error.contains("belongs to a bay"), "{}", error);
+
+        let names: Vec<_> = std::fs::read_dir(&forklift).unwrap().flatten().map(|entry| entry.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(bay_utils::FILE_NAME_BAY_REDIRECT)], "the bay's folder was filled");
+        assert!(staging_leftovers(&root).is_empty());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A staging folder whose lock is held is in use and kept; once released it is swept. One

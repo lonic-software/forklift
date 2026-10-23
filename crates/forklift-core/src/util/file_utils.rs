@@ -706,6 +706,33 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove `path` without following it: a link or a file as itself, a real folder recursively
+/// (whose own removal follows no link inside it). An absent path is not a failure.
+pub(crate) fn remove_unfollowed(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Error while checking \"{}\": {}", path.to_string_lossy(), e)),
+    };
+
+    let removed = if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        // A link to a folder is removed as a folder entry on Windows.
+        std::fs::remove_file(path).or_else(|e| if metadata.is_symlink() { std::fs::remove_dir(path) } else { Err(e) })
+    };
+
+    match removed {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
+    }
+}
+
+/// The counter behind every `<name>.tmp~<pid>-<n>` this process names, shared so two kinds of
+/// staging beside the same target never draw the same name.
+pub(crate) static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Generate a fresh, process-unique temp-file path for `file_path`.
 ///
 /// The temporary name must be unique per *write*, not just per process: two parallel tasks
@@ -733,13 +760,11 @@ fn write_and_sync_file(path: &Path, content: &[u8]) -> Result<(), String> {
 /// `.tmp` the object-store readers match on is kept. [`staged_temp_base`] recognises exactly
 /// this form.
 pub(crate) fn temp_path_for(file_path: &Path) -> Result<PathBuf, String> {
-    static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
     let file_name = file_path.file_name()
         .ok_or(format!("Cannot write to \"{}\": it has no file name.", file_path.to_string_lossy()))?
         .to_string_lossy();
 
-    let write_id = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let write_id = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut temporary_file_path = PathBuf::from(file_path);
     temporary_file_path.set_file_name(format!("{}{}{}-{}", file_name, TEMP_INFIX, std::process::id(), write_id));
     Ok(temporary_file_path)

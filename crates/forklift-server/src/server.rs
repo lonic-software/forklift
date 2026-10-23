@@ -1642,13 +1642,13 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
     let staging = file_utils::create_first_new_folder(candidates)
         .map_err(|e| internal(format!("Error while creating the warehouse folder: {}", e)))?;
 
-    // Synced whole before the rename: a warehouse visible after a power loss with part of its
-    // preparation missing would never be repaired, since a later `PUT` finds it and answers 200.
+    // Synced whole before the rename (prepare builds `.forklift` synced and renames it into the
+    // synced staging folder): a warehouse visible after a power loss with part of its preparation
+    // missing would never be repaired, since a later `PUT` finds it and answers 200.
     let prepared = {
         let _scope = StorageRootScope::enter(&staging);
         warehouse_utils::prepare_warehouse().map(|_| ())
-    }
-        .and_then(|_| file_utils::sync_tree(&staging));
+    };
 
     if let Err(error) = prepared {
         let _ = std::fs::remove_dir_all(&staging);

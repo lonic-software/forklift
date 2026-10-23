@@ -122,8 +122,8 @@ pub fn classify_forklift(forklift_path: &Path) -> Result<ForkliftKind, String> {
             "\"{}\" is a link to nothing, so \"{}\" is neither a warehouse nor a valid bay.",
             redirect.to_string_lossy(), forklift_path.to_string_lossy()
         )),
-        // A marker that cannot be read is an error, never a warehouse. A folder without one is
-        // still taken for a warehouse: those prepared before the marker existed carry none.
+        // A marker that cannot be read is an error, never a warehouse. Refusing a folder without
+        // one waits on the decision whether unmarked warehouses are adopted or re-created.
         Err(e) if absent(&e) => warehouse_utils::has_warehouse_marker(forklift_path).map(|_| ForkliftKind::Warehouse),
         Err(e) => Err(format!("Error while checking \"{}\": {}", redirect.to_string_lossy(), e)),
     }

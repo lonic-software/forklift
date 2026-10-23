@@ -48,8 +48,9 @@ The last thing `prepare` writes is `.forklift/warehouse`, a marker saying the fo
 is a complete warehouse; running `prepare` in a warehouse that has no marker yet adds
 one. A new `.forklift/` (or one that is there but empty) is built under the name
 `.forklift.tmp~<pid>-<n>` and renamed into place when it is complete, so an interrupted
-`prepare` leaves no half-built warehouse, only that folder: it is never tracked, and
-the next `prepare` in that directory removes it.
+`prepare` leaves no half-built warehouse, only that folder. It is never tracked, and
+the next `prepare` in the same directory removes it; one it cannot tell is abandoned
+is left for you to delete.
 
 ### `import-git` — migrate a git repository
 
