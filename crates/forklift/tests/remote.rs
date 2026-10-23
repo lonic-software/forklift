@@ -6809,31 +6809,13 @@ fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
 }
 
 #[test]
-fn a_post_handshake_failure_after_a_native_bundle_install_still_removes_the_target() {
-    // PR #84 review, finding 1 — general regression coverage, not a Windows-mechanism pin (see
-    // below): a non-sparse franchise installs the remote's bundle as native packs
-    // (`bundle_utils::import_bundle` -> `pack_utils::import_transport_packs`), and reading any
-    // object afterward in this same process — here, `adopt_remote_trust` walking the enrolled
-    // office's history, which the bundle already covers — mmaps those packs into the
-    // process-global pack registry (`pack_utils::PACK_REGISTRY`). If a later step then fails,
-    // cleanup must still be able to delete the target with those packs still mapped.
-    //
-    // The original worry was that an un-dropped mmap on a pack file blocks that file's own
-    // deletion on Windows. Tested directly on `windows-latest` (see
-    // `pack_utils::an_mmapd_pack_does_not_block_its_own_directory_removal`), that specific claim
-    // did not hold — Rust's `std::fs::File` defaults to `FILE_SHARE_DELETE` on Windows, so this
-    // scenario was never actually at risk of the wedge finding 1 described. This test is kept as
-    // general coverage for cleanup with packs loaded (a real, if lower-stakes, code path worth
-    // exercising), not as proof of a Windows-specific bug that turned out not to exist.
-    //
-    // Neither of the other two cleanup tests exercises this: both pass --only, which puts
-    // franchise in sparse mode and skips the whole-store bundle install entirely. A --pallet
-    // typo — the finding's original repro — no longer reaches this state either, now that it is
-    // refused before any fetch at all (see the early-refusal test above). The trigger here
-    // instead is a second, later parcel the (already-built, now-stale) bundle does not cover,
-    // whose object the remote then genuinely no longer has — forcing the incremental walk that
-    // must still fetch it to fail *after* the bundle (and its packs) are already installed and
-    // read.
+fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download() {
+    // A non-sparse franchise installs the remote's bundle as native packs and reads them in this
+    // same process (adopting trust walks the enrolled office's history, which the bundle covers),
+    // so they are mapped when a later step fails. The trigger is a second parcel the
+    // already-built bundle does not cover, whose object the remote then no longer has: the
+    // incremental walk fails *after* the bundle is installed and read. The finished import is
+    // remembered, and a resume once the remote is whole again does not download it a second time.
     let area = TestArea::new("post-handshake-cleanup-with-packs");
     let server = Server::start(&area, None);
 
@@ -6859,17 +6841,20 @@ fn a_post_handshake_failure_after_a_native_bundle_install_still_removes_the_targ
     // cannot recover an object the far end no longer has.
     std::fs::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
 
-    let dir = area.path("packed");
-    assert!(!dir.exists());
-
     let failed = area.forklift(".", &["franchise", &server.url, "packed"]);
-    assert!(!failed.status.success(),
-        "franchise must fail when a required object has vanished from the remote");
+    assert_eq!(failed.status.code(), Some(30),
+        "franchise must fail when a required object has vanished from the remote: {}", stderr(&failed));
+    assert!(area.read_file("packed/.forklift/franchise").contains("bundle=imported"),
+        "{}", area.read_file("packed/.forklift/franchise"));
 
-    assert!(!dir.exists(),
-        "a post-handshake failure, even with the remote's native-bundle packs already installed \
-        and read in this process, must still fully remove a target directory franchise itself \
-        created: {:?}", dir);
+    let blob = object_store_path(&area, "dev", &blob_b);
+    std::fs::copy(&blob, object_store_path(&area, "server-root", &blob_b)).unwrap();
+
+    let resumed = area.forklift(".", &["--json", "franchise", &server.url, "packed"]);
+    assert_success(&resumed);
+    let value = json_of(&resumed);
+    assert!(value["data"].get("bundle_objects").is_none(), "the imported bundle is kept, not fetched again: {}", value);
+    assert_eq!(area.read_file("packed/b.txt"), "second parcel, not in the bundle\n");
 }
 
 #[test]

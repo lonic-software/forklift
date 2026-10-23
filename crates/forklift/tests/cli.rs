@@ -7472,7 +7472,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 3,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 4,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
