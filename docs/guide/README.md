@@ -15,6 +15,7 @@ machine/agent interface).
 | You are… | Read |
 |----------|------|
 | A user learning the CLI | [`cli.md`](cli.md) — every command, by workflow, with examples |
+| Looking up what a term means | [`glossary.md`](glossary.md) — every Forklift term, with its git equivalent |
 | Setting up signing, users, or agents | [`trust-and-identity.md`](trust-and-identity.md) |
 | Running a forklift server | [`../SERVER.md`](../SERVER.md) |
 | Driving forklift from a script or AI agent | [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) |
