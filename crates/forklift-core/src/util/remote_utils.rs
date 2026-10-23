@@ -13142,7 +13142,7 @@ mod tests {
     /// A TLS handshake the client rejects repeats on a retry, so it ends the commit at once.
     #[test]
     fn a_rejected_tls_handshake_ends_the_commit_at_once() {
-        use std::io::Write;
+        use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -13152,7 +13152,13 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Read the ClientHello before answering and drain until the client hangs up: a
+                // socket closed with unread data is reset, and on Windows the reset can overtake
+                // the answer, so the client would see an aborted connection, not a bad handshake.
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                while matches!(stream.read(&mut buffer), Ok(n) if n > 0) {}
             }
         });
 
