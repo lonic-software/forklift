@@ -1400,13 +1400,13 @@ mod clients {
         /// **Only the no-redirect twin exists.** Every consumer rides a no-auto-follow client:
         /// `fetch_batch`'s `POST` so that a `307`/`308` cannot re-`POST` its body at a URL
         /// presigned for `GET` only (see [`super::RemoteClient::fetch_batch`]'s own doc),
-        /// `commit_lift` because it is a mutation, and `fetch_subtree` because no head redirects
-        /// it (`forklift-server` answers it directly, and the offloading head has no such
-        /// endpoint), so a redirect there comes back raw and fails loudly rather than being
-        /// followed somewhere nothing was designed to send it. *Bounded negative:* head-deadline
-        /// variants number exactly one; the domain is this enum; re-check by reading it. The
-        /// trigger for minting the follows-redirects twin is a head that offloads the subtree
-        /// response.
+        /// `commit_lift` because it is a mutation, and `fetch_subtree` because the protocol lets
+        /// a storage-backed head answer it with a `307` to a presigned bundle, which
+        /// [`super::RemoteClient::follow_bundle_redirect`] follows by hand without the
+        /// `Authorization` header an auto-follow would carry along. *Bounded negative:*
+        /// head-deadline variants number exactly one; the domain is this enum; re-check by
+        /// reading it. The trigger for minting the follows-redirects twin is a consumer whose
+        /// redirect is safe to follow with every header it sent.
         HeadDeadlineNoRedirect {
             head: std::time::Duration,
         },
@@ -1561,7 +1561,7 @@ mod clients {
         /// `POST` must not let a `307`/`308` replay its body at a `GET`-only presigned URL, and its
         /// response body must not be able to stall forever; `commit_lift` is a mutation, so it
         /// never follows a redirect, and its retry deadline needs the head-wait bounded;
-        /// `fetch_subtree` has `fetch_batch`'s cost shape and no redirect to follow.
+        /// `fetch_subtree` has `fetch_batch`'s cost shape and follows its redirect by hand.
         ///
         /// **Its own client rather than one more line on an existing one**, because neither
         /// existing client could be given the axis it lacks. [`Self::no_redirect`] cannot take a
@@ -3424,35 +3424,7 @@ impl RemoteClient {
         // `GET`'s own silence budget when there was. The two budgets are the same size and reached
         // by different arguments, so a single posture would render the right figure with the wrong
         // provenance, and the composer's two arms would have nothing left to tell apart.
-        let (response, body_posture) = match response.status() {
-            reqwest::StatusCode::SEE_OTHER
-            | reqwest::StatusCode::TEMPORARY_REDIRECT
-            | reqwest::StatusCode::PERMANENT_REDIRECT => {
-                let location = response.headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|value| value.to_str().ok())
-                    .ok_or_else(|| {
-                        "The remote's batch redirect carried no usable Location header.".to_string()
-                    })?
-                    .to_string();
-
-                // A bare GET: no Authorization header (the URL is self-authorizing) and no
-                // body — the request the redirect target is actually presigned for. On
-                // [`Posture::BoundedObjectReads`], reaching the same silence budget the `POST`
-                // above reaches through its own posture, but on its own grounds — see this
-                // function's own doc for why this station's cost shape matches
-                // [`Self::fetch_object`]'s, not the `POST`'s.
-                let redirect_posture = Posture::BoundedObjectReads;
-                let outcome = self.send_on_presigned(
-                    redirect_posture, reqwest::Method::GET, &location, SendBody::Empty
-                ).await;
-                let response = self.response_from_send(
-                    "following the batch redirect", redirect_posture, outcome
-                )?;
-                (response, redirect_posture)
-            }
-            _ => (response, post_posture),
-        };
+        let (response, body_posture) = self.follow_bundle_redirect(response, post_posture, "batch").await?;
 
         if !response.status().is_success() {
             return Err(self.error_of(response, "the batch fetch").await);
@@ -3461,6 +3433,43 @@ impl RemoteClient {
         let admission = bundle_utils::StreamAdmission::Requested(requested);
         self.import_response(response, "reading the batch response", body_posture, admission).await
             .map(BatchOutcome::Imported)
+    }
+
+    /// Follow an offloading head's redirect of a bundle response (`what` names it in the
+    /// messages) by hand, or hand back `response` and `posture` unchanged when it is not one.
+    /// A `303`/`307`/`308` is followed with a bare `GET`: no `Authorization` header (the URL is
+    /// self-authorizing) and no body — the request the target is actually presigned for. On
+    /// [`Posture::BoundedObjectReads`], reaching the same silence budget the head-wait posture's
+    /// client carries, but on its own grounds — see [`Self::fetch_batch`]'s doc for why this
+    /// station's cost shape matches [`Self::fetch_object`]'s, not the request's.
+    ///
+    /// Returns the response the bundle bytes are read from and the posture that read runs under,
+    /// so a body failure is reported against the station that actually produced the bytes.
+    async fn follow_bundle_redirect(&self,
+                                    response: reqwest::Response,
+                                    posture: Posture,
+                                    what: &str) -> Result<(reqwest::Response, Posture), String> {
+        match response.status() {
+            reqwest::StatusCode::SEE_OTHER
+            | reqwest::StatusCode::TEMPORARY_REDIRECT
+            | reqwest::StatusCode::PERMANENT_REDIRECT => {
+                let location = response.headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| format!("The remote's {} redirect carried no usable Location header.", what))?
+                    .to_string();
+
+                let redirect_posture = Posture::BoundedObjectReads;
+                let outcome = self.send_on_presigned(
+                    redirect_posture, reqwest::Method::GET, &location, SendBody::Empty
+                ).await;
+                let response = self.response_from_send(
+                    &format!("following the {} redirect", what), redirect_posture, outcome
+                )?;
+                Ok((response, redirect_posture))
+            }
+            _ => Ok((response, posture)),
+        }
     }
 
     /// Whether [`Self::fetch_batch`] is still worth asking, for this instance and every clone of it.
@@ -3519,12 +3528,14 @@ impl RemoteClient {
             return Ok(None);
         }
 
+        let (response, body_posture) = self.follow_bundle_redirect(response, posture, "subtree").await?;
+
         if !response.status().is_success() {
             return Err(self.error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
         }
 
         let admission = bundle_utils::StreamAdmission::Closure { root: subtree.to_string() };
-        self.import_response(response, "reading the subtree response", posture, admission).await.map(Some)
+        self.import_response(response, "reading the subtree response", body_posture, admission).await.map(Some)
     }
 
     /// Import a batch or subtree response into the object store as it arrives, never holding the
@@ -8697,7 +8708,8 @@ mod tests {
     }
 
     impl FakeOffloadingRemote {
-        /// `redirect_status` is what `POST /v1/objects/batch` answers with (this fix's server
+        /// `redirect_status` is what `POST /v1/objects/batch` and every
+        /// `GET /v1/parcels/{parcel}/subtree/{path}` answer with (this fix's server
         /// half only ever emits `303`, but `307`/`308` from an older or non-conforming head
         /// must be followed identically); `bundle` is served at the redirect target;
         /// `objects` seeds the loose `GET /v1/objects/{hash}` endpoint.
@@ -8761,7 +8773,9 @@ mod tests {
         let Some((method, path, had_auth, _body)) = read_test_request(&mut stream) else { return };
         hits.lock().unwrap().push((method.clone(), path.clone(), had_auth));
 
-        if method == "POST" && path == "/v1/objects/batch" {
+        let redirected = (method == "POST" && path == "/v1/objects/batch")
+            || (method == "GET" && path.starts_with("/v1/parcels/") && path.contains("/subtree/"));
+        if redirected {
             let reason = match redirect_status {
                 303 => "See Other",
                 307 => "Temporary Redirect",
@@ -8856,6 +8870,45 @@ mod tests {
                 "the batch POST itself still carries this remote's bearer token, status {}",
                 redirect_status
             );
+            assert!(
+                !remote.any_had_auth("/responses/bundle"),
+                "the presigned-URL follow-up must not carry this remote's bearer token, status {}",
+                redirect_status
+            );
+        }
+    }
+
+    /// The subtree endpoint may be offloaded the same way: `REMOTE_PROTOCOL.md` lets a
+    /// storage-backed head answer it with a `307` to a presigned bundle. It rides a no-redirect
+    /// client, so the follow is by hand, and the bearer token stays with the remote.
+    #[test]
+    fn fetch_subtree_follows_a_redirect_by_hand_without_leaking_auth() {
+        use crate::enums::dir_entry_type::DirEntryType;
+
+        for redirect_status in [303u16, 307, 308] {
+            let (blob, tree, bundle) = {
+                let _server_scope = Scratch::new(&format!("offload-subtree-server-{}", redirect_status));
+                let blob = store_blob(&format!("leaf-{}", redirect_status));
+                let tree = store_tree(&[("leaf", &blob, DirEntryType::Normal)]);
+                let bundle = bundle_utils::build_partial_bundle(&[tree.clone(), blob.clone()]).unwrap();
+                (blob, tree, bundle)
+            };
+
+            let _client_scope = Scratch::new(&format!("offload-subtree-client-{}", redirect_status));
+            let remote = FakeOffloadingRemote::start(redirect_status, bundle, HashMap::new());
+            let client = RemoteClient::new(&remote.url, Some("shhh".to_string())).unwrap();
+            let subtree_path = format!("/v1/parcels/{}/subtree/src", "p".repeat(64));
+
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let stats = runtime.block_on(client.fetch_subtree(&"p".repeat(64), "src", &tree))
+                .unwrap_or_else(|e| panic!("status {}: the redirect must be followed: {}", redirect_status, e));
+
+            assert!(stats.is_some(), "status {}: a followed redirect is not an absent endpoint", redirect_status);
+            assert!(file_utils::does_object_exist(&tree).unwrap(), "status {}", redirect_status);
+            assert!(file_utils::does_object_exist(&blob).unwrap(), "status {}", redirect_status);
+            assert_eq!(remote.hits_for(&subtree_path), 1, "status {}", redirect_status);
+            assert_eq!(remote.hits_for("/responses/bundle"), 1, "status {}", redirect_status);
+            assert!(remote.any_had_auth(&subtree_path), "status {}", redirect_status);
             assert!(
                 !remote.any_had_auth("/responses/bundle"),
                 "the presigned-URL follow-up must not carry this remote's bearer token, status {}",
