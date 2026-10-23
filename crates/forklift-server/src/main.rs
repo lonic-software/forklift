@@ -560,8 +560,13 @@ fn resolve_root(root: &str, create: bool) -> Result<std::path::PathBuf, String> 
             .map_err(|e| format!("Error while creating \"{}\": {}", root, e))?;
     }
 
-    std::fs::canonicalize(root)
-        .map_err(|e| format!("Error while resolving \"{}\": {}", root, e))
+    let resolved = std::fs::canonicalize(root)
+        .map_err(|e| format!("Error while resolving \"{}\": {}", root, e))?;
+
+    // A franchise that has not finished is no warehouse yet: it is resumed or deleted first.
+    forklift_core::util::franchise_utils::gate(&resolved).map_err(String::from)?;
+
+    Ok(resolved)
 }
 
 /// Prepare a bare warehouse: the same layout `forklift prepare` creates — the server
@@ -1270,5 +1275,27 @@ mod tests {
 
         assert!(line.contains(&expected_phrase), "{}", line);
         assert!(!line.to_lowercase().contains("unlimited"), "{}", line);
+    }
+
+    /// `prepare`, `bundle` and `gc` all resolve their root here: an unfinished franchise is no
+    /// warehouse to work on yet.
+    #[test]
+    fn a_root_holding_an_unfinished_franchise_is_refused() {
+        let root = std::env::temp_dir().join(format!("forklift-server-main-test-franchise-{}", std::process::id()));
+        let forklift = root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&forklift).unwrap();
+        std::fs::write(forklift_core::util::franchise_utils::record_path(&forklift), b"").unwrap();
+
+        let refused = resolve_root(root.to_str().unwrap(), false).unwrap_err();
+        assert!(matches!(
+            forklift_core::error::CoreError::from(refused),
+            forklift_core::error::CoreError::Refusal { code: forklift_core::error::RefusalCode::FranchiseIncomplete, .. }
+        ));
+
+        std::fs::remove_file(forklift_core::util::franchise_utils::record_path(&forklift)).unwrap();
+        assert!(resolve_root(root.to_str().unwrap(), false).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

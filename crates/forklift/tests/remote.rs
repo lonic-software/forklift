@@ -2331,6 +2331,29 @@ fn a_franchise_after_a_regenesis_holds_the_adopted_history_and_heals() {
         healed.status.code(), stderr(&healed));
 }
 
+/// A resume enforces the trust genesis its first attempt saw, as if `--expect` were given again:
+/// a remote that re-genesised between the attempts is refused, never adopted, and the token the
+/// first attempt was given is reused when the resume omits it.
+#[test]
+fn a_resume_refuses_a_remote_whose_anchor_changed_since_the_first_attempt() {
+    let area = TestArea::new("franchise-resume-regenesis");
+    let server = regenesis_on_remote(&area, |server| {
+        let failed = area.forklift(".", &["franchise", &server.url, "half", "--token", "root", "--only", "nowhere"]);
+        assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    });
+
+    let refused = area.forklift(".", &["--json", "franchise", &server.url, "half"]);
+    assert_eq!(refused.status.code(), Some(22), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json_of(&refused);
+    assert_eq!(value["error"]["code"], "trust_changed", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("is bound to the genesis its first attempt saw"), "{}", value);
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("delete \"half\" and franchise again"), "{}", value);
+    assert!(area.path("half/.forklift/franchise").is_file(), "a refused resume keeps the directory");
+
+    // A fresh franchise of the same remote adopts the new anchor (with a warning), as always.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "fresh", "--token", "root"]));
+}
+
 /// FORK-114, the accepting side: a clone whose office fell behind before the reset accepts the
 /// re-genesis. Its anchor's `adopts` names the remote's pre-reset office head, which the clone
 /// never lowered; accepting must fetch it, exactly as a fresh franchise does.
@@ -6534,60 +6557,154 @@ fn a_retry_after_a_failed_handshake_succeeds_into_the_same_directory() {
     assert_eq!(area.read_file("attempt1/code.txt"), "v1\n");
 }
 
-#[test]
-fn a_post_handshake_failure_removes_a_freshly_created_target_directory() {
-    // Cleanup coverage for a failure *after* the handshake has already succeeded (item 2 of the
-    // fix): a typo'd --only path is rejected only after the handshake, the scoped history fetch
-    // and the tree load have all already run (see `is_directory_in_tree`'s call site in
-    // franchise.rs) — by which point `prepare_warehouse` has already created `.forklift` and real
-    // objects have already been fetched into it. The target here did not exist before the
-    // attempt, so cleanup must remove the whole directory, not just the state that would have
-    // been written next.
-    let area = TestArea::new("post-handshake-cleanup-created");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
+/// A remote with `src/api/a.txt` and `src/web/b.txt` stacked and lifted from "dev".
+fn remote_with_two_subtrees(area: &TestArea, server: &Server) {
+    prepare_warehouse(area, "dev", &server.url);
     area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/b.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
-
-    let dir = area.path("typo");
-    assert!(!dir.exists());
-
-    // "src/ap" (missing the final "i") names nothing in the head — rejected after the handshake.
-    let failed = area.forklift(".", &["franchise", &server.url, "typo", "--only", "src/ap"]);
-    assert!(!failed.status.success(), "a typo'd --only path must be refused");
-    assert!(stderr(&failed).contains("Nothing was recorded"), "{}", stderr(&failed));
-
-    assert!(!dir.exists(),
-        "a post-handshake failure must remove a target directory franchise itself created: {:?}",
-        dir);
 }
 
 #[test]
-fn a_post_handshake_failure_empties_a_pre_existing_target_directory() {
-    // Same post-handshake trigger as above, but the target pre-existed (empty) before the
-    // attempt: cleanup must leave the empty directory itself in place — it is the caller's, not
-    // franchise's, to remove — and only clear out what franchise put in it.
-    let area = TestArea::new("post-handshake-cleanup-preexisting");
+fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
+    // "src/ap" (missing the final "i") names nothing in the head: refused only after the
+    // handshake and the scoped history fetch, by which point objects are in the store.
+    let area = TestArea::new("franchise-resume-corrected");
     let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
 
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
-    assert_success(&area.forklift("dev", &["lift"]));
+    let failed = area.forklift(".", &["--json", "franchise", &server.url, "typo", "--only", "src/ap"]);
+    assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    let value = json_of(&failed);
+    assert_eq!(value["error"]["code"], "franchise_incomplete", "{}", value);
+    assert_eq!(value["error"]["details"]["cause_code"], "only_prefix_not_found", "{}", value);
+    assert_eq!(value["error"]["details"]["retry"], "change", "{}", value);
+    assert_eq!(value["error"]["details"]["directory"], "typo", "{}", value);
+    assert_eq!(value["error"]["details"]["remote"], server.url.as_str(), "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("\"src/ap\" is not a directory"), "{}", value);
 
-    let dir = area.path("typo");
-    std::fs::create_dir_all(&dir).unwrap();
+    assert!(area.path("typo/.forklift/franchise").is_file(), "the record must stand until the franchise finishes");
+    assert!(area.path("typo/.forklift/objects").is_dir(), "what was fetched must be kept");
 
-    let failed = area.forklift(".", &["franchise", &server.url, "typo", "--only", "src/ap"]);
-    assert!(!failed.status.success(), "a typo'd --only path must be refused");
+    // The corrected resume needs no other options and finishes in place.
+    let resumed = area.forklift(".", &["--json", "franchise", &server.url, "typo", "--only", "src/api"]);
+    assert_success(&resumed);
+    assert_eq!(area.read_file("typo/src/api/a.txt"), "api v1\n");
+    assert!(!area.path("typo/src/web").exists(), "the resume franchises at its own scope");
+    assert!(!area.path("typo/.forklift/franchise").exists(), "a finished franchise clears its record");
+    assert_success(&area.forklift("typo", &["status"]));
+}
 
-    assert!(dir.exists(), "a pre-existing target directory must remain: {:?}", dir);
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0,
-        "but everything franchise put in it must be gone: {:?}", dir);
+#[test]
+fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
+    // A full franchise of the same remote fetches every object loose (the test server has no
+    // bundle). A resume after a sparse attempt fetched the spine fetches only what it lacks.
+    let area = TestArea::new("franchise-resume-keeps-objects");
+    let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
+
+    let fresh = area.forklift(".", &["--json", "franchise", &server.url, "fresh"]);
+    assert_success(&fresh);
+    let fresh_fetched = json_of(&fresh)["data"]["fetched_objects"].as_u64().unwrap();
+
+    let failed = area.forklift(".", &["franchise", &server.url, "kept", "--only", "src/ap"]);
+    assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+
+    let resumed = area.forklift(".", &["--json", "franchise", &server.url, "kept"]);
+    assert_success(&resumed);
+    let resumed_fetched = json_of(&resumed)["data"]["fetched_objects"].as_u64().unwrap();
+
+    assert!(resumed_fetched < fresh_fetched,
+        "the resume must not refetch what the first attempt stored: {} vs {}", resumed_fetched, fresh_fetched);
+    assert_eq!(area.read_file("kept/src/api/a.txt"), "api v1\n");
+    assert_eq!(area.read_file("kept/src/web/b.txt"), "web v1\n");
+    assert_success(&area.forklift("kept", &["status"]));
+}
+
+#[test]
+fn every_other_command_refuses_inside_an_unfinished_franchise() {
+    let area = TestArea::new("franchise-incomplete-gate");
+    let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
+
+    let failed = area.forklift(".", &["franchise", &server.url, "half", "--only", "src/ap"]);
+    assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+
+    for args in [&["--json", "status"][..], &["--json", "heal"], &["--json", "prepare"], &["--json", "audit"]] {
+        let refused = area.forklift("half", args);
+        assert_eq!(refused.status.code(), Some(30), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
+        let value = json_of(&refused);
+        assert_eq!(value["error"]["code"], "franchise_incomplete", "{:?}: {}", args, value);
+        assert_eq!(value["error"]["details"]["cause_code"], "only_prefix_not_found", "{:?}: {}", args, value);
+        assert!(value["error"]["next_step"].as_str().unwrap().contains("--only src/ap"), "{:?}: {}", args, value);
+    }
+
+    // From a folder inside the working directory too.
+    std::fs::create_dir_all(area.path("half/sub")).unwrap();
+    let nested = area.forklift("half/sub", &["status"]);
+    assert_eq!(nested.status.code(), Some(30), "{}{}", stdout(&nested), stderr(&nested));
+}
+
+#[test]
+fn a_resume_of_another_remote_is_refused_before_it_connects() {
+    let area = TestArea::new("franchise-resume-other-remote");
+    let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
+
+    let failed = area.forklift(".", &["franchise", &server.url, "half", "--only", "src/ap"]);
+    assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    let record = std::fs::read(area.path("half/.forklift/franchise")).unwrap();
+
+    // Nothing listens there: a refusal that names the recorded remote proves no connection was tried.
+    let refused = area.forklift(".", &["--json", "franchise", "http://127.0.0.1:9", "half"]);
+    assert_eq!(refused.status.code(), Some(30), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json_of(&refused);
+    assert!(value["error"]["message"].as_str().unwrap().contains("not of http://127.0.0.1:9"), "{}", value);
+    assert_eq!(std::fs::read(area.path("half/.forklift/franchise")).unwrap(), record, "the record is untouched");
+
+    // A trailing slash is the same remote.
+    let resumed = area.forklift(".", &["franchise", &format!("{}/", server.url), "half"]);
+    assert_success(&resumed);
+}
+
+#[test]
+fn a_failed_franchise_into_a_nested_target_keeps_it_and_its_ancestors() {
+    let area = TestArea::new("franchise-nested-kept");
+    let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
+
+    let failed = area.forklift(".", &["franchise", &server.url, "a/b/c", "--only", "src/ap"]);
+    assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    assert!(area.path("a/b/c/.forklift/franchise").is_file());
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "a/b/c"]));
+    assert_eq!(area.read_file("a/b/c/src/web/b.txt"), "web v1\n");
+}
+
+#[test]
+fn a_pre_existing_target_keeps_a_failed_franchise_and_a_non_empty_one_is_refused() {
+    let area = TestArea::new("franchise-preexisting-kept");
+    let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
+
+    std::fs::create_dir_all(area.path("empty")).unwrap();
+    let failed = area.forklift(".", &["franchise", &server.url, "empty", "--only", "src/ap"]);
+    assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "empty"]));
+
+    // A directory holding anything franchise did not put there is never admitted.
+    area.write_file("busy/notes.txt", "mine\n");
+    let refused = area.forklift(".", &["franchise", &server.url, "busy"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("is not empty"), "{}", stderr(&refused));
+    assert_eq!(area.read_file("busy/notes.txt"), "mine\n");
+
+    // Nor is a finished warehouse: a franchise that completed is not resumed over.
+    let again = area.forklift(".", &["franchise", &server.url, "empty"]);
+    assert!(!again.status.success());
+    assert!(stderr(&again).contains("is not empty"), "{}", stderr(&again));
 }
 
 #[test]
@@ -6622,9 +6739,9 @@ fn a_pallet_typo_is_refused_before_anything_is_created() {
 
 #[test]
 fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() {
-    // Pins the *ordering* specifically, which the previous test does not: cleanup (findings 1-4
-    // in this same review round) makes "the target ends up clean" true whether the pallet is
-    // checked before or after the fetch, so that assertion alone cannot tell the two apart. Here
+    // Pins the *ordering* specifically, which the previous test does not: "the pallet typo is
+    // refused" holds whether the pallet is checked before or after the fetch, so that assertion
+    // alone cannot tell the two apart. Here
     // the remote's bundle is deliberately corrupted — a recognized header, an unparseable
     // payload — so importing it is a hard, unrelated failure. With the pallet check moved before
     // any fetch, a --pallet typo is reported and the broken bundle is never even downloaded.
@@ -6661,73 +6778,6 @@ fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() 
 }
 
 #[test]
-fn a_nested_target_with_missing_parents_removes_only_the_leaf_on_failure() {
-    // PR #84 review round 3, findings 1 & 2: the round-2 `claim_target` walked path components
-    // one at a time, tolerating only `AlreadyExists` — which broke an absolute Windows target
-    // (`CreateDirectoryW` on a drive root returns `PermissionDenied`, not `AlreadyExists`; see
-    // the separate absolute-path test) and still raced on `..`-aliased paths. `claim_target` now
-    // creates missing ancestors with the ordinary, tolerant `create_dir_all` (here, both "a" and
-    // "a/b" are absent) and treats only the *final* component as the atomic exclusivity token.
-    // Cleanup therefore only ever acts on the leaf — ancestors it had to create along the way
-    // (here, "a" and "a/b") are deliberately left standing: they're harmless (an empty directory
-    // never blocks a retry), and recursively removing them risks destroying content a concurrent
-    // actor legitimately created there in the unavoidable gap between the two creation syscalls.
-    let area = TestArea::new("nested-missing-parents");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
-    assert_success(&area.forklift("dev", &["lift"]));
-
-    let a = area.path("a");
-    let b = area.path("a/b");
-    let c = area.path("a/b/c");
-    assert!(!a.exists());
-
-    // "src/ap" (missing the final "i") triggers the post-handshake --only typo failure.
-    let failed = area.forklift(".", &[
-        "franchise", &server.url, "a/b/c", "--only", "src/ap",
-    ]);
-    assert!(!failed.status.success(), "a typo'd --only path must be refused");
-
-    assert!(a.exists(), "the ancestor \"a\" franchise had to create is left standing: {:?}", a);
-    assert!(b.exists(), "the ancestor \"a/b\" franchise had to create is left standing: {:?}", b);
-    assert!(!c.exists(), "the target \"a/b/c\" itself must be removed: {:?}", c);
-}
-
-#[test]
-fn a_nested_target_with_a_pre_existing_ancestor_removes_only_the_leaf_on_failure() {
-    // Same trigger, but "a" pre-exists before franchise ever runs (only "a/b" and "a/b/c" are
-    // missing): confirms `claim_target`'s `create_dir_all(parent)` tolerates an already-existing
-    // ancestor cleanly, and that cleanup's "leave ancestors alone" rule applies uniformly
-    // regardless of whether franchise itself created an ancestor or found it already there.
-    let area = TestArea::new("nested-partial-parents");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
-    assert_success(&area.forklift("dev", &["lift"]));
-
-    let a = area.path("a");
-    let b = area.path("a/b");
-    let c = area.path("a/b/c");
-    std::fs::create_dir_all(&a).unwrap();
-
-    let failed = area.forklift(".", &[
-        "franchise", &server.url, "a/b/c", "--only", "src/ap",
-    ]);
-    assert!(!failed.status.success(), "a typo'd --only path must be refused");
-
-    assert!(a.exists(), "the pre-existing ancestor \"a\" must not be removed: {:?}", a);
-    assert!(b.exists(), "the ancestor \"a/b\" franchise had to create is left standing: {:?}", b);
-    assert!(!c.exists(), "the target \"a/b/c\" itself must be removed: {:?}", c);
-}
-
-#[test]
 fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
     // PR #84 review, finding 5: moving the handshake before the cwd switch means it now runs in
     // whatever directory the operator happened to invoke franchise from — which may be a
@@ -6759,31 +6809,13 @@ fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
 }
 
 #[test]
-fn a_post_handshake_failure_after_a_native_bundle_install_still_removes_the_target() {
-    // PR #84 review, finding 1 — general regression coverage, not a Windows-mechanism pin (see
-    // below): a non-sparse franchise installs the remote's bundle as native packs
-    // (`bundle_utils::import_bundle` -> `pack_utils::import_transport_packs`), and reading any
-    // object afterward in this same process — here, `adopt_remote_trust` walking the enrolled
-    // office's history, which the bundle already covers — mmaps those packs into the
-    // process-global pack registry (`pack_utils::PACK_REGISTRY`). If a later step then fails,
-    // cleanup must still be able to delete the target with those packs still mapped.
-    //
-    // The original worry was that an un-dropped mmap on a pack file blocks that file's own
-    // deletion on Windows. Tested directly on `windows-latest` (see
-    // `pack_utils::an_mmapd_pack_does_not_block_its_own_directory_removal`), that specific claim
-    // did not hold — Rust's `std::fs::File` defaults to `FILE_SHARE_DELETE` on Windows, so this
-    // scenario was never actually at risk of the wedge finding 1 described. This test is kept as
-    // general coverage for cleanup with packs loaded (a real, if lower-stakes, code path worth
-    // exercising), not as proof of a Windows-specific bug that turned out not to exist.
-    //
-    // Neither of the other two cleanup tests exercises this: both pass --only, which puts
-    // franchise in sparse mode and skips the whole-store bundle install entirely. A --pallet
-    // typo — the finding's original repro — no longer reaches this state either, now that it is
-    // refused before any fetch at all (see the early-refusal test above). The trigger here
-    // instead is a second, later parcel the (already-built, now-stale) bundle does not cover,
-    // whose object the remote then genuinely no longer has — forcing the incremental walk that
-    // must still fetch it to fail *after* the bundle (and its packs) are already installed and
-    // read.
+fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download() {
+    // A non-sparse franchise installs the remote's bundle as native packs and reads them in this
+    // same process (adopting trust walks the enrolled office's history, which the bundle covers),
+    // so they are mapped when a later step fails. The trigger is a second parcel the
+    // already-built bundle does not cover, whose object the remote then no longer has: the
+    // incremental walk fails *after* the bundle is installed and read. The finished import is
+    // remembered, and a resume once the remote is whole again does not download it a second time.
     let area = TestArea::new("post-handshake-cleanup-with-packs");
     let server = Server::start(&area, None);
 
@@ -6809,17 +6841,20 @@ fn a_post_handshake_failure_after_a_native_bundle_install_still_removes_the_targ
     // cannot recover an object the far end no longer has.
     std::fs::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
 
-    let dir = area.path("packed");
-    assert!(!dir.exists());
-
     let failed = area.forklift(".", &["franchise", &server.url, "packed"]);
-    assert!(!failed.status.success(),
-        "franchise must fail when a required object has vanished from the remote");
+    assert_eq!(failed.status.code(), Some(30),
+        "franchise must fail when a required object has vanished from the remote: {}", stderr(&failed));
+    assert!(area.read_file("packed/.forklift/franchise").contains("bundle=imported"),
+        "{}", area.read_file("packed/.forklift/franchise"));
 
-    assert!(!dir.exists(),
-        "a post-handshake failure, even with the remote's native-bundle packs already installed \
-        and read in this process, must still fully remove a target directory franchise itself \
-        created: {:?}", dir);
+    let blob = object_store_path(&area, "dev", &blob_b);
+    std::fs::copy(&blob, object_store_path(&area, "server-root", &blob_b)).unwrap();
+
+    let resumed = area.forklift(".", &["--json", "franchise", &server.url, "packed"]);
+    assert_success(&resumed);
+    let value = json_of(&resumed);
+    assert!(value["data"].get("bundle_objects").is_none(), "the imported bundle is kept, not fetched again: {}", value);
+    assert_eq!(area.read_file("packed/b.txt"), "second parcel, not in the bundle\n");
 }
 
 #[test]

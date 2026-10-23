@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
+use forklift_core::error::CoreError;
 use forklift_core::util::{lock_utils, warehouse_utils};
 use forklift_core::util::fanout_utils::block_on_worker_stack;
 use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
@@ -266,11 +267,16 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     }
 
     if cli.command.requires_warehouse() {
-        warehouse_utils::enter_warehouse().map_err(|message| ForkliftError::new(
-            ErrorCode::NotAWarehouse,
-            message,
-            "Run \"forklift prepare\" to create a warehouse here, or change into one."
-        ))?;
+        // A coded refusal (an unfinished franchise) keeps its own code; anything else means there
+        // is no warehouse to enter.
+        warehouse_utils::enter_warehouse().map_err(|message| match CoreError::from(message) {
+            refusal @ CoreError::Refusal { .. } => ForkliftError::from(refusal),
+            other => ForkliftError::new(
+                ErrorCode::NotAWarehouse,
+                String::from(other),
+                "Run \"forklift prepare\" to create a warehouse here, or change into one."
+            ),
+        })?;
 
         // Mutating commands hold the warehouse lock for their whole runtime, so two forklift
         // processes can never interleave writes to the staging area or the pallet refs — and

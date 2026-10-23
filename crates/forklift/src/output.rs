@@ -34,7 +34,9 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 3 (this one): `lower` and `franchise` report the adopted trust anchor as
+/// Version 4 (this one): the `franchise_incomplete` (with `details`) and `only_prefix_not_found`
+/// error codes exist. A failed franchise keeps its directory and exits `franchise_incomplete`.
+/// Version 3: `lower` and `franchise` report the adopted trust anchor as
 /// `adopted_genesis` (present only on first contact) in place of the `adopted_anchor` flag, and
 /// the `trust_changed` (with `details`) and `remote_protocol_violation` error codes exist.
 /// Version 2: `history` entries carry `parents` (always present, `[]` for a root), the
@@ -42,7 +44,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -447,6 +449,14 @@ error_codes! {
 
     /// A command named a pallet this warehouse holds no ref for.
     PalletNotFound,
+
+    /// The directory holds a franchise that has not finished; running the same `franchise` again
+    /// resumes it. `error.details` carries `{directory, remote, cause_code, retry}`; `remote` is
+    /// `null` when the record cannot be read, `cause_code` and `retry` when no attempt failed.
+    FranchiseIncomplete,
+
+    /// A sparse franchise's `--only` prefix names no directory in the pallet on the remote.
+    OnlyPrefixNotFound,
 }
 
 impl ErrorCode {
@@ -481,6 +491,8 @@ impl ErrorCode {
             ErrorCode::TargetNotCovered => RefusalCode::TargetNotCovered.as_str(),
             ErrorCode::RemoteAhead => RefusalCode::RemoteAhead.as_str(),
             ErrorCode::PalletNotFound => RefusalCode::PalletNotFound.as_str(),
+            ErrorCode::FranchiseIncomplete => RefusalCode::FranchiseIncomplete.as_str(),
+            ErrorCode::OnlyPrefixNotFound => RefusalCode::OnlyPrefixNotFound.as_str(),
         }
     }
 
@@ -518,6 +530,8 @@ impl ErrorCode {
             ErrorCode::TargetNotCovered => 27,
             ErrorCode::RemoteAhead => 28,
             ErrorCode::PalletNotFound => 29,
+            ErrorCode::FranchiseIncomplete => 30,
+            ErrorCode::OnlyPrefixNotFound => 31,
         }
     }
 
@@ -593,6 +607,11 @@ impl ErrorCode {
                 "No pallet of that name exists in this warehouse (or, for \"lower\", on the \
                  remote); \"lower <name>\" brings in the remote's, \"palletize <name>\" creates a \
                  new one, \"palletize --remote\" lists the remote's",
+            ErrorCode::FranchiseIncomplete =>
+                "The directory holds a franchise that has not finished; running the same \
+                 \"franchise\" again resumes it and keeps what was fetched",
+            ErrorCode::OnlyPrefixNotFound =>
+                "A sparse franchise's --only path is not a directory in the pallet on the remote",
         }
     }
 
@@ -626,6 +645,8 @@ impl ErrorCode {
             RefusalCode::RemoteAhead => ErrorCode::RemoteAhead,
             RefusalCode::Diverged => ErrorCode::Diverged,
             RefusalCode::PalletNotFound => ErrorCode::PalletNotFound,
+            RefusalCode::FranchiseIncomplete => ErrorCode::FranchiseIncomplete,
+            RefusalCode::OnlyPrefixNotFound => ErrorCode::OnlyPrefixNotFound,
         }
     }
 }
@@ -1015,6 +1036,8 @@ mod tests {
             (RefusalCode::TargetNotCovered, "target_not_covered", 27),
             (RefusalCode::RemoteAhead, "remote_ahead", 28),
             (RefusalCode::PalletNotFound, "pallet_not_found", 29),
+            (RefusalCode::FranchiseIncomplete, "franchise_incomplete", 30),
+            (RefusalCode::OnlyPrefixNotFound, "only_prefix_not_found", 31),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

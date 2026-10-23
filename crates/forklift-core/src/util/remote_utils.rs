@@ -2224,6 +2224,31 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     }
 }
 
+/// What a transport failure that is a dropped connection says after its action: a refused
+/// connect, a reset, a body cut off. Its own words, so [`is_transient_failure`] can tell it from a
+/// local `Error while …` and from a transport failure that repeats (DNS, TLS, a bad body).
+const CONNECTION_FAILED: &str = "the connection to the remote failed: ";
+
+/// Whether `message` reports a failure retrying may get past: a timeout, a connection that failed
+/// or a server error (`5xx`) as this module composes them, anywhere in the message (a caller may
+/// have wrapped it). Never a local failure, whatever its text quotes.
+pub fn is_transient_failure(message: &str) -> bool {
+    if message.contains("Timed out while ") || message.contains(&format!(": {}", CONNECTION_FAILED)) {
+        return true;
+    }
+
+    // `classify_remote_error`'s uncoded shape: "The remote refused <action> (<status>): …".
+    // Only the first status after the phrase is its own: a later one is the server's message.
+    message.match_indices("The remote refused ").any(|(at, _)| {
+        let tail = &message[at..];
+        let status = tail.match_indices(" (").map(|(open, _)| &tail[open + 2..]).find(|status| {
+            status.len() >= 6 && status.as_bytes()[..3].iter().all(u8::is_ascii_digit) && status[3..].starts_with("): ")
+        });
+
+        status.is_some_and(|status| status.starts_with('5'))
+    })
+}
+
 /// How a transport-level failure (one that never got as far as an HTTP status) classifies, given
 /// only `reqwest::Error::is_connect()` and `reqwest::Error::is_timeout()` — the two booleans the
 /// crate exposes for exactly this decision. A free enum plus a pure function over those two
@@ -2496,6 +2521,28 @@ impl RemoteClient {
     /// something worth showing a CLI operator; this instead surfaces just the innermost cause's
     /// own message, which for an I/O failure is normally the OS's own wording (e.g. "Connection
     /// refused (os error 61)").
+    /// [`CONNECTION_FAILED`] when `e` is a connection that was refused, reset or cut off mid-body,
+    /// which retrying unchanged may get past; nothing for any other transport failure (DNS, TLS, a
+    /// body that cannot be decoded, a redirect loop), which retrying unchanged repeats.
+    fn connection_failed(e: &reqwest::Error) -> &'static str {
+        use std::io::ErrorKind;
+
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+        let mut dropped = e.is_body() && !e.is_decode();
+
+        while let Some(error) = current {
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                dropped |= matches!(io.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+                    | ErrorKind::NotConnected);
+            }
+
+            current = error.source();
+        }
+
+        if dropped { CONNECTION_FAILED } else { "" }
+    }
+
     fn root_cause(e: &(dyn std::error::Error + 'static)) -> String {
         let mut current = e;
         while let Some(source) = current.source() {
@@ -2602,7 +2649,7 @@ impl RemoteClient {
                     action
                 ),
             },
-            TransportFailure::Other => format!("Error while {}: {}", action, Self::root_cause(&e)),
+            TransportFailure::Other => format!("Error while {}: {}{}", action, Self::connection_failed(&e), Self::root_cause(&e)),
         }
     }
 
@@ -2643,7 +2690,7 @@ impl RemoteClient {
                 action, self.budgets.connect
             ),
             TransportFailure::ReadTimedOut => Self::mutation_read_timeout_message(action),
-            TransportFailure::Other => format!("Error while {}: {}", action, Self::root_cause(&e)),
+            TransportFailure::Other => format!("Error while {}: {}{}", action, Self::connection_failed(&e), Self::root_cause(&e)),
         }
     }
 
@@ -7106,6 +7153,21 @@ mod tests {
         assert_eq!(CoreError::from(classified.clone()), CoreError::Other(classified));
     }
 
+    /// A server error is transient however it is wrapped; a refusal the server meant is not, nor
+    /// is a local failure whose text merely mentions a status.
+    #[test]
+    fn a_server_error_is_transient_and_a_refusal_is_not() {
+        let server_error = classify_remote_error(503, "fetching objects", "busy".to_string(), None, None);
+        assert!(is_transient_failure(&server_error));
+        assert!(is_transient_failure(&format!("Could not adopt the remote @office: {}", server_error)));
+
+        let refused = classify_remote_error(404, "fetching objects", "no such object (500): gone".to_string(), None, None);
+        assert!(!is_transient_failure(&refused));
+        assert!(!is_transient_failure("Error while writing \"x (500): y\": No space left on device"));
+        assert!(is_transient_failure("Timed out while fetching objects: the remote did not respond."));
+        assert!(is_transient_failure(&format!("Error while downloading the bundle: {}connection reset", CONNECTION_FAILED)));
+    }
+
     /// A code a newer server sends that this client does not know degrades to a generic error
     /// (with the wrapped message), rather than being invented into a taxonomy exit code — but the
     /// wire's next_step still survives, folded into the message, so recovery guidance is not lost
@@ -9747,6 +9809,15 @@ mod tests {
             "must name something useful about the actual cause, not a generic wrapper message: {}",
             message
         );
+        assert!(is_transient_failure(&message), "a refused connection is worth retrying as is: {}", message);
+    }
+
+    /// A transport failure that is not a dropped connection repeats when retried unchanged, so it
+    /// is never worded as one.
+    #[test]
+    fn only_a_dropped_connection_reads_as_one() {
+        let unbuildable = reqwest::Client::new().get("http://[::1").build().unwrap_err();
+        assert_eq!(RemoteClient::connection_failed(&unbuildable), "");
     }
 
     /// A remote that accepts the connection, reads the request in full, and then genuinely goes

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use forklift_core::util::warehouse_utils;
+use forklift_core::util::{franchise_utils, warehouse_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle the prepare command: create the missing pieces of a warehouse in the current
@@ -10,8 +10,15 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())`      - If the warehouse is prepared.
-/// * `Err(String)` - If a folder or file could not be created.
+/// * `Err(String)` - If the directory holds an unfinished franchise, or a folder or file could
+///   not be created.
 pub fn handle_command(verbose: bool) -> Result<(), String> {
+    // Preparing over an unfinished franchise would hand it to every other command half-built:
+    // only `franchise` finishes it.
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Error while getting the current directory: {}", e))?;
+    franchise_utils::gate(&cwd)?;
+
     let created = warehouse_utils::prepare_warehouse()?;
 
     output::emit(&Prepared { created, verbose });

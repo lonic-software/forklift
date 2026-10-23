@@ -1804,8 +1804,8 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
 /// it isn't, on this platform/toolchain — if you're relying on it for a *new* decision, verify
 /// it the same way this one was.
 ///
-/// `pub` (not `pub(crate)`) so a caller in the `forklift` binary crate — `franchise`'s cleanup —
-/// can call it too; every other caller here is within this crate.
+/// `pub` (not `pub(crate)`) so a caller in the `forklift` binary crate — `franchise`, dropping the
+/// mappings its run loaded — can call it too; every other caller here is within this crate.
 pub fn invalidate_cache() {
     registry().lock().expect("the pack registry lock is poisoned")
         .remove(&file_utils::get_path_objects_root());
@@ -5758,7 +5758,7 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
-    /// Mechanism-level probe for a held pack mapping blocking a franchise's cleanup, isolated
+    /// Mechanism-level probe for a held pack mapping blocking a directory's removal, isolated
     /// from `franchise` entirely:
     /// does an `Mmap`'d pack file actually block `remove_dir_all` on its own containing
     /// directory? Windows-only by construction — POSIX permits unlinking (and therefore

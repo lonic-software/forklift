@@ -41,4 +41,6 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `target_not_covered` | 27 | "deliver" was aimed at a target holding changes the draft has not seen; consolidating the target into the draft comes first |
 | `remote_ahead` | 28 | The remote's pallet holds parcels this warehouse has not lowered yet; "lower" comes first |
 | `pallet_not_found` | 29 | No pallet of that name exists in this warehouse (or, for "lower", on the remote); "lower <name>" brings in the remote's, "palletize <name>" creates a new one, "palletize --remote" lists the remote's |
+| `franchise_incomplete` | 30 | The directory holds a franchise that has not finished; running the same "franchise" again resumes it and keeps what was fetched |
+| `only_prefix_not_found` | 31 | A sparse franchise's --only path is not a directory in the pallet on the remote |
 
