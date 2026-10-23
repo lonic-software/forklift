@@ -5322,6 +5322,48 @@ fn scope_prune_keeps_history_the_remote_has_moved_past_until_it_is_lowered() {
     assert!(!object_present(&area, "sparse", &docs_blob), "after a lower the prune frees it");
 }
 
+/// The entries of warehouse `name`'s held-heads record, as `<head> <pallet>` lines (the header
+/// skipped); none when the record is absent.
+fn held_heads(area: &TestArea, name: &str) -> Vec<String> {
+    match std::fs::read_to_string(area.path(&format!("{}/.forklift/held-heads", name))) {
+        Ok(text) => text.lines().skip(1).map(str::to_string).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("the held-heads record could not be read: {}", e),
+    }
+}
+
+#[test]
+fn a_landed_lift_or_lower_records_its_head_and_a_refused_lift_records_nothing() {
+    // FORK-254: lift records the head the remote accepted, replacing the recorded heads it descends
+    // from; lower records the head it adopted. A lift the remote refuses records nothing, since
+    // the record is written only after the compare-and-set.
+    let area = TestArea::new("held-heads-record");
+    let server = sparse_with_docs(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "clone"]));
+
+    let base = pallet_head(&area, "dev", "main");
+    assert_eq!(held_heads(&area, "dev"), vec![format!("{} main", base)]);
+
+    area.write_file("dev/src/api/a.txt", "api v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    let ahead = pallet_head(&area, "dev", "main");
+    assert_ne!(ahead, base);
+    assert_eq!(held_heads(&area, "dev"), vec![format!("{} main", ahead)], "the new head replaces its ancestor");
+
+    area.write_file("sparse/src/api/b.txt", "local\n");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "local"]));
+    let refused = area.forklift("sparse", &["lift"]);
+    assert!(!refused.status.success(), "the remote is ahead, so the lift is refused");
+    assert_eq!(held_heads(&area, "sparse"), Vec::<String>::new(), "a refused lift records nothing");
+
+    assert_success(&area.forklift("clone", &["lower"]));
+    assert_eq!(pallet_head(&area, "clone", "main"), ahead);
+    assert_eq!(held_heads(&area, "clone"), vec![format!("{} main", ahead)], "lower records the head it adopted");
+}
+
 #[test]
 fn scope_prune_refuses_and_changes_nothing_when_the_remote_is_unreachable() {
     // Without the remote's heads the prune cannot tell what exists only here, so it frees nothing

@@ -425,13 +425,16 @@ impl BaseServeLock {
 /// scoped fetch records its head, and re-checks the scope and lifts the head's fence when its
 /// transfer completes, under it; a ref write records a head it leaves unreached in the same hold
 /// as the write; `expand` compares and writes the scope, the ledger and the fence list under it.
-/// None of them holds it across a transfer or a walk.
+/// None of them holds it across a transfer or a walk. It also serializes the read-modify-write of
+/// the held-heads record ([`held_heads`](crate::util::held_heads)), which walks history before
+/// taking it.
 ///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
 /// ref compare-and-set, the trust install, `heal`'s restage of a ref or the anchor, the scoped
-/// fetch's record and re-check, and `expand`'s commit take it, and none of them calls another:
-/// work inside a hold uses the lock-free variants, which take the held lock as an argument.
+/// fetch's record and re-check, `expand`'s commit and the held-heads write take it, and none of
+/// them calls another: work inside a hold uses the lock-free variants, which take the held lock as
+/// an argument.
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.
     _file: std::fs::File,

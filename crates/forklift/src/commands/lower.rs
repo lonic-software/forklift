@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::RemoteClient;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, kv_utils, merge_utils, object_utils,
+    alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
     operation_utils, pallet_utils, remote_utils, shift_utils, stocktake_utils, trust_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -222,10 +222,19 @@ async fn lower_working_pallet(client: &RemoteClient,
     // A compare-and-set against the head this lower started from; the working tree goes back to
     // where it was if the pallet did not move (another bay moved it first, or the write failed).
     shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &remote_tree, local_tree.as_deref(), anchor)?;
+    record_adopted_head(&pallet, remote_head);
 
     report.outcome = Some(LowerOutcome::Lowered);
 
     Ok(())
+}
+
+/// Add the remote head a lower just adopted into `pallet`'s ref to the held-heads record. The ref
+/// has moved either way, so a failure only warns.
+fn record_adopted_head(pallet: &str, remote_head: &str) {
+    if let Err(why) = held_heads::record_held_head(pallet, remote_head) {
+        output::warn_held_head_unrecorded(&why);
+    }
 }
 
 /// The remote's head of user pallet `pallet`, or the refusal that it has none. The refusal lists
@@ -324,6 +333,7 @@ async fn lower_named_pallet(client: &RemoteClient,
 
     let error = match pallet_utils::update_pallet_head(&pallet, local_head.as_deref(), remote_head, &pallet_utils::RefPreconditions::NONE) {
         Ok(()) => {
+            record_adopted_head(&pallet, remote_head);
             report.outcome = Some(moved);
             return Ok(());
         }

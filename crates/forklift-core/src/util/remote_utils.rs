@@ -27,8 +27,8 @@ use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
-    bundle_utils, config_utils, fetch_ledger, file_utils, haul_utils, merge_utils, meta_tree, object_utils, office_utils,
-    pack_utils, pallet_utils, sign_utils, trust_utils,
+    bundle_utils, config_utils, fetch_ledger, file_utils, haul_utils, held_heads, merge_utils, meta_tree, object_utils,
+    office_utils, pack_utils, pallet_utils, sign_utils, trust_utils,
 };
 
 /// How many object transfers run concurrently.
@@ -308,6 +308,10 @@ pub struct LiftStats {
     pub uploaded_objects: usize,
     pub uploaded_signatures: usize,
     pub old_head: Option<String>,
+
+    /// Why the landed head could not be added to the held-heads record, if it could not. The lift
+    /// stands; only a candidate for a later prune is lost, so the caller warns.
+    pub unrecorded: Option<String>,
 }
 
 /// The outcome of lifting one pallet.
@@ -5475,11 +5479,16 @@ async fn lift_pallet_inner(client: &RemoteClient,
 
     client.update_ref(pallet, remote_head, local_head).await?;
 
+    // After the compare-and-set, so a refused or failed lift records nothing; best-effort, since
+    // the remote has the head now and an error here would read as a lift that did not land.
+    let unrecorded = held_heads::record_held_head(pallet, local_head).err();
+
     Ok(LiftResult::Lifted(LiftStats {
         new_parcels,
         uploaded_objects,
         uploaded_signatures,
         old_head: remote_head.map(|hash| hash.to_string()),
+        unrecorded,
     }))
 }
 

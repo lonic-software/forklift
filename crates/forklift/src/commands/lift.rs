@@ -118,6 +118,9 @@ pub async fn handle_command() -> Result<(), String> {
         match lifted {
             Ok(LiftResult::UpToDate) => report.up_to_date = true,
             Ok(LiftResult::Lifted(stats)) => {
+                if let Some(why) = &stats.unrecorded {
+                    output::warn_held_head_unrecorded(why);
+                }
                 report.new_parcels = stats.new_parcels;
                 report.uploaded_objects = stats.uploaded_objects;
                 report.uploaded_signatures = stats.uploaded_signatures;
