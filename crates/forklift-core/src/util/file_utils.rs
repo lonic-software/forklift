@@ -826,8 +826,9 @@ pub fn create_first_new_folder(candidates: impl IntoIterator<Item = PathBuf>) ->
 pub const PID_NUMBERED_TRIES: u64 = 64;
 
 /// The names a temp file or folder is created at, numbered for this process: `name(pid, n)` for
-/// this process's id and the next [`PID_NUMBERED_TRIES`] numbers drawn from `counter`. A site keeps
-/// its own `counter`, so no two calls in one process draw the same name.
+/// this process's id and the next [`PID_NUMBERED_TRIES`] numbers drawn from `counter`. Sites whose
+/// names can meet share one `counter` ([`TEMP_COUNTER`]), so no two calls in one process draw the
+/// same name.
 pub fn pid_numbered<'a>(counter: &'a std::sync::atomic::AtomicU64,
                         name: impl Fn(u32, u64) -> PathBuf + 'a) -> impl Iterator<Item = PathBuf> + 'a {
     let pid = std::process::id();

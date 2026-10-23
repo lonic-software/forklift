@@ -269,7 +269,13 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
             Ok(notes)
         }
         // Something else was put in place first: another prepare's, or a bay's redirect folder.
-        Placement::Taken => refuse_bay(&forklift).and_then(|()| fill_in_place(&forklift)),
+        Placement::Taken => match bay_utils::classify_forklift(&forklift)? {
+            // Gone again already: filling it in place would build it unstaged.
+            bay_utils::ForkliftKind::Absent => Err(format!(
+                "\"{}\" changed while a warehouse was being prepared there. Try again.", forklift.to_string_lossy()
+            )),
+            _ => fill_in_place(&forklift),
+        },
     }
 }
 
@@ -289,6 +295,9 @@ fn refuse_bay(forklift: &Path) -> Result<(), String> {
 /// none. The folders created are synced into their parents before the marker is written, so a
 /// marker never survives a power loss that the pieces it vouches for did not.
 fn fill_in_place(forklift: &Path) -> Result<Vec<String>, String> {
+    // Checked again here, not only before: a bay's folder can be put in place since.
+    refuse_bay(forklift)?;
+
     let (mut notes, created) = fill(forklift, forklift)?;
 
     // Each created folder and every folder between it and `forklift`, once each, deepest first.
@@ -414,7 +423,6 @@ thread_local! {
 /// * `Err(String)`   - The staging folder could not be made, `build` failed, or the rename failed
 ///                     for another reason; nothing is in place.
 pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Result<(), String>) -> Result<Placement, String> {
-
     let name = forklift.file_name()
         .ok_or(format!("Cannot create \"{}\": it has no name.", forklift.to_string_lossy()))?
         .to_string_lossy().into_owned();
