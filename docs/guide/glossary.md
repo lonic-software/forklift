@@ -138,8 +138,9 @@ truth and repairs itself.
 **Salvage.** What `compact --all` does with a damaged pack: it reads the pack record by record into
 loose objects, and deletes the pack only once every live object it may hold has another copy.
 
-**Object ceiling.** 64 MiB, the largest single object. It is a hard limit; files are already split
-into chunks from 8 MiB up, well below it.
+**Object ceiling.** 64 MiB, the largest object Forklift will write. Files are split into chunks
+from 8 MiB up, well below it. Objects over the ceiling that predate it stay readable locally, but a
+remote refuses to transfer them.
 
 **gc** (git: `gc` / `prune`). Garbage collection: deleting objects nothing reaches any more. On a
 server it is `forklift-server gc`, which keeps a grace period so lifts still in flight are safe.
@@ -222,7 +223,7 @@ shared by every bay.
 
 **Materialization scope** (git: sparse-checkout). The paths one bay writes to disk
 (`bay add --scope`). It is always within the fetch scope. An empty or missing scope file means
-everything.
+everything. Every narrower scope also includes the root `.forkliftignore`.
 
 **Sealed.** Content outside the fetch scope. It is not on disk, but the hash a signed parcel
 commits to pins it, so it is shown as neither removed nor forged.
@@ -242,8 +243,8 @@ to free disk. This is safe only for content the remote still holds, because the 
 confirm.
 
 **Held-heads record.** `.forklift/held-heads`: for each working pallet, up to 16 heads this
-warehouse saw the remote accept or serve. Each entry is only a candidate to ask the remote about, never proof on
-its own. It is written today. Nothing reads it yet.
+warehouse saw the remote accept or serve. Each entry is only a candidate to ask the remote about,
+never proof on its own. It is written today. Nothing reads it yet.
 
 **Fetched-heads ledger, fence list.** A sparse warehouse's record of every head a scoped fetch
 brought in, including heads no pallet points at any more, so `expand` can widen their history too.
@@ -288,7 +289,7 @@ Forklift has several locks. Each guards a different thing.
 
 | Lock | Guards | Taken by |
 |------|--------|----------|
-| Warehouse lock (`lock`, per bay) (git: `index.lock`) | one bay's inventory and working directory | every mutating command in that bay; a killed process leaves it behind. It does not guard refs, which every bay shares |
+| Warehouse lock (`lock`, per bay) (git: `index.lock`) | one bay's inventory and working directory | every mutating command in that bay, including those that write refs; a killed process leaves it behind. It serializes only its own bay, so ref writes, which every bay shares, also take the ref lock |
 | Ref lock (`refs.lock`) | state shared by every bay | each pallet ref compare-and-set, trust installs, the fetched-heads ledger and fence list, `expand`'s scope commit, and the held-heads record |
 | Object-store lock (`store.lock`) | the object store | compaction, so two never overlap |
 | Store-access lock (`store-access.lock`) | whole-store rewrites | `compact --all`, `scope-prune` and server gc, against mutating commands |
@@ -389,8 +390,8 @@ admin adds a new operator. `link`: you add a device of your own. `authorize`: an
 operator who lost every device. `office keygen` makes the key and prints the lines to hand over.
 
 **Rotate, retire, compromised.** `office rotate` replaces a key with a fresh one, signed by the old.
-`office retire` revokes a key. `--compromised` marks it as possibly in other hands. Retired keys are kept
-forever, so old signatures can still be checked.
+`office retire` revokes a key. `--compromised` marks it as possibly in other hands. Retired keys
+are kept forever, so old signatures can still be checked.
 
 **Distrust boundary.** The pallet heads vouched for at the moment a key was revoked. The revoked
 key's signatures stay valid only on parcels reachable from that boundary. This is decided by
@@ -518,15 +519,17 @@ every answer `recorded`.
 **`--json`.** Every command's machine-readable output, for scripts and AI agents.
 
 **Schema version.** The version number carried in all `--json` output. It changes when a command's
-output or the set of error codes changes incompatibly, so a script can pin it. A new field can
-appear without a change, so a parser should ignore fields it does not know.
+output or the set of error codes changes incompatibly, so a script can pin it. It is also how a
+script detects capabilities: check `schema` before relying on a field, rather than looking for the
+field itself.
 
 **MCP server** (`forklift mcp`). Serves Forklift's commands as tools to an AI client over the Model
 Context Protocol.
 
 **Exit code.** The number a command exits with, which scripts switch on. 0 is success, 1
-unclassified, 2 a usage error, 130 cancelled. Forklift's own refusals have stable codes from 3
-upward, such as 6 (warehouse locked), 21 (durability taint) and 22 (trust changed). The full list is
+unclassified, 2 a usage error. 128+n means the process was killed by signal n (130 is Ctrl-C);
+Forklift never exits 130 on its own, and stdout may then be empty. Forklift's own refusals have
+stable codes from 3 upward, such as 6 (warehouse locked), 21 (durability taint) and 22 (trust changed). The full list is
 in [errors.md](../generated/errors.md).
 
 **Error code.** The stable name of a refusal in `--json` output, such as `warehouse_locked`. Each
