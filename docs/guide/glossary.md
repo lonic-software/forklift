@@ -57,8 +57,9 @@ metadata. See [`palletize`](cli.md#palletize--create-a-pallet--list-pallets-pz).
 **Revision** (git: revision). Any way of naming a point in history, such as a pallet name or a
 parcel hash prefix.
 
-**Operator** (git: author). Whoever made a parcel, recorded as an opaque id; see
-[Identity and keys](#identity-and-keys).
+**Operator** (git: author or committer, but broader). An identity in Forklift, recorded as an
+opaque id: whoever makes parcels and, in a signed warehouse, whoever holds keys and roles in the
+office. See [Identity and keys](#identity-and-keys).
 
 **Office.** The signed record of operators, keys and roles; see
 [The office and trust](#the-office-and-trust).
@@ -267,14 +268,14 @@ Forklift has several locks, each guarding a different thing.
 
 **Lift** (git: `push`, never forced). Uploads a pallet and moves the remote's head.
 
-**Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A divergence is reported, never
-merged on its own.
+**Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A diverged working pallet is
+reported, never merged on its own.
 
 **Diverged, remote ahead.** Refusals meaning the remote's history moved: *diverged* when both sides
 have parcels the other lacks, *remote ahead* when you need to lower first.
 
-**Bundle** (git: bundle). A whole-warehouse package that speeds up clones. It is never a source of
-truth.
+**Bundle** (git: bundle, or a packfile in transit). Many objects downloaded as one package, for a
+`franchise`, a `lower` or a sparse fetch. It is never a source of truth.
 
 **Batch endpoint, batch lane.** The request that fetches many objects at once. A client that finds
 it missing or slow **closes the lane** and fetches one at a time.
@@ -366,7 +367,9 @@ signed.
 **First contact, TOFU** (like an SSH host key). Adopting a remote's genesis the first time you
 connect. See [First contact](trust-and-identity.md#joining-a-trusted-warehouse-first-contact).
 
-**Trust changed.** The refusal when a remote's genesis no longer matches the one you pinned.
+**Trust changed.** The refusal when a remote's trust no longer matches what you pinned, such as a
+different genesis. See
+[First contact](trust-and-identity.md#joining-a-trusted-warehouse-first-contact).
 
 **Re-genesis** (trust reset). Recovery for an office no one can sign any more: a new genesis, with
 the old history kept as **attested** but no longer verified. See
