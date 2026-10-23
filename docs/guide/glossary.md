@@ -1,12 +1,12 @@
 # Forklift glossary
 
-The terms Forklift uses, what each means, and its git equivalent where there is one. The
-[guides](README.md) explain how to *use* each thing; this page only says what each word means.
+The terms Forklift uses, what each means, and its git equivalent where there is one. This page only
+defines words. Flags, refusals and edge cases belong to the guides: each entry links to the
+section of [cli.md](cli.md) or [trust-and-identity.md](trust-and-identity.md) that covers it.
 
-Terms are grouped by topic. Within a topic, the more basic terms come first. A few words mean
-different things in different places; [Overloaded words](#overloaded-words) lists each one with
-all its meanings. Terms for features that are designed but not shipped are kept apart, in
-[Planned, not shipped](#planned-not-shipped).
+Terms are grouped by topic, with the more basic terms first. A few words mean different things in
+different places; [Overloaded words](#overloaded-words) lists them. Terms for features that are
+designed but not shipped are kept apart, in [Planned, not shipped](#planned-not-shipped).
 
 **Contents:**
 
@@ -31,42 +31,39 @@ all its meanings. Terms for features that are designed but not shipped are kept 
 ## The warehouse model
 
 **Warehouse** (git: repository). A project and all its history. The history lives in a
-`.forklift/` folder; the working files sit beside it. `prepare` creates one.
+`.forklift/` folder beside the working files. See [`prepare`](cli.md#prepare--create-a-warehouse).
 
-**`.forklift/`** (git: `.git/`). The warehouse's own folder: the object store, inventory, pallets,
-config, commit-graph and bays.
+**`.forklift/`** (git: `.git/`). The warehouse's own folder: objects, inventory, pallets, config
+and bays.
 
-**Warehouse marker.** The file `.forklift/warehouse`, the last thing `prepare` writes. It certifies
-that the folder is a complete warehouse rather than a half-built one. A marker this build cannot
-read is an error, never treated as absent.
+**Warehouse marker.** The file `.forklift/warehouse`, written last by `prepare`, which marks the
+folder as a complete warehouse rather than a half-built one.
 
-**Parcel** (git: commit). One immutable recorded snapshot: a root tree, its parents, authorship
-actions and a description. Facts learned after a parcel is made go into
-[post-metadata](#meta-pallets-and-metadata), never into the parcel.
+**Parcel** (git: commit). One immutable recorded snapshot: a root tree, its parents, who made it,
+and a description. Facts learned later go into [post-metadata](#meta-pallets-and-metadata), never
+into the parcel.
 
-**Pallet** (git: branch). A named, movable pointer to a parcel, its *head*. Working pallets hold
-your project's history. [Meta pallets](#meta-pallets-and-metadata), whose names start with `@`,
-hold Forklift's own signed metadata.
+**Pallet** (git: branch). A named, movable pointer to a parcel. Working pallets hold your project's
+history; [meta pallets](#meta-pallets-and-metadata), named with `@`, hold Forklift's own signed
+metadata. See [`palletize`](cli.md#palletize--create-a-pallet--list-pallets-pz).
 
-**Head** (of a pallet) (git: branch tip). The parcel a pallet points at. A server is also called a
-head; see [Overloaded words](#overloaded-words).
+**Head** (git: branch tip). The parcel a pallet points at. A server is also called a head; see
+[Overloaded words](#overloaded-words).
 
 **Unborn pallet** (git: unborn branch). A pallet with nothing stacked on it yet.
 
 **Default pallet** (git: default branch). The pallet a new clone starts on.
 
-**Revision** (git: revision). Any way of naming a point in history: a pallet name, an `@`-qualified
-meta pallet, or a parcel hash prefix of at least 4 hex characters. Two forms belong to one command
-each. `diff` also accepts `:empty`, the empty tree, so a root parcel can be compared against a
-clean slate. `show` takes `<revision>:<path>` to name one file at that revision.
+**Revision** (git: revision). Any way of naming a point in history, such as a pallet name or a
+parcel hash prefix.
 
-**Operator** (git: author). Whoever authored a parcel. History stores an opaque operator id, never
-a name or email; see [Identity and keys](#identity-and-keys).
+**Operator** (git: author). Whoever made a parcel, recorded as an opaque id; see
+[Identity and keys](#identity-and-keys).
 
 **Office.** The signed record of operators, keys and roles; see
 [The office and trust](#the-office-and-trust).
 
-The everyday verbs map one to one onto git:
+The everyday verbs map onto git like this:
 
 | Forklift | git | What it does |
 |----------|-----|--------------|
@@ -91,511 +88,403 @@ The everyday verbs map one to one onto git:
 | `blame` | `blame` | who wrote each line |
 | `import-git` / `export-git` | none | migrate a git repository in, or back out |
 
-Most commands have a short alias (`st` for `stocktake`, `s` for `stack`), and `fl` can be set up as
-a short name for `forklift` itself (`alias`). The full command list with aliases is in
+Every command, with its short alias, is listed in
 [cli.md](cli.md#10-command--alias-reference).
 
 ## Objects and storage
 
 **Object** (git: object). An immutable piece of stored content, named by the Blake3 hash of its
-bytes. Identical content always has the same name, so it is stored once.
+bytes, so identical content is stored once.
 
-**Blob** (git: blob). A file's contents. A symlink's blob holds its target path.
+**Blob** (git: blob). A file's contents.
 
 **Tree** (git: tree). A directory listing: sorted entries, each with a type, a name and a hash.
-Entry types are normal file, executable, symbolic link, tree, and the chunked forms of the first
-two.
 
-**Recipe** (git: none; the closest is a Git LFS pointer, but this is built in). The index of a large
-file (8 MiB or more): the whole file's content hash, its total size, and the ordered list of its
-chunks. A tree entry for a large file points at its recipe.
+**Recipe** (git: none; closest is a Git LFS pointer, but built in). The index of a large file: the
+ordered list of its chunks. See [Large files](cli.md#large-files).
 
-**Chunk.** One content-defined piece of a large file, stored as its own object type. Because chunk
-boundaries follow the content, an edit to a large file only stores the chunks it changed.
+**Chunk.** One content-defined piece of a large file. An edit stores only the chunks it changed.
 
-**Object store** (git: object database). `.forklift/objects/`, where objects live. Each one is
-stored zstd-compressed.
+**Object store** (git: object database). `.forklift/objects/`, where objects live.
 
 **Loose object** (git: loose object). An object stored as its own file.
 
-**Pack** (git: packfile). Many objects in one append-only data file plus a sorted index
-(`.pack` + `.idx`).
+**Pack** (git: packfile). Many objects in one data file plus an index.
 
-**Delta** (git: delta). An object stored compressed against a similar *base* object, such as the
-previous version of the same file. It is checked against its hash when rebuilt.
+**Delta** (git: delta). An object stored compressed against a similar base object.
 
-**Compact** (git: `repack`). Moves loose objects into packs. Plain `compact` adds a pack and drops
-nothing, so it is safe beside a running server. `compact --all` rewrites every pack and drops
-unreachable objects. `compact --all --redelta` also re-chooses delta bases for the whole store.
+**Compact** (git: `repack`). Moves loose objects into packs; with more flags, rewrites the store.
+See [`compact`](cli.md#compact--pack-the-object-store).
 
-**Maintenance / auto-compaction** (git: `gc --auto`). The automatic `compact` a mutating command
-runs once the store passes its thresholds (`maintenance.loose`, `maintenance.packs`).
+**Maintenance** (git: `gc --auto`). The automatic compaction a command runs once the store passes
+its thresholds.
 
-**Commit-graph** (git: commit-graph). `.forklift/graph/`, a derived cache of parent links,
-generation numbers and changed-path filters that speeds up history walks. It is never a source of
-truth and repairs itself.
+**Commit-graph** (git: commit-graph). A derived cache that speeds up history walks. It is never a
+source of truth.
 
-**Salvage.** What `compact --all` does with a damaged pack: it reads the pack record by record into
-loose objects, and deletes the pack only once every live object it may hold has another copy.
+**Salvage.** Recovering the readable objects out of a damaged pack during compaction.
 
-**Object ceiling.** 64 MiB, the largest object Forklift will write. Files are split into chunks
-from 8 MiB up, well below it. Objects over the ceiling that predate it stay readable locally, but a
-remote refuses to transfer them.
+**Object ceiling.** The largest object Forklift will write. Large files are chunked well below it.
 
-**gc** (git: `gc` / `prune`). Garbage collection: deleting objects nothing reaches any more. On a
-server it is `forklift-server gc`, which keeps a grace period so lifts still in flight are safe.
+**gc** (git: `gc` / `prune`). Deleting objects nothing reaches any more.
 
-**Parcel actions.** The authorship records inside a parcel. *AUTHOR* names who wrote the change.
-*STACK* names who recorded it (git: committer). Operations that copy a change, such as
-`cherry-pick`, keep the original AUTHOR actions and add their own STACK action.
+**Parcel actions.** The authorship records inside a parcel. *AUTHOR* names who wrote the change;
+*STACK* names who recorded it (git: committer).
 
 ## Staging and working directories
 
 **Inventory**, also called the **dock** (git: index, staging area). What the next parcel will
-contain. Unlike git's single index file, it is split into one **shard** per directory, so a change
-rewrites only the shards it touches.
+contain. Unlike git's single index file, it is split into one **shard** per directory.
 
-**Stat cache** (git: the index's stat data). The size, times, device and inode stored for each
-inventory entry. It lets `load` and `stocktake` skip re-reading files that have not changed.
+**Stat cache** (git: the index's stat data). File metadata kept with each inventory entry, so
+unchanged files need not be re-read.
 
-**Racily clean** (git: racy git). A file modified within the same clock tick as its last stat
-could look unchanged when it is not. Forklift rehashes such a file until a later stat proves it
-clean.
+**Racily clean** (git: racy git). A file changed so soon after it was last checked that its
+metadata cannot prove it unchanged. Forklift re-reads such files.
 
-**Bay** (git: worktree). An extra working directory that shares one warehouse's objects, pallets,
-trust and config, with its own inventory, current pallet and lock. Several bays can work on
-different pallets at once.
+**Bay** (git: worktree). An extra working directory sharing one warehouse's history, with its own
+inventory and current pallet. See [`bay`](cli.md#bay--parallel-working-directories).
 
-**Redirect.** The file inside a bay's `.forklift/` folder that names the warehouse it belongs to.
-The warehouse in turn records where each bay lives.
+**Redirect.** The file in a bay's `.forklift/` folder naming the warehouse it belongs to.
 
-**Position.** The parcel a bay's files currently stand on. If another bay moves the shared pallet
-past it, the bay is **behind** until `shift` catches it up.
+**Position.** The parcel a bay's files currently stand on. A bay whose pallet another bay moved is
+**behind**.
 
-**Incomplete load.** A `load` that was interrupted. It leaves a record behind, and the commands that
-record a parcel (`stack`, `park`, `consolidate`, `cherry-pick`) refuse until the load is finished
-(exit 20), so a half-staged change is never recorded. The same exit code also means an
-interrupted [operation](#durability-and-recovery) is still standing; `heal` resolves that one.
+**Incomplete load.** A `load` that was interrupted. Recording a parcel is refused until it is
+finished, so a half-staged change is never stacked.
 
-**Ignore file** (git: `.gitignore`). `.forkliftignore`, the patterns of files Forklift should not
-track.
+**Ignore file** (git: `.gitignore`). `.forkliftignore`; see
+[`.forkliftignore`](cli.md#forkliftignore--files-forklift-shouldnt-track).
 
 ## Merging and moving work
 
-**Consolidate** (git: `merge`). Merges another pallet in. The outcome is either "already up to
-date", a fast-forward, or a three-way merge that records a two-parent **merge parcel**.
+**Consolidate** (git: `merge`). Merges another pallet in, recording a two-parent **merge parcel**
+when it is not a fast-forward. See
+[`consolidate`](cli.md#consolidate--merge-con).
 
-**diff3.** The exact, whitespace-preserving three-way algorithm `consolidate` merges with. It is
-deliberately separate from the diff used for display. Conflict markers include the base text.
+**diff3.** The exact three-way algorithm `consolidate` merges with, separate from the diff used for
+display.
 
-**Conflict** (git: conflict). A file both sides changed in ways that cannot be combined. A
-conflicted file blocks `stack` until it is resolved. A binary file, or one whose type changed,
-conflicts as a whole. `conflicts` lists them.
+**Conflict** (git: conflict). A file both sides changed in ways that cannot be combined. See
+[`conflicts`](cli.md#conflicts--list-unresolved-conflicts).
 
-**Cherry-pick** (git: `cherry-pick`). Applies one parcel's change, relative to its first parent,
-onto the current pallet as a new parcel.
+**Cherry-pick** (git: `cherry-pick`). Applies one parcel's change onto the current pallet as a new
+parcel.
 
-**Deliver** (git: squash merge, but git loses the trail). Squashes a draft pallet's net change onto
-a target as one signed parcel. The draft pallet is kept, and a delivery record links the new parcel
-back to it.
+**Deliver** (git: squash merge, but git loses the trail). Squashes a draft pallet onto a target as
+one signed parcel, keeping a link back to the draft. See
+[`deliver`](cli.md#deliver--squash-a-draft-onto-a-target-keeping-the-trail-dv).
 
-**Draft pallet, checkpoint, trail.** A convention for `deliver`, not a special pallet type. You (or
-an agent) stack checkpoints on a draft pallet. Delivering it squashes them into one parcel, and the
-draft's history (the trail) stays browsable.
+**Draft pallet, checkpoint, trail.** A convention for `deliver`: checkpoints are stacked on a draft
+pallet, and after delivery the draft's history (the trail) stays browsable.
 
-**Optimistic lift** (git: none). When `lift` finds the remote has moved, the working directory is
-clean, and the two sides merge without conflict, it lowers, consolidates and retries on its own.
-Edits that overlap still stop with *diverged*.
+**Optimistic lift** (git: none). A `lift` that finds the remote moved, but can merge cleanly, merges
+and retries on its own. See [`lift`](cli.md#lift--push-li).
 
-**Park** (git: `stash`). Saves staged and unstaged changes as a **parked parcel** and resets to the
-head. `park pop` re-applies them, and reports a conflict if the files they touch changed since.
+**Park** (git: `stash`). Sets staged and unstaged changes aside as a **parked parcel**; `park pop`
+brings them back. See [`park`](cli.md#park--stash-pa).
 
-**Undo** (git: roughly `reset --soft` plus the reflog). Reverses the last journaled operation:
-stack, consolidate, cherry-pick, shift or a pallet delete. The **undo journal** is the bay-local
-record that makes this possible. `undo --as <name>` brings a deleted pallet back under a new name.
-Trust operations are never undone.
+**Undo** (git: roughly `reset` plus the reflog). Reverses the last recorded operation, using the
+bay's **undo journal**. See [`undo`](cli.md#undo--reverse-the-last-operation).
 
 ## Sparse warehouses and scope
 
-**Sparse warehouse** (git: partial clone plus sparse checkout). A warehouse made with
-`franchise --only <paths>`. It has every parcel and signature, so the whole history is there, but
-it holds file content only for the listed paths.
+**Sparse warehouse** (git: partial clone plus sparse checkout). A warehouse that has all of history
+but file content only for some paths. See [`franchise`](cli.md#franchise--clone-fr).
 
-**Fetch scope.** The paths a warehouse holds content for (`.forklift/config/fetch-scope`). It is
-shared by every bay.
+**Fetch scope.** The paths a warehouse holds content for, shared by every bay.
 
-**Materialization scope** (git: sparse-checkout). The paths one bay writes to disk
-(`bay add --scope`). It is always within the fetch scope. An empty or missing scope file means
-everything. Every narrower scope also includes the root `.forkliftignore`.
+**Materialization scope** (git: sparse-checkout). The paths one checkout writes to disk, always
+within the fetch scope. See [`scope`](cli.md#scope--show-the-sparse-workspace-scope).
 
-**Sealed.** Content outside the fetch scope. It is not on disk, but the hash a signed parcel
-commits to pins it, so it is shown as neither removed nor forged.
+**Sealed.** Content outside the fetch scope: not on disk, but pinned by the signed parcel's hash.
 
-**Spine.** The trees on the path from the root down to each scoped folder. A sparse warehouse
-always holds them.
+**Spine.** The trees from the root down to each scoped folder, which a sparse warehouse always
+holds.
 
-**Expand.** Widens the fetch scope and fetches the newly included content, across all history held.
+**Expand.** Widens the fetch scope and fetches the new content. See
+[`expand`](cli.md#expand--widen-a-sparse-warehouses-fetch-scope).
 
-**Narrow.** Shrinks one checkout's materialization scope (a bay's, or a sparse main tree's) and
-removes the dropped files from the working directory. It frees nothing in the object store: that
-content is still ordinary history.
+**Narrow.** Shrinks a checkout's materialization scope without freeing storage. See
+[`narrow`](cli.md#narrow--shrink-this-checkouts-materialization-scope).
 
-**scope-prune** (git: none). Narrows the fetch scope and deletes the content that falls out of it,
-to free disk. This is safe only for content the remote still holds, because the remote is where
-`expand` gets it back. So `scope-prune` asks the remote first, keeps history that was never
-lifted, and refuses, changing nothing, when it cannot reach the remote. It also refuses a path any
-checkout still materializes.
+**scope-prune** (git: none). Shrinks the fetch scope and deletes the dropped content to free disk.
+See [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
-**Held-heads record.** `.forklift/held-heads`: for each working pallet, up to 16 heads this
-warehouse saw the remote accept or serve. Each entry is only a candidate to ask the remote about,
-never proof on its own. It is written today. Nothing reads it yet.
+**Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. It is
+written today; nothing reads it yet.
 
-**Fetched-heads ledger, fence list.** A sparse warehouse's record of every head a scoped fetch
-brought in, including heads no pallet points at any more, so `expand` can widen their history too.
-A recorded head the remote can no longer serve moves to the *fence list*, and no pallet may be
-moved onto a fenced head until a scoped fetch of it completes.
+**Fetched-heads ledger, fence list.** A sparse warehouse's record of the heads its fetches brought
+in, and of those the remote can no longer serve.
 
-**Origin.** The remote a sparse warehouse fetched from. A sparse warehouse may lift only to its
-origin.
+**Origin.** The remote a sparse warehouse fetched from.
 
 ## Durability and recovery
 
 **visible ⟹ durable.** Forklift's core durability rule: once an object's final name is visible on
-disk, the object is safely on disk. Because of this, "the file exists" can be trusted as "the
-object is stored".
+disk, the object is safely on disk.
 
-**Durability taint** (git: none). A record of objects whose durability could not be proven, for
-example because a crash hit mid-write. Every command first tries to heal a taint on its own (see
-*Restage*). Only a taint that cannot be healed that way makes commands other than `heal` and `audit`
-refuse (exit 21).
+**Durability taint** (git: none). A record of objects whose durability could not be proven, such as
+after a crash mid-write.
 
-**Torn taint.** A taint record that was itself cut off by a crash. Its scope is unknown, so `heal`
-rescans the whole store.
+**Torn taint.** A taint record that was itself cut off by a crash.
 
-**Restage.** Reading an object back, checking its hash and rewriting it durably. Every command that
-opens a warehouse, except `heal` and `audit`, first restages any verified loose object recorded in a
-taint.
+**Restage.** Reading an object back, checking its hash, and rewriting it durably.
 
-**heal** (git: none; loosely `fsck`). The recovery command. It resolves a durability taint, and
-finishes, rolls forward or rolls back an operation a crash interrupted.
+**heal** (git: none; loosely `fsck`). The recovery command for taints and interrupted operations.
+See [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation).
 
-**Operation marker.** A record a multi-step command (shift, park, consolidate, lower, bay creation
-and others) writes before it starts and removes when it finishes. A marker left behind tells
-`heal` that something was interrupted.
+**Operation marker.** A record a multi-step command writes before it starts and removes when it
+finishes. One left behind marks an **interrupted operation**. See
+[Interrupted operations](cli.md#interrupted-operations).
 
-**Interrupted operation.** An operation whose marker was left standing. `heal` finishes or undoes
-it. An interrupted `franchise` is resumed by running the same command again.
-
-**Store health.** What `store` reports: counts and sizes of loose and packed objects, delta
-density, whether maintenance is due, and any damaged or unreadable packs.
+**Store health.** What [`store`](cli.md#store--object-store-health) reports about the object store.
 
 ## Locks
 
-Forklift has several locks. Each guards a different thing.
+Forklift has several locks, each guarding a different thing.
 
-| Lock | Guards | Taken by |
-|------|--------|----------|
-| Warehouse lock (`lock`, per bay) (git: `index.lock`) | one bay's inventory and working directory | every mutating command in that bay, including those that write refs; a killed process leaves it behind. It serializes only its own bay, so ref writes, which every bay shares, also take the ref lock |
-| Ref lock (`refs.lock`) | state shared by every bay | each pallet ref compare-and-set, trust installs, the fetched-heads ledger and fence list, `expand`'s scope commit, and the held-heads record |
-| Object-store lock (`store.lock`) | the object store | compaction, so two never overlap |
-| Store-access lock (`store-access.lock`) | whole-store rewrites | `compact --all`, `scope-prune` and server gc, against mutating commands |
-| Config lock (`<config file>.lock`) | one config file | every config edit; a second editor waits rather than failing |
-| Serve lock (`.forklift/serve.lock`) | a warehouse being served | `forklift-server`; blocks gc and full repack |
-| Server base lock (`.forklift-server.lock`) | a server's base folder | one server per folder |
-| Build lock (`lock`, in a temporary `.tmp~` folder) | a warehouse being built | `prepare` and `franchise`, until the finished folder is renamed into place |
+| Lock | Guards |
+|------|--------|
+| Warehouse lock (git: `index.lock`) | one bay's inventory and working directory |
+| Ref lock (`refs.lock`) | pallets and other state every bay shares |
+| Object-store lock (`store.lock`) | the object store, against overlapping compactions |
+| Store-access lock (`store-access.lock`) | the object store, during whole-store rewrites |
+| Config lock | one config file |
+| Serve lock (`serve.lock`) | a warehouse a server is serving |
+| Server base lock (`.forklift-server.lock`) | a server's base folder |
+| Build lock | a warehouse still being created |
 
 ## Remotes
 
-**Remote** (git: remote). Another warehouse you sync with. A remote is treated as untrusted
-storage: everything downloaded is checked against its hash, and signed history against the
-office.
+**Remote** (git: remote). Another warehouse you sync with, treated as untrusted storage. See
+[Working with remotes](cli.md#6-working-with-remotes).
 
-**Franchise** (git: `clone`). Copies a remote warehouse. If it fails partway, it keeps what it
-fetched; running the same command again resumes.
+**Franchise** (git: `clone`). Copies a remote warehouse.
 
-**Lift** (git: `push`, never forced). Uploads a pallet and moves the remote's head, fast-forward
-only. The office is lifted first.
+**Lift** (git: `push`, never forced). Uploads a pallet and moves the remote's head.
 
-**Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A divergence is reported, never merged
-on its own. Meta pallets sync first.
+**Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A divergence is reported, never
+merged on its own.
 
-**Diverged / remote ahead.** The two refusals that mean the remote's history moved. *Diverged*:
-both sides have parcels the other lacks. *Remote ahead*: the remote has moved on, and you need to
-lower first. A lift can also be refused for other reasons, such as `behind` (another bay moved the
-pallet), a meta conflict or a trust change.
+**Diverged, remote ahead.** Refusals meaning the remote's history moved: *diverged* when both sides
+have parcels the other lacks, *remote ahead* when you need to lower first.
 
-**Bundle** (git: bundle, or a clone packfile). A whole-warehouse package the server offers so a
-clone can download history in one piece. It only speeds up clones and is never a source of truth.
+**Bundle** (git: bundle). A whole-warehouse package that speeds up clones. It is never a source of
+truth.
 
-**Batch endpoint, batch lane.** The remote request that returns many objects at once. If the remote
-lacks it or is too slow, the client **closes the lane**: for the rest of that command it fetches
-objects one at a time.
+**Batch endpoint, batch lane.** The request that fetches many objects at once. A client that finds
+it missing or slow **closes the lane** and fetches one at a time.
 
-**Tor.** Forklift can reach a remote over Tor (`remote.tor`). The point is reaching machines behind
-NAT, not anonymity.
+**Tor.** A transport for reaching remotes behind NAT; see
+[Reaching a remote over Tor](cli.md#reaching-a-remote-over-tor).
 
 ## Servers
 
-**Head** (in the server sense). A server program that answers the remote protocol. This is a
-different meaning from a pallet's head. There are two:
+**Head** (in the server sense). A server program that answers the remote protocol. There are two:
+**`forklift-server`**, the **direct head**, which serves warehouses from its own disk; and the
+**Lambda head**, the **serverless head**, which runs on AWS. See [SERVER.md](../SERVER.md).
 
-- **`forklift-server`, the direct head.** A program that serves warehouses from its own disk and
-  checks uploads as they arrive.
-- **The Lambda head, the serverless head.** The hosted service on AWS: API Gateway and Lambda,
-  objects in S3, refs and trust in DynamoDB.
+**Served root.** A warehouse folder that `forklift-server` serves.
 
-**Served root.** A warehouse folder that `forklift-server` serves. It is an ordinary warehouse on
-the server's disk, and everyone's lifts land in it. A plain clone on someone's laptop is not a
-served root.
+**Control plane, data plane.** The *control plane* carries requests such as the handshake and refs;
+the *data plane* (also *byte plane*) carries object bytes.
 
-**Single- and multi-warehouse serving.** `--root` serves one warehouse; `--warehouses` serves many
-from one folder, each created explicitly.
+**Handshake.** The first request a client makes, which describes the remote.
 
-**Control plane, data plane.** The *control plane* carries the JSON requests: the handshake, refs,
-negotiation. The *data plane* (also *byte plane*) carries object bytes. On AWS the data plane goes
-straight between the client and S3 through presigned URLs.
+**Staging (server).** Where the Lambda head holds uploads until their hashes are checked.
 
-**Handshake.** The first request a client makes. It returns the protocol version, the pallets, the
-default pallet and the trust anchor.
+**Hooks.** Programs a server calls to fit into a hosting provider. They never take part in
+verifying history.
 
-**Staging (server).** On the Lambda head, uploads land under a staging prefix. They become
-fetchable only once their hashes are checked and they are promoted into the object store.
-
-**Hooks.** Programs a server calls to fit into a hosting provider: *authentication*, *admission*,
-*events* and *resolution*. Requests to them are signed. Hooks are never part of verifying history.
-
-**Principal.** Who the server decided a request comes from: a named operator (per-operator token),
-a shared static token, or nobody (an `--open` server). Only a named operator can be held to
-per-pallet grants.
+**Principal.** Who the server decided a request comes from.
 
 ## Identity and keys
 
-**Operator id** (git: author name and email, but pseudonymous). An opaque id: a minted UUID by
-default, or any string you or a provider choose. History stores only this id and public keys, never
-a name or email.
+**Operator id** (git: author name and email, but pseudonymous). An opaque id. History never stores
+a name or email. See
+[Profiles and pseudonymity](trust-and-identity.md#11-profiles-and-pseudonymity).
 
-**Display name** (`operator.name`) (git: `user.name`). Your name as shown on your own machine. It
-is never sent anywhere.
+**Display name** (git: `user.name`). Your name as shown on your own machine. It is never sent
+anywhere.
 
-**Profile.** A named identity (id, name and keys), so one machine can act as different operators in
-different warehouses.
+**Profile.** A named identity, so one machine can act as different operators.
 
 **Key** (git: GPG or SSH signing key). An Ed25519 key pair. The public half is recorded in the
-office; the private half stays in `~/.forklift-keys`, optionally protected by a passphrase.
+office; the private half stays on your machine.
 
-**Identity root.** The one key per operator the office pins. Every other key of that operator must
-chain back to it.
+**Identity root.** The one key per operator that every other key of that operator chains back to.
 
-**Endorsement.** A signed statement by a key you already have: "this new key is also me". It is how
-you add a new device.
+**Endorsement.** A signed statement by a key you already have that a new key is also you.
 
-**Proof of possession.** The new key's own signature over the operator id, so nobody can enroll a
-key they do not hold.
+**Proof of possession.** A new key's own signature, so nobody can enroll a key they do not hold.
 
-**`office admit`, `office link`, `office authorize`.** The ways a key enters the office. `admit`: an
-admin adds a new operator. `link`: you add a device of your own. `authorize`: an admin re-keys an
-operator who lost every device. `office keygen` makes the key and prints the lines to hand over.
+**Admit, link, authorize.** The ways a key enters the office: adding an operator, adding your own
+device, and re-keying an operator who lost every device. See
+[Adding people](trust-and-identity.md#3-adding-people) and
+[Multiple devices](trust-and-identity.md#5-multiple-devices).
 
-**Rotate, retire, compromised.** `office rotate` replaces a key with a fresh one, signed by the old.
-`office retire` revokes a key. `--compromised` marks it as possibly in other hands. Retired keys
-are kept forever, so old signatures can still be checked.
+**Rotate, retire, compromised.** Replacing a key, revoking it, and marking it as possibly in other
+hands. See [Rotating and revoking keys](trust-and-identity.md#8-rotating-and-revoking-keys).
 
-**Distrust boundary.** The pallet heads vouched for at the moment a key was revoked. The revoked
-key's signatures stay valid only on parcels reachable from that boundary. This is decided by
-ancestry, never by timestamps, which a key holder could forge.
+**Distrust boundary.** The point in history after which a revoked key's signatures stop counting,
+decided by ancestry rather than timestamps.
 
-**Role** (git: none; like a host's collaborator permissions). *admin*, *writer* or *reader*,
-recorded in the office.
+**Role** (git: none; like a host's collaborator permissions). *admin*, *writer* or *reader*.
 
-**Grant.** A list limiting which working pallets a writer may move. An empty list means all
-pallets.
+**Grant.** A list limiting which pallets a writer may move. See
+[Roles and grants](trust-and-identity.md#4-roles-and-grants).
 
-**Identity class.** Whether an operator is a *human*, *agent*, *bot* or *service*. It is set when
-the operator is admitted and is separate from role.
+**Identity class.** Whether an operator is a *human*, *agent*, *bot* or *service*.
 
-**Agent, supervisor.** An agent is an operator marked as an AI. Every agent must name an enrolled
-human supervisor; automation cannot supervise automation. The rule behind this: automation signs as
-itself, never as a human.
+**Agent, supervisor.** An agent is an operator marked as an AI; each names a human supervisor.
+Automation signs as itself, never as a human. See
+[Agents, bots, and services](trust-and-identity.md#7-agents-bots-and-services).
 
 ## The office and trust
 
 **The office** (`@office`) (git: none; like a host's collaborator list, but inside the repo and
-signed). A meta pallet holding operators, keys and roles. Its history is the audit trail of who was
-allowed to do what.
+signed). The meta pallet holding operators, keys and roles. Its history is the audit trail of who
+was allowed to do what. See [Concepts](trust-and-identity.md#1-concepts).
 
-**Office chain.** The office's history, a straight line from genesis. Each office parcel must be
-signed by a key that was valid in the state before it.
+**Office chain.** The office's history, a straight line from genesis.
 
-**Genesis.** The first office parcel, signed by itself. `office enroll` creates it.
+**Genesis.** The first office parcel, which signs itself.
 
-**Trust anchor** (`.forklift/trust`). The record that pins genesis. Once a warehouse has one, every
-new parcel must be signed, and signing cannot be switched off again.
+**Trust anchor.** The record that pins genesis. Once a warehouse has one, new parcels must be
+signed.
 
-**Trust boundary** (enrollment boundary). Every pallet head at the moment trust was switched on.
-Parcels reachable from it predate trust and may be unsigned; these are **legacy parcels**.
+**Trust boundary.** The pallet heads at the moment trust was switched on. Parcels before it, the
+**legacy parcels**, may be unsigned.
 
-**Trust pin.** A history root the trust state keeps alive: the trust boundary and every distrust
-boundary. gc and compaction never delete what a trust pin reaches.
+**Trust pin.** A point in history the trust state keeps alive, so gc never deletes what it reaches.
 
-**First contact, TOFU** (like an SSH host key). The first `franchise` or `lower` adopts the remote's
-genesis and warns that it did. `--expect <genesis>` pins the expected genesis in advance instead.
-Every later answer from that remote is checked against the pinned genesis.
+**First contact, TOFU** (like an SSH host key). Adopting a remote's genesis the first time you
+connect. See [First contact](trust-and-identity.md#joining-a-trusted-warehouse-first-contact).
 
-**Trust changed.** The refusal when a remote's genesis no longer matches the pinned one (exit 22).
-The report says what changed, such as a re-genesis or an unrelated warehouse.
+**Trust changed.** The refusal when a remote's genesis no longer matches the one you pinned.
 
 **Re-genesis** (trust reset). Recovery for an office no one can sign any more: a new genesis, with
-the old history kept as **attested** (readable, but no longer verified). It is deliberately loud.
-`office regenesis --confirm` creates a new root for the configured operator; it needs no admin,
-since there is none left (without `--confirm` it only explains what would happen). A remote accepts
-the reset only from the server operator's static token. Each clone must then accept it explicitly
-with `office accept-regenesis --confirm <genesis>`.
+the old history kept as **attested** but no longer verified. See
+[Recovery: re-genesis](trust-and-identity.md#9-recovery-re-genesis).
 
-**Audit** (git: none; loosely `verify-commit` plus `fsck`). Checks signed history offline: the
-office chain from genesis, then every parcel's signature against the office. A server runs the same
-checks on upload. `audit --full` also re-hashes large-file chunks.
+**Audit** (git: none; loosely `verify-commit` plus `fsck`). Checks signed history offline. See
+[`audit`](cli.md#audit--verify-signed-history-offline-a).
 
-**Parcel signature.** An Ed25519 signature over a parcel's hash, stored beside the object in a
-`.sig` file. Unlike git, the signature is never inside the commit.
+**Parcel signature.** An Ed25519 signature over a parcel's hash, stored beside the parcel rather
+than inside it.
 
 ## Meta pallets and metadata
 
-**Meta pallet** (git: roughly `refs/notes/*`). A pallet in its own namespace, named with `@`. The
-fixed set is `@office`, `@manifest`, `@kv`, `@tags` and `@haul`; any other `@name` is refused.
-Meta pallet names never collide with working pallet names.
+**Meta pallet** (git: roughly `refs/notes/*`). A pallet named with `@`, in a namespace of its own:
+`@office`, `@manifest`, `@kv`, `@tags` and `@haul`.
 
-**Tracked metadata.** Metadata stored as ordinary blobs and trees, so it gets hashing, signing and
-transport for free.
+**Tracked metadata.** Metadata stored as ordinary objects, so it is hashed, signed and transferred
+like everything else.
 
-**Post-metadata.** Anything recorded about a parcel after it was made: approvals, notes,
-provenance. It never changes the parcel itself.
+**Post-metadata.** Anything recorded about a parcel after it was made. It never changes the parcel.
 
-**Cell.** One signed value at one path in a meta pallet. Every changed cell must be stamped with the
-key that signed the parcel changing it.
+**Cell.** One signed value at one path in a meta pallet.
 
-**Replay** (git: none). How `@kv`, `@manifest`, `@tags` and `@haul` sync. (`@office` is not
-replayed: it syncs as trust, and a diverged office is a trust refusal.) Diverged meta pallets are
-never merged: your net change since the common ancestor is replayed onto the remote's head as one
-new parcel, re-signed
-with your current key.
+**Replay** (git: none). How meta pallets other than `@office` sync: instead of merging, your change
+is re-applied onto the remote's head as a new parcel.
 
-**Meta conflict.** Both sides changed the same meta path differently (exit 24). You pick a side
-with `lower --keep <pallet>:<path>=ours|theirs`.
+**Meta conflict.** Both sides changed the same meta value differently. See
+[`lower`](cli.md#lower--pull-lo).
 
-**Manifest** (`@manifest`) (git: notes, or a host's reviews). Signed statements attached to a
-parcel: approvals (one per operator), notes, provenance and delivery records.
+**Manifest** (`@manifest`) (git: notes, or a host's reviews). Signed statements about a parcel, such
+as approvals and provenance. See [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf).
 
-**Provenance.** A manifest entry recording which model, tool and session produced a parcel. It is
-signed evidence, not a free-text comment.
+**Provenance.** A manifest entry recording which model, tool and session produced a parcel.
 
-**kv** (`@kv`) (git: notes, loosely). Free-form text values keyed by parcel and key, each signed by
-whoever wrote it.
+**kv** (`@kv`) (git: notes, loosely). Free-form signed values keyed by parcel. See
+[`kv`](cli.md#kv--custom-metadata-on-parcels).
 
 **Tag** (`@tags`) (git: `tag -s`, but git tags can be moved or deleted). A named, signed pointer at
-a parcel. Only an admin can create one, and it can never be moved or deleted.
+a parcel that can never move. See [`tag`](cli.md#tag--signed-tags--releases).
 
 ## Hauls
 
-**Haul** (git: none; like a pull request). A reviewable proposal to merge one pallet into another
-in the same warehouse, stored as signed cells on `@haul`. It is open, closed or merged.
+**Haul** (git: none; like a pull request). A reviewable proposal to merge one pallet into another,
+stored on `@haul`. See [`haul`](cli.md#haul--pull-requests-reviewable-merge-proposals).
 
-**Haul id.** The hash of the haul's opening record. Most `haul` commands accept a unique prefix;
-`lower --keep` needs the full 64-character id.
+**Haul id.** The hash that names a haul.
 
-**Opener.** The operator who opened a haul, and the only one who may move its proposed head
-(`haul update`).
+**Opener.** The operator who opened a haul.
 
-**Review.** An approval, a request for changes, or a comment, pinned to the head the reviewer saw. A
-review stops counting once the head moves. Reviews are recorded but not yet enforced.
+**Review.** An approval, a request for changes, or a comment on a haul.
 
-**Merge proof.** Your own warehouse's check of a haul marked merged: verified (the target really
-contains it), refuted, or unproven (the evidence is not held locally).
+**Merge proof.** Your own warehouse's check of whether a haul marked merged really is.
 
 ## Querying history
 
-**Query** (git: `log` filters; jj revsets). `query` filters history, above all on signed facts:
-identity class, supervisor, signer, provenance, tag and paths touched. It also filters on
-description text, authoring dates and merges, like `history`.
+**Query** (git: `log` filters; jj revsets). Filters history, above all on signed facts such as who
+signed a parcel and what produced it. See
+[`query`](cli.md#query--filter-history-on-signed-identity-q).
 
-**Verified by default.** Unless told otherwise, `query` never matches an identity filter against a
-value it has not checked. It filters cheaply first, then verifies every survivor's signature.
+**Verified by default.** `query` checks a parcel's signature before matching it on identity.
 
-**Recorded.** The cheap reading of identity: what a parcel says about itself, which can be forged.
-`history --class` always reads it this way. `query` does so only with `--recorded`, and then labels
-every answer `recorded`.
+**Recorded.** What a parcel says about itself, unchecked, as opposed to verified.
 
-**Trust label.** How far a parcel's identity was confirmed: *verified*, *signed-revoked*,
-*unsigned*, *unknown-key* or *recorded*.
+**Trust label.** How far a parcel's identity was confirmed, such as *verified* or *unsigned*.
 
 ## The machine interface
 
-**`--json`.** Every command's machine-readable output, for scripts and AI agents.
+**`--json`.** Every command's machine-readable output, for scripts and AI agents. See
+[Machine & agent output](cli.md#8-machine--agent-output) and
+[MACHINE_INTERFACE.md](../MACHINE_INTERFACE.md).
 
-**Schema version.** The version number carried in all `--json` output. It changes on an
-incompatible change to a command's output, and whenever an error code is added, so a script can pin
-it. It is also how a script detects capabilities: check `schema` before relying on a field, rather
-than looking for the field itself.
+**Schema version.** The version number carried in all `--json` output, which a script can check.
 
 **MCP server** (`forklift mcp`). Serves Forklift's commands as tools to an AI client over the Model
 Context Protocol.
 
-**Exit code.** The number a command exits with, which scripts switch on. 0 is success, 1
-unclassified, 2 a usage error. 128+n means the process was killed by signal n (130 is Ctrl-C);
-Forklift never exits 130 on its own, and stdout may then be empty. Forklift's own refusals have
-stable codes from 3 upward, such as 6 (warehouse locked), 21 (durability taint) and 22 (trust
-changed). Only a script that runs `forklift` directly should switch on those numbers; one that runs
-it through another tool, such as Pult, classifies by the tool name and error code instead. The full
-list is in [errors.md](../generated/errors.md).
+**Exit code.** The number a command exits with. Forklift's refusals each have a stable one; see
+[Exit codes](cli.md#11-exit-codes).
 
-**Error code.** The stable name of a refusal in `--json` output, such as `warehouse_locked`. Each
-has an exit code.
+**Error code.** The stable name of a refusal in `--json` output, such as `warehouse_locked`.
 
-**Protocol version.** The version of the remote protocol. A client refuses a server speaking one
-it does not know.
+**Protocol version.** The version of the remote protocol client and server speak.
 
-**`self-schema`, Pult.** `self-schema` prints Forklift's command surface as a manifest for Pult, a
-separate Lonic tool that drives command-line tools.
+**`self-schema`, Pult.** `self-schema` describes Forklift's commands for Pult, a separate Lonic
+tool that drives command-line tools. See
+[`self-schema`](cli.md#self-schema--describe-the-command-surface-for-pult).
 
 ## Overloaded words
 
 | Word | Meanings |
 |------|----------|
 | head | (1) the parcel a pallet points at; (2) a server program: `forklift-server` or the Lambda head |
-| scope | (1) fetch scope, what the warehouse holds; (2) materialization scope, what one bay writes to disk |
+| scope | (1) fetch scope, what the warehouse holds; (2) materialization scope, what one checkout writes to disk |
 | lock | several different locks; see [Locks](#locks) |
-| marker | the warehouse marker; the operation marker; the incomplete-load record; conflict markers inside a file |
-| staging | (1) the inventory; (2) the Lambda head's holding area for unverified uploads |
+| marker | the warehouse marker; the operation marker; conflict markers inside a file |
+| staging | (1) the inventory; (2) the Lambda head's holding area for unchecked uploads |
 | gc | (1) the general idea of deleting unreachable objects; (2) the `forklift-server gc` command |
-| admission | (1) the server's `admission` hook; (2) admitting an operator to the office (`office admit`) |
-| redirect | (1) a bay's redirect file; (2) an HTTP redirect in the remote protocol |
-| `--class` | recorded on `history`; verified on `query`, unless `--recorded` is given |
+| admission | (1) a server hook; (2) admitting an operator to the office |
+| redirect | (1) a bay's redirect file; (2) an HTTP redirect |
 
 ## Planned, not shipped
 
-These terms appear in the design notes and tickets. The features they describe are designed or
+These terms appear in design notes and tickets. The features they describe are designed or
 proposed, but not built.
 
-**Tombstone.** When a pallet is deleted on a server, a record of its last head. It would keep that
-history safe from server gc, and require a later pallet of the same name to descend from it, so a
-sparse clone that pruned against the old head never loses data.
+**Tombstone.** A record of a deleted pallet's last head on a server, keeping that history safe.
 
-**Holds request.** A remote request, "do you still hold head X?", answered held, not held or
-unknown. It would let `scope-prune` use the held-heads record.
+**Holds request.** A remote request asking whether it still holds a given head.
 
-**Cache mode** ("a warehouse is a cache, not a replica"). A warehouse that keeps every parcel but
-may evict file content and trees, fetching them back on demand.
+**Cache mode.** A warehouse that keeps every parcel but may evict content, fetching it back on
+demand.
 
 **Lazy history, remote-first reads, signed trust checkpoints.** Clones whose cost depends on the
-tip rather than the history length; history, blame and audit run against a remote with no local
-warehouse; and verifying from a signed snapshot of trust instead of replaying from genesis.
+tip rather than history length; reading history from a remote with no local warehouse; and
+verifying from a signed snapshot of trust instead of from genesis.
 
-**Approval gating.** A signed merge policy that hauls must satisfy before they can merge.
+**Approval gating.** A signed merge policy hauls must satisfy before they can merge.
 
-**File-level access control.** Per-file grants that a remote enforces on lift and withholds on
-fetch.
+**File-level access control.** Per-file grants that a remote enforces.
 
 **First-class conflicts.** Conflicts that can be stacked and shared, rather than blocking `stack`.
 
 **Locker.** A private, per-operator tracked namespace.
 
-**Peer mode.** Warehouses syncing with each other directly, with a server as an always-on peer.
+**Peer mode.** Warehouses syncing with each other directly.
