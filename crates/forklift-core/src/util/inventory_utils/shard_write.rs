@@ -396,13 +396,13 @@ pub fn replace_all_inventories(shards: &BTreeMap<String, Inventory>) -> Result<(
     Ok(())
 }
 
-/// One key's shard as [`replace_differing_inventories`] compares it: registered, wanted, or both.
+/// One wanted key's shard as [`replace_differing_inventories`] compares it.
 struct ShardDiff {
     /// Whether the freshly built shard's bytes differ from the shard on disk (no shard on either
     /// side counts as equal).
     differs: bool,
-    /// The shard on disk, parsed, when it exists and `differs`.
-    on_disk: Option<Inventory>,
+    /// The rollup stamp of the shard on disk, when it exists and `differs`.
+    on_disk_stamp: Option<String>,
     /// The freshly built shard's bytes, when the key has a shard in the new set.
     fresh: Option<Vec<u8>>,
 }
@@ -410,23 +410,30 @@ struct ShardDiff {
 /// [`replace_all_inventories`] over a store it can trust: every shard whose bytes would change is
 /// written, every other is left alone, and the registered set becomes exactly the new one.
 ///
-/// Every registered and every wanted key is read and compared across every core, against the
-/// store as it stands before anything is written. Then, in three steps, each durable before the
-/// next starts:
+/// Every wanted key — each key of `shards` and its ancestors — is read and compared across every
+/// core, against the store as it stands before anything is written. A registered key the new set
+/// drops is never read: it is unregistered, whatever its shard holds. Then, in three steps, each
+/// durable before the next starts:
 ///
-/// 1. **Phase A** — the rollup of every shard on disk, of a key the new set keeps, whose stamp is
-///    going (the new set carries another stamp, or none, for that key) is cleared, as one batched
-///    barrier.
-///    A stamp is a tree hash, so it changes exactly when content under it changes: every stamped
-///    ancestor of a content change or a removal is cleared here, before phase B lands that change
-///    (R1). A shard whose only change is stat data keeps its ancestors' bytes, and so their rollups,
-///    untouched: they still name the same tree. A shard this does not rewrite is never cleared.
+/// 1. **Phase A** — every shard on disk whose stamp is going (the new set carries another stamp,
+///    or none, for that key), and which is an ancestor of a key whose shard changes or goes, has
+///    its rollup cleared, as one batched barrier. A stamp is a tree hash, so it changes exactly
+///    when content under it changes: every stamped ancestor of a content change or a removal is
+///    cleared here, before phase B lands that change (R1). A key whose own entries alone change
+///    needs no clear, since its new content and new stamp land in one rename; and a shard whose only
+///    change is stat data keeps its ancestors' bytes, and so their rollups, untouched: they still
+///    name the same tree. A shard this does not rewrite is never cleared.
 /// 2. **Registration** — the dropped keys are unregistered and the new ones registered, in one
 ///    metadata write. A key the new set keeps registered with no shard of its own, whose old shard
 ///    is on disk, is unregistered and registered again in the same write, which clears and syncs
 ///    its address.
 /// 3. **Phase B** — every shard whose bytes differ, as a second barrier; then every unregistered
 ///    shard, the dropped keys' included, is swept.
+///
+/// Phase B lands new stamps in the same barrier as the content under them, so a power loss
+/// during it may keep an ancestor's new stamp and lose a descendant's rewrite. That state exists
+/// only under the operation marker the caller raised, which every committing command refuses and
+/// `forklift heal` settles by rebuilding staging from a tree.
 ///
 /// # Arguments
 /// * `shards` - Warehouse path key → inventory, for every tracked directory.
@@ -450,9 +457,7 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
     let mut ledger = ShardLedger { entries: metadata };
 
     let wanted = close_under_ancestors(&shards.keys().map(|key| key_to_metadata_entry(key)).collect());
-    let keys: Vec<String> = ledger.entries.union(&wanted)
-        .map(|entry| metadata_entry_to_key(entry).to_string())
-        .collect();
+    let keys: Vec<String> = wanted.iter().map(|entry| metadata_entry_to_key(entry).to_string()).collect();
 
     // A wanted key not registered yet reads as no shard: its address is cleared when it registers.
     let compared = fanout_utils::fanout_map(&keys, |key| -> Option<ShardDiff> {
@@ -460,38 +465,33 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
         let fresh = shards.get(key).map(InventoryBuilder::build);
         let differs = on_disk != fresh;
 
-        let on_disk = match on_disk {
-            Some(bytes) if differs => Some(parser::inventory::inventory_parser::parse_inventory(&bytes).ok()?),
+        let on_disk_stamp = match on_disk {
+            Some(bytes) if differs => parser::inventory::inventory_parser::parse_inventory(&bytes).ok()?
+                .get_rollup_hash()
+                .cloned(),
             _ => None,
         };
 
-        Some(ShardDiff { differs, on_disk, fresh })
+        Some(ShardDiff { differs, on_disk_stamp, fresh })
     });
 
     let Some(compared) = compared.into_iter().collect::<Option<Vec<ShardDiff>>>() else {
         return Ok(false);
     };
 
-    let mut clears: Vec<(&str, Inventory)> = Vec::new();
+    let mut unregistered: BTreeSet<String> = ledger.entries.difference(&wanted)
+        .map(|entry| metadata_entry_to_key(entry).to_string())
+        .collect();
+    let mut stamps_going: Vec<&str> = Vec::new();
     let mut writes: Vec<(&str, Vec<u8>)> = Vec::new();
-    let mut unregistered: BTreeSet<String> = BTreeSet::new();
 
     for (key, diff) in keys.iter().zip(compared) {
         if !diff.differs {
             continue;
         }
 
-        // A dropped key's own stamp needs no clear: its whole subtree is dropped with it, and it is
-        // unregistered before anything of phase B lands.
-        let kept = wanted.contains(&key_to_metadata_entry(key));
-
-        if let (true, Some(mut on_disk)) = (kept, diff.on_disk) {
-            let fresh_stamp = shards.get(key.as_str()).and_then(Inventory::get_rollup_hash);
-
-            if on_disk.get_rollup_hash().is_some() && on_disk.get_rollup_hash() != fresh_stamp {
-                on_disk.clear_rollup();
-                clears.push((key, on_disk));
-            }
+        if diff.on_disk_stamp.is_some() && diff.on_disk_stamp.as_ref() != shards.get(key).and_then(Inventory::get_rollup_hash) {
+            stamps_going.push(key);
         }
 
         match diff.fresh {
@@ -502,10 +502,15 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
         }
     }
 
+    let changed_ancestors: BTreeSet<String> = writes.iter().map(|(key, _)| *key)
+        .chain(unregistered.iter().map(String::as_str))
+        .flat_map(ancestor_keys_root_first)
+        .collect();
+
     let phase_a_batch = file_utils::WriteBatch::new();
 
-    for (key, inventory) in &clears {
-        stage_shard_at(&ledger.shard_path_for_write(key)?, inventory, &phase_a_batch)?;
+    for key in stamps_going.into_iter().filter(|key| changed_ancestors.contains(*key)) {
+        stage_rollup_clear(&ledger, key, &phase_a_batch)?;
     }
 
     phase_a_batch.finish()?;
@@ -516,11 +521,7 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
 
     for (key, bytes) in &writes {
         let shard_path = ledger.shard_path_for_write(key)?;
-
-        if let Some(parent) = shard_path.parent() {
-            file_utils::create_folder_if_not_exists(parent)?;
-        }
-
+        create_shard_folder(&shard_path)?;
         phase_b_batch.stage(&shard_path, bytes)?;
     }
 
@@ -768,10 +769,28 @@ fn stage_shard_at(inventory_path: &Path, inventory: &Inventory, batch: &file_uti
 
 /// Make sure a shard's parent folder exists, and serialize its bytes.
 fn ensure_inventory_folder_and_build(inventory: &Inventory, inventory_path: &Path) -> Result<Vec<u8>, String> {
-    let mut parent_path = std::path::PathBuf::from(inventory_path);
-    parent_path.pop();
-
-    file_utils::create_folder_if_not_exists(&parent_path)?;
+    create_shard_folder(inventory_path)?;
 
     Ok(InventoryBuilder::build(inventory))
+}
+
+/// Make sure the folder of the shard at `inventory_path` exists. A folder created here is made
+/// durable with every folder above it up to the inventory root, so a shard renamed into it by the
+/// batch that follows cannot vanish with its folder in a power loss; that batch's own device flush
+/// covers these syncs.
+fn create_shard_folder(inventory_path: &Path) -> Result<(), String> {
+    let Some(shard_folder) = inventory_path.parent() else {
+        return Ok(());
+    };
+
+    if file_utils::create_folder_if_not_exists(shard_folder)? {
+        let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
+        let created_in: BTreeSet<std::path::PathBuf> = shard_folder.ancestors().skip(1)
+            .take_while(|folder| folder.starts_with(&inventory_root))
+            .map(Path::to_path_buf)
+            .collect();
+        file_utils::sync_folders_before_flushed_write(&created_in)?;
+    }
+
+    Ok(())
 }
