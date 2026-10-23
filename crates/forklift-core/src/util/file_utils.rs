@@ -30,11 +30,13 @@ pub const FILENAME_IGNORE: &str = ".forkliftignore";
 
 const IGNORE_FILE_COMMENT_PREFIX: &str = "#";
 
-/// Always ignored: the warehouse's own folder. Anchored at both ends, so a tracked sibling that
-/// merely starts with the same name (`.forklift-notes`, the ignore file itself) is not
-/// swallowed. The ignore file is tracked content, like `.gitignore`: its rules travel with the
-/// history.
-const DEFAULT_IGNORED_PATHS: [&str; 1] = [r"^\.forklift(/.*)?$"];
+/// Always ignored: the warehouse's own folder, and at any depth the folders a `.forklift` is built
+/// in before it is renamed into place (`.forklift.tmp~<pid>-<n>`, see
+/// `warehouse_utils::place_forklift`), which an interrupted prepare or franchise leaves behind.
+/// Anchored at both ends, and the staging rule on a whole path component, so a tracked sibling that
+/// merely starts with the same name (`.forklift-notes`, the ignore file itself) is not swallowed.
+/// The ignore file is tracked content, like `.gitignore`: its rules travel with the history.
+const DEFAULT_IGNORED_PATHS: [&str; 2] = [r"^\.forklift(/.*)?$", r"(^|/)\.forklift\.tmp~[0-9]+-[0-9]+(/.*)?$"];
 
 /// The path separator used in warehouse-internal paths (inventory keys, metadata entries,
 /// object store paths). This is always `/`, on every platform: keys written on one platform
@@ -329,6 +331,34 @@ static BARRIER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// The current value of the process-wide durability-barrier counter — see [`BARRIER_COUNT`].
 pub fn barrier_count() -> u64 {
     BARRIER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// fsync every file and folder under `dir`, deepest first, then `dir` itself, so renaming `dir`
+/// into place publishes it whole: after a power loss it is visible either with everything that was
+/// in it or not at all. Links are synced as neither. A no-op when [`fsync_enabled`] is false.
+pub fn sync_tree(dir: &Path) -> Result<(), String> {
+    if !fsync_enabled() {
+        return Ok(());
+    }
+
+    let failed = |path: &Path, e: std::io::Error| format!("Error while syncing \"{}\": {}", path.display(), e);
+
+    for entry in std::fs::read_dir(dir).map_err(|e| failed(dir, e))? {
+        let entry = entry.map_err(|e| failed(dir, e))?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| failed(&path, e))?;
+
+        if file_type.is_dir() {
+            sync_tree(&path)?;
+        } else if file_type.is_file() {
+            // A write handle: Windows refuses to flush a file opened read-only.
+            std::fs::OpenOptions::new().write(true).open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| failed(&path, e))?;
+        }
+    }
+
+    sync_dir(dir)
 }
 
 /// Rename `from` to `to` only if nothing stands at `to`; otherwise fail with `AlreadyExists` and
@@ -4103,12 +4133,14 @@ mod tests {
             defaults.excludes(key, tracked, defaults.coverage_of(parent))
         };
 
-        for ignored in [".forklift", ".forklift/config/warehouse.toml"] {
+        for ignored in [".forklift", ".forklift/config/warehouse.toml", ".forklift.tmp~12-0", ".forklift.tmp~12-0/lock",
+                        "sub/.forklift.tmp~7-3", "sub/deeper/.forklift.tmp~7-3/.forklift/objects"] {
             // Trackedness never overrides a built-in rule.
             assert!(excludes(ignored, true), "{} must be ignored", ignored);
         }
         // The ignore file is a sibling too: it is tracked content, like `.gitignore`.
-        for tracked in [".forkliftignore", ".forkliftignore.bak", ".forklift-notes", ".forkliftrc", "a/.forklift", "x.forklift"] {
+        for tracked in [".forkliftignore", ".forkliftignore.bak", ".forklift-notes", ".forkliftrc", "a/.forklift", "x.forklift",
+                        "x.forklift.tmp~1-2", ".forklift.tmp~1-2x", ".forklift.tmp~1", ".forklift.tmp~a-2", "a/b.forklift.tmp~1-2"] {
             assert!(!excludes(tracked, false), "{} must not be ignored", tracked);
         }
     }

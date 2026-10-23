@@ -1642,11 +1642,13 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
     let staging = file_utils::create_first_new_folder(candidates)
         .map_err(|e| internal(format!("Error while creating the warehouse folder: {}", e)))?;
 
+    // Synced whole before the rename: a warehouse visible after a power loss with part of its
+    // preparation missing would never be repaired, since a later `PUT` finds it and answers 200.
     let prepared = {
         let _scope = StorageRootScope::enter(&staging);
         warehouse_utils::prepare_warehouse().map(|_| ())
     }
-        .and_then(|_| sync_tree(&staging));
+        .and_then(|_| file_utils::sync_tree(&staging));
 
     if let Err(error) = prepared {
         let _ = std::fs::remove_dir_all(&staging);
@@ -1699,36 +1701,6 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
             }
         }
     }
-}
-
-/// fsync every file and folder under `dir`, deepest first, so renaming `dir` into place publishes
-/// it whole: a warehouse is never visible after a power loss with part of its preparation missing,
-/// which nothing would repair (a later `PUT` finds it and answers 200). A no-op when fsync is off.
-fn sync_tree(dir: &std::path::Path) -> Result<(), String> {
-    if !file_utils::fsync_enabled() {
-        return Ok(());
-    }
-
-    let failed = |path: &std::path::Path, e: std::io::Error| {
-        format!("Error while syncing \"{}\": {}", path.display(), e)
-    };
-
-    for entry in std::fs::read_dir(dir).map_err(|e| failed(dir, e))? {
-        let entry = entry.map_err(|e| failed(dir, e))?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| failed(&path, e))?;
-
-        if file_type.is_dir() {
-            sync_tree(&path)?;
-        } else if file_type.is_file() {
-            // A write handle: Windows refuses to flush a file opened read-only.
-            std::fs::OpenOptions::new().write(true).open(&path)
-                .and_then(|file| file.sync_all())
-                .map_err(|e| failed(&path, e))?;
-        }
-    }
-
-    file_utils::sync_dir(dir)
 }
 
 /// Remove what interrupted warehouse creations left in `base`: the folders [`create_warehouse`]

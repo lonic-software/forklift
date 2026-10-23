@@ -13367,3 +13367,24 @@ fn haul_merge_of_a_head_this_warehouse_does_not_hold_names_where_to_get_it() {
     assert!(err.contains("Nothing was merged."), "{}", err);
     assert!(!warehouse.root.join("feature.txt").exists());
 }
+
+/// `prepare` marks the warehouse, and what an interrupted prepare or franchise leaves while building a
+/// `.forklift` (a `.forklift.tmp~<pid>-<n>` folder, at the top or deeper) is never tracked.
+#[test]
+fn prepare_marks_the_warehouse_and_staging_leftovers_are_never_tracked() {
+    let warehouse = TestWarehouse::new("staging-leftovers");
+    assert_success(&warehouse.run(&["prepare"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/warehouse")).unwrap(), "/forklift-warehouse 1\n");
+
+    warehouse.write_file(".forklift.tmp~9-9/lock", "");
+    warehouse.write_file(".forklift.tmp~9-9/.forklift/franchise", "x\n");
+    warehouse.write_file("sub/.forklift.tmp~3-4/notes.txt", "x\n");
+    warehouse.write_file("sub/keep.txt", "kept\n");
+
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(status["data"]["unstaged"], serde_json::json!([{"kind": "untracked", "path": "sub/"}]), "{}", status);
+
+    assert_success(&warehouse.run(&["load", "."]));
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    assert_eq!(status["data"]["staged"], serde_json::json!([{"kind": "added", "path": "sub/keep.txt"}]), "{}", status);
+}

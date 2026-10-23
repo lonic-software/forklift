@@ -44,6 +44,13 @@ Idempotent —
 running it in an existing warehouse only creates what's missing. `-v` lists each
 piece created.
 
+The last thing `prepare` writes is `.forklift/warehouse`, a marker saying the folder
+is a complete warehouse; running `prepare` in a warehouse that has no marker yet adds
+one. A new `.forklift/` (or one that is there but empty) is built under the name
+`.forklift.tmp~<pid>-<n>` and renamed into place when it is complete, so an interrupted
+`prepare` leaves no half-built warehouse, only that folder: it is never tracked, and
+the next `prepare` in that directory removes it.
+
 ### `import-git` — migrate a git repository
 
 ```sh
@@ -162,7 +169,8 @@ own lines:
 
 The file is **tracked content**, like `.gitignore`: `load` and `stack` it, and its
 rules travel with the history — a `franchise` or `lower` brings the remote's rules
-along. Only `.forklift/` is always ignored. `import-git` adds a rule for `.git/` when
+along. Only `.forklift/` and the `.forklift.tmp~<pid>-<n>` folders an interrupted
+`prepare` or `franchise` leaves (at any depth) are always ignored. `import-git` adds a rule for `.git/` when
 the warehouse holds a `.git` folder. The rules are read only from the file on disk at
 the warehouse root. Every sparse scope holds that file, whatever its prefixes: a
 `franchise --only` checkout fetches and materializes it, so its rules apply there too and

@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, park_utils, record_utils};
+use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, park_utils, record_utils, warehouse_utils};
 use crate::util::record_utils::RecordError;
 
 /// The file inside a bay's `.forklift` folder that names its warehouse, and so makes that folder a
@@ -85,7 +85,8 @@ pub enum ForkliftKind {
 /// # Returns
 /// * `Ok(ForkliftKind)` - What the entry is.
 /// * `Err(String)`      - If it is neither a file nor a folder, holds a `redirect` that is not a
-///                        regular file, or could not be read.
+///                        regular file, holds a warehouse marker this build cannot read, or could
+///                        not be read.
 pub fn classify_forklift(forklift_path: &Path) -> Result<ForkliftKind, String> {
     use std::io::ErrorKind;
 
@@ -121,7 +122,9 @@ pub fn classify_forklift(forklift_path: &Path) -> Result<ForkliftKind, String> {
             "\"{}\" is a link to nothing, so \"{}\" is neither a warehouse nor a valid bay.",
             redirect.to_string_lossy(), forklift_path.to_string_lossy()
         )),
-        Err(e) if absent(&e) => Ok(ForkliftKind::Warehouse),
+        // A marker that cannot be read is an error, never a warehouse. A folder without one is
+        // still taken for a warehouse: those prepared before the marker existed carry none.
+        Err(e) if absent(&e) => warehouse_utils::has_warehouse_marker(forklift_path).map(|_| ForkliftKind::Warehouse),
         Err(e) => Err(format!("Error while checking \"{}\": {}", redirect.to_string_lossy(), e)),
     }
 }
