@@ -19,7 +19,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_OBJECTS_ROOT};
-use crate::util::{file_utils, record_utils, remote_utils, taint_utils};
+use crate::util::{file_utils, record_utils, remote_utils, taint_utils, warehouse_utils};
+use crate::util::warehouse_utils::Placement;
 use crate::util::record_utils::RecordError;
 
 /// The name of the record in the warehouse's `.forklift` folder.
@@ -324,7 +325,7 @@ pub fn write(forklift: &Path, record: &FranchiseRecord) -> Result<(), String> {
 /// folder: the last step of a franchise that finished, so the warehouse is never gated again.
 pub fn finish(forklift: &Path) -> Result<(), String> {
     for temp in record_temps(forklift)? {
-        remove_unfollowed(&temp)?;
+        file_utils::remove_unfollowed(&temp)?;
     }
 
     match std::fs::remove_file(record_path(forklift)) {
@@ -373,8 +374,8 @@ pub fn is_staging_leftover(name: &OsStr) -> bool {
 
 /// Claim `target`, which [`admit`] judged [`Admission::Fresh`], for a new franchise: create it
 /// (and any missing ancestor) if absent, then put its `.forklift` folder in place with `record`
-/// already inside. The folder is built under a temp name and renamed into place only if no
-/// `.forklift` exists ([`file_utils::rename_no_replace`]), so the directory is never a warehouse
+/// already inside. The folder is built under a staging name and renamed into place only if no
+/// `.forklift` exists ([`warehouse_utils::place_forklift`]), so the directory is never a warehouse
 /// without its record: a kill at any point leaves either no `.forklift` (only a staging leftover,
 /// which [`admit`] ignores) or one the gate refuses. Two franchises racing for one directory
 /// cannot both claim it.
@@ -387,41 +388,25 @@ pub fn claim(target: &Path, record: &FranchiseRecord) -> Result<(), String> {
             .map_err(|e| format!("Error while creating \"{}\": {}", parent.to_string_lossy(), e))?;
     }
 
+    let taken = || format!(
+        "\"{}\" was claimed by another franchise while this one was connecting; franchise into a new \
+        or empty directory.", target.to_string_lossy()
+    );
+
     match std::fs::create_dir(target) {
         Ok(()) => (),
         // Absent before the handshake, or found then: either way it must still be fresh now.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match admit(target)? {
             Admission::Fresh => (),
-            Admission::Resume(_) => return Err(format!(
-                "\"{}\" was claimed by another franchise while this one was connecting; franchise \
-                into a new or empty directory.", target.to_string_lossy()
-            )),
+            Admission::Resume(_) => return Err(taken()),
         },
         Err(e) => return Err(format!("Error while creating \"{}\": {}", target.to_string_lossy(), e)),
     }
 
-    let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
-    let staging = file_utils::temp_path_for(&forklift)?;
-
-    std::fs::create_dir(&staging)
-        .map_err(|e| format!("Error while creating \"{}\": {}", staging.to_string_lossy(), e))?;
-
-    let placed = write(&staging, record).and_then(|()| match file_utils::rename_no_replace(&staging, &forklift) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
-            "\"{}\" was claimed by another franchise while this one was connecting; franchise into \
-            a new or empty directory.", target.to_string_lossy()
-        )),
-        Err(e) => Err(format!("Error while moving \"{}\" into place: {}", forklift.to_string_lossy(), e)),
-    });
-
-    if let Err(e) = placed {
-        // A real folder this call created, so the recursive removal follows nothing it did not make.
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+    match warehouse_utils::place_forklift(&target.join(FOLDER_NAME_FORKLIFT_ROOT), |staged| write(staged, record))? {
+        Placement::Placed => Ok(()),
+        Placement::Taken => Err(taken()),
     }
-
-    file_utils::sync_dir(target)
 }
 
 /// Count the final entries of the object store under `forklift`: loose objects, signature
@@ -573,7 +558,7 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bund
     let discarded = taints.torn || (std::fs::symlink_metadata(&objects).is_ok() && !is_real_dir(&objects)?);
 
     if discarded {
-        remove_unfollowed(&objects)?;
+        file_utils::remove_unfollowed(&objects)?;
         file_utils::sync_dir(&forklift)?;
     } else {
         let mut touched = std::collections::BTreeSet::new();
@@ -604,13 +589,13 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bund
             || (keep_bundles && name == FOLDER_NAME_BUNDLES);
 
         if !kept {
-            remove_unfollowed(&forklift.join(&name))?;
+            file_utils::remove_unfollowed(&forklift.join(&name))?;
         }
     }
 
     for name in list_names(target)? {
         if name != FOLDER_NAME_FORKLIFT_ROOT {
-            remove_unfollowed(&target.join(&name))?;
+            file_utils::remove_unfollowed(&target.join(&name))?;
         }
     }
 
@@ -631,7 +616,7 @@ fn remove_in_store(forklift: &Path, recorded: &Path) -> Result<PathBuf, String> 
         let path = parent.join(component);
 
         if components.peek().is_none() || !is_real_dir(&path)? {
-            remove_unfollowed(&path)?;
+            file_utils::remove_unfollowed(&path)?;
             return Ok(parent);
         }
 
@@ -674,35 +659,12 @@ fn remove_signature_sidecars(objects: &Path) -> Result<(), String> {
 
         for file in list_names(&folder.path())? {
             if file.to_string_lossy().ends_with(".sig") {
-                remove_unfollowed(&folder.path().join(file))?;
+                file_utils::remove_unfollowed(&folder.path().join(file))?;
             }
         }
     }
 
     Ok(())
-}
-
-/// Remove `path` without following it: a link or a file as itself, a real folder recursively
-/// (whose own removal follows no link inside it). An absent path is not a failure.
-fn remove_unfollowed(path: &Path) -> Result<(), String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("Error while checking \"{}\": {}", path.to_string_lossy(), e)),
-    };
-
-    let removed = if metadata.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        // A link to a folder is removed as a folder entry on Windows.
-        std::fs::remove_file(path).or_else(|e| if metadata.is_symlink() { std::fs::remove_dir(path) } else { Err(e) })
-    };
-
-    match removed {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Error while removing \"{}\": {}", path.to_string_lossy(), e)),
-    }
 }
 
 /// Classify a failure after the claim: its code (`error` when it has none), and what to do next.

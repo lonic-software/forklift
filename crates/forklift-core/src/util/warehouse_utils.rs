@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, pallet_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, pallet_utils, record_utils};
 
 /// The directory the user invoked forklift from, relative to the warehouse root.
 /// Set once by [`enter_warehouse`]; empty when the user is at the root itself.
@@ -162,8 +162,61 @@ pub fn cwd_relative_to_root() -> PathBuf {
     CWD_RELATIVE_TO_ROOT.get().cloned().unwrap_or_default()
 }
 
-/// Prepare a warehouse in the current folder. Every step is idempotent: only the pieces
-/// that are missing get created.
+/// The file in a warehouse's `.forklift` folder that says `prepare` finished building it: written
+/// last, so a folder holding it holds every piece of a warehouse.
+pub const FILE_NAME_WAREHOUSE_MARKER: &str = "warehouse";
+/// The record kind and format version of the warehouse marker (see [`record_utils`]). Version 1
+/// holds no entries.
+const WAREHOUSE_MARKER_RECORD: &str = "warehouse";
+const WAREHOUSE_MARKER_VERSION: u32 = 1;
+
+/// The lock file in a staging folder of [`place_forklift`], held while the folder is in use.
+const FILE_NAME_STAGING_LOCK: &str = "lock";
+
+/// Whether the `.forklift` folder `forklift` holds a warehouse marker. A marker this build cannot
+/// read is an error, never taken for one or for none: it may be a newer Forklift's.
+///
+/// # Returns
+/// * `Ok(true)`    - It holds a marker this build reads.
+/// * `Ok(false)`   - It holds none.
+/// * `Err(String)` - The marker cannot be read, or is in a format this build does not know.
+pub fn has_warehouse_marker(forklift: &Path) -> Result<bool, String> {
+    let path = forklift.join(FILE_NAME_WAREHOUSE_MARKER);
+
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(false),
+        Err(e) => return Err(format!("Error while reading the warehouse marker \"{}\": {}", path.to_string_lossy(), e)),
+    };
+
+    let unknown = |reason: String| format!(
+        "The warehouse marker \"{}\" {} Forklift cannot tell whether \"{}\" is a warehouse, so it does \
+        not use it.", path.to_string_lossy(), reason, forklift.to_string_lossy()
+    );
+
+    match record_utils::from_bytes(&bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
+        Ok(entries) if entries.is_empty() => Ok(true),
+        Ok(_) => Err(unknown("holds entries this version of Forklift does not know.".to_string())),
+        Err(e) => Err(unknown(e.describe())),
+    }
+}
+
+/// Write the warehouse marker in `forklift`, atomically and synced with its folder.
+fn write_warehouse_marker(forklift: &Path) -> Result<(), String> {
+    let bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, std::iter::empty::<&str>());
+
+    file_utils::replace_file_atomically(&forklift.join(FILE_NAME_WAREHOUSE_MARKER), &bytes)
+        .map_err(|e| format!("Error while marking \"{}\" as a warehouse: {}", forklift.to_string_lossy(), e))
+}
+
+/// Prepare a warehouse in the current folder (the storage root in scope). Every step is
+/// idempotent: only the pieces that are missing get created, and the warehouse marker
+/// ([`FILE_NAME_WAREHOUSE_MARKER`]) is written last.
+///
+/// Where no `.forklift` stands, or an empty one, the whole folder is built under a staging name and
+/// renamed into place ([`place_forklift`]), so a prepare stopped at any point leaves no half-built
+/// `.forklift`. Where a `.forklift` with anything in it stands (a warehouse, or a franchise's claim),
+/// the missing pieces are added in place.
 ///
 /// No `.forkliftignore` is written, as `git init` writes no `.gitignore`. The ignore file is
 /// tracked content, and a template written here would be an untracked file that franchise and
@@ -172,57 +225,324 @@ pub fn cwd_relative_to_root() -> PathBuf {
 /// # Returns
 /// * `Ok(Vec<String>)` - One note per created piece; empty if the warehouse was already
 ///                       fully prepared.
-/// * `Err(String)`     - If the folder is a bay's, or a folder or file could not be created.
+/// * `Err(String)`     - If the folder is a bay's, its marker cannot be read, or a folder or file
+///                       could not be created.
 pub fn prepare_warehouse() -> Result<Vec<String>, String> {
-    let mut created: Vec<String> = Vec::new();
+    let forklift = forklift_root();
 
-    // A bay's `.forklift` is a folder too: filling it with warehouse pieces would report success
-    // while leaving a directory that is neither.
-    match bay_utils::classify_forklift(&forklift_root())? {
-        bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => return Err(format!(
-            "\"{}\" belongs to a bay, so a warehouse cannot be prepared there. Remove the bay from its \
-            warehouse first.", forklift_root().to_string_lossy()
-        )),
-        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => (),
+    refuse_bay(&forklift)?;
+
+    // An empty folder holds nothing to keep; it is replaced by a built one rather than filled, so
+    // the folder is never a warehouse with pieces missing. Removing it is non-recursive, so a
+    // folder something was put in since is filled in place instead, and so is one that cannot be
+    // removed (a mount point, or in a directory this may not write).
+    if is_empty_real_folder(&forklift)? {
+        let _ = std::fs::remove_dir(&forklift);
     }
 
-    if file_utils::create_folder_if_not_exists(&forklift_root())? {
-        created.push(format!("Created folder \"{}\".", FOLDER_NAME_FORKLIFT_ROOT));
+    match std::fs::symlink_metadata(&forklift) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(format!("Error while checking \"{}\": {}", forklift.to_string_lossy(), e)),
+        Ok(_) => return fill_in_place(&forklift),
+    }
+
+    let mut notes = Vec::new();
+
+    let placement = place_forklift(&forklift, |staged| {
+        let _scope = globals::StorageRootScope::enter(staged.parent().unwrap_or(staged));
+
+        // A bay's context outranks a storage-root scope, so the pieces would land in its shared
+        // folder rather than the staged one.
+        if forklift_root() != staged {
+            return Err(format!(
+                "A warehouse cannot be prepared at \"{}\" while a bay is entered.", forklift.to_string_lossy()
+            ));
+        }
+
+        notes = fill(staged, &forklift)?.0;
+        write_warehouse_marker(staged)
+    })?;
+
+    match placement {
+        Placement::Placed => {
+            notes.insert(0, format!("Created folder \"{}\".", FOLDER_NAME_FORKLIFT_ROOT));
+            Ok(notes)
+        }
+        // Something else was put in place first: another prepare's, or a bay's redirect folder.
+        Placement::Taken => match bay_utils::classify_forklift(&forklift)? {
+            // Gone again already: filling it in place would build it unstaged.
+            bay_utils::ForkliftKind::Absent => Err(format!(
+                "\"{}\" changed while a warehouse was being prepared there. Try again.", forklift.to_string_lossy()
+            )),
+            _ => fill_in_place(&forklift),
+        },
+    }
+}
+
+/// Refuse a `.forklift` that is a bay's: filling it with warehouse pieces would report success
+/// while leaving a directory that is neither.
+fn refuse_bay(forklift: &Path) -> Result<(), String> {
+    match bay_utils::classify_forklift(forklift)? {
+        bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => Err(format!(
+            "\"{}\" belongs to a bay, so a warehouse cannot be prepared there. Remove the bay from its \
+            warehouse first.", forklift.to_string_lossy()
+        )),
+        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => Ok(()),
+    }
+}
+
+/// Add the missing pieces to the existing `.forklift` folder `forklift`, then the marker if it has
+/// none. The folders created are synced into their parents before the marker is written, so a
+/// marker never survives a power loss that the pieces it vouches for did not.
+fn fill_in_place(forklift: &Path) -> Result<Vec<String>, String> {
+    // Checked again here, not only before: a bay's folder can be put in place since.
+    refuse_bay(forklift)?;
+
+    let (mut notes, created) = fill(forklift, forklift)?;
+
+    // Each created folder and every folder between it and `forklift`, once each, deepest first.
+    let mut folders: Vec<&Path> = created.iter()
+        .flat_map(|folder| folder.ancestors().take_while(|dir| dir.starts_with(forklift)))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    folders.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+
+    for dir in folders {
+        file_utils::sync_dir(dir)?;
+    }
+
+    if !has_warehouse_marker(forklift)? {
+        write_warehouse_marker(forklift)?;
+        notes.push(format!("Marked \"{}\" as a warehouse's folder.", FOLDER_NAME_FORKLIFT_ROOT));
+    }
+
+    Ok(notes)
+}
+
+/// Create the missing pieces of a warehouse in `forklift_root()`, which is `forklift`, but for the
+/// marker. Notes name each piece under `shown`, the path the folder has once in place.
+///
+/// # Returns
+/// * `Ok((notes, folders))` - One note per created piece, and the folders created.
+/// * `Err(String)`          - A folder or file could not be created.
+fn fill(forklift: &Path, shown: &Path) -> Result<(Vec<String>, Vec<PathBuf>), String> {
+    let mut notes: Vec<String> = Vec::new();
+    let mut created: Vec<PathBuf> = Vec::new();
+
+    let (from, to) = (forklift.to_string_lossy().into_owned(), shown.to_string_lossy().into_owned());
+    let respell = |path: &str| match path.strip_prefix(&*from) {
+        Some(rest) => format!("{}{}", to, rest),
+        None => path.to_string(),
     };
 
-    let folder_path_objects_root = file_utils::get_path_objects_root();
+    let folders = [
+        PathBuf::from(file_utils::get_path_objects_root()),
+        PathBuf::from(file_utils::get_path_inventory_root()),
+        config_utils::get_warehouse_config_folder(),
+    ];
 
-    if file_utils::create_folder_if_not_exists(Path::new(&folder_path_objects_root))? {
-        created.push(format!("Created folder \"{}\".", &folder_path_objects_root));
+    for folder in folders {
+        if file_utils::create_folder_if_not_exists(&folder)? {
+            notes.push(format!("Created folder \"{}\".", respell(&folder.to_string_lossy())));
+            created.push(folder);
+        }
     }
 
-    let folder_path_inventory_root = file_utils::get_path_inventory_root();
+    // Created here rather than by the position, so it is synced with the rest.
+    let pallets = pallet_utils::get_pallets_folder();
 
-    if file_utils::create_folder_if_not_exists(Path::new(&folder_path_inventory_root))? {
-        created.push(format!("Created folder \"{}\".", &folder_path_inventory_root));
-    }
-
-    let folder_path_config_root = config_utils::get_warehouse_config_folder();
-
-    if file_utils::create_folder_if_not_exists(&folder_path_config_root)? {
-        created.push(format!(
-            "Created folder \"{}\".",
-            folder_path_config_root.to_string_lossy()
-        ));
+    if file_utils::create_folder_if_not_exists(&pallets)? {
+        created.push(pallets);
     }
 
     if pallet_utils::create_position_if_not_exists()? {
-        created.push(format!(
+        notes.push(format!(
             "Created the pallets folder and the bay position (on pallet \"{}\").",
             pallet_utils::DEFAULT_PALLET_NAME
         ));
     }
 
     if config_utils::create_warehouse_config_if_not_exists()? {
-        created.push("Created warehouse configuration file.".to_string());
+        notes.push("Created warehouse configuration file.".to_string());
     }
 
-    Ok(created)
+    Ok((notes, created))
+}
+
+/// Whether `path` is a folder itself, not a link to one, with nothing in it.
+fn is_empty_real_folder(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::read_dir(path)
+            .map(|mut entries| entries.next().is_none())
+            .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Error while checking \"{}\": {}", path.to_string_lossy(), e)),
+    }
+}
+
+/// How [`place_forklift`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// The built folder is in place.
+    Placed,
+
+    /// Something stood at the target by the time of the rename, and was left alone.
+    Taken,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set, the next [`place_forklift`] on this thread stops just before its rename and leaves
+    /// its staging folder as a killed process would. Cleared when it fires.
+    static STOP_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When set, the next [`place_forklift`] on this thread runs it just before its rename, as
+    /// another process would. Cleared when it fires.
+    static BEFORE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Put a new `.forklift` folder in place at `forklift`, which must be absent: create a staging
+/// folder `<name>.tmp~<pid>-<n>` beside it, lock it, let `build` fill `<staging>/<name>` (created
+/// empty), sync that tree, and rename it to `forklift` only if nothing stands there yet
+/// ([`file_utils::rename_no_replace`]), then sync the parent. A process stopped at any point leaves
+/// no `.forklift`, only the staging folder, which the built-in ignore rules skip and the next call
+/// in that directory removes.
+///
+/// The staging folder holds a lock file the call holds a kernel lock on (`File::try_lock`) for as
+/// long as the folder is in use. The sweep of leftovers removes the content of a staging folder
+/// only while holding its lock, and builds happen only while holding it, so a sweep never removes
+/// a build in progress. A staging folder without a lock file is removed only if empty: its lock
+/// file can be gone while a build holds the lock on it (a sweep deletes the file after releasing
+/// it), so its content is never judged dead.
+///
+/// # Arguments
+/// * `forklift` - Where the folder goes.
+/// * `build`    - Fills the staged folder, given its path.
+///
+/// # Returns
+/// * `Ok(Placement)` - Whether the folder went in place; the staging folder is gone either way.
+/// * `Err(String)`   - The staging folder could not be made, `build` failed, or the rename failed
+///                     for another reason; nothing is in place.
+pub(crate) fn place_forklift(forklift: &Path, build: impl FnOnce(&Path) -> Result<(), String>) -> Result<Placement, String> {
+    let name = forklift.file_name()
+        .ok_or(format!("Cannot create \"{}\": it has no name.", forklift.to_string_lossy()))?
+        .to_string_lossy().into_owned();
+    let parent = forklift.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+
+    sweep_staging_leftovers(parent, &name);
+
+    let staging = file_utils::create_first_new_folder(file_utils::pid_numbered(&file_utils::TEMP_COUNTER, |pid, n| {
+        parent.join(format!("{}.tmp~{}-{}", name, pid, n))
+    })).map_err(|e| format!("Error while creating a staging folder beside \"{}\": {}", forklift.to_string_lossy(), e))?;
+
+    let lock_path = staging.join(FILE_NAME_STAGING_LOCK);
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&lock_path)
+        .map_err(|e| format!("Error while creating the lock file \"{}\": {}", lock_path.to_string_lossy(), e))
+        .and_then(|file| match file.try_lock() {
+            Ok(()) => Ok(file),
+            // Only a sweep takes a staging folder's lock, and it is clearing this one.
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "\"{}\" was being cleared away as it was created. Try again.", staging.to_string_lossy()
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(format!(
+                "Error while locking \"{}\": {}", lock_path.to_string_lossy(), e
+            )),
+        });
+
+    let lock = match lock {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = std::fs::remove_file(&lock_path);
+            let _ = std::fs::remove_dir(&staging);
+            return Err(e);
+        }
+    };
+
+    let staged = staging.join(&name);
+
+    let built = std::fs::create_dir(&staged)
+        .map_err(|e| format!("Error while creating \"{}\": {}", staged.to_string_lossy(), e))
+        .and_then(|()| build(&staged))
+        .and_then(|()| file_utils::sync_tree(&staged));
+
+    #[cfg(test)]
+    if STOP_BEFORE_RENAME.with(|stop| stop.replace(false)) {
+        return Err("stopped before the rename".to_string());
+    }
+
+    #[cfg(test)]
+    if let Some(before) = BEFORE_RENAME.with(|before| before.borrow_mut().take()) {
+        before();
+    }
+
+    let placed = built.and_then(|()| match file_utils::rename_no_replace(&staged, forklift) {
+        Ok(()) => Ok(Placement::Placed),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Placement::Taken),
+        Err(e) => Err(format!("Error while moving \"{}\" into place: {}", forklift.to_string_lossy(), e)),
+    });
+
+    // Still holding the lock, so no sweep is in the folder. A real folder this call created, so the
+    // removal follows nothing it did not make; gone already once placed.
+    let _ = file_utils::remove_unfollowed(&staged);
+    drop(lock);
+    let _ = std::fs::remove_file(&lock_path);
+    let _ = std::fs::remove_dir(&staging);
+
+    let placement = placed?;
+
+    if placement == Placement::Placed {
+        file_utils::sync_dir(parent)?;
+    }
+
+    Ok(placement)
+}
+
+/// Remove the staging folders of [`place_forklift`] for `name` that a stopped process left in
+/// `parent`. Best-effort: a leftover that stays is skipped by the built-in ignore rules, and is
+/// tried again by the next call. A link is never followed, and a folder whose lock is held is in
+/// use and kept.
+fn sweep_staging_leftovers(parent: &Path, name: &str) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().and_then(file_utils::staged_temp_base) != Some(name) {
+            continue;
+        }
+
+        let staging = entry.path();
+
+        if !std::fs::symlink_metadata(&staging).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+
+        let lock_path = staging.join(FILE_NAME_STAGING_LOCK);
+
+        // Opened, never created: a lock file this created could be one a build is about to open.
+        match std::fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(lock) => {
+                if lock.try_lock().is_err() {
+                    continue;
+                }
+
+                if let Ok(names) = std::fs::read_dir(&staging) {
+                    for name in names.flatten().map(|entry| entry.file_name()) {
+                        if name != FILE_NAME_STAGING_LOCK {
+                            let _ = file_utils::remove_unfollowed(&staging.join(name));
+                        }
+                    }
+                }
+
+                drop(lock);
+                let _ = std::fs::remove_file(&lock_path);
+                let _ = std::fs::remove_dir(&staging);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_dir(&staging);
+            }
+            Err(_) => (),
+        }
+    }
 }
 
 /// Validate a warehouse id, the one rule both server heads apply: a single portable component
@@ -348,6 +668,256 @@ mod tests {
         }
 
         std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn fresh_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-warehouse-{}-{}", label, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn prepare_at(root: &Path) -> Result<Vec<String>, String> {
+        let _scope = globals::StorageRootScope::enter(root);
+        prepare_warehouse()
+    }
+
+    /// The staging folders of `place_forklift` in `dir`.
+    fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir).unwrap().flatten()
+            .filter(|entry| entry.file_name().to_str().and_then(file_utils::staged_temp_base) == Some(FOLDER_NAME_FORKLIFT_ROOT))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// A new warehouse is built whole under a staging name, marked, and renamed into place; nothing
+    /// of the staging is left, and the notes name the pieces where they now stand.
+    #[test]
+    fn prepare_marks_a_new_warehouse_and_leaves_no_staging_folder() {
+        let root = fresh_dir("marks");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+        let notes = prepare_at(&root).unwrap();
+
+        assert_eq!(has_warehouse_marker(&forklift), Ok(true));
+        assert_eq!(std::fs::read(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), b"/forklift-warehouse 1\n");
+        for piece in ["objects", "inventory", "config"] {
+            assert!(forklift.join(piece).is_dir(), "{} must be in place", piece);
+        }
+        assert_eq!(staging_leftovers(&root), Vec::<PathBuf>::new());
+        assert_eq!(notes[0], "Created folder \".forklift\".");
+        assert!(notes.iter().any(|note| note == &format!("Created folder \"{}/objects\".", forklift.to_string_lossy())), "{:?}", notes);
+        assert!(notes.iter().all(|note| !note.contains(".tmp~")), "a note names a staging path: {:?}", notes);
+
+        // Prepared again: nothing to do.
+        assert_eq!(prepare_at(&root).unwrap(), Vec::<String>::new());
+        assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An empty `.forklift` is replaced by a built one, never filled in place.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_forklift_folder_is_replaced_by_a_built_one() {
+        let root = fresh_dir("empty");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir(&forklift).unwrap();
+        // Held open, so the volume cannot hand the replacement the same inode.
+        let _held = std::fs::File::open(&forklift).unwrap();
+        let before = inode(&forklift);
+
+        let notes = prepare_at(&root).unwrap();
+
+        assert_ne!(inode(&forklift), before, "the empty folder was filled in place");
+        assert_eq!(has_warehouse_marker(&forklift), Ok(true));
+        assert_eq!(notes[0], "Created folder \".forklift\".");
+        assert_eq!(staging_leftovers(&root), Vec::<PathBuf>::new());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `.forklift` with anything in it is filled in place, marker last: an existing warehouse
+    /// from before the marker gets one, and a folder with no marker still reads as a warehouse.
+    #[test]
+    fn an_existing_forklift_folder_is_filled_in_place_and_marked() {
+        let root = fresh_dir("in-place");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(forklift.join("objects")).unwrap();
+        std::fs::write(forklift.join("keep"), "mine").unwrap();
+        assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
+
+        let notes = prepare_at(&root).unwrap();
+
+        assert_eq!(std::fs::read_to_string(forklift.join("keep")).unwrap(), "mine");
+        assert_eq!(has_warehouse_marker(&forklift), Ok(true));
+        assert_eq!(notes.last().unwrap(), "Marked \".forklift\" as a warehouse's folder.");
+        assert!(!notes.iter().any(|note| note.contains("objects")), "objects existed: {:?}", notes);
+        assert!(notes.iter().any(|note| note.contains("inventory")), "{:?}", notes);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A prepare stopped before its rename leaves no `.forklift`, only a staging folder the built-in
+    /// ignore rules skip; the next prepare there sweeps it. Top level, and nested in a warehouse.
+    #[test]
+    fn a_prepare_stopped_before_its_rename_leaves_no_forklift_and_the_next_one_sweeps_it() {
+        let outer = fresh_dir("stopped");
+        let rules = file_utils::ignore_rules_from(None).unwrap();
+
+        for (root, key_prefix) in [(outer.clone(), ""), (outer.join("sub"), "sub/")] {
+            std::fs::create_dir_all(&root).unwrap();
+            let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+            STOP_BEFORE_RENAME.with(|stop| stop.set(true));
+            assert_eq!(prepare_at(&root).unwrap_err(), "stopped before the rename");
+
+            assert!(std::fs::symlink_metadata(&forklift).is_err(), "no `.forklift` may stand");
+            let leftovers = staging_leftovers(&root);
+            assert_eq!(leftovers.len(), 1, "{:?}", leftovers);
+            let staging = &leftovers[0];
+            assert!(staging.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_WAREHOUSE_MARKER).is_file(), "built whole");
+
+            let name = staging.file_name().unwrap().to_str().unwrap();
+            for key in [format!("{}{}", key_prefix, name), format!("{}{}/lock", key_prefix, name),
+                        format!("{}{}/.forklift/config/warehouse.toml", key_prefix, name)] {
+                let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+                assert!(rules.excludes(&key, false, rules.coverage_of(parent)), "{} must be ignored", key);
+            }
+
+            prepare_at(&root).unwrap();
+
+            assert_eq!(has_warehouse_marker(&forklift), Ok(true));
+            assert_eq!(staging_leftovers(&root), Vec::<PathBuf>::new(), "the leftover was swept");
+        }
+
+        std::fs::remove_dir_all(&outer).ok();
+    }
+
+    /// A bay's folder put at `.forklift` while a prepare builds its own is refused, never filled.
+    #[test]
+    fn a_bay_put_in_place_during_a_prepare_is_refused_not_filled() {
+        let root = fresh_dir("bay-race");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+        let bay = forklift.clone();
+        BEFORE_RENAME.with(|before| *before.borrow_mut() = Some(Box::new(move || {
+            std::fs::create_dir(&bay).unwrap();
+            std::fs::write(bay.join(bay_utils::FILE_NAME_BAY_REDIRECT), "elsewhere\n").unwrap();
+        })));
+
+        let error = prepare_at(&root).unwrap_err();
+        assert!(error.contains("belongs to a bay"), "{}", error);
+
+        let names: Vec<_> = std::fs::read_dir(&forklift).unwrap().flatten().map(|entry| entry.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(bay_utils::FILE_NAME_BAY_REDIRECT)], "the bay's folder was filled");
+        assert!(staging_leftovers(&root).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A staging folder whose lock is held is in use and kept; once released it is swept. One
+    /// without a lock file is removed only when empty: its lock file can be gone while a build
+    /// still holds the lock on it.
+    #[test]
+    fn a_sweep_keeps_a_locked_staging_folder_and_a_lockless_one_with_content() {
+        let root = fresh_dir("sweep");
+        let make = |name: &str, lock: bool, content: bool| {
+            let staging = root.join(name);
+            std::fs::create_dir(&staging).unwrap();
+            if lock {
+                std::fs::write(staging.join(FILE_NAME_STAGING_LOCK), "").unwrap();
+            }
+            if content {
+                std::fs::create_dir_all(staging.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
+            }
+            staging
+        };
+
+        let live = make(".forklift.tmp~1-1", true, true);
+        let dead = make(".forklift.tmp~1-2", true, true);
+        let lockless_empty = make(".forklift.tmp~1-3", false, false);
+        let lockless_full = make(".forklift.tmp~1-4", false, true);
+        let other = make(".forklift.tmp~x-5", true, true);
+
+        let held = std::fs::OpenOptions::new().read(true).write(true).open(live.join(FILE_NAME_STAGING_LOCK)).unwrap();
+        held.try_lock().unwrap();
+
+        prepare_at(&root).unwrap();
+
+        assert!(live.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects").is_dir(), "a held lock is never swept");
+        assert!(!dead.exists(), "a staging folder whose lock can be taken is dead");
+        assert!(!lockless_empty.exists());
+        assert!(lockless_full.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects").is_dir());
+        assert!(other.exists(), "not a staging name");
+
+        drop(held);
+        sweep_staging_leftovers(&root, FOLDER_NAME_FORKLIFT_ROOT);
+        assert!(!live.exists(), "released, it is swept");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A marker this build cannot read is an error everywhere a warehouse is judged, and prepare
+    /// neither overwrites it nor fills around it.
+    #[test]
+    fn a_marker_this_build_cannot_read_is_refused() {
+        let root = fresh_dir("marker");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+
+        for bad in ["/forklift-warehouse 2\n", "/forklift-warehouse 1\nentry\n", "/forklift-warehouse 1", "warehouse\n"] {
+            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), bad).unwrap();
+
+            let error = has_warehouse_marker(&forklift).unwrap_err();
+            assert!(error.starts_with("The warehouse marker \""), "{}", error);
+            assert!(bay_utils::classify_forklift(&forklift).is_err(), "{:?} classified", bad);
+            assert!(prepare_at(&root).is_err(), "{:?} prepared over", bad);
+            assert_eq!(std::fs::read_to_string(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), bad);
+            assert!(!forklift.join("objects").exists(), "{:?} filled around", bad);
+        }
+
+        std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), "/forklift-warehouse 1\n").unwrap();
+        assert_eq!(has_warehouse_marker(&forklift), Ok(true));
+        assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A franchise's claim puts its `.forklift` in place with the record inside; prepare then fills
+    /// it in place and marks it, keeping the record.
+    #[test]
+    fn prepare_fills_a_franchise_claim_and_keeps_its_record() {
+        let root = fresh_dir("claim");
+        let target = root.join("t");
+        let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
+        let record = franchise_utils::FranchiseRecord {
+            url: "http://example.com:9418".to_string(),
+            token: None,
+            request: franchise_utils::Request { pallet: None, only: Vec::new() },
+            genesis: None,
+            bundle_imported: false,
+            attempt: franchise_utils::Attempt::Running,
+            start_census: 0,
+            last_failure: None,
+        };
+
+        franchise_utils::claim(&target, &record).unwrap();
+        assert_eq!(staging_leftovers(&target), Vec::<PathBuf>::new());
+        assert_eq!(has_warehouse_marker(&forklift), Ok(false));
+
+        prepare_at(&target).unwrap();
+
+        assert_eq!(has_warehouse_marker(&forklift), Ok(true));
+        assert!(forklift.join("objects").is_dir());
+        assert_eq!(franchise_utils::read(&forklift), Ok(Some(record)));
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -993,7 +993,7 @@ pub fn store_object_stream(claimed_hash: &str,
 
     // A temp file in the object's own shard folder, unique per write. `write_file_atomically`
     // (`file_utils.rs`) names its own temp files unique-per-write the same way (a process-wide
-    // atomic counter plus the pid), off its own independent `TEMP_FILE_COUNTER` — two
+    // atomic counter plus the pid), off `TEMP_COUNTER`, which this path does not draw from — two
     // independent counters can coincidentally reach the same numeric value, so if this path used
     // the identical `"{name}.tmp~{pid}-{id}"` infix, a write here and a concurrent
     // `write_file_atomically` write for the *same* hash (e.g. one thread streaming a large
