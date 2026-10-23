@@ -253,8 +253,9 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<std::time::Durati
     value.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
-/// `url`'s path and query, the part after its origin. Built from the parts rather than by slicing
-/// the serialization, which keeps any userinfo the origin leaves out.
+/// `url`'s path and query, the part after its origin. Built from the parts: slicing the
+/// serialization at the origin's length would cut wrongly whenever the URL carries userinfo,
+/// which the serialization keeps and the origin omits.
 fn origin_relative_path(url: &reqwest::Url) -> String {
     match url.query() {
         Some(query) => format!("{}?{}", url.path(), query),
@@ -2550,16 +2551,18 @@ impl RemoteClient {
         let path = origin_relative_path(url);
         self.clients.send_on(
             posture, &self.budgets, method,
-            RequestDestination::Authenticated { base: &origin, token: self.token.as_deref(), path: &path },
+            RequestDestination::Authenticated {
+                base: &origin, token: self.token.as_deref(), path: &path
+            },
             SendBody::Empty,
         ).await
     }
 
     /// The presigned counterpart of [`Self::send_on`] — same posture, same payload guarantee,
     /// but sending to an absolute, self-authorizing URL with **no** bearer token attached. Down
-    /// to one live caller — [`Self::follow_bundle_redirect`]'s cross-origin `GET` (a presigned storage URL
-    /// is self-authorizing; forwarding a bearer token meant for the control plane would be a
-    /// needless credential leak) — since [`Self::put_presigned`], this shape's other historical
+    /// to one live caller — [`Self::follow_bundle_redirect`]'s cross-origin `GET` (a presigned
+    /// storage URL is self-authorizing; forwarding a bearer token meant for the control plane
+    /// would be a needless credential leak) — since [`Self::put_presigned`], this shape's other historical
     /// caller, moved onto [`clients::Clients::send_with_watchdog`], which builds its own
     /// bearer-token-free request entirely inside [`clients`] rather than reaching back out here.
     ///
