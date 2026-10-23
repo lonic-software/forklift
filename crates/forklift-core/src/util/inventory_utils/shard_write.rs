@@ -414,8 +414,9 @@ struct ShardDiff {
 /// store as it stands before anything is written. Then, in three steps, each durable before the
 /// next starts:
 ///
-/// 1. **Phase A** — the rollup of every shard on disk whose stamp is going (a stamp the new set
-///    does not carry for that key, or a key the new set drops) is cleared, as one batched barrier.
+/// 1. **Phase A** — the rollup of every shard on disk, of a key the new set keeps, whose stamp is
+///    going (the new set carries another stamp, or none, for that key) is cleared, as one batched
+///    barrier.
 ///    A stamp is a tree hash, so it changes exactly when content under it changes: every stamped
 ///    ancestor of a content change or a removal is cleared here, before phase B lands that change
 ///    (R1). A shard whose only change is stat data keeps its ancestors' bytes, and so their rollups,
@@ -424,8 +425,8 @@ struct ShardDiff {
 ///    metadata write. A key the new set keeps registered with no shard of its own, whose old shard
 ///    is on disk, is unregistered and registered again in the same write, which clears and syncs
 ///    its address.
-/// 3. **Phase B** — every shard whose bytes differ, as a second barrier; then the dropped keys'
-///    shards are removed, and any unregistered shard swept.
+/// 3. **Phase B** — every shard whose bytes differ, as a second barrier; then every unregistered
+///    shard, the dropped keys' included, is swept.
 ///
 /// # Arguments
 /// * `shards` - Warehouse path key → inventory, for every tracked directory.
@@ -474,19 +475,20 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
     let mut clears: Vec<(&str, Inventory)> = Vec::new();
     let mut writes: Vec<(&str, Vec<u8>)> = Vec::new();
     let mut unregistered: BTreeSet<String> = BTreeSet::new();
-    let mut dropped: Vec<&str> = Vec::new();
 
     for (key, diff) in keys.iter().zip(compared) {
         if !diff.differs {
             continue;
         }
 
+        // A dropped key's own stamp needs no clear: its whole subtree is dropped with it, and it is
+        // unregistered before anything of phase B lands.
         let kept = wanted.contains(&key_to_metadata_entry(key));
 
-        if let Some(mut on_disk) = diff.on_disk {
+        if let (true, Some(mut on_disk)) = (kept, diff.on_disk) {
             let fresh_stamp = shards.get(key.as_str()).and_then(Inventory::get_rollup_hash);
 
-            if on_disk.get_rollup_hash().is_some() && (!kept || on_disk.get_rollup_hash() != fresh_stamp) {
+            if on_disk.get_rollup_hash().is_some() && on_disk.get_rollup_hash() != fresh_stamp {
                 on_disk.clear_rollup();
                 clears.push((key, on_disk));
             }
@@ -496,10 +498,6 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
             Some(bytes) => writes.push((key, bytes)),
             None => {
                 unregistered.insert(key.clone());
-
-                if !kept {
-                    dropped.push(key);
-                }
             }
         }
     }
@@ -528,10 +526,8 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
 
     phase_b_batch.finish()?;
 
-    for key in dropped {
-        remove_shard_folder(key)?;
-    }
-
+    // The dropped keys' shards: unregistered, so never read again, and cleared before any
+    // registration reuses their addresses.
     sweep_unregistered_shards();
 
     Ok(true)

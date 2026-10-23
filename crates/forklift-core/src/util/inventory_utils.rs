@@ -4456,6 +4456,23 @@ mod tests {
         assert_only_registered_shards_remain();
     }
 
+    /// With nothing registered, no shard read finds the damage: the store root itself is judged.
+    #[test]
+    fn a_file_in_place_of_the_store_falls_back_even_with_nothing_registered() {
+        let _scratch = Scratch::new("diff-store-is-a-file");
+        let store_root = file_utils::get_inventory_store_root().unwrap();
+        std::fs::create_dir_all(store_root.parent().unwrap()).unwrap();
+        std::fs::write(&store_root, b"not a folder").unwrap();
+        write_metadata_to_file(&file_utils::get_inventory_metadata_path(), &BTreeSet::new()).unwrap();
+
+        crate::util::operation_utils::raise_for_fixture();
+        replace_all_inventories(&new_set(vec![("", chain_shard(1, None, None))]))
+            .expect("a file in place of the store must not block the reset");
+
+        assert!(std::fs::symlink_metadata(&store_root).unwrap().is_dir());
+        assert_eq!(registered_names(""), vec!["file.txt".to_string()]);
+    }
+
     #[test]
     fn replacing_every_inventory_resets_damaged_metadata_over_a_populated_store() {
         let _scratch = Scratch::new("diff-metadata-damaged");
