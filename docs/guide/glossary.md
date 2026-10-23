@@ -172,8 +172,9 @@ The warehouse in turn records where each bay lives.
 **Position.** The parcel a bay's files currently stand on. If another bay moves the shared pallet
 past it, the bay is **behind** until `shift` catches it up.
 
-**Incomplete load.** A `load` that was interrupted. It leaves a record behind, and `stack` and
-`park` refuse until the load is finished, so a half-staged change is never recorded.
+**Incomplete load.** A `load` that was interrupted. It leaves a record behind, and the commands that
+record a parcel (`stack`, `park`, `consolidate`, `cherry-pick`) refuse until the load is finished
+(exit 20), so a half-staged change is never recorded.
 
 **Ignore file** (git: `.gitignore`). `.forkliftignore`, the patterns of files Forklift should not
 track.
@@ -205,7 +206,7 @@ draft's history (the trail) stays browsable.
 disjoint files, it lowers, consolidates and retries on its own.
 
 **Park** (git: `stash`). Saves staged and unstaged changes as a **parked parcel** and resets to the
-head. `park pop` brings them back, on the same head only.
+head. `park pop` re-applies them, and reports a conflict if the files they touch changed since.
 
 **Undo** (git: roughly `reset --soft` plus the reflog). Reverses the last journaled operation:
 stack, consolidate, cherry-pick, shift or a pallet delete. The **undo journal** is the bay-local
@@ -261,8 +262,9 @@ disk, the object is safely on disk. Because of this, "the file exists" can be tr
 object is stored".
 
 **Durability taint** (git: none). A record of objects whose durability could not be proven, for
-example because a crash hit mid-write. While a taint stands, every command except `heal` and
-`audit` refuses (exit 21).
+example because a crash hit mid-write. Every command first tries to heal a taint on its own (see
+*Restage*). Only a taint that cannot be healed that way makes commands other than `heal` and `audit`
+refuse (exit 21).
 
 **Torn taint.** A taint record that was itself cut off by a crash. Its scope is unknown, so `heal`
 rescans the whole store.
@@ -313,9 +315,10 @@ only. The office is lifted first.
 **Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A divergence is reported, never merged
 on its own. Meta pallets sync first.
 
-**Diverged / remote ahead.** The two refusals a lift can end in when it cannot proceed. *Diverged*:
+**Diverged / remote ahead.** The two refusals that mean the remote's history moved. *Diverged*:
 both sides have parcels the other lacks. *Remote ahead*: the remote has moved on, and you need to
-lower first.
+lower first. A lift can also be refused for other reasons, such as `behind` (another bay moved the
+pallet), a meta conflict or a trust change.
 
 **Bundle** (git: bundle, or a clone packfile). A whole-warehouse package the server offers so a
 clone can download history in one piece. It only speeds up clones and is never a source of truth.
@@ -439,7 +442,8 @@ The report says what changed, such as a re-genesis or an unrelated warehouse.
 
 **Re-genesis** (trust reset). Recovery for an office no one can sign any more: a new genesis, with
 the old history kept as **attested** (readable, but no longer verified). It is deliberately loud.
-An admin runs `office regenesis`, and each clone must accept it explicitly with
+An admin runs `office regenesis --confirm` (without `--confirm` it only explains what would
+happen), and each clone must accept it explicitly with
 `office accept-regenesis --confirm <genesis>`.
 
 **Audit** (git: none; loosely `verify-commit` plus `fsck`). Checks signed history offline: the
