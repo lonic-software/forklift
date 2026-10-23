@@ -2224,9 +2224,9 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     }
 }
 
-/// What a transport failure that is not a timeout says after its action: a reset, a refused
-/// connect, a DNS or TLS failure. Its own words, so [`is_transient_failure`] can tell it from a
-/// local `Error while …`.
+/// What a transport failure that is a dropped connection says after its action: a refused
+/// connect, a reset, a body cut off. Its own words, so [`is_transient_failure`] can tell it from a
+/// local `Error while …` and from a transport failure that repeats (DNS, TLS, a bad body).
 const CONNECTION_FAILED: &str = "the connection to the remote failed: ";
 
 /// Whether `message` reports a failure retrying may get past: a timeout, a connection that failed
@@ -2521,6 +2521,28 @@ impl RemoteClient {
     /// something worth showing a CLI operator; this instead surfaces just the innermost cause's
     /// own message, which for an I/O failure is normally the OS's own wording (e.g. "Connection
     /// refused (os error 61)").
+    /// [`CONNECTION_FAILED`] when `e` is a connection that was refused, reset or cut off mid-body,
+    /// which retrying unchanged may get past; nothing for any other transport failure (DNS, TLS, a
+    /// body that cannot be decoded, a redirect loop), which retrying unchanged repeats.
+    fn connection_failed(e: &reqwest::Error) -> &'static str {
+        use std::io::ErrorKind;
+
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+        let mut dropped = e.is_body() && !e.is_decode();
+
+        while let Some(error) = current {
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                dropped |= matches!(io.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+                    | ErrorKind::NotConnected);
+            }
+
+            current = error.source();
+        }
+
+        if dropped { CONNECTION_FAILED } else { "" }
+    }
+
     fn root_cause(e: &(dyn std::error::Error + 'static)) -> String {
         let mut current = e;
         while let Some(source) = current.source() {
@@ -2627,7 +2649,7 @@ impl RemoteClient {
                     action
                 ),
             },
-            TransportFailure::Other => format!("Error while {}: {}{}", action, CONNECTION_FAILED, Self::root_cause(&e)),
+            TransportFailure::Other => format!("Error while {}: {}{}", action, Self::connection_failed(&e), Self::root_cause(&e)),
         }
     }
 
@@ -2668,7 +2690,7 @@ impl RemoteClient {
                 action, self.budgets.connect
             ),
             TransportFailure::ReadTimedOut => Self::mutation_read_timeout_message(action),
-            TransportFailure::Other => format!("Error while {}: {}{}", action, CONNECTION_FAILED, Self::root_cause(&e)),
+            TransportFailure::Other => format!("Error while {}: {}{}", action, Self::connection_failed(&e), Self::root_cause(&e)),
         }
     }
 
@@ -9788,6 +9810,14 @@ mod tests {
             message
         );
         assert!(is_transient_failure(&message), "a refused connection is worth retrying as is: {}", message);
+    }
+
+    /// A transport failure that is not a dropped connection repeats when retried unchanged, so it
+    /// is never worded as one.
+    #[test]
+    fn only_a_dropped_connection_reads_as_one() {
+        let unbuildable = reqwest::Client::new().get("http://[::1").build().unwrap_err();
+        assert_eq!(RemoteClient::connection_failed(&unbuildable), "");
     }
 
     /// A remote that accepts the connection, reads the request in full, and then genuinely goes

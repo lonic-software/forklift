@@ -274,8 +274,8 @@ struct FranchiseAttempt {
     /// progress.
     bundle_imported_at_start: bool,
 
-    /// Whether the franchise has begun removing its record: past that point the warehouse is
-    /// complete, and a failure must never write the record back.
+    /// Whether the franchise has begun removing its record: once the record is gone the warehouse
+    /// is complete, and a failure must never write it back.
     finishing: bool,
 }
 
@@ -285,7 +285,7 @@ impl FranchiseAttempt {
     /// failure that repeats without storing anything is reported as `change`. Recording is best
     /// effort, and its failure is appended rather than hiding the cause.
     fn fail(&mut self, error: String) -> String {
-        if self.finishing {
+        if self.finishing && franchise_utils::read(&self.forklift).is_ok_and(|record| record.is_none()) {
             return error;
         }
 
@@ -380,7 +380,13 @@ fn start_attempt(attempt: &mut FranchiseAttempt,
         attempt.bundle_imported_at_start = previous.bundle_imported;
     }
 
-    let discarded = franchise_utils::prepare_resume(absolute_target, previous, keep_bundles)?;
+    let discarded = franchise_utils::prepare_resume(absolute_target, previous, keep_bundles).map_err(|e| {
+        // Clearing stopped partway: an import counts as kept only if its store and bundle still are.
+        let kept = keep_bundles && attempt.record.bundle_imported && franchise_utils::holds_import(&attempt.forklift);
+        attempt.record.bundle_imported = kept;
+        attempt.bundle_imported_at_start = kept;
+        e
+    })?;
 
     // A discarded store took the imported objects with it: the bundle is imported again.
     let keep_bundles = keep_bundles && !discarded;
@@ -875,6 +881,13 @@ mod tests {
         assert_eq!(finishing.fail("Error while syncing: EIO".to_string()), "Error while syncing: EIO");
         assert!(matches!(franchise_utils::read(&forklift), Ok(None)));
 
+        // Finishing failed before the record went: the failure is recorded like any other.
+        franchise_utils::write(&forklift, &finishing.record).unwrap();
+        let refusal = finishing.fail("Error while clearing the franchise record: EACCES".to_string());
+        assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::FranchiseIncomplete, .. }));
+        assert_eq!(franchise_utils::read(&forklift).unwrap().unwrap().attempt, Attempt::Failed);
+        std::fs::remove_file(franchise_utils::record_path(&forklift)).unwrap();
+
         let mut failing = attempt(forklift.clone());
         let refusal = failing.fail("Error while writing: No space left on device".to_string());
         assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::FranchiseIncomplete, .. }));
@@ -895,11 +908,25 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, target.join(".forklift")).unwrap();
 
         let previous = FranchiseRecord { bundle_imported: true, start_census: 7, ..record() };
-        let mut resumed = attempt(root.join("record"));
+        let recorded = root.join("record");
+        std::fs::create_dir_all(recorded.join("objects")).unwrap();
+        std::fs::create_dir_all(recorded.join("bundles")).unwrap();
 
+        let mut resumed = attempt(recorded.clone());
         assert!(start_attempt(&mut resumed, &target, Some(&previous), true).is_err());
         assert!(resumed.record.bundle_imported);
         assert!(resumed.bundle_imported_at_start);
         assert_eq!(resumed.record.start_census, 7);
+
+        // A resume that was not keeping the bundle (a sparse one) never claims it.
+        let mut sparse = attempt(recorded.clone());
+        assert!(start_attempt(&mut sparse, &target, Some(&previous), false).is_err());
+        assert!(!sparse.record.bundle_imported && !sparse.bundle_imported_at_start);
+
+        // Nor does one whose clearing already took the bundle away.
+        std::fs::remove_dir(recorded.join("bundles")).unwrap();
+        let mut cleared = attempt(recorded);
+        assert!(start_attempt(&mut cleared, &target, Some(&previous), true).is_err());
+        assert!(!cleared.record.bundle_imported && !cleared.bundle_imported_at_start);
     }
 }

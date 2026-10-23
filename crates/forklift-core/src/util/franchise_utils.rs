@@ -641,6 +641,13 @@ fn remove_in_store(forklift: &Path, recorded: &Path) -> Result<PathBuf, String> 
     Ok(parent)
 }
 
+/// Whether `forklift` still holds what a finished bundle import left: the object store and the
+/// bundles, each a real folder.
+pub fn holds_import(forklift: &Path) -> bool {
+    is_real_dir(&forklift.join(FOLDER_NAME_OBJECTS_ROOT)).unwrap_or(false)
+        && is_real_dir(&forklift.join(FOLDER_NAME_BUNDLES)).unwrap_or(false)
+}
+
 /// Whether `path`, relative to `.forklift`, names something inside the object store.
 fn is_object_store_path(path: &Path) -> bool {
     let mut components = path.components();

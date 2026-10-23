@@ -333,10 +333,31 @@ pub fn barrier_count() -> u64 {
 
 /// Rename `from` to `to` only if nothing stands at `to`; otherwise fail with `AlreadyExists` and
 /// leave both alone. Atomic where the platform offers it (`renamex_np` with `RENAME_EXCL` on
-/// macOS, `renameat2` with `RENAME_NOREPLACE` on Linux). Elsewhere, and on a volume that refuses
-/// the flag, a check runs just before a plain rename, so an empty folder created between the two
-/// is replaced. Windows never replaces a folder by renaming onto it.
+/// macOS, `renameat2` with `RENAME_NOREPLACE` on Linux, `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING` on Windows). On another Unix, and on a volume that refuses the flag,
+/// a check runs just before a plain rename, so an empty folder created between the two is replaced.
 pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+        let wide = |path: &Path| path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (w_from, w_to) = (wide(from), wide(to));
+
+        if unsafe { MoveFileExW(w_from.as_ptr(), w_to.as_ptr(), 0) } != 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+
+        return match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+            _ => Err(error),
+        };
+    }
+
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -364,6 +385,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
 
+    #[cfg(not(windows))]
     match std::fs::symlink_metadata(to) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(from, to),
         Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
