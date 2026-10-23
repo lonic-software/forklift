@@ -127,8 +127,8 @@ source of truth.
 
 **Object ceiling.** The largest object Forklift will write. Large files are chunked well below it.
 
-**gc** (git: `gc` / `prune`). Deleting objects nothing reaches any more. There is no client `gc`
-command: `compact --all` does it locally, and `forklift-server gc` on a server.
+**gc** (git: `gc` / `prune`). Deleting objects nothing reaches any more. On a server it is the
+`forklift-server gc` command.
 
 **Parcel actions.** The authorship records inside a parcel. *AUTHOR* names who wrote the change;
 *STACK* names who recorded it (git: committer).
