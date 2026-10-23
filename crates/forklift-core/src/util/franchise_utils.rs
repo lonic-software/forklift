@@ -1190,11 +1190,17 @@ mod tests {
         std::fs::create_dir_all(outside.join("ab")).unwrap();
         std::fs::write(outside.join("ab").join("cdef"), b"keep").unwrap();
 
+        // A link to what looks like an unfinished franchise's `.forklift`.
+        let outside_forklift = root.join("outside-forklift");
+        std::fs::create_dir_all(outside_forklift.join("refs")).unwrap();
+        write(&outside_forklift, &record()).unwrap();
+
         let linked = root.join("linked");
         std::fs::create_dir_all(&linked).unwrap();
-        std::os::unix::fs::symlink(&outside, linked.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        std::os::unix::fs::symlink(&outside_forklift, linked.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         assert!(admit(&linked).is_err());
         assert!(prepare_resume(&linked, Some(&record()), false).is_err());
+        assert!(outside_forklift.join("refs").is_dir());
 
         let store_linked = root.join("store-linked");
         let forklift = store_linked.join(FOLDER_NAME_FORKLIFT_ROOT);
