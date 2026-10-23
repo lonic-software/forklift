@@ -126,7 +126,8 @@ source of truth.
 
 **Object ceiling.** The largest object Forklift will write. Large files are chunked well below it.
 
-**gc** (git: `gc` / `prune`). Deleting objects nothing reaches any more.
+**gc** (git: `gc` / `prune`). Deleting objects nothing reaches any more. There is no client `gc`
+command: `compact --all` does it locally, and `forklift-server gc` on a server.
 
 **Parcel actions.** The authorship records inside a parcel. *AUTHOR* names who wrote the change;
 *STACK* names who recorded it (git: committer).
@@ -178,14 +179,16 @@ one signed parcel, keeping a link back to the draft. See
 **Draft pallet, checkpoint, trail.** A convention for `deliver`: checkpoints are stacked on a draft
 pallet, and after delivery the draft's history (the trail) stays browsable.
 
-**Optimistic lift** (git: none). A `lift` that finds the remote moved, but can merge cleanly, merges
-and retries on its own. See [`lift`](cli.md#lift--push-li).
+**Optimistic lift** (git: none). A `lift` that finds the remote moved merges and retries on its
+own, when the working directory is clean and the merge has no conflicts. Otherwise it stops with
+*diverged*. See [`lift`](cli.md#lift--push-li).
 
-**Park** (git: `stash`). Sets staged and unstaged changes aside as a **parked parcel**; `park pop`
-brings them back. See [`park`](cli.md#park--stash-pa).
+**Park** (git: `stash`). Sets staged and unstaged changes to tracked files aside as a **parked
+parcel**; untracked files are left alone. `park pop` brings the changes back. See
+[`park`](cli.md#park--stash-pa).
 
-**Undo** (git: roughly `reset` plus the reflog). Reverses the last recorded operation, using the
-bay's **undo journal**. See [`undo`](cli.md#undo--reverse-the-last-operation).
+**Undo** (git: roughly `reset --soft` plus the reflog). Reverses the last recorded operation,
+using the bay's **undo journal**. See [`undo`](cli.md#undo--reverse-the-last-operation).
 
 ## Sparse warehouses and scope
 
@@ -249,9 +252,9 @@ Forklift has several locks, each guarding a different thing.
 | Warehouse lock (git: `index.lock`) | one bay's inventory and working directory |
 | Ref lock (`refs.lock`) | pallets and other state every bay shares |
 | Object-store lock (`store.lock`) | the object store, against overlapping compactions |
-| Store-access lock (`store-access.lock`) | the object store, during whole-store rewrites |
+| Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`compact --all`, `scope-prune`, gc) |
 | Config lock | one config file |
-| Serve lock (`serve.lock`) | a warehouse a server is serving |
+| Serve lock (`serve.lock`) | a warehouse a server is serving; gc and `compact --all` also take it while they run |
 | Server base lock (`.forklift-server.lock`) | a server's base folder |
 | Build lock | a warehouse still being created |
 
@@ -327,8 +330,9 @@ device, and re-keying an operator who lost every device. See
 **Rotate, retire, compromised.** Replacing a key, revoking it, and marking it as possibly in other
 hands. See [Rotating and revoking keys](trust-and-identity.md#8-rotating-and-revoking-keys).
 
-**Distrust boundary.** The point in history after which a revoked key's signatures stop counting,
-decided by ancestry rather than timestamps.
+**Distrust boundary.** The pallet heads vouched for when a key was revoked. The revoked key's
+signatures still count only on parcels reachable from those heads, decided by ancestry rather
+than timestamps.
 
 **Role** (git: none; like a host's collaborator permissions). *admin*, *writer* or *reader*.
 
@@ -386,8 +390,9 @@ like everything else.
 
 **Cell.** One signed value at one path in a meta pallet.
 
-**Replay** (git: none). How meta pallets other than `@office` sync: instead of merging, your change
-is re-applied onto the remote's head as a new parcel.
+**Replay** (git: none). What happens when a meta pallet other than `@office` has diverged from
+the remote: instead of merging, your change is re-applied onto the remote's head as a new parcel.
+A meta pallet that has not diverged fast-forwards like any other.
 
 **Meta conflict.** Both sides changed the same meta value differently. See
 [`lower`](cli.md#lower--pull-lo).
