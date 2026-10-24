@@ -8,7 +8,7 @@ or a `--json` output struct).
 
 # Commands and aliases
 
-Every `forklift` command and subcommand, generated from the same command definition the binary parses its arguments with, so a new command or alias cannot be missing here. An **alias** is a short name shown in `forklift help`. A **hidden alias** is accepted but not shown; most are git's name for the same command, so `forklift commit` runs `stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` walks through them by task.
+Every `forklift` command and subcommand, generated from the same command definition the binary parses its arguments with; CI fails when this page falls behind it. Commands are in alphabetical order, each followed by its subcommands. An **alias** is a short name shown in `forklift help`. A **hidden alias** is accepted but not shown; most are git's name for the same command, so `forklift commit` runs `stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` walks through them by task.
 
 | Command | Alias | Hidden alias | Does |
 |---|---|---|---|
@@ -26,8 +26,9 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `config` | `cfg` |  | Read or change configuration values |
 | `conflicts` |  |  | List the files left in conflict by an unresolved consolidation |
 | `consolidate` | `con` | `merge` | Consolidate (merge) another pallet into the current one |
-| `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail (`dv`) |
+| `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
 | `diff` | `d` |  | Show line-by-line changes |
+| `expand` |  |  | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) |
 | `export-git` |  |  | Export this warehouse's history into a new git repository (one-way, lossy) |
 | `franchise` | `fr` | `clone` | Open a local franchise of a remote warehouse (clone) |
 | `haul` |  |  | Reviewable merge proposals (pull requests) on the @haul meta pallet |
@@ -44,21 +45,22 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `help` | `h` |  | Print the command list, or detailed help about one command |
 | `history` | `hi` | `log` | Print the parcels of a revision, newest first |
 | `import-git` |  |  | Import a git repository's history into this warehouse (one-way migration) |
-| `lift` | `li` | `push` | Upload the current pallet's new parcels to the remote (push) |
-| `load` | `l` | `add` | Take the current state of a file or directory into the inventory (stage) |
-| `lower` | `lo` | `pull` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) |
 | `kv` |  |  | Custom metadata: signed text values keyed by parcel and key |
 | `kv set` |  |  | Set a key on a parcel |
 | `kv get` |  |  | Show a key's value on a parcel |
 | `kv unset` |  |  | Remove a key from a parcel |
 | `kv list` |  |  | List every value, or a parcel's |
 | `kv log` |  |  | Show every change to a key, newest first, with who made it |
-| `manifest` | `mf` |  | Attach signed post-metadata to a parcel: approvals, review notes (`mf`) |
+| `lift` | `li` | `push` | Upload the current pallet's new parcels to the remote (push) |
+| `load` | `l` | `add` | Take the current state of a file or directory into the inventory (stage) |
+| `lower` | `lo` | `pull` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) |
+| `manifest` | `mf` |  | Attach signed post-metadata to a parcel: approvals, review notes |
 | `manifest note` |  |  | Attach a free-form note to a parcel |
 | `manifest approve` |  |  | Record a signed approval (sign-off) of a parcel |
 | `manifest provenance` |  |  | Record how a parcel was produced: model, tool, session (AI provenance) |
 | `manifest show` |  |  | Show the manifest entries attached to a parcel |
 | `mcp` |  |  | Serve the command surface to an AI agent as MCP tools (stdio) |
+| `narrow` |  |  | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) |
 | `office` | `o` |  | Manage the warehouse office: users and signing keys |
 | `office enroll` |  |  | Enroll the configured operator and establish trust — one-way! |
 | `office keygen` |  |  | Generate a keypair locally and print its public half + proof-of-possession |
@@ -84,17 +86,15 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `query` | `q` |  | Query parcel history by signed identity, signer and parcel facts |
 | `remove` | `rm` |  | Stage a file or directory for removal |
 | `restore` | `r` |  | Restore a file or directory from the inventory (discard unstaged changes) |
+| `scope` |  |  | Show this bay's sparse materialization scope, and the warehouse fetch scope |
+| `scope status` |  |  | Show the current bay's materialization scope and the warehouse fetch scope (the default) |
+| `scope-prune` |  |  | Reclaim disk from a sparse warehouse: forget a fetched path and free its content |
 | `self-schema` |  |  | Describe this binary's command surface as a Pult manifest |
 | `self-update` |  |  | Check for a newer release and update this binary (client only) |
 | `shift` | `sh` | `checkout`, `switch` | Shift to another pallet |
 | `show` |  |  | Print a file's content at a revision (`git show <rev>:<path>`'s equivalent) |
 | `stack` | `s` | `commit` | Stack the inventory as a new parcel (commit) on the current pallet |
 | `stocktake` | `st` | `status` | Report the staged and unstaged changes of the warehouse |
-| `expand` |  |  | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) |
-| `narrow` |  |  | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) |
-| `scope` |  |  | Show this bay's sparse materialization scope, and the warehouse fetch scope |
-| `scope status` |  |  | Show the current bay's materialization scope and the warehouse fetch scope (the default) |
-| `scope-prune` |  |  | Reclaim disk from a sparse warehouse: forget a fetched path and free its content |
 | `store` |  |  | Report object-store health: loose vs packed objects, packs, and whether compaction is due |
 | `tag` |  |  | Manage signed tags: named, admin-signed pointers at a parcel (releases) |
 | `tag create` |  |  | Create a signed tag pointing at a revision (admin only) |

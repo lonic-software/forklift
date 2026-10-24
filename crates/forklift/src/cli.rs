@@ -226,7 +226,7 @@ pub enum Command {
         pallet: String,
     },
 
-    /// Squash the current draft pallet onto a target as one clean parcel, keeping the trail (`dv`)
+    /// Squash the current draft pallet onto a target as one clean parcel, keeping the trail
     #[command(
         visible_alias = "dv",
         long_about = "Deliver the current (draft) pallet's checkpoint trail onto a target pallet \
@@ -522,7 +522,7 @@ pub enum Command {
         action: KvAction,
     },
 
-    /// Attach signed post-metadata to a parcel: approvals, review notes (`mf`)
+    /// Attach signed post-metadata to a parcel: approvals, review notes
     #[command(
         visible_alias = "mf",
         long_about = "Record and read the manifest — signed post-metadata attached to a parcel \

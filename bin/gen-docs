@@ -10,7 +10,8 @@
 #                              docs/generated; exits 1 if anything is stale, missing or extra.
 #                              bin/check and CI run this.
 #
-# Honours CARGO_TARGET_DIR, so it can build outside the main checkout's target/.
+# Runs whatever binary cargo just built, so a CARGO_TARGET_DIR (or a configured target-dir)
+# lets it build outside the main checkout's target/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -36,9 +37,16 @@ else
 fi
 
 echo "── building forklift --features docgen"
-cargo build --quiet -p forklift --features docgen
-
-bin="${CARGO_TARGET_DIR:-target}/debug/forklift"
+# Take the binary's path from cargo's own report of what it built, rather than guessing it:
+# the target directory can come from CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR or any
+# .cargo/config.toml, and a build.target triple adds a directory level. Only an executable
+# target reports a path ("executable":null otherwise), and -p forklift builds one.
+bin="$(cargo build --quiet -p forklift --features docgen --message-format=json-render-diagnostics \
+    | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+if [ -z "$bin" ]; then
+    echo "gen-docs: cargo reported no forklift executable" >&2
+    exit 1
+fi
 
 for page in "${pages[@]}"; do
     "$bin" __docgen "$page" > "$out/$page.md.tmp"

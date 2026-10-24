@@ -2162,8 +2162,8 @@ dependency** — it flips on the SOCKS5 client already vendored in the HTTP stac
 
 Every command and subcommand, with its short alias and a one-line description, is listed in
 **[`../generated/commands.md`](../generated/commands.md)**. That page is generated from the
-command definition the binary parses its arguments with, so it cannot fall behind a new
-command or alias.
+command definition the binary parses its arguments with, and CI fails when the committed
+copy falls behind a new command or alias.
 
 ### Coming from git?
 

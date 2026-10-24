@@ -53,8 +53,8 @@ pub fn render_errors() -> Result<String, String> {
 ///
 /// # Returns
 /// * `Ok(String)`  - The rendered markdown.
-/// * `Err(String)` - A listed command has no one-line description (it would render as an empty
-///                   cell), or a description cites a reference only the project's own trackers can
+/// * `Err(String)` - A listed command's one-line description is empty or spans several lines
+///                   (either would break its row), or a description cites a reference only the project's own trackers can
 ///                   resolve (see [`check_no_internal_refs`]).
 pub fn render_commands() -> Result<String, String> {
     let mut out = String::new();
@@ -62,7 +62,8 @@ pub fn render_commands() -> Result<String, String> {
     out.push_str("# Commands and aliases\n\n");
     out.push_str(
         "Every `forklift` command and subcommand, generated from the same command definition the \
-         binary parses its arguments with, so a new command or alias cannot be missing here. \
+         binary parses its arguments with; CI fails when this page falls behind it. Commands are \
+         in alphabetical order, each followed by its subcommands. \
          An **alias** is a short name shown in `forklift help`. A **hidden alias** is accepted \
          but not shown; most are git's name for the same command, so `forklift commit` runs \
          `stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` \
@@ -70,7 +71,10 @@ pub fn render_commands() -> Result<String, String> {
     );
     out.push_str("| Command | Alias | Hidden alias | Does |\n");
     out.push_str("|---|---|---|---|\n");
-    for command in Cli::command().get_subcommands() {
+    let cli = Cli::command();
+    let mut commands: Vec<&clap::Command> = cli.get_subcommands().collect();
+    commands.sort_by_key(|command| command.get_name());
+    for command in commands {
         render_command_rows(&mut out, "", command)?;
     }
     out.push('\n');
@@ -79,7 +83,7 @@ pub fn render_commands() -> Result<String, String> {
 }
 
 /// Append one table row for `command` (prefixed by its parents' names), then one per visible
-/// subcommand, depth first, in declaration order. Hidden commands (the `__docgen` diagnostic
+/// subcommand, depth first, in declaration order (the order `forklift help <command>` lists them). Hidden commands (the `__docgen` diagnostic
 /// among them) are skipped along with everything under them.
 fn render_command_rows(out: &mut String, parent: &str, command: &clap::Command) -> Result<(), String> {
     if command.is_hide_set() {
@@ -91,7 +95,14 @@ fn render_command_rows(out: &mut String, parent: &str, command: &clap::Command) 
         format!("{parent} {}", command.get_name())
     };
     let about = command.get_about().map(|about| about.to_string()).unwrap_or_default();
-    if about.trim().is_empty() {
+    let about = about.trim();
+    if about.contains('\n') {
+        return Err(format!(
+            "docgen: command `{name}`'s one-line description spans several lines, which would \
+             break its row in commands.md. Shorten it to one line in cli.rs."
+        ));
+    }
+    if about.is_empty() {
         return Err(format!(
             "docgen: command `{name}` has no one-line description (its doc comment's first \
              line), so commands.md would show an empty cell. Give it one in cli.rs."
@@ -104,7 +115,7 @@ fn render_command_rows(out: &mut String, parent: &str, command: &clap::Command) 
         name,
         code_list(&visible),
         code_list(&hidden),
-        about.trim().replace('|', "\\|"),
+        about.replace('|', "\\|"),
     ));
     for sub in command.get_subcommands() {
         render_command_rows(out, &name, sub)?;

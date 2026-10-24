@@ -261,7 +261,8 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
 5. **Dispatch it** in `main.rs`.
 6. **Test it** in `tests/cli.rs` (or `tests/remote.rs` for remote behavior). Assert
    both the human output and, where it matters, the `--json` envelope.
-7. **Document it** in [`cli.md`](cli.md) (and the reference table).
+7. **Document it** in [`cli.md`](cli.md), and run `bin/gen-docs` to add it to the generated
+   command list.
 
 ---
 
@@ -304,8 +305,8 @@ maintained alongside the code.
 
 Documentation is part of the change, not a follow-up. When a change alters:
 
-- **a command's flags, name, or behavior** → update [`cli.md`](cli.md) (and its
-  reference table);
+- **a command's flags, name, or behavior** → update [`cli.md`](cli.md), and run `bin/gen-docs`
+  when its name, alias or one-line help changed;
 - **trust / office / key behavior** → update [`trust-and-identity.md`](trust-and-identity.md);
 - **server flags / ops** → update [`../SERVER.md`](../SERVER.md);
 - **the `--json` envelope, error codes, or MCP tools** → update

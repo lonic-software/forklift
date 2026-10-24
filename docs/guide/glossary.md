@@ -91,7 +91,7 @@ The everyday verbs map onto git like this:
 | `import-git` / `export-git` | none | migrate a git repository in, or back out |
 
 Every command, with its short alias, is listed in
-[cli.md](cli.md#10-command--alias-reference).
+[the generated command list](../generated/commands.md).
 
 ## Objects and storage
 
