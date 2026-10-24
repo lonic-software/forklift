@@ -41,7 +41,7 @@ use forklift_core::util::pallet_utils::{
 use forklift_core::util::lock_utils::{self, BaseServeLock, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
-    object_utils, office_utils, pack_utils, pallet_utils, sign_utils, tree_utils, warehouse_utils,
+    object_utils, office_utils, pack_utils, pallet_utils, scope_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
 
@@ -99,19 +99,62 @@ impl WarehouseHandle {
     ///
     /// The shared hold is tried, never waited for: this runs under the registry mutex, on a
     /// runtime thread.
-    fn serving(root: PathBuf) -> Result<WarehouseHandle, String> {
+    ///
+    /// A sparse root (one franchised with `--only`) is refused for good. Clients treat a served
+    /// head as proof that the server holds its whole closure: scope-prune frees local copies of
+    /// what the remote heads reach, so a sparse root would let a client free content the server
+    /// cannot serve back. Checking once, here, is enough because a full root never turns sparse:
+    /// of the fetch-scope writers, franchise sets it as it creates the warehouse, `expand` never
+    /// widens one to full, and scope-prune only narrows one that is already sparse.
+    fn serving(root: PathBuf) -> Result<WarehouseHandle, ServingRefusal> {
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
         // absolute path or an open file, so they stay valid once the scope drops).
         let (serve_lock, store_access) = {
             let _scope = StorageRootScope::enter(&root);
-            let serve_lock = ServeLock::acquire()?;
-            (serve_lock, StoreAccessLock::try_shared()?)
+            let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
+            let store_access = StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?;
+
+            if scope_utils::is_warehouse_sparse().map_err(ServingRefusal::Unreadable)? {
+                return Err(ServingRefusal::Sparse);
+            }
+
+            (serve_lock, store_access)
         };
         let mut handle = WarehouseHandle::new(root);
         handle._serve_lock = Some(serve_lock);
         handle._store_access = Some(store_access);
         Ok(handle)
+    }
+}
+
+/// Why [`WarehouseHandle::serving`] would not serve a root.
+#[derive(Debug)]
+enum ServingRefusal {
+    /// Another server holds it, or a `gc`, full repack or scope-prune is running against it. It
+    /// can be served once that ends.
+    Busy(String),
+
+    /// Its fetch scope could not be read.
+    Unreadable(String),
+
+    /// It is sparse, and is never served.
+    Sparse,
+}
+
+impl ServingRefusal {
+    /// The refusal as a message, naming the warehouse as `name`.
+    fn message(self, name: &str) -> String {
+        match self {
+            ServingRefusal::Busy(reason) | ServingRefusal::Unreadable(reason) => reason,
+            ServingRefusal::Sparse => format!(
+                "{} is a sparse warehouse: it was franchised with --only, so it does not hold \
+                every path its pallets reach. A client trusts a server to hold the whole history \
+                it serves, and could free local copies this one cannot send back. Serve a full \
+                warehouse instead: franchise the remote again without --only.",
+                name
+            ),
+        }
     }
 }
 
@@ -658,7 +701,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
             // Hold the serve lock for the served root for the process lifetime: a second
             // server on the same root is refused here rather than silently breaking the CAS.
-            ServeMode::Single(Arc::new(WarehouseHandle::serving(root)?))
+            let handle = WarehouseHandle::serving(root.clone())
+                .map_err(|refusal| refusal.message(&format!("\"{}\"", root.to_string_lossy())))?;
+            ServeMode::Single(Arc::new(handle))
         }
         (None, Some(base)) => {
             let base = std::fs::canonicalize(&base)
@@ -1557,12 +1602,19 @@ fn resolve_warehouse(state: &AppState,
     // Acquire this warehouse's serve lock as it is served, and hold it in the registry's handle
     // until the handle is let go. Refuses (503) if a `gc`, full repack or scope-prune is running
     // against this warehouse, or another server already serves it — serving it then would be
-    // unsafe.
+    // unsafe. A sparse warehouse stays refused (409) until it is replaced.
     let handle = Arc::new(
-        WarehouseHandle::serving(root).map_err(|e| (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, e),
-        ))?
+        WarehouseHandle::serving(root).map_err(|refusal| match refusal {
+            ServingRefusal::Busy(reason) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, reason),
+            ),
+            ServingRefusal::Unreadable(reason) => internal(reason),
+            ServingRefusal::Sparse => (
+                StatusCode::CONFLICT,
+                ServingRefusal::Sparse.message(&format!("Warehouse \"{}\"", id)),
+            ),
+        })?
     );
 
     // Only once it is served: a refused warehouse must not cost a live one its place.
@@ -4006,6 +4058,70 @@ mod tests {
         assert_eq!(live_ids(&state), ["w1"].map(String::from).into());
 
         drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Restrict the fetch scope of the warehouse at `root`, as `franchise --only src` does.
+    fn make_sparse(root: &std::path::Path) {
+        let _scope = StorageRootScope::enter(root);
+        scope_utils::set_fetch_scope(&scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
+    }
+
+    /// A sparse warehouse is never served, and the refusal is a 409 naming it as sparse rather than
+    /// the 503 a busy one gets. A full warehouse beside it is served.
+    ///
+    /// Revert: drop the sparse check from `serving` → `sparse` is served and becomes live → red.
+    #[test]
+    fn a_sparse_warehouse_is_refused_with_a_409() {
+        let base = scratch_dir("sparse-multi");
+        let state = capped_state(&base, 4, &["full", "sparse"]);
+        make_sparse(&base.join("sparse"));
+
+        let refused = resolve_warehouse(&state, &warehouse_params("sparse")).err().expect("refused");
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
+        assert!(refused.1.starts_with("Warehouse \"sparse\" is a sparse warehouse"), "{}", refused.1);
+        assert!(refused.1.contains("without --only"), "{}", refused.1);
+        assert!(!serve_lock_exists(&base, "sparse"), "a refused warehouse keeps no serve lock");
+
+        drop(resolve_warehouse(&state, &warehouse_params("full")).unwrap());
+        assert_eq!(live_ids(&state), ["full"].map(String::from).into());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The single-root path gets the same refusal from the same funnel, and a fetch scope that cannot
+    /// be read is refused rather than read as full.
+    ///
+    /// Revert: drop the sparse check from `serving` → the sparse root is served → red. Revert:
+    /// read an unreadable fetch scope as full (`unwrap_or(false)`) → the garbled root is served →
+    /// red.
+    #[test]
+    fn serving_refuses_a_sparse_root_and_an_unreadable_fetch_scope() {
+        let base = scratch_dir("sparse-single");
+
+        let full = base.join("full");
+        std::fs::create_dir_all(full.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        drop(WarehouseHandle::serving(full.clone()).expect("a full root is served"));
+
+        let sparse = base.join("sparse");
+        std::fs::create_dir_all(sparse.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        make_sparse(&sparse);
+        let refused = WarehouseHandle::serving(sparse.clone()).err().expect("a sparse root is refused");
+        assert!(matches!(refused, ServingRefusal::Sparse), "{:?}", refused);
+        let message = refused.message("\"/srv/wh\"");
+        assert!(message.starts_with("\"/srv/wh\" is a sparse warehouse"), "{}", message);
+
+        let garbled = base.join("garbled");
+        std::fs::create_dir_all(garbled.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        make_sparse(&garbled);
+        {
+            let _scope = StorageRootScope::enter(&garbled);
+            std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
+        }
+        let refused = WarehouseHandle::serving(garbled).err().expect("an unreadable scope is refused");
+        assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
