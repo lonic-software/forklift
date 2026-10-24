@@ -488,7 +488,8 @@ fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
 /// targets through them.
 struct LocalRoots {
     /// Every parcel reachable from a bay's base or parked parcel, an in-progress consolidation or
-    /// cherry-pick, or a trust pin, in any bay, that the pallet heads do not already reach. Walked scoped, like history.
+    /// cherry-pick, or a trust pin, in any bay, that the pallet heads do not already reach. Walked scoped, like history,
+    /// except a meta-shaped tree, which is walked in full (see [`retain_local_closure`]).
     parcels: Vec<String>,
     /// Every staged inventory shard leaf, in any bay. Retained whatever its path.
     staged: Vec<(String, DirEntryType)>,
@@ -633,7 +634,10 @@ fn collect_retained(
 
 /// Retain what [`LocalRoots`] reach: every staged leaf whatever its path (descending a chunked
 /// entry's recipe), and every local parcel scoped exactly like pallet history in
-/// [`collect_retained`].
+/// [`collect_retained`], user history scoped and meta history in full. Which is which is read off
+/// the root tree's shape ([`recovery_utils::is_meta_tree_root`]), never off the root that reached
+/// it: a trust pin can name either, and the `adopts` pin names office history that no meta head
+/// reaches after a re-genesis (FORK-281).
 ///
 /// Scoped is enough for the parcels, because a prune only ever frees its targets, and every
 /// target is pallet history under the pruned path. A local parcel's own work (an edit parked
@@ -684,6 +688,14 @@ fn retain_local_closure(
 
         retained.insert(tree_hash.clone());
         let tree = object_utils::load_tree(&tree_hash)?;
+
+        // A meta tree is retained in full whatever reached it, as meta pallets are in
+        // `collect_retained`: the `adopts` pin names office history no meta head reaches after
+        // a re-genesis, and the scope would read its metadata folder as out of scope (FORK-281).
+        let path = match path {
+            Some(root) if root.is_empty() && recovery_utils::is_meta_tree_root(&tree) => None,
+            path => path,
+        };
 
         for (name, file) in tree.get_files() {
             let kept = match &path {
@@ -1052,6 +1064,36 @@ mod tests {
         // prune frees the pruned path, not every out-of-scope object.
         assert!(!plan.to_free.contains(&f.readme_blob),
             "prune must free only the pruned path, not all out-of-scope content");
+    }
+
+    /// FORK-281: after a re-genesis the anchor's `adopts` pin names office history no meta head
+    /// reaches. Its tree is meta-shaped, so it is retained in full whatever the fetch scope, and
+    /// a cell sharing its bytes with the pruned path stays. Mutation: drop the meta-tree rule in
+    /// `retain_local_closure` → `.forklift` reads out of scope at the root, the shared blob is
+    /// freed → red.
+    #[test]
+    fn plan_prune_keeps_an_adopted_office_cell_the_pruned_path_shares() {
+        let _scratch = Scratch::new("keeps-adopted-office");
+        let f = build_fixture();
+
+        // `.forklift/tracked/cells/cell`, holding the very bytes `src/web/w.txt` holds.
+        let cells = store_tree(&[("cell", &f.web_blob, DirEntryType::Normal)]);
+        let tracked = store_tree(&[("cells", &cells, DirEntryType::Tree)]);
+        let metadata = store_tree(&[("tracked", &tracked, DirEntryType::Tree)]);
+        let office_root = store_tree(&[(crate::globals::FOLDER_NAME_FORKLIFT_ROOT, &metadata, DirEntryType::Tree)]);
+        let adopted = store_parcel(&office_root, Vec::new());
+
+        let mut sources = root_sources().unwrap();
+        sources.pin_parcels.push((adopted.clone(), office_utils::PinAbsencePolicy::Loss));
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).unwrap();
+
+        assert!(!plan.to_free.contains(&f.web_blob),
+            "a blob the adopted office history holds must not be freed: {:?}", plan.to_free);
+        assert_eq!(plan.retained_shared, 1, "the shared blob is kept as shared content");
+        // The guard engaged on a non-empty plan: the pruned tree itself is still freed.
+        assert_eq!(plan.to_free, vec![f.web_tree.clone()]);
     }
 
     #[test]

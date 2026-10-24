@@ -2439,7 +2439,7 @@ fn walk_tree(
 /// name, and is then walked in full. The wider alias match of
 /// [`office_utils::is_metadata_folder_name`] is for working directories: here it would send a user
 /// tree with a legal entry such as `FORKLI~1` down the full walk too.
-fn is_meta_tree_root(tree: &crate::model::tree_item::TreeItem) -> bool {
+pub(crate) fn is_meta_tree_root(tree: &crate::model::tree_item::TreeItem) -> bool {
     tree.get_subtrees().chain(tree.get_files()).any(|(name, _)| name == FOLDER_NAME_FORKLIFT_ROOT)
 }
 
