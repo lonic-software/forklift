@@ -2392,9 +2392,9 @@ fn walk_tree(
         let tree = object_utils::load_tree(&tree_hash)?;
 
         // A meta tree is walked in full whatever the scope — see `walk_closure_for`'s own doc
-        // comment. Its root holds the metadata folder, which no user tree can.
+        // comment. Its root holds the metadata folder, which a user tree has only if crafted.
         let spine_path = match spine_path {
-            Some(path) if path.is_empty() && is_meta_tree_root(&tree) => {
+            Some(path) if walks_in_full(&tree, &path) => {
                 visited_trees.full.insert(tree_hash.clone());
                 None
             }
@@ -2441,6 +2441,16 @@ fn walk_tree(
 /// tree with a legal entry such as `FORKLI~1` down the full walk too.
 fn is_meta_tree_root(tree: &crate::model::tree_item::TreeItem) -> bool {
     tree.get_subtrees().chain(tree.get_files()).any(|(name, _)| name == FOLDER_NAME_FORKLIFT_ROOT)
+}
+
+/// Whether a scoped walk reaching `tree` at spine path `path` walks it in full instead: a
+/// meta-shaped root tree ([`is_meta_tree_root`]) is meta history, which the fetch scope never
+/// selects from. The one rule heal's enumerating walk and scope-prune's retained walks share, so
+/// heal never reports lost what a prune kept, nor a prune frees what heal counts as held.
+/// Widening it widens what a prune keeps: a crafted meta-shaped user tree it matches keeps even
+/// its pruned path.
+pub(crate) fn walks_in_full(tree: &crate::model::tree_item::TreeItem, path: &str) -> bool {
+    path.is_empty() && is_meta_tree_root(tree)
 }
 
 /// The trees a closure walk has been through, so it walks each at most once per way it is reached.
