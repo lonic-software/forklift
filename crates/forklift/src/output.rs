@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
+use forklift_core::util::remote_utils::BatchLaneClosure;
 use forklift_core::util::{heal_utils, load_guard_utils, merge_utils, query_utils, scope_utils, trust_utils};
 
 /// The version of the envelope every Lonic tool shares, carried as `lonic_json`. A consumer
@@ -34,7 +35,11 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 5 (this one): the `staged_upload_discarded` error code exists, and a lift whose commit
+/// Version 6 (this one): `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
+/// (`degraded` or `endpoint_absent`) when the remote's batch download stopped being used and the
+/// rest of the command fetched one object at a time (`office accept-regenesis` says so in its
+/// message instead). An error document does not carry it.
+/// Version 5: the `staged_upload_discarded` error code exists, and a lift whose commit
 /// the remote keeps answering "not ready" fails at a deadline instead of after a fixed attempt count.
 /// Version 4: the `franchise_incomplete` (with `details`) and `only_prefix_not_found`
 /// error codes exist. A failed franchise keeps its directory and exits `franchise_incomplete`.
@@ -46,7 +51,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -190,6 +195,25 @@ pub fn message(text: impl Into<String>) {
 /// optional, opt-in, CPU-bound pass, not something owed to every store.
 pub const DENSIFY_TIP: &str = "Tip: \"forklift compact --all --redelta\" can significantly \
     shrink this store (one-shot, takes a few minutes on large histories).";
+
+/// The line `franchise`, `lower`, `expand`, `lift` and `office accept-regenesis` print when their
+/// remote's batch lane closed, so a command that ran slow says why. One shared wording, so the
+/// commands never drift apart.
+pub fn batch_lane_line(closure: BatchLaneClosure) -> &'static str {
+    match closure {
+        BatchLaneClosure::Degraded => "The remote was slow to start a batch download, so the rest \
+            was fetched one object at a time.",
+        BatchLaneClosure::EndpointAbsent => "The remote does not serve batch downloads, so objects \
+            were fetched one at a time.",
+    }
+}
+
+/// Print [`batch_lane_line`] when the lane closed; nothing when it stayed open.
+pub fn print_batch_lane(closure: Option<BatchLaneClosure>) {
+    if let Some(closure) = closure {
+        println!("{}", batch_lane_line(closure));
+    }
+}
 
 /// `skip_serializing_if` predicate for a flag that is written only when set.
 pub fn is_false(value: &bool) -> bool {
@@ -950,6 +974,21 @@ macro_rules! human {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each closure reason gets its own sentence, and the JSON value names it the same way the
+    /// docs do. Revert: word both reasons alike → the two lines compare equal.
+    #[test]
+    fn a_closed_batch_lane_says_why_it_closed() {
+        let degraded = batch_lane_line(BatchLaneClosure::Degraded);
+        let absent = batch_lane_line(BatchLaneClosure::EndpointAbsent);
+
+        assert!(degraded.contains("slow to start a batch download"), "{}", degraded);
+        assert!(absent.contains("does not serve batch downloads"), "{}", absent);
+        assert!(degraded.contains("one object at a time") && absent.contains("one at a time"));
+
+        assert_eq!(serde_json::to_value(BatchLaneClosure::Degraded).unwrap(), "degraded");
+        assert_eq!(serde_json::to_value(BatchLaneClosure::EndpointAbsent).unwrap(), "endpoint_absent");
+    }
 
     #[test]
     fn a_result_serializes_in_key_order_or_fails_as_a_generic_error() {

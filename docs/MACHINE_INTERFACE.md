@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 5,
+  "schema": 6,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 5,
+  "schema": 6,
   "command": "stocktake",
   "ok": false,
   "error": {
@@ -82,7 +82,12 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 5** (current): the `staged_upload_discarded` error code exists (exit 32), and a lift
+**Schema 6** (current): `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
+(`degraded` or `endpoint_absent`) when the remote's batch download stopped being used and the
+rest of the command fetched one object at a time; absent when it stayed open. `office
+accept-regenesis` says so in its `message` instead. An error document does not carry it.
+
+**Schema 5**: the `staged_upload_discarded` error code exists (exit 32), and a lift
 whose commit the remote keeps answering "not ready" fails at a deadline instead of after a fixed
 attempt count.
 

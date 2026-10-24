@@ -924,13 +924,19 @@ pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
         return Ok(());
     };
 
-    output::message(format!(
+    let mut accepted = format!(
         "Accepted the re-genesis.\n\
         Old genesis: {}\n\
         New genesis: {}\n\
         The prior history is retained as attested; \"lower\" to continue.",
         old.genesis, new.genesis
-    ));
+    );
+
+    if let Some(closure) = client.batch_lane_closure() {
+        accepted = format!("{}\n{}", accepted, output::batch_lane_line(closure));
+    }
+
+    output::message(accepted);
 
     Ok(())
 }

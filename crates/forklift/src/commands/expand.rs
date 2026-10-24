@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::remote_utils::{ExpandCommit, RemoteClient};
+use forklift_core::util::remote_utils::{BatchLaneClosure, ExpandCommit, RemoteClient};
 use forklift_core::util::scope_utils::ScopeClass;
 use forklift_core::util::{object_utils, pallet_utils, remote_utils, scope_utils};
 use crate::output::{self, CommandOutput};
@@ -61,6 +61,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
             added: Vec::new(),
             scope: current.prefixes().to_vec(),
             fetched_objects: 0,
+            batch_lane: None,
         });
 
         return Ok(());
@@ -108,6 +109,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
                     added: expansion.added().to_vec(),
                     scope: scope.prefixes().to_vec(),
                     fetched_objects: expansion.fetched_objects(),
+                    batch_lane: client.batch_lane_closure(),
                 });
 
                 return Ok(());
@@ -117,6 +119,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
                     added: Vec::new(),
                     scope: scope.prefixes().to_vec(),
                     fetched_objects: expansion.fetched_objects(),
+                    batch_lane: client.batch_lane_closure(),
                 });
 
                 return Ok(());
@@ -162,20 +165,25 @@ pub(crate) struct ExpandReport {
 
     /// Loose objects fetched for the newly in-scope subtree(s).
     fetched_objects: usize,
+
+    /// Why the remote's batch download stopped being used, when it did. Absent when it stayed open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_lane: Option<BatchLaneClosure>,
 }
 
 impl CommandOutput for ExpandReport {
     fn render_human(&self) {
         if self.added.is_empty() {
             println!("Nothing to expand: every requested path is already in the fetch scope.");
-            return;
+        } else {
+            println!(
+                "Expanded the fetch scope with {} ({} object(s) fetched). Fetch scope now: {}.",
+                self.added.join(", "), self.fetched_objects, self.scope.join(", ")
+            );
+            println!("Scope a bay to a newly fetched path with \"bay add --scope\".");
         }
 
-        println!(
-            "Expanded the fetch scope with {} ({} object(s) fetched). Fetch scope now: {}.",
-            self.added.join(", "), self.fetched_objects, self.scope.join(", ")
-        );
-        println!("Scope a bay to a newly fetched path with \"bay add --scope\".");
+        output::print_batch_lane(self.batch_lane);
     }
 }
 

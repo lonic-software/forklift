@@ -7,7 +7,7 @@ use forklift_core::model::remote::WarehouseInfo;
 use forklift_core::util::franchise_utils::{self, Admission, Attempt, Failure, FranchiseRecord, Phase, Request};
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::remote_utils::{RemoteClient, TorSettings};
+use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
     bundle_utils, config_utils, file_utils, lock_utils, object_utils, operation_utils, pack_utils,
@@ -434,6 +434,7 @@ async fn franchise_into_prepared_target(
         scope: fetch_scope.prefixes().to_vec(),
         fetched_objects: 0,
         densify_suggested: false,
+        batch_lane: None,
     };
 
     // The bundle is a fast start, not a requirement: whatever it lacks (or if there is none) is
@@ -512,7 +513,7 @@ async fn franchise_into_prepared_target(
 
         report.pallet = pallet_name;
         report.unborn = true;
-        emit_report(&report, client);
+        emit_report(&mut report, client);
 
         return Ok(());
     };
@@ -574,7 +575,7 @@ async fn franchise_into_prepared_target(
     report.pallet = pallet_name;
     report.head = Some(remote_head.clone());
     report.fetched_objects = stats.fetched_objects;
-    emit_report(&report, client);
+    emit_report(&mut report, client);
 
     Ok(())
 }
@@ -673,11 +674,12 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
 
 /// Emit a successful franchise's report, announcing a first-contact adoption first. Only on
 /// success: a franchise that fails afterwards is resumed, and a resume adopts the anchor again.
-fn emit_report(report: &FranchiseReport, client: &RemoteClient) {
+fn emit_report(report: &mut FranchiseReport, client: &RemoteClient) {
     if let Some(genesis) = &report.adopted_genesis {
         output::warn_trust_adopted(&trust_utils::first_contact(client.url(), genesis));
     }
 
+    report.batch_lane = client.batch_lane_closure();
     output::emit(report);
 }
 
@@ -725,6 +727,10 @@ pub(crate) struct FranchiseReport {
     /// ingest — the densify suggestion, human-output only (not part of the JSON contract).
     #[serde(skip)]
     densify_suggested: bool,
+
+    /// Why the remote's batch download stopped being used, when it did. Absent when it stayed open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_lane: Option<BatchLaneClosure>,
 }
 
 impl CommandOutput for FranchiseReport {
@@ -772,6 +778,8 @@ impl CommandOutput for FranchiseReport {
                 self.scope.join(", ")
             );
         }
+
+        output::print_batch_lane(self.batch_lane);
     }
 }
 
