@@ -2144,7 +2144,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
 }
 
 /// The warehouse path of a tree entry named `name` under directory `prefix` (`""` = the root).
-fn child_path(prefix: &str, name: &str) -> String {
+pub(crate) fn child_path(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
         name.to_string()
     } else {
