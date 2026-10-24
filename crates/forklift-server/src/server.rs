@@ -112,14 +112,14 @@ impl WarehouseHandle {
         // absolute path or an open file, so they stay valid once the scope drops).
         let (serve_lock, store_access) = {
             let _scope = StorageRootScope::enter(&root);
-            let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
-            let store_access = StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?;
 
+            // First, so a sparse root under a running scope-prune is told it is sparse, not busy.
             if scope_utils::is_warehouse_sparse().map_err(ServingRefusal::Unreadable)? {
                 return Err(ServingRefusal::Sparse);
             }
 
-            (serve_lock, store_access)
+            let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
+            (serve_lock, StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?)
         };
         let mut handle = WarehouseHandle::new(root);
         handle._serve_lock = Some(serve_lock);
@@ -4076,6 +4076,15 @@ mod tests {
         let base = scratch_dir("sparse-multi");
         let state = capped_state(&base, 4, &["full", "sparse"]);
         make_sparse(&base.join("sparse"));
+
+        // A scope-prune holding the store exclusively does not mask the answer as "busy".
+        let pruning = {
+            let _scope = StorageRootScope::enter(&base.join("sparse"));
+            StoreAccessLock::try_exclusive().expect("exclusive hold")
+        };
+        let refused = resolve_warehouse(&state, &warehouse_params("sparse")).err().expect("refused");
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
+        drop(pruning);
 
         let refused = resolve_warehouse(&state, &warehouse_params("sparse")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);

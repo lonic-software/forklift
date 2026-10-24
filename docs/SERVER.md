@@ -49,6 +49,12 @@ forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token <sec
 Clients configure `forklift config remote.url http://…` (plus `remote.token`), or just
 `forklift franchise <url> <dir> --token <secret>`.
 
+A served root must hold the full tree. A sparse warehouse (one franchised with `--only`) is
+refused: `serve --root` will not start on it, and a `--warehouses` server answers `409` for it.
+Clients trust a server to hold every object its pallet heads reach, and `scope-prune` frees local
+copies on that basis, so a sparse root could lead a client to free content it can never fetch back.
+To serve a franchised copy, franchise it without `--only`.
+
 ## Serving many warehouses
 
 ```sh
