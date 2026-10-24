@@ -139,39 +139,13 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         .or_else(|| imported.first())
         .map(|(_, pallet)| pallet.clone());
 
-    let mut unheld: Vec<String> = Vec::new();
-
-    if let Some(pallet) = &current {
-        let head = pallet_utils::get_pallet_head(pallet)?;
-        let tree = head.as_deref().map(|head| object_utils::load_parcel(head).map(|parcel| parcel.tree_hash)).transpose()?;
-
-        // Raised before the position, which comes before the inventory build, and that build can
-        // fail on a file it cannot read: until staging is built, nothing may commit it.
-        let position = pallet_utils::BayPosition::new(pallet, head.clone());
-        let mut operation = Operation::new(OperationKind::ImportGit, position.clone(), tree.clone(), position.clone());
-        operation.target_tree = tree.clone();
-        operation_utils::raise(&operation)?;
-
-        pallet_utils::write_position(&position)?;
-
-        if let Some(tree) = tree {
-            progress.status("Building the inventory");
-            let built = shift_utils::build_inventories_for_tree(&tree, shift_utils::TreeProvenance::Verify)?;
-            inventory_utils::replace_all_inventories(&built.shards)?;
-            unheld = built.unheld;
-        }
-
-        operation_utils::finish()?;
-    }
-
     // A colocated git repo keeps its `.git` folder in the working tree; forklift should never
     // track it. The rule goes into the tracked ignore file, so it is added only when there is a
-    // `.git` folder here to ignore. The history is already imported by now, so a failure to add
-    // it is reported as a warning naming the rule, not as a failed import.
+    // `.git` folder here to ignore. It is written before the operation below is raised: heal
+    // finishes an interrupted import by building its inventory, and adds no rule. The history is
+    // already imported by now, so a failure to add it is reported as a warning naming the rule,
+    // not as a failed import.
     let mut warnings = converter.warnings;
-    if let Some(warning) = unheld_warning(&unheld) {
-        warnings.push(warning);
-    }
     let git_rule = if forklift_core::globals::warehouse_root().join(".git").exists() {
         match ignore_git_directory() {
             Ok(GitRule::Refused(e)) => {
@@ -197,6 +171,40 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     } else {
         None
     };
+
+    let mut unheld: Vec<String> = Vec::new();
+
+    if let Some(pallet) = &current {
+        let head = pallet_utils::get_pallet_head(pallet)?;
+        let tree = head.as_deref().map(|head| object_utils::load_parcel(head).map(|parcel| parcel.tree_hash)).transpose()?;
+
+        // Raised before the position, which comes before the inventory build, and that build can
+        // fail on a file it cannot read: until staging is built, nothing may commit it.
+        let position = pallet_utils::BayPosition::new(pallet, head.clone());
+        let mut operation = Operation::new(OperationKind::ImportGit, position.clone(), tree.clone(), position.clone());
+        operation.target_tree = tree.clone();
+        operation_utils::raise(&operation)?;
+
+        pallet_utils::write_position(&position)?;
+
+        if let Some(tree) = tree {
+            progress.status("Building the inventory");
+            let built = shift_utils::build_inventories_for_tree(&tree, shift_utils::TreeProvenance::Verify)?;
+            inventory_utils::replace_all_inventories(&built.shards)?;
+            unheld = built.unheld;
+        }
+
+        operation_utils::finish()?;
+    }
+
+    // A tracked ignore file the rule was just appended to no longer holds its imported content,
+    // but that is the import's own edit, which the report names, not one for `restore` to undo.
+    if matches!(git_rule, Some(GitRule::Added)) {
+        unheld.retain(|key| key != file_utils::FILENAME_IGNORE);
+    }
+    if let Some(warning) = unheld_warning(&unheld) {
+        warnings.push(warning);
+    }
 
     output::emit(&ImportReport {
         commits: converter.commits.len(),
@@ -1180,7 +1188,8 @@ pub(crate) struct ImportReport {
 
     /// Every checked-out file that does not hold the content imported for it (an uncommitted
     /// edit or deletion, or a file git converted as it checked it out), in tree order. Each reads
-    /// as an unstaged change. The warning names only the first few.
+    /// as an unstaged change. The warning names only the first few. A tracked `.forkliftignore`
+    /// the import appended the `.git` rule to is not listed, although it reads as changed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unheld: Vec<String>,
 }
