@@ -1927,7 +1927,10 @@ refusal before ever reaching its own fetch):
   failure. `heal` no longer treats this as a dead end: it re-derives the full scope itself by
   checking every object actually present in the warehouse and re-walking every pallet head,
   parked change, staged file, and trust pin to see what is still needed, then records
-  exactly what came out dangling. This can take noticeably longer than the ordinary case (it is
+  exactly what came out dangling. In a clone made with `--only`, pallet content outside the
+  clone's paths was never fetched, so its absence is not reported; if the file recording those
+  paths cannot be read, the incomplete record is left standing and `heal` says so. This can take
+  noticeably longer than the ordinary case (it is
   checking the whole object store, not just the affected paths), and it prints progress as it
   goes. If nothing turns out to be missing, the taint clears — exit 0, same as any other clean
   heal. If something is genuinely gone and still needed, the taint stays standing on exactly

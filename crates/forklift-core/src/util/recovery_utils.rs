@@ -239,13 +239,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
-use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
+use crate::globals::{forklift_root, FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
+    audit_utils, bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
     pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
     taint_utils,
 };
 use crate::util::progress_utils::Progress;
+use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 
 /// How many dangling references a refusal message names individually before summarizing the
 /// rest as "(and N more)" — mirrors `audit_utils::MAX_NAMED_MISSING_CHUNKS`'s reasoning: a pack
@@ -1887,7 +1888,9 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     // corrupt reachable object must keep failing this walk loud, exactly as before the carve-out
     // existed — see `tests::a_present_but_corrupt_pallet_head_fails_the_walk_loudly`.
     let no_corrupt: BTreeSet<String> = BTreeSet::new();
-    let outcome = walk_closure_for(targets, &roots, &no_corrupt, None)?;
+    // Unscoped: gc's live set descends every present tree whatever the fetch scope, so the
+    // targeted walk must too, or it could miss a target gc would keep (the superset invariant).
+    let outcome = walk_closure_for(targets, &roots, &no_corrupt, &MaterializationScope::full(), None)?;
     Ok(ClosureWalkResult {
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
@@ -1908,7 +1911,11 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// falls through past its (vacuous) targets-check to its presence guard — and `Some` sink, which
 /// both collects every absence found and (per the module doc comment) turns on the terminal-
 /// leaf/chunk presence checks that [`closure_references_any`] skips entirely. Same descent, so this
-/// can never tolerate (or fail to tolerate) anything [`closure_references_any`] doesn't.
+/// can never tolerate (or fail to tolerate) anything [`closure_references_any`] doesn't — except
+/// that this walk keeps every tree but a meta tree within the warehouse's fetch scope
+/// (FORK-262): a sparse franchise never fetched what lies outside it, so recording those sealed
+/// objects as vanished would refuse every torn heal there. A fetch scope that cannot be read is a
+/// degraded source, and the walk then runs in full.
 ///
 /// `corrupt` is the §8.3 corrupt-boundary carve-out: a hash in this set that the walk reaches is
 /// treated exactly like a raw-absent one — recorded via the sink, not descended into — even
@@ -1927,12 +1934,22 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 ///                            anomalous corruption the caller could not pre-classify, above all
 ///                            one discovered only inside a pack).
 pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<ClosureWalkResult, String> {
-    let roots = collect_walk_roots()?;
+    let mut roots = collect_walk_roots()?;
+    // An unreadable scope leaves the walk unable to tell a sealed object from a lost one. Walking
+    // in full then over-reports, and the degraded note keeps the caller from acting on it.
+    let scope = scope_utils::read_fetch_scope().unwrap_or_else(|error| {
+        roots.degraded_sources.push(format!(
+            "the fetch scope could not be read this run ({}), so objects outside it could not be \
+            told apart from lost ones.",
+            error
+        ));
+        MaterializationScope::full()
+    });
     let empty_targets: BTreeSet<String> = BTreeSet::new();
     let mut absent: BTreeSet<String> = BTreeSet::new();
     let outcome = {
         let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
-        walk_closure_for(&empty_targets, &roots, corrupt, Some(&mut collecting_sink))?
+        walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&mut collecting_sink))?
     };
     Ok(ClosureWalkResult {
         hashes: absent,
@@ -2013,6 +2030,18 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// entry for it is dequeued first marks it visited and the other becomes a same-result no-op — see
 /// [`AbsencePolicy`]'s own doc comment for the mechanics that make this order-independent.
 ///
+/// **Every tree is walked within `scope`, except a meta tree (FORK-262).** A sparse warehouse never
+/// fetched what lies outside its fetch scope, so the enumerating walk records none of it as
+/// absent. The scope selects user-pallet content only, so [`walk_tree`] walks a tree whose root
+/// holds the metadata folder by its exact name — the shape of every office and meta-tree pallet,
+/// which a user tree has only if crafted — in full ([`is_meta_tree_root`]). That decides by the
+/// tree, never by which root reached it: a trust pin can name either kind (`adopts` names office
+/// history, a `boundary` snapshot names user and meta heads alike), and a meta parcel walked within
+/// the scope would leave a real loss unreported.
+///
+/// `scope` is the fetch scope for the enumerating walk ([`enumerate_absent_reachable`]) and full
+/// for the targeted one ([`closure_references_any`]), which must descend everything gc keeps.
+///
 /// The §8.3 corrupt-boundary carve-out is unaffected by any of this: a pin root already known
 /// corrupt (step 1's hash-verify found real, present, wrong bytes at that path — never "maybe
 /// never fetched"; an absence and a corruption cannot both be true of the same path) is reported
@@ -2033,11 +2062,12 @@ fn walk_closure_for(
     targets: &BTreeSet<String>,
     roots: &WalkRoots,
     corrupt: &BTreeSet<String>,
+    scope: &MaterializationScope,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     let mut unwalked: BTreeMap<String, String> = BTreeMap::new();
-    let mut visited_trees: HashSet<String> = HashSet::new();
+    let mut visited_trees = TreeVisits::default();
     let mut visited_parcels: HashSet<String> = HashSet::new();
 
     for (hash, item_type) in &roots.shard_referenced {
@@ -2056,7 +2086,7 @@ fn walk_closure_for(
 
     drain_parcel_queue(
         &mut queue, targets, corrupt, &mut referenced, &mut unwalked, &mut visited_parcels, &mut visited_trees,
-        sink,
+        scope, sink,
     )?;
 
     // F6: every declared pin root this run can positively confirm is genuinely never held — see
@@ -2205,12 +2235,16 @@ impl From<office_utils::PinAbsencePolicy> for AbsencePolicy {
 
 /// The shared parcel-ancestry descent [`walk_closure_for`] drives with its one combined queue
 /// (ordinary and pin roots together, since F1's fix — see that function's own doc comment). Drains
-/// `queue` to empty, including any parent entries `queue` itself grows while draining.
+/// `queue` to empty, including any parent entries `queue` itself grows while draining, walking
+/// every present parcel's tree within `scope`.
 ///
 /// Unlike a plain "insert-and-skip-if-already-present" visited check, marking a hash visited is
 /// deferred for a `Gap`-policy absence specifically (see [`AbsencePolicy::Gap`]'s own doc comment)
 /// — every *other* outcome (a target match, a corrupt-boundary hit, a `Report`-policy absence, or
 /// a present parcel) marks `visited_parcels` immediately, exactly as before F1's fix.
+// Each argument is distinct state of the one walk, threaded down to `walk_tree`; a parameter object
+// would only obscure them.
+#[allow(clippy::too_many_arguments)]
 fn drain_parcel_queue(
     queue: &mut VecDeque<(String, AbsencePolicy)>,
     targets: &BTreeSet<String>,
@@ -2218,7 +2252,8 @@ fn drain_parcel_queue(
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
     visited_parcels: &mut HashSet<String>,
-    visited_trees: &mut HashSet<String>,
+    visited_trees: &mut TreeVisits,
+    scope: &MaterializationScope,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     while let Some((hash, policy)) = queue.pop_front() {
@@ -2276,7 +2311,7 @@ fn drain_parcel_queue(
         visited_parcels.insert(hash.clone());
         let parcel = object_utils::load_parcel(&hash)?;
         walk_tree(
-            &parcel.tree_hash, targets, corrupt, referenced, unwalked, visited_trees, reborrow_sink(&mut sink),
+            &parcel.tree_hash, targets, corrupt, referenced, unwalked, visited_trees, scope, reborrow_sink(&mut sink),
         )?;
 
         for parent in parcel.parents {
@@ -2289,6 +2324,10 @@ fn drain_parcel_queue(
     Ok(())
 }
 
+/// Walk one parcel's tree. Under a sparse `scope`, the spine is walked entry by entry, deduplicated
+/// on (hash, path), and each in-scope subtree is walked in full, deduplicated on the hash; an
+/// out-of-scope entry is never checked or enqueued — see [`TreeVisits`].
+///
 /// Iterative, work-queue-driven — a parcel's spine tree can nest arbitrarily deep, and the
 /// obvious recursive shape (one stack frame per level) risks a stack overflow on a
 /// pathologically deep tree; see [`tests::walk_tree_survives_a_pathologically_deep_tree`]. Mirrors
@@ -2297,19 +2336,25 @@ fn drain_parcel_queue(
 /// deep, never further, so it stays recursion-free without needing this treatment. That test
 /// runs the walk on a small-stack thread, so it relies on the walk staying on the calling
 /// thread; a walk fanned out to worker threads needs its falsifier rebuilt.
+// Same arguments as `drain_parcel_queue`, minus the parcel state.
+#[allow(clippy::too_many_arguments)]
 fn walk_tree(
     tree_hash: &str,
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
-    visited_trees: &mut HashSet<String>,
+    visited_trees: &mut TreeVisits,
+    scope: &MaterializationScope,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
-    let mut tree_queue: VecDeque<String> = VecDeque::new();
-    tree_queue.push_back(tree_hash.to_string());
+    // Each entry carries its warehouse path while it is on the spine of `scope`, and `None` once
+    // the walk is in full: inside an in-scope subtree, or under a full scope from the start.
+    let mut tree_queue: VecDeque<(String, Option<String>)> = VecDeque::new();
+    let root_path = (scope.classify("") == ScopeClass::Spine).then(String::new);
+    tree_queue.push_back((tree_hash.to_string(), root_path));
 
-    while let Some(tree_hash) = tree_queue.pop_front() {
+    while let Some((tree_hash, spine_path)) = tree_queue.pop_front() {
         // Targets-check FIRST — same reasoning as `walk_closure_for`'s parcel queue: a vanished
         // hash that is itself a hunted target is a reference, and must be reported as one even
         // though it is raw-absent.
@@ -2317,7 +2362,7 @@ fn walk_tree(
             referenced.insert(tree_hash);
             continue;
         }
-        if !visited_trees.insert(tree_hash.clone()) {
+        if !visited_trees.first_visit(&tree_hash, spine_path.as_deref()) {
             continue;
         }
         // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a sealed subtree
@@ -2346,16 +2391,79 @@ fn walk_tree(
 
         let tree = object_utils::load_tree(&tree_hash)?;
 
+        // A meta tree is walked in full whatever the scope — see `walk_closure_for`'s own doc
+        // comment. Its root holds the metadata folder, which no user tree can.
+        let spine_path = match spine_path {
+            Some(path) if path.is_empty() && is_meta_tree_root(&tree) => {
+                visited_trees.full.insert(tree_hash.clone());
+                None
+            }
+            spine_path => spine_path,
+        };
+
+        // On the spine, an entry out of scope is sealed by its hash in this tree and was never
+        // fetched: its absence is no loss, so it is neither checked nor descended. `Some(child)`
+        // is the entry's spine path, or `None` once it is in scope whole.
+        let in_scope = |name: &str| -> Option<Option<String>> {
+            match &spine_path {
+                None => Some(None),
+                Some(path) => {
+                    let child = audit_utils::child_path(path, name);
+                    match scope.classify(&child) {
+                        ScopeClass::OutOfScope => None,
+                        ScopeClass::InScope => Some(None),
+                        ScopeClass::Spine => Some(Some(child)),
+                    }
+                }
+            }
+        };
+
         for (_, file) in tree.get_files() {
-            check_leaf(&file.hash, file.item_type, targets, corrupt, referenced, unwalked, reborrow_sink(&mut sink))?;
+            if in_scope(&file.name).is_some() {
+                check_leaf(&file.hash, file.item_type, targets, corrupt, referenced, unwalked, reborrow_sink(&mut sink))?;
+            }
         }
 
         for (_, subtree) in tree.get_subtrees() {
-            tree_queue.push_back(subtree.hash.clone());
+            if let Some(child) = in_scope(&subtree.name) {
+                tree_queue.push_back((subtree.hash.clone(), child));
+            }
         }
     }
 
     Ok(())
+}
+
+/// Whether a root tree holds the metadata folder, by its exact name: every office and meta-tree
+/// pallet's root is built with it. A user tree holds it only if crafted, since load refuses the
+/// name, and is then walked in full. The wider alias match of
+/// [`office_utils::is_metadata_folder_name`] is for working directories: here it would send a user
+/// tree with a legal entry such as `FORKLI~1` down the full walk too.
+fn is_meta_tree_root(tree: &crate::model::tree_item::TreeItem) -> bool {
+    tree.get_subtrees().chain(tree.get_files()).any(|(name, _)| name == FOLDER_NAME_FORKLIFT_ROOT)
+}
+
+/// The trees a closure walk has been through, so it walks each at most once per way it is reached.
+#[derive(Default)]
+struct TreeVisits {
+    /// Trees walked in full: everything beneath one was checked, whatever path reached it.
+    full: HashSet<String>,
+    /// Spine trees of a sparse warehouse, by the path each was walked at. The same tree at another
+    /// path is walked again, because the scope selects different entries there: deduplicating on
+    /// the hash alone would leave an in-scope loss under the second path unchecked.
+    spine: HashSet<(String, String)>,
+}
+
+impl TreeVisits {
+    /// Whether `tree_hash` still needs walking, marking it walked: in full when `spine_path` is
+    /// `None`, otherwise on the spine at that path. A tree already walked in full needs no spine
+    /// walk anywhere.
+    fn first_visit(&mut self, tree_hash: &str, spine_path: Option<&str>) -> bool {
+        match spine_path {
+            None => self.full.insert(tree_hash.to_string()),
+            Some(path) => !self.full.contains(tree_hash) && self.spine.insert((tree_hash.to_string(), path.to_string())),
+        }
+    }
 }
 
 /// Check one leaf entry (a tree's file entry, or a staged shard's item): if its own hash is a
@@ -3150,6 +3258,286 @@ mod tests {
         assert_eq!(absent.len(), 1,
             "nothing beneath the absent boundary may be recorded — it must never be descended \
             into: {:?}", absent);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Store `tree` and a root parcel over it, and point the `namespace` pallet `name` at the parcel.
+    /// Must be called after a `StorageRootScope` is entered. Returns the tree's hash.
+    fn plant_head_over_tree(namespace: pallet_utils::PalletNamespace, name: &str, tree: &crate::model::tree_item::TreeItem) -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+
+        let mut tree_object = LooseObjectBuilder::build_tree(tree);
+        tree_object.store().unwrap();
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some(name.to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::update_pallet_head_in(
+            namespace, name, None, &parcel_object.hash, &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+
+        tree_object.hash.clone()
+    }
+
+    /// A temp storage root for one test, entered for the returned guard's lifetime.
+    fn enter_temp_root(label: &str) -> (PathBuf, crate::globals::StorageRootScope) {
+        let dir = std::env::temp_dir().join(format!("forklift-recovery-utils-{}-{}", label, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&dir);
+        (dir, scope)
+    }
+
+    /// FORK-262: a sparse franchise never fetched the objects outside its scope, so the
+    /// enumerating walk records none of them, while an in-scope loss is still recorded. The root
+    /// holds an out-of-scope file and subtree (both never stored) and an in-scope subtree whose one
+    /// file is never stored. Mutation: walk every entry of a spine tree → the sealed README and
+    /// docs are recorded too → red.
+    #[test]
+    fn a_sparse_enumerating_walk_records_an_in_scope_loss_and_no_sealed_object() {
+        use crate::model::tree_item::TreeItem;
+
+        let (dir, _scope) = enter_temp_root("sparse-sealed");
+        let (readme, docs, lost) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+
+        let mut src = TreeItem::new("src".to_string(), String::new(), DirEntryType::Tree);
+        src.add_child(TreeItem::new("a.txt".to_string(), lost.clone(), DirEntryType::Normal));
+        let mut src_object = crate::builder::object::loose_object_builder::LooseObjectBuilder::build_tree(&src);
+        src_object.store().unwrap();
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("README".to_string(), readme, DirEntryType::Normal));
+        root.add_child(TreeItem::new("docs".to_string(), docs, DirEntryType::Tree));
+        root.add_child(TreeItem::new("src".to_string(), src_object.hash.clone(), DirEntryType::Tree));
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert_eq!(walk.hashes, [lost].into_iter().collect::<BTreeSet<String>>(),
+            "only the in-scope loss may be recorded, never a sealed object outside the scope");
+        assert!(!walk.degraded_sources.iter().any(|note| note.contains("fetch scope")), "{:?}", walk.degraded_sources);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-262: one tree reached at two paths is walked at each, because the scope selects
+    /// different entries there. Tree `T` holds a file `lost` that was never stored, and sits at
+    /// `a` and at `b`. Under each scope below, `a/lost` is out of scope and `b/lost` in scope, and
+    /// `a` is walked first, on the spine. Mutation: deduplicate spine trees on the hash alone →
+    /// `b` is skipped under the second scope, and under the first as well if a spine visit also
+    /// marks the full set → the loss goes unrecorded → red.
+    #[test]
+    fn a_tree_shared_by_two_paths_is_walked_at_each_so_an_in_scope_loss_is_not_masked() {
+        use crate::model::tree_item::TreeItem;
+
+        let (dir, _scope) = enter_temp_root("sparse-shared-tree");
+        let lost = "4".repeat(64);
+
+        let mut shared = TreeItem::new("t".to_string(), String::new(), DirEntryType::Tree);
+        shared.add_child(TreeItem::new("lost".to_string(), lost.clone(), DirEntryType::Normal));
+        let mut shared_object = crate::builder::object::loose_object_builder::LooseObjectBuilder::build_tree(&shared);
+        shared_object.store().unwrap();
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("a".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
+        root.add_child(TreeItem::new("b".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+
+        // `b` in scope whole (spine, then full), and `b` itself on the spine (spine, then spine).
+        for prefixes in [vec!["a/x", "b"], vec!["a/x", "b/lost"]] {
+            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(prefixes.clone())).unwrap();
+            let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+            assert_eq!(walk.hashes, [lost.clone()].into_iter().collect::<BTreeSet<String>>(),
+                "under scope {:?}, the loss at b/lost must be recorded", prefixes);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A meta-shaped root tree, `.forklift/tracked/cells/<lost>`, whose one cell was never stored.
+    /// Must be called after a `StorageRootScope` is entered.
+    fn meta_shaped_tree_with_a_lost_cell(lost: &str) -> crate::model::tree_item::TreeItem {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::tree_item::TreeItem;
+
+        let mut cells = TreeItem::new("cells".to_string(), String::new(), DirEntryType::Tree);
+        cells.add_child(TreeItem::new("cell".to_string(), lost.to_string(), DirEntryType::Normal));
+        let mut cells_object = LooseObjectBuilder::build_tree(&cells);
+        cells_object.store().unwrap();
+        let mut tracked = TreeItem::new("tracked".to_string(), String::new(), DirEntryType::Tree);
+        tracked.add_child(TreeItem::new("cells".to_string(), cells_object.hash.clone(), DirEntryType::Tree));
+        let mut tracked_object = LooseObjectBuilder::build_tree(&tracked);
+        tracked_object.store().unwrap();
+        let mut forklift = TreeItem::new(".forklift".to_string(), String::new(), DirEntryType::Tree);
+        forklift.add_child(TreeItem::new("tracked".to_string(), tracked_object.hash.clone(), DirEntryType::Tree));
+        let mut forklift_object = LooseObjectBuilder::build_tree(&forklift);
+        forklift_object.store().unwrap();
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new(".forklift".to_string(), forklift_object.hash.clone(), DirEntryType::Tree));
+        root
+    }
+
+    /// FORK-262: the fetch scope selects user-pallet content only, so a meta pallet is walked in
+    /// full under any scope. Mutation: drop the meta-tree rule in `walk_tree` → `.forklift` is
+    /// out of scope at the root, and the lost cell is never checked → red.
+    #[test]
+    fn a_sparse_enumerating_walk_still_walks_a_meta_pallet_in_full() {
+        let (dir, _scope) = enter_temp_root("sparse-meta-full");
+        let lost = "5".repeat(64);
+
+        let root = meta_shaped_tree_with_a_lost_cell(&lost);
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &root);
+        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert_eq!(walk.hashes, [lost].into_iter().collect::<BTreeSet<String>>(),
+            "a meta pallet's lost object must be recorded whatever the fetch scope");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-262: a trust pin over a user tree is walked within the fetch scope, even when no
+    /// pallet head reaches its parcel: a scope prune frees what the pin alone reaches outside the
+    /// scope, so a full walk would report it lost for good. Mutation: walk every pinned parcel's
+    /// tree in full → the sealed README is recorded → red.
+    #[test]
+    fn a_trust_pin_no_pallet_reaches_is_walked_within_the_fetch_scope() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+
+        let (dir, _scope) = enter_temp_root("sparse-pin-scoped");
+        let (sealed, lost) = ("7".repeat(64), "8".repeat(64));
+
+        let mut src = TreeItem::new("src".to_string(), String::new(), DirEntryType::Tree);
+        src.add_child(TreeItem::new("a.txt".to_string(), lost.clone(), DirEntryType::Normal));
+        let mut src_object = LooseObjectBuilder::build_tree(&src);
+        src_object.store().unwrap();
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("README".to_string(), sealed, DirEntryType::Normal));
+        root.add_child(TreeItem::new("src".to_string(), src_object.hash.clone(), DirEntryType::Tree));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root);
+        tree_object.store().unwrap();
+        let mut pinned = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_object.hash.clone(), parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        pinned.store().unwrap();
+
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: vec![(pinned.hash.clone(), office_utils::PinAbsencePolicy::Gap)],
+            haul_heads: Vec::new(),
+            shard_referenced: Vec::new(),
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            walk_closure_for(
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), Some(&mut sink),
+            ).unwrap();
+        }
+        assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
+            "a pinned parcel's in-scope loss is recorded, and nothing outside the scope");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-262: whether a tree is walked in full is decided by its shape, never by which root
+    /// reached it. The re-genesis `adopts` pin names office history that no meta head reaches any
+    /// more; walked within the scope, a lost cell of it would go unreported and the taint would
+    /// clear over real loss. Mutation: drop the meta-tree rule in `walk_tree` → red.
+    #[test]
+    fn an_adopts_pin_over_office_history_no_meta_head_reaches_is_walked_in_full() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+
+        let (dir, _scope) = enter_temp_root("sparse-adopts-full");
+        let lost = "9".repeat(64);
+
+        let root = meta_shaped_tree_with_a_lost_cell(&lost);
+        let mut tree_object = LooseObjectBuilder::build_tree(&root);
+        tree_object.store().unwrap();
+        let mut adopted = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_object.hash.clone(), parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        adopted.store().unwrap();
+
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: vec![(adopted.hash.clone(), office_utils::PinAbsencePolicy::Loss)],
+            haul_heads: Vec::new(),
+            shard_referenced: Vec::new(),
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            walk_closure_for(
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), Some(&mut sink),
+            ).unwrap();
+        }
+        assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
+            "the adopted office history's lost cell must be recorded whatever the fetch scope");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-262: only the exact metadata folder name marks a meta tree. A user tree whose root holds
+    /// a legal name the working-directory guard folds onto it (`FORKLI~1`, an NTFS short name) is
+    /// still walked within the scope. Mutation: match with `office_utils::is_metadata_folder_name`
+    /// → the tree is walked in full and the sealed `docs` is recorded → red.
+    #[test]
+    fn a_user_tree_with_a_metadata_folder_alias_is_still_walked_within_the_scope() {
+        use crate::model::tree_item::TreeItem;
+
+        let (dir, _scope) = enter_temp_root("sparse-alias-scoped");
+        let (alias, docs) = ("a".repeat(64), "b".repeat(64));
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("FORKLI~1".to_string(), alias, DirEntryType::Tree));
+        root.add_child(TreeItem::new("docs".to_string(), docs, DirEntryType::Tree));
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert!(walk.hashes.is_empty(), "nothing outside the scope may be recorded: {:?}", walk.hashes);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-262: a fetch scope that cannot be read is a degraded source, so the rescan refuses
+    /// rather than clearing on a walk that cannot tell sealed from lost; the walk itself runs in
+    /// full. Mutation: propagate the read error → `Err` → red; or ignore it and walk in full with
+    /// no note → the degraded assertion reddens.
+    #[test]
+    fn an_unreadable_fetch_scope_is_a_degraded_source_and_the_walk_runs_in_full() {
+        use crate::model::tree_item::TreeItem;
+
+        let (dir, _scope) = enter_temp_root("sparse-unreadable-scope");
+        let sealed = "6".repeat(64);
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("README".to_string(), sealed.clone(), DirEntryType::Normal));
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+        std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert!(walk.degraded_sources.iter().any(|note| note.contains("fetch scope could not be read")),
+            "{:?}", walk.degraded_sources);
+        assert_eq!(walk.hashes, [sealed].into_iter().collect::<BTreeSet<String>>());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4422,7 +4810,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), Some(&mut sink)).unwrap();
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
 
@@ -4483,7 +4871,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         let outcome = {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), Some(&mut sink))
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink))
                 .expect("tag subjects must never abort the walk")
         };
 
@@ -4496,7 +4884,7 @@ mod tests {
         );
 
         let targets: BTreeSet<String> = [absent.clone(), lost_parent.clone()].into_iter().collect();
-        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), None)
+        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), &MaterializationScope::full(), None)
             .expect("the targeted walk runs");
         assert!(
             targeted.referenced.is_empty(),
