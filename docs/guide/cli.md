@@ -592,7 +592,6 @@ forklift history                 # from the current pallet's head, newest first
 forklift history feature         # from another pallet
 forklift history 1a2b3c          # from a parcel (hash prefix, ≥ 4 chars)
 forklift history @office          # the office's audit trail (users & keys — a meta pallet)
-forklift history --class agent    # only parcels an agent authored
 forklift history -n 20            # only the 20 newest parcels (bounded walk)
 forklift history --oneline        # one terse line per parcel: abbreviated hash + subject
 forklift history -n 20 --json                  # a page + a `next` cursor (for agents)
@@ -609,9 +608,9 @@ description's first line (git's `log --oneline`) — and, since it shows no auth
 class, it skips the office read and the display-name resolution the full form does,
 so it is the fastest way to scan history. **Machine authorship is legible:** an author that is an
 agent, bot or service is shown as `[agent, supervised by <human>]`, read from the
-signed office record — so authorship stays forge-proof, and `--class
-<human|agent|bot|service>` filters the log to answer "which parcels did agents write,
-under whose supervision".
+signed office record for the operator the parcel names. `history` does not filter by
+class: "which parcels did agents write, under whose supervision" is `query --class`
+(below), answered from the verified signer.
 
 With `--json`, each entry also carries `parents` — every parent of that parcel, in
 their stored (canonical) order — base-first for a consolidation — `[]` for a root —
@@ -624,9 +623,9 @@ which is what a caller building a graph (rather than just reading a log) walks:
 `history` on a pallet with nothing stacked on it yet fails with the `empty_history`
 error code (exit 19) rather than a generic one.
 
-One trust note: `history --class` reads the **recorded** (self-declared) identity —
+One trust note: the class `history` shows is the **recorded** (self-declared) identity —
 each action in `--json` says so with `"trust": "recorded"`. `query --class` is the
-verified counterpart.
+verified reading.
 
 ### `query` — filter history on signed identity (`q`)
 
@@ -645,8 +644,8 @@ forklift query --where '{"any":[…]}' --json     # full or/not/nesting as a JSO
 ```
 
 The compliance question `history` cannot answer: *"all parcels authored by an agent,
-unsupervised"* — answered **verified**. Where `history --class` trusts what the parcel
-records, `query --class` checks the signature and joins the office off the *verified
+unsupervised"* — answered **verified**. Where `history` shows what the parcel records,
+`query --class` checks the signature and joins the office off the *verified
 signer*; a parcel that merely *claims* a human author but is signed with an agent's
 key matches `--class agent`, and an unsigned parcel matches no identity predicate at
 all (its class is unknowable, and a compliance filter must not guess). Answers carry a
@@ -872,11 +871,14 @@ lifts nothing for `@kv`, lists each such key with both values, and exits 24 (`me
 choose a side per key and lower again:
 
 ```sh
-forklift lower --keep kv:<parcel-hash>/ci=theirs   # take the remote's value
-forklift lower --keep kv:<parcel-hash>/ci=ours     # keep yours, lifted over theirs
+forklift lower --keep @kv:<parcel-hash>/ci=theirs   # take the remote's value
+forklift lower --keep @kv:<parcel-hash>/ci=ours     # keep yours, lifted over theirs
 ```
 
-`theirs` on a bare `kv:<parcel-hash>` takes the remote's side for every key on that parcel.
+`--keep` names the meta pallet with its `@`, as every command does, and the path as the conflict
+names it: a parcel or haul by its full hash, a tag by its name. A bare `kv:` is refused, never
+read as `@kv`. `theirs` on a bare `@kv:<parcel-hash>` takes the remote's side for every key on
+that parcel.
 `theirs` also discards a local change nobody else made, even when the remote never moved: that is
 the way out when `lift` reports a change the remote refuses to admit. It needs the pallet on the
 remote already, since a pallet never lifted has no remote side to keep.
@@ -896,10 +898,10 @@ requires an admin — an authoritative act, which the remote enforces too. Tag n
 **immutable**: a name already in use is refused, and no one, the remote included, can move or
 delete a tag. Tags live on the `@tags` meta pallet, reserving no user pallet name; without a
 revision, `tag create` tags the current pallet's head. If two admins cut the same name
-concurrently, `lower` reports the conflict: `--keep tags:<name>=theirs` drops your tag, and
+concurrently, `lower` reports the conflict: `--keep @tags:<name>=theirs` drops your tag, and
 keeping yours is refused, since that would move theirs. An admin demoted before lifting a tag
 they cut is left holding a tag the remote refuses; `lift` says so, and
-`lower --keep tags:<name>=theirs` drops it the same way, once `@tags` is on the remote.
+`lower --keep @tags:<name>=theirs` drops it the same way, once `@tags` is on the remote.
 
 A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
 or was collected because nothing else referenced it (e.g. after an `undo` moved the only
@@ -1445,12 +1447,13 @@ with a compare-and-swap. When trust is established, the office pallet and trust
 anchor are lifted first (the server verifies every signature before accepting).
 The remote only accepts **fast-forward** updates — no force push.
 
-**Optimistic lift:** if the remote moved and the two changes are cleanly
-mergeable (they touch different files), `lift` **auto-lowers, consolidates and
-retries** on its own — so a fleet of agents stacking to one pallet stops
-serializing through a human. It reports how many times it auto-merged. Only a
-clean warehouse qualifies (the merge materializes), and a **true overlap** (both
-sides edited the same file) still stops with the diverged error (`diverged`, exit 5), leaving
+**Optimistic lift:** if the remote moved and the two changes merge without
+conflicts (different files, or edits to the same file that a three-way merge combines),
+`lift` **auto-lowers, consolidates and retries** on its own — so a fleet of agents
+stacking to one pallet stops serializing through a human. It reports how many times it
+auto-merged. Only a clean warehouse qualifies (the merge materializes), and a
+**conflicting overlap** (changes the three-way merge cannot combine) still stops with
+the diverged error (`diverged`, exit 5), leaving
 the warehouse untouched: palletize the fetched remote head, shift back to your pallet,
 consolidate the new one, and lift the result. A remote holding parcels you have not lowered yet — its head unknown here, or moved
 since you read it — is a different refusal, `remote_ahead` (exit 28): `lower` first, which
@@ -1485,7 +1488,7 @@ again, which uploads it afresh.
 forklift lower
 forklift lower feature              # bring in, or fast-forward, another pallet; this bay stays put
 forklift lower --expect <genesis>   # refuse unless the remote's trust anchor is this one
-forklift lower --keep kv:<hash>/<key>=theirs   # resolve a custom-metadata conflict
+forklift lower --keep @kv:<hash>/<key>=theirs  # resolve a custom-metadata conflict
 ```
 
 Fetches the remote's new parcels for the current pallet and fast-forwards to them

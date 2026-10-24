@@ -397,10 +397,6 @@ pub enum Command {
         /// A pallet name or a parcel hash prefix (default: the current pallet)
         revision: Option<String>,
 
-        /// Show only parcels authored by this identity class: human | agent | bot | service
-        #[arg(long)]
-        class: Option<String>,
-
         /// Show at most this many parcels (newest first) — a bounded walk that never loads
         /// the whole history
         #[arg(long, short = 'n')]
@@ -494,11 +490,13 @@ pub enum Command {
         /// Resolve a metadata conflict: keep ours or theirs at a path (repeatable)
         #[arg(
             long = "keep",
-            value_name = "PALLET:PATH=SIDE",
-            long_help = "Resolve a metadata conflict that a previous lower named. PALLET is the \
-                         metadata pallet (kv), PATH the subject (a full parcel hash) and, \
-                         optionally, the key, as in kv:<subject>/<key>, and SIDE is ours or \
-                         theirs. \"theirs\" drops every local change at or beneath the path; \
+            value_name = "@PALLET:PATH=SIDE",
+            long_help = "Resolve a metadata conflict that a previous lower named. @PALLET is the \
+                         metadata pallet with its @ (@kv, @tags, @manifest or @haul), PATH the \
+                         path the conflict named: on @kv a subject (a full parcel hash) and, \
+                         optionally, the key, as in @kv:<subject>/<key>; on @tags a tag name; on \
+                         @manifest a subject and on @haul a full haul id, each optionally with \
+                         the path beneath it. SIDE is ours or theirs. \"theirs\" drops every local change at or beneath the path; \
                          \"ours\" puts the local value back on top of the remote one, and must \
                          name a conflicted key exactly. \"theirs\" also discards a local change \
                          nobody else made. A resolution naming a path with nothing to resolve is \

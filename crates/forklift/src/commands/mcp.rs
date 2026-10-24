@@ -199,7 +199,16 @@ fn call_tool(params: &Value, state: &ServerState, notify: &mut dyn FnMut(&Value)
     let name = params.get("name").and_then(Value::as_str)
         .ok_or_else(|| JsonRpcError::invalid_params("the tool name is required"))?;
 
-    let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut arguments = params.get("arguments").filter(|value| !value.is_null()).cloned().unwrap_or(json!({}));
+
+    // An argument the tool does not declare, or one of the wrong type, is refused, never
+    // ignored: a dropped filter would answer a broader question than the one asked, still with
+    // ok:true. The provenance keys the server sets itself (below) are the exception: an agent's
+    // value for them is discarded.
+    let server_set: &[&str] = if name == "manifest_provenance" { &["tool", "session"] } else { &[] };
+    if let Some(reason) = argument_refusal(name, &arguments, server_set) {
+        return Err(JsonRpcError::invalid_params(&reason));
+    }
 
     // Provenance hardening (§7.2): the `tool` and `session` are set from this MCP connection,
     // overriding anything the agent supplied — the harness identifies the tool, not the
@@ -776,10 +785,6 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             if let Some(revision) = string_arg("revision") {
                 args.push(revision);
             }
-            if let Some(class) = string_arg("class") {
-                args.push("--class".to_string());
-                args.push(class);
-            }
             // Bounded, cursor-pageable walk: `limit` caps the page, and `after` (the
             // `next` cursor from a previous page's data) resumes — so an agent reads
             // history in batches instead of the whole graph.
@@ -799,15 +804,15 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             }
             for flag in [
                 "from", "class", "supervisor", "signer", "grep", "model", "tool", "tag",
-                "touches", "where", "after",
+                "touches", "after",
             ] {
                 if let Some(value) = string_arg(flag) {
                     args.push(format!("--{}", flag));
                     args.push(value);
                 }
             }
-            // The predicate tree may also arrive as a JSON object (the natural MCP form);
-            // it is re-serialized into the same --where the CLI takes.
+            // The predicate tree arrives as a JSON object (the natural MCP form; the schema refuses
+            // any other); it is re-serialized into the same --where the CLI takes.
             if let Some(predicate) = arguments.get("where").filter(|value| value.is_object()) {
                 args.push("--where".to_string());
                 args.push(predicate.to_string());
@@ -1142,6 +1147,7 @@ fn tool_definitions() -> Value {
         "type": "object",
         "properties": properties,
         "required": required,
+        "additionalProperties": false,
     });
 
     let string = json!({ "type": "string" });
@@ -1161,9 +1167,9 @@ fn tool_definitions() -> Value {
             object(json!({ "path": string }), json!(["path"]))),
         tool("diff", "Show changed files. Default: working directory vs inventory. staged=true: inventory vs head. targets: two revisions to compare, optionally plus a path.",
             object(json!({ "staged": boolean, "targets": { "type": "array", "items": string } }), json!([]))),
-        tool("history", "Walk the parcel history newest first from a revision (default: the current pallet). Read it in pages with limit (max parcels) plus after (the data.next cursor from the previous page); class filters by author identity class (human|agent|bot|service).",
-            object(json!({ "revision": string, "class": string, "limit": integer, "after": string }), json!([]))),
-        tool("query", "Query parcel history on its signed dimensions - identity class, supervisor, signing key, recorded machine-authorship provenance (model/tool), signed tags - plus parcel facts (dates, description glob, merge-ness, touched paths). Identity answers are verified by default (the signature is checked; the office is joined off the verified signer, never the parcel's own claim); recorded=true opts into the cheap self-declared reading, labeled. A signed-revoked match carries signer.boundary - vouched (inside the revocation's vouched history), suspect (outside it: a forged backdate, or the key's holder kept signing after the revocation), or unresolved (a partial clone is missing one of the boundary's heads, so the question cannot be answered here - never treat this as suspect) - filterable via a where leaf on signer.boundary (values vouched or suspect only). A parcel with no provenance recorded at all never matches model/tool in either direction; an untagged parcel plainly does not carry tag. touches compares against the first parent only, so a merge whose result at the path already matches its first parent does not match even if its other parent touched it. Compose or/not/nesting via `where` (a JSON predicate tree: {all|any|not} over {field,op,value}). Scope the walk with revision and from - that, not limit, bounds verification work. Page with limit plus after (the data.next cursor).",
+        tool("history", "Walk the parcel history newest first from a revision (default: the current pallet). Read it in pages with limit (max parcels) plus after (the data.next cursor from the previous page). To filter by author identity class, use query.",
+            object(json!({ "revision": string, "limit": integer, "after": string }), json!([]))),
+        tool("query", "Query parcel history on its signed dimensions - identity class, supervisor, signing key, recorded machine-authorship provenance (model/tool), signed tags - plus parcel facts (dates, description glob, merge-ness, touched paths). Identity answers are verified by default (the signature is checked; the office is joined off the verified signer, never the parcel's own claim); recorded=true opts into the cheap self-declared reading, labeled. A signed-revoked match carries signer.boundary - vouched (inside the revocation's vouched history), suspect (outside it: a forged backdate, or the key's holder kept signing after the revocation), or unresolved (a partial clone is missing a boundary head or an ancestor of one, so the question cannot be answered here - never treat this as suspect) - filterable via a where leaf on signer.boundary (values vouched or suspect only). A parcel with no provenance recorded at all never matches model/tool in either direction; an untagged parcel plainly does not carry tag. touches compares against the first parent only, so a merge whose result at the path already matches its first parent does not match even if its other parent touched it. Compose or/not/nesting via `where` (a JSON predicate tree: {all|any|not} over {field,op,value}). Scope the walk with revision and from - that, not limit, bounds verification work. Page with limit plus after (the data.next cursor).",
             object(json!({ "revision": string, "from": string, "class": string, "unsupervised": boolean, "supervisor": string, "signer": string, "grep": string, "model": string, "tool": string, "tag": string, "touches": string, "recorded": boolean, "merges": boolean, "no_merges": boolean, "where": { "type": "object" }, "limit": integer, "after": string }), json!([]))),
         tool("conflicts", "List the files an unresolved consolidation left in conflict, with each side as a content address.",
             object(json!({}), json!([]))),
@@ -1193,7 +1199,7 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("lift", "Push the current pallet's new parcels to the configured remote.",
             object(json!({}), json!([]))),
-        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged @kv replays the local changes onto the remote's; keys both sides changed refuse with meta_conflict (exit 24, every path and both sides in error.details) until each is resolved with a keep entry \"kv:<subject>/<key>=ours|theirs\".",
+        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged meta pallet (@kv, @tags, @manifest, @haul) replays the local changes onto the remote's; paths both sides changed refuse with meta_conflict (exit 24, every pallet, path and both sides in error.details) until each is resolved with a keep entry \"@<pallet>:<path>=ours|theirs\", the pallet as details names it, e.g. \"@kv:<subject>/<key>=theirs\".",
             object(json!({ "expect": string, "keep": { "type": "array", "items": string } }), json!([]))),
         tool("office_list", "List the enrolled operators and their keys.",
             object(json!({}), json!([]))),
@@ -1262,6 +1268,63 @@ fn tool_definitions() -> Value {
         tool("haul_reopen", "Reopen a closed merge proposal.",
             object(json!({ "id": string }), json!(["id"]))),
     ])
+}
+
+/// Why the named tool refuses these arguments, if it does: they are not a JSON object, or an
+/// argument is one its input schema does not declare (and `server_set` does not name), or a
+/// declared argument's value does not have the declared type. A null value is an omitted
+/// argument (harnesses fill unset optionals with it) and `build_args` reads it as absent. An
+/// unknown tool declares nothing to check against; `build_args` refuses it on its own.
+fn argument_refusal(name: &str, arguments: &Value, server_set: &[&str]) -> Option<String> {
+    static DEFINITIONS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    let properties = DEFINITIONS.get_or_init(tool_definitions).as_array()?.iter()
+        .find(|definition| definition["name"] == name)?
+        .pointer("/inputSchema/properties")?
+        .as_object()?;
+
+    let Some(arguments) = arguments.as_object() else {
+        return Some(format!("the \"{}\" tool's arguments must be a JSON object", name));
+    };
+
+    let mut given = arguments.iter().filter(|(_, value)| !value.is_null());
+    given.find_map(|(key, value)| match properties.get(key) {
+        None if server_set.contains(&key.as_str()) => None,
+        None => Some(format!("the \"{}\" tool takes no \"{}\" argument", name, key)),
+        Some(schema) if !matches_schema(value, schema) => Some(format!(
+            "the \"{}\" tool's \"{}\" argument must be {}", name, key, describe_schema(schema)
+        )),
+        Some(_) => None,
+    })
+}
+
+/// A property's type in words, for a refusal ("a string", "an array of strings", "an integer of
+/// at least 1").
+fn describe_schema(schema: &Value) -> String {
+    match schema["type"].as_str() {
+        Some("array") => format!("an array of {}s", describe_schema(&schema["items"]).trim_start_matches("a ")),
+        Some("integer") => match schema["minimum"].as_u64() {
+            Some(minimum) => format!("an integer of at least {}", minimum),
+            None => "an integer".to_string(),
+        },
+        Some("object") => "an object".to_string(),
+        Some(kind) => format!("a {}", kind),
+        None => "any value".to_string(),
+    }
+}
+
+/// Whether a value has the type a tool property declares (with an array's item type and an
+/// integer's minimum). A property with no type accepts anything.
+fn matches_schema(value: &Value, schema: &Value) -> bool {
+    match schema["type"].as_str() {
+        Some("string") => value.is_string(),
+        Some("boolean") => value.is_boolean(),
+        Some("object") => value.is_object(),
+        Some("integer") => value.as_u64()
+            .is_some_and(|number| schema["minimum"].as_u64().is_none_or(|minimum| number >= minimum)),
+        Some("array") => value.as_array()
+            .is_some_and(|items| items.iter().all(|item| matches_schema(item, &schema["items"]))),
+        _ => true,
+    }
 }
 
 /// One tool definition.
@@ -1659,9 +1722,44 @@ mod tests {
         assert_eq!(args("kv_log", json!({ "revision": "main", "key": "ci" })), ["kv", "log", "main", "ci"]);
         assert_eq!(args("kv_unset", json!({ "revision": "main", "key": "ci" })), ["kv", "unset", "main", "ci"]);
         assert_eq!(args("kv_list", json!({})), ["kv", "list"]);
-        assert_eq!(args("lower", json!({ "keep": ["kv:a/b=ours", "kv:c=theirs"] })),
-                   ["lower", "--keep", "kv:a/b=ours", "--keep", "kv:c=theirs"]);
+        assert_eq!(args("lower", json!({ "keep": ["@kv:a/b=ours", "@kv:c=theirs"] })),
+                   ["lower", "--keep", "@kv:a/b=ours", "--keep", "@kv:c=theirs"]);
         assert!(super::build_args("kv_get", &json!({ "revision": "main" })).is_err(), "key is required");
+    }
+
+    #[test]
+    fn an_argument_the_tool_does_not_declare_or_of_the_wrong_type_is_refused() {
+        let refused = |name: &str, arguments: serde_json::Value| super::argument_refusal(name, &arguments, &[]);
+
+        assert!(refused("history", json!({ "class": "agent", "limit": 5 })).unwrap().contains("\"class\""));
+        assert_eq!(refused("query", json!({ "class": "agent", "limit": 5 })), None);
+        assert_eq!(refused("history", json!({})), None);
+        assert_eq!(super::argument_refusal("manifest_provenance", &json!({ "tool": "t" }), &["tool"]), None);
+
+        // A declared argument of the wrong type would otherwise be dropped just the same.
+        for (name, arguments) in [
+            ("query", json!({ "class": ["agent"] })),
+            ("query", json!({ "where": "{}" })),
+            ("lower", json!({ "expect": 123 })),
+            ("lower", json!({ "keep": ["@kv:a=ours", 1] })),
+            ("bay_add", json!({ "name": "b", "scope": "src" })),
+            ("history", json!({ "limit": "5" })),
+            ("history", json!({ "limit": 0 })),
+            ("stocktake", json!({ "summary": "yes" })),
+            ("history", json!(["class", "agent"])),
+        ] {
+            assert!(refused(name, arguments.clone()).is_some(), "{} {} must be refused", name, arguments);
+        }
+        assert_eq!(refused("query", json!({ "where": { "field": "class", "op": "eq", "value": "agent" } })), None);
+        assert_eq!(refused("lower", json!({ "keep": ["@kv:a=ours"] })), None);
+
+        // A null is an omitted optional, which build_args reads as absent: nothing is dropped.
+        assert_eq!(refused("history", json!({ "revision": null, "limit": null, "after": null })), None);
+        assert_eq!(refused("lower", json!({ "expect": null, "keep": null })), None);
+        assert_eq!(refused("history", json!({ "limit": "5" })).unwrap(),
+                   "the \"history\" tool's \"limit\" argument must be an integer of at least 1");
+        assert_eq!(refused("lower", json!({ "keep": "x" })).unwrap(),
+                   "the \"lower\" tool's \"keep\" argument must be an array of strings");
     }
 
     #[test]

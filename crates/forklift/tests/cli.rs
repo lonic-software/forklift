@@ -4452,6 +4452,26 @@ fn manifest_provenance_records_forge_proof_machine_authorship() {
 }
 
 #[test]
+fn mcp_refuses_an_argument_the_tool_does_not_declare() {
+    let warehouse = TestWarehouse::new("mcp-undeclared");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // `history` has no class filter: dropping the argument would answer a broader question
+    // than the one asked, so the call is refused instead.
+    let input = format!(
+        "{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"history","arguments":{"class":"agent"}}}"#,
+    );
+    let output = warehouse.run_with_stdin(&["mcp"], &input);
+    let call = stdout(&output).lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|message| message["id"] == 2)
+        .expect("a reply to the history call");
+    assert!(call["error"]["message"].as_str().unwrap_or("").contains("\"class\""), "{}", call);
+}
+
+#[test]
 fn mcp_provenance_takes_tool_and_session_from_the_connection_not_the_agent() {
     let warehouse = TestWarehouse::new("provenance-origin");
     warehouse.write_file("a.txt", "one\n");
@@ -5894,7 +5914,7 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
 }
 
 #[test]
-fn history_shows_and_filters_by_identity_class() {
+fn history_shows_identity_class_and_query_filters_by_it() {
     let warehouse = TestWarehouse::new("history-class");
     warehouse.write_file("a.txt", "v1\n");
     assert_success(&warehouse.run(&["prepare"]));
@@ -5918,15 +5938,22 @@ fn history_shows_and_filters_by_identity_class() {
     let history = stdout(&warehouse.run(&["history"]));
     assert!(history.contains("[agent, supervised by test@forklift]"), "unexpected: {}", history);
 
-    // Filtering by class answers "which parcels did agents write".
-    let agents = stdout(&warehouse.run(&["history", "--class", "agent"]));
+    // History shows the recorded class but does not filter on it: "which parcels did agents
+    // write" is `query --class`, answered from the verified signer.
+    assert!(!warehouse.run(&["history", "--class", "agent"]).status.success(),
+            "history has no class filter");
+    let agents = stdout(&warehouse.run(&["query", "--class", "agent"]));
     assert!(agents.contains("agent work") && !agents.contains("human work"), "unexpected: {}", agents);
 
-    let humans = stdout(&warehouse.run(&["history", "--class", "human"]));
-    assert!(humans.contains("human work") && !humans.contains("agent work"), "unexpected: {}", humans);
+    // The human parcel predates the office, so it is unsigned: the verified reading matches no
+    // class for it, while the labeled recorded reading still names its human author.
+    let humans = stdout(&warehouse.run(&["query", "--class", "human"]));
+    assert!(!humans.contains("human work") && !humans.contains("agent work"), "unexpected: {}", humans);
+    let recorded = stdout(&warehouse.run(&["query", "--recorded", "--class", "human"]));
+    assert!(recorded.contains("human work") && !recorded.contains("agent work"), "unexpected: {}", recorded);
 
     // An unknown class is rejected.
-    assert!(!warehouse.run(&["history", "--class", "robot"]).status.success());
+    assert!(!warehouse.run(&["query", "--class", "robot"]).status.success());
 }
 
 #[test]

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
 use forklift_core::error::sanitize;
 use forklift_core::model::parcel::Parcel;
-use forklift_core::util::office_utils::{IdentityClass, OfficeState};
+use forklift_core::util::office_utils::OfficeState;
 use forklift_core::util::{object_utils, office_utils, pallet_utils, remote_utils};
 use crate::output::{self, CommandOutput};
 
@@ -18,12 +18,13 @@ use crate::output::{self, CommandOutput};
 /// Parcels are ordered by their latest action timestamp; the parents of a consolidation
 /// are interleaved the same way (each parcel is printed once).
 ///
-/// With `--class`, only parcels authored by an identity of that class are shown ("which
-/// parcels did agents write", §7.1) — a display pass over the signed office records.
+/// Each entry shows its operators' identity classes as recorded (`trust: "recorded"`). There
+/// is no class filter here: `query --class` answers "which parcels did agents write" from the
+/// verified signer, and a filter of the same name over the recorded identity would read as
+/// the same guarantee.
 ///
 /// # Arguments
 /// * `revision` - The revision to start from (`None` starts at the current pallet's head).
-/// * `class`    - When set, keep only parcels an identity of this class authored.
 /// * `limit`    - When set, stop after this many parcels are shown. Because the walk yields
 ///                parcels newest-first, a limit loads only the newest `limit` parcels and
 ///                their frontier — not the whole history (git log's default-recency behavior).
@@ -34,14 +35,12 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - If the history was printed.
 /// * `Err(String)` - If the revision cannot be resolved or a parcel could not be read.
-pub async fn handle_command(revision: Option<String>, class: Option<String>, limit: Option<usize>, after: Option<String>, oneline: bool) -> Result<(), String> {
-    let class_filter = class.map(|value| IdentityClass::parse(&value)).transpose()?;
-
+pub async fn handle_command(revision: Option<String>, limit: Option<usize>, after: Option<String>, oneline: bool) -> Result<(), String> {
     // The terse human form (`--oneline`) prints only the abbreviated hash and subject, so it
-    // needs neither display names nor — unless it is also filtering by class — the office. That
-    // lets it skip the display-name resolution (a network round-trip) and the office read
-    // entirely, which is much of what the verbose walk spends per parcel. It is a human render,
-    // so `--json` (the machine format) ignores it.
+    // needs neither display names nor the office. That lets it skip the display-name
+    // resolution (a network round-trip) and the office read entirely, which is much of what the
+    // verbose walk spends per parcel. It is a human render, so `--json` (the machine format)
+    // ignores it.
     let terse = oneline && !output::is_json();
 
     // Display names, resolved through the configured remote (server-mediated per
@@ -55,9 +54,9 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
 
     // The office maps an operator to their signed identity class (§7.1); best-effort, so
     // a warehouse without trust simply shows no classes. Authorship stays forge-proof —
-    // this only *reads* the class already recorded. Terse output shows no class, so it reads
-    // the office only when a `--class` filter needs it.
-    let office = if terse && class_filter.is_none() {
+    // this only *reads* the class already recorded. Terse output shows no class, so it never
+    // reads the office.
+    let office = if terse {
         OfficeState { users: Vec::new(), keys: Vec::new() }
     } else {
         office_utils::read_office_state()
@@ -100,7 +99,7 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
     }
 
     if terse {
-        return render_terse(heap, loaded, enqueued, class_filter, &office, limit);
+        return render_terse(heap, loaded, enqueued, limit);
     }
 
     // Human output streams entry-by-entry, so a quit pager or a closed `| head` stops the
@@ -118,25 +117,21 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
         let parcel = loaded.remove(&hash).expect("every heap entry has its parcel loaded");
         let entry = HistoryEntry::of(&hash, &parcel, &names, &office);
 
-        // The filter decides which parcels are shown, never which are walked.
-        if class_filter.is_none_or(|class| entry.matches_class(class)) {
-            match sink.as_mut() {
-                // A write error means the reader (pager / pipe) went away: stop cleanly.
-                Some(out) => {
-                    if entry.render(out, shown == 0).is_err() { return Ok(()); }
-                    shown += 1;
+        match sink.as_mut() {
+            // A write error means the reader (pager / pipe) went away: stop cleanly.
+            Some(out) => {
+                if entry.render(out, shown == 0).is_err() { return Ok(()); }
+                shown += 1;
 
-                    // Flushed every 16 entries (not just at the end): otherwise a filtering
-                    // walk (`--class`, few matches over many parcels) looks hung under the
-                    // 256KiB buffer, and a reader that goes away (`| head`, a closed pager)
-                    // is only noticed once the buffer fills. A failed flush is a write error
-                    // like any other: stop cleanly the same way.
-                    if shown % 16 == 0 && out.flush().is_err() { return Ok(()); }
-                }
-                None => {
-                    entries.push(entry);
-                    shown += 1;
-                }
+                // Flushed every 16 entries (not just at the end): otherwise a reader that
+                // goes away (`| head`, a closed pager) is only noticed once the 256KiB
+                // buffer fills. A failed flush is a write error like any other: stop
+                // cleanly the same way.
+                if shown % 16 == 0 && out.flush().is_err() { return Ok(()); }
+            }
+            None => {
+                entries.push(entry);
+                shown += 1;
             }
         }
 
@@ -174,15 +169,13 @@ pub async fn handle_command(revision: Option<String>, class: Option<String>, lim
 }
 
 /// The terse walk (`--oneline`): one line per parcel — the abbreviated hash and the
-/// description's first line — streamed newest-first. It builds no `HistoryEntry` and touches the
-/// office only when a `--class` filter needs it, so the per-parcel cost is a parcel read and a
-/// short write, nothing more. Consumes the seeded walk state (heap/loaded/enqueued).
+/// description's first line — streamed newest-first. It builds no `HistoryEntry` and never
+/// touches the office, so the per-parcel cost is a parcel read and a short write, nothing more.
+/// Consumes the seeded walk state (heap/loaded/enqueued).
 fn render_terse(
     mut heap: BinaryHeap<(i64, String)>,
     mut loaded: HashMap<String, Parcel>,
     mut enqueued: HashSet<String>,
-    class_filter: Option<IdentityClass>,
-    office: &OfficeState,
     limit: Option<usize>,
 ) -> Result<(), String> {
     /// How many leading hash characters the terse form prints (git abbreviates similarly).
@@ -196,28 +189,21 @@ fn render_terse(
     while let Some((_, hash)) = heap.pop() {
         let parcel = loaded.remove(&hash).expect("every heap entry has its parcel loaded");
 
-        // A class filter is rare with --oneline; only then is the (heavier) class lookup done.
-        let show = class_filter.is_none_or(|class| {
-            HistoryEntry::of(&hash, &parcel, &BTreeMap::new(), office).matches_class(class)
-        });
+        let subject = parcel.description.as_deref()
+            .and_then(|description| description.lines().next())
+            .unwrap_or("");
+        let abbrev = &hash[..hash.len().min(ABBREV)];
+        // A write error means the reader (a pager, a `| head`) went away: stop cleanly.
+        if writeln!(out, "\x1b[33m{}\x1b[0m {}", abbrev, sanitize(subject)).is_err() {
+            return Ok(());
+        }
+        shown += 1;
 
-        if show {
-            let subject = parcel.description.as_deref()
-                .and_then(|description| description.lines().next())
-                .unwrap_or("");
-            let abbrev = &hash[..hash.len().min(ABBREV)];
-            // A write error means the reader (a pager, a `| head`) went away: stop cleanly.
-            if writeln!(out, "\x1b[33m{}\x1b[0m {}", abbrev, sanitize(subject)).is_err() {
-                return Ok(());
-            }
-            shown += 1;
-
-            // Flushed every 128 lines: --oneline is one short line per parcel, so the buffer
-            // would otherwise take a long walk to fill — same "stop cleanly" handling as a
-            // failed write above.
-            if shown % 128 == 0 && out.flush().is_err() {
-                return Ok(());
-            }
+        // Flushed every 128 lines: --oneline is one short line per parcel, so the buffer
+        // would otherwise take a long walk to fill — same "stop cleanly" handling as a
+        // failed write above.
+        if shown % 128 == 0 && out.flush().is_err() {
+            return Ok(());
         }
 
         enqueue_parents(&parcel, &mut heap, &mut loaded, &mut enqueued)?;
@@ -316,9 +302,8 @@ pub(crate) struct HistoryAction {
     supervisor: Option<String>,
 
     /// Always "recorded": history reads the identity the parcel itself records (and joins
-    /// the office off it) without verifying the signature. `query --class` is the verified
-    /// counterpart — same flag word, different trust tier, stamped here so no consumer can
-    /// mistake one for the other.
+    /// the office off it) without verifying the signature. `query --class` gives the verified
+    /// reading; the tier is stamped here so no consumer can mistake one for the other.
     trust: &'static str,
 
     /// The action time. Serialized as RFC 3339 (UTC) for `--json`; formatted directly for
@@ -372,13 +357,6 @@ impl HistoryEntry {
             actions,
             description: parcel.description.clone(),
         }
-    }
-
-    /// Whether any action of this parcel was performed by an identity of the given class
-    /// (an operator with no recorded class reads as a human).
-    fn matches_class(&self, class: IdentityClass) -> bool {
-        self.actions.iter()
-            .any(|action| action.class.as_deref().unwrap_or("human") == class.as_str())
     }
 }
 

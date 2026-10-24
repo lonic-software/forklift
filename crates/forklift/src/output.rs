@@ -433,11 +433,11 @@ error_codes! {
     /// alone, so it is classified here directly rather than as a `forklift-core` `RefusalCode`.
     EmptyHistory,
 
-    /// `stack` or `park` refused because a `load` that never finished cleanly is still recorded
-    /// (`load_guard_utils`), or a command that changes the bay or commits staged content refused
-    /// because an operation that rewrites the whole staging area was interrupted
-    /// (`operation_utils`): committing the staged inventory now could silently produce an
-    /// incomplete result.
+    /// `stack`, `park`, `consolidate` or `cherry-pick` refused because a `load` that never
+    /// finished cleanly is still recorded (`load_guard_utils`), or a command that changes the
+    /// bay or commits staged content refused because an operation that rewrites the whole
+    /// staging area was interrupted (`operation_utils`): committing the staged inventory now
+    /// could silently produce an incomplete result.
     IncompleteLoad,
 
     /// The automatic entry-heal (`heal_utils`) hit a durability taint it could not resolve on its
@@ -608,9 +608,9 @@ impl ErrorCode {
             ErrorCode::EmptyHistory =>
                 "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
             ErrorCode::IncompleteLoad =>
-                "\"stack\" or \"park\" refused because a \"load\" that never finished cleanly is \
-                 still recorded, or a command refused because an operation that rewrites the whole \
-                 staging area was interrupted (\"forklift heal\" finishes or undoes it)",
+                "\"stack\", \"park\", \"consolidate\" or \"cherry-pick\" refused because a \
+                 \"load\" that never finished cleanly is still recorded, or a command refused \
+                 because an operation that rewrites the whole staging area was interrupted (\"forklift heal\" finishes or undoes it)",
             ErrorCode::DurabilityTaint =>
                 "A durability taint could not be auto-healed (a vanished, unreadable, or \
                  corrupt path, or a torn taint record)",
