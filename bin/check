@@ -18,7 +18,7 @@ echo "── cargo test --workspace"
 cargo test --workspace
 
 echo "── cargo clippy --workspace (report-only, like CI)"
-cargo clippy --workspace || true
+cargo clippy --workspace --all-targets || true
 
 echo "── docs freshness (bin/gen-docs)"
 # Regenerate into a scratch directory (never touching docs/generated in place) and diff —

@@ -13,6 +13,7 @@
 # std::fs::rename: every rename goes through file_utils::rename (or rename_no_replace), which
 # retries while another process's handle blocks it on Windows.
 disallowed-methods = [
+    { path = "tokio::fs::rename", reason = "use file_utils::rename (or rename_no_replace), on a blocking thread if need be; tokio's rename does not retry a rename an open handle blocks on Windows" },
     { path = "std::fs::rename", reason = "use file_utils::rename (or rename_no_replace), which retries a rename another process's open handle blocks on Windows (an editor, indexer or antivirus holding the source, the target, or a file in a renamed folder)" },
     { path = "zstd::stream::decode_all", reason = "unbounded decode of untrusted bytes; use object_utils::decode_object_bounded unless reading back bytes this store itself wrote — allow per-site with a justification" },
     { path = "zstd::stream::read::Decoder::new", reason = "every zstd decoder of untrusted bytes is built by object_utils::bounded_zstd_decoder / bounded_zstd_dictionary_decoder, which bound the frame window (a frame can otherwise make its decoder hold up to 128 MiB)" },
