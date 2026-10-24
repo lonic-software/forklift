@@ -190,6 +190,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
     )?;
 
     let mut roots: Vec<String> = sources.parcels;
+    roots.extend(sources.meta_heads);
     roots.extend(sources.haul_heads);
     roots.extend(sources.pin_parcels.into_iter().map(|(hash, _policy)| hash));
 

@@ -2407,6 +2407,36 @@ fn a_regenesis_lifted_to_a_fresh_remote_carries_its_adopted_history() {
         healed.status.code(), stderr(&healed));
 }
 
+/// FORK-262: a sparse franchise never fetched what lies outside its scope, so heal's torn-taint
+/// rescan must not record those sealed objects as vanished. Signing is on, so the walk also
+/// starts from the trust pins and the meta pallets.
+#[test]
+fn a_torn_taint_in_a_sparse_franchise_heals_over_its_sealed_objects() {
+    let area = TestArea::new("sparse-torn-heal");
+    let server = Server::start(&area, Some("root"));
+
+    prepare_warehouse(&area, "dev", &server.url);
+    assert_success(&area.forklift("dev", &["config", "remote.token", "root"]));
+    area.write_file("dev/README", "readme\n");
+    area.write_file("dev/src/a.txt", "a\n");
+    area.write_file("dev/docs/guide.md", "guide\n");
+    area.write_file("dev/docs/deep/notes.md", "notes\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--token", "root", "--only", "src"]));
+    plant_torn_taint(&area, "sparse");
+    let healed = area.forklift("sparse", &["--json", "heal"]);
+    assert!(healed.status.success(),
+        "heal must clear over the sealed objects of a sparse franchise: {:?}\n{}\n{}",
+        healed.status.code(), stdout(&healed), stderr(&healed));
+    assert!(!area.path("sparse/.forklift/taint").exists()
+        || std::fs::read_dir(area.path("sparse/.forklift/taint")).unwrap().next().is_none(),
+        "the taint must be cleared, not replaced by a remainder");
+}
+
 /// FORK-114: the server refuses a first anchor whose `adopts` names history it does not hold —
 /// it would be a pin it can never serve — and stores nothing.
 #[test]
