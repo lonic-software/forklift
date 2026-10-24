@@ -361,8 +361,69 @@ pub fn sync_tree(dir: &Path) -> Result<(), String> {
     sync_dir(dir)
 }
 
+/// How long [`rename`] and [`rename_no_replace`] keep retrying a rename that another process's
+/// handle is blocking, and the first and longest delay between attempts (the delay doubles).
+const HELD_RENAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+const HELD_RENAME_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
+const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `std::fs::rename`, retried while another process's open handle blocks it. Every rename in the
+/// workspace goes through here or [`rename_no_replace`]; clippy refuses a bare `std::fs::rename`.
+///
+/// On Windows, a rename fails while any other process holds the source or the target open
+/// without `FILE_SHARE_DELETE` — an editor, a search indexer or an antivirus scanner reading the
+/// file — and also while one holds a file inside a folder being renamed. Those holds are usually
+/// brief, so the rename is retried with a doubling delay for up to [`HELD_RENAME_DEADLINE`]. A
+/// failed attempt moves nothing, so a retry starts from the state the first attempt saw. Any other
+/// error returns at once, and a hold that outlasts the deadline returns its last error unchanged.
+/// On Unix an open handle never blocks a rename, and this is a plain `std::fs::rename`.
+pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
+    retry_while_held(|| std::fs::rename(from, to), is_held_by_another_process)
+}
+
+/// Whether a failed rename was refused because another process holds a handle that forbids it.
+/// Windows reports a hold on the target as `ERROR_ACCESS_DENIED` and one on the source (which the
+/// rename must open for delete) as `ERROR_SHARING_VIOLATION`; `ERROR_LOCK_VIOLATION` is a byte-range
+/// lock. `ERROR_ACCESS_DENIED` is also a genuine permission refusal, which a retry cannot help:
+/// that case costs [`HELD_RENAME_DEADLINE`] before failing with the same error.
+#[cfg(windows)]
+fn is_held_by_another_process(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    matches!(
+        error.raw_os_error().map(|code| code as u32),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    )
+}
+
+#[cfg(not(windows))]
+fn is_held_by_another_process(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Run `attempt` until it succeeds, fails with an error `is_held` rejects, or
+/// [`HELD_RENAME_DEADLINE`] has passed since the first attempt; the result is the last attempt's.
+fn retry_while_held<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+    is_held: impl Fn(&std::io::Error) -> bool,
+) -> std::io::Result<T> {
+    let started = std::time::Instant::now();
+    let mut delay = HELD_RENAME_FIRST_DELAY;
+
+    loop {
+        match attempt() {
+            Err(error) if is_held(&error) && started.elapsed() < HELD_RENAME_DEADLINE => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(HELD_RENAME_MAX_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Rename `from` to `to` only if nothing stands at `to`; otherwise fail with `AlreadyExists` and
-/// leave both alone. Atomic where the platform offers it (`renamex_np` with `RENAME_EXCL` on
+/// leave both alone. A rename another process's handle blocks is retried as [`rename`] retries it. Atomic where the platform offers it (`renamex_np` with `RENAME_EXCL` on
 /// macOS, `renameat2` with `RENAME_NOREPLACE` on Linux, `MoveFileExW` without
 /// `MOVEFILE_REPLACE_EXISTING` on Windows). On another Unix, and on a volume that refuses the flag,
 /// a check runs just before a plain rename, so an empty folder created between the two is replaced.
@@ -376,15 +437,15 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         let wide = |path: &Path| path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
         let (w_from, w_to) = (wide(from), wide(to));
 
-        if unsafe { MoveFileExW(w_from.as_ptr(), w_to.as_ptr(), 0) } != 0 {
-            return Ok(());
-        }
+        let moved = retry_while_held(|| match unsafe { MoveFileExW(w_from.as_ptr(), w_to.as_ptr(), 0) } {
+            0 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        }, is_held_by_another_process);
 
-        let error = std::io::Error::last_os_error();
-
-        return match error.raw_os_error().map(|code| code as u32) {
-            Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
-            _ => Err(error),
+        return match moved {
+            Err(error) if matches!(error.raw_os_error().map(|code| code as u32), Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS)) =>
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+            moved => moved,
         };
     }
 
@@ -417,7 +478,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 
     #[cfg(not(windows))]
     match std::fs::symlink_metadata(to) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(from, to),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => rename(from, to),
         Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
         Err(e) => Err(e),
     }
@@ -894,7 +955,7 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 
     write_and_sync_file(&temporary_file_path, content)?;
 
-    std::fs::rename(&temporary_file_path, file_path).map_err(|e|
+    rename(&temporary_file_path, file_path).map_err(|e|
         format!("Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e)
     )?;
 
@@ -1000,7 +1061,7 @@ fn publish_replacement(file_path: &Path, content: &[u8], sync: bool) -> Result<(
     let temporary_file_path = temporary_file_path.as_path();
 
     let written = write_replacement(file, temporary_file_path, file_path, content, sync).and_then(|()|
-        std::fs::rename(temporary_file_path, file_path).map_err(|e| format!(
+        rename(temporary_file_path, file_path).map_err(|e| format!(
             "Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e
         ))
     );
@@ -1239,7 +1300,7 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     // became visible at all).
     let mut renamed_finals: Vec<&Path> = Vec::new();
     for (temp, final_path) in pending {
-        if let Err(e) = std::fs::rename(temp, final_path) {
+        if let Err(e) = rename(temp, final_path) {
             let rename_error = format!(
                 "Error while moving file into place at \"{}\": {}", final_path.to_string_lossy(), e
             );
@@ -3801,6 +3862,198 @@ fn get_regex_for_pattern(pattern: &str) -> Result<Regex, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A distinguishable error for the retry tests: raw code 7 is no error Windows reports for a
+    /// held file, so only the test's own classifier calls it held.
+    fn held() -> std::io::Error {
+        std::io::Error::from_raw_os_error(7)
+    }
+
+    /// A rename refused by a hold is retried until the hold lifts, and then succeeds.
+    #[test]
+    fn a_held_rename_is_retried_until_the_hold_lifts() {
+        let mut attempts = 0;
+
+        let result = retry_while_held(|| {
+            attempts += 1;
+            if attempts < 4 { Err(held()) } else { Ok(()) }
+        }, |error| error.raw_os_error() == Some(7));
+
+        assert!(result.is_ok(), "{:?}", result);
+        assert_eq!(attempts, 4);
+    }
+
+    /// Any error that is not a hold returns at once, unretried and unchanged.
+    #[test]
+    fn an_error_that_is_not_a_hold_is_not_retried() {
+        let mut attempts = 0;
+
+        let result: std::io::Result<()> = retry_while_held(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }, |error| error.raw_os_error() == Some(7));
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
+    /// A hold that outlasts the deadline returns its last error, and only after the deadline.
+    #[test]
+    fn a_hold_that_outlasts_the_deadline_returns_its_error() {
+        let started = std::time::Instant::now();
+        let mut attempts = 0;
+
+        let result: std::io::Result<()> = retry_while_held(|| {
+            attempts += 1;
+            Err(held())
+        }, |error| error.raw_os_error() == Some(7));
+
+        let elapsed = started.elapsed();
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(7));
+        assert!(attempts > 1, "{}", attempts);
+        assert!(elapsed >= HELD_RENAME_DEADLINE, "{:?}", elapsed);
+        assert!(elapsed < HELD_RENAME_DEADLINE * 3, "{:?}", elapsed);
+    }
+
+    /// Off Windows, an open handle never blocks a rename, so nothing is classified as held and no
+    /// error is retried.
+    #[cfg(not(windows))]
+    #[test]
+    fn nothing_is_held_off_windows() {
+        assert!(!is_held_by_another_process(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(!is_held_by_another_process(&std::io::Error::from_raw_os_error(libc::EACCES)));
+    }
+
+    /// Opens `path` the way an editor, indexer or scanner that forbids deleting it does: shared for
+    /// reading and writing, not for delete. The hold lasts as long as the returned handle.
+    #[cfg(windows)]
+    fn hold_without_share_delete(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(path).unwrap()
+    }
+
+    /// Releases `hold` from another thread after `after`.
+    #[cfg(windows)]
+    fn release_later(hold: std::fs::File, after: std::time::Duration) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            drop(hold);
+        })
+    }
+
+    #[cfg(windows)]
+    fn held_rename_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-held-rename-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Windows refuses a rename over a target another process holds without FILE_SHARE_DELETE,
+    /// with an error classified as held; `rename` waits for the hold to lift and then replaces it.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_over_a_held_target_waits_for_the_hold() {
+        let dir = held_rename_dir("target");
+        let (from, to) = (dir.join("new"), dir.join("old"));
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let hold = hold_without_share_delete(&to);
+
+        #[allow(clippy::disallowed_methods)] // the unretried rename the hold is shown to refuse
+        let refused = std::fs::rename(&from, &to).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        rename(&from, &to).unwrap();
+        releaser.join().unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a hold on the source, which a rename must open for delete.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_of_a_held_source_waits_for_the_hold() {
+        let dir = held_rename_dir("source");
+        let (from, to) = (dir.join("new"), dir.join("old"));
+        std::fs::write(&from, b"new").unwrap();
+        let hold = hold_without_share_delete(&from);
+
+        #[allow(clippy::disallowed_methods)] // the unretried rename the hold is shown to refuse
+        let refused = std::fs::rename(&from, &to).unwrap_err();
+        assert!(is_held_by_another_process(&refused), "{:?}", refused);
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        rename(&from, &to).unwrap();
+        releaser.join().unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `rename_no_replace` waits out a held source the same way.
+    #[cfg(windows)]
+    #[test]
+    fn a_no_replace_rename_of_a_held_source_waits_for_the_hold() {
+        let dir = held_rename_dir("no-replace");
+        let (from, to) = (dir.join("new"), dir.join("absent"));
+        std::fs::write(&from, b"new").unwrap();
+        let hold = hold_without_share_delete(&from);
+
+        let releaser = release_later(hold, std::time::Duration::from_millis(200));
+        rename_no_replace(&from, &to).unwrap();
+        releaser.join().unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hold that outlasts the deadline fails the rename and moves nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_over_a_target_held_past_the_deadline_fails_and_moves_nothing() {
+        let dir = held_rename_dir("past-deadline");
+        let (from, to) = (dir.join("new"), dir.join("old"));
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let hold = hold_without_share_delete(&to);
+
+        let error = rename(&from, &to).unwrap_err();
+        drop(hold);
+
+        assert!(is_held_by_another_process(&error), "{:?}", error);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
+        assert_eq!(std::fs::read(&from).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both atomic writers ride out a held target: a store write and a config replacement.
+    #[cfg(windows)]
+    #[test]
+    fn the_atomic_writers_wait_for_a_held_target() {
+        let dir = held_rename_dir("writers");
+
+        for (name, write) in [
+            ("store", write_file_atomically as fn(&Path, &[u8]) -> Result<(), String>),
+            ("config", replace_file_atomically),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"old").unwrap();
+            let releaser = release_later(hold_without_share_delete(&path), std::time::Duration::from_millis(200));
+
+            write(&path, b"new").unwrap_or_else(|e| panic!("{}: {}", name, e));
+            releaser.join().unwrap();
+
+            assert_eq!(std::fs::read(&path).unwrap(), b"new", "{}", name);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Keys a volume may fold into one spelling, and keys of any length or depth, get distinct
     /// shard folders of one fixed shape, spelled in characters no volume folds.

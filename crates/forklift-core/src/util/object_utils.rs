@@ -1052,7 +1052,7 @@ pub fn store_object_stream(claimed_hash: &str,
     // re-checked against any taint already standing for this root before this function may report
     // `Ok(true)` — see `file_utils::sync_dir_or_taint`.
     let final_path = folder_path.join(&file_name);
-    std::fs::rename(&temp_path, &final_path)
+    file_utils::rename(&temp_path, &final_path)
         .map_err(|e| format!("Error while moving a streamed object into place: {}", e))?;
     file_utils::sync_dir_or_taint(folder_path, &[final_path.as_path()])?;
 

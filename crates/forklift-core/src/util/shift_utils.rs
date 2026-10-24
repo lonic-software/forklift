@@ -1057,7 +1057,7 @@ fn write_chunked_file(path: &str,
                 .map_err(|e| creation_error(path, "creating", e))?;
         }
 
-        match std::fs::rename(&temp_path, fs_path) {
+        match file_utils::rename(&temp_path, fs_path) {
             Ok(()) => Ok(()),
             // A bay may live on another file system than the metadata folder.
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
@@ -1135,7 +1135,7 @@ fn copy_into_place(assembled: &Path, fs_path: &Path, path: &str, item_type: DirE
 
         set_file_mode(&beside, path, item_type)?;
 
-        std::fs::rename(&beside, fs_path)
+        file_utils::rename(&beside, fs_path)
             .map_err(|e| format!("Error while finalizing \"{}\": {}", path, e))
     })();
 

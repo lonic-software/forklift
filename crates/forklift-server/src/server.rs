@@ -1749,7 +1749,7 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
         return Err(conflict());
     }
 
-    match std::fs::rename(&staging, &target) {
+    match file_utils::rename(&staging, &target) {
         Ok(()) => {
             // The warehouse is visible from here on, so this is `Created` whatever the sync says:
             // a retry would find it and answer 200, and its creation would never be announced.
