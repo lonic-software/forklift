@@ -1797,8 +1797,9 @@ struct ClosureSeams<'a> {
 ///              parcel that way).
 /// * `base`   - A bound whose root tree is a candidate base for every parcel of the segment, as
 ///              well as each parcel's own parents. Must be one of `bounds`.
-/// * `scope`  - The warehouse fetch scope: content outside it is sealed, never loaded. A full
-///              scope walks everything.
+/// * `scope`    - The warehouse fetch scope: content outside it is sealed, never loaded. A full
+///                scope walks everything.
+/// * `reverify` - The `audit --full` content level, threaded down to each chunked file.
 fn verify_closure_core(
     head: &str,
     bounds: Option<&[&str]>,
@@ -1809,16 +1810,16 @@ fn verify_closure_core(
 ) -> Result<(), String> {
     let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree } = *seams;
 
-    // Only the new segment: the closure behind `known_complete` was proven complete when
-    // that head was committed. This walk used to build its prune set with
-    // `collect_reachable(known_complete)`, which decoded every parcel body in the ancestry —
-    // O(history) on every ref update, however little the lift added.
+    // Only the new segment: the closure behind each bound was proven complete when that head
+    // was written. This walk used to build its prune set with `collect_reachable` from the bound,
+    // which decoded every parcel body in the ancestry — O(history) on every ref update, however
+    // little the lift added.
     let (parcels, parents_of) = new_parcels_with_edges(head, bounds)
         .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
     // Parents first — but only for the incremental gate, and for the same reason the parent bases
-    // below are gated: it is the parent bases that need the order, and with `known_complete: None`
-    // there are none. `new_parcels` returns the segment breadth-first *from head*, so a child
+    // below are gated: it is the parent bases that need the order, and with `bounds: None` there
+    // are none. `new_parcels` returns the segment breadth-first *from head*, so a child
     // precedes the parent that explains it — the order the ordinary audit reports failures in, and
     // deliberately left alone there. This walk needs the opposite, because a parcel's own parents
     // are candidate bases below and may only explain content their own top-level audit has already
@@ -1863,25 +1864,25 @@ fn verify_closure_core(
         None => parcels,
     };
 
-    // The candidate bases a parcel's tree is pruned against (§9.4b W1): `known_complete`'s root
-    // tree, **and** the parcel's own immediate parents' root trees.
+    // The candidate bases a parcel's tree is pruned against (§9.4b W1): `base`'s root tree, **and**
+    // the parcel's own immediate parents' root trees.
     //
     // Soundness — a subtree byte-identical to a candidate's at the same path has, by content-
-    // addressing, the identical closure. For `known_complete` that closure was proven present when
-    // it was committed; for a parent inside this segment it was proven by that parent's own
+    // addressing, the identical closure. For `base` (one of the bounds) that closure was proven
+    // present when it was written; for a parent inside this segment it was proven by that parent's own
     // top-level audit, which the parents-first order has already run. Completeness — a subtree no
     // candidate explains is walked (once, deduped by `visited_trees`), so the audit never advances
     // a ref over content whose presence neither an accepted push nor an earlier-audited member of
     // this same call has established.
     //
-    // Why the union rather than replacing the root: dropping `known_complete` is not never-worse.
-    // Content can move away and come back, so a parcel that reverts a path to `known_complete`'s
+    // Why the union rather than replacing the root: dropping `base` is not never-worse.
+    // Content can move away and come back, so a parcel that reverts a path to `base`'s
     // content is explained free today and would cost a full descent under a parents-only prune.
     // Keeping both makes the skip set a superset of the current one by construction.
     // `.ok()` is the walk's *third* mirror-dependent local read, and the quietest: the boundary-
     // parent arm below at least names itself, and the per-member load is loud (it errors). This one
     // fails to a `None` that reads as "creation, no candidates". On a linear push the sole parent
-    // *is* `known_complete`, so the arm below re-reads this same parcel and fails the same way —
+    // is usually `base`, so the arm below re-reads this same parcel and fails the same way —
     // the candidate list ends up empty and every push walks whole. Tolerant in the safe direction
     // (more is verified, never less) but invisible.
     //
@@ -1904,11 +1905,11 @@ fn verify_closure_core(
     // Each parcel's tree hash, remembered as it is audited. The parents-first order means every
     // in-segment parent has already passed through this loop by the time a child needs its tree,
     // so a candidate base costs a map lookup rather than a re-decode of a parcel this walk has
-    // already read. Only boundary parents — the fork points just below `known_complete`, which the
-    // segment excludes — fall through to a load.
+    // already read. Only boundary parents — the fork points just below a bound, which the segment
+    // excludes — fall through to a load.
     let mut tree_of: HashMap<String, String> = HashMap::new();
 
-    // Seed with `known_complete`: it is the boundary parent of every linear push, and its tree was
+    // Seed with `base`: it is the boundary parent of every linear push, and its tree was
     // already loaded above for `base_root`. Without this the common case pays a second read of the
     // same parcel purely to learn a hash already in hand.
     if let (Some(known), Some(root)) = (base, base_root.as_ref()) {
@@ -1929,8 +1930,8 @@ fn verify_closure_core(
         // explanations, so the walk verifies more rather than less.
         let mut bases: Vec<String> = base_root.iter().cloned().collect();
 
-        // Parent bases are the incremental gate's optimization, and only its. With no
-        // `known_complete` this call is the unbounded walk — the one an operator runs to prove a
+        // Parent bases are the incremental gate's optimization, and only its. With no `bounds`
+        // this call is the unbounded walk — the one an operator runs to prove a
         // warehouse whole, and the one these tests use as the control that a deleted object really
         // was deleted. Pruning it against parents would still be *sound* by the same induction
         // (a root parcel has no parents and is walked whole, and every child only skips what an
@@ -1961,7 +1962,7 @@ fn verify_closure_core(
         }
 
         // `bases` holds *tree* hashes, so what collapses here is two candidates naming the same
-        // tree — not a parent that happens to be `known_complete`. The first parcel of a linear
+        // tree — not a parent that happens to be `base`. The first parcel of a linear
         // push is the obvious case (its only parent *is* the bound), but so is any later parcel
         // whose ancestors left the root tree untouched. Without this, every changed level below
         // such a parcel would load the identical base tree twice — a read apiece on the AWS head.
@@ -2285,13 +2286,13 @@ pub(crate) fn child_path(prefix: &str, name: &str) -> String {
 /// descended in full when the copy is reached first (sibling order decides which, and the
 /// relocation test asserts both directions rather than the flattering one).
 ///
-/// **The prune, and its soundness invariant.** [`verify_parcel_closure_with`] bounds *which
-/// parcels* this runs for (only the new segment behind `known_complete`); this bounds *how much of
+/// **The prune, and its soundness invariant.** [`verify_closure_core`] bounds *which
+/// parcels* this runs for (only the new segment no bound reaches); this bounds *how much of
 /// each new parcel's tree* is walked. A subtree whose hash equals a candidate base's subtree at the
 /// same path is skipped whole — the invariant that makes this sound: *a subtree hash identical to
 /// one whose closure has already been established has, by content-addressing, the identical
-/// closure.* The establishing act differs by candidate: for `known_complete` it was proven when
-/// that head was committed; for an immediate parent it was proven by that parent's own top-level
+/// closure.* The establishing act differs by candidate: for the walk's `base` (one of its bounds) it
+/// was proven when that head was written; for an immediate parent it was proven by that parent's own top-level
 /// audit earlier in this same call, which is what the parents-first order guarantees.
 /// Re-checking it here would not be meaningless — it would catch bit-rot the store suffered
 /// *since* that commit — but that guarantee was never this walk's job: store durability between
@@ -2299,7 +2300,7 @@ pub(crate) fn child_path(prefix: &str, name: &str) -> String {
 /// `audit --full` re-reads content precisely because a push never re-scrubs it), not
 /// something the commit-gate closure check was ever chartered to
 /// re-verify on every push. This is the same induction the incremental audit already rests on (a
-/// parcel lost behind `known_complete` does not fail this walk either), extended from parcels down
+/// parcel lost behind a bound does not fail this walk either), extended from parcels down
 /// through the tree.
 ///
 /// Before the prune, every push re-presence-checked **every** blob in the entire tree, not just
@@ -2311,8 +2312,8 @@ pub(crate) fn child_path(prefix: &str, name: &str) -> String {
 /// comparison, loading neither its tree nor its recipe and checking none of its chunks. It mirrors
 /// `collect_changed_closure`'s client-side prune, which settles a hash before checking it for the
 /// same reason this walk does. The two candidate sets are deliberately *not* the same: the client
-/// prunes against the immediate parents only, this walk against those **plus** `known_complete`
-/// (see [`verify_parcel_closure_with`] on why the union rather than a replacement). The server's
+/// prunes against the immediate parents only, this walk against those **plus** the bound's
+/// (see [`verify_closure_core`] on why the union rather than a replacement). The server's
 /// set is the superset, so nothing the client uploads is refused here for want of an explanation.
 ///
 /// **Completeness (W4 preserved).** A subtree or file that is explained by no candidate base is
@@ -2321,15 +2322,15 @@ pub(crate) fn child_path(prefix: &str, name: &str) -> String {
 /// neither an accepted push nor an earlier-audited member of the same call has established.
 ///
 /// That sentence replaces an accepted-push-only one, and the difference is the whole point of the
-/// candidate set. A base is no longer only `known_complete`'s subtree: it is that **plus** the
+/// candidate set. A base is no longer only the bound's subtree: it is that **plus** the
 /// parcel's own immediate parents' subtrees at the same path. A parent inside this same push
 /// vouches for content only once its own top-level audit has run, which is why
-/// [`verify_parcel_closure_with`] orders the segment parents-first — the marking discipline below
+/// [`verify_closure_core`] orders the segment parents-first — the marking discipline below
 /// is sound under that order and not otherwise.
 ///
 /// # Arguments
 /// * `tree_hash`        - The root of the subtree to verify.
-/// * `base_tree_hashes` - The candidate bases' subtrees at this same path: `known_complete`'s, and
+/// * `base_tree_hashes` - The candidate bases' subtrees at this same path: the walk's `base`'s, and
 ///                        each immediate parent's. Empty for a creation or a newly-introduced path.
 ///                        A match against **any** of them prunes the subtree without a load.
 /// * `visited_trees`    - Trees already settled (shared across parcels of one walk). Recorded
@@ -2367,7 +2368,7 @@ fn verify_tree_closure(tree_hash: &str,
         // `collect_changed_closure` states on the client side. Content-addressing means one subtree
         // hash can recur at another path in the same walk (a merge adopting one side's subtree under
         // two names), and a hash settled once needs no second descent. Marking before the check is
-        // what makes the recurrence free; it is sound only because `verify_parcel_closure_with`
+        // what makes the recurrence free; it is sound only because `verify_closure_core`
         // processes the segment parents-first, so a hash a child pruned against a parent is one that
         // parent's own audit has already settled.
         if !visited_trees.insert(tree_hash.clone()) {
@@ -2375,7 +2376,7 @@ fn verify_tree_closure(tree_hash: &str,
         }
 
         // Explained by some candidate base at this path: identical hash ⟹ identical closure ⟹ present,
-        // either because `known_complete` vouched for it or because an earlier-audited parcel of this
+        // either because a bound vouched for it or because an earlier-audited parcel of this
         // same call did. Pruned without loading any tree — this is the whole W1 saving, and it is
         // exactly where an untouched large chunked file's ~million chunks are NOT re-presence-checked.
         if base_tree_hashes.contains(&tree_hash) {

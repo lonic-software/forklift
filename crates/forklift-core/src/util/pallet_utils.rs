@@ -999,10 +999,6 @@ fn update_pallet_head_checked(
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
 
-    // Worked out before the lock, since it can walk history: the compare-and-set pins the ref to
-    // `expected`, so what it says about `expected` holds inside the hold too.
-    let left = left_unreached(namespace, expected, new)?;
-
     let mut verified_at = match closure_to_verify(namespace, expected, new) {
         false => None,
         true => {
@@ -1015,6 +1011,12 @@ fn update_pallet_head_checked(
             Some(scope)
         }
     };
+
+    // Worked out before the lock, since it can walk history: the compare-and-set pins the ref to
+    // `expected`, so what it says about `expected` holds inside the hold too. After the closure
+    // check, so a head whose ancestry is missing is refused as incomplete rather than failing
+    // this walk first.
+    let left = left_unreached(namespace, expected, new)?;
 
     loop {
         #[cfg(test)]
@@ -1133,7 +1135,10 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 ///
 /// It is where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
 /// the hold), is recorded in the fetched-heads ledger, in the same hold as the write. It verifies
-/// no closure: a user-pallet head write reaches it through [`update_pallet_head_in`], which does.
+/// no closure, so a user-pallet head write must reach it through [`update_pallet_head_checked`],
+/// which verifies the new head or takes a [`VerifiedClosure`] for exactly that head and scope. Its
+/// one other caller, the trust install, writes the meta office ref, whose writer verifies its own
+/// history.
 pub(crate) fn update_pallet_head_locked(
     lock: &crate::util::lock_utils::RefLock,
     namespace: PalletNamespace,
@@ -1646,6 +1651,22 @@ pub(crate) mod tests {
             remove(&mid);
 
             assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: work out the head the write leaves unreached before the closure check → its
+        // ancestry walk meets the gone parcel first and the write fails, not refused as incomplete.
+        #[test]
+        fn a_sparse_move_off_a_non_ancestor_onto_a_gone_ancestry_is_refused_as_incomplete() {
+            let (_root, _scope) = scratch("closure-sparse-unreached");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let other = parcel(&two_dirs("x0", "y0"), &[]);
+            write("main", None, &other).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            let mid = parcel(&two_dirs("a1", "b0"), &[&base]);
+            let head = parcel(&two_dirs("a2", "b0"), &[&mid]);
+            remove(&mid);
+
+            assert_incomplete(write("main", Some(&other), &head), "main", Some(&other));
         }
 
         // Revert: check only the first parent's side → the merge lands over the part-way side.
