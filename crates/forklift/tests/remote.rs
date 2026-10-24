@@ -4999,6 +4999,47 @@ fn a_sparse_audit_fails_on_a_tampered_in_scope_tree() {
 }
 
 #[test]
+fn a_sparse_audit_checks_each_path_of_a_shared_spine_tree() {
+    // Which entries a spine walk descends depends on the tree's path, not its hash. With scope
+    // {a/x, b/y} over identical directories `a` and `b`, the walk at `a` checks only `a/x`; the
+    // walk at `b` must still run to check `b/y`, even though the same tree was already walked as
+    // spine at `a`. A missing object under `b/y` must fail the audit.
+    let area = TestArea::new("sparse-audit-shared-spine");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    for dir in ["a", "b"] {
+        area.write_file(&format!("dev/{}/x/x.txt", dir), "x\n");
+        area.write_file(&format!("dev/{}/y/y.txt", dir), "y\n");
+    }
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["office", "enroll"]));
+    area.write_file("dev/note.txt", "signed\n");
+    assert_success(&area.forklift("dev", &["load", "note.txt"]));
+    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    assert_eq!(path_object_hash(&area, "dev", &head, "a"), path_object_hash(&area, "dev", &head, "b"),
+        "the fixture needs `a` and `b` to be one tree object");
+    let y_blob = path_object_hash(&area, "dev", &head, "b/y/y.txt");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "a/x", "--only", "b/y"]));
+    assert_success(&area.forklift("sparse", &["audit"]));
+
+    // The blob under `b/y` is the only object in scope at `b` and nowhere else.
+    std::fs::remove_file(object_store_path(&area, "sparse", &y_blob)).unwrap();
+
+    let audit = area.forklift("sparse", &["audit"]);
+    assert!(!audit.status.success(),
+        "a missing in-scope blob under the second path of a shared spine tree must fail the audit: {}",
+        stdout(&audit));
+    assert!(format!("{}{}", stdout(&audit), stderr(&audit)).contains(&y_blob),
+        "the failure names the missing blob: {}{}", stdout(&audit), stderr(&audit));
+}
+
+#[test]
 fn a_content_corrupted_in_scope_blob_passes_closure_but_fails_on_read() {
     // The limitation, stated honestly: audit presence-checks blobs, it does not re-read their
     // content — so a present-but-corrupted in-scope blob passes the closure check (true of a
