@@ -2031,9 +2031,11 @@ pub fn verify_parcel_closure_scoped(
     // `verified` holds trees whose *entire* closure is proven present; it is populated only by
     // the full walk below and never by a spine walk, so an in-scope encounter of a subtree is
     // never wrongly skipped because the same hash was earlier reached, only partially, on the
-    // spine. `spine_seen` deduplicates the (few, path-shaped) spine trees for its own sake.
+    // spine. `spine_seen` deduplicates spine walks on (hash, path), as `collect_retained` does:
+    // which entries a spine walk checks depends on the path, so one tree object reached as spine
+    // at two paths is walked at each.
     let mut verified: HashSet<String> = HashSet::new();
-    let mut spine_seen: HashSet<String> = HashSet::new();
+    let mut spine_seen: HashSet<(String, String)> = HashSet::new();
 
     for hash in &parcels {
         let parcel = object_utils::load_parcel(hash)
@@ -2064,7 +2066,7 @@ pub fn verify_parcel_closure_scoped(
 /// # Arguments
 /// * `prefix`      - The warehouse path of `tree_hash` (`""` at the root), classified by `scope`.
 /// * `verified`    - Trees whose full closure is already proven present (populated by the full walk).
-/// * `spine_seen`  - Spine trees already walked in this pass (perf-only dedup).
+/// * `spine_seen`  - (tree, path) pairs already walked as spine in this pass.
 /// * `reverify`    - The `audit --full` content level, threaded down to each in-scope chunked file.
 // The four dyn-closure/set arguments, the classifier scope, the two-level path/prefix pair and the
 // `reverify` level are each distinct and threaded through the recursion; a parameter object would
@@ -2073,7 +2075,7 @@ pub fn verify_parcel_closure_scoped(
 fn verify_tree_closure_scoped(tree_hash: &str,
                               prefix: &str,
                               verified: &mut HashSet<String>,
-                              spine_seen: &mut HashSet<String>,
+                              spine_seen: &mut HashSet<(String, String)>,
                               blob_exists: &dyn Fn(&str) -> Result<bool, String>,
                               chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
                               load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
@@ -2096,9 +2098,10 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         ScopeClass::Spine => {}
     }
 
-    // A spine tree already proven fully present in scope elsewhere, or already walked as a spine
-    // on this pass, needs no re-walk.
-    if verified.contains(tree_hash) || !spine_seen.insert(tree_hash.to_string()) {
+    // A spine tree already proven fully present elsewhere needs no re-walk, nor does one already
+    // walked as spine at this same path. The same tree at another path is walked again: the scope
+    // selects different entries there.
+    if verified.contains(tree_hash) || !spine_seen.insert((tree_hash.to_string(), prefix.to_string())) {
         return Ok(());
     }
 
