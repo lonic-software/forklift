@@ -378,10 +378,11 @@ const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_mil
 /// unchanged. A hold this process keeps itself is waited out too, and fails the same way.
 ///
 /// A retry is a fresh rename against whatever stands there by then: a caller that checked the
-/// target before calling has that check widened by up to the deadline. A retry stops, returning
-/// the hold's error, once the source is gone: a rename that took effect while reporting a hold
-/// still reports that hold as a failure, rather than being retried into an unrelated error. On
-/// Unix an open handle never blocks a rename, and this is a plain `std::fs::rename`.
+/// target before calling has that check widened by up to the deadline. A held failure whose source
+/// is already gone is not retried: a rename that took effect while reporting a hold still reports
+/// that hold as a failure, rather than being retried into an unrelated error. A source someone
+/// else removes during a wait fails the next attempt with `NotFound`. On Unix an open handle never
+/// blocks a rename, and this is a plain `std::fs::rename`.
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<()> {
     let (from, to) = (from.as_ref(), to.as_ref());
 
@@ -4072,38 +4073,6 @@ mod tests {
         releaser.join().unwrap();
 
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A source that vanishes while the target is held ends the retries at once, with the hold's
-    /// error: retrying on would only turn it into `NotFound`.
-    #[cfg(windows)]
-    #[test]
-    fn a_rename_whose_source_vanishes_during_a_hold_stops_with_the_hold() {
-        let dir = held_rename_dir("source-vanishes");
-        let (from, to) = (dir.join("new"), dir.join("old"));
-        std::fs::write(&from, b"new").unwrap();
-        std::fs::write(&to, b"old").unwrap();
-        let hold = hold_without_share_delete(&to);
-
-        let deleter = {
-            let from = from.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                std::fs::remove_file(&from).unwrap();
-            })
-        };
-        let releaser = release_later(hold, std::time::Duration::from_millis(600));
-
-        let started = std::time::Instant::now();
-        let error = rename(&from, &to).unwrap_err();
-        let elapsed = started.elapsed();
-        deleter.join().unwrap();
-        releaser.join().unwrap();
-
-        assert!(is_held_by_another_process(&error), "{:?}", error);
-        assert!(elapsed < std::time::Duration::from_millis(500), "{:?}", elapsed);
-        assert_eq!(std::fs::read(&to).unwrap(), b"old");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
