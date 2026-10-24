@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     fn hash(digit: char) -> String {
-        digit.to_string().repeat(64)
+        crate::util::pallet_utils::tests::stub_parcel(&digit.to_string())
     }
 
     /// A snapshot on `pallet` holding only that pallet's ref at `head`, with no consolidation.
@@ -2233,18 +2233,19 @@ mod tests {
     #[test]
     fn the_journal_is_capped_at_max_entries() {
         let _scratch = Scratch::new("journal-cap");
+        let head = |i: usize| crate::util::pallet_utils::tests::stub_parcel(&i.to_string());
 
         for i in 0..(MAX_ENTRIES + 10) {
             advance(
                 "main",
                 pallet_utils::get_pallet_head("main").unwrap().as_deref(),
-                &format!("{:064x}", i),
+                &head(i),
             ).unwrap();
             let before = capture().unwrap();
             advance(
                 "main",
                 pallet_utils::get_pallet_head("main").unwrap().as_deref(),
-                &format!("{:064x}", i + 1),
+                &head(i + 1),
             ).unwrap();
             push_if_changed("stack", before).unwrap();
         }
@@ -2254,9 +2255,9 @@ mod tests {
         // The oldest entries are the ones dropped: the newest surviving entry is the very
         // last one pushed, and the oldest is the eleventh.
         let entries = read().unwrap();
-        assert_eq!(entries[0].before.head("main"), Some(&format!("{:064x}", 10)));
+        assert_eq!(entries[0].before.head("main"), Some(&head(10)));
         let newest = pop().unwrap().unwrap();
-        assert_eq!(newest.before.head("main"), Some(&format!("{:064x}", MAX_ENTRIES + 9)));
+        assert_eq!(newest.before.head("main"), Some(&head(MAX_ENTRIES + 9)));
     }
     #[test]
     fn a_lost_create_of_a_deleted_pallet_is_judged_by_the_head_it_found() {
@@ -2284,8 +2285,9 @@ mod tests {
     fn a_create_of_an_incomplete_deleted_head_refuses() {
         let _scratch = Scratch::new("create-deleted-incomplete");
 
-        // No parcel `hash('a')` is here at all.
-        let refused = create_deleted("side", "side", false, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap_err();
+        // No such parcel is here at all.
+        let absent = "a".repeat(64);
+        let refused = create_deleted("side", "side", false, &absent, &pallet_utils::RefPreconditions::NONE).unwrap_err();
         assert!(refused.contains("not completely present"), "{}", refused);
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
     }

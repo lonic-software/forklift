@@ -1470,7 +1470,7 @@ fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
 
@@ -1498,7 +1498,49 @@ mod tests {
     }
 
     fn hash(c: char) -> String {
-        c.to_string().repeat(64)
+        stub_parcel(&c.to_string())
+    }
+
+    /// Point a user pallet at `new` without verifying `new`'s closure: a warehouse whose history
+    /// went missing after a ref write that found it complete, for a test of what reads and
+    /// repairs do then.
+    pub(crate) fn update_pallet_head_unverified(name: &str,
+                                                expected: Option<&str>,
+                                                new: &str,
+                                                preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+        update_pallet_head_in_unverified(PalletNamespace::User, name, expected, new, preconditions)
+    }
+
+    /// [`update_pallet_head_unverified`] in `namespace`.
+    pub(crate) fn update_pallet_head_in_unverified(namespace: PalletNamespace,
+                                                   name: &str,
+                                                   expected: Option<&str>,
+                                                   new: &str,
+                                                   preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+        let verified = VerifiedClosure::new(new, crate::util::scope_utils::read_fetch_scope()?);
+        update_pallet_head_verified(namespace, name, expected, new, preconditions, &verified)
+    }
+
+    /// A parcel over an empty tree, stored with its tree and distinct per `tag`: a head whose
+    /// closure is complete, for a test that needs only some pallet head. Deterministic, so a test
+    /// may compare a ref against a second call.
+    pub(crate) fn stub_parcel(tag: &str) -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::tree_item::TreeItem;
+
+        let mut tree = LooseObjectBuilder::build_tree(
+            &TreeItem::new(String::new(), String::new(), crate::enums::dir_entry_type::DirEntryType::Tree)
+        );
+        tree.store().unwrap();
+
+        let mut parcel = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
+            tree_hash: tree.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some(tag.to_string()),
+        });
+        parcel.store().unwrap();
+        parcel.hash
     }
 
     fn ref_bytes(name: &str) -> Vec<u8> {

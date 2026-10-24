@@ -2358,75 +2358,78 @@ fn verify_tree_closure(tree_hash: &str,
                        load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
                        reverify: bool)
                        -> Result<(), String> {
-    // Record the visit before checking base-explained, not after — the same discipline
-    // `collect_changed_closure` states on the client side. Content-addressing means one subtree
-    // hash can recur at another path in the same walk (a merge adopting one side's subtree under
-    // two names), and a hash settled once needs no second descent. Marking before the check is
-    // what makes the recurrence free; it is sound only because `verify_parcel_closure_with`
-    // processes the segment parents-first, so a hash a child pruned against a parent is one that
-    // parent's own audit has already settled.
-    if !visited_trees.insert(tree_hash.to_string()) {
-        return Ok(());
-    }
+    // An explicit stack rather than recursion: a ref write runs this walk, and a tree nested a
+    // few thousand levels deep would otherwise overflow the thread's stack.
+    let mut pending: Vec<(String, Vec<String>)> = vec![(tree_hash.to_string(), base_tree_hashes.to_vec())];
 
-    // Explained by some candidate base at this path: identical hash ⟹ identical closure ⟹ present,
-    // either because `known_complete` vouched for it or because an earlier-audited parcel of this
-    // same call did. Pruned without loading any tree — this is the whole W1 saving, and it is
-    // exactly where an untouched large chunked file's ~million chunks are NOT re-presence-checked.
-    if base_tree_hashes.iter().any(|base| base == tree_hash) {
-        return Ok(());
-    }
-
-    let tree = object_utils::load_tree(tree_hash)
-        .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
-
-    // The candidate bases' entries at this path, by name, unioned — a child is explained if *any*
-    // base carries that name at that hash. Loaded only for a tree no base explained whole, and
-    // tolerantly per base: a base that cannot be read contributes no explanations, so the walk
-    // verifies more rather than less, which is always sound.
-    //
-    // Sound is not free. A base is trusted ancestry or a parcel this same call just audited, so on
-    // the AWS head a failure here means a transient store error, not a missing object — and the
-    // `continue` converts that blip into a full descent of everything the base would have
-    // explained, up to an untouched multi-gigabyte file's recipe and every chunk `HEAD` under the
-    // 29 s gateway ceiling. The operator then sees a timeout rather than the store error that
-    // caused it. Two to three bases per parcel instead of one scales the chance of hitting it, so
-    // the tolerance is a deliberate trade of a rare slow refusal against a wrong fast one, not a
-    // free win.
-    let (base_files, base_subtrees) = base_entries(base_tree_hashes, load_base_tree);
-
-    for (name, file) in tree.get_files() {
-        // Base-explained: this exact file hash sits at this path under some candidate base, so its
-        // blob — and, for a chunked file, its whole recipe→chunk closure — is present by induction.
-        // Skipping it is what makes an unchanged file cost nothing on a push.
-        if base_files.get(name).is_some_and(|hashes| hashes.contains(&file.hash)) {
+    while let Some((tree_hash, base_tree_hashes)) = pending.pop() {
+        // Record the visit before checking base-explained, not after — the same discipline
+        // `collect_changed_closure` states on the client side. Content-addressing means one subtree
+        // hash can recur at another path in the same walk (a merge adopting one side's subtree under
+        // two names), and a hash settled once needs no second descent. Marking before the check is
+        // what makes the recurrence free; it is sound only because `verify_parcel_closure_with`
+        // processes the segment parents-first, so a hash a child pruned against a parent is one that
+        // parent's own audit has already settled.
+        if !visited_trees.insert(tree_hash.clone()) {
             continue;
         }
 
-        if !blob_exists(&file.hash)? {
-            return Err(format!(
-                "Blob {} (\"{}\" in tree {}) is missing.",
-                file.hash, file.name, tree_hash
-            ));
+        // Explained by some candidate base at this path: identical hash ⟹ identical closure ⟹ present,
+        // either because `known_complete` vouched for it or because an earlier-audited parcel of this
+        // same call did. Pruned without loading any tree — this is the whole W1 saving, and it is
+        // exactly where an untouched large chunked file's ~million chunks are NOT re-presence-checked.
+        if base_tree_hashes.contains(&tree_hash) {
+            continue;
         }
 
-        // A *changed* chunked file's tree-entry hash names a recipe; its chunks are reachable only
-        // through the recipe. Non-tolerant on purpose — this is the commit-gate closure audit
-        // (§9.4b W4): a signed ref must never advance over a chunked file whose chunks are not all
-        // present, or the file becomes silently unmaterializable the moment someone fetches it.
-        // (gc's own descent is presence-*tolerant*; this one is the opposite, exactly because a
-        // ref move is a durability promise a fetch is not.) The prune above only reaches this for
-        // a file no candidate base already vouches for, so W4 is never weakened.
-        if file.item_type.is_chunked() {
-            verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
-        }
-    }
+        let tree = object_utils::load_tree(&tree_hash)
+            .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
 
-    for (name, subtree) in tree.get_subtrees() {
-        verify_tree_closure(
-            &subtree.hash, base_subtrees.get(name).map_or(&[][..], Vec::as_slice), visited_trees,
-            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, reverify,
-        )?;
+        // The candidate bases' entries at this path, by name, unioned — a child is explained if *any*
+        // base carries that name at that hash. Loaded only for a tree no base explained whole, and
+        // tolerantly per base: a base that cannot be read contributes no explanations, so the walk
+        // verifies more rather than less, which is always sound.
+        //
+        // Sound is not free. A base is trusted ancestry or a parcel this same call just audited, so on
+        // the AWS head a failure here means a transient store error, not a missing object — and the
+        // `continue` converts that blip into a full descent of everything the base would have
+        // explained, up to an untouched multi-gigabyte file's recipe and every chunk `HEAD` under the
+        // 29 s gateway ceiling. The operator then sees a timeout rather than the store error that
+        // caused it. Two to three bases per parcel instead of one scales the chance of hitting it, so
+        // the tolerance is a deliberate trade of a rare slow refusal against a wrong fast one, not a
+        // free win.
+        let (base_files, mut base_subtrees) = base_entries(&base_tree_hashes, load_base_tree);
+
+        for (name, file) in tree.get_files() {
+            // Base-explained: this exact file hash sits at this path under some candidate base, so its
+            // blob — and, for a chunked file, its whole recipe→chunk closure — is present by induction.
+            // Skipping it is what makes an unchanged file cost nothing on a push.
+            if base_files.get(name).is_some_and(|hashes| hashes.contains(&file.hash)) {
+                continue;
+            }
+
+            if !blob_exists(&file.hash)? {
+                return Err(format!(
+                    "Blob {} (\"{}\" in tree {}) is missing.",
+                    file.hash, file.name, tree_hash
+                ));
+            }
+
+            // A *changed* chunked file's tree-entry hash names a recipe; its chunks are reachable only
+            // through the recipe. Non-tolerant on purpose — this is the commit-gate closure audit
+            // (§9.4b W4): a signed ref must never advance over a chunked file whose chunks are not all
+            // present, or the file becomes silently unmaterializable the moment someone fetches it.
+            // (gc's own descent is presence-*tolerant*; this one is the opposite, exactly because a
+            // ref move is a durability promise a fetch is not.) The prune above only reaches this for
+            // a file no candidate base already vouches for, so W4 is never weakened.
+            if file.item_type.is_chunked() {
+                verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
+            }
+        }
+
+        for (name, subtree) in tree.get_subtrees() {
+            pending.push((subtree.hash.clone(), base_subtrees.remove(name).unwrap_or_default()));
+        }
     }
 
     Ok(())
@@ -3492,7 +3495,7 @@ mod tests {
         assert_eq!(signing.key_id(), Some(fixture.admin_key_id.as_str()));
         fixture.admit(BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
 
-        let refused = signing.write_head("main", None, &"1".repeat(64));
+        let refused = signing.write_head("main", None, &crate::util::pallet_utils::tests::stub_parcel("1"));
 
         assert_eq!(crate::util::pallet_utils::get_pallet_head("main").unwrap(), None, "the pallet must be unchanged");
         assert_eq!(refused, Err(RefUpdateError::OfficeMoved { found: office_head() }));

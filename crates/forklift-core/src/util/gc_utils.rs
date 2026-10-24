@@ -429,7 +429,7 @@ pub(crate) mod tests {
         };
         let mut object = LooseObjectBuilder::build_parcel(&parcel);
         object.store().unwrap();
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &object.hash,
