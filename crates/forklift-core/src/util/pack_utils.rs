@@ -8705,7 +8705,7 @@ pub(crate) mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &parcel_object.hash, &pallet_utils::RefPreconditions::NONE)
+        pallet_utils::tests::update_pallet_head_unverified("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &parcel_object.hash, &pallet_utils::RefPreconditions::NONE)
             .unwrap();
     }
 

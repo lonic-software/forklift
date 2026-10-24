@@ -610,7 +610,7 @@ mod tests {
             genesis: "0".repeat(64), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: None,
         }).unwrap();
 
-        let refused = signing.write_head("main", None, &"1".repeat(64));
+        let refused = signing.write_head("main", None, &pallet_utils::tests::stub_parcel("1"));
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), None, "the pallet must be unchanged");
         assert_eq!(refused, Err(RefUpdateError::AnchorMoved));

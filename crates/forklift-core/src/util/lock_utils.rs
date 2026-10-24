@@ -420,11 +420,12 @@ impl BaseServeLock {
 /// nothing else, so the wait is short and is not announced; a holder stalled inside a write
 /// stalls every ref writer.
 ///
-/// It also orders the fetched-heads ledger and fence list of a sparse warehouse
+/// It also orders the fetched-heads ledger of a sparse warehouse
 /// ([`fetch_ledger`](crate::util::fetch_ledger)) against the ref writes and the fetch scope: a
-/// scoped fetch records its head, and re-checks the scope and lifts the head's fence when its
-/// transfer completes, under it; a ref write records a head it leaves unreached in the same hold
-/// as the write; `expand` compares and writes the scope, the ledger and the fence list under it.
+/// scoped fetch records its head, and re-checks the scope when its transfer completes, under it;
+/// a ref write records a head it leaves unreached in the same hold as the write, and re-reads the
+/// scope its closure check ran against; `expand` compares and writes the scope and the ledger
+/// under it.
 /// None of them holds it across a transfer or a walk. It also serializes the read-modify-write of
 /// the held-heads record ([`held_heads`](crate::util::held_heads)), which walks history before
 /// taking it.

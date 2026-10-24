@@ -254,12 +254,13 @@ mod tests {
         let three = test_support::store_parcel(&tree, &[&two]);
         pallet_utils::update_pallet_head("zeta", None, &one, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(one.clone()))).unwrap();
-        pallet_utils::update_pallet_head("alpha", None, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap();
+        let (alpha_a, alpha_b) = (test_support::store_parcel(&tree, &[&one]), test_support::store_parcel(&tree, &[&two]));
+        pallet_utils::update_pallet_head("alpha", None, &alpha_a, &pallet_utils::RefPreconditions::NONE).unwrap();
 
         let before = journal_utils::capture().unwrap();
         pallet_utils::update_pallet_head("zeta", Some(&one), &two, &pallet_utils::RefPreconditions::NONE).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(two.clone()))).unwrap();
-        pallet_utils::update_pallet_head("alpha", Some(&hash('a')), &hash('b'), &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::update_pallet_head("alpha", Some(&alpha_a), &alpha_b, &pallet_utils::RefPreconditions::NONE).unwrap();
         journal_utils::push_if_changed("stack", before).unwrap();
 
         // Another bay stacks on "zeta" between the gate and the restore.
@@ -272,7 +273,7 @@ mod tests {
         assert!(error.contains("has moved since"), "{}", error);
 
         assert_eq!(pallet_utils::get_pallet_head("zeta").unwrap(), Some(three), "the other bay's head must stand");
-        assert_eq!(pallet_utils::get_pallet_head("alpha").unwrap(), Some(hash('b')), "no other ref may be restored");
+        assert_eq!(pallet_utils::get_pallet_head("alpha").unwrap(), Some(alpha_b), "no other ref may be restored");
         assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("zeta", Some(two)),
             "the bay still stands where the operation left it");
         assert!(journal_utils::peek().unwrap().is_some(), "a refused undo must keep its entry");
@@ -288,7 +289,7 @@ mod tests {
 
         // A parcel whose tree this store no longer holds.
         let freed = test_support::store_parcel(&hash('f'), &[]);
-        pallet_utils::update_pallet_head("side", None, &freed, &none).unwrap();
+        test_support::write_ref_unchecked("side", &freed);
         let entry = journal_utils::delete_entry("side", &freed).unwrap();
         pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "side", &freed, &none, &entry).unwrap();
 

@@ -1650,7 +1650,7 @@ mod tests {
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
 
-        let (start, new) = ("a".repeat(64), "b".repeat(64));
+        let (start, new) = (crate::util::pallet_utils::tests::stub_parcel("a"), crate::util::pallet_utils::tests::stub_parcel("b"));
         crate::util::pallet_utils::update_pallet_head("main", None, &start, &crate::util::pallet_utils::RefPreconditions::NONE).unwrap();
 
         // Another bay makes the very same move first.

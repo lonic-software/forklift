@@ -4497,10 +4497,7 @@ pub async fn fetch_history_at(client: &RemoteClient,
         fetch_ledger::record_fetch(&lock, head, pallet)?;
     }
 
-    let stats = fetch_bounded_at(client, head, scope, progress).await?;
-    fetch_ledger::lift_fence(&RefLock::acquire()?, head)?;
-
-    Ok(stats)
+    fetch_bounded_at(client, head, scope, progress).await
 }
 
 /// One transfer of a scoped fetch: the whole history at a full scope, otherwise the path-pruned
@@ -4539,8 +4536,6 @@ where
         let current = scope_utils::read_fetch_scope()?;
 
         if current == scope {
-            // Complete at the current scope: a fence an earlier part-way fetch left is lifted.
-            fetch_ledger::lift_fence(&lock, head)?;
             return Ok(stats);
         }
 
@@ -4580,7 +4575,7 @@ pub const EXPAND_ATTEMPTS: usize = 3;
 
 /// The outcome of one [`Expansion::commit`].
 pub enum ExpandCommit {
-    /// The widened scope, the pruned ledger and the fence list were written.
+    /// The widened scope and the pruned ledger were written.
     Written(MaterializationScope),
 
     /// Another `expand` already brought every added prefix into scope; nothing was written.
@@ -4599,11 +4594,12 @@ pub enum ExpandCommit {
 /// fetches nothing. The heads are walked one at a time over shared dedup sets, so a history they
 /// share is walked once.
 ///
-/// A ledger head that no ref reaches and whose walk fails is moved to the fence list rather than
-/// failing the expand: its fetch went only part-way, and the ref compare-and-set refuses it as a
-/// new head until a fetch of it completes. The walk failing for a reason that is not the remote
-/// lacking the head (a dropped connection) fences it too; a later fetch of it lifts the fence.
-/// A base or ref head whose walk fails refuses the expand, naming the pallet.
+/// A ledger head that no ref reaches and whose walk fails is dropped from the ledger rather than
+/// failing the expand: its fetch went only part-way, so its closure is incomplete at the widened
+/// scope, and the ref compare-and-set refuses it as a new head for that reason until a fetch of it
+/// completes. The walk failing for a reason that is not the remote lacking the head (a dropped
+/// connection) drops it too. A base or ref head whose walk fails refuses the expand, naming the
+/// pallet.
 ///
 /// The steps are separate so that a test can change the warehouse between them: [`walk`] fetches,
 /// [`walk_new_ref_heads_locally`] covers ref heads that appeared since without the network, and
@@ -4641,10 +4637,10 @@ pub struct Expansion {
     /// Parcels covered by the local walk: built here, from parents in `seen` or in this set.
     local_parcels: HashSet<String>,
 
-    /// Ledger heads whose walk failed, to be fenced at the commit.
-    fence_candidates: BTreeSet<String>,
+    /// Ledger heads whose walk failed, to be dropped from the ledger at the commit.
+    unwalkable: BTreeSet<String>,
 
-    /// Fence candidates a new ref reached, taken off the candidates once to be walked again.
+    /// Unwalkable heads a new ref reached, taken off that set once to be walked again.
     retried: HashSet<String>,
 
     /// Objects fetched so far.
@@ -4670,7 +4666,7 @@ impl Expansion {
             walked_heads: HashSet::new(),
             reached: Vec::new(),
             local_parcels: HashSet::new(),
-            fence_candidates: BTreeSet::new(),
+            unwalkable: BTreeSet::new(),
             retried: HashSet::new(),
             fetched_objects: 0,
         }
@@ -4706,11 +4702,11 @@ impl Expansion {
     }
 
     /// Fetch at the widened scope: the base and every user-pallet ref head on the first call, then
-    /// every present ledger head not yet walked or fenced. A ledger head whose parcel is absent is
+    /// every present ledger head not yet walked or found unwalkable. A ledger head whose parcel is absent is
     /// not walked, since walking it would download it again.
     ///
     /// # Returns
-    /// * `Ok(())`      - Every head was walked or marked to be fenced.
+    /// * `Ok(())`      - Every head was walked or found unwalkable.
     /// * `Err(String)` - The base or a ref head could not be walked; the error names its pallet.
     pub async fn walk(&mut self, client: &RemoteClient) -> Result<(), String> {
         self.walk_base(client).await?;
@@ -4727,7 +4723,7 @@ impl Expansion {
 
         for entry in fetch_ledger::read_ledger()? {
             if self.walked_heads.contains(&entry.head)
-                || self.fence_candidates.contains(&entry.head)
+                || self.unwalkable.contains(&entry.head)
                 || !file_utils::does_object_exist(&entry.head)?
             {
                 continue;
@@ -4736,7 +4732,7 @@ impl Expansion {
             // A head a ref reaches is in `seen` already, so its walk succeeds without fetching;
             // one that fails is reached by no ref.
             if self.walk_head(client, &entry.head).await.is_err() {
-                self.fence_candidates.insert(entry.head);
+                self.unwalkable.insert(entry.head);
             }
         }
 
@@ -4748,8 +4744,8 @@ impl Expansion {
     /// holds or by a local build whose out-of-scope subtrees come from its parents, so walking the
     /// parcel graph is enough. Runs outside the lock.
     ///
-    /// A ref head that reaches a head marked to be fenced is left uncovered the first time, and
-    /// that head is taken off the candidates: the fetch that wrote the ref may have completed it, so
+    /// A ref head that reaches an unwalkable head is left uncovered the first time, and that head
+    /// is taken off the unwalkable set: the fetch that wrote the ref may have completed it, so
     /// the next walk tries it again and the commit retries meanwhile. Reaching it a second time
     /// refuses the expand.
     ///
@@ -4767,9 +4763,9 @@ impl Expansion {
                     continue;
                 }
 
-                if self.fence_candidates.contains(&hash) {
+                if self.unwalkable.contains(&hash) {
                     if self.retried.insert(hash.clone()) {
-                        self.fence_candidates.remove(&hash);
+                        self.unwalkable.remove(&hash);
                         continue 'refs;
                     }
 
@@ -4792,12 +4788,13 @@ impl Expansion {
     }
 
     /// Under the [`RefLock`], check that nothing changed that the walks missed, and if so write the
-    /// fence list, the pruned ledger and the widened scope, in that order. Only compares and writes
-    /// inside the hold.
+    /// pruned ledger and the widened scope, in that order. Only compares and writes inside the
+    /// hold.
     ///
     /// It retries when the on-disk scope differs from the one the walk widened (re-widening from
-    /// it first), when the ledger holds a present head that was neither walked nor marked to be
-    /// fenced, or when a ref head lies outside the walked set. A ledger head whose parcel is still
+    /// it first), when the ledger holds a present head that was neither walked nor found
+    /// unwalkable, or when a ref head lies outside the walked set. An unwalkable ledger head is
+    /// dropped. A ledger head whose parcel is still
     /// absent now is dropped: a fetch still in flight re-records it when it sees the new scope. So
     /// is one a walked ref reaches while that ref still stands where it was walked: the ref's own
     /// closure covers it, and a ref write that later leaves it records it again.
@@ -4837,7 +4834,7 @@ impl Expansion {
 
         for entry in fetch_ledger::read_ledger()? {
             if !file_utils::does_object_exist(&entry.head)?
-                || self.fence_candidates.contains(&entry.head)
+                || self.unwalkable.contains(&entry.head)
                 || covered(&entry.head)
             {
                 continue;
@@ -4854,22 +4851,6 @@ impl Expansion {
             if !self.seen.parcels.contains(head) && !self.local_parcels.contains(head) {
                 return Ok(ExpandCommit::Retry);
             }
-        }
-
-        // A head walked whole at the widened scope is no longer part-way, even one whose own walk
-        // failed but a later head's walk passed through; a fenced head whose parcel is gone has
-        // nothing left to guard.
-        let old_fence = fetch_ledger::read_fence()?;
-        let mut fence: Vec<String> = Vec::new();
-
-        for head in old_fence.iter().chain(&self.fence_candidates) {
-            if !self.seen.parcels.contains(head) && !fence.contains(head) && file_utils::does_object_exist(head)? {
-                fence.push(head.clone());
-            }
-        }
-
-        if fence != old_fence {
-            fetch_ledger::write_fence(&lock, &fence)?;
         }
 
         if ledger != fetch_ledger::read_ledger()? {
@@ -15589,10 +15570,9 @@ mod tests {
             let mut expansion = expand(&base, &["web"]);
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
 
-            assert!(!expansion.walked_heads.contains(&absent) && !expansion.fence_candidates.contains(&absent));
+            assert!(!expansion.walked_heads.contains(&absent) && !expansion.unwalkable.contains(&absent));
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
             assert!(ledger_heads().is_empty());
-            assert!(fetch_ledger::read_fence().unwrap().is_empty());
             assert!(!file_utils::does_object_exist(&absent).unwrap(), "nothing fetched it");
         }
 
@@ -15607,10 +15587,22 @@ mod tests {
             head
         }
 
-        // Revert: let the head compare-and-set skip the fence → the palletize lands.
+        /// A ledger head whose `src` is here but whose `web` blob is not: complete at the scope
+        /// `src`, so a ref may be written at it, but not at a scope that adds `web`, which the
+        /// remote can no longer serve.
+        fn web_missing(base: &str) -> String {
+            let head = parcel("web-missing", vec![base.to_string()]);
+            let blob = blob("b web-missing");
+            let (folder, file) = file_utils::get_path_for_object(&blob).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+            record(&head, "web-missing");
+            head
+        }
+
+        // Revert: skip the closure check at the head compare-and-set → the palletize lands.
         #[test]
-        fn an_unservable_ledger_head_is_fenced_and_refused_as_a_new_head() {
-            let _scratch = Scratch::new("expand-fence");
+        fn an_unservable_ledger_head_is_dropped_and_refused_as_a_new_head() {
+            let _scratch = Scratch::new("expand-unwalkable");
             let base = sparse_main();
             let head = part_way(&base);
 
@@ -15619,31 +15611,28 @@ mod tests {
             expansion.walk_new_ref_heads_locally().unwrap();
 
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
-            assert_eq!(fetch_ledger::read_fence().unwrap(), vec![head.clone()]);
             assert!(ledger_heads().is_empty());
 
             let refused = pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE);
-            assert!(matches!(refused, Err(RefUpdateError::Fenced { .. })), "{:?}", refused.map_err(|e| e.to_string()));
+            assert!(matches!(refused, Err(RefUpdateError::Incomplete { .. })), "{:?}", refused.map_err(|e| e.to_string()));
         }
 
-        // Revert: lift the fence when the fetch is recorded → a fetch that then fails leaves the
-        // head palletizable; or never lift it → a completed fetch leaves it refused.
+        // Revert: skip the closure check at the head compare-and-set → the part-way head is
+        // palletized before its fetch completes; or refuse every new head → it stays refused
+        // after.
         #[test]
-        fn only_a_completed_fetch_lifts_the_fence() {
-            let _scratch = Scratch::new("fence-lift");
-            sparse_main();
-            let head = "c".repeat(64);
-            {
-                let lock = RefLock::acquire().unwrap();
-                fetch_ledger::write_fence(&lock, &[head.clone()]).unwrap();
-            }
+        fn a_part_way_head_is_refused_until_its_fetch_completes() {
+            let _scratch = Scratch::new("part-way-refused");
+            let base = sparse_main();
+            let head = part_way(&base);
 
-            let failed = runtime().block_on(fetch_history_scoped(&unreachable(), &head, "x", &Progress::NONE));
-            assert!(failed.is_err());
-            assert!(fetch_ledger::is_fenced(&head).unwrap(), "a failed fetch completes nothing");
+            let refused = pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE);
+            assert!(matches!(refused, Err(RefUpdateError::Incomplete { .. })), "{:?}", refused.map_err(|e| e.to_string()));
+            assert_eq!(pallet_utils::get_pallet_head("x").unwrap(), None, "nothing was written");
 
-            runtime().block_on(fetch_recorded(&head, "x", async |_: &MaterializationScope| Ok(FetchStats::default()))).unwrap();
-            assert!(!fetch_ledger::is_fenced(&head).unwrap(), "a completed fetch lifts the fence");
+            // The fetch completes: the missing tree arrives.
+            content_tree("part-way");
+            pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE).unwrap();
         }
 
         // Revert: drop the ref write's ledger record → the head `main` left is in no record, so
@@ -15700,31 +15689,6 @@ mod tests {
             assert_eq!(ledger_heads(), vec![kept]);
         }
 
-        // Revert: keep walked heads on the fence → the healed head stays fenced; or keep absent
-        // heads → the gone head stays listed.
-        #[test]
-        fn the_commit_lifts_the_fence_of_a_walked_head_and_drops_an_absent_one() {
-            let _scratch = Scratch::new("expand-unfence");
-            let base = sparse_main();
-            // A crash between the fence write and the ledger write leaves a head in both; this
-            // walk now completes it.
-            let healed = parcel("healed", vec![base.clone()]);
-            record(&healed, "healed");
-            let gone = "e".repeat(64);
-            {
-                let lock = RefLock::acquire().unwrap();
-                fetch_ledger::write_fence(&lock, &[healed.clone(), gone]).unwrap();
-            }
-
-            let mut expansion = expand(&base, &["web"]);
-            runtime().block_on(expansion.walk(&unreachable())).unwrap();
-            expansion.walk_new_ref_heads_locally().unwrap();
-
-            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
-            assert!(fetch_ledger::read_fence().unwrap().is_empty());
-            assert_eq!(ledger_heads(), vec![healed]);
-        }
-
         // Revert: leave the base walk out of `reached` → `main`'s own walk adds nothing after
         // it, so the ledger head in the current pallet's history is kept.
         #[test]
@@ -15743,64 +15707,19 @@ mod tests {
             assert!(ledger_heads().is_empty());
         }
 
-        // Revert: fence every candidate unfiltered → `head`, walked whole through `descendant`
-        // after its own walk failed, is fenced anyway.
+        // Revert: drop the local walk's check of unwalkable heads → the commit widens the scope
+        // over a ref whose history is incomplete at the widened scope.
         #[test]
-        fn a_head_to_be_fenced_that_a_later_walk_passes_through_is_not_fenced() {
-            let _scratch = Scratch::new("expand-fence-passed");
+        fn a_ref_written_at_an_unwalkable_head_refuses_the_expand() {
+            let _scratch = Scratch::new("expand-unwalkable-ref");
             let base = sparse_main();
-            let head = part_way(&base);
+            let head = web_missing(&base);
 
             let mut expansion = expand(&base, &["web"]);
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
-            assert!(expansion.fence_candidates.contains(&head));
+            assert!(expansion.unwalkable.contains(&head));
 
-            // A lower of a descendant completes the head meanwhile.
-            content_tree("part-way");
-            let descendant = parcel("descendant", vec![head.clone()]);
-            record(&descendant, "other");
-
-            runtime().block_on(expansion.walk(&unreachable())).unwrap();
-            assert!(expansion.seen.parcels.contains(&head));
-            expansion.walk_new_ref_heads_locally().unwrap();
-
-            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
-            assert!(fetch_ledger::read_fence().unwrap().is_empty());
-        }
-
-        // Revert: lift the fence only of heads walked as heads → `fenced`, walked whole as the
-        // parent of a ref head, stays fenced.
-        #[test]
-        fn a_fenced_head_walked_through_a_ref_is_unfenced() {
-            let _scratch = Scratch::new("expand-unfence-ancestor");
-            let base = sparse_main();
-            let fenced = parcel("fenced", vec![base.clone()]);
-            let child = parcel("child", vec![fenced.clone()]);
-            pallet_utils::update_pallet_head("y", None, &child, &RefPreconditions::NONE).unwrap();
-            {
-                let lock = RefLock::acquire().unwrap();
-                fetch_ledger::write_fence(&lock, &[fenced.clone()]).unwrap();
-            }
-
-            let mut expansion = expand(&base, &["web"]);
-            runtime().block_on(expansion.walk(&unreachable())).unwrap();
-            expansion.walk_new_ref_heads_locally().unwrap();
-
-            assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
-            assert!(fetch_ledger::read_fence().unwrap().is_empty());
-        }
-
-        // Revert: drop the local walk's fence check → the commit fences a head a ref now holds.
-        #[test]
-        fn a_ref_written_at_a_head_to_be_fenced_refuses_the_expand() {
-            let _scratch = Scratch::new("expand-fence-ref");
-            let base = sparse_main();
-            let head = part_way(&base);
-
-            let mut expansion = expand(&base, &["web"]);
-            runtime().block_on(expansion.walk(&unreachable())).unwrap();
-            assert!(expansion.fence_candidates.contains(&head));
-
+            // Complete at the scope still on disk, so the ref write is accepted.
             pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE).unwrap();
 
             // The first time, the head gets another walk rather than a refusal.
@@ -15812,17 +15731,17 @@ mod tests {
             assert!(error.contains("\"x\"") && error.contains("part-way"), "{}", error);
         }
 
-        // Revert: refuse at once when a new ref reaches a head marked to be fenced → the expand
-        // refuses although the fetch behind the ref completed the head.
+        // Revert: refuse at once when a new ref reaches an unwalkable head → the expand refuses
+        // although the fetch behind the ref completed the head.
         #[test]
-        fn a_head_to_be_fenced_that_a_ref_now_holds_is_walked_again() {
-            let _scratch = Scratch::new("expand-fence-rewalk");
+        fn an_unwalkable_head_that_a_ref_now_holds_is_walked_again() {
+            let _scratch = Scratch::new("expand-unwalkable-rewalk");
             let base = sparse_main();
             let head = part_way(&base);
 
             let mut expansion = expand(&base, &["web"]);
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
-            assert!(expansion.fence_candidates.contains(&head));
+            assert!(expansion.unwalkable.contains(&head));
 
             // A lower completes the head and palletizes it meanwhile.
             content_tree("part-way");
@@ -15834,7 +15753,6 @@ mod tests {
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
             expansion.walk_new_ref_heads_locally().unwrap();
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
-            assert!(fetch_ledger::read_fence().unwrap().is_empty());
         }
     }
 }

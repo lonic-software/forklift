@@ -550,17 +550,29 @@ pub fn restore_deleted(entry: &JournalEntry, as_name: Option<&str>) -> Result<Re
 
     refuse_a_bay_out_of_step(&name, &head, as_name)?;
 
-    crate::util::audit_utils::verify_parcel_closure_scoped(&head, None, &crate::util::scope_utils::read_fetch_scope()?, false)
-        .map_err(|e| format!(
-            "The history of deleted pallet \"{}\" ({}) is no longer complete in this warehouse: {} \
-            Nothing was undone. If a remote holds that history, \"forklift lower {}\" brings the \
-            pallet back from it; otherwise the history is gone.",
-            wire, head, e, deleted.name
-        ))?;
-
     let preconditions = trust_preconditions(&wire, &head)?;
 
-    create_deleted(&wire, &name, as_name.is_some(), &head, &preconditions).map(restored)
+    // The ref write verifies the history is still complete; a refusal names what to run instead.
+    create_deleted(&wire, &name, as_name.is_some(), &head, &preconditions)
+        .map_err(|e| match e {
+            CreateRefused::Incomplete(missing) => format!(
+                "The history of deleted pallet \"{}\" ({}) is no longer complete in this warehouse: {} \
+                Nothing was undone. If a remote holds that history, \"forklift lower {}\" brings the \
+                pallet back from it; otherwise the history is gone.",
+                wire, head, missing, deleted.name
+            ),
+            CreateRefused::Other(error) => error,
+        })
+        .map(restored)
+}
+
+/// Why [`create_deleted`] did not create the pallet.
+#[derive(Debug, PartialEq)]
+enum CreateRefused {
+    /// The deleted head's history is no longer completely present (what is missing).
+    Incomplete(String),
+    /// Anything else, as the message to report.
+    Other(String),
 }
 
 /// The compare-and-set [`restore_deleted`] ends in: create `name` at `head`, judging a lost race
@@ -569,15 +581,16 @@ fn create_deleted(wire: &str,
                   name: &str,
                   renamed: bool,
                   head: &str,
-                  preconditions: &pallet_utils::RefPreconditions) -> Result<Restored, String> {
+                  preconditions: &pallet_utils::RefPreconditions) -> Result<Restored, CreateRefused> {
     match pallet_utils::update_pallet_head_in(PalletNamespace::User, name, None, head, preconditions) {
         Ok(()) => Ok(Restored::Created),
-        Err(RefUpdateError::Moved(moved)) => settle_on(wire, name, renamed, head, moved.found),
+        Err(RefUpdateError::Moved(moved)) => settle_on(wire, name, renamed, head, moved.found).map_err(CreateRefused::Other),
         Err(RefUpdateError::Failed(error)) => match pallet_utils::get_pallet_head(name) {
             Ok(Some(found)) if found == head => Ok(Restored::Created),
-            _ => Err(format!("{} The undo entry is kept; run \"forklift undo\" again.", error)),
+            _ => Err(CreateRefused::Other(format!("{} The undo entry is kept; run \"forklift undo\" again.", error))),
         },
-        Err(error) => Err(error.to_string()),
+        Err(RefUpdateError::Incomplete { missing, .. }) => Err(CreateRefused::Incomplete(missing)),
+        Err(error) => Err(CreateRefused::Other(error.to_string())),
     }
 }
 
@@ -961,9 +974,10 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
             }
             // Another writer moved it after the operation: theirs stands.
             Err(RefUpdateError::Moved(_)) => {}
-            // The write failed (no precondition is consumed, so nothing else refuses it): put the
-            // current pallet back where the operation left it, so the bay still matches the entry
-            // and a retried undo passes the gate again.
+            // The write failed, or was refused because the pre-head's history is no longer
+            // complete (no precondition is consumed, so nothing else refuses it): put the current
+            // pallet back where the operation left it, so the bay still matches the entry and a
+            // retried undo passes the gate again.
             Err(e) => return Err(un_restore_current(entry, e.to_string())),
         }
     }
@@ -1222,7 +1236,7 @@ mod tests {
     }
 
     fn hash(digit: char) -> String {
-        digit.to_string().repeat(64)
+        crate::util::pallet_utils::tests::stub_parcel(&digit.to_string())
     }
 
     /// A snapshot on `pallet` holding only that pallet's ref at `head`, with no consolidation.
@@ -2233,18 +2247,19 @@ mod tests {
     #[test]
     fn the_journal_is_capped_at_max_entries() {
         let _scratch = Scratch::new("journal-cap");
+        let head = |i: usize| crate::util::pallet_utils::tests::stub_parcel(&i.to_string());
 
         for i in 0..(MAX_ENTRIES + 10) {
             advance(
                 "main",
                 pallet_utils::get_pallet_head("main").unwrap().as_deref(),
-                &format!("{:064x}", i),
+                &head(i),
             ).unwrap();
             let before = capture().unwrap();
             advance(
                 "main",
                 pallet_utils::get_pallet_head("main").unwrap().as_deref(),
-                &format!("{:064x}", i + 1),
+                &head(i + 1),
             ).unwrap();
             push_if_changed("stack", before).unwrap();
         }
@@ -2254,9 +2269,9 @@ mod tests {
         // The oldest entries are the ones dropped: the newest surviving entry is the very
         // last one pushed, and the oldest is the eleventh.
         let entries = read().unwrap();
-        assert_eq!(entries[0].before.head("main"), Some(&format!("{:064x}", 10)));
+        assert_eq!(entries[0].before.head("main"), Some(&head(10)));
         let newest = pop().unwrap().unwrap();
-        assert_eq!(newest.before.head("main"), Some(&format!("{:064x}", MAX_ENTRIES + 9)));
+        assert_eq!(newest.before.head("main"), Some(&head(MAX_ENTRIES + 9)));
     }
     #[test]
     fn a_lost_create_of_a_deleted_pallet_is_judged_by_the_head_it_found() {
@@ -2270,9 +2285,9 @@ mod tests {
 
         // Created meanwhile at another head: refused, theirs stands.
         pallet_utils::update_pallet_head("other", None, &hash('b'), &none).unwrap();
-        let refused = create_deleted("side", "other", false, &hash('a'), &none).unwrap_err();
+        let Err(CreateRefused::Other(refused)) = create_deleted("side", "other", false, &hash('a'), &none) else { panic!() };
         assert!(refused.contains("exists again") && refused.contains("forklift undo --as <new-name>"), "{}", refused);
-        let refused = create_deleted("side", "other", true, &hash('a'), &none).unwrap_err();
+        let Err(CreateRefused::Other(refused)) = create_deleted("side", "other", true, &hash('a'), &none) else { panic!() };
         assert!(refused.contains("Pallet \"other\" already exists"), "{}", refused);
         assert_eq!(pallet_utils::get_pallet_head("other").unwrap(), Some(hash('b')));
 
@@ -2281,14 +2296,13 @@ mod tests {
     }
 
     #[test]
-    fn a_create_of_a_fenced_deleted_head_refuses() {
-        let _scratch = Scratch::new("create-deleted-fenced");
-        let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
-        crate::util::fetch_ledger::write_fence(&lock, &[hash('a')]).unwrap();
-        drop(lock);
+    fn a_create_of_an_incomplete_deleted_head_refuses() {
+        let _scratch = Scratch::new("create-deleted-incomplete");
 
-        let refused = create_deleted("side", "side", false, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap_err();
-        assert!(refused.contains("fetched only part-way"), "{}", refused);
+        // No such parcel is here at all.
+        let absent = "a".repeat(64);
+        let refused = create_deleted("side", "side", false, &absent, &pallet_utils::RefPreconditions::NONE);
+        assert!(matches!(&refused, Err(CreateRefused::Incomplete(missing)) if missing.contains(&absent)), "{:?}", refused);
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
     }
 

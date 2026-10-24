@@ -104,12 +104,9 @@ impl Warehouse {
         };
         let parcel_hash = store(LooseObjectBuilder::build_parcel(&crafted));
 
-        pallet_utils::update_pallet_head(
-            name,
-            pallet_utils::get_pallet_head(name).unwrap().as_deref(),
-            &parcel_hash,
-            &pallet_utils::RefPreconditions::NONE,
-        ).unwrap();
+        // Straight to the ref file: the check every real ref write runs would refuse a tree it
+        // cannot walk, and these trees are crafted to be unwalkable.
+        std::fs::write(pallet_utils::get_pallets_folder().join(name), format!("{}\n", parcel_hash)).unwrap();
     }
 }
 

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
+use crate::util::scope_utils::MaterializationScope;
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -654,12 +655,18 @@ pub enum RefUpdateError {
         found: Option<String>,
     },
 
-    /// The new head of a user pallet is a parcel a sparse warehouse fetched only part-way, and
-    /// whose remote could not serve the rest when `expand` widened the fetch scope (see
-    /// [`fetch_ledger`](crate::util::fetch_ledger)); nothing was written.
-    Fenced {
-        /// The fenced parcel.
+    /// The new head of a user pallet does not have its history completely present in this
+    /// warehouse, within its fetch scope: a parcel, tree, blob or chunk it needs is missing, as a
+    /// fetch that stopped part-way leaves it; nothing was written.
+    Incomplete {
+        /// The pallet whose ref was to move.
+        pallet: String,
+
+        /// The refused head.
         head: String,
+
+        /// What is missing, as the closure check reported it.
+        missing: String,
     },
 
     /// Anything else: an invalid name or value, or the ref could not be read or written.
@@ -676,11 +683,12 @@ impl std::fmt::Display for RefUpdateError {
                 {}); this command wrote nothing. Run it again.",
                 found.as_deref().unwrap_or("unborn")
             ),
-            RefUpdateError::Fenced { head } => write!(
+            RefUpdateError::Incomplete { pallet, head, missing } => write!(
                 f,
-                "Parcel {} was fetched only part-way; lower it from a remote that has it. Nothing was \
-                written.",
-                &head[..head.len().min(12)]
+                "Refusing to set pallet \"{}\" to {}: its history is not completely present in this \
+                warehouse ({}). Nothing was written. If a fetch of it stopped part-way, run that \
+                fetch again before this command.",
+                pallet, &head[..head.len().min(12)], missing
             ),
             RefUpdateError::AnchorMoved => f.write_str(
                 "Another bay or process changed this warehouse's trust anchor while this command \
@@ -927,6 +935,8 @@ pub fn update_meta_pallet_head(name: &str,
 /// * `Err(RefUpdateError::Moved)`     - The ref did not hold `expected`; nothing was written.
 /// * `Err(RefUpdateError::OfficeMoved | AnchorMoved | PalletsMoved | WitnessMoved)`
 ///                                    - A precondition did not hold; nothing was written.
+/// * `Err(RefUpdateError::Incomplete)` - A user pallet's new head does not have its history
+///                                      completely present; nothing was written.
 /// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
 ///                                      ref could not be locked, read or written (the write may
 ///                                      still have landed: read the ref back to tell).
@@ -937,20 +947,130 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None)
+}
+
+/// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
+/// remote's ref update, after its own closure check): the write skips its own verification when
+/// `verified` is for `new` at the current fetch scope, and verifies as usual otherwise.
+pub fn update_pallet_head_verified(
+    namespace: PalletNamespace,
+    name: &str,
+    expected: Option<&str>,
+    new: &str,
+    preconditions: &RefPreconditions,
+    verified: &VerifiedClosure,
+) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified))
+}
+
+/// That a head's closure was verified, and at which fetch scope. Minted only by the verifier
+/// ([`audit_utils::verify_parcel_closure_for_write`](crate::util::audit_utils::verify_parcel_closure_for_write)),
+/// so holding one means the check ran.
+#[derive(Clone, Debug)]
+pub struct VerifiedClosure {
+    head: String,
+    scope: MaterializationScope,
+}
+
+impl VerifiedClosure {
+    pub(crate) fn new(head: &str, scope: MaterializationScope) -> VerifiedClosure {
+        VerifiedClosure { head: head.to_string(), scope }
+    }
+}
+
+/// The compare-and-set behind [`update_pallet_head_in`] and [`update_pallet_head_verified`].
+///
+/// A user-pallet ref moving to a new parcel first has that parcel's closure verified (see
+/// [`verify_new_head`]), before the lock, since the walk can be long and the hold does no walking.
+/// Objects cannot vanish between the walk and the write: every command that writes a ref holds
+/// the store-access lock shared, which every deleter needs exclusively. The fetch scope can change
+/// in between, though (an `expand` in another bay commits a widened one under the lock), so the
+/// hold re-reads it, and when it is no longer the scope verified against, the hold is released and
+/// the closure verified again at the new one.
+fn update_pallet_head_checked(
+    namespace: PalletNamespace,
+    name: &str,
+    expected: Option<&str>,
+    new: &str,
+    preconditions: &RefPreconditions,
+    verified: Option<&VerifiedClosure>,
+) -> Result<(), RefUpdateError> {
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
 
+    let mut verified_at = match closure_to_verify(namespace, expected, new) {
+        false => None,
+        true => {
+            let scope = crate::util::scope_utils::read_fetch_scope()?;
+
+            if !verified.is_some_and(|verified| verified.head == new && verified.scope == scope) {
+                verify_new_head(name, expected, new, &scope)?;
+            }
+
+            Some(scope)
+        }
+    };
+
     // Worked out before the lock, since it can walk history: the compare-and-set pins the ref to
-    // `expected`, so what it says about `expected` holds inside the hold too.
+    // `expected`, so what it says about `expected` holds inside the hold too. After the closure
+    // check, so a head whose ancestry is missing is refused as incomplete rather than failing
+    // this walk first.
     let left = left_unreached(namespace, expected, new)?;
 
-    let lock = crate::util::lock_utils::RefLock::acquire()?;
+    loop {
+        #[cfg(test)]
+        tests::before_hold_checkpoint();
 
-    // The ref's own compare goes first: a ref another writer moved, perhaps to this very parcel
-    // (which callers read as landed), reports that move, never a precondition it would mask.
-    require_head(namespace, name, expected)?;
-    check_preconditions(&lock, preconditions)?;
-    update_pallet_head_locked(&lock, namespace, name, expected, new, left)
+        let lock = crate::util::lock_utils::RefLock::acquire()?;
+
+        // The ref's own compare goes first: a ref another writer moved, perhaps to this very
+        // parcel (which callers read as landed), reports that move, never a precondition it
+        // would mask.
+        require_head(namespace, name, expected)?;
+        check_preconditions(&lock, preconditions)?;
+
+        if let Some(scope) = &verified_at {
+            let current = crate::util::scope_utils::read_fetch_scope()?;
+
+            if &current != scope {
+                drop(lock);
+                verify_new_head(name, expected, new, &current)?;
+                verified_at = Some(current);
+                continue;
+            }
+        }
+
+        return update_pallet_head_locked(&lock, namespace, name, expected, new, left);
+    }
+}
+
+/// Whether a write of `new` over `expected` must verify `new`'s closure: a user-pallet ref moving
+/// to a parcel it does not already hold. A meta pallet's writers verify their own history.
+fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &str) -> bool {
+    namespace == PalletNamespace::User && expected != Some(new)
+}
+
+/// Verify that `new`'s history is completely present at the fetch scope `scope`, back to what
+/// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
+/// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
+///
+/// [`audit_utils::verify_ref_head_closure`]: crate::util::audit_utils::verify_ref_head_closure
+fn verify_new_head(name: &str,
+                   expected: Option<&str>,
+                   new: &str,
+                   scope: &MaterializationScope) -> Result<(), RefUpdateError> {
+    let heads: Vec<String> = all_pallet_refs()?.into_iter()
+        .filter(|(pallet, _)| pallet.namespace == PalletNamespace::User)
+        .map(|(_, head)| head)
+        .collect();
+
+    crate::util::audit_utils::verify_ref_head_closure(new, &heads, expected, scope)
+        .map_err(|missing| RefUpdateError::Incomplete {
+            pallet: name.to_string(),
+            head: new.to_string(),
+            missing,
+        })
 }
 
 /// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
@@ -1013,10 +1133,12 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 /// consumed under it (a trust install, which writes the anchor and the office in one hold). Keeps
 /// the readback and the write log.
 ///
-/// Every head write passes through here, so this is where a fenced parcel is refused as a new
-/// user-pallet head ([`RefUpdateError::Fenced`]); a ref that already holds it may keep it. It is
-/// also where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
-/// the hold), is recorded in the fetched-heads ledger, in the same hold as the write.
+/// It is where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
+/// the hold), is recorded in the fetched-heads ledger, in the same hold as the write. It verifies
+/// no closure, so a user-pallet head write must reach it through [`update_pallet_head_checked`],
+/// which verifies the new head or takes a [`VerifiedClosure`] for exactly that head and scope. Its
+/// one other caller, the trust install, writes the meta office ref, whose writer verifies its own
+/// history.
 pub(crate) fn update_pallet_head_locked(
     lock: &crate::util::lock_utils::RefLock,
     namespace: PalletNamespace,
@@ -1028,13 +1150,6 @@ pub(crate) fn update_pallet_head_locked(
     validate_head_write(name, new)?;
 
     let found = require_head(namespace, name, expected)?;
-
-    if namespace == PalletNamespace::User
-        && found.as_deref() != Some(new)
-        && crate::util::fetch_ledger::is_fenced(new)?
-    {
-        return Err(RefUpdateError::Fenced { head: new.to_string() });
-    }
 
     if let Some(old) = left {
         crate::util::fetch_ledger::record_fetch(lock, old, name)?;
@@ -1360,9 +1475,21 @@ fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    thread_local! {
+        /// Run once by the next head write on this thread, between its closure check and its hold.
+        static BEFORE_HOLD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The seam [`update_pallet_head_checked`] calls before each hold.
+    pub(super) fn before_hold_checkpoint() {
+        if let Some(run) = BEFORE_HOLD.with(|slot| slot.borrow_mut().take()) {
+            run();
+        }
+    }
 
     /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.
     fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
@@ -1376,7 +1503,342 @@ mod tests {
     }
 
     fn hash(c: char) -> String {
-        c.to_string().repeat(64)
+        stub_parcel(&c.to_string())
+    }
+
+    /// Point a user pallet at `new` without verifying `new`'s closure: a warehouse whose history
+    /// went missing after a ref write that found it complete, for a test of what reads and
+    /// repairs do then.
+    pub(crate) fn update_pallet_head_unverified(name: &str,
+                                                expected: Option<&str>,
+                                                new: &str,
+                                                preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+        update_pallet_head_in_unverified(PalletNamespace::User, name, expected, new, preconditions)
+    }
+
+    /// [`update_pallet_head_unverified`] in `namespace`.
+    pub(crate) fn update_pallet_head_in_unverified(namespace: PalletNamespace,
+                                                   name: &str,
+                                                   expected: Option<&str>,
+                                                   new: &str,
+                                                   preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+        let verified = VerifiedClosure::new(new, crate::util::scope_utils::read_fetch_scope()?);
+        update_pallet_head_verified(namespace, name, expected, new, preconditions, &verified)
+    }
+
+    /// A parcel over an empty tree, stored with its tree and distinct per `tag`: a head whose
+    /// closure is complete, for a test that needs only some pallet head. Deterministic, so a test
+    /// may compare a ref against a second call.
+    pub(crate) fn stub_parcel(tag: &str) -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::tree_item::TreeItem;
+
+        let mut tree = LooseObjectBuilder::build_tree(
+            &TreeItem::new(String::new(), String::new(), crate::enums::dir_entry_type::DirEntryType::Tree)
+        );
+        tree.store().unwrap();
+
+        let mut parcel = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
+            tree_hash: tree.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some(tag.to_string()),
+        });
+        parcel.store().unwrap();
+        parcel.hash
+    }
+
+    /// The closure check at a user-pallet head write: a head whose history is not completely
+    /// present at the fetch scope is refused, back to what some ref already reaches.
+    mod closure_at_write {
+        use super::*;
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::tree_item::TreeItem;
+
+        fn blob(content: &str) -> String {
+            let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
+            object.store().unwrap();
+            object.hash
+        }
+
+        fn tree(entries: &[(&str, &str, DirEntryType)]) -> String {
+            let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            for (name, hash, item_type) in entries {
+                tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *item_type));
+            }
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            object.hash
+        }
+
+        /// A tree with `src/a` and `web/b`, holding `src` and `web` as their contents.
+        fn two_dirs(src: &str, web: &str) -> String {
+            let src = tree(&[("a", &blob(src), DirEntryType::Normal)]);
+            let web = tree(&[("b", &blob(web), DirEntryType::Normal)]);
+            tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)])
+        }
+
+        fn parcel(tree_hash: &str, parents: &[&str]) -> String {
+            let mut object = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
+                tree_hash: tree_hash.to_string(),
+                parents: parents.iter().map(|parent| parent.to_string()).collect(),
+                actions: Vec::new(),
+                description: None,
+            });
+            object.store().unwrap();
+            object.hash
+        }
+
+        fn remove(hash: &str) {
+            let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+        }
+
+        fn write(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
+            update_pallet_head(name, expected, new, &RefPreconditions::NONE)
+        }
+
+        fn assert_incomplete(result: Result<(), RefUpdateError>, name: &str, expected: Option<&str>) {
+            assert!(matches!(result, Err(RefUpdateError::Incomplete { .. })), "{:?}", result);
+            assert_eq!(get_pallet_head(name).unwrap().as_deref(), expected, "nothing was written");
+        }
+
+        // Revert: skip the closure check → both writes land over the missing blob; or refuse
+        // every new head → the head stays refused once the blob arrives.
+        #[test]
+        fn a_head_and_an_intermediate_parcel_with_a_missing_blob_are_refused_until_it_arrives() {
+            let (_root, _scope) = scratch("closure-full");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+
+            let mid = parcel(&two_dirs("a1", "b1"), &[&base]);
+            let head = parcel(&two_dirs("a2", "b1"), &[&mid]);
+            let missing = blob("b1");
+            remove(&missing);
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+            assert_incomplete(write("main", Some(&base), &mid), "main", Some(&base));
+            assert_incomplete(write("side", None, &head), "side", None);
+
+            // The fetch completes.
+            blob("b1");
+            write("main", Some(&base), &head).unwrap();
+        }
+
+        // Revert: drop the error's name for the missing object → the message names nothing.
+        #[test]
+        fn the_refusal_names_the_head_and_the_missing_object() {
+            let (_root, _scope) = scratch("closure-message");
+            let missing = blob("lost");
+            let head = parcel(&tree(&[("f", &missing, DirEntryType::Normal)]), &[]);
+            remove(&missing);
+
+            let message = write("main", None, &head).unwrap_err().to_string();
+            assert!(message.contains(&head[..12]) && message.contains(&missing), "{}", message);
+            assert!(message.contains("Nothing was written"), "{}", message);
+        }
+
+        // Revert: check only the head parcel itself → the write lands over a deleted ancestor.
+        #[test]
+        fn a_head_whose_ancestor_parcel_is_gone_is_refused() {
+            let (_root, _scope) = scratch("closure-ancestor");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let mid = parcel(&two_dirs("a1", "b0"), &[&base]);
+            let head = parcel(&two_dirs("a2", "b0"), &[&mid]);
+            remove(&mid);
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: work out the head the write leaves unreached before the closure check → its
+        // ancestry walk meets the gone parcel first and the write fails, not refused as incomplete.
+        #[test]
+        fn a_sparse_move_off_a_non_ancestor_onto_a_gone_ancestry_is_refused_as_incomplete() {
+            let (_root, _scope) = scratch("closure-sparse-unreached");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let other = parcel(&two_dirs("x0", "y0"), &[]);
+            write("main", None, &other).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            let mid = parcel(&two_dirs("a1", "b0"), &[&base]);
+            let head = parcel(&two_dirs("a2", "b0"), &[&mid]);
+            remove(&mid);
+
+            assert_incomplete(write("main", Some(&other), &head), "main", Some(&other));
+        }
+
+        // Revert: check only the first parent's side → the merge lands over the part-way side.
+        #[test]
+        fn a_merge_onto_a_part_way_parcel_is_refused() {
+            let (_root, _scope) = scratch("closure-merge");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+
+            // A lower that stopped part-way: the parcel arrived, a blob of its tree did not.
+            let lowered = parcel(&two_dirs("a0", "b-lowered"), &[&base]);
+            remove(&blob("b-lowered"));
+            let merge = parcel(&two_dirs("a-merged", "b0"), &[&base, &lowered]);
+
+            assert_incomplete(write("main", Some(&base), &merge), "main", Some(&base));
+        }
+
+        // Revert: refuse a head no ref reaches → a complete stray parcel is refused.
+        #[test]
+        fn a_complete_parcel_no_ref_reaches_is_accepted() {
+            let (_root, _scope) = scratch("closure-stray");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            let head = parcel(&two_dirs("a1", "b1"), &[&base]);
+
+            write("feature", None, &head).unwrap();
+            assert_eq!(get_pallet_head("feature").unwrap(), Some(head));
+        }
+
+        // Revert: bound the walk by the written ref's own head only → the walk enters `other`'s
+        // head, whose damage is not this write's, and refuses.
+        #[test]
+        fn the_walk_stops_at_every_ref_head() {
+            let (_root, _scope) = scratch("closure-bounds");
+            let theirs = parcel(&two_dirs("a0", "b-theirs"), &[]);
+            write("other", None, &theirs).unwrap();
+            let first = parcel(&two_dirs("a0", "b0"), &[&theirs]);
+            let head = parcel(&two_dirs("a1", "b0"), &[&first]);
+            remove(&blob("b-theirs"));
+            remove(&blob("b0"));
+
+            // `first` is walked and refused; once it is whole, `theirs` bounds the walk.
+            assert_incomplete(write("feature", None, &head), "feature", None);
+            blob("b0");
+            write("feature", None, &head).unwrap();
+        }
+
+        // Revert: drop the base-tree prune → `web`, carried unchanged from the current head, is
+        // walked and its damaged blob refuses a write that changed only `src`.
+        #[test]
+        fn a_subtree_the_current_head_carries_is_not_walked_again() {
+            let (_root, _scope) = scratch("closure-prune");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a1", "b0"), &[&base]);
+            remove(&blob("b0"));
+
+            write("main", Some(&base), &head).unwrap();
+        }
+
+        // Revert: verify at the full scope in a sparse warehouse → an out-of-scope blob that was
+        // never fetched refuses the write; or skip the scoped walk → the in-scope one does not.
+        #[test]
+        fn a_sparse_warehouse_checks_only_what_its_scope_holds() {
+            let (_root, _scope) = scratch("closure-sparse");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+
+            let sealed = parcel(&two_dirs("a1", "b-sealed"), &[&base]);
+            let part_way = parcel(&two_dirs("a-lost", "b-sealed"), &[&sealed]);
+            remove(&blob("b-sealed"));
+            write("main", Some(&base), &sealed).unwrap();
+
+            remove(&blob("a-lost"));
+            assert_incomplete(write("main", Some(&sealed), &part_way), "main", Some(&sealed));
+        }
+
+        // Revert: pass no bases to the in-scope walk below a spine tree → `src`, carried unchanged
+        // from the current head, is walked and its damaged blob refuses a write that changed only
+        // `web`, which is out of scope.
+        #[test]
+        fn a_sparse_warehouse_keeps_the_base_tree_prune() {
+            let (_root, _scope) = scratch("closure-sparse-prune");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a0", "b1"), &[&base]);
+            remove(&blob("a0"));
+
+            write("main", Some(&base), &head).unwrap();
+        }
+
+        // Revert: walk the tree recursively → the write overflows the small stack below and aborts.
+        #[test]
+        fn a_deeply_nested_tree_is_checked_without_overflowing_the_stack() {
+            let (root, _scope) = scratch("closure-deep");
+            let mut current = tree(&[("f", &blob("leaf"), DirEntryType::Normal)]);
+
+            // Written without the store's durability steps, which would dominate the test.
+            for _ in 0..2_000 {
+                let mut level = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+                level.add_child(TreeItem::new("d".to_string(), current, DirEntryType::Tree));
+                let mut object = LooseObjectBuilder::build_tree(&level);
+                let (folder, file) = file_utils::get_path_for_object(&object.hash).unwrap();
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(std::path::Path::new(&folder).join(file), object.compress().unwrap()).unwrap();
+                current = object.hash;
+            }
+            let head = parcel(&current, &[]);
+
+            let written = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let _scope = StorageRootScope::enter(&root);
+                    write("main", None, &head)
+                })
+                .unwrap()
+                .join()
+                .expect("the write thread must not panic");
+            written.unwrap();
+        }
+
+        // Revert: never re-read the scope inside the hold → the write lands over `web`, which
+        // the widened scope holds and this warehouse lacks.
+        #[test]
+        fn a_scope_widened_between_the_check_and_the_hold_is_checked_again() {
+            let (_root, _scope) = scratch("closure-widened");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a1", "b-sealed"), &[&base]);
+            remove(&blob("b-sealed"));
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
+            })));
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: re-verify a head the caller verified → the write refuses although it was told
+        // `head` was verified; or skip on any token → a token for another head or scope skips.
+        #[test]
+        fn a_verification_token_skips_the_check_only_for_its_own_head_and_scope() {
+            let (_root, _scope) = scratch("closure-token");
+            let missing = blob("lost");
+            let head = parcel(&tree(&[("f", &missing, DirEntryType::Normal)]), &[]);
+            let other = stub_parcel("other");
+            remove(&missing);
+            let full = MaterializationScope::full();
+
+            let wrong_head = VerifiedClosure::new(&other, full.clone());
+            assert_incomplete(update_pallet_head_verified(
+                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_head
+            ), "main", None);
+
+            let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]));
+            assert_incomplete(update_pallet_head_verified(
+                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_scope
+            ), "main", None);
+
+            // The token stands for a verification its caller made: the write takes its word.
+            let token = VerifiedClosure::new(&head, full);
+            update_pallet_head_verified(PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &token).unwrap();
+        }
+
+        // Revert: verify meta-pallet writes too → the office write walks a parcel it never needed.
+        #[test]
+        fn a_meta_pallet_write_is_not_checked_here() {
+            let (_root, _scope) = scratch("closure-meta");
+            update_meta_pallet_head(OFFICE, None, &"e".repeat(64), &RefPreconditions::NONE).unwrap();
+        }
     }
 
     fn ref_bytes(name: &str) -> Vec<u8> {

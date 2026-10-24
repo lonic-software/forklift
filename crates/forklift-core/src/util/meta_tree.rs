@@ -3496,7 +3496,7 @@ mod tests {
 
     fn set_work_head(pallet: &str, head: &str) {
         let old = pallet_utils::get_pallet_head(pallet).unwrap();
-        pallet_utils::update_pallet_head_in(
+        pallet_utils::tests::update_pallet_head_in_unverified(
             pallet_utils::PalletNamespace::User, pallet, old.as_deref(), head, &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
     }

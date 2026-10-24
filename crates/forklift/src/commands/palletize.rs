@@ -717,7 +717,7 @@ mod tests {
         // "x" stands on a parcel whose parent this store does not hold.
         let missing = "9".repeat(64);
         let x = test_support::store_parcel(&test_support::store_tree("x.txt", b"x\n"), &[missing.as_str()]);
-        pallet_utils::update_pallet_head("x", None, &x, &none).unwrap();
+        test_support::write_ref_unchecked("x", &x);
 
         let refused = test_support::block_on(delete_pallet("side", false)).unwrap_err();
         assert!(refused.contains("Cannot tell whether pallet \"x\" holds the work"), "{}", refused);

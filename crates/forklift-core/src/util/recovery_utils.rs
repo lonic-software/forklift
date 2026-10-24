@@ -3005,7 +3005,7 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
@@ -3087,7 +3087,7 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
@@ -3181,7 +3181,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&dir);
 
         let vanished_head_hash = "e".repeat(64);
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &vanished_head_hash,
@@ -3222,7 +3222,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(PathBuf::from(&folder).join(&file_name), &mismatched_bytes).unwrap();
 
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &corrupt_hash,
@@ -3288,7 +3288,7 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head_in(
+        pallet_utils::tests::update_pallet_head_in_unverified(
             namespace, name, None, &parcel_object.hash, &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
@@ -3591,7 +3591,7 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
@@ -3719,11 +3719,12 @@ mod tests {
 
         const DEPTH: usize = 2_000;
         const STACK: usize = 256 * 1024;
-        let target_hash = "9".repeat(64);
-
-        // Innermost tree: a single file entry naming the (absent) target hash — never actually
-        // stored as an object, since `check_leaf` only needs to check membership in `targets`
-        // against an entry's own hash, never read the entry's bytes.
+        // Innermost tree: a single file entry naming the target blob. The walk only checks an
+        // entry's own hash against `targets`; the blob is stored because the ref write below
+        // verifies the parcel's closure.
+        let mut target = LooseObjectBuilder::build_blob(&crate::model::blob::Blob { content: b"deep".to_vec() });
+        target.store().unwrap();
+        let target_hash = target.hash.clone();
         let mut innermost = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         innermost.add_child(TreeItem::new(
             "file.txt".to_string(), target_hash.clone(), DirEntryType::Normal,
@@ -5221,7 +5222,7 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
@@ -6262,12 +6263,12 @@ mod tests {
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
 
-        let v0 = "0".repeat(64);
-        let v1 = "1".repeat(64);
+        let v0 = pallet_utils::tests::stub_parcel("0");
+        let v1 = pallet_utils::tests::stub_parcel("1");
 
         // V0: the value standing at the moment of the (simulated) failed post-rename directory
         // sync for this ref's own write.
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &v0,
@@ -6333,7 +6334,7 @@ mod tests {
             let _scope = StorageRootScope::enter(&root);
             let forklift = forklift_root();
 
-            pallet_utils::update_pallet_head(pallet, None, &"0".repeat(64), &pallet_utils::RefPreconditions::NONE)
+            pallet_utils::tests::update_pallet_head_unverified(pallet, None, &"0".repeat(64), &pallet_utils::RefPreconditions::NONE)
                 .unwrap();
             let recorded = format!("pallets/{}", pallet);
             plant_complete_taint(&forklift, &[recorded.as_str()]);
@@ -6678,7 +6679,7 @@ mod tests {
         // `heal_restaging_a_tainted_pallet_ref_never_reverts_a_later_legitimate_head_move`'s
         // fixture) — present and readable, so `attempt.all_clean()` is true and `run` never even
         // reaches the closure walk. The pack-health warning must still appear.
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &"0".repeat(64),
@@ -6765,7 +6766,7 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
@@ -6925,7 +6926,7 @@ mod tests {
         };
         let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
         parcel_object.store().unwrap();
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &parcel_object.hash,
@@ -6994,7 +6995,7 @@ mod tests {
         // An ordinary, present, ref-shaped taint — `restage_object` never queries the pack
         // registry for a non-content-addressed path — so heal has real work to do, independent
         // of the broken pack folder.
-        pallet_utils::update_pallet_head(
+        pallet_utils::tests::update_pallet_head_unverified(
             "main",
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &"0".repeat(64),
