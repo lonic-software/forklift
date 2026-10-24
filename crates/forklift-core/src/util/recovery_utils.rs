@@ -1386,18 +1386,14 @@ fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
 /// Every durable ref source's roots for the closure walk (§3.2: "every durable ref source", never
 /// the registration ledger) — see the module doc comment.
 struct WalkRoots {
-    /// Parcel hashes to walk ancestry-and-tree-closure from: every user pallet head, every bay's
-    /// parked parcels, and every parcel a bay's in-progress consolidation or cherry-pick records.
-    /// The enumerating walk descends these within the fetch scope ([`walk_closure_for`]). A hash
+    /// Parcel hashes to walk ancestry-and-tree-closure from: every pallet head (both namespaces),
+    /// every bay's parked parcels, and every parcel a bay's in-progress consolidation or
+    /// cherry-pick records. A hash
     /// here that is itself absent is treated as an ordinary dangling reference — see
     /// [`walk_closure_for`]. Every one of these is a ref THIS warehouse's own commands set, so its
     /// absence is genuine local loss, never "maybe never fetched" — unlike [`Self::pin_parcels`]
     /// below.
     parcels: Vec<String>,
-    /// Every meta pallet head ([`GcRootSources::meta_heads`]), reported when absent exactly like
-    /// [`Self::parcels`], but always walked in full: the fetch scope selects user-pallet content
-    /// only.
-    meta_heads: Vec<String>,
     /// Every tag as `(name, subject)` — **never walked** (FORK-83). A tag is not a gc root, so
     /// nothing only a tag reaches may hold a taint open, and an absent subject (collected, or
     /// never fetched by a sparse franchise) can never be resolved anyway. These are read only so
@@ -1412,10 +1408,9 @@ struct WalkRoots {
     /// Every trust-pin root — the trust anchor's adopted head, its enrollment boundary, and every
     /// key's revocation distrust boundary — paired with its own
     /// [`office_utils::PinAbsencePolicy`] (see [`office_utils::collect_trust_pin_roots`]), walked
-    /// within the fetch scope with the user history, after the meta pallets' full drain, over the
-    /// same visited set — see
-    /// [`walk_closure_for`]'s own doc comment for why the per-entry policy stays correct across
-    /// the two drains. Unlike an ordinary ref root, a `Gap`-
+    /// by the same queue and drain as [`Self::parcels`] above (unified since PR #120 round 2 — see
+    /// [`walk_closure_for`]'s own doc comment for why one shared drain, rather than the previous
+    /// two, is what makes the per-entry policy correct). Unlike an ordinary ref root, a `Gap`-
     /// policy trust boundary can legitimately *name* a head this warehouse never actually fetched:
     /// `office enroll`/`office revoke` snapshot a remote's or a revoker's *declared* pallet heads
     /// by hash, not by pulling their history first (DESIGN.html §8.7/§8.11). So an absent
@@ -1451,12 +1446,9 @@ struct WalkRoots {
 
 /// [`gc_root_sources`]'s result — see that function's own doc comment.
 pub(crate) struct GcRootSources {
-    /// Every user pallet head plus every readable bay's base, parked parcels and in-progress
-    /// consolidation and cherry-pick parcels: the roots of the user history.
+    /// Every pallet head (both namespaces) plus every readable bay's base, parked parcels and
+    /// in-progress consolidation and cherry-pick parcels.
     pub parcels: Vec<String>,
-    /// Every meta pallet head. Kept apart from [`Self::parcels`] because a sparse warehouse's
-    /// fetch scope selects user-pallet content only: heal walks these in full whatever the scope.
-    pub meta_heads: Vec<String>,
     /// The head every haul not yet merged proposes ([`haul_utils::unmerged_haul_heads`]). Kept
     /// apart from [`Self::parcels`] because a haul opened elsewhere *declares* its head, which
     /// this warehouse may never have fetched: its absence is a gap, never lost data.
@@ -1529,13 +1521,9 @@ pub(crate) fn gc_root_sources(
     pin_policy: office_utils::TrustPinReadPolicy,
 ) -> Result<GcRootSources, String> {
     let mut parcels: Vec<String> = Vec::new();
-    let mut meta_heads: Vec<String> = Vec::new();
 
-    for (pallet_ref, head) in pallet_utils::all_pallet_refs()? {
-        match pallet_ref.namespace {
-            pallet_utils::PalletNamespace::User => parcels.push(head),
-            pallet_utils::PalletNamespace::Meta => meta_heads.push(head),
-        }
+    for (_, head) in pallet_utils::all_pallet_refs()? {
+        parcels.push(head);
     }
 
     // A haul's proposed head is merged from the recorded hash, whatever its source pallet holds
@@ -1575,7 +1563,7 @@ pub(crate) fn gc_root_sources(
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_leaves)?;
     }
 
-    Ok(GcRootSources { parcels, meta_heads, haul_heads, pin_parcels: trust_pins.roots, shard_leaves, degraded })
+    Ok(GcRootSources { parcels, haul_heads, pin_parcels: trust_pins.roots, shard_leaves, degraded })
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -1651,7 +1639,6 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
 
     Ok(WalkRoots {
         parcels: sources.parcels,
-        meta_heads: sources.meta_heads,
         tag_subjects,
         tags_unread,
         pin_parcels: sources.pin_parcels,
@@ -1925,10 +1912,10 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// both collects every absence found and (per the module doc comment) turns on the terminal-
 /// leaf/chunk presence checks that [`closure_references_any`] skips entirely. Same descent, so this
 /// can never tolerate (or fail to tolerate) anything [`closure_references_any`] doesn't — except
-/// that this walk keeps every root but the meta pallets within the warehouse's fetch scope
+/// that this walk keeps every tree but a meta tree within the warehouse's fetch scope
 /// (FORK-262): a sparse franchise never fetched what lies outside it, so recording those sealed
-/// objects as vanished would refuse every torn heal there. A fetch scope that cannot be read is a degraded source,
-/// and the walk then runs in full.
+/// objects as vanished would refuse every torn heal there. A fetch scope that cannot be read is a
+/// degraded source, and the walk then runs in full.
 ///
 /// `corrupt` is the §8.3 corrupt-boundary carve-out: a hash in this set that the walk reaches is
 /// treated exactly like a raw-absent one — recorded via the sink, not descended into — even
@@ -2034,23 +2021,22 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// this, and `tests::a_lost_parcel_reachable_both_as_its_own_boundary_pin_and_as_a_present_sibling_pins_parent_is_still_reported`
 /// for the falsifying fixture.
 ///
-/// **Two drains over one shared `visited_parcels`, split by scope, not by policy (FORK-262).** The
-/// first drains the meta pallet heads in full; the second drains every other root — the user
-/// pallet heads, the bay-scoped parcels, the trust pins and the haul heads — within `scope`. A
-/// sparse warehouse never fetched what lies outside its scope, so the enumerating walk records
-/// none of it as absent. The roots are split exactly as `prune_utils` retains them: meta pallet
-/// heads in full, everything else scoped, the pins included. A scope prune frees whatever a pin
-/// alone reaches outside the scope, so a pin walked in full would report what prune freed as lost
-/// and keep the taint standing for good.
-/// The split keeps the `Gap` rule intact: an absent `Gap` entry is still never marked visited, and
-/// a `Report` edge reaching the same hash resolves it in whichever drain finds it, before or after.
-/// Nor does the order change any verdict under a full scope, where both drains walk alike: a hash
-/// that is both an ordinary root (or one of its ancestors) and a pin root lands on the same
-/// verdict whichever entry is dequeued first — see [`AbsencePolicy`]'s own doc comment for the
-/// mechanics that make this order-independent. The order matters only under a sparse scope: a pin
-/// naming a meta pallet's history finds it already walked in full, and no tree walked in full is
-/// walked again on the spine, so nothing the meta drain reached is skipped. A pin naming a meta
-/// parcel no meta head reaches any more is walked within the scope, as prune retains it.
+/// One shared queue and one shared [`drain_parcel_queue`] call now handle every root — ordinary
+/// and pin alike — seeded together up front, rather than the two-pass, two-drain shape this
+/// module used before F1's fix (which is also what the ~25-line duplicate drain body this rewrite
+/// removed was for). Final results are identical to the old two-pass ordering for every case that
+/// ordering used to get right: a hash that is both an ordinary root (or one of its own ancestors)
+/// and a pin root still lands on the ordinary walk's verdict either way, because whichever queue
+/// entry for it is dequeued first marks it visited and the other becomes a same-result no-op — see
+/// [`AbsencePolicy`]'s own doc comment for the mechanics that make this order-independent.
+///
+/// **Every tree is walked within `scope`, except a meta tree (FORK-262).** A sparse warehouse never
+/// fetched what lies outside its fetch scope, so the enumerating walk records none of it as
+/// absent. The scope selects user-pallet content only, so [`walk_tree`] walks a tree whose root
+/// holds the metadata folder — the shape of every office and meta-tree pallet, which no user tree
+/// can have — in full. That decides by the tree, never by which root reached it: a trust pin can
+/// name either kind (`adopts` names office history, a `boundary` snapshot names user and meta
+/// heads alike), and a meta parcel walked within the scope would leave a real loss unreported.
 ///
 /// `scope` is the fetch scope for the enumerating walk ([`enumerate_absent_reachable`]) and full
 /// for the targeted one ([`closure_references_any`]), which must descend everything gc keeps.
@@ -2087,25 +2073,18 @@ fn walk_closure_for(
         check_leaf(hash, *item_type, targets, corrupt, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
     }
 
-    // The meta pallets first, in full; then every other root within `scope`. Both drains share
-    // `visited_parcels`, so a pin naming a meta pallet's history finds it already walked in full.
-    // See this function's own doc comment for why the drains still resolve a `Gap` entry exactly
-    // as one combined queue would.
-    let mut meta_queue: VecDeque<(String, AbsencePolicy)> = roots.meta_heads.iter()
-        .map(|hash| (hash.clone(), AbsencePolicy::Report))
-        .collect();
-    drain_parcel_queue(
-        &mut meta_queue, targets, corrupt, &mut referenced, &mut unwalked, &mut visited_parcels, &mut visited_trees,
-        &MaterializationScope::full(), reborrow_sink(&mut sink),
-    )?;
-
-    let mut scoped_queue: VecDeque<(String, AbsencePolicy)> = roots.parcels.iter()
-        .map(|hash| (hash.clone(), AbsencePolicy::Report))
+    // One combined queue, ordinary and pin roots alike — see this function's own doc comment for
+    // why seeding them together (rather than the previous two-pass, two-drain shape) is both
+    // simpler and what actually fixes F1.
+    let mut queue: VecDeque<(String, AbsencePolicy)> = roots.parcels.iter()
+        .cloned()
+        .map(|hash| (hash, AbsencePolicy::Report))
         .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
         .chain(roots.haul_heads.iter().map(|hash| (hash.clone(), AbsencePolicy::Gap)))
         .collect();
+
     drain_parcel_queue(
-        &mut scoped_queue, targets, corrupt, &mut referenced, &mut unwalked, &mut visited_parcels, &mut visited_trees,
+        &mut queue, targets, corrupt, &mut referenced, &mut unwalked, &mut visited_parcels, &mut visited_trees,
         scope, sink,
     )?;
 
@@ -2253,9 +2232,10 @@ impl From<office_utils::PinAbsencePolicy> for AbsencePolicy {
     }
 }
 
-/// The shared parcel-ancestry descent [`walk_closure_for`] drives once per scope (the meta pallets
-/// in full, then every other root within the fetch scope — see that function's own doc comment). Drains `queue` to empty, including any parent entries `queue` itself grows while
-/// draining, walking every present parcel's tree within `scope`.
+/// The shared parcel-ancestry descent [`walk_closure_for`] drives with its one combined queue
+/// (ordinary and pin roots together, since F1's fix — see that function's own doc comment). Drains
+/// `queue` to empty, including any parent entries `queue` itself grows while draining, walking
+/// every present parcel's tree within `scope`.
 ///
 /// Unlike a plain "insert-and-skip-if-already-present" visited check, marking a hash visited is
 /// deferred for a `Gap`-policy absence specifically (see [`AbsencePolicy::Gap`]'s own doc comment)
@@ -2410,6 +2390,16 @@ fn walk_tree(
 
         let tree = object_utils::load_tree(&tree_hash)?;
 
+        // A meta tree is walked in full whatever the scope — see `walk_closure_for`'s own doc
+        // comment. Its root holds the metadata folder, which no user tree can.
+        let spine_path = match spine_path {
+            Some(path) if path.is_empty() && is_meta_tree_root(&tree) => {
+                visited_trees.full.insert(tree_hash.clone());
+                None
+            }
+            spine_path => spine_path,
+        };
+
         // On the spine, an entry out of scope is sealed by its hash in this tree and was never
         // fetched: its absence is no loss, so it is neither checked nor descended. `Some(child)`
         // is the entry's spine path, or `None` once it is in scope whole.
@@ -2441,6 +2431,13 @@ fn walk_tree(
     }
 
     Ok(())
+}
+
+/// Whether a root tree holds the metadata folder: the shape of every office and meta-tree pallet,
+/// and of no user tree. The name match is [`office_utils::is_metadata_folder_name`]'s, wider than
+/// the exact name, so a crafted tree errs toward the full walk.
+fn is_meta_tree_root(tree: &crate::model::tree_item::TreeItem) -> bool {
+    tree.get_subtrees().chain(tree.get_files()).any(|(name, _)| office_utils::is_metadata_folder_name(name))
 }
 
 /// The trees a closure walk has been through, so it walks each at most once per way it is reached.
@@ -3360,18 +3357,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// FORK-262: the fetch scope selects user-pallet content only, so a meta pallet is walked in
-    /// full under any scope. Mutation: drain the meta heads within the scope → the meta tree's
-    /// file, outside `src`, is never checked → red.
-    #[test]
-    fn a_sparse_enumerating_walk_still_walks_a_meta_pallet_in_full() {
+    /// A meta-shaped root tree, `.forklift/tracked/cells/<lost>`, whose one cell was never stored.
+    /// Must be called after a `StorageRootScope` is entered.
+    fn meta_shaped_tree_with_a_lost_cell(lost: &str) -> crate::model::tree_item::TreeItem {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
         use crate::model::tree_item::TreeItem;
 
+        let mut cells = TreeItem::new("cells".to_string(), String::new(), DirEntryType::Tree);
+        cells.add_child(TreeItem::new("cell".to_string(), lost.to_string(), DirEntryType::Normal));
+        let mut cells_object = LooseObjectBuilder::build_tree(&cells);
+        cells_object.store().unwrap();
+        let mut tracked = TreeItem::new("tracked".to_string(), String::new(), DirEntryType::Tree);
+        tracked.add_child(TreeItem::new("cells".to_string(), cells_object.hash.clone(), DirEntryType::Tree));
+        let mut tracked_object = LooseObjectBuilder::build_tree(&tracked);
+        tracked_object.store().unwrap();
+        let mut forklift = TreeItem::new(".forklift".to_string(), String::new(), DirEntryType::Tree);
+        forklift.add_child(TreeItem::new("tracked".to_string(), tracked_object.hash.clone(), DirEntryType::Tree));
+        let mut forklift_object = LooseObjectBuilder::build_tree(&forklift);
+        forklift_object.store().unwrap();
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new(".forklift".to_string(), forklift_object.hash.clone(), DirEntryType::Tree));
+        root
+    }
+
+    /// FORK-262: the fetch scope selects user-pallet content only, so a meta pallet is walked in
+    /// full under any scope. Mutation: drop the meta-tree rule in `walk_tree` → `.forklift` is
+    /// out of scope at the root, and the lost cell is never checked → red.
+    #[test]
+    fn a_sparse_enumerating_walk_still_walks_a_meta_pallet_in_full() {
         let (dir, _scope) = enter_temp_root("sparse-meta-full");
         let lost = "5".repeat(64);
 
-        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        root.add_child(TreeItem::new("record".to_string(), lost.clone(), DirEntryType::Normal));
+        let root = meta_shaped_tree_with_a_lost_cell(&lost);
         plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &root);
         scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
 
@@ -3382,10 +3400,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// FORK-262: a trust pin is walked within the fetch scope, as prune retains it, even when no
+    /// FORK-262: a trust pin over a user tree is walked within the fetch scope, even when no
     /// pallet head reaches its parcel: a scope prune frees what the pin alone reaches outside the
-    /// scope, so a full walk would report it lost for good. Mutation: drain the pins in full →
-    /// the sealed README is recorded → red.
+    /// scope, so a full walk would report it lost for good. Mutation: walk every pinned parcel's
+    /// tree in full → the sealed README is recorded → red.
     #[test]
     fn a_trust_pin_no_pallet_reaches_is_walked_within_the_fetch_scope() {
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -3411,7 +3429,6 @@ mod tests {
 
         let roots = WalkRoots {
             parcels: Vec::new(),
-            meta_heads: Vec::new(),
             tag_subjects: Vec::new(),
             tags_unread: None,
             pin_parcels: vec![(pinned.hash.clone(), office_utils::PinAbsencePolicy::Gap)],
@@ -3428,6 +3445,48 @@ mod tests {
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
             "a pinned parcel's in-scope loss is recorded, and nothing outside the scope");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-262: whether a tree is walked in full is decided by its shape, never by which root
+    /// reached it. The re-genesis `adopts` pin names office history that no meta head reaches any
+    /// more; walked within the scope, a lost cell of it would go unreported and the taint would
+    /// clear over real loss. Mutation: drop the meta-tree rule in `walk_tree` → red.
+    #[test]
+    fn an_adopts_pin_over_office_history_no_meta_head_reaches_is_walked_in_full() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+
+        let (dir, _scope) = enter_temp_root("sparse-adopts-full");
+        let lost = "9".repeat(64);
+
+        let root = meta_shaped_tree_with_a_lost_cell(&lost);
+        let mut tree_object = LooseObjectBuilder::build_tree(&root);
+        tree_object.store().unwrap();
+        let mut adopted = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree_object.hash.clone(), parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        adopted.store().unwrap();
+
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: vec![(adopted.hash.clone(), office_utils::PinAbsencePolicy::Loss)],
+            haul_heads: Vec::new(),
+            shard_referenced: Vec::new(),
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            walk_closure_for(
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), Some(&mut sink),
+            ).unwrap();
+        }
+        assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
+            "the adopted office history's lost cell must be recorded whatever the fetch scope");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4715,7 +4774,6 @@ mod tests {
         let never_fetched = "a".repeat(64);
         let roots = WalkRoots {
             parcels: Vec::new(),
-            meta_heads: Vec::new(),
             tag_subjects: Vec::new(),
             tags_unread: None,
             pin_parcels: Vec::new(),
@@ -4774,7 +4832,6 @@ mod tests {
         let absent = "a".repeat(64);
         let roots = WalkRoots {
             parcels: Vec::new(),
-            meta_heads: Vec::new(),
             tag_subjects: vec![
                 ("present".to_string(), tagged.clone()),
                 ("v1.0".to_string(), absent.clone()),
