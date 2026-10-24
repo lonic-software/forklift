@@ -104,6 +104,14 @@ pub(crate) fn store_parcel(tree: &str, parents: &[&str]) -> String {
     object.hash
 }
 
+/// Point pallet `name` at `head` by writing its ref file directly, past the closure check every real
+/// ref write runs: for a fixture that models a store already missing history `head` reaches.
+pub(crate) fn write_ref_unchecked(name: &str, head: &str) {
+    let path = forklift_core::util::pallet_utils::get_pallets_folder().join(name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("{}\n", head)).unwrap();
+}
+
 /// Check `tree` out into the empty working directory and staging, as a fixture: under an operation
 /// marker of its own, since every wholesale rewrite of staging needs one.
 pub(crate) fn check_out(tree: &str) {

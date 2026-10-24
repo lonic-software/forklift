@@ -6173,12 +6173,9 @@ fn build_over_cap_subtree_without_blobs(warehouse_root: &Path, name: &str) -> St
         description: Some("over-cap subtree fixture".to_string()),
     };
     let parcel_hash = store(LooseObjectBuilder::build_parcel(&parcel));
-    pallet_utils::update_pallet_head(
-        "main",
-        pallet_utils::get_pallet_head("main").unwrap().as_deref(),
-        &parcel_hash,
-        &pallet_utils::RefPreconditions::NONE,
-    ).unwrap();
+    // Straight to the ref file: the check every real ref write runs would refuse a head whose
+    // blobs this store does not hold.
+    std::fs::write(pallet_utils::get_pallets_folder().join("main"), format!("{}\n", parcel_hash)).unwrap();
 
     parcel_hash
 }

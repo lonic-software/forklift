@@ -2427,9 +2427,12 @@ fn verify_tree_closure(tree_hash: &str,
             }
         }
 
-        for (name, subtree) in tree.get_subtrees() {
-            pending.push((subtree.hash.clone(), base_subtrees.remove(name).unwrap_or_default()));
-        }
+        // Pushed in reverse so they are walked by name, as a recursive walk would: a subtree hash
+        // recurring under a later name is free once the earlier one settled it.
+        let children: Vec<_> = tree.get_subtrees()
+            .map(|(name, subtree)| (subtree.hash.clone(), base_subtrees.remove(name).unwrap_or_default()))
+            .collect();
+        pending.extend(children.into_iter().rev());
     }
 
     Ok(())
