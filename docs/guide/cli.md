@@ -5,8 +5,8 @@ git, the [terminology map](README.md#the-warehouse-model-in-one-minute) will get
 you oriented fast.
 
 Conventions in this guide:
-- `forklift <command>` — most commands have a short alias, shown in the reference
-  table at the end and in each command's `forklift help <command>`.
+- `forklift <command>` — most commands have a short alias, shown in the
+  [command list](../generated/commands.md) and in each command's `forklift help <command>`.
 - Three global flags apply to every command: `-v`/`--verbose` (more detail),
   `--json` (machine output — see [Machine & agent output](#machine--agent-output)),
   and `--no-pager` (see [Paging](#paging) below).
@@ -2160,72 +2160,24 @@ dependency** — it flips on the SOCKS5 client already vendored in the HTTP stac
 
 ## 10. Command & alias reference
 
+Every command and subcommand, with its short alias and a one-line description, is listed in
+**[`../generated/commands.md`](../generated/commands.md)**. That page is generated from the
+command definition the binary parses its arguments with, and CI fails when the committed
+copy falls behind a new command or alias.
+
 ### Coming from git?
 
-Forklift accepts the familiar git command names as hidden aliases, so your muscle memory
-works on day one — while forklift's own vocabulary stays primary in `--help` (the aliases
-nudge you toward the real names as you go):
+Forklift accepts git's names for its everyday commands as hidden aliases, so `forklift commit`
+runs `stack` and `forklift push` runs `lift`. They work but are left out of `--help`, which
+shows forklift's own names; the generated page lists each one in its "Hidden alias" column.
 
-| You type (git) | Runs (forklift) | | You type (git) | Runs (forklift) |
-|---|---|---|---|---|
-| `init` | `prepare` | | `checkout` / `switch` | `shift` |
-| `add` | `load` | | `merge` | `consolidate` |
-| `commit` | `stack` | | `clone` | `franchise` |
-| `status` | `stocktake` | | `push` | `lift` |
-| `log` | `history` | | `pull` | `lower` |
-| `branch` | `palletize` | | `stash` | `park` |
-| `annotate` | `blame` | | `rm --cached` | `remove` |
-| `restore --staged` | `unload` | | | |
-
-The mapping isn't always one-to-one in *behavior* (e.g. `commit` runs `stack`, which commits
-what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `show` and
-`cherry-pick` keep their git names outright. For the review workflow, git's "pull request" is
-[`haul`](#haul--pull-requests-reviewable-merge-proposals).
-
-| Command | Alias | Does |
-|---------|-------|------|
-| `prepare` | `p` | Create a warehouse here |
-| `import-git` | | Migrate a git repo's history into the warehouse |
-| `export-git` | | Export the warehouse's history back into a git repo |
-| `alias` | | Manage the `fl` short alias next to this binary |
-| `config` | `cfg` | Read/set/unset configuration |
-| `profile` | | Manage named identity profiles |
-| `load` | `l` | Stage changes into the inventory |
-| `unload` | `ul` | Unstage (undo a `load`) |
-| `remove` | `rm` | Stage a removal |
-| `restore` | `r` | Restore from the inventory (discard changes) |
-| `stocktake` | `st` | Show staged and unstaged changes |
-| `diff` | `d` | Show line-by-line changes |
-| `stack` | `s` | Record the inventory as a new parcel |
-| `undo` | | Reverse the last stack, consolidate, cherry-pick or shift |
-| `peek` | `pk` | Inspect an object or inventory |
-| `show` | | Print a file's content at a revision (`<revision>:<path>`) |
-| `history` | `hi` | Walk the parcel graph |
-| `blame` | `bl` | Attribute each line to its author (with identity class) |
-| `audit` | `a` | Verify signed history offline |
-| `palletize` | `pz` | Create a pallet / list pallets |
-| `shift` | `sh` | Switch pallets |
-| `consolidate` | `con` | Merge another pallet in |
-| `cherry-pick` | `cp` | Apply a parcel's diff here, preserving authorship |
-| `deliver` | `dv` | Squash a draft onto a target, keeping the trail |
-| `bay` | | Parallel working directories (add / list / remove) |
-| `compact` | | Pack the loose object store into dense pack files |
-| `store` | | Report object-store health (loose vs packed, sizes, maintenance due) |
-| `heal` | | Resolve a standing durability taint, or finish or undo an interrupted operation |
-| `conflicts` | | List unresolved conflicts |
-| `park` | `pa` | Stash / list / pop work in progress |
-| `franchise` | `fr` | Clone a remote warehouse (`--only` for a sparse clone) |
-| `lift` | `li` | Push to a remote |
-| `lower` | `lo` | Pull from a remote |
-| `expand` | | Widen a sparse warehouse's fetch scope and fetch the new subtree(s) |
-| `narrow` | | Shrink this checkout's materialization scope (frees nothing) |
-| `office` | `o` | Manage users, keys, roles, agents, trust |
-| `manifest` | `mf` | Record/read signed post-metadata on parcels |
-| `tag` | | Signed tags / releases (admin-signed, offline-verifiable) |
-| `mcp` | | Serve the command surface as MCP tools |
-| `self-schema` | | Describe the command surface as a Pult manifest |
-| `help` | `h` | Show help |
-| `version` | `v` | Print the version |
+The mapping isn't always one-to-one in *behavior*: `commit` runs `stack`, which commits what
+you've `load`ed; it doesn't stage for you. `diff`, `restore`, `tag`, `show` and `cherry-pick`
+keep their git names outright. git's `restore --staged` works as it is (or use `unload`), and
+git's `rm --cached` is `remove`, which takes no `--cached` flag because it only ever stages the
+removal. For the review workflow, git's "pull request" is
+[`haul`](#haul--pull-requests-reviewable-merge-proposals). The
+[glossary](glossary.md) maps the concepts behind the names.
 
 ---
 

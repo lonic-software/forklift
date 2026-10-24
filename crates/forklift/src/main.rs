@@ -468,6 +468,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             match target {
                 DocgenTarget::Errors => docgen::render_errors().map(|out| print!("{}", out)),
                 DocgenTarget::JsonSchemas => docgen::render_json_schemas().map(|out| print!("{}", out)),
+                DocgenTarget::Commands => docgen::render_commands().map(|out| print!("{}", out)),
             }
         }
     }
