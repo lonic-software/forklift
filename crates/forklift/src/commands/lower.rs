@@ -1037,7 +1037,7 @@ mod tests {
     use super::parse_keeps;
 
     fn refusal(spec: &str) -> String {
-        parse_keeps(&[spec.to_string()]).err().expect("the keep must be refused")
+        parse_keeps(&[spec.to_string()]).expect_err("the keep must be refused")
     }
 
     #[test]
