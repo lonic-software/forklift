@@ -386,7 +386,7 @@ pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<(
     let (from, to) = (from.as_ref(), to.as_ref());
 
     #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
-    retry_while_held(|| std::fs::rename(from, to), is_held_by_another_process, || source_remains(from))
+    retry_while_held(|| std::fs::rename(from, to), is_held_by_another_process, || true)
 }
 
 /// Whether a rename's source still stands, so another attempt can still move it.
