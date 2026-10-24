@@ -201,6 +201,12 @@ fn call_tool(params: &Value, state: &ServerState, notify: &mut dyn FnMut(&Value)
 
     let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // An argument the tool does not declare is refused, never ignored: a dropped filter would
+    // answer a broader question than the one asked, still with ok:true.
+    if let Some(key) = undeclared_argument(name, &arguments) {
+        return Err(JsonRpcError::invalid_params(&format!("the \"{}\" tool takes no \"{}\" argument", name, key)));
+    }
+
     // Provenance hardening (§7.2): the `tool` and `session` are set from this MCP connection,
     // overriding anything the agent supplied — the harness identifies the tool, not the
     // model's own output. `model` stays the agent's attestation (MCP carries no model id).
@@ -1159,7 +1165,7 @@ fn tool_definitions() -> Value {
             object(json!({ "staged": boolean, "targets": { "type": "array", "items": string } }), json!([]))),
         tool("history", "Walk the parcel history newest first from a revision (default: the current pallet). Read it in pages with limit (max parcels) plus after (the data.next cursor from the previous page). To filter by author identity class, use query.",
             object(json!({ "revision": string, "limit": integer, "after": string }), json!([]))),
-        tool("query", "Query parcel history on its signed dimensions - identity class, supervisor, signing key, recorded machine-authorship provenance (model/tool), signed tags - plus parcel facts (dates, description glob, merge-ness, touched paths). Identity answers are verified by default (the signature is checked; the office is joined off the verified signer, never the parcel's own claim); recorded=true opts into the cheap self-declared reading, labeled. A signed-revoked match carries signer.boundary - vouched (inside the revocation's vouched history), suspect (outside it: a forged backdate, or the key's holder kept signing after the revocation), or unresolved (a partial clone is missing one of the boundary's heads, so the question cannot be answered here - never treat this as suspect) - filterable via a where leaf on signer.boundary (values vouched or suspect only). A parcel with no provenance recorded at all never matches model/tool in either direction; an untagged parcel plainly does not carry tag. touches compares against the first parent only, so a merge whose result at the path already matches its first parent does not match even if its other parent touched it. Compose or/not/nesting via `where` (a JSON predicate tree: {all|any|not} over {field,op,value}). Scope the walk with revision and from - that, not limit, bounds verification work. Page with limit plus after (the data.next cursor).",
+        tool("query", "Query parcel history on its signed dimensions - identity class, supervisor, signing key, recorded machine-authorship provenance (model/tool), signed tags - plus parcel facts (dates, description glob, merge-ness, touched paths). Identity answers are verified by default (the signature is checked; the office is joined off the verified signer, never the parcel's own claim); recorded=true opts into the cheap self-declared reading, labeled. A signed-revoked match carries signer.boundary - vouched (inside the revocation's vouched history), suspect (outside it: a forged backdate, or the key's holder kept signing after the revocation), or unresolved (a partial clone is missing a boundary head or an ancestor of one, so the question cannot be answered here - never treat this as suspect) - filterable via a where leaf on signer.boundary (values vouched or suspect only). A parcel with no provenance recorded at all never matches model/tool in either direction; an untagged parcel plainly does not carry tag. touches compares against the first parent only, so a merge whose result at the path already matches its first parent does not match even if its other parent touched it. Compose or/not/nesting via `where` (a JSON predicate tree: {all|any|not} over {field,op,value}). Scope the walk with revision and from - that, not limit, bounds verification work. Page with limit plus after (the data.next cursor).",
             object(json!({ "revision": string, "from": string, "class": string, "unsupervised": boolean, "supervisor": string, "signer": string, "grep": string, "model": string, "tool": string, "tag": string, "touches": string, "recorded": boolean, "merges": boolean, "no_merges": boolean, "where": { "type": "object" }, "limit": integer, "after": string }), json!([]))),
         tool("conflicts", "List the files an unresolved consolidation left in conflict, with each side as a content address.",
             object(json!({}), json!([]))),
@@ -1189,7 +1195,7 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("lift", "Push the current pallet's new parcels to the configured remote.",
             object(json!({}), json!([]))),
-        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged meta pallet (@kv, @tags, @manifest, @haul) replays the local changes onto the remote's; paths both sides changed refuse with meta_conflict (exit 24, every pallet, path and both sides in error.details) until each is resolved with a keep entry \"<pallet>:<path>=ours|theirs\", the pallet as details names it, e.g. \"@kv:<subject>/<key>=theirs\".",
+        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged meta pallet (@kv, @tags, @manifest, @haul) replays the local changes onto the remote's; paths both sides changed refuse with meta_conflict (exit 24, every pallet, path and both sides in error.details) until each is resolved with a keep entry \"@<pallet>:<path>=ours|theirs\", the pallet as details names it, e.g. \"@kv:<subject>/<key>=theirs\".",
             object(json!({ "expect": string, "keep": { "type": "array", "items": string } }), json!([]))),
         tool("office_list", "List the enrolled operators and their keys.",
             object(json!({}), json!([]))),
@@ -1258,6 +1264,19 @@ fn tool_definitions() -> Value {
         tool("haul_reopen", "Reopen a closed merge proposal.",
             object(json!({ "id": string }), json!(["id"]))),
     ])
+}
+
+/// The first argument the named tool's input schema does not declare, if any. An unknown tool
+/// declares nothing to check against; `build_args` refuses it on its own.
+fn undeclared_argument(name: &str, arguments: &Value) -> Option<String> {
+    let definitions = tool_definitions();
+    let properties = definitions.as_array()?.iter()
+        .find(|definition| definition["name"] == name)?
+        .pointer("/inputSchema/properties")?
+        .as_object()?
+        .clone();
+
+    arguments.as_object()?.keys().find(|key| !properties.contains_key(*key)).cloned()
 }
 
 /// One tool definition.
@@ -1658,6 +1677,14 @@ mod tests {
         assert_eq!(args("lower", json!({ "keep": ["@kv:a/b=ours", "@kv:c=theirs"] })),
                    ["lower", "--keep", "@kv:a/b=ours", "--keep", "@kv:c=theirs"]);
         assert!(super::build_args("kv_get", &json!({ "revision": "main" })).is_err(), "key is required");
+    }
+
+    #[test]
+    fn an_argument_the_tool_does_not_declare_is_refused() {
+        assert_eq!(super::undeclared_argument("history", &json!({ "class": "agent", "limit": 5 })),
+                   Some("class".to_string()));
+        assert_eq!(super::undeclared_argument("query", &json!({ "class": "agent", "limit": 5 })), None);
+        assert_eq!(super::undeclared_argument("history", &json!({})), None);
     }
 
     #[test]

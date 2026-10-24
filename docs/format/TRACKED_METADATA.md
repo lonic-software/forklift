@@ -322,15 +322,18 @@ operator = "mate@lonic.net"
 public_key = "9d61b19d…"   # Ed25519, 32 bytes, hex
 issued_at = 1782205234
 retired_at = 1782206000    # absent while the key is active
-revocation_reason = "compromise"   # "retirement" or "compromise"; present exactly when retired_at is
+revocation_reason = "compromise"   # "retirement" or "compromise"; written with retired_at
 distrust_boundary = ["<pallet head hash>", …]   # absent while the key is active
 authorized_by = "<key id>"         # the operator's own key (an endorsement), or an admin's
-endorsement = "<hex>"              # authorized_by's Ed25519 signature over this public key
-proof_of_possession = "<hex>"      # this key's own signature over its public key
+endorsement = "<hex>"              # authorized_by's Ed25519 signature (payload below)
+proof_of_possession = "<hex>"      # this key's own signature (payload below)
 ```
 
 `authorized_by`, `endorsement` and `proof_of_possession` are mandatory: a record missing any
-of them does not parse. Only an operator's identity root (their first key) may authorize
+of them does not parse. The endorsement signs the text
+`forklift key endorsement v1\nkey: <public_key>\noperator: <operator>\nauthorized_by: <key id>\nissued_at: <issued_at>\n`,
+and the proof of possession signs `forklift key proof-of-possession v1\nkey: <public_key>\noperator: <operator>\n`,
+so neither can be moved to another operator. Only an operator's identity root (their first key) may authorize
 itself; every later key is endorsed by a key of theirs that chains to that root, or by an
 admin's. A revoked key's signatures are
 valid only on parcels reachable from its `distrust_boundary`, decided by ancestry, never by

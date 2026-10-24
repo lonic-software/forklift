@@ -504,7 +504,7 @@ both sides of it, and the working pallet that lowered with its new head:
 }
 ```
 
-A side without `value` removed the key. Rerun `lower` with one `--keep <pallet>:<path>=ours|theirs`
+A side without `value` removed the key. Rerun `lower` with one `--keep @<pallet>:<path>=ours|theirs`
 per path, both exactly as `details` names them (`--keep @kv:<subject>/<key>=theirs`). The pallet
 keeps its `@`; a bare `kv:` is refused. `theirs` on a bare `<subject>` resolves every key under
 it. A keep that names no conflict, or a pallet that did not diverge, is refused rather than
@@ -673,7 +673,7 @@ multi-subcommand command becomes `<command>_<subcommand>` tools) or is on a smal
 human-only allow-list; a unit test (`every_cli_command_is_an_mcp_tool_or_explicitly_human_only`)
 fails CI if that ever drifts. Tools (arguments in parentheses):
 
-- **Inspect:** `stocktake` (summary?), `history` (revision?, class?, limit?, after?),
+- **Inspect:** `stocktake` (summary?), `history` (revision?, limit?, after?),
   `diff` (staged?, targets?), `peek` (object | inventory), `show` (target — a single
   "<revision>:<path>" string), `blame` (path, rev?), `audit` (pallet?), `conflicts`.
 - **Change:** `load` (path), `remove` (path — stage a removal), `unload` (path — unstage),

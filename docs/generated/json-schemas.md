@@ -1727,7 +1727,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "trust": {
-          "description": "Always \"recorded\": history reads the identity the parcel itself records (and joins\nthe office off it) without verifying the signature. `query --class` is the verified\ncounterpart — same flag word, different trust tier, stamped here so no consumer can\nmistake one for the other.",
+          "description": "Always \"recorded\": history reads the identity the parcel itself records (and joins\nthe office off it) without verifying the signature. `query --class` gives the verified\nreading; the tier is stamped here so no consumer can mistake one for the other.",
           "type": "string"
         }
       },

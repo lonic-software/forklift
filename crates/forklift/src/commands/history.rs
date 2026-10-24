@@ -302,9 +302,8 @@ pub(crate) struct HistoryAction {
     supervisor: Option<String>,
 
     /// Always "recorded": history reads the identity the parcel itself records (and joins
-    /// the office off it) without verifying the signature. `query --class` is the verified
-    /// counterpart — same flag word, different trust tier, stamped here so no consumer can
-    /// mistake one for the other.
+    /// the office off it) without verifying the signature. `query --class` gives the verified
+    /// reading; the tier is stamped here so no consumer can mistake one for the other.
     trust: &'static str,
 
     /// The action time. Serialized as RFC 3339 (UTC) for `--json`; formatted directly for

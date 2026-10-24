@@ -434,10 +434,10 @@ error_codes! {
     EmptyHistory,
 
     /// `stack`, `park`, `consolidate` or `cherry-pick` refused because a `load` that never
-    /// finished cleanly is still recorded (`load_guard_utils`), or a command that changes the bay
-    /// or commits staged content refused because an operation that rewrites the whole staging
-    /// area was interrupted (`operation_utils`): committing the staged inventory now could silently produce an
-    /// incomplete result.
+    /// finished cleanly is still recorded (`load_guard_utils`), or a command that changes the
+    /// bay or commits staged content refused because an operation that rewrites the whole
+    /// staging area was interrupted (`operation_utils`): committing the staged inventory now
+    /// could silently produce an incomplete result.
     IncompleteLoad,
 
     /// The automatic entry-heal (`heal_utils`) hit a durability taint it could not resolve on its
@@ -609,8 +609,8 @@ impl ErrorCode {
                 "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
             ErrorCode::IncompleteLoad =>
                 "\"stack\", \"park\", \"consolidate\" or \"cherry-pick\" refused because a \
-                 \"load\" that never finished cleanly is still recorded, or a command refused because an operation that rewrites the whole \
-                 staging area was interrupted (\"forklift heal\" finishes or undoes it)",
+                 \"load\" that never finished cleanly is still recorded, or a command refused \
+                 because an operation that rewrites the whole staging area was interrupted (\"forklift heal\" finishes or undoes it)",
             ErrorCode::DurabilityTaint =>
                 "A durability taint could not be auto-healed (a vanished, unreadable, or \
                  corrupt path, or a torn taint record)",
