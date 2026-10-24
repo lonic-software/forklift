@@ -1073,7 +1073,7 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             installing the anchor would leave that history outside trust. Nothing was written.",
             pallet.to_wire(), found
         )),
-        moved @ (RefUpdateError::Moved(_) | RefUpdateError::Fenced { .. } | RefUpdateError::WitnessMoved { .. }) => {
+        moved @ (RefUpdateError::Moved(_) | RefUpdateError::Incomplete { .. } | RefUpdateError::WitnessMoved { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
         RefUpdateError::Failed(message) => internal(message),
@@ -2624,8 +2624,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             )));
         }
 
-        // A ref must never point at missing history.
-        audit_utils::verify_parcel_closure(&request.new_head, request.old_head.as_deref())
+        // A ref must never point at missing history. The write below takes this verification
+        // rather than walking the history a second time.
+        let verified = audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
             .map_err(unprocessable)?;
 
         if let Some(old_head) = &request.old_head {
@@ -2743,17 +2744,19 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             pallets: PalletsPrecondition::NotConsumed,
         };
 
-        match pallet_utils::update_pallet_head_in(namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions) {
+        match pallet_utils::update_pallet_head_verified(
+            namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified
+        ) {
             Ok(()) => {}
             Err(RefUpdateError::Moved(moved)) => {
                 return Err(pallet_moved(moved.found.as_deref(), request.old_head.as_deref()));
             }
             Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
             Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
-            Err(moved @ (RefUpdateError::PalletsMoved { .. } | RefUpdateError::Fenced { .. }
-                         | RefUpdateError::WitnessMoved { .. })) => {
+            Err(moved @ (RefUpdateError::PalletsMoved { .. } | RefUpdateError::WitnessMoved { .. })) => {
                 return Err((StatusCode::CONFLICT, moved.to_string()));
             }
+            Err(incomplete @ RefUpdateError::Incomplete { .. }) => return Err(unprocessable(incomplete.to_string())),
             Err(RefUpdateError::Failed(e)) => return Err(internal(e)),
         }
 

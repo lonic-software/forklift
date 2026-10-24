@@ -1128,7 +1128,7 @@ const KNOWN: u8 = 2;
 /// * `Ok(Vec<String>)` - The new parcels, breadth-first from `head`.
 /// * `Err(String)`     - If a parcel is in neither the commit-graph nor the object store.
 pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<String>, String> {
-    Ok(new_parcels_with_edges(head, known_verified)?.0)
+    Ok(new_parcels_with_edges(head, known_verified.as_ref().map(std::slice::from_ref))?.0)
 }
 
 /// [`new_parcels`], also returning the parent edges the walk read on its way.
@@ -1138,12 +1138,12 @@ pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<Strin
 /// candidate bases *are* the parents — would otherwise decode every parcel of the segment twice.
 /// Returning them makes the audit's ordering and its candidate bases share one view of who a
 /// parent is, which is the property the ordering's soundness actually rests on.
-fn new_parcels_with_edges(head: &str, known_verified: Option<&str>)
+fn new_parcels_with_edges(head: &str, known_verified: Option<&[&str]>)
                           -> Result<(Vec<String>, HashMap<String, Vec<String>>), String> {
     let fresh: Option<HashSet<String>> = match known_verified {
         None => None,
-        Some(bound) if bound == head => return Ok((Vec::new(), HashMap::new())),
-        Some(bound) => Some(fresh_frontier(head, bound)?),
+        Some(bounds) if bounds.contains(&head) => return Ok((Vec::new(), HashMap::new())),
+        Some(bounds) => Some(fresh_frontier(head, bounds)?),
     };
 
     // Breadth-first from `head`, so the order — and therefore the first failure reported — is
@@ -1179,21 +1179,29 @@ fn new_parcels_with_edges(head: &str, known_verified: Option<&str>)
     Ok((order, edges))
 }
 
-/// The set behind [`new_parcels`]: parcels reachable from `head` but not from `bound`.
+/// The set behind [`new_parcels`]: parcels reachable from `head` but from none of `bounds`.
 ///
 /// A max-heap on the generation number drives the walk, so parcels are settled newest-first
 /// and each one's marks are final when it is popped (every parcel that could mark it has a
 /// strictly greater generation, hence was popped earlier). The walk stops as soon as nothing
-/// fresh is left pending: whatever remains is reachable from `bound`, and so is everything
+/// fresh is left pending: whatever remains is reachable from a bound, and so is everything
 /// behind it.
-fn fresh_frontier(head: &str, bound: &str) -> Result<HashSet<String>, String> {
+///
+/// A parcel reached only as known history that can be read neither from the commit-graph nor
+/// from the store is left out rather than failing the walk: it vouches for nothing, so what it
+/// would have bounded is walked as fresh instead, and a parcel the fresh side reaches still fails
+/// on the same read.
+fn fresh_frontier(head: &str, bounds: &[&str]) -> Result<HashSet<String>, String> {
     let mut walk = Frontier::default();
 
     walk.mark(head, FRESH)?;
-    walk.mark(bound, KNOWN)?;
+
+    for bound in bounds {
+        walk.mark(bound, KNOWN)?;
+    }
 
     // Nothing fresh left pending means nothing new can be discovered: every parcel still on
-    // the heap is reachable from `bound`, and so is all of its ancestry.
+    // the heap is reachable from a bound, and so is all of its ancestry.
     while walk.fresh_pending > 0 {
         let Some((_, hash)) = walk.heap.pop() else {
             break;
@@ -1209,7 +1217,7 @@ fn fresh_frontier(head: &str, bound: &str) -> Result<HashSet<String>, String> {
             walk.fresh_pending -= 1;
         }
 
-        // Reachable from `bound`: none of it is new, and neither is anything behind it.
+        // Reachable from a bound: none of it is new, and neither is anything behind it.
         let inherited = if marks & KNOWN != 0 {
             KNOWN
         } else {
@@ -1261,7 +1269,14 @@ impl Frontier {
         }
 
         if before.is_none() {
-            let node = graph_utils::node(hash)?;
+            let node = match graph_utils::node(hash) {
+                Ok(node) => node,
+                Err(_) if flag == KNOWN => {
+                    self.marks.remove(hash);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
 
             self.parents_of.insert(hash.to_string(), node.parents);
             self.heap.push((node.generation, hash.to_string()));
@@ -1684,6 +1699,20 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
     )
 }
 
+/// [`verify_parcel_closure`], returning the proof a ref write accepts in place of verifying the
+/// same head again ([`pallet_utils::update_pallet_head_verified`]). The walk is unscoped, so the
+/// proof is for the full scope: in a sparse warehouse the write verifies again at its own.
+///
+/// # Returns
+/// * `Ok(VerifiedClosure)` - Everything is present.
+/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable).
+pub fn verify_parcel_closure_for_write(head: &str,
+                                       known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, String> {
+    verify_parcel_closure(head, known_complete)?;
+
+    Ok(pallet_utils::VerifiedClosure::new(head, MaterializationScope::full()))
+}
+
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
 ///
 /// Parcels and trees are always read (and parsed) from the object store — the walk
@@ -1742,11 +1771,49 @@ pub fn verify_parcel_closure_with(
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
 ) -> Result<(), String> {
+    let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree };
+
+    verify_closure_core(
+        head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &MaterializationScope::full(),
+        false, &seams,
+    )
+}
+
+/// The object-store reads [`verify_closure_core`] varies by head (see
+/// [`verify_parcel_closure_with`] for each one).
+struct ClosureSeams<'a> {
+    blob_exists: &'a dyn Fn(&str) -> Result<bool, String>,
+    chunks_missing: &'a dyn Fn(&[String]) -> Result<Vec<String>, String>,
+    load_recipe_chunks: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
+    load_base_tree: &'a dyn Fn(&str) -> Result<TreeItem, String>,
+}
+
+/// The closure walk behind every verifier here.
+///
+/// * `bounds` - The heads whose history is already known complete. `None` is the unbounded walk
+///              (the audit, and the control the tests use): every parcel, breadth-first from
+///              `head`, each tree walked whole. `Some` walks only the parcels no bound reaches,
+///              parents first, pruning each tree against its parents' (an empty set walks every
+///              parcel that way).
+/// * `base`   - A bound whose root tree is a candidate base for every parcel of the segment, as
+///              well as each parcel's own parents. Must be one of `bounds`.
+/// * `scope`  - The warehouse fetch scope: content outside it is sealed, never loaded. A full
+///              scope walks everything.
+fn verify_closure_core(
+    head: &str,
+    bounds: Option<&[&str]>,
+    base: Option<&str>,
+    scope: &MaterializationScope,
+    reverify: bool,
+    seams: &ClosureSeams,
+) -> Result<(), String> {
+    let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree } = *seams;
+
     // Only the new segment: the closure behind `known_complete` was proven complete when
     // that head was committed. This walk used to build its prune set with
     // `collect_reachable(known_complete)`, which decoded every parcel body in the ancestry —
     // O(history) on every ref update, however little the lift added.
-    let (parcels, parents_of) = new_parcels_with_edges(head, known_complete)
+    let (parcels, parents_of) = new_parcels_with_edges(head, bounds)
         .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
     // Parents first — but only for the incremental gate, and for the same reason the parent bases
@@ -1789,7 +1856,7 @@ pub fn verify_parcel_closure_with(
     // records are right. Sorting against the edges the membership sweep itself read cannot
     // disagree with membership even in principle, which is a stronger discharge of the same
     // obligation. That it also costs no additional read is a bonus, not the argument.
-    let ordered = match known_complete {
+    let ordered = match bounds {
         Some(_) => parents_first(&parcels, &parents_of).ok_or_else(|| {
             format!("The history behind {} has a cycle; the warehouse is corrupt.", head)
         })?,
@@ -1824,12 +1891,15 @@ pub fn verify_parcel_closure_with(
     // reads named here would break the audit at its first step rather than degrade it. Tolerance
     // sorts these reads by how their failure *presents*, loud or silent; it does not sort them by
     // which ones the mirror has to keep answering. It has to answer all of them.
-    let base_root: Option<String> = match known_complete {
+    let base_root: Option<String> = match base {
         Some(known) => object_utils::load_parcel(known).ok().map(|parcel| parcel.tree_hash),
         None => None,
     };
 
+    // Trees whose entire closure is proven present, and (tree, path) pairs walked only as the
+    // spine of a sparse scope (see `verify_tree_closure_scoped`).
     let mut visited_trees: HashSet<String> = HashSet::new();
+    let mut spine_seen: HashSet<(String, String)> = HashSet::new();
 
     // Each parcel's tree hash, remembered as it is audited. The parents-first order means every
     // in-segment parent has already passed through this loop by the time a child needs its tree,
@@ -1841,7 +1911,7 @@ pub fn verify_parcel_closure_with(
     // Seed with `known_complete`: it is the boundary parent of every linear push, and its tree was
     // already loaded above for `base_root`. Without this the common case pays a second read of the
     // same parcel purely to learn a hash already in hand.
-    if let (Some(known), Some(root)) = (known_complete, base_root.as_ref()) {
+    if let (Some(known), Some(root)) = (base, base_root.as_ref()) {
         tree_of.insert(known.to_string(), root.clone());
     }
 
@@ -1866,7 +1936,7 @@ pub fn verify_parcel_closure_with(
         // (a root parcel has no parents and is walked whole, and every child only skips what an
         // already-audited ancestor carries), but it would no longer walk every object, and a
         // control that prunes is not a control. Left full on purpose.
-        if known_complete.is_some() {
+        if bounds.is_some() {
             for parent in parents_of.get(hash).into_iter().flatten() {
                 match tree_of.get(parent) {
                     Some(tree) => bases.push(tree.clone()),
@@ -1905,11 +1975,12 @@ pub fn verify_parcel_closure_with(
         bases.sort();
         bases.dedup();
 
-        verify_tree_closure(
-            &parcel.tree_hash, &bases, &mut visited_trees,
-            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree,
-            // The commit gate presence-checks; content re-verification is `audit --full` only.
-            false,
+        // At a full scope this is the plain tree walk (the root is in scope); in a sparse
+        // warehouse it stops at each out-of-scope boundary. The commit gate presence-checks;
+        // content re-verification is `audit --full` only.
+        verify_tree_closure_scoped(
+            &parcel.tree_hash, "", &bases, &mut visited_trees, &mut spine_seen,
+            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, scope, reverify,
         )?;
     }
 
@@ -2012,50 +2083,62 @@ pub fn verify_parcel_closure_scoped(
     scope: &MaterializationScope,
     reverify: bool,
 ) -> Result<(), String> {
-    let parcels = new_parcels(head, known_complete)
-        .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
+    // A local audit reads everything from the local object store. The bulk chunk-presence seam
+    // probes it serially (a presence check is a microsecond filesystem lookup); the AWS head
+    // overrides the *shape* with parallel S3 HEADs. An out-of-scope recipe is sealed, never
+    // loaded, so its chunks are never even named — the store invariant "recipe absent ⟹ chunks
+    // absent" holds.
+    let seams = ClosureSeams {
+        blob_exists: &|hash| file_utils::does_object_exist(hash),
+        chunks_missing: &local_chunks_missing,
+        load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
+        load_base_tree: &|hash| object_utils::load_tree(hash),
+    };
 
-    let blob_exists = |hash: &str| file_utils::does_object_exist(hash);
-    // The bulk chunk-presence seam: a local audit probes the same local store as everything else,
-    // serially (a presence check is a microsecond filesystem lookup); the AWS head overrides the
-    // *shape* with parallel S3 HEADs. An out-of-scope recipe is sealed, never loaded, so its chunks
-    // are never even named — the store invariant "recipe absent ⟹ chunks absent" holds.
-    let chunks_missing = |chunks: &[String]| local_chunks_missing(chunks);
-    // A local audit reads its recipes from the same local store as everything else; the chunk
-    // descent presence-checks an in-scope chunked file's chunks.
-    let load_recipe_chunks = |hash: &str| object_utils::recipe_chunk_hashes(hash);
-    // The base-tree prune (§9.4b W1) is a `known_complete`-only optimization; a sparse audit always
-    // runs full (`known_complete: None`, no base), so this loader is threaded but never invoked.
-    let load_base_tree = |hash: &str| object_utils::load_tree(hash);
+    verify_closure_core(head, known_complete.as_ref().map(std::slice::from_ref), known_complete, scope, reverify, &seams)
+}
 
-    // `verified` holds trees whose *entire* closure is proven present; it is populated only by
-    // the full walk below and never by a spine walk, so an in-scope encounter of a subtree is
-    // never wrongly skipped because the same hash was earlier reached, only partially, on the
-    // spine. `spine_seen` deduplicates spine walks on (hash, path), as `collect_retained` does:
-    // which entries a spine walk checks depends on the path, so one tree object reached as spine
-    // at two paths is walked at each.
-    let mut verified: HashSet<String> = HashSet::new();
-    let mut spine_seen: HashSet<(String, String)> = HashSet::new();
+/// Verify the closure of `head` before a ref is moved to it, in this warehouse: every parcel from
+/// `head` back to history some ref already reaches, and each one's trees, blobs and chunks within
+/// the fetch scope `scope`. A ref must never point at missing history; this is the client's gate
+/// for that, as [`verify_parcel_closure`] is a remote's.
+///
+/// Everything reachable from one of `known_complete` (the current ref heads) is trusted: every ref
+/// head was verified when it was written, and a sparse warehouse widens its fetch scope only after
+/// walking every ref head at the widened scope. `base` (the ref's own current head, one of
+/// `known_complete`) is also a candidate base for every new parcel's tree, as each parcel's own
+/// parents are. A parcel no ref reaches is walked down to its root.
+///
+/// # Arguments
+/// * `head`           - The parcel the ref is about to hold.
+/// * `known_complete` - The ref heads whose history is known complete.
+/// * `base`           - The ref's current head, when it has one.
+/// * `scope`          - The warehouse fetch scope.
+///
+/// # Returns
+/// * `Ok(())`      - Everything within the scope is present.
+/// * `Err(String)` - What is missing (or unreadable).
+pub fn verify_ref_head_closure(head: &str,
+                               known_complete: &[String],
+                               base: Option<&str>,
+                               scope: &MaterializationScope) -> Result<(), String> {
+    let bounds: Vec<&str> = known_complete.iter().map(String::as_str).collect();
+    let seams = ClosureSeams {
+        blob_exists: &|hash| file_utils::does_object_exist(hash),
+        chunks_missing: &local_chunks_missing,
+        load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
+        load_base_tree: &|hash| object_utils::load_tree(hash),
+    };
 
-    for hash in &parcels {
-        let parcel = object_utils::load_parcel(hash)
-            .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
-
-        verify_tree_closure_scoped(
-            &parcel.tree_hash, "", &mut verified, &mut spine_seen, &blob_exists, &chunks_missing,
-            &load_recipe_chunks, &load_base_tree, scope, reverify,
-        )?;
-    }
-
-    Ok(())
+    verify_closure_core(head, Some(&bounds), base, scope, false, &seams)
 }
 
 /// [`verify_tree_closure`], threaded with the three-valued sparse classifier so an out-of-scope
 /// boundary is sealed (skipped) rather than loaded.
 ///
 /// * **InScope** `prefix` — everything below is in scope too, so the whole closure is present:
-///   verify it fully via [`verify_tree_closure`], sharing (and populating) the fully-verified
-///   `verified` memo.
+///   verify it fully via [`verify_tree_closure`], against the same candidate bases, sharing (and
+///   populating) the fully-verified `verified` memo.
 /// * **OutOfScope** `prefix` — sealed by the hash the parent spine tree already commits; never
 ///   loaded, never descended.
 /// * **Spine** `prefix` — an ancestor of an in-scope path: walk it, descending only the entries
@@ -2063,8 +2146,14 @@ pub fn verify_parcel_closure_scoped(
 ///   sealed hash. A spine walk verifies only part of the tree, so it must never record the tree
 ///   in `verified` — that memo means "entire closure present", which a spine walk cannot claim.
 ///
+/// The base-tree prune holds on the spine as it does in scope: a spine tree some candidate base
+/// carries at the same path has, by content-addressing, the same in-scope content, which that
+/// base's own verification already found present at this scope. It is skipped, and not recorded
+/// in `verified`; an entry a base carries at the same hash is skipped likewise.
+///
 /// # Arguments
 /// * `prefix`      - The warehouse path of `tree_hash` (`""` at the root), classified by `scope`.
+/// * `bases`       - The candidate bases' trees at this same path (see [`verify_tree_closure`]).
 /// * `verified`    - Trees whose full closure is already proven present (populated by the full walk).
 /// * `spine_seen`  - (tree, path) pairs already walked as spine in this pass.
 /// * `reverify`    - The `audit --full` content level, threaded down to each in-scope chunked file.
@@ -2074,6 +2163,7 @@ pub fn verify_parcel_closure_scoped(
 #[allow(clippy::too_many_arguments)]
 fn verify_tree_closure_scoped(tree_hash: &str,
                               prefix: &str,
+                              bases: &[String],
                               verified: &mut HashSet<String>,
                               spine_seen: &mut HashSet<(String, String)>,
                               blob_exists: &dyn Fn(&str) -> Result<bool, String>,
@@ -2084,13 +2174,8 @@ fn verify_tree_closure_scoped(tree_hash: &str,
                               reverify: bool) -> Result<(), String> {
     match scope.classify(prefix) {
         ScopeClass::InScope => {
-            // A sparse audit always runs full (no `known_complete`), so there is no base to prune
-            // against — pass an empty candidate set, and the full closure of this in-scope subtree
-            // is walked. This stays empty when the push gate's candidate set widens: the sparse
-            // path's behaviour is required to be bit-for-bit unchanged, and it is the widening's
-            // one hard boundary.
             return verify_tree_closure(
-                tree_hash, &[], verified, blob_exists, chunks_missing, load_recipe_chunks,
+                tree_hash, bases, verified, blob_exists, chunks_missing, load_recipe_chunks,
                 load_base_tree, reverify,
             )
         }
@@ -2099,20 +2184,27 @@ fn verify_tree_closure_scoped(tree_hash: &str,
     }
 
     // A spine tree already proven fully present elsewhere needs no re-walk, nor does one already
-    // walked as spine at this same path. The same tree at another path is walked again: the scope
-    // selects different entries there.
-    if verified.contains(tree_hash) || !spine_seen.insert((tree_hash.to_string(), prefix.to_string())) {
+    // walked as spine at this same path, nor one a candidate base carries here. The same tree at
+    // another path is walked again: the scope selects different entries there.
+    if bases.iter().any(|base| base == tree_hash)
+        || verified.contains(tree_hash)
+        || !spine_seen.insert((tree_hash.to_string(), prefix.to_string()))
+    {
         return Ok(());
     }
 
     // Loading re-hashes the object (content-addressed read), so a corrupted spine tree fails here.
     let tree = object_utils::load_tree(tree_hash)
         .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
+    let (base_files, base_subtrees) = base_entries(bases, load_base_tree);
 
-    for (_, file) in tree.get_files() {
+    for (name, file) in tree.get_files() {
         let path = child_path(prefix, &file.name);
         if scope.classify(&path) == ScopeClass::OutOfScope {
             continue; // sealed by hash, never fetched
+        }
+        if base_files.get(name).is_some_and(|hashes| hashes.contains(&file.hash)) {
+            continue; // a base carries it here: present by the base's own verification
         }
         if !blob_exists(&file.hash)? {
             return Err(format!(
@@ -2129,18 +2221,48 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         }
     }
 
-    for (_, subtree) in tree.get_subtrees() {
+    for (name, subtree) in tree.get_subtrees() {
         let path = child_path(prefix, &subtree.name);
         if scope.classify(&path) == ScopeClass::OutOfScope {
             continue; // sealed by hash, never descended
         }
         verify_tree_closure_scoped(
-            &subtree.hash, &path, verified, spine_seen, blob_exists, chunks_missing,
-            load_recipe_chunks, load_base_tree, scope, reverify,
+            &subtree.hash, &path, base_subtrees.get(name).map_or(&[][..], Vec::as_slice), verified,
+            spine_seen, blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, scope, reverify,
         )?;
     }
 
     Ok(())
+}
+
+/// The candidate bases' entries one level down, by name and unioned: the file hashes each base
+/// carries under a name, and the distinct subtree hashes. Read tolerantly per base: a base that
+/// cannot be read contributes no explanations, so the walk verifies more rather than less.
+#[allow(clippy::type_complexity)]
+fn base_entries(bases: &[String],
+                load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>)
+                -> (HashMap<String, HashSet<String>>, HashMap<String, Vec<String>>) {
+    let mut base_files: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut base_subtrees: HashMap<String, Vec<String>> = HashMap::new();
+
+    for base in bases {
+        let Ok(base_tree) = load_base_tree(base) else { continue };
+
+        for (name, file) in base_tree.get_files() {
+            base_files.entry(name.clone()).or_default().insert(file.hash.clone());
+        }
+        for (name, subtree) in base_tree.get_subtrees() {
+            let candidates = base_subtrees.entry(name.clone()).or_default();
+
+            // Two candidate bases carrying the identical child at this name would otherwise each
+            // be loaded again one level down.
+            if !candidates.contains(&subtree.hash) {
+                candidates.push(subtree.hash.clone());
+            }
+        }
+    }
+
+    (base_files, base_subtrees)
 }
 
 /// The warehouse path of a tree entry named `name` under directory `prefix` (`""` = the root).
@@ -2271,25 +2393,7 @@ fn verify_tree_closure(tree_hash: &str,
     // caused it. Two to three bases per parcel instead of one scales the chance of hitting it, so
     // the tolerance is a deliberate trade of a rare slow refusal against a wrong fast one, not a
     // free win.
-    let mut base_files: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut base_subtrees: HashMap<String, Vec<String>> = HashMap::new();
-
-    for base in base_tree_hashes {
-        let Ok(base_tree) = load_base_tree(base) else { continue };
-
-        for (name, file) in base_tree.get_files() {
-            base_files.entry(name.clone()).or_default().insert(file.hash.clone());
-        }
-        for (name, subtree) in base_tree.get_subtrees() {
-            let candidates = base_subtrees.entry(name.clone()).or_default();
-
-            // Same reason as the parcel-level dedupe: two candidate bases carrying the identical
-            // child at this name would otherwise each be loaded again one level down.
-            if !candidates.contains(&subtree.hash) {
-                candidates.push(subtree.hash.clone());
-            }
-        }
-    }
+    let (base_files, base_subtrees) = base_entries(base_tree_hashes, load_base_tree);
 
     for (name, file) in tree.get_files() {
         // Base-explained: this exact file hash sits at this path under some candidate base, so its

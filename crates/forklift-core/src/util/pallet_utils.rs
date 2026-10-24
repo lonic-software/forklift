@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
+use crate::util::scope_utils::MaterializationScope;
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -654,12 +655,18 @@ pub enum RefUpdateError {
         found: Option<String>,
     },
 
-    /// The new head of a user pallet is a parcel a sparse warehouse fetched only part-way, and
-    /// whose remote could not serve the rest when `expand` widened the fetch scope (see
-    /// [`fetch_ledger`](crate::util::fetch_ledger)); nothing was written.
-    Fenced {
-        /// The fenced parcel.
+    /// The new head of a user pallet does not have its history completely present in this
+    /// warehouse, within its fetch scope: a parcel, tree, blob or chunk it needs is missing, as a
+    /// fetch that stopped part-way leaves it; nothing was written.
+    Incomplete {
+        /// The pallet whose ref was to move.
+        pallet: String,
+
+        /// The refused head.
         head: String,
+
+        /// What is missing, as the closure check reported it.
+        missing: String,
     },
 
     /// Anything else: an invalid name or value, or the ref could not be read or written.
@@ -676,11 +683,12 @@ impl std::fmt::Display for RefUpdateError {
                 {}); this command wrote nothing. Run it again.",
                 found.as_deref().unwrap_or("unborn")
             ),
-            RefUpdateError::Fenced { head } => write!(
+            RefUpdateError::Incomplete { pallet, head, missing } => write!(
                 f,
-                "Parcel {} was fetched only part-way; lower it from a remote that has it. Nothing was \
-                written.",
-                &head[..head.len().min(12)]
+                "Refusing to set pallet \"{}\" to {}: its history is not completely present in this \
+                warehouse ({}). Nothing was written. If a fetch of it stopped part-way, run that \
+                fetch again before this command.",
+                pallet, &head[..head.len().min(12)], missing
             ),
             RefUpdateError::AnchorMoved => f.write_str(
                 "Another bay or process changed this warehouse's trust anchor while this command \
@@ -927,6 +935,8 @@ pub fn update_meta_pallet_head(name: &str,
 /// * `Err(RefUpdateError::Moved)`     - The ref did not hold `expected`; nothing was written.
 /// * `Err(RefUpdateError::OfficeMoved | AnchorMoved | PalletsMoved | WitnessMoved)`
 ///                                    - A precondition did not hold; nothing was written.
+/// * `Err(RefUpdateError::Incomplete)` - A user pallet's new head does not have its history
+///                                      completely present; nothing was written.
 /// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
 ///                                      ref could not be locked, read or written (the write may
 ///                                      still have landed: read the ref back to tell).
@@ -937,6 +947,55 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None)
+}
+
+/// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
+/// remote's ref update, after its own closure check): the write skips its own verification when
+/// `verified` is for `new` at the current fetch scope, and verifies as usual otherwise.
+pub fn update_pallet_head_verified(
+    namespace: PalletNamespace,
+    name: &str,
+    expected: Option<&str>,
+    new: &str,
+    preconditions: &RefPreconditions,
+    verified: &VerifiedClosure,
+) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified))
+}
+
+/// That a head's closure was verified, and at which fetch scope. Minted only by the verifier
+/// ([`audit_utils::verify_parcel_closure_for_write`](crate::util::audit_utils::verify_parcel_closure_for_write)),
+/// so holding one means the check ran.
+#[derive(Clone, Debug)]
+pub struct VerifiedClosure {
+    head: String,
+    scope: MaterializationScope,
+}
+
+impl VerifiedClosure {
+    pub(crate) fn new(head: &str, scope: MaterializationScope) -> VerifiedClosure {
+        VerifiedClosure { head: head.to_string(), scope }
+    }
+}
+
+/// The compare-and-set behind [`update_pallet_head_in`] and [`update_pallet_head_verified`].
+///
+/// A user-pallet ref moving to a new parcel first has that parcel's closure verified (see
+/// [`verify_new_head`]), before the lock, since the walk can be long and the hold does no walking.
+/// Objects cannot vanish between the walk and the write: every command that writes a ref holds
+/// the store-access lock shared, which every deleter needs exclusively. The fetch scope can change
+/// in between, though (an `expand` in another bay commits a widened one under the lock), so the
+/// hold re-reads it, and when it is no longer the scope verified against, the hold is released and
+/// the closure verified again at the new one.
+fn update_pallet_head_checked(
+    namespace: PalletNamespace,
+    name: &str,
+    expected: Option<&str>,
+    new: &str,
+    preconditions: &RefPreconditions,
+    verified: Option<&VerifiedClosure>,
+) -> Result<(), RefUpdateError> {
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
 
@@ -944,13 +1003,72 @@ pub fn update_pallet_head_in(
     // `expected`, so what it says about `expected` holds inside the hold too.
     let left = left_unreached(namespace, expected, new)?;
 
-    let lock = crate::util::lock_utils::RefLock::acquire()?;
+    let mut verified_at = match closure_to_verify(namespace, expected, new) {
+        false => None,
+        true => {
+            let scope = crate::util::scope_utils::read_fetch_scope()?;
 
-    // The ref's own compare goes first: a ref another writer moved, perhaps to this very parcel
-    // (which callers read as landed), reports that move, never a precondition it would mask.
-    require_head(namespace, name, expected)?;
-    check_preconditions(&lock, preconditions)?;
-    update_pallet_head_locked(&lock, namespace, name, expected, new, left)
+            if !verified.is_some_and(|verified| verified.head == new && verified.scope == scope) {
+                verify_new_head(name, expected, new, &scope)?;
+            }
+
+            Some(scope)
+        }
+    };
+
+    loop {
+        #[cfg(test)]
+        tests::before_hold_checkpoint();
+
+        let lock = crate::util::lock_utils::RefLock::acquire()?;
+
+        // The ref's own compare goes first: a ref another writer moved, perhaps to this very
+        // parcel (which callers read as landed), reports that move, never a precondition it
+        // would mask.
+        require_head(namespace, name, expected)?;
+        check_preconditions(&lock, preconditions)?;
+
+        if let Some(scope) = &verified_at {
+            let current = crate::util::scope_utils::read_fetch_scope()?;
+
+            if &current != scope {
+                drop(lock);
+                verify_new_head(name, expected, new, &current)?;
+                verified_at = Some(current);
+                continue;
+            }
+        }
+
+        return update_pallet_head_locked(&lock, namespace, name, expected, new, left);
+    }
+}
+
+/// Whether a write of `new` over `expected` must verify `new`'s closure: a user-pallet ref moving
+/// to a parcel it does not already hold. A meta pallet's writers verify their own history.
+fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &str) -> bool {
+    namespace == PalletNamespace::User && expected != Some(new)
+}
+
+/// Verify that `new`'s history is completely present at the fetch scope `scope`, back to what
+/// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
+/// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
+///
+/// [`audit_utils::verify_ref_head_closure`]: crate::util::audit_utils::verify_ref_head_closure
+fn verify_new_head(name: &str,
+                   expected: Option<&str>,
+                   new: &str,
+                   scope: &MaterializationScope) -> Result<(), RefUpdateError> {
+    let heads: Vec<String> = all_pallet_refs()?.into_iter()
+        .filter(|(pallet, _)| pallet.namespace == PalletNamespace::User)
+        .map(|(_, head)| head)
+        .collect();
+
+    crate::util::audit_utils::verify_ref_head_closure(new, &heads, expected, scope)
+        .map_err(|missing| RefUpdateError::Incomplete {
+            pallet: name.to_string(),
+            head: new.to_string(),
+            missing,
+        })
 }
 
 /// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
@@ -1013,10 +1131,9 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 /// consumed under it (a trust install, which writes the anchor and the office in one hold). Keeps
 /// the readback and the write log.
 ///
-/// Every head write passes through here, so this is where a fenced parcel is refused as a new
-/// user-pallet head ([`RefUpdateError::Fenced`]); a ref that already holds it may keep it. It is
-/// also where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
-/// the hold), is recorded in the fetched-heads ledger, in the same hold as the write.
+/// It is where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
+/// the hold), is recorded in the fetched-heads ledger, in the same hold as the write. It verifies
+/// no closure: a user-pallet head write reaches it through [`update_pallet_head_in`], which does.
 pub(crate) fn update_pallet_head_locked(
     lock: &crate::util::lock_utils::RefLock,
     namespace: PalletNamespace,
@@ -1028,13 +1145,6 @@ pub(crate) fn update_pallet_head_locked(
     validate_head_write(name, new)?;
 
     let found = require_head(namespace, name, expected)?;
-
-    if namespace == PalletNamespace::User
-        && found.as_deref() != Some(new)
-        && crate::util::fetch_ledger::is_fenced(new)?
-    {
-        return Err(RefUpdateError::Fenced { head: new.to_string() });
-    }
 
     if let Some(old) = left {
         crate::util::fetch_ledger::record_fetch(lock, old, name)?;
@@ -1363,6 +1473,18 @@ fn collect_pallet_names(folder: &Path, prefix: &str, names: &mut Vec<String>) ->
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    thread_local! {
+        /// Run once by the next head write on this thread, between its closure check and its hold.
+        static BEFORE_HOLD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The seam [`update_pallet_head_checked`] calls before each hold.
+    pub(super) fn before_hold_checkpoint() {
+        if let Some(run) = BEFORE_HOLD.with(|slot| slot.borrow_mut().take()) {
+            run();
+        }
+    }
 
     /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.
     fn scratch(name: &str) -> (PathBuf, StorageRootScope) {

@@ -2281,14 +2281,12 @@ mod tests {
     }
 
     #[test]
-    fn a_create_of_a_fenced_deleted_head_refuses() {
-        let _scratch = Scratch::new("create-deleted-fenced");
-        let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
-        crate::util::fetch_ledger::write_fence(&lock, &[hash('a')]).unwrap();
-        drop(lock);
+    fn a_create_of_an_incomplete_deleted_head_refuses() {
+        let _scratch = Scratch::new("create-deleted-incomplete");
 
+        // No parcel `hash('a')` is here at all.
         let refused = create_deleted("side", "side", false, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap_err();
-        assert!(refused.contains("fetched only part-way"), "{}", refused);
+        assert!(refused.contains("not completely present"), "{}", refused);
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
     }
 

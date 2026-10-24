@@ -222,8 +222,8 @@ See [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 **Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. See
 [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
-**Fetched-heads ledger, fence list.** A sparse warehouse's record of the heads its fetches brought
-in, and of those the remote can no longer serve.
+**Fetched-heads ledger.** A sparse warehouse's record of the heads its fetches brought in, so that
+`expand` widens their history too.
 
 **Origin.** The remote a sparse warehouse fetched from.
 

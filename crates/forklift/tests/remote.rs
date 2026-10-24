@@ -4565,11 +4565,11 @@ fn expand_fetches_the_widened_content_of_a_head_a_refused_lower_fetched() {
     assert!(object_present(&area, "sparse", &web_blob), "the palletized head's widened content is present");
 }
 
-// Revert: let the ref compare-and-set skip the fence → the palletize lands on a head whose
-// src/web is missing.
+// Revert: let the ref compare-and-set skip the closure check → the palletize lands on a head
+// whose src/web is missing.
 #[test]
-fn expand_fences_a_fetched_head_the_remote_can_no_longer_serve() {
-    let area = TestArea::new("sparse-expand-fence");
+fn expand_leaves_a_fetched_head_the_remote_can_no_longer_serve_unpalletizable() {
+    let area = TestArea::new("sparse-expand-unservable");
     let server = Server::start(&area, None);
     let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
 
@@ -4579,8 +4579,8 @@ fn expand_fences_a_fetched_head_the_remote_can_no_longer_serve() {
     assert_success(&expanded);
 
     let refused = area.forklift("sparse", &["palletize", "x", &up_head]);
-    assert!(!refused.status.success(), "a fenced head is no new head: {}", stdout(&refused));
-    assert!(stderr(&refused).contains("fetched only part-way"), "{}", stderr(&refused));
+    assert!(!refused.status.success(), "an incomplete head is no new head: {}", stdout(&refused));
+    assert!(stderr(&refused).contains("not completely present"), "{}", stderr(&refused));
     assert!(!area.path("sparse/.forklift/pallets/x").exists());
 }
 

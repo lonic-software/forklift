@@ -1,4 +1,4 @@
-//! The fetched-heads ledger and the fence list of a sparse warehouse.
+//! The fetched-heads ledger of a sparse warehouse.
 //!
 //! A history fetch in a sparse warehouse stops at every local ref head, on the understanding that
 //! a ref's closure is complete at the current fetch scope. `expand` widens that scope, so it
@@ -11,13 +11,14 @@
 //! the recorded heads as well as the ref heads. A ref write that leaves a head no longer reached
 //! from its ref records that head too, since an `undo` can write it back without fetching.
 //!
-//! A recorded head that no ref reaches and that the remote can no longer serve cannot be walked.
-//! `expand` moves it to the fence list instead of failing, and the ref compare-and-set refuses a
-//! fenced head as a new user-pallet head, until a scoped fetch of that head completes.
+//! A recorded head that no ref reaches and that the remote can no longer serve cannot be walked;
+//! `expand` drops it rather than failing. Nothing here guards against such a head becoming a ref:
+//! the ref compare-and-set verifies a new head's closure at the current fetch scope, so a head that
+//! is not complete there is refused whatever fetched it.
 //!
-//! Both files live in the shared forklift root, so every bay sees the same ones, and both are
-//! [`record_utils`] files: the ledger one `<head> <pallet>` entry per line, the fence list one
-//! head per line. A full warehouse records nothing, so neither file exists there.
+//! The file lives in the shared forklift root, so every bay sees the same one, and it is a
+//! [`record_utils`] file of one `<head> <pallet>` entry per line. A full warehouse records nothing,
+//! so the file does not exist there.
 
 use std::path::PathBuf;
 use crate::globals;
@@ -28,11 +29,6 @@ use crate::util::{file_utils, object_utils, record_utils};
 const FILE_NAME_LEDGER: &str = "fetched-heads";
 const LEDGER_RECORD: &str = "fetched-heads";
 const LEDGER_VERSION: u32 = 1;
-
-/// The fence list's name in the shared forklift root, and its [`record_utils`] kind and version.
-const FILE_NAME_FENCE: &str = "fenced-heads";
-const FENCE_RECORD: &str = "fenced-heads";
-const FENCE_VERSION: u32 = 1;
 
 /// One head the ledger recorded: the head, and the pallet it was fetched for or left by. The
 /// pallet is kept for diagnosis; the ledger holds each head once.
@@ -47,10 +43,6 @@ pub struct LedgerEntry {
 
 fn ledger_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_LEDGER)
-}
-
-fn fence_path() -> PathBuf {
-    globals::forklift_root().join(FILE_NAME_FENCE)
 }
 
 /// Read a record file's entries, or none when the file is absent.
@@ -86,21 +78,6 @@ pub fn read_ledger() -> Result<Vec<LedgerEntry>, String> {
         .collect()
 }
 
-/// The fenced heads. Lock-free, like [`read_ledger`].
-pub fn read_fence() -> Result<Vec<String>, String> {
-    let path = fence_path();
-    let heads = read_entries(&path, FENCE_RECORD, FENCE_VERSION)?;
-
-    if let Some(bad) = heads.iter().find(|head| !object_utils::is_object_hash(head)) {
-        return Err(format!(
-            "The file \"{}\" holds an entry that is not a parcel hash: \"{}\".",
-            path.to_string_lossy(), bad.escape_debug()
-        ));
-    }
-
-    Ok(heads)
-}
-
 /// Replace the ledger. Only under the ref lock.
 pub fn write_ledger(_lock: &RefLock, entries: &[LedgerEntry]) -> Result<(), String> {
     let lines = entries.iter().map(|entry| format!("{} {}", entry.head, entry.pallet));
@@ -108,14 +85,9 @@ pub fn write_ledger(_lock: &RefLock, entries: &[LedgerEntry]) -> Result<(), Stri
     file_utils::write_file_atomically(&ledger_path(), &record_utils::to_bytes(LEDGER_RECORD, LEDGER_VERSION, lines))
 }
 
-/// Replace the fence list. Only under the ref lock.
-pub fn write_fence(_lock: &RefLock, heads: &[String]) -> Result<(), String> {
-    file_utils::write_file_atomically(&fence_path(), &record_utils::to_bytes(FENCE_RECORD, FENCE_VERSION, heads))
-}
-
 /// Add `head` to the ledger, unless it is there already: a scoped fetch about to run, in the same
 /// hold that read the fetch scope it will use, or a head a ref write is leaving. Only under the
-/// ref lock. It does not lift a fence: only a fetch that completed does ([`lift_fence`]).
+/// ref lock.
 ///
 /// # Arguments
 /// * `lock`   - The held ref lock.
@@ -130,24 +102,6 @@ pub fn record_fetch(lock: &RefLock, head: &str, pallet: &str) -> Result<(), Stri
     }
 
     Ok(())
-}
-
-/// Take `head` off the fence list: a scoped fetch of it completed at the current fetch scope, so it
-/// is whole. Only under the ref lock, in the hold that confirmed the scope.
-pub fn lift_fence(lock: &RefLock, head: &str) -> Result<(), String> {
-    let mut fence = read_fence()?;
-
-    if fence.iter().any(|fenced| fenced == head) {
-        fence.retain(|fenced| fenced != head);
-        write_fence(lock, &fence)?;
-    }
-
-    Ok(())
-}
-
-/// Whether `head` is on the fence list.
-pub fn is_fenced(head: &str) -> Result<bool, String> {
-    Ok(read_fence()?.iter().any(|fenced| fenced == head))
 }
 
 #[cfg(test)]
@@ -178,25 +132,18 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_head_is_listed_once_and_only_a_lifted_one_leaves_the_fence() {
+    fn a_recorded_head_is_listed_once() {
         let _scratch = Scratch::new("record");
         let head = "a".repeat(64);
-        let other = "b".repeat(64);
 
         assert!(read_ledger().unwrap().is_empty(), "an absent ledger is empty");
 
         let lock = RefLock::acquire().unwrap();
-        write_fence(&lock, &[head.clone(), other.clone()]).unwrap();
         record_fetch(&lock, &head, "main").unwrap();
         record_fetch(&lock, &head, "side").unwrap();
-        assert!(is_fenced(&head).unwrap(), "recording a fetch about to run lifts nothing");
-        lift_fence(&lock, &head).unwrap();
         drop(lock);
 
         assert_eq!(read_ledger().unwrap(), vec![LedgerEntry { head: head.clone(), pallet: "main".to_string() }]);
-        assert_eq!(read_fence().unwrap(), vec![other.clone()], "only the lifted head leaves the fence");
-        assert!(!is_fenced(&head).unwrap());
-        assert!(is_fenced(&other).unwrap());
     }
 
     #[test]
