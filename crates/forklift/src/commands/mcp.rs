@@ -804,15 +804,15 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             }
             for flag in [
                 "from", "class", "supervisor", "signer", "grep", "model", "tool", "tag",
-                "touches", "where", "after",
+                "touches", "after",
             ] {
                 if let Some(value) = string_arg(flag) {
                     args.push(format!("--{}", flag));
                     args.push(value);
                 }
             }
-            // The predicate tree may also arrive as a JSON object (the natural MCP form);
-            // it is re-serialized into the same --where the CLI takes.
+            // The predicate tree arrives as a JSON object (the natural MCP form; the schema refuses
+            // any other); it is re-serialized into the same --where the CLI takes.
             if let Some(predicate) = arguments.get("where").filter(|value| value.is_object()) {
                 args.push("--where".to_string());
                 args.push(predicate.to_string());
@@ -1272,8 +1272,9 @@ fn tool_definitions() -> Value {
 
 /// Why the named tool refuses these arguments, if it does: they are not a JSON object, or an
 /// argument is one its input schema does not declare (and `server_set` does not name), or a
-/// declared argument's value does not have the declared type. An unknown tool declares nothing
-/// to check against; `build_args` refuses it on its own.
+/// declared argument's value does not have the declared type. A null value is an omitted
+/// argument (harnesses fill unset optionals with it) and `build_args` reads it as absent. An
+/// unknown tool declares nothing to check against; `build_args` refuses it on its own.
 fn argument_refusal(name: &str, arguments: &Value, server_set: &[&str]) -> Option<String> {
     static DEFINITIONS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     let properties = DEFINITIONS.get_or_init(tool_definitions).as_array()?.iter()
@@ -1285,14 +1286,30 @@ fn argument_refusal(name: &str, arguments: &Value, server_set: &[&str]) -> Optio
         return Some(format!("the \"{}\" tool's arguments must be a JSON object", name));
     };
 
-    arguments.iter().find_map(|(key, value)| match properties.get(key) {
+    let given = arguments.iter().filter(|(_, value)| !value.is_null());
+    given.find_map(|(key, value)| match properties.get(key) {
         None if server_set.contains(&key.as_str()) => None,
         None => Some(format!("the \"{}\" tool takes no \"{}\" argument", name, key)),
         Some(schema) if !matches_schema(value, schema) => Some(format!(
-            "the \"{}\" tool's \"{}\" argument must be {}", name, key, schema
+            "the \"{}\" tool's \"{}\" argument must be {}", name, key, describe_schema(schema)
         )),
         Some(_) => None,
     })
+}
+
+/// A property's type in words, for a refusal ("a string", "an array of strings", "an integer of
+/// at least 1").
+fn describe_schema(schema: &Value) -> String {
+    match schema["type"].as_str() {
+        Some("array") => format!("an array of {}s", describe_schema(&schema["items"]).trim_start_matches("a ")),
+        Some("integer") => match schema["minimum"].as_u64() {
+            Some(minimum) => format!("an integer of at least {}", minimum),
+            None => "an integer".to_string(),
+        },
+        Some("object") => "an object".to_string(),
+        Some(kind) => format!("a {}", kind),
+        None => "any value".to_string(),
+    }
 }
 
 /// Whether a value has the type a tool property declares (with an array's item type and an
@@ -1735,6 +1752,14 @@ mod tests {
         }
         assert_eq!(refused("query", json!({ "where": { "field": "class", "op": "eq", "value": "agent" } })), None);
         assert_eq!(refused("lower", json!({ "keep": ["@kv:a=ours"] })), None);
+
+        // A null is an omitted optional, which build_args reads as absent: nothing is dropped.
+        assert_eq!(refused("history", json!({ "revision": null, "limit": null, "after": null })), None);
+        assert_eq!(refused("lower", json!({ "expect": null, "keep": null })), None);
+        assert_eq!(refused("history", json!({ "limit": "5" })).unwrap(),
+                   "the \"history\" tool's \"limit\" argument must be an integer of at least 1");
+        assert_eq!(refused("lower", json!({ "keep": "x" })).unwrap(),
+                   "the \"lower\" tool's \"keep\" argument must be an array of strings");
     }
 
     #[test]

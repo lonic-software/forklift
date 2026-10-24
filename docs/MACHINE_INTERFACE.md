@@ -675,7 +675,7 @@ fails CI if that ever drifts. Each tool's `inputSchema` is closed
 (`additionalProperties: false`), and the server enforces it: a `tools/call` whose
 `arguments` are not an object, name an argument the tool does not declare, or give a
 declared one the wrong type is refused with JSON-RPC `invalid_params` rather than run
-with the argument dropped. (`manifest_provenance`'s `tool` and `session` are the one
+with the argument dropped. A `null` value counts as the argument omitted. (`manifest_provenance`'s `tool` and `session` are the one
 exception: the server sets them from the connection and discards an agent's value.)
 Tools (arguments in parentheses):
 
