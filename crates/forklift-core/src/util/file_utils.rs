@@ -361,7 +361,8 @@ pub fn sync_tree(dir: &Path) -> Result<(), String> {
     sync_dir(dir)
 }
 
-/// How long [`rename`] and [`rename_no_replace`] keep retrying a rename that a handle is blocking, and the first and longest delay between attempts (the delay doubles).
+/// How long [`rename`] and [`rename_no_replace`] keep retrying a rename that a handle is blocking,
+/// and the first and longest delay between attempts (the delay doubles).
 const HELD_RENAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 const HELD_RENAME_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
 const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -378,9 +379,9 @@ const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_mil
 ///
 /// A retry is a fresh rename against whatever stands there by then: a caller that checked the
 /// target before calling has that check widened by up to the deadline. A retry stops, returning
-/// the hold's error, once the source is gone, so a rename that took effect while reporting a hold
-/// is never retried into an unrelated error. On Unix an open handle never blocks a rename, and
-/// this is a plain `std::fs::rename`.
+/// the hold's error, once the source is gone: a rename that took effect while reporting a hold
+/// still reports that hold as a failure, rather than being retried into an unrelated error. On
+/// Unix an open handle never blocks a rename, and this is a plain `std::fs::rename`.
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<()> {
     let (from, to) = (from.as_ref(), to.as_ref());
 
@@ -394,10 +395,11 @@ fn source_remains(from: &Path) -> bool {
 }
 
 /// Whether a failed rename was refused because a handle (another process's, or this process's
-/// own) forbids it. Windows reports a hold on the target as `ERROR_ACCESS_DENIED` and one on the source (which the
-/// rename must open for delete) as `ERROR_SHARING_VIOLATION`; `ERROR_LOCK_VIOLATION` is a byte-range
-/// lock. `ERROR_ACCESS_DENIED` is also a genuine permission refusal, which a retry cannot help:
-/// that case costs [`HELD_RENAME_DEADLINE`] before failing with the same error.
+/// own) forbids it. Windows reports a hold on the target as `ERROR_ACCESS_DENIED` and one on the
+/// source (which the rename must open for delete) as `ERROR_SHARING_VIOLATION`;
+/// `ERROR_LOCK_VIOLATION` is a byte-range lock. `ERROR_ACCESS_DENIED` is also a genuine permission
+/// refusal, which a retry cannot help: that case costs [`HELD_RENAME_DEADLINE`] before failing with
+/// the same error.
 #[cfg(windows)]
 fn is_held_by_another_process(error: &std::io::Error) -> bool {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
@@ -439,8 +441,8 @@ fn retry_while_held<T>(
 /// leave both alone. Atomic where the platform offers it (`renamex_np` with `RENAME_EXCL` on
 /// macOS, `renameat2` with `RENAME_NOREPLACE` on Linux, `MoveFileExW` without
 /// `MOVEFILE_REPLACE_EXISTING` on Windows, where a rename a handle blocks is retried as [`rename`]
-/// retries it). On another Unix, and on a volume that refuses the flag,
-/// a check runs just before a plain rename, so an empty folder created between the two is replaced.
+/// retries it). On another Unix, and on a volume that refuses the flag, a check runs just before a
+/// plain rename, so an empty folder created between the two is replaced.
 pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -4070,6 +4072,38 @@ mod tests {
         releaser.join().unwrap();
 
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A source that vanishes while the target is held ends the retries at once, with the hold's
+    /// error: retrying on would only turn it into `NotFound`.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_whose_source_vanishes_during_a_hold_stops_with_the_hold() {
+        let dir = held_rename_dir("source-vanishes");
+        let (from, to) = (dir.join("new"), dir.join("old"));
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let hold = hold_without_share_delete(&to);
+
+        let deleter = {
+            let from = from.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::fs::remove_file(&from).unwrap();
+            })
+        };
+        let releaser = release_later(hold, std::time::Duration::from_millis(600));
+
+        let started = std::time::Instant::now();
+        let error = rename(&from, &to).unwrap_err();
+        let elapsed = started.elapsed();
+        deleter.join().unwrap();
+        releaser.join().unwrap();
+
+        assert!(is_held_by_another_process(&error), "{:?}", error);
+        assert!(elapsed < std::time::Duration::from_millis(500), "{:?}", elapsed);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
