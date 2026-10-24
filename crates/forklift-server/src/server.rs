@@ -71,9 +71,10 @@ struct WarehouseHandle {
 
     /// The shared store-access hold for this root, held beside the serve lock for the same
     /// lifetime and `None` exactly when it is. It orders everything the server writes against
-    /// every operation that deletes objects on a liveness or scope decision — a full repack, gc
-    /// and scope-prune, run by another process on this root — so a lift can never dedup against
-    /// an object one of them is about to delete.
+    /// every operation that deletes objects on a liveness decision — a full repack or gc, run by
+    /// another process on this root — so a lift can never dedup against an object one of them is
+    /// about to delete. (Scope-prune, the other deleter, runs only on a sparse warehouse, which is
+    /// never served.)
     _store_access: Option<StoreAccessLock>,
 }
 
@@ -93,9 +94,9 @@ impl WarehouseHandle {
 
     /// A handle for a warehouse this process is about to serve: acquires the serve lock and the
     /// shared store-access hold at `root` and keeps both in the handle for its lifetime. Errors if
-    /// the root is already served by another process, or a `gc`, full repack or scope-prune is
-    /// running against it — in either case serving it would be unsafe. Every handle the server
-    /// registers must come from here.
+    /// the root holds an unfinished franchise, is already served by another process, or a `gc` or
+    /// full repack is running against it — in each case serving it would be unsafe. Every handle
+    /// the server registers must come from here, in single and multi mode alike.
     ///
     /// The shared hold is tried, never waited for: this runs under the registry mutex, on a
     /// runtime thread.
@@ -111,9 +112,14 @@ impl WarehouseHandle {
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
         // absolute path or an open file, so they stay valid once the scope drops).
         let (serve_lock, store_access) = {
+            // An unfinished franchise has no settled fetch scope yet (one killed before it wrote the
+            // scope reads as full), so it is refused before the scope is trusted.
+            franchise_utils::gate(&root).map_err(|e| ServingRefusal::Unfinished(String::from(e)))?;
+
             let _scope = StorageRootScope::enter(&root);
 
-            // First, so a sparse root under a running scope-prune is told it is sparse, not busy.
+            // Before the locks, so a sparse root under a running scope-prune is told it is sparse,
+            // not busy.
             if scope_utils::is_warehouse_sparse().map_err(ServingRefusal::Unreadable)? {
                 return Err(ServingRefusal::Sparse);
             }
@@ -131,9 +137,12 @@ impl WarehouseHandle {
 /// Why [`WarehouseHandle::serving`] would not serve a root.
 #[derive(Debug)]
 enum ServingRefusal {
-    /// Another server holds it, or a `gc`, full repack or scope-prune is running against it. It
-    /// can be served once that ends.
+    /// Another server holds it, or a `gc` or full repack is running against it. It can be served
+    /// once that ends.
     Busy(String),
+
+    /// It holds a franchise that has not finished: it is resumed or deleted first.
+    Unfinished(String),
 
     /// Its fetch scope could not be read.
     Unreadable(String),
@@ -146,7 +155,9 @@ impl ServingRefusal {
     /// The refusal as a message, naming the warehouse as `name`.
     fn message(self, name: &str) -> String {
         match self {
-            ServingRefusal::Busy(reason) | ServingRefusal::Unreadable(reason) => reason,
+            ServingRefusal::Busy(reason)
+            | ServingRefusal::Unfinished(reason)
+            | ServingRefusal::Unreadable(reason) => reason,
             ServingRefusal::Sparse => format!(
                 "{} is a sparse warehouse: it was franchised with --only, so it does not hold \
                 every path its pallets reach. A client trusts a server to hold the whole history \
@@ -193,11 +204,12 @@ struct RegistryEntry {
 /// The live handles of a multi-warehouse server, at most `cap` of them while any is idle.
 ///
 /// A handle holds its warehouse's serve lock and shared store-access hold, so a live warehouse
-/// costs an open file and keeps `gc`, a full repack and scope-prune off it. Serving a warehouse
+/// costs an open file and keeps `gc` and a full repack off it. Serving a warehouse
 /// that is not live lets the least recently used *idle* one go first (see
 /// [`WarehouseRegistry::make_room`]). When none is idle the new one is admitted over the cap: a
-/// request is never refused for the cap alone, and running out of files still surfaces as
-/// [`WarehouseHandle::serving`]'s 503.
+/// request is never refused for the cap alone, and running out of files surfaces as
+/// [`WarehouseHandle::serving`]'s refusal: a 503 when the locks cannot be taken, a 500 when the
+/// fetch scope cannot be read.
 struct WarehouseRegistry {
     entries: HashMap<String, RegistryEntry>,
     clock: u64,
@@ -696,11 +708,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
                 )),
             }
 
-            // A franchise that has not finished is no warehouse yet: it is resumed or deleted first.
-            franchise_utils::gate(&root).map_err(String::from)?;
-
             // Hold the serve lock for the served root for the process lifetime: a second
-            // server on the same root is refused here rather than silently breaking the CAS.
+            // server on the same root is refused here rather than silently breaking the CAS. An
+            // unfinished franchise is refused here too.
             let handle = WarehouseHandle::serving(root.clone())
                 .map_err(|refusal| refusal.message(&format!("\"{}\"", root.to_string_lossy())))?;
             ServeMode::Single(Arc::new(handle))
@@ -1600,15 +1610,17 @@ fn resolve_warehouse(state: &AppState,
     }
 
     // Acquire this warehouse's serve lock as it is served, and hold it in the registry's handle
-    // until the handle is let go. Refuses (503) if a `gc`, full repack or scope-prune is running
-    // against this warehouse, or another server already serves it — serving it then would be
-    // unsafe. A sparse warehouse stays refused (409) until it is replaced.
+    // until the handle is let go. Refuses (503) if a `gc` or full repack is running against this
+    // warehouse, or another server already serves it — serving it then would be unsafe. A sparse
+    // warehouse stays refused (409) until it is replaced, and an unfinished franchise (409) until
+    // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root).map_err(|refusal| match refusal {
             ServingRefusal::Busy(reason) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, reason),
             ),
+            ServingRefusal::Unfinished(reason) => (StatusCode::CONFLICT, reason),
             ServingRefusal::Unreadable(reason) => internal(reason),
             ServingRefusal::Sparse => (
                 StatusCode::CONFLICT,
@@ -4131,6 +4143,35 @@ mod tests {
         let refused = WarehouseHandle::serving(garbled).err().expect("an unreadable scope is refused");
         assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A multi-warehouse server refuses an unfinished franchise (409) as single mode does: one
+    /// killed before it wrote its fetch scope reads as full, so its scope cannot be trusted yet. A
+    /// fetch scope that cannot be read is a 500.
+    ///
+    /// Revert: drop the franchise gate from `serving` → `unfinished` is served → red.
+    #[test]
+    fn a_multi_server_refuses_an_unfinished_franchise_and_an_unreadable_scope() {
+        let base = scratch_dir("unfinished-multi");
+        let state = capped_state(&base, 4, &["unfinished", "garbled"]);
+
+        let forklift = base.join("unfinished").join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::write(franchise_utils::record_path(&forklift), b"torn").unwrap();
+        let refused = resolve_warehouse(&state, &warehouse_params("unfinished")).err().expect("refused");
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
+        assert!(!serve_lock_exists(&base, "unfinished"), "a refused warehouse keeps no serve lock");
+
+        make_sparse(&base.join("garbled"));
+        {
+            let _scope = StorageRootScope::enter(&base.join("garbled"));
+            std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
+        }
+        let refused = resolve_warehouse(&state, &warehouse_params("garbled")).err().expect("refused");
+        assert_eq!(refused.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", refused.1);
+
+        assert!(live_ids(&state).is_empty());
+        drop(state);
         let _ = std::fs::remove_dir_all(&base);
     }
 

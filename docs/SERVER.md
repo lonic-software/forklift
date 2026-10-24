@@ -53,7 +53,8 @@ A served root must hold the full tree. A sparse warehouse (one franchised with `
 refused: `serve --root` will not start on it, and a `--warehouses` server answers `409` for it.
 Clients trust a server to hold every object its pallet heads reach, and `scope-prune` frees local
 copies on that basis, so a sparse root could lead a client to free content it can never fetch back.
-To serve a franchised copy, franchise it without `--only`.
+To serve a franchised copy, franchise it without `--only`. A franchise that has not finished is refused the same
+way (`409`) until it is resumed or deleted.
 
 ## Serving many warehouses
 
@@ -85,7 +86,7 @@ open-file limit (and never more than 1024) live. When it needs to serve one more
 of the least recently used warehouse that no request is using. It never refuses a request
 because of that cap: when every live warehouse is busy, it serves the new one over the cap. A
 warehouse that was let go is served again on its next request. Below the cap nothing is let go.
-While a warehouse is not live, `gc`, a full repack and scope-prune can run on it. A lift whose
+While a warehouse is not live, `gc` and a full repack can run on it. A lift whose
 objects were deleted between its requests is refused at the ref update (`422`) and can be
 retried; nothing is ever left pointing at a deleted object. The auto-rebuild lift count
 (`rebuild_after_lifts`) starts again from zero when a warehouse is let go.
