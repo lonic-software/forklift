@@ -38,7 +38,7 @@ pub const TOOL: &str = "forklift";
 /// Version 6 (this one): `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
 /// (`degraded` or `endpoint_absent`) when the remote's batch download stopped being used and the
 /// rest of the command fetched one object at a time (`office accept-regenesis` says so in its
-/// message instead).
+/// message instead). An error document does not carry it.
 /// Version 5: the `staged_upload_discarded` error code exists, and a lift whose commit
 /// the remote keeps answering "not ready" fails at a deadline instead of after a fixed attempt count.
 /// Version 4: the `franchise_incomplete` (with `details`) and `only_prefix_not_found`

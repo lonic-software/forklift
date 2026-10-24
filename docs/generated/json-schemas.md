@@ -2004,7 +2004,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "Why the remote's batch download stopped being used during an auto-merge, when it did.\nAbsent when it stayed open."
+      "description": "Why the remote's batch download stopped being used while this lift fetched (an auto-merge),\nwhen it did. Absent when it stayed open."
     },
     "head": {
       "type": "string"

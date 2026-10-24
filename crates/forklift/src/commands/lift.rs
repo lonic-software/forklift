@@ -307,8 +307,8 @@ pub(crate) struct LiftReport {
     uploaded_objects: usize,
     uploaded_signatures: usize,
 
-    /// Why the remote's batch download stopped being used during an auto-merge, when it did.
-    /// Absent when it stayed open.
+    /// Why the remote's batch download stopped being used while this lift fetched (an auto-merge),
+    /// when it did. Absent when it stayed open.
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_lane: Option<BatchLaneClosure>,
 }
