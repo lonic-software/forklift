@@ -1543,6 +1543,283 @@ pub(crate) mod tests {
         parcel.hash
     }
 
+    /// The closure check at a user-pallet head write: a head whose history is not completely
+    /// present at the fetch scope is refused, back to what some ref already reaches.
+    mod closure_at_write {
+        use super::*;
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::blob::Blob;
+        use crate::model::tree_item::TreeItem;
+
+        fn blob(content: &str) -> String {
+            let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
+            object.store().unwrap();
+            object.hash
+        }
+
+        fn tree(entries: &[(&str, &str, DirEntryType)]) -> String {
+            let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            for (name, hash, item_type) in entries {
+                tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *item_type));
+            }
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            object.hash
+        }
+
+        /// A tree with `src/a` and `web/b`, holding `src` and `web` as their contents.
+        fn two_dirs(src: &str, web: &str) -> String {
+            let src = tree(&[("a", &blob(src), DirEntryType::Normal)]);
+            let web = tree(&[("b", &blob(web), DirEntryType::Normal)]);
+            tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)])
+        }
+
+        fn parcel(tree_hash: &str, parents: &[&str]) -> String {
+            let mut object = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
+                tree_hash: tree_hash.to_string(),
+                parents: parents.iter().map(|parent| parent.to_string()).collect(),
+                actions: Vec::new(),
+                description: None,
+            });
+            object.store().unwrap();
+            object.hash
+        }
+
+        fn remove(hash: &str) {
+            let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+        }
+
+        fn write(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
+            update_pallet_head(name, expected, new, &RefPreconditions::NONE)
+        }
+
+        fn assert_incomplete(result: Result<(), RefUpdateError>, name: &str, expected: Option<&str>) {
+            assert!(matches!(result, Err(RefUpdateError::Incomplete { .. })), "{:?}", result);
+            assert_eq!(get_pallet_head(name).unwrap().as_deref(), expected, "nothing was written");
+        }
+
+        // Revert: skip the closure check → both writes land over the missing blob; or refuse
+        // every new head → the head stays refused once the blob arrives.
+        #[test]
+        fn a_head_and_an_intermediate_parcel_with_a_missing_blob_are_refused_until_it_arrives() {
+            let (_root, _scope) = scratch("closure-full");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+
+            let mid = parcel(&two_dirs("a1", "b1"), &[&base]);
+            let head = parcel(&two_dirs("a2", "b1"), &[&mid]);
+            let missing = blob("b1");
+            remove(&missing);
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+            assert_incomplete(write("main", Some(&base), &mid), "main", Some(&base));
+            assert_incomplete(write("side", None, &head), "side", None);
+
+            // The fetch completes.
+            blob("b1");
+            write("main", Some(&base), &head).unwrap();
+        }
+
+        // Revert: drop the error's name for the missing object → the message names nothing.
+        #[test]
+        fn the_refusal_names_the_head_and_the_missing_object() {
+            let (_root, _scope) = scratch("closure-message");
+            let missing = blob("lost");
+            let head = parcel(&tree(&[("f", &missing, DirEntryType::Normal)]), &[]);
+            remove(&missing);
+
+            let message = write("main", None, &head).unwrap_err().to_string();
+            assert!(message.contains(&head[..12]) && message.contains(&missing), "{}", message);
+            assert!(message.contains("Nothing was written"), "{}", message);
+        }
+
+        // Revert: check only the head parcel itself → the write lands over a deleted ancestor.
+        #[test]
+        fn a_head_whose_ancestor_parcel_is_gone_is_refused() {
+            let (_root, _scope) = scratch("closure-ancestor");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let mid = parcel(&two_dirs("a1", "b0"), &[&base]);
+            let head = parcel(&two_dirs("a2", "b0"), &[&mid]);
+            remove(&mid);
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: check only the first parent's side → the merge lands over the part-way side.
+        #[test]
+        fn a_merge_onto_a_part_way_parcel_is_refused() {
+            let (_root, _scope) = scratch("closure-merge");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+
+            // A lower that stopped part-way: the parcel arrived, a blob of its tree did not.
+            let lowered = parcel(&two_dirs("a0", "b-lowered"), &[&base]);
+            remove(&blob("b-lowered"));
+            let merge = parcel(&two_dirs("a-merged", "b0"), &[&base, &lowered]);
+
+            assert_incomplete(write("main", Some(&base), &merge), "main", Some(&base));
+        }
+
+        // Revert: refuse a head no ref reaches → a complete stray parcel is refused.
+        #[test]
+        fn a_complete_parcel_no_ref_reaches_is_accepted() {
+            let (_root, _scope) = scratch("closure-stray");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            let head = parcel(&two_dirs("a1", "b1"), &[&base]);
+
+            write("feature", None, &head).unwrap();
+            assert_eq!(get_pallet_head("feature").unwrap(), Some(head));
+        }
+
+        // Revert: bound the walk by the written ref's own head only → the walk enters `other`'s
+        // head, whose damage is not this write's, and refuses.
+        #[test]
+        fn the_walk_stops_at_every_ref_head() {
+            let (_root, _scope) = scratch("closure-bounds");
+            let theirs = parcel(&two_dirs("a0", "b-theirs"), &[]);
+            write("other", None, &theirs).unwrap();
+            let first = parcel(&two_dirs("a0", "b0"), &[&theirs]);
+            let head = parcel(&two_dirs("a1", "b0"), &[&first]);
+            remove(&blob("b-theirs"));
+            remove(&blob("b0"));
+
+            // `first` is walked and refused; once it is whole, `theirs` bounds the walk.
+            assert_incomplete(write("feature", None, &head), "feature", None);
+            blob("b0");
+            write("feature", None, &head).unwrap();
+        }
+
+        // Revert: drop the base-tree prune → `web`, carried unchanged from the current head, is
+        // walked and its damaged blob refuses a write that changed only `src`.
+        #[test]
+        fn a_subtree_the_current_head_carries_is_not_walked_again() {
+            let (_root, _scope) = scratch("closure-prune");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a1", "b0"), &[&base]);
+            remove(&blob("b0"));
+
+            write("main", Some(&base), &head).unwrap();
+        }
+
+        // Revert: verify at the full scope in a sparse warehouse → an out-of-scope blob that was
+        // never fetched refuses the write; or skip the scoped walk → the in-scope one does not.
+        #[test]
+        fn a_sparse_warehouse_checks_only_what_its_scope_holds() {
+            let (_root, _scope) = scratch("closure-sparse");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+
+            let sealed = parcel(&two_dirs("a1", "b-sealed"), &[&base]);
+            let part_way = parcel(&two_dirs("a-lost", "b-sealed"), &[&sealed]);
+            remove(&blob("b-sealed"));
+            write("main", Some(&base), &sealed).unwrap();
+
+            remove(&blob("a-lost"));
+            assert_incomplete(write("main", Some(&sealed), &part_way), "main", Some(&sealed));
+        }
+
+        // Revert: pass no bases to the in-scope walk below a spine tree → `src`, carried unchanged
+        // from the current head, is walked and its damaged blob refuses a write that changed only
+        // `web`, which is out of scope.
+        #[test]
+        fn a_sparse_warehouse_keeps_the_base_tree_prune() {
+            let (_root, _scope) = scratch("closure-sparse-prune");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a0", "b1"), &[&base]);
+            remove(&blob("a0"));
+
+            write("main", Some(&base), &head).unwrap();
+        }
+
+        // Revert: walk the tree recursively → the write overflows the small stack below and aborts.
+        #[test]
+        fn a_deeply_nested_tree_is_checked_without_overflowing_the_stack() {
+            let (root, _scope) = scratch("closure-deep");
+            let mut current = tree(&[("f", &blob("leaf"), DirEntryType::Normal)]);
+
+            // Written without the store's durability steps, which would dominate the test.
+            for _ in 0..2_000 {
+                let mut level = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+                level.add_child(TreeItem::new("d".to_string(), current, DirEntryType::Tree));
+                let mut object = LooseObjectBuilder::build_tree(&level);
+                let (folder, file) = file_utils::get_path_for_object(&object.hash).unwrap();
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(std::path::Path::new(&folder).join(file), object.compress().unwrap()).unwrap();
+                current = object.hash;
+            }
+            let head = parcel(&current, &[]);
+
+            let written = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let _scope = StorageRootScope::enter(&root);
+                    write("main", None, &head)
+                })
+                .unwrap()
+                .join()
+                .expect("the write thread must not panic");
+            written.unwrap();
+        }
+
+        // Revert: never re-read the scope inside the hold → the write lands over `web`, which
+        // the widened scope holds and this warehouse lacks.
+        #[test]
+        fn a_scope_widened_between_the_check_and_the_hold_is_checked_again() {
+            let (_root, _scope) = scratch("closure-widened");
+            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a1", "b-sealed"), &[&base]);
+            remove(&blob("b-sealed"));
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
+            })));
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: re-verify a head the caller verified → the write refuses although it was told
+        // `head` was verified; or skip on any token → a token for another head or scope skips.
+        #[test]
+        fn a_verification_token_skips_the_check_only_for_its_own_head_and_scope() {
+            let (_root, _scope) = scratch("closure-token");
+            let missing = blob("lost");
+            let head = parcel(&tree(&[("f", &missing, DirEntryType::Normal)]), &[]);
+            let other = stub_parcel("other");
+            remove(&missing);
+            let full = MaterializationScope::full();
+
+            let wrong_head = VerifiedClosure::new(&other, full.clone());
+            assert_incomplete(update_pallet_head_verified(
+                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_head
+            ), "main", None);
+
+            let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]));
+            assert_incomplete(update_pallet_head_verified(
+                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_scope
+            ), "main", None);
+
+            // The token stands for a verification its caller made: the write takes its word.
+            let token = VerifiedClosure::new(&head, full);
+            update_pallet_head_verified(PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &token).unwrap();
+        }
+
+        // Revert: verify meta-pallet writes too → the office write walks a parcel it never needed.
+        #[test]
+        fn a_meta_pallet_write_is_not_checked_here() {
+            let (_root, _scope) = scratch("closure-meta");
+            update_meta_pallet_head(OFFICE, None, &"e".repeat(64), &RefPreconditions::NONE).unwrap();
+        }
+    }
+
     fn ref_bytes(name: &str) -> Vec<u8> {
         std::fs::read(get_pallet_ref_path(PalletNamespace::User, name)).unwrap()
     }
