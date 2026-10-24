@@ -4,7 +4,7 @@ use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::remote_utils::RemoteClient;
+use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
@@ -100,12 +100,15 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         head: String::new(),
         fetched_objects: 0,
         fetched_signatures: 0,
+        batch_lane: None,
     };
 
     let lowered = match named {
         Some(_) => lower_named_pallet(&client, &info, &mut report, &progress).await,
         None => lower_working_pallet(&client, &info, &mut report, &progress).await,
     };
+
+    report.batch_lane = client.batch_lane_closure();
 
     // The most severe outcome decides the exit: the working pallet's own failure, then a meta
     // pallet that failed, then a meta conflict. The report shows what did go through.
@@ -531,6 +534,13 @@ pub(crate) struct LowerReport {
     head: String,
     fetched_objects: usize,
     fetched_signatures: usize,
+
+    /// Why the remote's batch download stopped being used, when it did: everything the command
+    /// fetched after that came one object at a time. `degraded` is a remote too slow to start a
+    /// batch answer; `endpoint_absent` is one that serves no batch downloads. Absent when the
+    /// lane stayed open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_lane: Option<BatchLaneClosure>,
 }
 
 impl LowerReport {
@@ -616,6 +626,10 @@ impl CommandOutput for LowerReport {
                     self.pallet, self.head, self.fetched_objects, self.fetched_signatures, self.pallet
                 );
             }
+        }
+
+        if let Some(closure) = self.batch_lane {
+            println!("{}", output::batch_lane_line(closure));
         }
     }
 }

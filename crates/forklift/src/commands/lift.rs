@@ -2,7 +2,7 @@ use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::remote_utils::{LiftResult, RemoteClient};
+use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
 use forklift_core::util::{
     config_utils, file_utils, merge_utils, object_utils, pallet_utils,
     remote_utils, scope_utils,
@@ -32,6 +32,8 @@ pub async fn handle_command() -> Result<(), String> {
 
     let progress = events::progress();
     let mut auto_merged = 0usize;
+    // Each attempt dials a fresh client, so a lane an earlier attempt's fetch closed is carried here.
+    let mut batch_lane: Option<BatchLaneClosure> = None;
 
     // Optimistic lift (§7.7): a diverged push whose merge is clean auto-lowers,
     // consolidates and retries, so a fleet stacking to one pallet stops serializing
@@ -86,6 +88,7 @@ pub async fn handle_command() -> Result<(), String> {
                 match try_auto_merge(&client, &pallet, position.base.as_deref(), &head, remote, &progress).await {
                     Ok(true) => {
                         auto_merged += 1;
+                        batch_lane = batch_lane.or(client.batch_lane_closure());
                         continue;
                     }
                     Ok(false) => {}
@@ -108,6 +111,7 @@ pub async fn handle_command() -> Result<(), String> {
             new_parcels: 0,
             uploaded_objects: 0,
             uploaded_signatures: 0,
+            batch_lane: batch_lane.or(client.batch_lane_closure()),
         };
 
         let lifted = remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await;
@@ -301,6 +305,13 @@ pub(crate) struct LiftReport {
     new_parcels: usize,
     uploaded_objects: usize,
     uploaded_signatures: usize,
+
+    /// Why the remote's batch download stopped being used, when it did: everything an auto-merge
+    /// fetched after that came one object at a time. `degraded` is a remote too slow to start a
+    /// batch answer; `endpoint_absent` is one that serves no batch downloads. Absent when the
+    /// lane stayed open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_lane: Option<BatchLaneClosure>,
 }
 
 /// Whether a count is zero (for skipping it in the JSON envelope).
@@ -341,6 +352,10 @@ impl CommandOutput for LiftReport {
                 self.pallet, self.head, self.new_parcels, self.uploaded_objects,
                 self.uploaded_signatures
             );
+        }
+
+        if let Some(closure) = self.batch_lane {
+            println!("{}", output::batch_lane_line(closure));
         }
     }
 }

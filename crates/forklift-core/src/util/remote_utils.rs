@@ -302,6 +302,22 @@ pub enum BatchOutcome {
     Degraded,
 }
 
+/// Why a remote's batch lane closed, so the rest of the command fetched one object at a time.
+/// Read from [`RemoteClient::batch_lane_closure`] once the command's fetches are done.
+///
+/// The lane belongs to the client, not to one fetch: every fetch a command makes through the same
+/// client (the office, the meta pallets, the pallet itself) shares it, so the command reports it
+/// once rather than each fetch's stats carrying a copy.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchLaneClosure {
+    /// The remote has no batch endpoint.
+    EndpointAbsent,
+    /// The remote did not start a batch answer in time.
+    Degraded,
+}
+
 /// What a lift actually transferred.
 pub struct LiftStats {
     pub new_parcels: usize,
@@ -2255,8 +2271,10 @@ pub struct RemoteClient {
     /// [`fetch_missing_objects`] goes straight to loose GETs instead of paying the head wait again
     /// for every later wave of the same command. Shared by every clone, since a command's walk
     /// hands clones to its workers; never reopened, since nothing this instance sees afterwards
-    /// says the endpoint got any faster.
-    batch_lane_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// says the endpoint got any faster. It keeps the reason the lane first closed for, which
+    /// the command reads back through [`Self::batch_lane_closure`] to tell the user why it ran
+    /// slow.
+    batch_lane_closed: std::sync::Arc<std::sync::OnceLock<BatchLaneClosure>>,
 }
 
 /// Compose the client-facing error for a non-success response, threading a server-side refusal
@@ -3450,7 +3468,7 @@ impl RemoteClient {
             "the batch fetch",
         ).await?;
         if let SendOutcome::HeadWaitExpired { .. } = outcome {
-            self.close_batch_lane();
+            self.close_batch_lane(BatchLaneClosure::Degraded);
             return Ok(BatchOutcome::Degraded);
         }
         let response = self.response_from_send(
@@ -3458,7 +3476,7 @@ impl RemoteClient {
         )?;
 
         if endpoint_absent(response.status()) {
-            self.close_batch_lane();
+            self.close_batch_lane(BatchLaneClosure::EndpointAbsent);
             return Ok(BatchOutcome::EndpointAbsent);
         }
 
@@ -3573,11 +3591,17 @@ impl RemoteClient {
 
     /// Whether [`Self::fetch_batch`] is still worth asking, for this instance and every clone of it.
     pub(crate) fn batch_lane_open(&self) -> bool {
-        !self.batch_lane_closed.load(std::sync::atomic::Ordering::Relaxed)
+        self.batch_lane_closed.get().is_none()
     }
 
-    fn close_batch_lane(&self) {
-        self.batch_lane_closed.store(true, std::sync::atomic::Ordering::Relaxed);
+    /// Why this remote's batch lane closed, if it did, for this instance and every clone of it.
+    /// The first reason stands: two workers closing it at once both saw the lane fail.
+    pub fn batch_lane_closure(&self) -> Option<BatchLaneClosure> {
+        self.batch_lane_closed.get().copied()
+    }
+
+    fn close_batch_lane(&self, reason: BatchLaneClosure) {
+        let _ = self.batch_lane_closed.set(reason);
     }
 
     /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
@@ -9254,6 +9278,10 @@ mod tests {
                 {:?}", status, outcome
             );
             assert!(!absent.batch_lane_open(), "a {} closes the batch lane", status);
+            assert_eq!(
+                absent.batch_lane_closure(), Some(BatchLaneClosure::EndpointAbsent),
+                "a {} closes the lane for the endpoint's absence, not for a slow head", status
+            );
         }
 
         let broken = RemoteClient::new(
@@ -11506,6 +11534,10 @@ mod tests {
         assert!(matches!(outcome, BatchOutcome::Degraded), "{:?}", outcome);
         assert!(!client.batch_lane_open(), "a degraded batch closes the lane");
         assert!(!clone.batch_lane_open(), "the lane is shared with every clone of the client");
+        assert_eq!(
+            clone.batch_lane_closure(), Some(BatchLaneClosure::Degraded),
+            "the reason is shared with the lane, and a slow head is not an absent endpoint"
+        );
         assert!(
             elapsed >= effective_budget,
             "elapsed {:?} is under the head budget {:?}", elapsed, effective_budget

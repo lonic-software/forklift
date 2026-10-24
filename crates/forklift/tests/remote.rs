@@ -724,6 +724,165 @@ fn lift_franchise_lower_round_trip() {
     assert!(stdout(&lowered_again).contains("Already up to date"), "{}", stdout(&lowered_again));
 }
 
+/// A pass-through HTTP proxy in front of a real server that answers every batch fetch with a `404`,
+/// as a remote without the batch endpoint would. Everything else is forwarded unchanged, one
+/// request per connection (`Connection: close` on the forwarded request, so the server closes
+/// after its answer and the copy below ends).
+struct BatchlessProxy {
+    url: String,
+    batch_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl BatchlessProxy {
+    fn start(upstream: &str) -> BatchlessProxy {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = upstream.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let batch_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&batch_requests);
+
+        // The acceptor lives for the rest of the test process, like `HookServer`'s.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(downstream) = stream else { continue };
+                let upstream = upstream.clone();
+                let counted = std::sync::Arc::clone(&counted);
+
+                std::thread::spawn(move || BatchlessProxy::serve(downstream, &upstream, &counted));
+            }
+        });
+
+        BatchlessProxy { url, batch_requests }
+    }
+
+    fn serve(mut downstream: std::net::TcpStream,
+             upstream: &str,
+             batch_requests: &std::sync::atomic::AtomicUsize) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 8192];
+
+        let header_end = loop {
+            if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break position + 4;
+            }
+
+            match downstream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let mut lines = head.split("\r\n").filter(|line| !line.is_empty());
+        let request_line = lines.next().unwrap_or_default().to_string();
+        let headers: Vec<String> = lines
+            .filter(|line| !line.to_ascii_lowercase().starts_with("connection:"))
+            .map(str::to_string)
+            .collect();
+        let content_length: usize = headers.iter()
+            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+
+        let mut body = buffer[header_end..].to_vec();
+
+        while body.len() < content_length {
+            match downstream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+            }
+        }
+
+        let path = request_line.split_whitespace().nth(1).unwrap_or_default();
+
+        if path.ends_with("/objects/batch") {
+            batch_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = downstream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
+
+        let Ok(mut server) = std::net::TcpStream::connect(upstream) else { return };
+        let mut forwarded = format!("{}\r\n{}\r\nConnection: close\r\n\r\n", request_line, headers.join("\r\n")).into_bytes();
+        forwarded.extend_from_slice(&body);
+
+        if server.write_all(&forwarded).is_err() {
+            return;
+        }
+
+        let _ = std::io::copy(&mut server, &mut downstream);
+        let _ = downstream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// A remote whose batch lane closes is named in the command's output, and a healthy one is not
+/// (FORK-268). The same change is lowered twice: once straight from the server, once through a proxy
+/// that refuses every batch fetch, so the only difference between the runs is the lane.
+///
+/// Revert: drop `report.batch_lane = client.batch_lane_closure()` from `lower` → the proxied run
+/// prints no line and carries no `batch_lane`; set it unconditionally → the direct run carries one.
+#[test]
+fn lower_names_a_closed_batch_lane_and_a_healthy_lower_does_not() {
+    let area = TestArea::new("batch-lane");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/docs/readme.txt", "hello\n");
+    area.write_file("a/src/main.txt", "fn main\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "direct"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "proxied"]));
+
+    // Two directories and two files change, so the lower's tree and blob waves each miss more
+    // than one object and go to the batch lane.
+    area.write_file("a/docs/readme.txt", "hello again\n");
+    area.write_file("a/src/main.txt", "fn main v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let proxy = BatchlessProxy::start(&server.url);
+    assert_success(&area.forklift("proxied", &["config", "remote.url", &proxy.url]));
+
+    let fallback = "does not serve batch downloads";
+
+    let direct = area.forklift("direct", &["lower"]);
+    assert_success(&direct);
+    assert!(stdout(&direct).contains("Lowered pallet \"main\""), "{}", stdout(&direct));
+    assert!(!stdout(&direct).contains(fallback), "a healthy lower names no fallback: {}", stdout(&direct));
+    assert!(!stdout(&direct).contains("one object at a time"), "{}", stdout(&direct));
+
+    let proxied = area.forklift("proxied", &["--json", "lower"]);
+    assert_success(&proxied);
+    assert!(
+        proxy.batch_requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the lower must have asked the proxy for a batch, or this run proves nothing"
+    );
+    let document: serde_json::Value = serde_json::from_str(&stdout(&proxied)).unwrap();
+    assert_eq!(document["data"]["outcome"], "lowered", "{}", document);
+    assert_eq!(document["data"]["batch_lane"], "endpoint_absent", "{}", document);
+    assert_eq!(area.read_file("proxied/src/main.txt"), "fn main v2\n");
+
+    // The human form names it in one line; the direct run's JSON carries no field at all.
+    area.write_file("a/docs/readme.txt", "hello a third time\n");
+    area.write_file("a/src/main.txt", "fn main v3\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "third"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let human = area.forklift("proxied", &["lower"]);
+    assert_success(&human);
+    assert!(stdout(&human).contains(fallback), "{}", stdout(&human));
+
+    let direct_json = area.forklift("direct", &["--json", "lower"]);
+    assert_success(&direct_json);
+    let document: serde_json::Value = serde_json::from_str(&stdout(&direct_json)).unwrap();
+    assert_eq!(document["data"]["outcome"], "lowered", "{}", document);
+    assert!(document["data"].get("batch_lane").is_none(), "{}", document);
+}
+
 // A lower refused over an untracked file where the remote's head adds one changes nothing, and leaves
 // no interrupted operation behind. Revert: raise lower's operation marker before its collision
 // check → every later command refuses until heal, and heal completes a lower that never ran.
