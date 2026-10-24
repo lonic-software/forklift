@@ -1286,7 +1286,7 @@ fn argument_refusal(name: &str, arguments: &Value, server_set: &[&str]) -> Optio
         return Some(format!("the \"{}\" tool's arguments must be a JSON object", name));
     };
 
-    let given = arguments.iter().filter(|(_, value)| !value.is_null());
+    let mut given = arguments.iter().filter(|(_, value)| !value.is_null());
     given.find_map(|(key, value)| match properties.get(key) {
         None if server_set.contains(&key.as_str()) => None,
         None => Some(format!("the \"{}\" tool takes no \"{}\" argument", name, key)),
