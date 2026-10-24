@@ -4253,7 +4253,7 @@ impl RemoteClient {
         }
         drop(file);
 
-        std::fs::rename(&temp_path, path).map_err(|e| format!(
+        file_utils::rename(&temp_path, path).map_err(|e| format!(
             "Error while moving the bundle into place at \"{}\": {}", path.to_string_lossy(), e
         ))?;
 

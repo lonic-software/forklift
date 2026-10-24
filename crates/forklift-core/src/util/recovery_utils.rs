@@ -2947,7 +2947,7 @@ mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
         file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
         let upper = Path::new(&folder).with_file_name("AB");
-        std::fs::rename(&folder, &upper).unwrap();
+        file_utils::rename(&folder, &upper).unwrap();
         let canonical = Path::new(&folder).join(&file_name);
         let folds = canonical.exists();
 
@@ -7078,7 +7078,7 @@ mod tests {
     fn a_walk_over_an_inventory_root_out_of_reach_fails() {
         let (root, _scope) = staged_warehouse("walker-root-out-of-reach", &["", "docs"]);
         let inventory_root = PathBuf::from(file_utils::get_path_inventory_root());
-        std::fs::rename(&inventory_root, root.join("drive")).unwrap();
+        file_utils::rename(&inventory_root, root.join("drive")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("unmounted"), &inventory_root).unwrap();
         #[cfg(windows)]
@@ -7111,7 +7111,7 @@ mod tests {
             let linked = if level == "slot" { data.parent().unwrap().to_path_buf() } else { data.clone() };
 
             let outside = root.join("outside");
-            std::fs::rename(&linked, &outside).unwrap();
+            file_utils::rename(&linked, &outside).unwrap();
             #[cfg(unix)]
             std::os::unix::fs::symlink(&outside, &linked).unwrap();
             #[cfg(windows)]

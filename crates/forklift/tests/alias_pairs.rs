@@ -76,7 +76,7 @@ impl Warehouse {
     }
 
     fn rename(&self, from: &str, to: &str) {
-        std::fs::rename(self.path(from), self.path(to)).unwrap();
+        forklift_core::util::file_utils::rename(self.path(from), self.path(to)).unwrap();
     }
 
     fn stocktake(&self) -> String {

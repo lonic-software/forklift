@@ -562,7 +562,7 @@ pub(crate) mod tests {
         gc_keeps_a_respelled_live_blob("gc-uppercase-folder", |path| {
             let folder = path.parent().unwrap();
             let upper = folder.with_file_name(folder.file_name().unwrap().to_ascii_uppercase());
-            std::fs::rename(folder, &upper).unwrap();
+            file_utils::rename(folder, &upper).unwrap();
             upper.join(path.file_name().unwrap())
         });
     }
@@ -572,7 +572,7 @@ pub(crate) mod tests {
     fn gc_never_sweeps_a_live_blob_whose_file_name_is_spelled_in_uppercase() {
         gc_keeps_a_respelled_live_blob("gc-uppercase-file", |path| {
             let upper = path.with_file_name(path.file_name().unwrap().to_ascii_uppercase());
-            std::fs::rename(path, &upper).unwrap();
+            file_utils::rename(path, &upper).unwrap();
             upper
         });
     }

@@ -278,7 +278,7 @@ fn rewrite_dentry(final_path: &Path, content: &[u8]) -> Result<(), String> {
         return Err(e);
     }
 
-    std::fs::rename(&temp_path, final_path).map_err(|e| {
+    file_utils::rename(&temp_path, final_path).map_err(|e| {
         let _ = std::fs::remove_file(&temp_path);
         format!("Error while restaging \"{}\": {}", final_path.to_string_lossy(), e)
     })

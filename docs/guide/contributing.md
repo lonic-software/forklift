@@ -186,7 +186,10 @@ forklift behaves predictably. From `DESIGN.html` §2:
   boundary into `WarehousePath`: repo-relative, `/`-separated on every platform,
   no `.`/`..`, root = empty key. The storage layer never sees anything else.
 - **Atomicity.** Object writes and every state file (refs, config, signatures) are
-  temp-file + rename. Mutating commands hold the **warehouse lock**
+  temp-file + rename. Rename through `file_utils::rename` (or `rename_no_replace`),
+  which waits up to a second for another process (an editor, indexer or antivirus
+  scanner) to release a Windows handle that blocks the rename; `clippy.toml` bans
+  a bare `std::fs::rename`. Mutating commands hold the **warehouse lock**
   (`.forklift/lock`, `create_new`, held for the whole command) so a reader can
   never see a half-updated staging area. Read-only commands don't take it. Add a
   new mutating command to the lock list in `cli.rs`

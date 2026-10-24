@@ -2325,9 +2325,9 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                     // replace it with the just-verified bytes before publishing the index.
                     std::fs::remove_file(&data_final)
                         .map_err(|e| format!("Error while replacing incomplete pack data: {}", e))?;
-                    std::fs::rename(&pair.data_path, &data_final)
+                    file_utils::rename(&pair.data_path, &data_final)
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
-                    std::fs::rename(&pair.index_path, &index_final)
+                    file_utils::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
                     published_this_run.push(data_final.clone());
                     published_this_run.push(index_final.clone());
@@ -2337,17 +2337,17 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                     // point first, then publish the verified pair data-first/index-last.
                     std::fs::remove_file(&index_final)
                         .map_err(|e| format!("Error while replacing incomplete pack index: {}", e))?;
-                    std::fs::rename(&pair.data_path, &data_final)
+                    file_utils::rename(&pair.data_path, &data_final)
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
-                    std::fs::rename(&pair.index_path, &index_final)
+                    file_utils::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
                     published_this_run.push(data_final.clone());
                     published_this_run.push(index_final.clone());
                 }
                 (false, false) => {
-                    std::fs::rename(&pair.data_path, &data_final)
+                    file_utils::rename(&pair.data_path, &data_final)
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
-                    std::fs::rename(&pair.index_path, &index_final)
+                    file_utils::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
                     published_this_run.push(data_final.clone());
                     published_this_run.push(index_final.clone());
@@ -5054,10 +5054,10 @@ impl PackWriter {
         let data_final = self.pack_folder.join(format!("{}.{}", pack_id, PACK_DATA_EXTENSION));
         let index_final = self.pack_folder.join(format!("{}.{}", pack_id, PACK_INDEX_EXTENSION));
 
-        std::fs::rename(&self.data_temp_path, &data_final).map_err(|e| format!(
+        file_utils::rename(&self.data_temp_path, &data_final).map_err(|e| format!(
             "Error while finalizing pack data \"{}\": {}", data_final.to_string_lossy(), e
         ))?;
-        std::fs::rename(&index_temp_path, &index_final).map_err(|e| format!(
+        file_utils::rename(&index_temp_path, &index_final).map_err(|e| format!(
             "Error while finalizing pack index \"{}\": {}", index_final.to_string_lossy(), e
         ))?;
 
@@ -6180,7 +6180,7 @@ pub(crate) mod tests {
 
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
         let upper = Path::new(&folder).with_file_name(hash[..2].to_ascii_uppercase());
-        std::fs::rename(&folder, &upper).unwrap();
+        file_utils::rename(&folder, &upper).unwrap();
         let folds = Path::new(&folder).join(&file_name).exists();
 
         compact(false, false, false, &Progress::NONE).unwrap();
@@ -7767,7 +7767,7 @@ pub(crate) mod tests {
         for artifact_path in [&artifacts[0].data_path, &artifacts[0].index_path] {
             let extension = artifact_path.extension().unwrap().to_str().unwrap();
             let new_path = pack_folder.join(format!("{}.{}", new_stem, extension));
-            std::fs::rename(artifact_path, &new_path).unwrap();
+            file_utils::rename(artifact_path, &new_path).unwrap();
         }
     }
 

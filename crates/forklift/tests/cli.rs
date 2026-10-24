@@ -1285,7 +1285,7 @@ fn a_mode_only_change_is_reported_staged_and_unstaged_and_blocks_shift() {
 
     // Back the other way, folded into a move: the pallet diff keeps the mode of the moved file.
     assert_success(&warehouse.run(&["palletize", "executable"]));
-    std::fs::rename(&path, warehouse.root.join("moved.txt")).unwrap();
+    forklift_core::util::file_utils::rename(&path, warehouse.root.join("moved.txt")).unwrap();
     std::fs::set_permissions(warehouse.root.join("moved.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     let staged = stdout(&warehouse.run(&["diff", "--staged"]));
@@ -2856,7 +2856,7 @@ fn re_proving_an_unproven_entry_never_hides_a_kind_change() {
     assert_success(&warehouse.run(&["import-git", "."]));
 
     std::fs::set_permissions(root.join("big.bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::rename(root.join("file.txt"), root.join("copy.txt")).unwrap();
+    forklift_core::util::file_utils::rename(root.join("file.txt"), root.join("copy.txt")).unwrap();
     std::os::unix::fs::symlink("copy.txt", root.join("file.txt")).unwrap();
     std::fs::remove_file(root.join("link")).unwrap();
     warehouse.write_file("link", "file.txt");
@@ -4194,7 +4194,7 @@ fn moves_are_detected_as_a_post_pass_and_reported_as_one_change() {
 
     // A file moved on disk (not loaded yet) pairs by inode + hash: one unstaged move
     // instead of a removal and an untracked file.
-    std::fs::rename(
+    forklift_core::util::file_utils::rename(
         warehouse.root.join("src/alpha.txt"),
         warehouse.root.join("src/renamed.txt"),
     ).unwrap();
@@ -4234,7 +4234,7 @@ fn moves_are_detected_as_a_post_pass_and_reported_as_one_change() {
     assert_success(&warehouse.run(&["stack", "renamed"]));
     assert_success(&warehouse.run(&["palletize", "feature"]));
     std::fs::create_dir_all(warehouse.root.join("sub")).unwrap();
-    std::fs::rename(
+    forklift_core::util::file_utils::rename(
         warehouse.root.join("src/beta.txt"),
         warehouse.root.join("sub/beta.txt"),
     ).unwrap();
@@ -12650,8 +12650,8 @@ fn an_old_format_bay_redirect_is_refused_with_a_conversion_that_works() {
 
     let staging = bay_dir.join(".forklift.new-1");
     std::fs::create_dir(&staging).unwrap();
-    std::fs::rename(&forklift, staging.join("redirect")).unwrap();
-    std::fs::rename(&staging, &forklift).unwrap();
+    forklift_core::util::file_utils::rename(&forklift, staging.join("redirect")).unwrap();
+    forklift_core::util::file_utils::rename(&staging, &forklift).unwrap();
 
     let untracked = changes(&bay, "unstaged");
     assert!(untracked.contains(&("untracked".to_string(), "redirect".to_string()))

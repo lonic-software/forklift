@@ -206,7 +206,7 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
             Ok(_) => Err(format!("\"{}\" already exists, so the bay cannot be created there.", forklift.to_string_lossy())),
             Err(e) => Err(format!("Error while checking \"{}\": {}", forklift.to_string_lossy(), e)),
         })
-        .and_then(|()| std::fs::rename(&staging, &forklift).map_err(|e| format!(
+        .and_then(|()| file_utils::rename(&staging, &forklift).map_err(|e| format!(
             "Error while moving the bay folder into place at \"{}\": {}", forklift.to_string_lossy(), e
         )));
 
@@ -275,7 +275,7 @@ pub fn remove_bay_redirect(bay_dir: &Path, shared_forklift: &Path, name: &str) -
         Err(e) => return Err(RedirectRemoval::Kept(format!("Error while checking \"{}\": {}", retired.to_string_lossy(), e))),
     }
 
-    match std::fs::rename(&forklift, &retired) {
+    match file_utils::rename(&forklift, &retired) {
         Ok(()) => (),
         Err(e) if gone(&e) => return Ok(()),
         Err(e) => return Err(RedirectRemoval::Kept(format!(
@@ -1099,9 +1099,9 @@ mod tests {
         let old = bay("old");
         write_bay_redirect(&old, &warehouse, "review").unwrap();
         let folder = old.join(FOLDER_NAME_FORKLIFT_ROOT);
-        std::fs::rename(folder.join(FILE_NAME_BAY_REDIRECT), old.join("record")).unwrap();
+        file_utils::rename(folder.join(FILE_NAME_BAY_REDIRECT), old.join("record")).unwrap();
         std::fs::remove_dir(&folder).unwrap();
-        std::fs::rename(old.join("record"), &folder).unwrap();
+        file_utils::rename(old.join("record"), &folder).unwrap();
         remove_bay_redirect(&old, &shared, "review").unwrap();
         assert!(std::fs::symlink_metadata(&folder).is_err(), "this bay's old-format file is removed");
 

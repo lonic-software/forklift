@@ -155,7 +155,8 @@ jobs:
         if: env.SKIP_TESTS != 'true'
         # Style-level lint debt is tracked separately; deny only warnings that indicate
         # correctness issues once the doc-comment cleanup lands. For now, report-only.
-        run: cargo clippy
+        # --all-targets so clippy.toml's bans reach test code too.
+        run: cargo clippy --workspace --all-targets
 
       # CI builds with the config's rustflags switched off (see RUSTFLAGS above), so this checks
       # what developers get on macOS. A throwaway crate is built twice, as a developer would build

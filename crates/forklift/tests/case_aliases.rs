@@ -440,7 +440,7 @@ fn restore_refuses_a_path_that_names_another_spellings_file() {
         return;
     }
 
-    std::fs::rename(warehouse.root.join("Docs"), warehouse.root.join("docs")).unwrap();
+    forklift_core::util::file_utils::rename(warehouse.root.join("Docs"), warehouse.root.join("docs")).unwrap();
     warehouse.write("docs/a", "changed\n");
     warehouse.run_ok(&["load", "."]);
 
@@ -638,7 +638,7 @@ fn with_unrelated_work(name: &str, files: &[(&str, &str)]) -> Warehouse {
 
 impl Warehouse {
     fn rename(&self, from: &str, to: &str) {
-        std::fs::rename(self.root.join(from), self.root.join(to)).unwrap();
+        forklift_core::util::file_utils::rename(self.root.join(from), self.root.join(to)).unwrap();
     }
 
     /// The staged lines and the lines not in the inventory a stocktake lists, whitespace collapsed

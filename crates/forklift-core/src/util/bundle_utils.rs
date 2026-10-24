@@ -252,7 +252,7 @@ fn write_envelope_and_publish(temporary_path: &Path,
     }
     drop(writer);
 
-    std::fs::rename(temporary_path, bundle_path)
+    file_utils::rename(temporary_path, bundle_path)
         .map_err(|e| format!("Error while moving the bundle into place: {}", e))?;
     if let Some(parent) = bundle_path.parent() {
         file_utils::sync_dir(parent)?;

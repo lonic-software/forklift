@@ -1581,7 +1581,7 @@ mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
         file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
         let listed = Path::new(&folder).join(&file_name);
-        std::fs::rename(&listed, listed.with_file_name(file_name.to_ascii_uppercase())).unwrap();
+        file_utils::rename(&listed, listed.with_file_name(file_name.to_ascii_uppercase())).unwrap();
         let folds = listed.exists();
 
         let resolved = resolve_object_hash_prefix("abcd");
@@ -1812,7 +1812,7 @@ mod tests {
         assert!(error.contains("Rename it to a valid pallet name"), "the way out is named: {}", error);
 
         // The named way out: renamed to a valid name, the entry lists as that pallet.
-        std::fs::rename(folder.join("X"), folder.join("x2")).unwrap();
+        file_utils::rename(folder.join("X"), folder.join("x2")).unwrap();
         assert_eq!(list_pallets_in(PalletNamespace::User).unwrap(), vec!["feature/x2", "main", "mainline"]);
 
         let _ = std::fs::remove_dir_all(&root);

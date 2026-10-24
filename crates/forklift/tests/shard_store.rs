@@ -123,7 +123,7 @@ fn a_case_only_directory_rename_stages_as_a_move_and_parks_clean() {
     }
 
     warehouse.write("other", "edited\n");
-    std::fs::rename(warehouse.root.join("Docs"), warehouse.root.join("docs")).unwrap();
+    forklift_core::util::file_utils::rename(warehouse.root.join("Docs"), warehouse.root.join("docs")).unwrap();
     warehouse.run_ok(&["load", "."]);
 
     let status = warehouse.stocktake();
@@ -287,7 +287,7 @@ fn a_linked_shard_folder_is_refused_and_the_named_way_out_works() {
     let inventory = warehouse.root.join(".forklift/inventory");
     let slot = inventory.join(forklift_core::util::file_utils::shard_folder_relative("docs"));
     let outside = warehouse.base.join("outside");
-    std::fs::rename(&slot, &outside).unwrap();
+    forklift_core::util::file_utils::rename(&slot, &outside).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, &slot).unwrap();
     #[cfg(windows)]
