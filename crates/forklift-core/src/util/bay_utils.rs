@@ -1099,9 +1099,9 @@ mod tests {
         let old = bay("old");
         write_bay_redirect(&old, &warehouse, "review").unwrap();
         let folder = old.join(FOLDER_NAME_FORKLIFT_ROOT);
-        std::fs::rename(folder.join(FILE_NAME_BAY_REDIRECT), old.join("record")).unwrap();
+        file_utils::rename(folder.join(FILE_NAME_BAY_REDIRECT), old.join("record")).unwrap();
         std::fs::remove_dir(&folder).unwrap();
-        std::fs::rename(old.join("record"), &folder).unwrap();
+        file_utils::rename(old.join("record"), &folder).unwrap();
         remove_bay_redirect(&old, &shared, "review").unwrap();
         assert!(std::fs::symlink_metadata(&folder).is_err(), "this bay's old-format file is removed");
 

@@ -377,7 +377,9 @@ const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_mil
 /// failed attempt moves nothing, so a retry starts from the state the first attempt saw. Any other
 /// error returns at once, and a hold that outlasts the deadline returns its last error unchanged.
 /// On Unix an open handle never blocks a rename, and this is a plain `std::fs::rename`.
-pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<()> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+
     #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
     retry_while_held(|| std::fs::rename(from, to), is_held_by_another_process)
 }
@@ -4117,11 +4119,11 @@ mod tests {
         // nothing is not. Inside the store, every link is damage, whatever it points at.
         #[cfg(unix)]
         {
-            std::fs::rename(root.join("inventory"), root.join("relocated")).unwrap();
+            rename(root.join("inventory"), root.join("relocated")).unwrap();
             std::os::unix::fs::symlink(root.join("relocated"), root.join("inventory")).unwrap();
             assert_eq!(non_folder_in_shard_chain(&data), None, "a linked inventory root");
 
-            std::fs::rename(root.join("relocated/inv_/af"), root.join("fan-out")).unwrap();
+            rename(root.join("relocated/inv_/af"), root.join("fan-out")).unwrap();
             std::os::unix::fs::symlink(root.join("fan-out"), root.join("relocated/inv_/af")).unwrap();
             assert_eq!(non_folder_in_shard_chain(&data), Some(root.join("inventory/inv_/af").as_path()),
                        "a linked fan-out folder");
@@ -4638,8 +4640,8 @@ mod tests {
         let lower = Some(("ab".to_string(), "cdef".to_string()));
         assert_eq!(canonical_loose_entry(&temp.join("ab"), "cdef"), lower, "lowercase is its own spelling");
 
-        std::fs::rename(temp.join("ab"), temp.join("AB")).unwrap();
-        std::fs::rename(temp.join("AB").join("cdef"), temp.join("AB").join("CdEf")).unwrap();
+        rename(temp.join("ab"), temp.join("AB")).unwrap();
+        rename(temp.join("AB").join("cdef"), temp.join("AB").join("CdEf")).unwrap();
         let folds = temp.join("ab").join("cdef").exists();
 
         let resolved = canonical_loose_entry(&temp.join("AB"), "CdEf");
@@ -5999,7 +6001,7 @@ mod tests {
         for artifact_path in [&artifacts[0].data_path, &artifacts[0].index_path] {
             let extension = artifact_path.extension().unwrap().to_str().unwrap();
             let new_path = pack_folder.join(format!("{}.{}", new_stem, extension));
-            std::fs::rename(artifact_path, &new_path).unwrap();
+            rename(artifact_path, &new_path).unwrap();
         }
     }
 

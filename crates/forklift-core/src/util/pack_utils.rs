@@ -6180,7 +6180,7 @@ pub(crate) mod tests {
 
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
         let upper = Path::new(&folder).with_file_name(hash[..2].to_ascii_uppercase());
-        std::fs::rename(&folder, &upper).unwrap();
+        file_utils::rename(&folder, &upper).unwrap();
         let folds = Path::new(&folder).join(&file_name).exists();
 
         compact(false, false, false, &Progress::NONE).unwrap();
@@ -7767,7 +7767,7 @@ pub(crate) mod tests {
         for artifact_path in [&artifacts[0].data_path, &artifacts[0].index_path] {
             let extension = artifact_path.extension().unwrap().to_str().unwrap();
             let new_path = pack_folder.join(format!("{}.{}", new_stem, extension));
-            std::fs::rename(artifact_path, &new_path).unwrap();
+            file_utils::rename(artifact_path, &new_path).unwrap();
         }
     }
 

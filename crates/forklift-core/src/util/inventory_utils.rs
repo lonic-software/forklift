@@ -5016,7 +5016,7 @@ mod tests {
                 _ => data_path.clone(),
             };
             let outside = scratch.root.join("outside");
-            std::fs::rename(&linked, &outside).unwrap();
+            file_utils::rename(&linked, &outside).unwrap();
             let is_dir = level != "data";
             link_to(&outside, &linked, is_dir);
 
@@ -5052,7 +5052,7 @@ mod tests {
 
         let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
         let moved = scratch.root.join("drive");
-        std::fs::rename(&inventory_root, &moved).unwrap();
+        file_utils::rename(&inventory_root, &moved).unwrap();
         link_to(&scratch.root.join("unmounted"), &inventory_root, true);
 
         let ledger = ShardLedger::read();
@@ -5080,7 +5080,7 @@ mod tests {
 
         let metadata = file_utils::get_inventory_metadata_path();
         let outside = scratch.root.join("other-metadata");
-        std::fs::rename(&metadata, &outside).unwrap();
+        file_utils::rename(&metadata, &outside).unwrap();
         link_to(&outside, &metadata, false);
 
         let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
