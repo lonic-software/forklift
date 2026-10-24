@@ -48,8 +48,9 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 - `tool` names the producer, so a document read after `pult <command>` says whether it
   came from Pult or from the tool Pult ran.
 - `schema` versions Forklift's payloads: every command's `data` and the error-code
-  registry. It changes only on an incompatible change, so a consumer can pin it — and it
-  *is* the capability-detection mechanism: check it before relying on a field, rather
+  registry. It changes whenever either does, an added field or error code included (schemas
+  4 to 6 each only added), so a consumer can pin it — and it *is* the capability-detection
+  mechanism: check it before relying on a field, rather
   than sniffing for the field's presence.
 - `command` is the command as parsed — the canonical name, never the alias typed
   (`st` reports `"stocktake"`) — on success and failure alike. It is `null` only when
@@ -233,9 +234,12 @@ revocation time — e.g. `{ "signer": { "key": "<key-id>", "revocation_reason":
 boundary: a forged backdate, or the key's holder kept signing after the revocation.
 `audit` refuses a suspect parcel outright; a read-only query cannot refuse a signed
 history it was only asked to read, so this is the loud label instead. It can also read
-`"unresolved"`: at least one of the revocation's boundary heads is not present on *this*
-store (a partial clone whose franchise only ever fetched reachable history — an orphaned
-head never arrives), so the question cannot be answered here at all. `"unresolved"` must
+`"unresolved"`: the parcel is not reachable from any part of the boundary *this* store
+holds, and the boundary walk crossed a gap (an absent boundary head, or an absent ancestor
+behind one, as in a partial clone whose franchise only ever fetched reachable history) that
+could have been what vouches for it, so the question cannot be answered here at all. A gap
+alone never makes a parcel that a present boundary head vouches for `"unresolved"`; it
+stays `"vouched"`. `"unresolved"` must
 never be read as `"suspect"` — a parcel that is plainly vouched on the origin would
 otherwise look suspicious purely because this clone is incomplete; run the query against
 the origin, or fetch the full history, for a definitive answer. Filter on it with a
@@ -479,9 +483,10 @@ the pallet is the cause `only_prefix_not_found` (exit 31 where it is raised on i
 
 ### Custom metadata that changed on both sides: `meta_conflict`
 
-`lower` reconciles a diverged `@kv` path by path: changes to different keys replay onto the
-remote's and are lifted. When the same key changed differently here and on the remote, nothing
-is lifted for that pallet and `lower` refuses with `meta_conflict` (exit 24). The working pallet
+`lower` reconciles a diverged meta pallet (`@kv`, `@tags`, `@manifest` or `@haul`) path by
+path: changes to different paths replay onto the remote's and are lifted. When the same path
+changed differently here and on the remote, nothing is lifted for that pallet and `lower`
+refuses with `meta_conflict` (exit 24). The working pallet
 still lowers; only the conflicted meta pallets wait. `details` names every conflicted path and
 both sides of it, and the working pallet that lowered with its new head:
 
@@ -500,8 +505,9 @@ both sides of it, and the working pallet that lowered with its new head:
 ```
 
 A side without `value` removed the key. Rerun `lower` with one `--keep <pallet>:<path>=ours|theirs`
-per path (`--keep kv:<subject>/<key>=theirs`); `theirs` on a bare `<subject>` resolves every key
-under it. A keep that names no conflict, or a pallet that did not diverge, is refused rather than
+per path, both exactly as `details` names them (`--keep @kv:<subject>/<key>=theirs`). The pallet
+keeps its `@`; a bare `kv:` is refused. `theirs` on a bare `<subject>` resolves every key under
+it. A keep that names no conflict, or a pallet that did not diverge, is refused rather than
 ignored, so a stale resolution never applies to a later conflict.
 
 ## Structured conflicts

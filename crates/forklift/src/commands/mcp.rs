@@ -1193,7 +1193,7 @@ fn tool_definitions() -> Value {
             object(json!({}), json!([]))),
         tool("lift", "Push the current pallet's new parcels to the configured remote.",
             object(json!({}), json!([]))),
-        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged @kv replays the local changes onto the remote's; keys both sides changed refuse with meta_conflict (exit 24, every path and both sides in error.details) until each is resolved with a keep entry \"kv:<subject>/<key>=ours|theirs\".",
+        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged meta pallet (@kv, @tags, @manifest, @haul) replays the local changes onto the remote's; paths both sides changed refuse with meta_conflict (exit 24, every pallet, path and both sides in error.details) until each is resolved with a keep entry \"<pallet>:<path>=ours|theirs\", the pallet as details names it, e.g. \"@kv:<subject>/<key>=theirs\".",
             object(json!({ "expect": string, "keep": { "type": "array", "items": string } }), json!([]))),
         tool("office_list", "List the enrolled operators and their keys.",
             object(json!({}), json!([]))),
@@ -1659,8 +1659,8 @@ mod tests {
         assert_eq!(args("kv_log", json!({ "revision": "main", "key": "ci" })), ["kv", "log", "main", "ci"]);
         assert_eq!(args("kv_unset", json!({ "revision": "main", "key": "ci" })), ["kv", "unset", "main", "ci"]);
         assert_eq!(args("kv_list", json!({})), ["kv", "list"]);
-        assert_eq!(args("lower", json!({ "keep": ["kv:a/b=ours", "kv:c=theirs"] })),
-                   ["lower", "--keep", "kv:a/b=ours", "--keep", "kv:c=theirs"]);
+        assert_eq!(args("lower", json!({ "keep": ["@kv:a/b=ours", "@kv:c=theirs"] })),
+                   ["lower", "--keep", "@kv:a/b=ours", "--keep", "@kv:c=theirs"]);
         assert!(super::build_args("kv_get", &json!({ "revision": "main" })).is_err(), "key is required");
     }
 

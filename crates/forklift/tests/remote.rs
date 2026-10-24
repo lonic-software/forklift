@@ -1499,7 +1499,7 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main", "-m", "release"]));
 
     // Before its first lift the remote has no @tags at all, so there is no side to keep.
-    let unlifted = area.forklift("b", &["lower", "--keep", "tags:v1.0=theirs"]);
+    let unlifted = area.forklift("b", &["lower", "--keep", "@tags:v1.0=theirs"]);
     assert!(!unlifted.status.success(), "{}", stdout(&unlifted));
     assert!(stderr(&unlifted).contains("@tags is not on the remote yet"), "{}", stderr(&unlifted));
 
@@ -1517,11 +1517,11 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_eq!(value["error"]["details"]["pallets"][0]["pallet"], "@tags");
     assert_eq!(value["error"]["details"]["pallets"][0]["conflicts"][0]["path"], "v1.0");
 
-    let refused = area.forklift("a", &["lower", "--keep", "tags:v1.0=ours"]);
+    let refused = area.forklift("a", &["lower", "--keep", "@tags:v1.0=ours"]);
     assert!(!refused.status.success(), "keeping ours would move a published tag");
     assert!(stderr(&refused).contains("never changed or removed"), "{}", stderr(&refused));
 
-    assert_success(&area.forklift("a", &["lower", "--keep", "tags:v1.0=theirs"]));
+    assert_success(&area.forklift("a", &["lower", "--keep", "@tags:v1.0=theirs"]));
     let shown = stdout(&area.forklift("a", &["--json", "tag", "show", "v1.0"]));
     let value: serde_json::Value = serde_json::from_str(&shown).unwrap();
     assert_eq!(value["data"]["tagger"], worker_id, "{}", shown);
@@ -1542,18 +1542,18 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "a demoted tagger's tag must not be admitted");
     assert!(stderr(&refused).contains("not an admin"), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("\"lower --keep tags:<path>=theirs\" drops it"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("\"lower --keep @tags:<path>=theirs\" drops it"), "{}", stderr(&refused));
 
     // The way out: lower with theirs at the refused tag. Ours is refused, since nothing on the
     // remote conflicts with it, and so is theirs at a path with no local change.
     let remote_tags = area.read_file("c/.forklift/meta/tags").trim().to_string();
     assert_ne!(area.read_file("b/.forklift/meta/tags").trim(), remote_tags, "b's @tags must start ahead");
 
-    let kept_ours = area.forklift("b", &["lower", "--keep", "tags:v1.1=ours"]);
+    let kept_ours = area.forklift("b", &["lower", "--keep", "@tags:v1.1=ours"]);
     assert!(!kept_ours.status.success(), "{}", stdout(&kept_ours));
     assert!(stderr(&kept_ours).contains("v1.1 is not in conflict"), "{}", stderr(&kept_ours));
 
-    let stale = area.forklift("b", &["lower", "--keep", "tags:v9.9=theirs"]);
+    let stale = area.forklift("b", &["lower", "--keep", "@tags:v9.9=theirs"]);
     assert!(!stale.status.success(), "{}", stdout(&stale));
     assert!(stderr(&stale).contains("v9.9 has no local change"), "{}", stderr(&stale));
 
@@ -1574,14 +1574,14 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("b", &["lower"]));
 
-    assert_success(&area.forklift("b", &["lower", "--keep", "tags:v1.1=theirs"]));
+    assert_success(&area.forklift("b", &["lower", "--keep", "@tags:v1.1=theirs"]));
     assert_eq!(area.read_file("b/.forklift/meta/tags").trim(), remote_tags, "theirs returns @tags to the remote's head");
     assert!(!area.forklift("b", &["tag", "show", "v1.1"]).status.success(), "the refused tag is dropped");
     assert!(stdout(&area.forklift("b", &["tag", "show", "v1.0"])).contains("release"), "the admitted tag stays");
     assert_success(&area.forklift("b", &["lift"]));
 
     // In sync again, a resolution has nothing to resolve.
-    let in_sync = area.forklift("b", &["lower", "--keep", "tags:v1.1=theirs"]);
+    let in_sync = area.forklift("b", &["lower", "--keep", "@tags:v1.1=theirs"]);
     assert!(!in_sync.status.success(), "{}", stdout(&in_sync));
     assert!(stderr(&in_sync).contains("@tags holds no local change the remote lacks"), "{}", stderr(&in_sync));
 
@@ -1636,7 +1636,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
 
     // Keeping theirs at a haul A opened locally drops it whole; A's comment, under a different
     // path from B's, replays onto the remote's and lifts.
-    let lowered = area.forklift("a", &["lower", "--keep", &format!("haul:{}=theirs", second)]);
+    let lowered = area.forklift("a", &["lower", "--keep", &format!("@haul:{}=theirs", second)]);
     assert_success(&lowered);
     assert!(stdout(&lowered).contains("Replayed the local @haul"), "{}", stdout(&lowered));
 
@@ -1665,7 +1665,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_eq!(pallets[0]["conflicts"][0]["path"], format!("{}/state", id));
     assert_eq!(pallets[0]["conflicts"][0]["theirs"]["value"], format!("closed at head {}", first_head));
 
-    assert_success(&area.forklift("a", &["lower", "--keep", &format!("haul:{}/state=theirs", id)]));
+    assert_success(&area.forklift("a", &["lower", "--keep", &format!("@haul:{}/state=theirs", id)]));
     let show = |side: &str| serde_json::from_str::<serde_json::Value>(&stdout(&area.forklift(side, &["--json", "haul", "show", &id])))
         .unwrap()["data"].clone();
     assert_eq!((show("a")["status"].as_str(), show("a")["head"].as_str()), (Some("closed"), Some(first_head.as_str())));
@@ -1700,7 +1700,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     // Keeping ours records the merge at the head it merged, over B's move — once the remote's
     // main holds the merge. Until then the replay holds the record back, and a second lower,
     // after A's main is lifted, replays it.
-    let held = area.forklift("a", &["lower", "--keep", &format!("haul:{}/state=ours", id)]);
+    let held = area.forklift("a", &["lower", "--keep", &format!("@haul:{}/state=ours", id)]);
     assert!(!held.status.success(), "{}", stdout(&held));
     assert!(stderr(&held).contains("records a merge whose parcel the remote's target does not hold yet"), "{}", stderr(&held));
     assert!(stderr(&held).contains("run \"forklift lower\" again"), "{}", stderr(&held));
@@ -1719,7 +1719,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert!(!lifted.status.success(), "@haul is still diverged: {}", stdout(&lifted));
     assert_eq!(remote_pallet_head(&server, "main").as_deref(), Some(pallet_head(&area, "a", "main").as_str()));
 
-    assert_success(&area.forklift("a", &["lower", "--keep", &format!("haul:{}/state=ours", id)]));
+    assert_success(&area.forklift("a", &["lower", "--keep", &format!("@haul:{}/state=ours", id)]));
     let merged = show("a");
     assert_eq!((merged["status"].as_str(), merged["head"].as_str()), (Some("merged"), Some(a_head.as_str())));
     assert_success(&area.forklift("a", &["lift"]));
@@ -7399,14 +7399,22 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
                "a conflicted lower leaves the local @kv as it was");
 
     // Keeps that cannot apply are refused: a pallet without resolutions, a malformed side.
-    let refused = area.forklift("a", &["lower", "--keep", "office:main=ours"]);
+    let refused = area.forklift("a", &["lower", "--keep", "@office:main=ours"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("takes no resolutions"), "{}", stderr(&refused));
-    let refused = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=mine", subject)]);
+    let refused = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/ci=mine", subject)]);
     assert!(!refused.status.success());
 
+    // A meta pallet is spelled with its "@", as everywhere else: the bare name is refused and
+    // the refusal names the spelling that works, though this keep would otherwise resolve.
+    let bare = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=ours", subject)]);
+    assert!(!bare.status.success(), "a keep naming the pallet without its @ must be refused");
+    assert!(stderr(&bare).contains(&format!("--keep @kv:{}/ci=ours", subject)), "{}", stderr(&bare));
+    assert_eq!(stdout(&area.forklift("b", &["kv", "get", "main", "ci"])).trim(), "red",
+               "nothing was lifted for the refused keep");
+
     // Keeping ours lifts the local value over the remote's.
-    let kept = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=ours", subject)]);
+    let kept = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/ci=ours", subject)]);
     assert_success(&kept);
     assert!(stdout(&kept).contains("Replayed"), "{}", stdout(&kept));
     assert_success(&area.forklift("b", &["lower"]));
@@ -7421,13 +7429,13 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "blue");
 
     // A keep for a pallet that did not diverge is refused rather than silently ignored.
-    let stale = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=theirs", subject)]);
+    let stale = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/ci=theirs", subject)]);
     assert!(!stale.status.success(), "a keep with nothing to resolve must be refused");
 
     // On a pallet only this side moved, theirs drops the change it names and replays the rest.
     assert_success(&area.forklift("a", &["kv", "set", "main", "drop", "x"]));
     assert_success(&area.forklift("a", &["kv", "set", "main", "stay", "y"]));
-    let kept = area.forklift("a", &["lower", "--keep", &format!("kv:{}/drop=theirs", subject)]);
+    let kept = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/drop=theirs", subject)]);
     assert_success(&kept);
     assert!(stdout(&kept).contains("Replayed"), "{}", stdout(&kept));
     assert!(!area.forklift("a", &["kv", "get", "main", "drop"]).status.success(), "the named change is dropped");

@@ -322,7 +322,19 @@ operator = "mate@lonic.net"
 public_key = "9d61b19d…"   # Ed25519, 32 bytes, hex
 issued_at = 1782205234
 retired_at = 1782206000    # absent while the key is active
+revocation_reason = "compromise"   # "retirement" or "compromise"; present exactly when retired_at is
+distrust_boundary = ["<pallet head hash>", …]   # absent while the key is active
+authorized_by = "<key id>"         # the operator's own key (an endorsement), or an admin's
+endorsement = "<hex>"              # authorized_by's Ed25519 signature over this public key
+proof_of_possession = "<hex>"      # this key's own signature over its public key
 ```
+
+`authorized_by`, `endorsement` and `proof_of_possession` are mandatory: a record missing any
+of them does not parse. Only an operator's identity root (their first key) may authorize
+itself; every later key is endorsed by a key of theirs that chains to that root, or by an
+admin's. A revoked key's signatures are
+valid only on parcels reachable from its `distrust_boundary`, decided by ancestry, never by
+`retired_at`.
 
 A key record does not store its id; readers derive it from `public_key`, and refuse a record
 that has a `key_id` entry. Every lookup goes by key id, while the endorsement and
@@ -351,6 +363,8 @@ file records it:
 genesis = "<genesis office parcel hash>"
 enabled_at = 1782205234
 boundary = ["<pallet head hash>", …]
+prior_genesis = "<hash>"   # re-genesis only: the genesis of the chain this anchor replaced
+adopts = "<hash>"          # re-genesis only: the old office head, kept as attested history
 ```
 
 - `genesis` anchors the office chain; `audit` refuses an office history that does not
@@ -360,8 +374,9 @@ boundary = ["<pallet head hash>", …]
   everything else must be signed. The boundary is exact ancestry — timestamps have
   second granularity and can be forged, so they never decide a security question.
 - The trust file is a **one-way door**. Nothing removes it, and there is no "temporarily
-  disable signing" escape hatch; losing every active key means archiving the warehouse
-  and re-establishing trust (re-genesis).
+  disable signing" escape hatch. A chain whose keys are all lost, or that has no usable
+  admin left, is reset with `office regenesis`, which replaces the anchor and keeps the old
+  office chain as attested history (see the trust guide, "Recovery: re-genesis").
 
 ## Threat model
 What local trust does and does not defend against, by attacker capability:
@@ -383,16 +398,17 @@ What local trust does and does not defend against, by attacker capability:
    the real one. The anchor's strength comes from being witnessed, not hidden — the same
    shape as certificate-transparency roots.
 
-3. **Owns the machine** — out of scope. They have `~/.forklift-keys` (mode 0600, but
-   unencrypted at rest) and therefore the operator's identity itself; no VCS-level
+3. **Owns the machine** — out of scope. They have `~/.forklift-keys` (mode 0600, and
+   unencrypted at rest unless the key is passphrase-protected, which a live attacker can
+   capture as it is typed) and therefore the operator's identity itself; no VCS-level
    mechanism survives endpoint compromise. This is the boundary of the design, not a
    weakness of it: Phase 2's goal is *portable verifiability* — any copy of the
    warehouse plus the genesis hash can be verified offline, on hardware the attacker
    does not control.
 
-Possible future hardening (deliberately not Phase 2 scope): passphrase-encrypting
-private keys at rest (the SSH precedent) — protects leaked backups and stolen disks,
-not a live attacker on the machine.
+A private key can be passphrase-encrypted at rest (`--passphrase` on `enroll`, `keygen` and
+`rotate`): that protects leaked backups, stolen disks and an unattended process without the
+passphrase, not a live attacker on the machine.
 
 ## Key lifecycle rules
 - **enroll** — genesis only; later users are admitted by an enrolled operator.
@@ -400,6 +416,7 @@ not a live attacker on the machine.
   an enrolled operator records user + key, signed with their own active key.
 - **rotate** — issues a fresh key and retires the operator's active ones in one office
   parcel, signed with the **old** key: the continuity proof.
-- **retire** — any enrolled operator can retire a key (compromise recovery). The office
-  parcel is never signed with the key being retired, and an operator cannot retire
-  their own last active key (that would be a self-lockout; rotate instead).
+- **retire** — an operator can retire their own keys, and an admin can retire anyone's
+  (compromise recovery). The office parcel is never signed with the key being retired,
+  and an operator cannot retire their own last active key (that would be a self-lockout;
+  rotate instead).

@@ -184,7 +184,7 @@ fn with_drop_hint(error: String, info: &forklift_core::model::remote::WarehouseI
     }
 
     forklift_core::error::append_to_message(error, &format!(
-        "If the remote refuses a local change, \"lower --keep {}:<path>=theirs\" drops it.", name
+        "If the remote refuses a local change, \"lower --keep {}:<path>=theirs\" drops it.", wire
     ))
 }
 

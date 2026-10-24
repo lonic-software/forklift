@@ -872,11 +872,14 @@ lifts nothing for `@kv`, lists each such key with both values, and exits 24 (`me
 choose a side per key and lower again:
 
 ```sh
-forklift lower --keep kv:<parcel-hash>/ci=theirs   # take the remote's value
-forklift lower --keep kv:<parcel-hash>/ci=ours     # keep yours, lifted over theirs
+forklift lower --keep @kv:<parcel-hash>/ci=theirs   # take the remote's value
+forklift lower --keep @kv:<parcel-hash>/ci=ours     # keep yours, lifted over theirs
 ```
 
-`theirs` on a bare `kv:<parcel-hash>` takes the remote's side for every key on that parcel.
+`--keep` names the meta pallet with its `@`, as every command does, and the path as the conflict
+names it: a parcel or haul by its full hash, a tag by its name. A bare `kv:` is refused, never
+read as `@kv`. `theirs` on a bare `@kv:<parcel-hash>` takes the remote's side for every key on
+that parcel.
 `theirs` also discards a local change nobody else made, even when the remote never moved: that is
 the way out when `lift` reports a change the remote refuses to admit. It needs the pallet on the
 remote already, since a pallet never lifted has no remote side to keep.
@@ -896,10 +899,10 @@ requires an admin — an authoritative act, which the remote enforces too. Tag n
 **immutable**: a name already in use is refused, and no one, the remote included, can move or
 delete a tag. Tags live on the `@tags` meta pallet, reserving no user pallet name; without a
 revision, `tag create` tags the current pallet's head. If two admins cut the same name
-concurrently, `lower` reports the conflict: `--keep tags:<name>=theirs` drops your tag, and
+concurrently, `lower` reports the conflict: `--keep @tags:<name>=theirs` drops your tag, and
 keeping yours is refused, since that would move theirs. An admin demoted before lifting a tag
 they cut is left holding a tag the remote refuses; `lift` says so, and
-`lower --keep tags:<name>=theirs` drops it the same way, once `@tags` is on the remote.
+`lower --keep @tags:<name>=theirs` drops it the same way, once `@tags` is on the remote.
 
 A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
 or was collected because nothing else referenced it (e.g. after an `undo` moved the only
@@ -1445,12 +1448,13 @@ with a compare-and-swap. When trust is established, the office pallet and trust
 anchor are lifted first (the server verifies every signature before accepting).
 The remote only accepts **fast-forward** updates — no force push.
 
-**Optimistic lift:** if the remote moved and the two changes are cleanly
-mergeable (they touch different files), `lift` **auto-lowers, consolidates and
-retries** on its own — so a fleet of agents stacking to one pallet stops
-serializing through a human. It reports how many times it auto-merged. Only a
-clean warehouse qualifies (the merge materializes), and a **true overlap** (both
-sides edited the same file) still stops with the diverged error (`diverged`, exit 5), leaving
+**Optimistic lift:** if the remote moved and the two changes merge without
+conflicts (different files, or edits to the same file that a three-way merge combines),
+`lift` **auto-lowers, consolidates and retries** on its own — so a fleet of agents
+stacking to one pallet stops serializing through a human. It reports how many times it
+auto-merged. Only a clean warehouse qualifies (the merge materializes), and a
+**conflicting overlap** (changes the three-way merge cannot combine) still stops with
+the diverged error (`diverged`, exit 5), leaving
 the warehouse untouched: palletize the fetched remote head, shift back to your pallet,
 consolidate the new one, and lift the result. A remote holding parcels you have not lowered yet — its head unknown here, or moved
 since you read it — is a different refusal, `remote_ahead` (exit 28): `lower` first, which
@@ -1485,7 +1489,7 @@ again, which uploads it afresh.
 forklift lower
 forklift lower feature              # bring in, or fast-forward, another pallet; this bay stays put
 forklift lower --expect <genesis>   # refuse unless the remote's trust anchor is this one
-forklift lower --keep kv:<hash>/<key>=theirs   # resolve a custom-metadata conflict
+forklift lower --keep @kv:<hash>/<key>=theirs  # resolve a custom-metadata conflict
 ```
 
 Fetches the remote's new parcels for the current pallet and fast-forwards to them

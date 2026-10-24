@@ -658,21 +658,28 @@ async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<()
 /// Conflict resolutions, by bare pallet name, then cell path.
 type Keeps = BTreeMap<String, BTreeMap<String, KeepSide>>;
 
-/// Parse `--keep` values (`<pallet>:<path>=ours|theirs`) into cell paths, before anything is
-/// fetched. Only a meta pallet takes resolutions.
+/// Parse `--keep` values (`@<pallet>:<path>=ours|theirs`) into cell paths, before anything is
+/// fetched. Only a meta pallet takes resolutions, and it is spelled with its `@` as everywhere
+/// else on the command line; a bare name is refused rather than read as the meta pallet.
 fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
     let mut keeps = Keeps::new();
 
     for spec in specs {
         let malformed = || format!(
-            "\"--keep {}\" is not of the form <pallet>:<path>=ours|theirs, as in \
-            kv:<subject>/<key>=theirs.",
+            "\"--keep {}\" is not of the form @<pallet>:<path>=ours|theirs, as in \
+            @kv:<subject>/<key>=theirs.",
             spec
         );
 
         let (target, side) = spec.rsplit_once('=').ok_or_else(malformed)?;
         let (pallet, spelled) = target.split_once(':').ok_or_else(malformed)?;
-        let pallet = pallet.strip_prefix(pallet_utils::META_QUALIFIER).unwrap_or(pallet);
+        let Some(pallet) = pallet.strip_prefix(pallet_utils::META_QUALIFIER) else {
+            return Err(format!(
+                "\"--keep {}\" names the pallet without its \"{}\": a resolution names a meta \
+                pallet, as in --keep {}{}.",
+                spec, pallet_utils::META_QUALIFIER, pallet_utils::META_QUALIFIER, spec
+            ));
+        };
 
         let side = match side {
             "ours" => KeepSide::Ours,
@@ -956,9 +963,7 @@ fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts], pallet: &str, head: 
     let pallets: Vec<&str> = conflicts.iter().map(|pallet| pallet.pallet.as_str()).collect();
     let example = conflicts.first()
         .and_then(|pallet| pallet.conflicts.first().map(|conflict| (pallet, conflict)))
-        .map(|(pallet, conflict)| format!(
-            "{}:{}", pallet.pallet.trim_start_matches(pallet_utils::META_QUALIFIER), conflict.path
-        ))
+        .map(|(pallet, conflict)| format!("{}:{}", pallet.pallet, conflict.path))
         .unwrap_or_default();
 
     CoreError::refusal_with_details(
@@ -970,7 +975,7 @@ fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts], pallet: &str, head: 
             if pallets.len() == 1 { "it" } else { "them" }
         ),
         format!(
-            "Rerun lower with --keep <pallet>:<path>=ours|theirs for each named path, e.g. \
+            "Rerun lower with --keep @<pallet>:<path>=ours|theirs for each named path, e.g. \
             --keep {}=theirs.",
             example
         ),

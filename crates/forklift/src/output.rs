@@ -433,10 +433,10 @@ error_codes! {
     /// alone, so it is classified here directly rather than as a `forklift-core` `RefusalCode`.
     EmptyHistory,
 
-    /// `stack` or `park` refused because a `load` that never finished cleanly is still recorded
-    /// (`load_guard_utils`), or a command that changes the bay or commits staged content refused
-    /// because an operation that rewrites the whole staging area was interrupted
-    /// (`operation_utils`): committing the staged inventory now could silently produce an
+    /// `stack`, `park`, `consolidate` or `cherry-pick` refused because a `load` that never
+    /// finished cleanly is still recorded (`load_guard_utils`), or a command that changes the bay
+    /// or commits staged content refused because an operation that rewrites the whole staging
+    /// area was interrupted (`operation_utils`): committing the staged inventory now could silently produce an
     /// incomplete result.
     IncompleteLoad,
 
@@ -608,8 +608,8 @@ impl ErrorCode {
             ErrorCode::EmptyHistory =>
                 "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
             ErrorCode::IncompleteLoad =>
-                "\"stack\" or \"park\" refused because a \"load\" that never finished cleanly is \
-                 still recorded, or a command refused because an operation that rewrites the whole \
+                "\"stack\", \"park\", \"consolidate\" or \"cherry-pick\" refused because a \
+                 \"load\" that never finished cleanly is still recorded, or a command refused because an operation that rewrites the whole \
                  staging area was interrupted (\"forklift heal\" finishes or undoes it)",
             ErrorCode::DurabilityTaint =>
                 "A durability taint could not be auto-healed (a vanished, unreadable, or \
