@@ -427,7 +427,7 @@ becoming primary consumers of version control, which changes five things:
 1. **Authorship becomes a compliance question** — *what* wrote this, under *whose*
    authority. Forklift answers it cryptographically: agents are enrolled operators with an
    **identity class** (human / agent / bot / service) and a **supervisor**, every parcel
-   is signed by the agent's own key, and `history --class agent` filters "which parcels
+   is signed by the agent's own key, and `query --class agent` filters "which parcels
    did agents write, under whose supervision" — forge-proof and offline. Passphrase-
    protected human keys mean an unattended agent **fails closed** rather than signing as a
    human.

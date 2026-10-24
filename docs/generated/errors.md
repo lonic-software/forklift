@@ -32,7 +32,7 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
 | `query_predicate_invalid` | 18 | A "query" predicate is malformed or exceeds a fixed bound |
 | `empty_history` | 19 | "history" was asked to walk a pallet that has nothing stacked on it yet |
-| `incomplete_load` | 20 | "stack" or "park" refused because a "load" that never finished cleanly is still recorded, or a command refused because an operation that rewrites the whole staging area was interrupted ("forklift heal" finishes or undoes it) |
+| `incomplete_load` | 20 | "stack", "park", "consolidate" or "cherry-pick" refused because a "load" that never finished cleanly is still recorded, or a command refused because an operation that rewrites the whole staging area was interrupted ("forklift heal" finishes or undoes it) |
 | `durability_taint` | 21 | A durability taint could not be auto-healed (a vanished, unreadable, or corrupt path, or a torn taint record) |
 | `trust_changed` | 22 | A remote's trust anchor is not the one this warehouse holds or the command named; the details carry its current value |
 | `remote_protocol_violation` | 23 | A remote answered with something the protocol never produces; it is misbehaving or corrupt, and retrying gets the same answer |

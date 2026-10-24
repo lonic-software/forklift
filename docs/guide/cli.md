@@ -592,7 +592,6 @@ forklift history                 # from the current pallet's head, newest first
 forklift history feature         # from another pallet
 forklift history 1a2b3c          # from a parcel (hash prefix, ≥ 4 chars)
 forklift history @office          # the office's audit trail (users & keys — a meta pallet)
-forklift history --class agent    # only parcels an agent authored
 forklift history -n 20            # only the 20 newest parcels (bounded walk)
 forklift history --oneline        # one terse line per parcel: abbreviated hash + subject
 forklift history -n 20 --json                  # a page + a `next` cursor (for agents)
@@ -609,9 +608,9 @@ description's first line (git's `log --oneline`) — and, since it shows no auth
 class, it skips the office read and the display-name resolution the full form does,
 so it is the fastest way to scan history. **Machine authorship is legible:** an author that is an
 agent, bot or service is shown as `[agent, supervised by <human>]`, read from the
-signed office record — so authorship stays forge-proof, and `--class
-<human|agent|bot|service>` filters the log to answer "which parcels did agents write,
-under whose supervision".
+signed office record for the operator the parcel names. `history` does not filter by
+class: "which parcels did agents write, under whose supervision" is `query --class`
+(below), answered from the verified signer.
 
 With `--json`, each entry also carries `parents` — every parent of that parcel, in
 their stored (canonical) order — base-first for a consolidation — `[]` for a root —
@@ -624,9 +623,9 @@ which is what a caller building a graph (rather than just reading a log) walks:
 `history` on a pallet with nothing stacked on it yet fails with the `empty_history`
 error code (exit 19) rather than a generic one.
 
-One trust note: `history --class` reads the **recorded** (self-declared) identity —
+One trust note: the class `history` shows is the **recorded** (self-declared) identity —
 each action in `--json` says so with `"trust": "recorded"`. `query --class` is the
-verified counterpart.
+verified reading.
 
 ### `query` — filter history on signed identity (`q`)
 
@@ -645,8 +644,8 @@ forklift query --where '{"any":[…]}' --json     # full or/not/nesting as a JSO
 ```
 
 The compliance question `history` cannot answer: *"all parcels authored by an agent,
-unsupervised"* — answered **verified**. Where `history --class` trusts what the parcel
-records, `query --class` checks the signature and joins the office off the *verified
+unsupervised"* — answered **verified**. Where `history` shows what the parcel records,
+`query --class` checks the signature and joins the office off the *verified
 signer*; a parcel that merely *claims* a human author but is signed with an agent's
 key matches `--class agent`, and an unsigned parcel matches no identity predicate at
 all (its class is unknowable, and a compliance filter must not guess). Answers carry a

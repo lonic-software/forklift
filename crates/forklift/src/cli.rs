@@ -397,10 +397,6 @@ pub enum Command {
         /// A pallet name or a parcel hash prefix (default: the current pallet)
         revision: Option<String>,
 
-        /// Show only parcels authored by this identity class: human | agent | bot | service
-        #[arg(long)]
-        class: Option<String>,
-
         /// Show at most this many parcels (newest first) — a bounded walk that never loads
         /// the whole history
         #[arg(long, short = 'n')]
