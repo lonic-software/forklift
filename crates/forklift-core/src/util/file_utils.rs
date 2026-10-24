@@ -363,7 +363,7 @@ pub fn sync_tree(dir: &Path) -> Result<(), String> {
 
 /// How long [`rename`] and [`rename_no_replace`] keep retrying a rename that another process's
 /// handle is blocking, and the first and longest delay between attempts (the delay doubles).
-const HELD_RENAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+const HELD_RENAME_DEADLINE: std::time::Duration = std::time::Duration::ZERO;
 const HELD_RENAME_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
 const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
