@@ -199,14 +199,15 @@ fn call_tool(params: &Value, state: &ServerState, notify: &mut dyn FnMut(&Value)
     let name = params.get("name").and_then(Value::as_str)
         .ok_or_else(|| JsonRpcError::invalid_params("the tool name is required"))?;
 
-    let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut arguments = params.get("arguments").filter(|value| !value.is_null()).cloned().unwrap_or(json!({}));
 
-    // An argument the tool does not declare is refused, never ignored: a dropped filter would
-    // answer a broader question than the one asked, still with ok:true. The provenance keys the
-    // server sets itself (below) are the exception: an agent's value for them is discarded.
+    // An argument the tool does not declare, or one of the wrong type, is refused, never
+    // ignored: a dropped filter would answer a broader question than the one asked, still with
+    // ok:true. The provenance keys the server sets itself (below) are the exception: an agent's
+    // value for them is discarded.
     let server_set: &[&str] = if name == "manifest_provenance" { &["tool", "session"] } else { &[] };
-    if let Some(key) = undeclared_argument(name, &arguments, server_set) {
-        return Err(JsonRpcError::invalid_params(&format!("the \"{}\" tool takes no \"{}\" argument", name, key)));
+    if let Some(reason) = argument_refusal(name, &arguments, server_set) {
+        return Err(JsonRpcError::invalid_params(&reason));
     }
 
     // Provenance hardening (§7.2): the `tool` and `session` are set from this MCP connection,
@@ -1146,6 +1147,7 @@ fn tool_definitions() -> Value {
         "type": "object",
         "properties": properties,
         "required": required,
+        "additionalProperties": false,
     });
 
     let string = json!({ "type": "string" });
@@ -1268,20 +1270,44 @@ fn tool_definitions() -> Value {
     ])
 }
 
-/// The first argument the named tool's input schema does not declare and `server_set` does not
-/// name, if any. An unknown tool declares nothing to check against; `build_args` refuses it on
-/// its own.
-fn undeclared_argument(name: &str, arguments: &Value, server_set: &[&str]) -> Option<String> {
-    let definitions = tool_definitions();
-    let properties = definitions.as_array()?.iter()
+/// Why the named tool refuses these arguments, if it does: they are not a JSON object, or an
+/// argument is one its input schema does not declare (and `server_set` does not name), or a
+/// declared argument's value does not have the declared type. An unknown tool declares nothing
+/// to check against; `build_args` refuses it on its own.
+fn argument_refusal(name: &str, arguments: &Value, server_set: &[&str]) -> Option<String> {
+    static DEFINITIONS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    let properties = DEFINITIONS.get_or_init(tool_definitions).as_array()?.iter()
         .find(|definition| definition["name"] == name)?
         .pointer("/inputSchema/properties")?
-        .as_object()?
-        .clone();
+        .as_object()?;
 
-    arguments.as_object()?.keys()
-        .find(|key| !properties.contains_key(*key) && !server_set.contains(&key.as_str()))
-        .cloned()
+    let Some(arguments) = arguments.as_object() else {
+        return Some(format!("the \"{}\" tool's arguments must be a JSON object", name));
+    };
+
+    arguments.iter().find_map(|(key, value)| match properties.get(key) {
+        None if server_set.contains(&key.as_str()) => None,
+        None => Some(format!("the \"{}\" tool takes no \"{}\" argument", name, key)),
+        Some(schema) if !matches_schema(value, schema) => Some(format!(
+            "the \"{}\" tool's \"{}\" argument must be {}", name, key, schema
+        )),
+        Some(_) => None,
+    })
+}
+
+/// Whether a value has the type a tool property declares (with an array's item type and an
+/// integer's minimum). A property with no type accepts anything.
+fn matches_schema(value: &Value, schema: &Value) -> bool {
+    match schema["type"].as_str() {
+        Some("string") => value.is_string(),
+        Some("boolean") => value.is_boolean(),
+        Some("object") => value.is_object(),
+        Some("integer") => value.as_u64()
+            .is_some_and(|number| schema["minimum"].as_u64().is_none_or(|minimum| number >= minimum)),
+        Some("array") => value.as_array()
+            .is_some_and(|items| items.iter().all(|item| matches_schema(item, &schema["items"]))),
+        _ => true,
+    }
 }
 
 /// One tool definition.
@@ -1685,12 +1711,30 @@ mod tests {
     }
 
     #[test]
-    fn an_argument_the_tool_does_not_declare_is_refused() {
-        assert_eq!(super::undeclared_argument("history", &json!({ "class": "agent", "limit": 5 }), &[]),
-                   Some("class".to_string()));
-        assert_eq!(super::undeclared_argument("query", &json!({ "class": "agent", "limit": 5 }), &[]), None);
-        assert_eq!(super::undeclared_argument("history", &json!({}), &[]), None);
-        assert_eq!(super::undeclared_argument("manifest_provenance", &json!({ "tool": "t" }), &["tool"]), None);
+    fn an_argument_the_tool_does_not_declare_or_of_the_wrong_type_is_refused() {
+        let refused = |name: &str, arguments: serde_json::Value| super::argument_refusal(name, &arguments, &[]);
+
+        assert!(refused("history", json!({ "class": "agent", "limit": 5 })).unwrap().contains("\"class\""));
+        assert_eq!(refused("query", json!({ "class": "agent", "limit": 5 })), None);
+        assert_eq!(refused("history", json!({})), None);
+        assert_eq!(super::argument_refusal("manifest_provenance", &json!({ "tool": "t" }), &["tool"]), None);
+
+        // A declared argument of the wrong type would otherwise be dropped just the same.
+        for (name, arguments) in [
+            ("query", json!({ "class": ["agent"] })),
+            ("query", json!({ "where": "{}" })),
+            ("lower", json!({ "expect": 123 })),
+            ("lower", json!({ "keep": ["@kv:a=ours", 1] })),
+            ("bay_add", json!({ "name": "b", "scope": "src" })),
+            ("history", json!({ "limit": "5" })),
+            ("history", json!({ "limit": 0 })),
+            ("stocktake", json!({ "summary": "yes" })),
+            ("history", json!(["class", "agent"])),
+        ] {
+            assert!(refused(name, arguments.clone()).is_some(), "{} {} must be refused", name, arguments);
+        }
+        assert_eq!(refused("query", json!({ "where": { "field": "class", "op": "eq", "value": "agent" } })), None);
+        assert_eq!(refused("lower", json!({ "keep": ["@kv:a=ours"] })), None);
     }
 
     #[test]

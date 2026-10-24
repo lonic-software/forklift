@@ -671,7 +671,13 @@ and progress needs macOS or Linux, as the channel does.
 The tool surface **mirrors the CLI** — every CLI command is exposed as a tool (a
 multi-subcommand command becomes `<command>_<subcommand>` tools) or is on a small
 human-only allow-list; a unit test (`every_cli_command_is_an_mcp_tool_or_explicitly_human_only`)
-fails CI if that ever drifts. Tools (arguments in parentheses):
+fails CI if that ever drifts. Each tool's `inputSchema` is closed
+(`additionalProperties: false`), and the server enforces it: a `tools/call` whose
+`arguments` are not an object, name an argument the tool does not declare, or give a
+declared one the wrong type is refused with JSON-RPC `invalid_params` rather than run
+with the argument dropped. (`manifest_provenance`'s `tool` and `session` are the one
+exception: the server sets them from the connection and discards an agent's value.)
+Tools (arguments in parentheses):
 
 - **Inspect:** `stocktake` (summary?), `history` (revision?, limit?, after?),
   `diff` (staged?, targets?), `peek` (object | inventory), `show` (target — a single

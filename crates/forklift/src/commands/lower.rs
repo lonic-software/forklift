@@ -683,7 +683,7 @@ fn parse_keeps(specs: &[String]) -> Result<Keeps, String> {
         // A bare name is never read as the meta pallet. The `@` spelling is suggested only when
         // it would be accepted; any other bare name is the malformed case.
         let Some(pallet) = pallet.strip_prefix(pallet_utils::META_QUALIFIER) else {
-            if meta_tree::meta_rules(pallet).is_none() {
+            if meta_tree::meta_rules(pallet).is_none_or(|rules| rules.resolution_path(spelled).is_err()) {
                 return Err(malformed());
             }
             return Err(format!(
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn no_at_spelling_is_suggested_where_the_parser_would_refuse_it_too() {
-        for spec in ["main:foo=ours", "kv:alice/ci=mine", ":x=ours"] {
+        for spec in ["main:foo=ours", "kv:alice/ci=mine", "kv:alice/ci=ours", ":x=ours"] {
             let message = refusal(spec);
             assert!(message.contains("is not of the form") && !message.contains("--keep @"),
                     "{}: {}", spec, message);
