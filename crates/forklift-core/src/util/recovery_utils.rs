@@ -2034,9 +2034,10 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// fetched what lies outside its fetch scope, so the enumerating walk records none of it as
 /// absent. The scope selects user-pallet content only, so [`walk_tree`] walks a tree whose root
 /// holds the metadata folder by its exact name — the shape of every office and meta-tree pallet,
-/// which a user tree has only if crafted — in full ([`is_meta_tree_root`]). That decides by the tree, never by which root reached it: a trust pin can
-/// name either kind (`adopts` names office history, a `boundary` snapshot names user and meta
-/// heads alike), and a meta parcel walked within the scope would leave a real loss unreported.
+/// which a user tree has only if crafted — in full ([`is_meta_tree_root`]). That decides by the
+/// tree, never by which root reached it: a trust pin can name either kind (`adopts` names office
+/// history, a `boundary` snapshot names user and meta heads alike), and a meta parcel walked within
+/// the scope would leave a real loss unreported.
 ///
 /// `scope` is the fetch scope for the enumerating walk ([`enumerate_absent_reachable`]) and full
 /// for the targeted one ([`closure_references_any`]), which must descend everything gc keeps.
