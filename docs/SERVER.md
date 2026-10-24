@@ -53,8 +53,8 @@ A served root must hold the full tree. A sparse warehouse (one franchised with `
 refused: `serve --root` will not start on it, and a `--warehouses` server answers `409` for it.
 Clients trust a server to hold every object its pallet heads reach, and `scope-prune` frees local
 copies on that basis, so a sparse root could lead a client to free content it can never fetch back.
-To serve a franchised copy, franchise it without `--only`. A franchise that has not finished is refused the same
-way (`409`) until it is resumed or deleted.
+To serve a franchised copy, franchise it without `--only`. A franchise that has not finished is
+not served either (`503` from a `--warehouses` server) until it is resumed or deleted.
 
 ## Serving many warehouses
 

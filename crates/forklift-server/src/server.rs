@@ -208,8 +208,8 @@ struct RegistryEntry {
 /// that is not live lets the least recently used *idle* one go first (see
 /// [`WarehouseRegistry::make_room`]). When none is idle the new one is admitted over the cap: a
 /// request is never refused for the cap alone, and running out of files surfaces as
-/// [`WarehouseHandle::serving`]'s refusal: a 503 when the locks cannot be taken, a 500 when the
-/// fetch scope cannot be read.
+/// [`WarehouseHandle::serving`]'s refusal: a 503 when the franchise gate or the locks cannot
+/// be checked or taken, a 500 when the fetch scope cannot be read.
 struct WarehouseRegistry {
     entries: HashMap<String, RegistryEntry>,
     clock: u64,
@@ -1612,7 +1612,7 @@ fn resolve_warehouse(state: &AppState,
     // Acquire this warehouse's serve lock as it is served, and hold it in the registry's handle
     // until the handle is let go. Refuses (503) if a `gc` or full repack is running against this
     // warehouse, or another server already serves it — serving it then would be unsafe. A sparse
-    // warehouse stays refused (409) until it is replaced, and an unfinished franchise (409) until
+    // warehouse stays refused (409) until it is replaced, and an unfinished franchise (503) until
     // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root).map_err(|refusal| match refusal {
@@ -1620,7 +1620,17 @@ fn resolve_warehouse(state: &AppState,
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, reason),
             ),
-            ServingRefusal::Unfinished(reason) => (StatusCode::CONFLICT, reason),
+            // Not the gate's own refusal: its code and next step name this server's directories,
+            // and a client would read them as a franchise of its own to resume.
+            ServingRefusal::Unfinished(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Warehouse \"{}\" is temporarily unavailable: it holds a franchise that has not \
+                    finished, or that could not be checked. It is served once the franchise is resumed \
+                    or deleted.",
+                    id
+                ),
+            ),
             ServingRefusal::Unreadable(reason) => internal(reason),
             ServingRefusal::Sparse => (
                 StatusCode::CONFLICT,
@@ -4146,7 +4156,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A multi-warehouse server refuses an unfinished franchise (409) as single mode does: one
+    /// A multi-warehouse server refuses an unfinished franchise (503) as single mode does: one
     /// killed before it wrote its fetch scope reads as full, so its scope cannot be trusted yet. A
     /// fetch scope that cannot be read is a 500.
     ///
@@ -4159,7 +4169,9 @@ mod tests {
         let forklift = base.join("unfinished").join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::write(franchise_utils::record_path(&forklift), b"torn").unwrap();
         let refused = resolve_warehouse(&state, &warehouse_params("unfinished")).err().expect("refused");
-        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
+        assert!(refused.1.starts_with("Warehouse \"unfinished\" is temporarily unavailable"), "{}", refused.1);
+        assert!(!refused.1.contains(&*base.to_string_lossy()), "no server path reaches the client: {}", refused.1);
         assert!(!serve_lock_exists(&base, "unfinished"), "a refused warehouse keeps no serve lock");
 
         make_sparse(&base.join("garbled"));
