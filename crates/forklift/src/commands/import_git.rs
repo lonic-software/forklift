@@ -199,6 +199,8 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
 
     // A tracked ignore file the rule was just appended to no longer holds its imported content,
     // but that is the import's own edit, which the report names, not one for `restore` to undo.
+    // An edit the file held before then goes unnamed too; it still reads as changed, and the
+    // report already sends the user to load the file.
     if matches!(git_rule, Some(GitRule::Added)) {
         unheld.retain(|key| key != file_utils::FILENAME_IGNORE);
     }
@@ -1189,7 +1191,8 @@ pub(crate) struct ImportReport {
     /// Every checked-out file that does not hold the content imported for it (an uncommitted
     /// edit or deletion, or a file git converted as it checked it out), in tree order. Each reads
     /// as an unstaged change. The warning names only the first few. A tracked `.forkliftignore`
-    /// the import appended the `.git` rule to is not listed, although it reads as changed.
+    /// the import appended the `.git` rule to is not listed, although it reads as changed, even
+    /// when it also held an edit of its own before the import.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unheld: Vec<String>,
 }
