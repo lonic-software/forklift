@@ -2451,11 +2451,45 @@ fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
 
     let status = json(&warehouse.run(&["--json", "stocktake"]));
     assert_eq!(status["data"]["staged_count"], 0, "the inventory is built at the imported tree: {}", status);
-    // The import stopped before it added the ignore rule for `.git`, and heal only finishes the
-    // inventory, so the folder still reads as untracked.
-    assert_eq!(unstaged_changes(&warehouse), vec![("untracked".to_string(), ".git/".to_string())]);
+    // The import added the ignore rule for `.git` before the build that failed, so after heal the
+    // folder stays ignored and the new ignore file is the only untracked path.
+    assert_eq!(unstaged_changes(&warehouse), vec![("untracked".to_string(), ".forkliftignore".to_string())]);
+    assert!(std::fs::read_to_string(root.join(".forkliftignore")).unwrap().contains(r"^\.git(/.*)?$"));
     let stack = warehouse.run(&["stack", "after heal"]);
     assert!(stderr(&stack).contains("Nothing to stack"), "the bay is no longer refused: {}", stderr(&stack));
+}
+
+/// A git repository that tracks its own `.forkliftignore` gets the `.git` rule appended to it
+/// before the import builds its inventory, so that file no longer holds its imported content. It
+/// reads as modified, for `load` and `stack` to keep the rule, but the unheld warning, whose
+/// remedy `restore` would drop the rule, names only the files the user changed.
+#[test]
+fn import_git_does_not_report_its_own_ignore_rule_as_an_unheld_file() {
+    let warehouse = TestWarehouse::new("import-git-tracked-ignore");
+    let root = warehouse.root.clone();
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file(".forkliftignore", "^build(/.*)?$\n");
+    warehouse.write_file("edited.txt", "aaaa\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+    warehouse.write_file("edited.txt", "an uncommitted edit\n");
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    let imported = json(&warehouse.run(&["--json", "import-git", "."]));
+    assert_eq!(imported["data"]["ignored_git"], true, "{}", imported);
+    assert_eq!(imported["data"]["unheld"], serde_json::json!(["edited.txt"]), "{}", imported);
+    let warnings = imported["data"]["warnings"].to_string();
+    assert!(warnings.contains("1 file(s) do not hold") && warnings.contains("\\\"edited.txt\\\""), "{}", imported);
+    assert!(!warnings.contains(".forkliftignore"), "{}", imported);
+
+    let rules = std::fs::read_to_string(root.join(".forkliftignore")).unwrap();
+    assert!(rules.starts_with("^build(/.*)?$\n") && rules.contains(r"^\.git(/.*)?$"), "{:?}", rules);
+    assert_eq!(unstaged_changes(&warehouse), vec![
+        ("modified".to_string(), ".forkliftignore".to_string()),
+        ("modified".to_string(), "edited.txt".to_string()),
+    ]);
 }
 
 /// Forklift has no checkout conversion, so a file git rewrote on checkout (`eol=crlf`, `ident`,

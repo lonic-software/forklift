@@ -71,7 +71,8 @@ one name (`Feature` and `feature`), when one mapped name would be a folder of an
 `a-b/x`), or when the name is already a pallet here or nests with one. Git's HEAD
 branch is checked out, and `.git/` is added to `.forkliftignore` (creating the file if
 there is none) so a colocated repo reads clean, unless a rule there already matches `.git`, which
-it then names. An ignore file Forklift refuses to read is left as it is, with a warning. The edit is left in the working tree,
+it then names. The rule is added before the inventory is built, so an import interrupted there and
+finished by `heal` has it too. An ignore file Forklift refuses to read is left as it is, with a warning. The edit is left in the working tree,
 not stacked: `load .forkliftignore` and stack it with your next parcel. Requires `git` on your PATH. The imported history is **unsigned** (it
 predates trust) — import into a fresh warehouse, then `office enroll` to anchor it as the
 legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules

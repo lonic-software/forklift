@@ -1892,7 +1892,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "unheld": {
-      "description": "Every checked-out file that does not hold the content imported for it (an uncommitted\nedit or deletion, or a file git converted as it checked it out), in tree order. Each reads\nas an unstaged change. The warning names only the first few.",
+      "description": "Every checked-out file that does not hold the content imported for it (an uncommitted\nedit or deletion, or a file git converted as it checked it out), in tree order. Each reads\nas an unstaged change. The warning names only the first few. A tracked `.forkliftignore`\nthe import appended the `.git` rule to is not listed, although it reads as changed, even\nwhen it also held an edit of its own before the import.",
       "items": {
         "type": "string"
       },
