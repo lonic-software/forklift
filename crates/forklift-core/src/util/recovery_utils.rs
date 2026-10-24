@@ -239,7 +239,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
-use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
+use crate::globals::{forklift_root, FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
     audit_utils, bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
     pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
@@ -2033,8 +2033,8 @@ fn reborrow_sink<'a>(sink: &'a mut Option<&mut dyn FnMut(&str)>) -> Option<&'a m
 /// **Every tree is walked within `scope`, except a meta tree (FORK-262).** A sparse warehouse never
 /// fetched what lies outside its fetch scope, so the enumerating walk records none of it as
 /// absent. The scope selects user-pallet content only, so [`walk_tree`] walks a tree whose root
-/// holds the metadata folder — the shape of every office and meta-tree pallet, which no user tree
-/// can have — in full. That decides by the tree, never by which root reached it: a trust pin can
+/// holds the metadata folder by its exact name — the shape of every office and meta-tree pallet,
+/// which a user tree has only if crafted — in full ([`is_meta_tree_root`]). That decides by the tree, never by which root reached it: a trust pin can
 /// name either kind (`adopts` names office history, a `boundary` snapshot names user and meta
 /// heads alike), and a meta parcel walked within the scope would leave a real loss unreported.
 ///
@@ -2433,11 +2433,13 @@ fn walk_tree(
     Ok(())
 }
 
-/// Whether a root tree holds the metadata folder: the shape of every office and meta-tree pallet,
-/// and of no user tree. The name match is [`office_utils::is_metadata_folder_name`]'s, wider than
-/// the exact name, so a crafted tree errs toward the full walk.
+/// Whether a root tree holds the metadata folder, by its exact name: every office and meta-tree
+/// pallet's root is built with it. A user tree holds it only if crafted, since load refuses the
+/// name, and is then walked in full. The wider alias match of
+/// [`office_utils::is_metadata_folder_name`] is for working directories: here it would send a user
+/// tree with a legal entry such as `FORKLI~1` down the full walk too.
 fn is_meta_tree_root(tree: &crate::model::tree_item::TreeItem) -> bool {
-    tree.get_subtrees().chain(tree.get_files()).any(|(name, _)| office_utils::is_metadata_folder_name(name))
+    tree.get_subtrees().chain(tree.get_files()).any(|(name, _)| name == FOLDER_NAME_FORKLIFT_ROOT)
 }
 
 /// The trees a closure walk has been through, so it walks each at most once per way it is reached.
@@ -3487,6 +3489,29 @@ mod tests {
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
             "the adopted office history's lost cell must be recorded whatever the fetch scope");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-262: only the exact metadata folder name marks a meta tree. A user tree whose root holds
+    /// a legal name the working-directory guard folds onto it (`FORKLI~1`, an NTFS short name) is
+    /// still walked within the scope. Mutation: match with `office_utils::is_metadata_folder_name`
+    /// → the tree is walked in full and the sealed `docs` is recorded → red.
+    #[test]
+    fn a_user_tree_with_a_metadata_folder_alias_is_still_walked_within_the_scope() {
+        use crate::model::tree_item::TreeItem;
+
+        let (dir, _scope) = enter_temp_root("sparse-alias-scoped");
+        let (alias, docs) = ("a".repeat(64), "b".repeat(64));
+
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root.add_child(TreeItem::new("FORKLI~1".to_string(), alias, DirEntryType::Tree));
+        root.add_child(TreeItem::new("docs".to_string(), docs, DirEntryType::Tree));
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert!(walk.hashes.is_empty(), "nothing outside the scope may be recorded: {:?}", walk.hashes);
 
         std::fs::remove_dir_all(&dir).ok();
     }
