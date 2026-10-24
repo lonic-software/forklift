@@ -4452,6 +4452,26 @@ fn manifest_provenance_records_forge_proof_machine_authorship() {
 }
 
 #[test]
+fn mcp_refuses_an_argument_the_tool_does_not_declare() {
+    let warehouse = TestWarehouse::new("mcp-undeclared");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    // `history` has no class filter: dropping the argument would answer a broader question
+    // than the one asked, so the call is refused instead.
+    let input = format!(
+        "{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"history","arguments":{"class":"agent"}}}"#,
+    );
+    let output = warehouse.run_with_stdin(&["mcp"], &input);
+    let call = stdout(&output).lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|message| message["id"] == 2)
+        .expect("a reply to the history call");
+    assert!(call["error"]["message"].as_str().unwrap_or("").contains("\"class\""), "{}", call);
+}
+
+#[test]
 fn mcp_provenance_takes_tool_and_session_from_the_connection_not_the_agent() {
     let warehouse = TestWarehouse::new("provenance-origin");
     warehouse.write_file("a.txt", "one\n");

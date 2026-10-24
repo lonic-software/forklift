@@ -202,8 +202,10 @@ fn call_tool(params: &Value, state: &ServerState, notify: &mut dyn FnMut(&Value)
     let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     // An argument the tool does not declare is refused, never ignored: a dropped filter would
-    // answer a broader question than the one asked, still with ok:true.
-    if let Some(key) = undeclared_argument(name, &arguments) {
+    // answer a broader question than the one asked, still with ok:true. The provenance keys the
+    // server sets itself (below) are the exception: an agent's value for them is discarded.
+    let server_set: &[&str] = if name == "manifest_provenance" { &["tool", "session"] } else { &[] };
+    if let Some(key) = undeclared_argument(name, &arguments, server_set) {
         return Err(JsonRpcError::invalid_params(&format!("the \"{}\" tool takes no \"{}\" argument", name, key)));
     }
 
@@ -1266,9 +1268,10 @@ fn tool_definitions() -> Value {
     ])
 }
 
-/// The first argument the named tool's input schema does not declare, if any. An unknown tool
-/// declares nothing to check against; `build_args` refuses it on its own.
-fn undeclared_argument(name: &str, arguments: &Value) -> Option<String> {
+/// The first argument the named tool's input schema does not declare and `server_set` does not
+/// name, if any. An unknown tool declares nothing to check against; `build_args` refuses it on
+/// its own.
+fn undeclared_argument(name: &str, arguments: &Value, server_set: &[&str]) -> Option<String> {
     let definitions = tool_definitions();
     let properties = definitions.as_array()?.iter()
         .find(|definition| definition["name"] == name)?
@@ -1276,7 +1279,9 @@ fn undeclared_argument(name: &str, arguments: &Value) -> Option<String> {
         .as_object()?
         .clone();
 
-    arguments.as_object()?.keys().find(|key| !properties.contains_key(*key)).cloned()
+    arguments.as_object()?.keys()
+        .find(|key| !properties.contains_key(*key) && !server_set.contains(&key.as_str()))
+        .cloned()
 }
 
 /// One tool definition.
@@ -1681,10 +1686,11 @@ mod tests {
 
     #[test]
     fn an_argument_the_tool_does_not_declare_is_refused() {
-        assert_eq!(super::undeclared_argument("history", &json!({ "class": "agent", "limit": 5 })),
+        assert_eq!(super::undeclared_argument("history", &json!({ "class": "agent", "limit": 5 }), &[]),
                    Some("class".to_string()));
-        assert_eq!(super::undeclared_argument("query", &json!({ "class": "agent", "limit": 5 })), None);
-        assert_eq!(super::undeclared_argument("history", &json!({})), None);
+        assert_eq!(super::undeclared_argument("query", &json!({ "class": "agent", "limit": 5 }), &[]), None);
+        assert_eq!(super::undeclared_argument("history", &json!({}), &[]), None);
+        assert_eq!(super::undeclared_argument("manifest_provenance", &json!({ "tool": "t" }), &["tool"]), None);
     }
 
     #[test]
