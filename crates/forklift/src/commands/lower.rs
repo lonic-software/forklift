@@ -535,10 +535,7 @@ pub(crate) struct LowerReport {
     fetched_objects: usize,
     fetched_signatures: usize,
 
-    /// Why the remote's batch download stopped being used, when it did: everything the command
-    /// fetched after that came one object at a time. `degraded` is a remote too slow to start a
-    /// batch answer; `endpoint_absent` is one that serves no batch downloads. Absent when the
-    /// lane stayed open.
+    /// Why the remote's batch download stopped being used, when it did. Absent when it stayed open.
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_lane: Option<BatchLaneClosure>,
 }
@@ -628,9 +625,7 @@ impl CommandOutput for LowerReport {
             }
         }
 
-        if let Some(closure) = self.batch_lane {
-            println!("{}", output::batch_lane_line(closure));
-        }
+        output::print_batch_lane(self.batch_lane);
     }
 }
 

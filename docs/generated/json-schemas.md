@@ -1017,16 +1017,16 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "BatchLaneClosure": {
-      "description": "Why a remote's batch lane closed, so the rest of the command fetched one object at a time.\nRead from [`RemoteClient::batch_lane_closure`] once the command's fetches are done.\n\nThe lane belongs to the client, not to one fetch: every fetch a command makes through the same\nclient (the office, the meta pallets, the pallet itself) shares it, so the command reports it\nonce rather than each fetch's stats carrying a copy.",
+      "description": "Why the remote's batch download stopped being used, after which the command fetched one\nobject at a time.",
       "oneOf": [
         {
           "const": "endpoint_absent",
-          "description": "The remote has no batch endpoint.",
+          "description": "The remote does not serve batch downloads.",
           "type": "string"
         },
         {
           "const": "degraded",
-          "description": "The remote did not start a batch answer in time.",
+          "description": "The remote was too slow to start a batch answer.",
           "type": "string"
         }
       ]
@@ -1051,7 +1051,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "Why the remote's batch download stopped being used, when it did: everything the command\nfetched after that came one object at a time. `degraded` is a remote too slow to start a\nbatch answer; `endpoint_absent` is one that serves no batch downloads. Absent when the\nlane stayed open."
+      "description": "Why the remote's batch download stopped being used, when it did. Absent when it stayed open."
     },
     "bundle_objects": {
       "description": "Objects imported from the remote's bundle, when it had one.",
@@ -1954,16 +1954,16 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "BatchLaneClosure": {
-      "description": "Why a remote's batch lane closed, so the rest of the command fetched one object at a time.\nRead from [`RemoteClient::batch_lane_closure`] once the command's fetches are done.\n\nThe lane belongs to the client, not to one fetch: every fetch a command makes through the same\nclient (the office, the meta pallets, the pallet itself) shares it, so the command reports it\nonce rather than each fetch's stats carrying a copy.",
+      "description": "Why the remote's batch download stopped being used, after which the command fetched one\nobject at a time.",
       "oneOf": [
         {
           "const": "endpoint_absent",
-          "description": "The remote has no batch endpoint.",
+          "description": "The remote does not serve batch downloads.",
           "type": "string"
         },
         {
           "const": "degraded",
-          "description": "The remote did not start a batch answer in time.",
+          "description": "The remote was too slow to start a batch answer.",
           "type": "string"
         }
       ]
@@ -2004,7 +2004,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "Why the remote's batch download stopped being used, when it did: everything an auto-merge\nfetched after that came one object at a time. `degraded` is a remote too slow to start a\nbatch answer; `endpoint_absent` is one that serves no batch downloads. Absent when the\nlane stayed open."
+      "description": "Why the remote's batch download stopped being used during an auto-merge, when it did.\nAbsent when it stayed open."
     },
     "head": {
       "type": "string"
@@ -2097,16 +2097,16 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "BatchLaneClosure": {
-      "description": "Why a remote's batch lane closed, so the rest of the command fetched one object at a time.\nRead from [`RemoteClient::batch_lane_closure`] once the command's fetches are done.\n\nThe lane belongs to the client, not to one fetch: every fetch a command makes through the same\nclient (the office, the meta pallets, the pallet itself) shares it, so the command reports it\nonce rather than each fetch's stats carrying a copy.",
+      "description": "Why the remote's batch download stopped being used, after which the command fetched one\nobject at a time.",
       "oneOf": [
         {
           "const": "endpoint_absent",
-          "description": "The remote has no batch endpoint.",
+          "description": "The remote does not serve batch downloads.",
           "type": "string"
         },
         {
           "const": "degraded",
-          "description": "The remote did not start a batch answer in time.",
+          "description": "The remote was too slow to start a batch answer.",
           "type": "string"
         }
       ]
@@ -2234,7 +2234,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "Why the remote's batch download stopped being used, when it did: everything the command\nfetched after that came one object at a time. `degraded` is a remote too slow to start a\nbatch answer; `endpoint_absent` is one that serves no batch downloads. Absent when the\nlane stayed open."
+      "description": "Why the remote's batch download stopped being used, when it did. Absent when it stayed open."
     },
     "fetched_objects": {
       "format": "uint",
@@ -4285,16 +4285,16 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "BatchLaneClosure": {
-      "description": "Why a remote's batch lane closed, so the rest of the command fetched one object at a time.\nRead from [`RemoteClient::batch_lane_closure`] once the command's fetches are done.\n\nThe lane belongs to the client, not to one fetch: every fetch a command makes through the same\nclient (the office, the meta pallets, the pallet itself) shares it, so the command reports it\nonce rather than each fetch's stats carrying a copy.",
+      "description": "Why the remote's batch download stopped being used, after which the command fetched one\nobject at a time.",
       "oneOf": [
         {
           "const": "endpoint_absent",
-          "description": "The remote has no batch endpoint.",
+          "description": "The remote does not serve batch downloads.",
           "type": "string"
         },
         {
           "const": "degraded",
-          "description": "The remote did not start a batch answer in time.",
+          "description": "The remote was too slow to start a batch answer.",
           "type": "string"
         }
       ]
@@ -4319,7 +4319,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "Why the remote's batch download stopped being used, when it did: everything the command\nfetched after that came one object at a time. `degraded` is a remote too slow to start a\nbatch answer; `endpoint_absent` is one that serves no batch downloads. Absent when the\nlane stayed open."
+      "description": "Why the remote's batch download stopped being used, when it did. Absent when it stayed open."
     },
     "fetched_objects": {
       "description": "Loose objects fetched for the newly in-scope subtree(s).",

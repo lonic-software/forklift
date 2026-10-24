@@ -1508,7 +1508,9 @@ that command fetches one object at a time, which is slower but still finishes, a
 says so in one closing line (`batch_lane: "degraded"` under `--json`). A remote that serves no
 batch downloads gets the same line, worded for that (`batch_lane: "endpoint_absent"`). A remote
 that rate-limits its fetches is waited out, for up to 30 seconds per request. The same holds
-for every command that fetches (`franchise`, `lower`, `expand`, and `lift` when it auto-merges).
+for every command that fetches (`franchise`, `lower`, `expand`, and `lift` when it auto-merges);
+`office accept-regenesis` adds the line to its message instead of a `batch_lane` field. A command
+that fails says only why it failed, not whether the batch download had stopped first.
 
 `lower <pallet>` names a pallet other than the current one (`palletize --remote` lists the
 remote's). It fetches that pallet's history, then creates the pallet here at the remote's head,

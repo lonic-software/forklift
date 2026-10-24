@@ -302,19 +302,19 @@ pub enum BatchOutcome {
     Degraded,
 }
 
-/// Why a remote's batch lane closed, so the rest of the command fetched one object at a time.
-/// Read from [`RemoteClient::batch_lane_closure`] once the command's fetches are done.
-///
-/// The lane belongs to the client, not to one fetch: every fetch a command makes through the same
-/// client (the office, the meta pallets, the pallet itself) shares it, so the command reports it
-/// once rather than each fetch's stats carrying a copy.
+/// Why the remote's batch download stopped being used, after which the command fetched one
+/// object at a time.
+// Read from `RemoteClient::batch_lane_closure` once the command's fetches are done. The lane
+// belongs to the client, not to one fetch: every fetch a command makes through the same client
+// (the office, the meta pallets, the pallet itself) shares it, so the command reports it once
+// rather than each fetch's stats carrying a copy.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchLaneClosure {
-    /// The remote has no batch endpoint.
+    /// The remote does not serve batch downloads.
     EndpointAbsent,
-    /// The remote did not start a batch answer in time.
+    /// The remote was too slow to start a batch answer.
     Degraded,
 }
 
