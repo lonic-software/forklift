@@ -5049,6 +5049,26 @@ mod tests {
         parcel_object.hash
     }
 
+    /// Store an unsigned parcel over an empty tree and return its hash: a pallet head whose history
+    /// is complete, for a test that needs only some head.
+    fn store_bare_parcel(description: &str) -> String {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        use forklift_core::enums::dir_entry_type::DirEntryType;
+        use forklift_core::model::parcel::Parcel;
+
+        let mut root_object = LooseObjectBuilder::build_tree(&TreeItem::new(String::new(), String::new(), DirEntryType::Tree));
+        root_object.store().unwrap();
+
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: root_object.hash,
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some(description.to_string()),
+        });
+        parcel_object.store().unwrap();
+        parcel_object.hash
+    }
+
     /// Restores `FORKLIFT_KEYS_DIR` when the test's scope ends, including on panic.
     /// A falsifier that does its job *fails*, and a straight-line restore placed after
     /// the assertion never runs on the one path that matters — leaving the process-global
@@ -5401,7 +5421,8 @@ mod tests {
     #[tokio::test]
     async fn a_first_anchor_whose_boundary_misses_a_head_is_refused_and_writes_nothing() {
         let (root, _scope) = trust_warehouse("put-trust-boundary");
-        forklift_core::util::pallet_utils::update_pallet_head("main", None, &"1".repeat(64), &RefPreconditions::NONE).unwrap();
+        let head = store_bare_parcel("main");
+        forklift_core::util::pallet_utils::update_pallet_head("main", None, &head, &RefPreconditions::NONE).unwrap();
         let state = Arc::new(single_mode_state(root.clone()));
 
         let response = put_trust(State(state), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(vec!["2".repeat(64)])))
@@ -5414,7 +5435,7 @@ mod tests {
 
         let accepted = put_trust(
             State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(PathParams::new()),
-            Json(first_anchor(vec!["1".repeat(64)])),
+            Json(first_anchor(vec![head])),
         ).await.into_response();
         assert!(accepted.status().is_success(), "a boundary holding every head installs: {}", accepted.status());
         let _ = std::fs::remove_dir_all(&root);

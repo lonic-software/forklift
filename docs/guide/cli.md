@@ -1521,6 +1521,13 @@ left behind it and catches up with `shift`. The pallet is created or moved only 
 is fully fetched, so a lower that fails part-way leaves it as it was. Naming the current pallet is
 the same as a bare `lower`.
 
+**A pallet never points at history this warehouse lacks.** Every command that moves a pallet to a
+parcel it does not already stand on (`stack`, `lower`, `consolidate`, `palletize`, `undo`, and the
+rest) first checks that the parcel's history is completely present, back to what some pallet
+already holds. In a sparse warehouse it checks only what the fetch scope holds. When something
+is missing, for instance after a fetch that stopped part-way, the command refuses, names the
+missing object, and writes nothing; running that fetch again completes the history.
+
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
 working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`
 replays your changes onto the remote's, and `--keep` resolves the paths both sides changed (see
@@ -1544,8 +1551,8 @@ Every history the warehouse holds is widened, not just the current pallet's: eve
 every remote head a `lower` or `lift` fetched without a pallet yet (such as the head of a
 diverged `lower`, which you may palletize later), and every head a pallet moved off that `undo`
 could bring back. If the remote can no longer serve one of those unpalletized heads, `expand`
-still succeeds, and that head is refused as a pallet head ("fetched only part-way") until a
-`lower` from a remote that has it fetches it in full. If it
+still succeeds, and that head is refused as a pallet head (its history "is not completely
+present") until a `lower` from a remote that has it fetches it in full. If it
 cannot serve a pallet's history, `expand` refuses and names the pallet. When another command
 changes the warehouse while `expand` runs, it walks the change and tries again, and after three
 tries it asks you to run it again.
