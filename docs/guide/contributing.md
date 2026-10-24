@@ -156,7 +156,7 @@ so the operational commands are one launcher away; the real logic lives in `bin/
 | `pult install` | build & install the CLI + server from this checkout |
 | `pult dev-server` | `bin/serve` — a throwaway local `forklift-server` over `.dev/server` for testing lift/lower/franchise |
 | `pult design` | open `docs/DESIGN.html` (the source of truth) in a browser |
-| `pult gen-docs` | `bin/gen-docs` — regenerate the derived docs (error codes, per-command JSON schemas) |
+| `pult gen-docs` | `bin/gen-docs` — regenerate the derived docs (error codes, the command and alias list, per-command JSON schemas); `bin/gen-docs --check` only checks they are current |
 
 Cutting a release: `pult release` picks the next patch/minor/major from the latest `v*`
 tag (or run `bin/release <x.y.z> --dry-run` to preflight without touching anything). It
@@ -319,17 +319,21 @@ The guides intentionally *reference* rather than duplicate `SERVER.md`,
 update for each concern. Keep it that way — duplication is what drifts.
 
 **Generated docs never need this by hand.** `docs/generated/errors.md` (the error/exit-code
-table) and `docs/generated/json-schemas.md` (every command's `--json` `data` schema) are
-produced by `bin/gen-docs` from the code itself — the `ErrorCode` enum and the
+table), `docs/generated/commands.md` (every command and subcommand with its aliases) and
+`docs/generated/json-schemas.md` (every command's `--json` `data` schema) are
+produced by `bin/gen-docs` from the code itself — the `ErrorCode` enum, the clap command
+definition in `crates/forklift/src/cli.rs`, and the
 `#[derive(schemars::JsonSchema)]` output structs in `crates/forklift/src/commands/`
 (behind the dev-only `docgen` cargo feature, never enabled in a release build; see
 `crates/forklift/src/docgen.rs`). Each command registers its structs from a
 `__docgen_schemas` fn through `docgen::OutputSchema::of`, which describes the serialized
 shape: a field with `skip_serializing_if` comes out optional without needing
-`#[serde(default)]`. `bin/check` regenerates them into a scratch directory
-and diffs against the committed copy, so **stale generated docs fail CI** — if you add an
-error code or change a command's `--json` output, run `pult gen-docs` (or `./bin/gen-docs`)
-and commit the result along with your change; you don't hand-edit those two files.
+`#[serde(default)]`. `bin/gen-docs --check` regenerates them into a scratch directory
+and diffs against the committed copy; CI's "generated docs" job and `bin/check` both run it, so
+**stale generated docs fail CI** — if you add an error code, add or rename a command or alias,
+change a command's one-line help, or change a command's `--json` output, run `pult gen-docs`
+(or `./bin/gen-docs`) and commit the result along with your change; you don't hand-edit those
+files. Other docs link to these pages rather than copying their tables.
 
 The doc comments those pages are rendered from are read by people outside the project, so the
 generator refuses a page that cites a `FORK-<n>` ticket, a `§<n>` section of the design

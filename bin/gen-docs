@@ -1,32 +1,61 @@
 #!/usr/bin/env bash
 # Regenerate the parts of the docs that are derivable from code: the error/exit-code
-# reference table and every command's `--json` output schema. Both come out of the
-# `forklift` binary itself, built with the dev-only `docgen` feature (never enabled in a
-# release build — see crates/forklift/Cargo.toml and crates/forklift/src/docgen.rs).
+# reference table, the command and alias list, and every command's `--json` output schema.
+# All come out of the `forklift` binary itself, built with the dev-only `docgen` feature
+# (never enabled in a release build — see crates/forklift/Cargo.toml and
+# crates/forklift/src/docgen.rs).
 #
-# usage: gen-docs [output-dir]     (default docs/generated)
+# usage: gen-docs              regenerate docs/generated in place (then commit the result)
+#        gen-docs --check      regenerate into a scratch directory and diff it against
+#                              docs/generated; exits 1 if anything is stale, missing or extra.
+#                              bin/check and CI run this.
 #
-# The optional output-dir lets `bin/check` generate into a scratch directory and diff it
-# against docs/generated without touching the working tree — see the "docs freshness"
-# step there. Normal use (regenerating for a commit) takes no argument.
+# Honours CARGO_TARGET_DIR, so it can build outside the main checkout's target/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-out="${1:-docs/generated}"
-mkdir -p "$out"
+# Each page is rendered by `forklift __docgen <target>` into docs/generated/<target>.md.
+pages=(errors json-schemas commands)
+
+check=false
+case "${1:-}" in
+    "") ;;
+    --check) check=true ;;
+    *) echo "usage: gen-docs [--check]" >&2; exit 2 ;;
+esac
+
+if $check; then
+    out="$(mktemp -d)"
+    trap 'rm -rf "$out"' EXIT
+else
+    out="docs/generated"
+    mkdir -p "$out"
+    # Render each page into a temp file and move it into place only on success: a renderer
+    # that refuses its page must leave the committed copy untouched, not truncated.
+    trap 'for p in "${pages[@]}"; do rm -f "$out/$p.md.tmp"; done' EXIT
+fi
 
 echo "── building forklift --features docgen"
 cargo build --quiet -p forklift --features docgen
 
-bin="./target/debug/forklift"
+bin="${CARGO_TARGET_DIR:-target}/debug/forklift"
 
-# Render each page into a temp file and move it into place only on success: a renderer that
-# refuses its page must leave the committed copy untouched, not truncated (and no temp file
-# behind for `bin/check`'s diff to trip over).
-trap 'rm -f "$out/errors.md.tmp" "$out/json-schemas.md.tmp"' EXIT
-"$bin" __docgen errors > "$out/errors.md.tmp"
-"$bin" __docgen json-schemas > "$out/json-schemas.md.tmp"
-mv "$out/errors.md.tmp" "$out/errors.md"
-mv "$out/json-schemas.md.tmp" "$out/json-schemas.md"
+for page in "${pages[@]}"; do
+    "$bin" __docgen "$page" > "$out/$page.md.tmp"
+done
+for page in "${pages[@]}"; do
+    mv "$out/$page.md.tmp" "$out/$page.md"
+done
 
-echo "gen-docs: wrote $out/errors.md and $out/json-schemas.md"
+if $check; then
+    # A plain recursive diff also catches a generated page deleted from, or a stray file
+    # added to, docs/generated.
+    if ! diff -ru docs/generated "$out"; then
+        echo
+        echo "docs/generated/ is stale — run ./bin/gen-docs and commit the result." >&2
+        exit 1
+    fi
+    echo "gen-docs: docs/generated is up to date"
+else
+    echo "gen-docs: wrote ${pages[*]/%/.md} in $out"
+fi

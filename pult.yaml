@@ -45,5 +45,5 @@ commands:
     run: "./bin/design"
 
   - id: gen-docs
-    title: Regenerate the derived docs (error codes, per-command JSON schemas)
+    title: Regenerate the derived docs (error codes, command list, per-command JSON schemas)
     run: "./bin/gen-docs"

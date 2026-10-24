@@ -1,8 +1,9 @@
 <!--
 GENERATED FILE — do not edit by hand.
-Produced by `bin/gen-docs` (crates/forklift/src/docgen.rs). `bin/check` regenerates and
-diffs this file to catch drift; run `bin/gen-docs` and commit the result after a change
-that affects it (a new error code, or a `--json` output struct).
+Produced by `bin/gen-docs` (crates/forklift/src/docgen.rs). CI and `bin/check` run
+`bin/gen-docs --check`, which fails when this file is stale; run `bin/gen-docs` and commit
+the result after a change that affects it (an error code, a command, alias or help line,
+or a `--json` output struct).
 -->
 
 # Error codes and exit codes

@@ -1048,6 +1048,8 @@ pub enum DocgenTarget {
     Errors,
     /// Every command's `--json` `data` payload schema (`docs/generated/json-schemas.md`).
     JsonSchemas,
+    /// Every command and subcommand with its aliases (`docs/generated/commands.md`).
+    Commands,
 }
 
 #[derive(Subcommand)]

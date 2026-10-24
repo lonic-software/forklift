@@ -1,10 +1,11 @@
-//! Generates the reference fragments under `docs/generated/` (errors table, per-command
-//! `--json` schemas). Only compiled in behind the `docgen` feature (see `bin/gen-docs`); a
+//! Generates the reference fragments under `docs/generated/` (errors table, command and alias
+//! list, per-command `--json` schemas). Only compiled in behind the `docgen` feature (see `bin/gen-docs`); a
 //! release build never enables it, so this module — and the `schemars` dependency it needs —
 //! costs the shipped binary nothing.
 //!
-//! Both renderers are deterministic (fixed iteration order), so `bin/gen-docs` run twice
-//! produces byte-identical output and `bin/check` can verify freshness with a plain diff.
+//! Every renderer is deterministic (fixed iteration order), so `bin/gen-docs` run twice
+//! produces byte-identical output and `bin/gen-docs --check` (run by CI and `bin/check`) can
+//! verify freshness with a plain diff.
 
 use crate::cli::Cli;
 use crate::internal_refs::check_no_internal_refs;
@@ -47,12 +48,81 @@ pub fn render_errors() -> Result<String, String> {
     Ok(out)
 }
 
+/// Render `docs/generated/commands.md`: every command and subcommand, with its aliases and its
+/// one-line description, read from the clap definition in `cli.rs` the binary parses with.
+///
+/// # Returns
+/// * `Ok(String)`  - The rendered markdown.
+/// * `Err(String)` - A listed command has no one-line description (it would render as an empty
+///                   cell), or a description cites a reference only the project's own trackers can
+///                   resolve (see [`check_no_internal_refs`]).
+pub fn render_commands() -> Result<String, String> {
+    let mut out = String::new();
+    out.push_str(GENERATED_BANNER);
+    out.push_str("# Commands and aliases\n\n");
+    out.push_str(
+        "Every `forklift` command and subcommand, generated from the same command definition the \
+         binary parses its arguments with, so a new command or alias cannot be missing here. \
+         An **alias** is a short name shown in `forklift help`. A **hidden alias** is accepted \
+         but not shown; most are git's name for the same command, so `forklift commit` runs \
+         `stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` \
+         walks through them by task.\n\n",
+    );
+    out.push_str("| Command | Alias | Hidden alias | Does |\n");
+    out.push_str("|---|---|---|---|\n");
+    for command in Cli::command().get_subcommands() {
+        render_command_rows(&mut out, "", command)?;
+    }
+    out.push('\n');
+    check_no_internal_refs("commands.md", &out)?;
+    Ok(out)
+}
+
+/// Append one table row for `command` (prefixed by its parents' names), then one per visible
+/// subcommand, depth first, in declaration order. Hidden commands (the `__docgen` diagnostic
+/// among them) are skipped along with everything under them.
+fn render_command_rows(out: &mut String, parent: &str, command: &clap::Command) -> Result<(), String> {
+    if command.is_hide_set() {
+        return Ok(());
+    }
+    let name = if parent.is_empty() {
+        command.get_name().to_string()
+    } else {
+        format!("{parent} {}", command.get_name())
+    };
+    let about = command.get_about().map(|about| about.to_string()).unwrap_or_default();
+    if about.trim().is_empty() {
+        return Err(format!(
+            "docgen: command `{name}` has no one-line description (its doc comment's first \
+             line), so commands.md would show an empty cell. Give it one in cli.rs."
+        ));
+    }
+    let visible: Vec<&str> = command.get_visible_aliases().collect();
+    let hidden: Vec<&str> = command.get_all_aliases().filter(|alias| !visible.contains(alias)).collect();
+    out.push_str(&format!(
+        "| `{}` | {} | {} | {} |\n",
+        name,
+        code_list(&visible),
+        code_list(&hidden),
+        about.trim().replace('|', "\\|"),
+    ));
+    for sub in command.get_subcommands() {
+        render_command_rows(out, &name, sub)?;
+    }
+    Ok(())
+}
+
+/// `a`, `b` as inline code, or nothing for an empty list.
+fn code_list(names: &[&str]) -> String {
+    names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+}
+
 /// Commands whose `--json` data is either the generic message shape (`{ "message": string }`)
 /// or no structured data (or no `--json` output) at all — deliberately outside the schema
 /// registry, with the reason. Every *other* CLI command must be in [`command_schemas`]:
 /// [`render_json_schemas`] checks the two lists are exhaustive and disjoint over the real CLI
 /// surface, the same shape as `mcp.rs`'s `every_cli_command_is_an_mcp_tool_or_explicitly_human_only`
-/// test — except this check runs *inside the generator itself* (`bin/gen-docs`, so `bin/check`),
+/// test — except this check runs *inside the generator itself* (`bin/gen-docs`, so CI and `bin/check`),
 /// because `cargo test --workspace` never compiles the `docgen` feature and so could never run a
 /// `#[cfg(test)]` version of it. A command with a JSON output struct that never got wired into
 /// the registry now fails the build instead of silently missing from json-schemas.md — the exact
@@ -166,9 +236,10 @@ pub fn render_json_schemas() -> Result<String, String> {
 
 const GENERATED_BANNER: &str = "<!--\n\
     GENERATED FILE — do not edit by hand.\n\
-    Produced by `bin/gen-docs` (crates/forklift/src/docgen.rs). `bin/check` regenerates and\n\
-    diffs this file to catch drift; run `bin/gen-docs` and commit the result after a change\n\
-    that affects it (a new error code, or a `--json` output struct).\n\
+    Produced by `bin/gen-docs` (crates/forklift/src/docgen.rs). CI and `bin/check` run\n\
+    `bin/gen-docs --check`, which fails when this file is stale; run `bin/gen-docs` and commit\n\
+    the result after a change that affects it (an error code, a command, alias or help line,\n\
+    or a `--json` output struct).\n\
 -->\n\n";
 
 /// One `--json` `data` shape for json-schemas.md, generated under schemars' *serialize*
