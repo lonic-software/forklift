@@ -146,7 +146,8 @@ Reference: [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf),
 
 **The problem.** A git clone downloads every file of every version unless you combine partial
 clone, for what is downloaded, with sparse-checkout, for what is on disk. They are separate
-features with separate commands, and the rest of git does not know which paths you left out.
+features with separate commands, and a partial clone's filter usually selects by object type or
+size rather than by the paths you work on.
 
 **How Forklift handles it.** Sparseness is one concept across the commands: a sparse warehouse
 fetches only the paths you ask for, and everything else stays **sealed by hash**, pinned to the
@@ -238,11 +239,12 @@ Reference: [`franchise`](cli.md#franchise--clone-fr),
 
 **The problem.** A git remote that accepts pushes runs git on the server: a process that
 negotiates which objects to send and builds a pack for each fetch. Hosting it means running and
-scaling those processes, and trusting what they serve.
+scaling those processes.
 
 **How Forklift handles it.** A Forklift remote is storage plus thin verifiers. It checks every
-object it accepts against its hash. The client checks everything it downloads by hash and
-signature, so altered content or forged history from a remote is caught. What you still rely on a
+object it accepts against its hash. The client checks everything it downloads by hash, and
+in a warehouse with an office, every parcel since the anchor by signature too, so forged history
+is caught as well as altered content. What you still rely on a
 remote for is availability and freshness: it could withhold data or keep serving an older signed
 head, and at first contact you verify its genesis yourself. That is what lets it be object storage
 behind small functions.
@@ -254,43 +256,47 @@ There are two server **heads** behind one protocol:
 - **The AWS head** (`forklift-aws-lambda`): API Gateway and two Lambda functions in front of S3
   and DynamoDB. Uploads and downloads of objects go directly between the client and S3 on
   presigned URLs instead of through the API; the functions read an upload only to check its
-  hash. See [the deployment reference](../DEPLOYMENT.md).
+  hash. Signatures, which are small, come through the API. See [the deployment reference](../DEPLOYMENT.md).
 
 Reference: [Working with remotes](cli.md#6-working-with-remotes) and the
 [remote protocol](../format/REMOTE_PROTOCOL.md).
 
 ## 6. Durability you can reason about
 
-**The problem.** When a git command is killed part-way, cleaning up is left to you: a stale
-`index.lock` stops every later command until you delete it by hand, and a half-finished operation
-has to be untangled by reading what it left behind.
+**The problem.** When a git command is killed part-way, cleaning up is left to you: a
+half-finished operation has to be untangled by reading what it left behind.
 
 **How Forklift handles it.** Forklift keeps one rule: anything another command can see is already
 on disk durably. If a write fails in the one window where that could break, Forklift records what
 is affected, and every command refuses with a coded error until `heal` resolves it. The next
 command usually resolves it on its own. An operation that is interrupted part-way (a merge, a
 shift, a park) is likewise recorded, and `heal` finishes or reverses it. On a healthy warehouse
-there is nothing to do. (One stale lock remains: a `forklift-server` that is hard-killed leaves
-its serve lock behind; see [Running a server](../SERVER.md).)
+there is nothing to do:
 
 ```console
 $ forklift heal
 Nothing to heal — no durability taint is standing.
 ```
 
+Locks are the exception. Like git's `index.lock`, Forklift's locks are files, and a command that is
+killed hard leaves its lock behind. The next command refuses and names the process that held it,
+and you remove the lock once that process is gone. A hard-killed `forklift-server` leaves its serve
+lock the same way; see [Running a server](../SERVER.md).
+
 Reference: [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation) and
 [Interrupted operations](cli.md#interrupted-operations).
 
 ## 7. Parallel by default
 
-**The problem.** git parallelizes some operations, such as checkout and packing, each behind its
-own setting. Work done one file at a time leaves most of a modern machine idle.
+**The problem.** git parallelizes some operations by default, such as packing, and others, such
+as checkout, only behind a setting. Work done one file at a time leaves most of a modern machine
+idle.
 
 **How Forklift handles it.** Forklift is designed to use every core by default, and spreads work
-across them wherever measurement shows it pays: hashing the working tree for `stocktake` and building the
-inventory, for example. Not every operation gains from it, and some were measured and kept serial.
-[The parallelization plan](../PARALLELIZATION_PLAN.md) lists every operation, whether it runs in
-parallel today, and why.
+across them wherever measurement shows it pays: hashing the working tree for `stocktake` and
+building the inventory, for example. Not every operation gains from it, and some were measured
+and kept serial. [The parallelization plan](../PARALLELIZATION_PLAN.md) lists every operation,
+whether it runs in parallel today, and why.
 
 ## 8. A first-class machine interface
 

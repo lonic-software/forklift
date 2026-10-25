@@ -500,14 +500,14 @@ fn concepts_run_as_written() {
 
 /// A page that shows commands in a `console` block promises they run as shown, so a page with one
 /// is either run here or a failure: adding examples to a page cannot leave them unrun. Every page
-/// git tracks is read, and a fence counts in any form `parse_steps` would refuse as well as the
-/// one it runs.
+/// in the repository is read, and a fence counts in any form `parse_steps` would refuse as well as
+/// the one it runs: either fence character, any case, indented, in a list item or a quote.
 #[test]
 fn every_page_with_console_blocks_is_run() {
     for path in tracked_pages() {
         let page = std::fs::read_to_string(&path).unwrap();
         let has_console = page.lines().any(|line| {
-            fence(line).is_some_and(|(_, _, info)| info.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("console")))
+            fence(line.trim_start_matches(|c: char| c == '>' || c.is_whitespace())).is_some_and(|(_, _, info)| info.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("console")))
         });
         if !has_console {
             continue;

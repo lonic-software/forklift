@@ -13,47 +13,75 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// The targets of the inline links `[text](target)` on a page, with their line numbers, outside
-/// code. A code span may wrap onto the next line, so whether a backtick run opens or closes one
-/// carries across lines, until the blank line that ends the paragraph.
+/// code. Code spans are found per paragraph, as CommonMark finds them: a run of backticks opens one
+/// only if a run of the same length follows in the paragraph, even on a later line, and an
+/// unmatched run is a literal backtick.
 fn link_targets(page: &str) -> Vec<(usize, String)> {
+    let lines = prose_lines(page);
     let mut targets = Vec::new();
-    let mut code_span: Option<usize> = None;
-    for (index, line) in prose_lines(page).into_iter().enumerate() {
-        if line.trim().is_empty() {
-            code_span = None;
+    let mut first = 0;
+    while first < lines.len() {
+        if lines[first].trim().is_empty() {
+            first += 1;
             continue;
         }
-
-        let mut outside_code = String::new();
-        let mut rest = line;
-        while !rest.is_empty() {
-            let ticks = rest.len() - rest.trim_start_matches('`').len();
-            if ticks > 0 {
-                code_span = match code_span {
-                    None => Some(ticks),
-                    Some(open) if open == ticks => None,
-                    open => open,
-                };
-                outside_code.push(' ');
-                rest = &rest[ticks..];
-                continue;
-            }
-            let next = rest.find('`').unwrap_or(rest.len());
-            if code_span.is_none() {
-                outside_code.push_str(&rest[..next]);
-            }
-            rest = &rest[next..];
+        let mut last = first;
+        while last + 1 < lines.len() && !lines[last + 1].trim().is_empty() {
+            last += 1;
         }
+        let paragraph = lines[first..=last].join("\n");
+        let outside_code = without_code_spans(&paragraph);
 
-        let mut rest = outside_code.as_str();
-        while let Some(at) = rest.find("](") {
-            let after = &rest[at + 2..];
-            let end = after.find([')', ' ']).unwrap_or(after.len());
-            targets.push((index + 1, after[..end].to_string()));
-            rest = &after[end..];
+        let mut from = 0;
+        while let Some(at) = outside_code[from..].find("](") {
+            let start = from + at + 2;
+            let end = outside_code[start..].find([')', ' ', '\n']).map_or(outside_code.len(), |end| start + end);
+            let line = first + 1 + outside_code[..start].matches('\n').count();
+            targets.push((line, outside_code[start..end].to_string()));
+            from = end;
         }
+        first = last + 1;
     }
     targets
+}
+
+/// `paragraph` with every code span replaced by one space. Line breaks inside a span are kept, so
+/// a position still maps to its line.
+fn without_code_spans(paragraph: &str) -> String {
+    let run_at = |text: &str| text.len() - text.trim_start_matches('`').len();
+    let mut kept = String::new();
+    let mut rest = paragraph;
+    while let Some(at) = rest.find('`') {
+        kept.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let ticks = run_at(rest);
+
+        let mut search = ticks;
+        let mut closing = None;
+        while let Some(next) = rest[search..].find('`') {
+            let position = search + next;
+            let length = run_at(&rest[position..]);
+            if length == ticks {
+                closing = Some(position);
+                break;
+            }
+            search = position + length;
+        }
+
+        match closing {
+            Some(position) => {
+                kept.push(' ');
+                kept.extend(rest[..position].chars().filter(|&c| c == '\n'));
+                rest = &rest[position + ticks..];
+            }
+            None => {
+                kept.push_str(&rest[..ticks]);
+                rest = &rest[ticks..];
+            }
+        }
+    }
+    kept.push_str(rest);
+    kept
 }
 
 /// The anchor GitHub gives a heading: lowercased, every character but letters, digits, spaces,
@@ -171,8 +199,12 @@ fn links_are_read_outside_code_only() {
 
     // A code span that wraps: the link after it on the next line is still read.
     assert_eq!(link_targets("ends with `a span\nthat wraps` then [a](x.md)."), [(2, "x.md".to_string())]);
-    // A blank line ends a paragraph, so an unclosed backtick does not hide the next one's links.
-    assert_eq!(targets("a stray ` backtick\n\n[a](x.md)"), ["x.md"]);
+    // A backtick with no partner is literal, so the links after it are read, in its paragraph too.
+    assert_eq!(targets("a stray ` backtick, see [a](x.md)"), ["x.md"]);
+    assert_eq!(targets("a stray ` backtick\nthen [a](x.md)\n\n[b](y.md)"), ["x.md", "y.md"]);
+    // A span closes only on a run of its own length, and never across a blank line.
+    assert!(targets("``a ` b\n[not](a link) c``").is_empty());
+    assert_eq!(targets("`open\n\n[a](x.md)` text"), ["x.md"]);
     // A target wrapped onto the next line is read as empty, which is reported, not skipped.
     assert_eq!(targets("[a](\nx.md)"), [""]);
 }

@@ -61,21 +61,33 @@ pub fn repository_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
 }
 
-/// Every Markdown page git tracks, sorted. Asking git, not walking folders, keeps a page anywhere
-/// in the tree from being missed and a build folder from being read.
+/// Every Markdown page in the repository, sorted: the ones git tracks and the new ones it does not
+/// ignore, so a page is checked before it is committed. Asking git, not walking folders, keeps a
+/// page anywhere in the tree from being missed and a build folder from being read.
 #[allow(dead_code)] // Used by only some of the test files that include this module.
 pub fn tracked_pages() -> Vec<std::path::PathBuf> {
     let root = repository_root();
-    let output = Command::new("git").arg("-C").arg(&root).args(["ls-files", "-z", "--", "*.md"]).output().unwrap();
-    assert!(output.status.success(), "git ls-files failed: {}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.md"])
+        .output()
+        .expect("the documentation tests list the pages with git, which must be on PATH");
+    assert!(
+        output.status.success(),
+        "the documentation tests need a git checkout to list the pages: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let mut pages: Vec<std::path::PathBuf> = String::from_utf8(output.stdout)
         .unwrap()
         .split('\0')
         .filter(|name| !name.is_empty())
         .map(|name| root.join(name))
+        .filter(|path| path.is_file()) // A page deleted but not yet staged is still listed.
         .collect();
     pages.sort();
+    pages.dedup();
     pages
 }
 
