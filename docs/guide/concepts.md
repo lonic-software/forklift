@@ -340,8 +340,6 @@ the page that describes the shipped behaviour:
 
 - Hauls merge within one warehouse, and reviews are recorded but do not gate a merge: see
   [`haul`](cli.md#haul--pull-requests-reviewable-merge-proposals).
-- The AWS head has no per-pallet authorization: every caller holding its token has the same
-  privileges. See [what the bearer token controls](../DEPLOYMENT.md#what-the-bearer-token-does--and-does-not--control).
 - File-level access control is designed but not built: see
   [Keeping these guides current](README.md#keeping-these-guides-current).
 

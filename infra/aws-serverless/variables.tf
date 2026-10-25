@@ -25,18 +25,62 @@ variable "verifier_package" {
 
 variable "auth_token" {
   description = <<-EOT
-    The bearer token the control plane requires via `Authorization: Bearer <token>`
-    (`FORKLIFT_TOKEN`). The code accepts any non-empty token; this module raises the floor to a
-    minimum length so a trivial or accidentally-empty value cannot be deployed. There is no
-    variable that maps to `FORKLIFT_OPEN_ACCESS` — deploying open access is not constructible
-    through this module (see the README's "Footguns closed by construction").
+    The shared bearer token: the deployment's administrator credential, full access under every
+    office rule, presented as `Authorization: Bearer <token>`. The function never receives it —
+    only its SHA-256 digest (`FORKLIFT_TOKEN_SHA256`) — though it is still held in this module's
+    state. Optional, but at least one of `auth_token` and `operator_token_digests` must be set.
+    The code accepts any non-blank token; this module raises the floor to a minimum length so a
+    trivial or accidentally-empty value cannot be deployed. There is no variable that maps to
+    `FORKLIFT_OPEN_ACCESS` — deploying open access is not constructible through this module (see
+    the README's "Footguns closed by construction").
   EOT
   type        = string
+  default     = null
   sensitive   = true
 
   validation {
-    condition     = length(trimspace(var.auth_token)) >= 16
+    condition     = var.auth_token == null || length(trimspace(coalesce(var.auth_token, " "))) >= 16
     error_message = "auth_token must be at least 16 non-whitespace characters."
+  }
+}
+
+variable "operator_token_digests" {
+  description = <<-EOT
+    Per-operator bearer tokens, by digest: a map from each token's SHA-256 (64 lowercase hex
+    characters: `printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1`) to the office identifier it
+    authenticates as (`FORKLIFT_OPERATOR_TOKENS`). Each request made with such a token is judged
+    by the warehouse's office: its role and pallet grants decide what it may upload and move.
+    The plaintext tokens never pass through this module. Optional, but at least one of
+    `auth_token` and `operator_token_digests` must be set.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for digest, identifier in var.operator_token_digests :
+      can(regex("^[0-9a-f]{64}$", digest)) && digest != sha256("") && trimspace(identifier) != ""
+    ])
+    error_message = "Each operator_token_digests key must be a token's SHA-256 (64 lowercase hex characters, never the empty string's), and each value a non-blank office identifier."
+  }
+
+  validation {
+    condition     = var.auth_token != null || length(var.operator_token_digests) > 0
+    error_message = "Set auth_token, operator_token_digests, or both: a control plane with no credential would refuse every request."
+  }
+
+  # Multi-warehouse mode: only the shared bearer sets a warehouse id up, so operator tokens alone
+  # could never write anywhere. The function refuses this too, at cold start.
+  validation {
+    condition     = var.warehouse_id != null || var.auth_token != null || length(var.operator_token_digests) == 0
+    error_message = "Multi-warehouse mode (warehouse_id = null) needs auth_token: only the shared bearer sets a warehouse up."
+  }
+
+  # The function refuses this too, at cold start: its shared-bearer match is tried first, so the
+  # operator binding would be dead and its holder an administrator.
+  validation {
+    condition     = !contains(keys(var.operator_token_digests), sha256(var.auth_token == null ? "" : var.auth_token))
+    error_message = "An operator_token_digests key is the digest of auth_token: the shared bearer and an operator token must differ."
   }
 }
 
@@ -89,8 +133,8 @@ variable "warehouse_id" {
     Null (the default) deploys in multi-warehouse mode (`FORKLIFT_WAREHOUSE_ID` unset) — routes
     live under `/warehouses/{id}/v1/...`. A non-null value deploys single-warehouse mode, serving
     fixed `/v1/...` routes. There is no invented default id: this mirrors `config_from_env`
-    exactly. Note: the auth token is single-tenant regardless of this setting — one token rules
-    every warehouse id in multi-warehouse mode (F8).
+    exactly. In multi-warehouse mode one credential set is accepted for every warehouse id, and
+    `auth_token` is required: only the shared bearer sets a warehouse id up (F8).
   EOT
   type        = string
   default     = null

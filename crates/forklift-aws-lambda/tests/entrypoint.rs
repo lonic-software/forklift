@@ -25,7 +25,7 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
-use forklift_aws_lambda::{handle, AuthConfig, BearerToken, Head, Routing};
+use forklift_aws_lambda::{handle, AuthConfig, Credentials, Head, Routing, TokenDigest};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{
@@ -654,36 +654,31 @@ fn a_trusted_lift_runs_the_audit_through_http() {
     assert!(info.trust.is_some());
 }
 
-/// **Pins the documented current posture** (`entrypoint::authenticate`'s doc comment,
-/// `docs/DEPLOYMENT.md`'s "What the bearer token does — and does not — control"): this head has
-/// no per-pallet authorization. Every request in this test carries nothing but the shared
-/// bearer token — no operator identity is ever presented, because this head has no mechanism to
-/// present one (no `Principal`, no per-operator token file, no authentication hook) — and that
-/// single secret is sufficient to move the office pallet itself, the most privileged pallet a
-/// warehouse has, exactly as it is sufficient to move an ordinary one. The content-level audit
-/// (closure presence, fast-forward, the signed office chain) still runs and still passes,
-/// because the pushed history really is validly signed; what this test isolates is that nothing
-/// *in addition* to that content check ever asks who transported the bytes.
+/// **Pins the shared bearer's authority** (`docs/DEPLOYMENT.md`'s "What the bearer tokens do —
+/// and do not — control"): the shared bearer (`FORKLIFT_TOKEN_SHA256`) resolves to
+/// `Principal::Static`, the deployment's own administrator credential, which every office
+/// authority rule admits — exactly as `forklift-server`'s static token. Every request in this
+/// test carries nothing but that bearer, and it is sufficient to move the office pallet itself,
+/// the most privileged pallet a warehouse has, as it is sufficient to move an ordinary one. The
+/// content-level audit (closure presence, fast-forward, the signed office chain) still runs and
+/// still passes, because the pushed history really is validly signed; what this test isolates
+/// is that the authority rules add nothing on top of it for this credential. Per-operator tokens
+/// are where roles and grants bite (see the `an_operator_*` tests below); a deployment that wants
+/// every caller judged by the office hands out operator tokens and keeps the shared bearer for
+/// its administrator, or configures none.
+///
+/// This is deliberate, not a gap waiting to be closed: do not invert it. A head that refused its
+/// own administrator credential would leave a re-genesis — which no operator may sanction —
+/// with no one able to make it.
 ///
 /// The two pushes run against **two independent fixtures**, not one shared warehouse. On a
 /// trusted warehouse, the non-office `ref_update` arm refuses with a 422 ("the office pallet is
-/// missing") whenever the ref store has no office head yet (that check lives inside
-/// `if let Some(anchor) = &anchor`, so an untrusted warehouse never reaches it) — so a single
-/// shared fixture would make the `main` assertion
-/// causally dependent on the `@office` HTTP push above it having already landed — a future gate
-/// that refused the office push with `403` would flip the `main` assertion to `422` for an
-/// unrelated reason (a missing office head), not the `403` that would actually signal a
-/// per-pallet gate. To keep the two assertions independent, `main_fixture`'s office head is
-/// seeded directly through `RefStore::compare_and_set_head`, never through the office HTTP
-/// endpoint, so it exists regardless of what that endpoint would do.
-///
-/// **Invert this when operator identity lands:** the day this head grows a caller-identity
-/// mechanism and calls the shared transport rule `forklift_core`'s `authority_utils::may_move`
-/// (as `forklift-server`'s `Principal::Operator` path does), a request carrying only the shared
-/// bearer — resolving to no operator identity — should be refused for at least one pallet class,
-/// and that assertion's `200` must become a `403`. Each assertion below flips independently: the office push flipping
-/// says nothing about whether the main push would too, and vice versa, which is the point of
-/// keeping them on separate fixtures.
+/// missing") whenever the ref store has no office head yet, so a single shared fixture would
+/// make the `main` assertion causally dependent on the `@office` HTTP push above it having
+/// already landed: a regression refusing the office push with `403` would flip the `main`
+/// assertion to `422` for an unrelated reason. To keep the two assertions independent,
+/// `main_fixture`'s office head is seeded directly through `RefStore::compare_and_set_head`,
+/// never through the office HTTP endpoint, so it exists regardless of what that endpoint does.
 #[test]
 fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
     let area = Area::new("shared-bearer-full-access");
@@ -718,7 +713,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
             objects: Arc::new(MemoryObjectStore::new()),
             refs: Arc::new(MemoryRefStore::new()),
             routing: Routing::Single("wh".to_string()),
-            auth: AuthConfig::Token(BearerToken::new("shared-secret".to_string()).unwrap()),
+            auth: credentials(Some("shared-secret"), &[]),
         };
         for (hash, bytes) in &harvest.objects {
             fixture.objects.put_verified(hash, bytes).expect("seed object");
@@ -746,7 +741,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
             serde_json::to_vec(&office).unwrap()
         ))),
         200,
-        "the office pallet moved on the shared bearer alone — no caller-role check ran"
+        "the office pallet moved on the shared bearer alone: the administrator credential"
     );
 
     // --- Assertion 2: an ordinary pallet moves on the identical bearer too. The office head is
@@ -782,6 +777,294 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
         200,
         "an ordinary pallet moved on the identical bearer, independently of the office push above"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// Per-operator tokens: each request judged by the office against the operator its token names.
+// -------------------------------------------------------------------------------------------
+
+/// `request` carrying `Authorization: Bearer <token>`.
+fn bearing(token: &str, mut request: Request<Vec<u8>>) -> Request<Vec<u8>> {
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {}", token).parse().expect("a header value"),
+    );
+    request
+}
+
+/// Enroll `identifier` in `dir`'s office with `role_args` (`office role`'s arguments after the
+/// identifier), from a key generated under that identifier, then switch back to the admin.
+fn enroll(area: &Area, dir: &str, identifier: &str, role_args: &[&str]) {
+    area.forklift(dir, &["config", "operator.identifier", identifier]);
+    let keygen = area.forklift_stdout(dir, &["office", "keygen"]);
+    area.forklift(dir, &["config", "operator.identifier", "tester@forklift"]);
+
+    let admit: Vec<&str> = keygen.lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .collect();
+    area.forklift(dir, &admit);
+
+    let mut role = vec!["office", "role", identifier];
+    role.extend(role_args);
+    area.forklift(dir, &role);
+}
+
+/// The tokens the operator tests configure: the shared bearer and one token per operator, of
+/// whom `nobody@forklift` is never enrolled.
+fn operator_credentials() -> AuthConfig {
+    credentials(Some("admin-secret"), &[
+        ("wes-token", "wes@forklift"),
+        ("rea-token", "rea@forklift"),
+        ("nobody-token", "nobody@forklift"),
+    ])
+}
+
+/// A trusted warehouse whose office enrolls `tester@forklift` (admin), `wes@forklift` (a writer
+/// granted `main` only) and `rea@forklift` (a reader), with one signed parcel on `main`. Returns
+/// the harvest, the office head and main's head.
+fn rostered_warehouse(area: &Area) -> (Harvest, String, String) {
+    prepare(area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    enroll(area, "wh", "wes@forklift", &["writer", "--pallet", "main"]);
+    enroll(area, "wh", "rea@forklift", &["reader"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_head = harvest.head_of("main").expect("main head");
+    (harvest, office_head, main_head)
+}
+
+/// A fixture behind [`operator_credentials`], seeded with every harvested object and signature.
+fn seeded(harvest: &Harvest) -> Fixture {
+    let fixture = Fixture { auth: operator_credentials(), ..Fixture::direct() };
+    for (hash, bytes) in &harvest.objects {
+        fixture.objects.put_verified(hash, bytes).expect("seed object");
+    }
+    for (hash, sidecar) in &harvest.signatures {
+        fixture.objects.put_signature(hash, sidecar).expect("seed signature");
+    }
+    fixture
+}
+
+/// Every route by which bytes or refs reach storage, as `token`, against a trusted warehouse
+/// with its office lifted. Each answer is collected, not asserted, so a test reads as a table.
+fn write_routes(fixture: &Fixture, token: &str, office_head: &str, main_head: &str) -> Vec<(&'static str, u16)> {
+    let fresh = b"bytes this operator wants stored".to_vec();
+    let fresh_hash = object_utils::hash_object_bytes(&fresh);
+    let signed = fixture.objects.get_signature(main_head).expect("read").expect("main is signed");
+    let call = |request| status(&fixture.call(bearing(token, request)));
+
+    vec![
+        ("upload-targets", call(post_json(
+            "/v1/objects/upload-targets",
+            &UploadTargetsRequest { session: "lift-1".to_string(), hashes: vec![fresh_hash.clone()] },
+        ))),
+        ("object put", call(put_bytes(&format!("/v1/objects/{}", fresh_hash), fresh))),
+        ("signature put", call(put_bytes(&format!("/v1/signatures/{}", main_head), signed))),
+        ("commit", call(post_json(
+            "/v1/lift/lift-1/commit",
+            &CommitLiftRequest { control_plane: vec![], blobs: vec![], more: false },
+        ))),
+        ("move main", call(post_json(
+            "/v1/pallets/main",
+            &RefUpdateRequest { old_head: None, new_head: main_head.to_string() },
+        ))),
+        ("move side", call(post_json(
+            "/v1/pallets/side",
+            &RefUpdateRequest { old_head: None, new_head: main_head.to_string() },
+        ))),
+        // Moving the office to a head that is not even an object: any caller the gate lets
+        // through is refused 422 for the spelling, so a 403 here is the gate's alone.
+        ("move the office", call(post_json(
+            &format!("/v1/pallets/@{}", OFFICE_PALLET_NAME),
+            &RefUpdateRequest { old_head: Some(office_head.to_string()), new_head: "not-a-hash".to_string() },
+        ))),
+    ]
+}
+
+/// A trusted warehouse with an office, lifted by the administrator over the shared bearer.
+fn lifted_office(harvest: &Harvest, office_head: &str) -> Fixture {
+    let fixture = seeded(harvest);
+    let anchor = harvest.trust.clone().expect("trust established");
+
+    assert_eq!(status(&fixture.call(bearing("admin-secret", put_json("/v1/trust", &anchor)))), 201);
+    let office = RefUpdateRequest { old_head: None, new_head: office_head.to_string() };
+    assert_eq!(
+        status(&fixture.call(bearing("admin-secret", post_json(&format!("/v1/pallets/@{}", OFFICE_PALLET_NAME), &office)))),
+        200
+    );
+    fixture
+}
+
+/// A reader may write nothing: every upload route and every ref update is a `403`, the office
+/// included. An operator the office does not enroll is refused the same way.
+#[test]
+fn an_operator_reader_or_stranger_is_refused_on_every_write_route() {
+    let area = Area::new("operator-reader");
+    let (harvest, office_head, main_head) = rostered_warehouse(&area);
+
+    for token in ["rea-token", "nobody-token"] {
+        let fixture = lifted_office(&harvest, &office_head);
+
+        for (route, answer) in write_routes(&fixture, token, &office_head, &main_head) {
+            assert_eq!(answer, 403, "{} by {}", route, token);
+        }
+
+        let info: WarehouseInfo = body_json(&fixture.call(bearing("admin-secret", get("/v1/warehouse"))));
+        assert_eq!(info.pallets.get("main"), None, "nothing moved for {}", token);
+    }
+}
+
+/// A writer granted `main` uploads, moves `main`, and may move a meta pallet, but is refused a
+/// pallet outside the grant. The office move is still refused, by the office's own content check
+/// (a `422` for the bad head), not by the gate.
+#[test]
+fn an_operator_writer_moves_only_the_pallets_it_is_granted() {
+    let area = Area::new("operator-writer");
+    let (harvest, office_head, main_head) = rostered_warehouse(&area);
+    let fixture = lifted_office(&harvest, &office_head);
+
+    let answers: HashMap<&str, u16> = write_routes(&fixture, "wes-token", &office_head, &main_head).into_iter().collect();
+
+    assert_eq!(answers["upload-targets"], 200);
+    assert_eq!(answers["object put"], 201);
+    assert_eq!(answers["signature put"], 200, "the identical sidecar, idempotently");
+    assert_eq!(answers["commit"], 200);
+    assert_eq!(answers["move main"], 200, "main is granted");
+    assert_eq!(answers["move side"], 403, "side is not");
+    assert_eq!(answers["move the office"], 422, "a writer passes the meta-pallet gate");
+
+    let info: WarehouseInfo = body_json(&fixture.call(bearing("admin-secret", get("/v1/warehouse"))));
+    assert_eq!(info.pallets.get("main"), Some(&main_head));
+    assert_eq!(info.pallets.get("side"), None);
+}
+
+/// No operator may sanction a re-genesis: its authority would come from the very chain being
+/// replaced. The administrator's shared bearer may, which is also what shows the anchor offered
+/// is a well-formed re-genesis the operator was refused for being an operator.
+#[test]
+fn an_operator_re_genesis_is_refused_and_the_shared_bearers_is_not() {
+    let area = Area::new("operator-re-genesis");
+    let (harvest, office_head, _) = rostered_warehouse(&area);
+    let fixture = lifted_office(&harvest, &office_head);
+
+    let prior = harvest.trust.clone().expect("trust established");
+    let replacement = TrustAnchorDto {
+        genesis: "b".repeat(64),
+        enabled_at: prior.enabled_at + 1,
+        boundary: vec![],
+        prior_genesis: Some(prior.genesis.clone()),
+        adopts: Some(office_head.clone()),
+    };
+
+    for token in ["wes-token", "rea-token", "nobody-token"] {
+        let response = fixture.call(bearing(token, put_json("/v1/trust", &replacement)));
+        assert_eq!(status(&response), 403, "a re-genesis by {}", token);
+    }
+
+    assert_eq!(status(&fixture.call(bearing("admin-secret", put_json("/v1/trust", &replacement)))), 201);
+}
+
+/// With no trust there is no office to consult, so the token is the whole gate: any configured
+/// operator token writes, enrolled anywhere or not.
+#[test]
+fn an_untrusted_warehouse_admits_any_operator() {
+    let area = Area::new("operator-untrusted");
+    prepare(&area, "wh");
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "unsigned"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main head");
+    let fixture = seeded(&harvest);
+
+    let fresh = b"bytes from a stranger".to_vec();
+    let fresh_hash = object_utils::hash_object_bytes(&fresh);
+    assert_eq!(status(&fixture.call(bearing("nobody-token", put_bytes(&format!("/v1/objects/{}", fresh_hash), fresh)))), 201);
+
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    assert_eq!(status(&fixture.call(bearing("nobody-token", post_json("/v1/pallets/main", &main)))), 200);
+}
+
+/// Multi-warehouse routing answers every id, so an id nobody has set up is not open to an
+/// operator token: it may neither write there nor claim the id by establishing its trust. Once
+/// the administrator has established trust, the office rules decide as anywhere else.
+#[test]
+fn in_multi_warehouse_routing_an_operator_writes_only_where_the_administrator_set_up() {
+    let area = Area::new("operator-multi");
+    let (harvest, _, main_head) = rostered_warehouse(&area);
+    let anchor = harvest.trust.clone().expect("trust established");
+    let fixture = Fixture { routing: Routing::Multi, ..seeded(&harvest) };
+
+    let fresh = b"bytes for a warehouse nobody set up".to_vec();
+    let fresh_hash = object_utils::hash_object_bytes(&fresh);
+    let object = || put_bytes(&format!("/warehouses/new/v1/objects/{}", fresh_hash), fresh.clone());
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+
+    for token in ["wes-token", "nobody-token"] {
+        assert_eq!(status(&fixture.call(bearing(token, put_json("/warehouses/new/v1/trust", &anchor)))), 403, "{}", token);
+        assert_eq!(status(&fixture.call(bearing(token, object()))), 403, "{}", token);
+        assert_eq!(
+            status(&fixture.call(bearing(token, post_json("/warehouses/new/v1/pallets/main", &main)))),
+            403,
+            "{}",
+            token
+        );
+        assert_eq!(status(&fixture.call(bearing(token, get("/warehouses/new/v1/warehouse")))), 200, "reads stay open");
+    }
+
+    let info: WarehouseInfo = body_json(&fixture.call(bearing("admin-secret", get("/warehouses/new/v1/warehouse"))));
+    assert!(info.trust.is_none(), "no operator established trust");
+
+    assert_eq!(status(&fixture.call(bearing("admin-secret", put_json("/warehouses/new/v1/trust", &anchor)))), 201);
+    assert_eq!(status(&fixture.call(bearing("nobody-token", object()))), 201, "set up, with no roster yet");
+}
+
+/// Trust established, office not yet lifted: there is no roster, so the gate admits every
+/// operator (the office's own first lift must get through). Nothing else may land in that
+/// window, because the commit is not conditioned on the office: a working pallet is refused by
+/// the audit for the missing office, and so is a meta pallet, which exists only under one.
+#[test]
+fn before_the_office_is_lifted_an_operator_moves_neither_a_working_nor_a_meta_pallet() {
+    let area = Area::new("operator-bootstrap");
+    let (harvest, _, main_head) = rostered_warehouse(&area);
+    let fixture = seeded(&harvest);
+    let anchor = harvest.trust.clone().expect("trust established");
+    assert_eq!(status(&fixture.call(bearing("admin-secret", put_json("/v1/trust", &anchor)))), 201);
+
+    for pallet in ["main", "@haul"] {
+        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+        let response = fixture.call(bearing("rea-token", post_json(&format!("/v1/pallets/{}", pallet), &request)));
+
+        assert_eq!(status(&response), 422, "{}", pallet);
+        let body: serde_json::Value = body_json(&response);
+        let message = body["error"].as_str().expect("an error message").to_lowercase();
+        assert!(message.contains("office"), "{}: {}", pallet, message);
+    }
+
+    let info: WarehouseInfo = body_json(&fixture.call(bearing("admin-secret", get("/v1/warehouse"))));
+    assert!(info.pallets.is_empty(), "{:?}", info.pallets);
+}
+
+/// A bearer that is blank after the scheme is refused like a missing one, by every credential
+/// configuration — it is never hashed and looked up.
+#[test]
+fn a_blank_bearer_is_refused() {
+    for blank in ["Bearer ", "Bearer    "] {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/warehouse")
+            .header(http::header::AUTHORIZATION, blank)
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(status(&call_with_auth(&operator_credentials(), request)), 401, "{:?}", blank);
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -898,6 +1181,15 @@ fn an_internal_error_is_redacted_at_the_edge_not_forwarded_verbatim() {
 // seam every other test in this file bypasses via `Fixture`'s `AuthConfig::Open` default.
 // -------------------------------------------------------------------------------------------
 
+/// Credentials of an optional shared bearer and one operator token per `(token, identifier)`,
+/// configured as a deployment configures them: by digest.
+fn credentials(static_token: Option<&str>, operators: &[(&str, &str)]) -> AuthConfig {
+    let digest = |token: &str| TokenDigest::of_token(token).expect("a non-blank token");
+    let operators = operators.iter().map(|(token, identifier)| (digest(token), identifier.to_string())).collect();
+
+    AuthConfig::Credentials(Credentials::new(static_token.map(digest), operators).expect("valid credentials"))
+}
+
 /// Route one request through `handle` with an explicit `AuthConfig`, over a fresh empty store.
 /// Every case here is decided by `authenticate` before the route even resolves, so which store
 /// backs it is irrelevant.
@@ -944,7 +1236,7 @@ fn the_open_opt_out_passes_every_request() {
 /// equal-length near-miss all refuse identically.
 #[test]
 fn a_configured_token_gates_every_request() {
-    let auth = AuthConfig::Token(BearerToken::new("secret".to_string()).unwrap());
+    let auth = credentials(Some("secret"), &[]);
 
     assert_eq!(
         status(&call_with_auth(&auth, get("/v1/warehouse"))),
@@ -999,6 +1291,11 @@ impl Area {
     }
 
     fn forklift(&self, dir: &str, args: &[&str]) {
+        self.forklift_stdout(dir, args);
+    }
+
+    /// Run the CLI as [`Area::forklift`] does, and return what it printed.
+    fn forklift_stdout(&self, dir: &str, args: &[&str]) -> String {
         let working = self.path(dir);
         std::fs::create_dir_all(&working).expect("create the working directory");
 
@@ -1017,6 +1314,8 @@ impl Area {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+
+        String::from_utf8_lossy(&output.stdout).to_string()
     }
 
     fn write_file(&self, relative: &str, content: &str) {

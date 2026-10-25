@@ -618,7 +618,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // precedence, could not recover a real token that precedence had already discarded in favor
     // of a blank one from the other source) — this line stays so `ServeOptions`, which is `pub`,
     // gives the same guarantee to any other constructor of it. Mirrors
-    // `forklift-aws-lambda::entrypoint::BearerToken::new`'s identical blank check.
+    // `forklift-aws-lambda::entrypoint::TokenDigest::of_token`'s identical blank check.
     let token = options.token.filter(|value| !value.trim().is_empty());
 
     // PR #124 round 5, F4: re-enforced here, beside the blank-token filter just above, rather

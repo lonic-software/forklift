@@ -9,24 +9,23 @@
 //! with a `307` redirect to a presigned storage URL when the [`ObjectStore`] is S3-backed,
 //! exactly as the protocol's redirect room allows.
 //!
-//! Authentication is the adapter's concern (`entrypoint::authenticate` — an optional API
-//! Gateway authorizer on top of it, if configured). There is no transport-level role/grant
-//! check anywhere in this crate to be the adapter's concern *of*: this type has no caller-
-//! identity concept at all, so it cannot consult an office role for who is calling. It is not
-//! a uniform "role for who signed" either: the office pallet's own parcels are checked against
-//! their signer's role, as of that parcel's own signing (`verify_office_chain`); every
-//! other pallet's parcels are accepted when they are either validly signed by a key the
-//! office currently tracks and has not revoked, or unsigned/untracked-key but reachable from
-//! the trust boundary (tolerated as legacy), or signed by a revoked key but reachable from that
-//! revocation's own distrust boundary — no role, no grant, in any of the three arms
-//! (`verify_pallet_history`). What it enforces is exactly that — the provider-independent
-//! content invariants: hash-verified objects, a
-//! fast-forward-only CAS, and — on a trusted warehouse — the full offline audit (the signed
-//! office chain and, for any non-office pallet, only its pushed history's own signature
-//! validity) before a ref moves. See [`Head::ref_update`]'s own doc comment and
-//! `docs/DEPLOYMENT.md`'s "What the bearer token does — and does not — control" for the
-//! caller-privilege consequence: every caller holding the transport bearer gets identical
-//! privileges over every pallet.
+//! Authentication is the adapter's concern (`entrypoint::authenticate`, with an optional API
+//! Gateway authorizer on top of it): it resolves who is calling to a [`Principal`], which every
+//! mutating method here takes. Authorization is this type's: each mutating method judges its
+//! caller with the office authority rules shared with `forklift-server`
+//! (`forklift_core::util::authority_utils`), against the office state it reads for itself. An
+//! upload (`upload_targets`, `object_put`, `signature_put`, `commit_lift`) is refused to an
+//! operator the office does not enroll and to a reader; a ref update is refused to an operator
+//! whose role and pallet grants do not admit that pallet; a trust re-genesis is refused to every
+//! operator, since its authority comes from the very chain being replaced. The shared bearer
+//! ([`Principal::Static`]) and an open head ([`Principal::Open`]) are the deployment's own
+//! credential, and pass every rule.
+//!
+//! The content invariants hold on top of that, for every caller alike: hash-verified objects, a
+//! fast-forward-only CAS, and — on a trusted warehouse — the full offline audit (the signed office
+//! chain, and for any non-office pallet its pushed history's own signature validity) before a ref
+//! moves. See [`Head::ref_update`]'s own doc comment and `docs/DEPLOYMENT.md`'s "What the bearer
+//! tokens do — and do not — control".
 //!
 //! **Every method here is synchronous and must be called from a blocking thread**
 //! (`tokio::task::spawn_blocking`), exactly as `forklift-server` runs its handlers' storage
@@ -36,8 +35,8 @@
 //! See `blocking.rs`.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use forklift_core::error::{CoreError, RefusalCode};
@@ -46,7 +45,8 @@ use forklift_core::model::remote::{
     PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::tree_item::TreeItem;
-use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
+use forklift_core::util::authority_utils::{self, Denied, Principal};
+use forklift_core::util::office_utils::{self, OfficeState, TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, sign_utils,
@@ -67,6 +67,11 @@ use crate::store::{
 /// malformed incumbent must degrade the message, never the outcome.
 fn genesis_of(json: &str) -> Option<String> {
     serde_json::from_str::<TrustAnchorDto>(json).ok().map(|dto| dto.genesis)
+}
+
+/// An office authority rule's refusal, as the `403` it is.
+fn forbidden(Denied(message): Denied) -> HeadError {
+    HeadError::forbidden(message)
 }
 
 /// How the head answers a byte read: the bytes, or a redirect to a storage URL.
@@ -116,6 +121,14 @@ enum ScratchSource {
     /// The process-global scratch for this warehouse, reused across warm invocations.
     Pooled(String),
 }
+
+/// Office states the authority rules have read, by office head. An office head is a content
+/// hash, so the state at one is the same in every warehouse and at every later time: an entry is
+/// never stale, only evicted. It spares an operator's every upload the office tree walk.
+static OFFICE_STATES: OnceLock<Mutex<HashMap<String, OfficeState>>> = OnceLock::new();
+
+/// How many office states [`OFFICE_STATES`] keeps; past it, one is dropped to make room.
+const MAX_CACHED_OFFICE_STATES: usize = 32;
 
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
@@ -175,6 +188,65 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
     }
 
+    /// The office state at an office head **already read once by the caller**, for the
+    /// authority rules: the head's whole tree is mirrored into the scratch and read there, the
+    /// stored state as `forklift-server` reads it (no chain verification — the ref update's
+    /// audit verifies the chain it commits on), then kept in [`OFFICE_STATES`]. An unborn
+    /// office, and an untrusted warehouse (whose office the rules never consult), are the empty
+    /// state.
+    fn office_state_at(&self, anchor: &Option<TrustAnchor>, office_head: Option<&str>) -> HeadResult<OfficeState> {
+        let empty = OfficeState { users: Vec::new(), keys: Vec::new() };
+
+        let (Some(_), Some(office_head)) = (anchor, office_head) else {
+            return Ok(empty);
+        };
+
+        let states = OFFICE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+
+        if let Some(state) = states.lock().map_err(|e| HeadError::internal(e.to_string()))?.get(office_head) {
+            return Ok(state.clone());
+        }
+
+        let scratch = self.scratch().map_err(HeadError::internal)?;
+
+        let state = scratch
+            .scoped(|| {
+                materialize_state(&self.objects, office_head, &mut Mirror::default())?;
+                office_utils::read_office_state_of(office_head)
+            })
+            .map_err(HeadError::internal)?;
+
+        let mut states = states.lock().map_err(|e| HeadError::internal(e.to_string()))?;
+        if states.len() >= MAX_CACHED_OFFICE_STATES {
+            if let Some(evicted) = states.keys().next().cloned() {
+                states.remove(&evicted);
+            }
+        }
+        states.insert(office_head.to_string(), state.clone());
+
+        Ok(state)
+    }
+
+    /// Authorize an upload: may this caller put bytes (objects, signatures, a staged lift) into
+    /// this warehouse at all? Only an operator is judged against the office, so only an operator
+    /// pays the reads. Nothing here is committed against the state read, so it is read fresh.
+    fn require_uploader(&self, caller: &Principal) -> HeadResult<()> {
+        if !matches!(caller, Principal::Operator(_)) {
+            return Ok(());
+        }
+
+        let anchor = self.refs.get_trust().map_err(HeadError::internal)?.map(|(anchor, _)| anchor);
+
+        let office_head = match anchor {
+            Some(_) => self.refs.get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME).map_err(HeadError::internal)?,
+            None => None,
+        };
+
+        let office_state = self.office_state_at(&anchor, office_head.as_deref())?;
+
+        authority_utils::may_upload(caller, &anchor, &office_state).map_err(forbidden)
+    }
+
     /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
     pub fn handshake(&self) -> HeadResult<WarehouseInfo> {
         let mut pallets = BTreeMap::new();
@@ -232,9 +304,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// serves both heads.
     pub fn upload_targets(
         &self,
+        caller: &Principal,
         session: &str,
         hashes: &[String],
     ) -> HeadResult<UploadTargetsResponse> {
+        self.require_uploader(caller)?;
         self.reject_malformed_batch(hashes)?;
 
         let mut response = UploadTargetsResponse {
@@ -306,10 +380,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// and the alternative (staging at the hash key) is exactly the invariant-1 hole.
     pub fn object_put(
         &self,
+        caller: &Principal,
         session: Option<&str>,
         hash: &str,
         bytes: &[u8],
     ) -> HeadResult<ObjectWriteResult> {
+        self.require_uploader(caller)?;
         require_object_hash(hash)?;
 
         match self.objects.put_target(session, hash).map_err(HeadError::internal)? {
@@ -344,7 +420,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// `PUT /v1/signatures/{hash}` — store a signature sidecar. The structure is validated
     /// here (`422` when malformed); whether it *verifies* is decided at ref-update time.
     /// A conflicting sidecar for an already-signed parcel is refused (`409`).
-    pub fn signature_put(&self, parcel_hash: &str, bytes: &[u8]) -> HeadResult<SignatureOutcome> {
+    pub fn signature_put(&self, caller: &Principal, parcel_hash: &str, bytes: &[u8]) -> HeadResult<SignatureOutcome> {
+        self.require_uploader(caller)?;
         require_object_hash(parcel_hash)?;
 
         sign_utils::validate_raw_parcel_signature(bytes, parcel_hash)
@@ -364,10 +441,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// `PUT /v1/trust` — establish the trust anchor (the same one-way door it is locally),
-    /// with the one sanctioned replacement: a re-genesis (§8.7). The static-token
-    /// authority a re-genesis requires is enforced by the runtime adapter, exactly as the
-    /// server head restricts it to its static token.
-    pub fn put_trust(&self, anchor: &TrustAnchorDto) -> HeadResult<TrustResult> {
+    /// with the one sanctioned replacement: a re-genesis (§8.7), which only the deployment's
+    /// own credential may make (`authority_utils::may_regenesis`), exactly as the server head
+    /// restricts it to its static token. Establishing a first anchor is not restricted.
+    pub fn put_trust(&self, caller: &Principal, anchor: &TrustAnchorDto) -> HeadResult<TrustResult> {
         // Clients refuse a malformed anchor at the handshake, and trust here is a one-way door:
         // one stored would lock every client out of this warehouse for good.
         anchor.validate().map_err(HeadError::unprocessable)?;
@@ -415,6 +492,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         if !is_regenesis {
             return Err(self.trust_one_way_door());
         }
+
+        authority_utils::may_regenesis(caller).map_err(forbidden)?;
 
         let office_head = self
             .refs
@@ -573,29 +652,36 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// `POST /v1/pallets/{name}` — the CAS ref update, the commit point of a lift and the
-    /// place the head enforces everything (DESIGN.html §4.2 step 6): closure presence,
-    /// fast-forward-ness, and — on a trusted warehouse — the same audit the CLI runs
-    /// offline. "Everything" is content-level only, exactly what the CLI's own offline audit
-    /// checks, and it differs by pallet: for the office pallet, every office-modifying parcel's
-    /// *signer* is checked against the office role it held as of that parcel's own signing
-    /// (`verify_office_chain`); for a meta pallet (`meta_tree::meta_rules`),
-    /// every new parcel passes `verify_meta_content` against the verified office, and the pallet
-    /// is refused outright without one; for any other pallet, a parcel is accepted when it is
-    /// either validly signed by a key the office currently tracks and has not revoked, or
-    /// unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), or
-    /// signed by a revoked key but reachable from that revocation's own distrust boundary — no
-    /// role, no grant, in any of the three arms
-    /// (`verify_pallet_history` → `classify_signature_trust`). There is no check on who
-    /// transported this request either way — this type takes no caller parameter at all — so a
-    /// caller who can produce a validly-signed history for a pallet can move it regardless of
-    /// what an office role would say about *that caller*, and — outside the office pallet —
-    /// regardless of what it would say about the *signer* too: an operator enrolled as
-    /// `reader`, or a `writer` granted only some other pallet, can sign and push this pallet's
-    /// history because no transport rule here consults `may_write_pallet` (only the `@haul`
-    /// content rule does, for a merged-state cell). The
-    /// audit runs against a scratch warehouse mirrored from the object store; the atomic CAS is
-    /// the DynamoDB conditional write of [`RefStore::compare_and_set_head`].
-    pub fn ref_update(&self, name: &str, request: &RefUpdateRequest) -> HeadResult<()> {
+    /// place the head enforces everything (DESIGN.html §4.2 step 6). Two layers, both always:
+    ///
+    /// * **Who may move this ref** — the caller, judged by `authority_utils::may_move`: an
+    ///   operator the office enrolls moves a meta pallet unless a reader, and a working pallet
+    ///   only as `may_write_pallet` admits; an operator the office does not enroll moves nothing
+    ///   once the office has a roster. The shared bearer and an open head pass. It is decided
+    ///   first, before the stale-head, hash-spelling and presence checks, so a refused caller
+    ///   never learns which of those would also have failed.
+    /// * **What the history may contain** — content-level, exactly what the CLI's own offline
+    ///   audit checks, and it differs by pallet: for the office pallet, every office-modifying
+    ///   parcel's *signer* is checked against the office role it held as of that parcel's own
+    ///   signing (`verify_office_chain`); for a meta pallet (`meta_tree::meta_rules`), every new
+    ///   parcel passes `verify_meta_content` against the verified office, and the pallet is
+    ///   refused outright without one; for any other pallet, a parcel is accepted when it is
+    ///   either validly signed by a key the office currently tracks and has not revoked, or
+    ///   unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), or
+    ///   signed by a revoked key but reachable from that revocation's own distrust boundary
+    ///   (`verify_pallet_history` → `classify_signature_trust`).
+    ///
+    /// The two layers judge different people: the first the caller who transports the request,
+    /// the second whoever signed the history. Holding the shared bearer remains full authority
+    /// over every pallet, the office included; it is the deployment's administrator credential.
+    ///
+    /// The trust anchor and the office head are each read once, and those reads serve the
+    /// authority decision, the stale check (the office's own head *is* the office head read),
+    /// the audit, and the commit's conditions alike: a grant revoked after the decision moves
+    /// the office head, and the commit refuses it. The audit runs against a scratch warehouse
+    /// mirrored from the object store; the atomic CAS is the DynamoDB conditional write of
+    /// [`RefStore::compare_and_set_head`].
+    pub fn ref_update(&self, caller: &Principal, name: &str, request: &RefUpdateRequest) -> HeadResult<()> {
         let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
         let namespace = pallet_ref.namespace;
         let bare = pallet_ref.name.clone();
@@ -609,10 +695,43 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         let pallet_rules = if is_meta { meta_tree::meta_rules(&bare) } else { None };
 
+        // Every movable input the update consumes is read once, here. The anchor's stored bytes
+        // travel alongside the decoded value: the commit below conditions on exactly what was
+        // read, never a re-serialization of it (FORK-95 design memo, claim C13) — a `serde` field
+        // reorder must never fail a push's anchor check for no anchor that actually moved.
+        let (anchor, anchor_bytes) = match self.refs.get_trust().map_err(HeadError::internal)? {
+            Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
+            None => (None, None),
+        };
+
+        let office_head = self
+            .refs
+            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+            .map_err(HeadError::internal)?;
+
+        // The pallet's own head. For the office that is the office head just read: one read, so
+        // the authority decision and the stale check can never see two different offices.
+        let current = if is_office {
+            office_head.clone()
+        } else {
+            self.refs.get_head(namespace, &bare).map_err(HeadError::internal)?
+        };
+
+        // Who may move this ref, against the anchor and office head read above — the same values
+        // the audit consumes and the commit conditions on. With trust and an office, the commit
+        // is conditioned on this office head, so a grant revoked after this decision refuses the
+        // commit. With no office yet there is no roster and the rule admits everyone (the token
+        // is the gate); an office lifted meanwhile cannot let that decision carry over to a commit,
+        // because a trusted working or meta pallet is refused without an office, and the office's
+        // own creation is conditioned on it still being unborn.
+        if matches!(caller, Principal::Operator(_)) {
+            let office_state = self.office_state_at(&anchor, office_head.as_deref())?;
+
+            authority_utils::may_move(caller, &anchor, &office_state, &pallet_ref).map_err(forbidden)?;
+        }
+
         // Fail fast on an obviously stale request; the conditional write below is the
         // authoritative gate that also catches a head that moves during the audit.
-        let current = self.refs.get_head(namespace, &bare).map_err(HeadError::internal)?;
-
         if current.as_deref() != request.old_head.as_deref() {
             return Err(self.moved(&current, &request.old_head));
         }
@@ -633,15 +752,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )));
         }
 
-        // The anchor's stored bytes travel alongside the decoded value: the commit below
-        // conditions on exactly what was read here, never a re-serialization of it (FORK-95
-        // design memo, claim C13) — a `serde` field reorder must never fail a push's anchor
-        // check for no anchor that actually moved.
-        let (anchor, anchor_bytes) = match self.refs.get_trust().map_err(HeadError::internal)? {
-            Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
-            None => (None, None),
-        };
-
         // An office is the chain an anchor verifies; one lifted without an anchor is a state
         // clients read as a stripped anchor, so it is never created. Same as the server, and
         // decided before any audit work. The commit conditions on the anchor still being absent.
@@ -650,11 +760,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 "Establish the trust anchor (PUT /v1/trust) before lifting the office.".to_string(),
             ));
         }
-
-        let office_head = self
-            .refs
-            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
-            .map_err(HeadError::internal)?;
 
         // Mirror the objects the audit reads into a scratch `.forklift`, then run the exact
         // `forklift_core` audit inside its scope. Working blobs are never mirrored — their
@@ -963,11 +1068,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// exactly as before.
     pub fn commit_lift(
         &self,
+        caller: &Principal,
         session: &str,
         control_plane: &[String],
         blobs: &[String],
         more: bool,
     ) -> HeadResult<()> {
+        self.require_uploader(caller)?;
+
         for hash in control_plane {
             let outcome =
                 self.objects.verify_and_promote(session, hash).map_err(HeadError::internal)?;

@@ -84,8 +84,12 @@ Build the two zips with `cargo lambda build --release --arm64` (see
 
 ## Footguns closed by construction
 
-- **Deploying open access.** No variable maps to `FORKLIFT_OPEN_ACCESS`; `auth_token` is
-  required and floor-validated. Open access is not constructible through this module.
+- **Deploying open access.** No variable maps to `FORKLIFT_OPEN_ACCESS`, and a configuration
+  with neither `auth_token` nor `operator_token_digests` is refused at plan time; `auth_token` is
+  floor-validated. Open access is not constructible through this module.
+- **A plaintext token in the function's configuration.** `auth_token` reaches the Lambda only as
+  its SHA-256 digest (`FORKLIFT_TOKEN_SHA256`), and per-operator tokens are given to the module as
+  digests in the first place (`operator_token_digests`).
 - **Forgetting the staging lifecycle rule.** Always created, no disable, floor 1 day — nothing
   in `crates/forklift-aws-lambda` ever revisits an abandoned lift session, so without this an
   abandoned or paginating client leaks staged bytes forever.
@@ -104,13 +108,21 @@ Build the two zips with `cargo lambda build --release --arm64` (see
 
 **Not closed by construction — still worth knowing:**
 
-- **The auth token lives in Terraform/OpenTofu state and the Lambda console.** Anyone with
-  `lambda:GetFunctionConfiguration` can read it; rotation is change-variable-and-apply. Use an
-  encrypted state backend. This module deliberately does not add a Secrets Manager integration —
-  the code reads an environment variable and nothing else, so that would imply security it
-  cannot deliver.
-- **Multi-warehouse mode is single-tenant on auth.** One `auth_token` rules every warehouse id
-  when `warehouse_id` is left null.
+- **`auth_token` lives in Terraform/OpenTofu state.** The Lambda console holds only its digest,
+  but the state holds the variable itself; use an encrypted state backend, or — for a single
+  warehouse (`warehouse_id` set) — leave `auth_token` null and configure only
+  `operator_token_digests`. Rotation is change-variable-and-apply. This
+  module deliberately does not add a Secrets Manager integration — the code reads an environment
+  variable and nothing else, so that would imply security it cannot deliver.
+- **The shared bearer is the administrator credential.** Whoever holds `auth_token` may move any
+  pallet, the office included, on every warehouse this stack serves. Give everyone else a
+  per-operator token: `operator_token_digests` maps each token's SHA-256 digest to its office
+  identifier, and that operator gets exactly the office's roles and pallet grants
+  (`docs/DEPLOYMENT.md`, "What the bearer tokens do — and do not — control").
+- **Multi-warehouse mode shares one credential set.** When `warehouse_id` is left null, the same
+  tokens are accepted for every warehouse id; each warehouse's own office still decides what an
+  operator token may do there, and only `auth_token` sets a new warehouse id up (establishes its
+  trust).
 - **Wrong-architecture package.** Not preventable in HCL; if you build an x86_64 zip and deploy
   with the arm64 default (or vice versa), every invocation fails with an exec-format error.
   `docs/DEPLOYMENT.md`'s verification checklist catches this on its first step.
@@ -141,7 +153,8 @@ The full, semver-governed contract is in [`variables.tf`](variables.tf) and
 [`outputs.tf`](outputs.tf) — every variable and output there is a permanent compatibility promise
 once published; renames and removals are breaking changes. A summary:
 
-**Required:** `control_plane_package`, `verifier_package`, `auth_token` (sensitive).
+**Required:** `control_plane_package`, `verifier_package`, and at least one of `auth_token`
+(sensitive) or `operator_token_digests` — `auth_token` whenever `warehouse_id` is null.
 
 **Optional, most consequential first:** `kms_key_arn`, `warehouse_id`, `force_destroy`,
 `deletion_protection`, `enable_pitr`, `staging_expiry_days`, `responses_expiry_days`,

@@ -635,98 +635,108 @@ binaries share it) or the AWS SDK's own default provider chain:
 | `FORKLIFT_AWS_ENDPOINT_URL` | Optional | Both | Endpoint override for LocalStack/MinIO; switches the S3 client to path-style addressing. An empty string is treated as unset. |
 | `FORKLIFT_DEFAULT_PALLET` | Optional | Control plane | The pallet a franchise checks out by default. Defaults to `main`. An empty string is treated as unset. A set value must be a valid pallet name (lowercase; see `format/PALLET_REFS.md`), or the function refuses to start. |
 | `AWS_REGION` | Effectively required | The AWS SDK's provider chain (not this crate directly) | Lambda's own execution environment sets this automatically; no operator action needed in the ordinary case. |
-| `FORKLIFT_TOKEN` | See below | Control plane only | The bearer token every request must present (`Authorization: Bearer <token>`). |
-| `FORKLIFT_OPEN_ACCESS` | See below | Control plane only | Set to `1` to run with no token at all (LocalStack/local dev only). |
+| `FORKLIFT_TOKEN_SHA256` | See below | Control plane only | The SHA-256 digest (64 lowercase hex characters) of the shared bearer token. |
+| `FORKLIFT_OPERATOR_TOKENS` | See below | Control plane only | A JSON object mapping each per-operator token's SHA-256 digest to its office identifier. |
+| `FORKLIFT_OPEN_ACCESS` | See below | Control plane only | Set to `1` to run with no credential at all (LocalStack/local dev only). |
+| `FORKLIFT_TOKEN` | Must be unset | Control plane only | Never read as a credential: if it is set, the function refuses to start (see below). |
 
-**Authentication.** `entrypoint::authenticate` resolves an `AuthConfig` once at cold start
-(`auth_from_env`) and applies it to every request:
+**Authentication.** `entrypoint::auth_from_env` resolves an `AuthConfig` once at cold start, and
+`entrypoint::authenticate` applies it to every request, resolving the caller to a `Principal` —
+the same type `forklift-server` resolves its callers to:
 
-* **`FORKLIFT_TOKEN`** is the bearer token clients must present as
-  `Authorization: Bearer <token>`, compared with `subtle`'s constant-time `ct_eq` — never a
-  byte-wise `==`, which would leak timing information about how many leading bytes matched. An
-  **empty value is treated exactly like an unset one** (refused), never as a valid empty token —
-  the same "empty counts as unset" convention this crate already applies to
-  `FORKLIFT_AWS_ENDPOINT_URL`, `FORKLIFT_WAREHOUSE_ID`, and `FORKLIFT_DEFAULT_PALLET`.
-* **When `FORKLIFT_TOKEN` is unset (or empty), the head refuses every request with `401`** —
-  fail closed by default, so a forgotten token fails loud rather than silently serving the world
-  from a public endpoint.
+* **The function holds digests, never plaintext tokens.** A Lambda's environment is part of the
+  function's configuration, readable by anyone who may read that configuration, so a token never
+  goes there. Compute a digest with any common tool —
+  `printf '%s' "$TOKEN" | shasum -a 256 | cut -d' ' -f1` (the bare 64 hex characters, without
+  the trailing ` -` that `shasum` prints), or Terraform's `sha256()` (which the module in
+  `infra/aws-serverless` does for you). Tokens are high-entropy secrets, so an unsalted digest gives nothing away.
+* **`FORKLIFT_TOKEN_SHA256`** is the shared bearer's digest. A client presenting that token as
+  `Authorization: Bearer <token>` is `Principal::Static`: **the deployment's administrator
+  credential**, full access to every pallet under every office rule. The comparison is
+  constant-time (`subtle`'s `ct_eq`).
+* **`FORKLIFT_OPERATOR_TOKENS`** binds per-operator tokens to office identifiers, e.g.
+  `{"<64-hex digest>": "mate@lonic.net"}`. A client presenting one is
+  `Principal::Operator(id)`, and the office's roles and per-pallet grants apply to it (below).
+  Identifiers are matched exactly against the office roster, never trimmed. Either variable alone
+  is a complete configuration for a single warehouse, and both together are fine; multi-warehouse
+  mode needs `FORKLIFT_TOKEN_SHA256` (below), and the function refuses to start without it.
+* **A misconfiguration fails the cold start**, so the function never serves on a credential set
+  it half understood: a digest that is not 64 lowercase hex characters; the digest of the empty
+  string; a blank identifier; one digest bound twice, or bound both as the shared bearer and as an
+  operator; `FORKLIFT_OPEN_ACCESS=1` beside any
+  credential; and **any `FORKLIFT_TOKEN` at all** — a plaintext token left over from an older
+  configuration is refused rather than silently ignored. Move it to `FORKLIFT_TOKEN_SHA256` as a
+  digest.
+* **With no credential configured, the head refuses every request with `401`** — fail closed by
+  default, so a forgotten credential fails loud rather than silently serving the world from a
+  public endpoint.
 * **`FORKLIFT_OPEN_ACCESS=1`** is the explicit, opt-in escape hatch from that default — every
-  request passes untouched, mirroring `forklift-server`'s open-access mode. It only takes effect
-  when `FORKLIFT_TOKEN` is unset (a configured token always wins); it exists for LocalStack and
-  local development, and a real deployment should never set it.
-* The `401`'s message is identical whether the header was missing, malformed, wrong, or no token
-  was configured at all — a probing client must not be able to distinguish those cases, the same
-  discipline that motivates the constant-time comparison.
-* **You — the operator — are responsible for getting `FORKLIFT_TOKEN` into the Lambda's
-  environment securely** (AWS Secrets Manager or SSM Parameter Store, wired to the function's
-  environment variables by your own IaC/CI pipeline at deploy time). This crate never talks to
-  Secrets Manager itself; it only ever reads an already-resolved environment variable.
+  request passes as `Principal::Open`, mirroring `forklift-server`'s open-access mode. It exists
+  for LocalStack and local development; a real deployment should never set it.
+* A blank bearer is refused before anything is hashed, and the `401`'s message is identical
+  whether the header was missing, malformed, blank, unknown, or no credential was configured at
+  all — a probing client must not be able to distinguish those cases.
+* **You — the operator — are responsible for getting the digests into the Lambda's environment**
+  (by your own IaC/CI pipeline at deploy time). This crate never talks to Secrets Manager itself;
+  it only ever reads already-resolved environment variables.
 * This check applies **only to the control-plane Lambda** — the verifier is never invoked by a
   bearer-carrying client (it is triggered by an S3 event), so it has no `AuthConfig` and needs
   none.
 
 An API Gateway authorizer or resource policy (see "Auth at the gateway" above) is a legitimate
-**additional** layer in front of this check, never a substitute for setting `FORKLIFT_TOKEN` —
-the bearer check is what a client actually speaks, and what `forklift-server` speaks too.
+**additional** layer in front of this check, never a substitute for a credential — the bearer
+check is what a client actually speaks, and what `forklift-server` speaks too.
 
-### What the bearer token does — and does not — control
+### What the bearer tokens do — and do not — control
 
-**This head has no per-pallet authorization.** The transport check above answers exactly one
-question — does the request carry the configured bearer token — and that is *all* it answers.
-There is no caller-identity concept anywhere in this head: no notion of "operator," no per-pallet
-grant, no reader/writer/admin distinction. Every caller who holds the shared bearer token has
-**identical privileges** to every other caller who holds it: any of them can move any pallet
-this warehouse serves, including the office pallet, subject only to the content-level checks
-below.
+The two kinds of token carry different authority. **The shared bearer is the administrator
+credential**: whoever holds it may move any pallet this warehouse serves, the office included,
+and is the only caller who may re-genesis trust — subject only to the content-level checks
+below. Issue it to the deployment's administrator and to nobody else. **A per-operator token
+carries exactly its office identity's authority**, judged by the same office rules
+(`forklift_core::util::authority_utils`) `forklift-server` applies:
 
-What actually constrains a push is run by `Head::ref_update` after authentication has already
-passed. Every row below is a distinct check, in the order it runs; none of them consult who
-transported the request:
+| Route | An operator token is refused (`403`) when |
+|---|---|
+| upload targets, object and signature uploads, lift commit | the office has a roster and does not enroll the operator, or enrolls them as a `reader` |
+| ref update, working pallet | the operator's role and pallet grants do not admit this pallet (`may_write_pallet`) |
+| ref update, meta pallet (`@office`, `@manifest`, `@haul`, `@tags`, `@kv`) | the operator is not enrolled, or is a `reader`; the pallet grant list is not consulted for a meta pallet |
+| trust (re-genesis) | always — a re-genesis's authority comes from the very chain it replaces, so only the shared bearer (or an open head) may perform one |
+
+On a single-warehouse head, until the warehouse is trusted, or while its office has no roster
+yet (the bootstrap window before the office is first lifted), no operator is judged against the
+office and every authenticated caller passes these rules. In multi-warehouse mode (no `FORKLIFT_WAREHOUSE_ID`),
+where every well-formed id answers, an untrusted id is one nobody has set up: an operator token
+is refused (`403`) every write to it, establishing its trust included, so only the shared bearer
+sets a warehouse up — as only the static token creates one on `forklift-server`. Once it is
+trusted, the bootstrap window applies there too. The window is not a hole: a trusted warehouse refuses a
+working or meta pallet outright until its office is lifted, and the office's own first lift is
+pinned by its own compare-and-set.
+
+What constrains every push, after authentication, is run by `Head::ref_update`. Every row below
+is a distinct check, in the order it runs; only row 0 consults who transported the request:
 
 | # | Check | Function (file:line) | Runs when | What it verifies | What it does *not* cover |
 |---|-------|----------------------|-----------|-------------------|---------------------------|
-| 1 | New-head presence | `Head::ref_update`, `crates/forklift-aws-lambda/src/head.rs:525` | every ref update | the pushed head object itself has been uploaded | ancestry, signatures, or content |
-| 2 | Closure presence | `audit_utils::verify_parcel_closure_with`, called at `head.rs:633` | every ref update | every blob, chunk and tree the new history reaches is present in the object store (§9.4b: chunk lists are checked non-tolerantly) | signatures, roles, grants |
-| 3 | Fast-forward-only | `merge_utils::is_ancestor`, called at `head.rs:650` | every ref update carrying `old_head`, except the sanctioned re-genesis office move (`head.rs:646`) | the new head is a descendant of `old_head` | content validity |
-| 4 | Office chain authenticity | `audit_utils::verify_office_chain_memoized`, called at `head.rs:666` (office update) and `head.rs:685` (any other pallet, to obtain the office state) | only once the warehouse is trusted (`anchor.is_some()`) | every office parcel is signed by a key active in the office at the point it signed, and the chain reaches genesis | whether a *working*-pallet parcel's own signer held any particular role — nothing below checks it: check 5 applies only to the office pallet's own chain, and check 6 explicitly finds no role check in any of its three arms |
+| 0 | Caller authority | `authority_utils::may_move`, called at `crates/forklift-aws-lambda/src/head.rs:704` | every ref update by a `Principal::Operator` the office enrolls (see above) | the operator may move this pallet's ref — the table above | the history's content, and who signed it |
+| 1 | New-head presence | `Head::ref_update`, `head.rs:722` | every ref update | the pushed head object itself has been uploaded | ancestry, signatures, or content |
+| 2 | Closure presence | `audit_utils::verify_parcel_closure_with`, called at `head.rs:832` | every ref update | every blob, chunk and tree the new history reaches is present in the object store (§9.4b: chunk lists are checked non-tolerantly) | signatures, roles, grants |
+| 3 | Fast-forward-only | `merge_utils::is_ancestor`, called at `head.rs:849` | every ref update carrying `old_head`, except the sanctioned re-genesis office move (`head.rs:846`) | the new head is a descendant of `old_head` | content validity |
+| 4 | Office chain authenticity | `audit_utils::verify_office_chain_memoized`, called at `head.rs:880` (office update) and `head.rs:892` (any other pallet, to obtain the office state) | only once the warehouse is trusted (`anchor.is_some()`) | every office parcel is signed by a key active in the office at the point it signed, and the chain reaches genesis | whether a *working*-pallet parcel's own signer held any particular role — nothing below checks it: check 5 applies only to the office pallet's own chain, and check 6 explicitly finds no role check in any of its three arms |
 | 5 | Office privilege | the same walk as row 4 (`audit_utils::verify_office_chain`, through its per-parcel `verify_parcel_privileges`; `HeadError::office_lift` maps the refusal) | wherever row 4 runs; on an office-pallet update its refusal is a `403` (row 4's is a `422`) when the lift brought the overstepping parcel, and a `422` when that parcel is already in the held office (the refusal says so); the walk names the first failing parcel in chain order, whichever row it fails; on any other pallet a held office that fails it is a `422` | each office parcel after the genesis is authorized: its key-permanence obligations honored (a key is never removed or altered, and a revocation is never undone or added without a reason — binds admins too); its *signer* held the office role (or self-service right) it needed as of that parcel's own signing; and any key it adds for another user is endorsed by an admin's key (`Status::Forbidden` in `error.rs`) | applies **only** to the office pallet's own chain — never to a working pallet's content |
-| 6 | Pallet history validity | `audit_utils::verify_pallet_history`, called at `head.rs:688` | only for a non-office pallet, only once trusted | each parcel is accepted when it is either (a) validly signed by a key the office currently tracks and has not revoked, (b) unsigned or signed by an untracked key but reachable from the trust anchor's boundary (tolerated as pre-trust "legacy" history, `crates/forklift-core/src/util/audit_utils.rs:~396`), or (c) signed by a *revoked* key but reachable from that revocation's own distrust boundary (`crates/forklift-core/src/util/audit_utils.rs:~446`) | no role check and no per-pallet grant check, in any of the three arms — and the boundary arms (b)/(c) mean the real precondition is weaker, and the exposure larger, than "every parcel carries a valid signature by a currently-tracked, non-revoked key" alone would suggest |
-| 7 | Per-pallet transport gate | `may_write_pallet` | **never called anywhere in this crate** | n/a | this head has no per-pallet transport gate at all — the shared move rule, `authority_utils::may_move` in forklift-core, is called only by `forklift-server`'s ref-update gate |
+| 6 | Pallet history validity | `audit_utils::verify_pallet_history`, called at `head.rs:895` | only for a non-office pallet, only once trusted | each parcel is accepted when it is either (a) validly signed by a key the office currently tracks and has not revoked, (b) unsigned or signed by an untracked key but reachable from the trust anchor's boundary (tolerated as pre-trust "legacy" history, `crates/forklift-core/src/util/audit_utils.rs:~396`), or (c) signed by a *revoked* key but reachable from that revocation's own distrust boundary (`crates/forklift-core/src/util/audit_utils.rs:~446`) | no role check and no per-pallet grant check, in any of the three arms — and the boundary arms (b)/(c) mean the real precondition is weaker, and the exposure larger, than "every parcel carries a valid signature by a currently-tracked, non-revoked key" alone would suggest |
 
-The consequence: a caller holding the shared bearer token can push any history that clears rows
-1–6 for any pallet — an operator enrolled as `reader`, or a `writer` granted only some other
-pallet, can sign and push it here, because row 7 never runs in this crate and there is no
-per-caller identity to check a grant against even if it did.
+Row 0 and rows 4–6 judge different people: row 0 the caller who transports the request, rows 4–6
+whoever signed the history. The trust anchor and the office head are read once per ref update,
+and those reads serve row 0, the stale-head check, the audit and the commit's conditions alike —
+a grant revoked after row 0 passed moves the office head, and the commit refuses the move.
 
-If you need per-pallet enforcement today — "this token may write pallet A but not pallet B" —
-this head has no built-in mechanism for it. Use `forklift-server` instead, with a per-operator
-tokens file (`docs/SERVER.md`, "Per-operator tokens") or an `authentication` hook
-(`docs/format/HOOK_PROTOCOL.md`), either of which resolves a bearer to an office operator
-identity that the per-pallet gate can then check — but only when B is a **working** pallet: a
-per-operator token does not give you "may write A but not meta-pallet B" (`@office`,
-`@manifest`, `@haul`, `@tags`, `@kv`; any other `@`-qualified name is refused). `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the
-paragraph below the table) is the authoritative statement of that meta-pallet exemption — in
-short, it holds **at transport** only (any non-`reader` may move a meta pallet's ref regardless
-of grants), and on top of that only `@office` gets any content-level role check at all
-(the office chain walk, `verify_office_chain`); see there rather than here for the full rule. Or configure
-`forklift-server`'s `admission_url` hook (`docs/SERVER.md`, "Per-operator tokens" / `docs/format/HOOK_PROTOCOL.md`)
-— it runs before the per-pallet transport gate, for *every* principal including one
-authenticated by the shared static token, and can refuse a ref update by pallet name regardless
-of how the caller authenticated (a soft-policy seam — quotas, plan limits, suspensions — not an
-office role/grant check, but real per-pallet enforcement available today); or add an API
-Gateway Lambda authorizer in front of this head ("Auth at the gateway" above), which can
-inspect the pallet name in the request path and deny per route; that is a deployer-supplied,
-out-of-repo mechanism, not something this head or this repository ships (this head has no
-admission-hook equivalent either). Note the same shared-privilege property holds for
-`forklift-server` too, whenever it is run with only the single static `--token` rather than
-per-operator tokens *and with no admission hook configured*: a caller authenticating with the
-static token is *not* resolved to an office identity, so the per-pallet role/grant gate never
-fires for it and — absent an admission hook — it gets the same uniform, full access described
-above. Per-pallet role/grant enforcement is a property of per-operator identity, not of either
-head as such — it is only that `forklift-server` has a mechanism to produce that identity
-today, and this head does not ship one; the admission hook is the one mechanism that constrains
-a static-token (or fully unauthenticated) caller per pallet without needing operator identity
-at all, and only `forklift-server` ships it.
+What this head does not have, beside `forklift-server`: an `authentication` hook (tokens are
+configured in the environment only, so issuing or revoking one is a redeploy) and an admission
+hook (`docs/SERVER.md`, "Hooks"). For soft per-pallet policy — quotas, plan limits, suspensions —
+on this head, add an API Gateway Lambda authorizer in front of it ("Auth at the gateway" above),
+which can inspect the pallet name in the request path and deny per route; that is a
+deployer-supplied, out-of-repo mechanism.
 
 ## Operational notes
 

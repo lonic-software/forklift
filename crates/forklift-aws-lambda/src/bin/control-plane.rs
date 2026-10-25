@@ -12,8 +12,8 @@
 
 use forklift_aws_lambda::aws::{build_clients, DynamoOps, S3Ops};
 use forklift_aws_lambda::{
-    auth_from_env, config_from_env, handle, AsyncBridge, AuthConfig, AwsConfig, DynamoRefStore,
-    Head, Routing, S3ObjectStore,
+    auth_from_env, check_auth_fits_routing, config_from_env, handle, AsyncBridge, AuthConfig,
+    AwsConfig, DynamoRefStore, Head, Routing, S3ObjectStore,
 };
 use std::time::SystemTime;
 
@@ -70,7 +70,8 @@ async fn context() -> Result<&'static Context, Error> {
     CONTEXT
         .get_or_try_init(|| async {
             let (config, routing) = config_from_env().map_err(Error::from)?;
-            let auth = auth_from_env();
+            let auth = auth_from_env().map_err(Error::from)?;
+            check_auth_fits_routing(&auth, &routing).map_err(Error::from)?;
             let (s3, dynamodb) = build_clients(&config).await.map_err(Error::from)?;
             let bridge = AsyncBridge::current().map_err(Error::from)?;
 

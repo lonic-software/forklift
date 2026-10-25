@@ -192,12 +192,14 @@ pallet name) reaches them.
 Row 2 is the one mechanism that already restricts a static-token (or `--open`) caller per
 pallet: configure `[hooks] admission_url` (below) to refuse by pallet name and it applies
 regardless of how the caller authenticated. It is a soft-policy seam, not an office role/grant
-check, but it is real per-pallet transport enforcement available today, not merely a gap. This
-is the same shared-privilege property `docs/DEPLOYMENT.md` documents for the AWS serverless
-head: that head's rows 4–6 (content-level, audit) still run on every push, but it has no
-operator-identity mechanism and so has no equivalent of rows 2 or 3 — nothing shipped in this
-repository adds one for that head either, short of a deployer-supplied API Gateway authorizer
-(`docs/DEPLOYMENT.md`, "Auth at the gateway").
+check, but it is real per-pallet transport enforcement available today, not merely a gap.
+
+The AWS serverless head runs the same rules: its per-operator tokens (configured as digests,
+`docs/DEPLOYMENT.md`, "What the bearer tokens do — and do not — control") resolve to
+`Principal::Operator` and meet the same `authority_utils` checks as row 3 here, and its shared
+bearer is `Principal::Static` with the same full access. It has no `authentication` or admission
+hook; a deployer-supplied API Gateway authorizer (`docs/DEPLOYMENT.md`, "Auth at the gateway") is
+the place for soft per-pallet policy there.
 
 ## Hooks (provider integration)
 

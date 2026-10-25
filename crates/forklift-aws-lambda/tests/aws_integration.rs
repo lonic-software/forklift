@@ -44,6 +44,7 @@ use forklift_aws_lambda::{
 };
 
 use forklift_core::globals::StorageRootScope;
+use forklift_core::util::authority_utils::Principal;
 use forklift_core::model::remote::{CommitLiftRequest, RefUpdateRequest, TrustAnchorDto};
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{self, PalletNamespace};
@@ -1165,9 +1166,9 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
 
         // The lift commits, and a stale replay conflicts.
         let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
-        head.ref_update("main", &request).expect("lift main");
+        head.ref_update(&Principal::Static, "main", &request).expect("lift main");
         assert_eq!(
-            head.ref_update("main", &request).expect_err("stale replay").status,
+            head.ref_update(&Principal::Static, "main", &request).expect_err("stale replay").status,
             forklift_aws_lambda::Status::Conflict
         );
 
@@ -1608,7 +1609,7 @@ struct ShimState {
 /// blocking thread (every `Head` method blocks on its store's futures), convert back.
 /// Headers are dropped on purpose: the shim always calls `handle` with `AuthConfig::Open` (see
 /// below), so only the method, path/query and body matter — a real deployment configures
-/// `AuthConfig::Token` instead and this shim would need to forward the header.
+/// `AuthConfig::Credentials` instead and this shim would need to forward the header.
 async fn shim_handler(
     axum::extract::State(state): axum::extract::State<Arc<ShimState>>,
     method: http::Method,
@@ -1924,7 +1925,7 @@ async fn chunk_commit_lift(
 
     tokio::task::spawn_blocking(move || {
         let head = Head::new(objects, refs);
-        let result = head.commit_lift(&session, &control_plane, &blobs, more);
+        let result = head.commit_lift(&Principal::Static, &session, &control_plane, &blobs, more);
         (head.objects, head.refs, result)
     })
     .await
@@ -2141,13 +2142,13 @@ async fn ref_update_refuses_a_missing_chunk_and_commits_once_complete_over_s3_an
         );
 
         let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
-        let err = head.ref_update("main", &request).expect_err("a missing chunk fails the closure");
+        let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a missing chunk fails the closure");
         assert_eq!(err.status, forklift_aws_lambda::Status::Unprocessable);
 
         // The control: upload the withheld chunk, and the identical update now commits.
         let victim_bytes = harvest.objects[&victim].clone();
         head.objects.put_verified(&victim, &victim_bytes).expect("upload the last chunk");
-        head.ref_update("main", &request).expect("complete once every chunk is present");
+        head.ref_update(&Principal::Static, "main", &request).expect("complete once every chunk is present");
 
         assert_eq!(head.handshake().expect("handshake").pallets.get("main"), Some(&main_head));
 

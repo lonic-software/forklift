@@ -40,8 +40,11 @@
 //! [`Scratch::shared`](crate::scratch::Scratch::shared) — both must key on the same warehouse
 //! id).
 
+use std::collections::HashMap;
+
 use http::{header, Method, Request, Response, StatusCode};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use forklift_core::model::remote::{
@@ -49,7 +52,10 @@ use forklift_core::model::remote::{
     RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
+use forklift_core::util::authority_utils::Principal;
+use forklift_core::util::object_utils::is_object_hash;
 use forklift_core::util::pallet_utils::{validate_pallet_name, DEFAULT_PALLET_NAME};
+use forklift_core::util::sign_utils;
 use forklift_core::util::warehouse_utils;
 
 use crate::aws::AwsConfig;
@@ -133,139 +139,244 @@ fn require_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<Stri
     }
 }
 
-/// A verified non-blank bearer token: the *only* way to build [`AuthConfig::Token`]'s payload,
-/// so a blank credential can never reach [`authenticate`]'s comparison from any constructor —
-/// not just [`auth_from_env`]'s (PR #124 round 3, F2). Before this, `AuthConfig::Token` held a
-/// bare `pub String`, so anything that can name the type — a future upstream change, a test, a
-/// fixture — could write `AuthConfig::Token(String::new())` directly, bypassing `auth_from`'s own
-/// filter entirely; a request then presenting `Authorization: Bearer ` (empty credential) would
-/// reach `tokens_match("", "")`, which is `true`. Filtering only at `auth_from` (the *env* path)
-/// left that checkpoint itself unguarded for every other path into the type. Making the payload
-/// this newtype, with its constructor as the sole way to obtain one, closes it structurally
-/// instead of adding a second filter at the usage site that the next new constructor could just
-/// as easily bypass again.
+/// The SHA-256 digest of a bearer token: the only form in which this head holds a credential.
 ///
-/// "Blank" here is the same rule `forklift-server` applies to its own static token
-/// (`main.rs::merge_static_token`, PR #124 round 3 F1): empty *or* whitespace-only. A
-/// whitespace-only configured token is exactly as unusable as an empty one — either no request
-/// can ever present a credential that trims to nothing over a transport that trims trailing
-/// whitespace off header values, so the deployment is silently locked out with no diagnostic, or
-/// a transport that does *not* trim (this crate makes no assumption either way about the Lambda
-/// runtime's header handling) lets a trivially-guessable all-whitespace value authenticate.
+/// A Lambda's environment is part of the function's configuration, readable by whoever may read
+/// that configuration, so the function never holds a plaintext token to compare against. A
+/// deployer computes the digest with any common tool (`shasum -a 256`, `openssl dgst -sha256`,
+/// terraform's `sha256()`); tokens are high-entropy, so an unsalted digest gives nothing away.
 ///
-/// The struct lives in its own private submodule, not directly in `entrypoint`, so the
-/// constructor is the only way to obtain one even *inside this file* (PR #124 round 4, F3): a
-/// tuple field private to `entrypoint` would still be visible to `entrypoint::tests` (a child
-/// module sees its ancestors' private items), so this file's own tests — the ones most likely to
-/// be edited next in this area — could otherwise write `BearerToken(String::new())` directly. A
-/// field private to `bearer_token` is invisible to `entrypoint` and to `entrypoint::tests` alike,
-/// both of which are siblings of `bearer_token`, not descendants of it — so `BearerToken::new` is
-/// structurally the only path to an instance, not merely the only path anyone happens to use.
-mod bearer_token {
-    #[derive(Clone, PartialEq, Eq)]
-    pub struct BearerToken(String);
+/// Neither constructor yields the digest of the empty string: a configuration holding it would
+/// admit a request with a blank bearer, were [`authenticate`] ever to hash one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TokenDigest([u8; 32]);
 
-    impl BearerToken {
-        /// The one constructor: rejects an empty or whitespace-only token rather than silently
-        /// treating it as unset, so a caller that reaches here — already past the "is a token
-        /// even configured" question `auth_from` asks first — gets back the actual problem
-        /// instead of having it discarded.
-        pub fn new(token: String) -> Result<BearerToken, String> {
-            if token.trim().is_empty() {
-                Err("a bearer token must not be empty or whitespace-only".to_string())
-            } else {
-                Ok(BearerToken(token))
+impl TokenDigest {
+    /// Parse a configured digest: exactly 64 lowercase hex characters, never the digest of the
+    /// empty string.
+    pub fn parse_hex(hex: &str) -> Result<TokenDigest, String> {
+        // An object hash's spelling is exactly a SHA-256 digest's: 64 lowercase hex characters.
+        let malformed = || "a token digest must be 64 lowercase hex characters (a SHA-256 digest)".to_string();
+
+        if !is_object_hash(hex) {
+            return Err(malformed());
+        }
+
+        let bytes = sign_utils::from_hex(hex).map_err(|()| malformed())?;
+        let digest = TokenDigest(bytes.try_into().map_err(|_| malformed())?);
+        if digest == TokenDigest::hash("") {
+            return Err("a token digest must not be the SHA-256 of the empty string".to_string());
+        }
+
+        Ok(digest)
+    }
+
+    /// The digest of a token, refused for an empty or whitespace-only token: the same rule
+    /// [`authenticate`] applies to a presented bearer, and `forklift-server` to its own static
+    /// token.
+    pub fn of_token(token: &str) -> Result<TokenDigest, String> {
+        if token.trim().is_empty() {
+            return Err("a bearer token must not be empty or whitespace-only".to_string());
+        }
+
+        Ok(TokenDigest::hash(token))
+    }
+
+    fn hash(token: &str) -> TokenDigest {
+        TokenDigest(Sha256::digest(token.as_bytes()).into())
+    }
+}
+
+impl std::fmt::Debug for TokenDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TokenDigest(<redacted>)")
+    }
+}
+
+/// The credentials a deployment accepts: the shared bearer, per-operator tokens, or both — never
+/// neither, which is what [`Credentials::new`] refuses.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credentials {
+    /// The shared bearer's digest. Its holder is [`Principal::Static`]: the deployment's own
+    /// administrator credential, full access under every office rule.
+    static_token: Option<TokenDigest>,
+
+    /// Per-operator token digests, each bound to an office identifier. Identifiers are kept
+    /// untrimmed: the office rules match them by exact equality against the roster.
+    operators: HashMap<TokenDigest, String>,
+}
+
+impl Credentials {
+    /// Assemble the accepted credentials. Refused when there are none at all, when an
+    /// identifier is blank, and when one digest is bound twice — among the operators, or as both
+    /// the shared bearer and an operator, where the shared bearer's match would silently make
+    /// that operator an administrator.
+    pub fn new(static_token: Option<TokenDigest>,
+               operators: Vec<(TokenDigest, String)>) -> Result<Credentials, String> {
+        if static_token.is_none() && operators.is_empty() {
+            return Err("no credential is configured".to_string());
+        }
+
+        let mut bound = HashMap::new();
+        for (digest, identifier) in operators {
+            if identifier.trim().is_empty() {
+                return Err("an operator token is bound to a blank identifier".to_string());
+            }
+
+            if static_token == Some(digest) {
+                return Err("an operator token's digest is also the shared bearer's".to_string());
+            }
+
+            if bound.insert(digest, identifier).is_some() {
+                return Err("one operator token digest is bound more than once".to_string());
             }
         }
 
-        pub(super) fn as_str(&self) -> &str {
-            &self.0
-        }
-    }
-
-    impl std::fmt::Debug for BearerToken {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "<redacted>")
-        }
+        Ok(Credentials { static_token, operators: bound })
     }
 }
-pub use bearer_token::BearerToken;
 
 /// The transport-authentication configuration, resolved once at cold start ([`auth_from_env`])
-/// and threaded into every request by [`handle`]. Full multi-tenant policy (resolving a bearer
-/// to a principal, per-warehouse admission) is tracked privately and stays out of scope here —
-/// this is the single-tenant seam: is *a* configured token present and correct at all.
-/// `Debug` is hand-written, not derived — see the `impl` just below — so redaction is
-/// structural rather than a claim about which paths happen to print this type today: this is
-/// this head's own primary bearer token, the same class `forklift-server`'s `HookEndpoint` and
-/// `ConfigFile` redact (PR #124 round 2, F3), and every `assert_eq!` in this module's own tests
-/// against a `Token(...)` value already formats it on any failure.
+/// and threaded into every request by [`handle`]. `Debug` is hand-written so a digest or an
+/// identifier never reaches a log line.
 #[derive(Clone, PartialEq, Eq)]
 pub enum AuthConfig {
-    /// A configured bearer token; every request must present it via
-    /// `Authorization: Bearer <token>`. Never blank — see [`BearerToken::new`].
-    Token(BearerToken),
+    /// Credentials are configured; every request must present one via
+    /// `Authorization: Bearer <token>`.
+    Credentials(Credentials),
 
-    /// No token is configured and the operator has explicitly opted out
-    /// (`FORKLIFT_OPEN_ACCESS=1`): every request passes untouched, mirroring
-    /// `forklift-server`'s `Principal::Open`. Meant for LocalStack and local development —
-    /// a real deployment sets `FORKLIFT_TOKEN` instead.
+    /// No credential is configured and the operator has explicitly opted out
+    /// (`FORKLIFT_OPEN_ACCESS=1`): every request passes as [`Principal::Open`], mirroring
+    /// `forklift-server` with no token configured. Meant for LocalStack and local development.
     Open,
 
-    /// No token is configured and there is no explicit opt-out: the safe default. Every
-    /// request is refused (`401`) — a forgotten `FORKLIFT_TOKEN` fails closed instead of
-    /// silently serving the world from a public endpoint.
+    /// No credential is configured and there is no explicit opt-out: the safe default. Every
+    /// request is refused (`401`), so a forgotten credential fails closed instead of serving the
+    /// world from a public endpoint.
     Closed,
 }
 
 impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AuthConfig::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+            AuthConfig::Credentials(credentials) => f
+                .debug_struct("Credentials")
+                .field("static_token", &credentials.static_token.is_some())
+                .field("operators", &credentials.operators.len())
+                .finish(),
             AuthConfig::Open => write!(f, "Open"),
             AuthConfig::Closed => write!(f, "Closed"),
         }
     }
 }
 
-/// Read the auth configuration from the environment:
-/// * `FORKLIFT_TOKEN` (optional) — the bearer token every request must present. An empty or
-///   whitespace-only value is treated exactly like an unset one (refuse), never as a valid
-///   blank token (PR #124 round 3, F1/F2).
-/// * `FORKLIFT_OPEN_ACCESS` (optional) — set to `1` to run with no token at all. Only takes
-///   effect when `FORKLIFT_TOKEN` is unset; LocalStack and local dev use this, a real
-///   deployment never should.
-pub fn auth_from_env() -> AuthConfig {
-    auth_from(std::env::var("FORKLIFT_TOKEN").ok(), std::env::var("FORKLIFT_OPEN_ACCESS").ok())
+/// Read the auth configuration from the environment. A misconfiguration is an `Err`, which
+/// fails the cold start: a head never runs on a credential set it half understood.
+/// * `FORKLIFT_TOKEN_SHA256` (optional) — the shared bearer's digest ([`TokenDigest`]).
+/// * `FORKLIFT_OPERATOR_TOKENS` (optional) — a JSON object mapping each per-operator token's
+///   digest to its office identifier.
+/// * `FORKLIFT_OPEN_ACCESS` (optional) — `1` runs with no credential at all. Refused beside
+///   any credential.
+/// * `FORKLIFT_TOKEN` — never read as a credential: its presence is refused, so a plaintext
+///   token left over from an older configuration is never silently ignored.
+pub fn auth_from_env() -> Result<AuthConfig, String> {
+    auth_from(|name| std::env::var(name).ok())
 }
 
-/// The pure decision behind [`auth_from_env`], split out so the matrix (blank-is-unset, the
-/// opt-out, and token-takes-precedence-over-the-opt-out) is testable without touching real
-/// process environment state. Routes the raw env value through [`BearerToken::new`] rather than
-/// filtering it separately — the constructor's blank check is the only one that exists, so this
-/// function cannot drift from it.
-fn auth_from(token: Option<String>, open_access: Option<String>) -> AuthConfig {
-    match token.and_then(|value| BearerToken::new(value).ok()) {
-        Some(token) => AuthConfig::Token(token),
-        None if open_access.as_deref() == Some("1") => AuthConfig::Open,
-        None => AuthConfig::Closed,
+/// Refuse credentials the routing can never use: in [`Routing::Multi`] only the shared bearer
+/// (or an open head) sets a warehouse up (see [`handle`]), so operator tokens alone would leave
+/// every warehouse id read-only for good. Checked at cold start, beside the two readers.
+pub fn check_auth_fits_routing(auth: &AuthConfig, routing: &Routing) -> Result<(), String> {
+    match (auth, routing) {
+        (AuthConfig::Credentials(credentials), Routing::Multi) if credentials.static_token.is_none() => Err(
+            "Multi-warehouse routing (no FORKLIFT_WAREHOUSE_ID) needs FORKLIFT_TOKEN_SHA256: only the \
+            shared bearer sets a warehouse up, so operator tokens alone could never write anywhere."
+                .to_string(),
+        ),
+        _ => Ok(()),
     }
 }
 
-/// Compare two bearer tokens without leaking which byte differs first: a naive `==` on `str`
-/// short-circuits at the first mismatch, which is exactly the timing side channel a bearer
-/// check must not have. The slice lengths are still compared up front (`subtle`'s own
-/// short-circuit) — a token's length is not the secret, only its bytes are.
-fn tokens_match(provided: &str, expected: &str) -> bool {
-    bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+/// The pure decision behind [`auth_from_env`], over any variable source.
+fn auth_from(var: impl Fn(&str) -> Option<String>) -> Result<AuthConfig, String> {
+    if var("FORKLIFT_TOKEN").is_some() {
+        return Err("The FORKLIFT_TOKEN environment variable is set, but this function holds no \
+            plaintext credential: set FORKLIFT_TOKEN_SHA256 to the token's SHA-256 digest \
+            (64 lowercase hex characters) and remove FORKLIFT_TOKEN."
+            .to_string());
+    }
+
+    let static_token = var("FORKLIFT_TOKEN_SHA256")
+        .map(|hex| TokenDigest::parse_hex(&hex))
+        .transpose()
+        .map_err(|e| format!("The FORKLIFT_TOKEN_SHA256 environment variable is invalid: {}.", e))?;
+
+    let operators = match var("FORKLIFT_OPERATOR_TOKENS") {
+        Some(json) => parse_operator_tokens(&json)
+            .map_err(|e| format!("The FORKLIFT_OPERATOR_TOKENS environment variable is invalid: {}.", e))?,
+        None => Vec::new(),
+    };
+
+    let open_access = var("FORKLIFT_OPEN_ACCESS").as_deref() == Some("1");
+
+    if static_token.is_none() && operators.is_empty() {
+        return Ok(if open_access { AuthConfig::Open } else { AuthConfig::Closed });
+    }
+
+    if open_access {
+        return Err("FORKLIFT_OPEN_ACCESS=1 is set beside a configured credential. Open access \
+            is only for a deployment with no credential at all; unset one or the other."
+            .to_string());
+    }
+
+    Credentials::new(static_token, operators)
+        .map(AuthConfig::Credentials)
+        .map_err(|e| format!("The configured credentials are invalid: {}.", e))
+}
+
+/// Parse `FORKLIFT_OPERATOR_TOKENS`: a JSON object of digest → identifier. The entries are read
+/// in order, duplicates kept, so [`Credentials::new`] can refuse a digest bound twice rather
+/// than a JSON parser silently keeping the last binding.
+fn parse_operator_tokens(json: &str) -> Result<Vec<(TokenDigest, String)>, String> {
+    struct Entries(Vec<(String, String)>);
+
+    impl<'de> serde::Deserialize<'de> for Entries {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Entries, D::Error> {
+            struct Visitor;
+
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Entries;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "an object mapping token digests to office identifiers")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Entries, A::Error> {
+                    let mut entries = Vec::new();
+                    while let Some(entry) = map.next_entry::<String, String>()? {
+                        entries.push(entry);
+                    }
+                    Ok(Entries(entries))
+                }
+            }
+
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+
+    let Entries(entries) = serde_json::from_str(json).map_err(|e| format!("not a JSON object of strings ({})", e))?;
+
+    entries
+        .into_iter()
+        .map(|(digest, identifier)| Ok((TokenDigest::parse_hex(&digest)?, identifier)))
+        .collect()
 }
 
 /// Strip the `Bearer` auth-scheme token case-insensitively (RFC 7235 §2.1: `auth-scheme` is a
 /// `token`, and the scheme name itself is case-insensitive — `bearer`, `Bearer`, `BEARER` all
 /// name the same scheme), leaving the credentials (the token after the scheme and its one
-/// separating space) untouched: still compared case-sensitively, in constant time, by
-/// [`tokens_match`]. Only the 7-byte scheme prefix is matched loosely; a non-`Bearer` scheme
-/// (`Basic …`) still fails to match at all.
+/// separating space) untouched. Only the 7-byte scheme prefix is matched loosely; a
+/// non-`Bearer` scheme (`Basic …`) still fails to match at all.
 fn strip_bearer_prefix(value: &str) -> Option<&str> {
     const SCHEME_LEN: usize = "bearer ".len();
 
@@ -279,63 +390,50 @@ fn strip_bearer_prefix(value: &str) -> Option<&str> {
 }
 
 /// The `401` this seam answers on any failure — a missing header, a non-`Bearer` scheme, a
-/// wrong token, or no token configured at all. The message is identical in every case: a
-/// probing client must not be able to tell "you sent nothing" from "you sent the wrong thing"
-/// from "this deployment isn't configured for auth", the same information a timing side
-/// channel would otherwise leak by a different route.
+/// blank or unknown token, or no credential configured at all. The message is identical in
+/// every case: a probing client must not be able to tell "you sent nothing" from "you sent the
+/// wrong thing" from "this deployment isn't configured for auth".
 fn unauthorized() -> HeadError {
     HeadError::unauthorized("A valid bearer token is required.")
 }
 
-/// The transport-authentication seam. Multi-tenant policy is tracked privately and is out
-/// of scope here.
+/// The transport-authentication seam: who is calling. [`AuthConfig::Open`] passes everything as
+/// [`Principal::Open`]; [`AuthConfig::Closed`] refuses everything. With credentials configured,
+/// a blank bearer is refused before anything is hashed; otherwise the bearer's digest is
+/// matched against the shared bearer's in constant time first ([`Principal::Static`]), then
+/// looked up among the operator tokens ([`Principal::Operator`]), the same order
+/// `forklift-server` resolves its tokens in. A lookup leaks timing only about the digest.
 ///
-/// The protocol carries auth as `Authorization: Bearer <token>`; in the hosted deployment an
-/// API Gateway authorizer in front of this function is an optional additional gate on top of
-/// this check. Neither this function nor anything downstream of it distinguishes *who* holds
-/// the bearer: this head has no caller-identity concept at all (no `Principal`, no operator
-/// identifier), so every request that carries the configured token gets identical privileges
-/// to every other. What actually constrains a push is content-level, run by [`Head::ref_update`]
-/// after authentication has already passed: closure presence (`verify_parcel_closure_with`),
-/// fast-forward-only refs, and — on a trusted warehouse — `verify_office_chain_memoized`
-/// (authenticity and privileges together) for an office-pallet update, `verify_meta_update` for a meta
-/// pallet on the meta-tree format (`@kv`, `@manifest`, `@tags`, `@haul`), or
-/// `verify_office_chain_memoized` + `verify_pallet_history` for a working pallet. The
-/// office and pallet-history checks differ: the office chain walk checks each
-/// office-modifying parcel's *signer* against the office role they held as of that parcel's own
-/// signing; `verify_pallet_history` accepts a parcel when it is either (a) validly signed
-/// by a key the office currently tracks and has not revoked, (b) unsigned or signed by an
-/// untracked key but reachable from the trust anchor's boundary (tolerated as pre-trust
-/// "legacy" history), or (c) signed by a *revoked* key but reachable from that revocation's own
-/// distrust boundary — no role, no grant, in any of the three arms
-/// (`audit_utils::classify_signature_trust`, `verify_pallet_history`). Either way, neither
-/// checks anything about the caller of *this* request, so a caller who can produce a
-/// validly-signed history for a pallet
-/// can move it regardless of whether an office role would have allowed *them* to — and, outside
-/// the office pallet, regardless of what it would say about the *signer* either. Per-pallet
-/// enforcement of the kind `forklift-server` offers to `Principal::Operator` callers needs an
-/// operator-identity mechanism this head does not have.
-///
-/// This function itself decides only the one thing prior to all of that: does the request
-/// carry the configured bearer at all. [`AuthConfig::Open`] passes everything (the explicit
-/// local/LocalStack opt-out); [`AuthConfig::Closed`] (no token configured, no opt-out) refuses
-/// everything; [`AuthConfig::Token`] requires an exact, constant-time match.
-fn authenticate<B>(auth: &AuthConfig, request: &Request<B>) -> HeadResult<()> {
-    let expected = match auth {
-        AuthConfig::Open => return Ok(()),
+/// What the principal may do is not decided here. The office authority rules
+/// (`forklift_core::util::authority_utils`) decide it at each mutating [`Head`] method, against
+/// the office state that method reads; the content-level audit in [`Head::ref_update`] runs on
+/// top of them for every principal.
+fn authenticate<B>(auth: &AuthConfig, request: &Request<B>) -> HeadResult<Principal> {
+    let credentials = match auth {
+        AuthConfig::Open => return Ok(Principal::Open),
         AuthConfig::Closed => return Err(unauthorized()),
-        AuthConfig::Token(expected) => expected.as_str(),
+        AuthConfig::Credentials(credentials) => credentials,
     };
 
     let provided = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(strip_bearer_prefix);
+        .and_then(strip_bearer_prefix)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(unauthorized)?;
 
-    match provided {
-        Some(token) if tokens_match(token, expected) => Ok(()),
-        _ => Err(unauthorized()),
+    let digest = TokenDigest::hash(provided);
+
+    if let Some(expected) = &credentials.static_token {
+        if bool::from(digest.0.ct_eq(&expected.0)) {
+            return Ok(Principal::Static);
+        }
+    }
+
+    match credentials.operators.get(&digest) {
+        Some(identifier) => Ok(Principal::Operator(identifier.clone())),
+        None => Err(unauthorized()),
     }
 }
 
@@ -363,9 +461,10 @@ where
     O: ObjectStore,
     R: RefStore,
 {
-    if let Err(error) = authenticate(auth, &request) {
-        return error_response(error);
-    }
+    let caller = match authenticate(auth, &request) {
+        Ok(caller) => caller,
+        Err(error) => return error_response(error),
+    };
 
     let (warehouse_id, route) = match resolve_route(routing, &request) {
         Ok(resolved) => resolved,
@@ -377,10 +476,51 @@ where
         Err(message) => return error_response(HeadError::internal(message)),
     };
 
-    match dispatch(&head, route, request.into_body()) {
+    if let Err(error) = require_set_up_for(routing, &head, &caller, &route) {
+        return error_response(error);
+    }
+
+    match dispatch(&head, &caller, route, request.into_body()) {
         Ok(response) => response,
         Err(error) => error_response(error),
     }
+}
+
+/// In multi-warehouse routing every well-formed id answers, so a warehouse with no trust anchor
+/// is one nobody has set up. An operator token may not write to it — nor establish its trust,
+/// which would hand the id to whoever held any token. Setting a warehouse up is the shared
+/// bearer's (or an open head's), as creating one is the static token's on `forklift-server`.
+/// A single-warehouse head serves the one warehouse its deployer configured, and there the
+/// office rules alone decide. An anchor, once present, is never removed (a re-genesis replaces
+/// it), so the warehouse cannot fall back out of this check before the route commits.
+fn require_set_up_for<O, R>(routing: &Routing, head: &Head<O, R>, caller: &Principal, route: &Route)
+    -> HeadResult<()>
+where
+    O: ObjectStore,
+    R: RefStore,
+{
+    let writes = matches!(
+        route,
+        Route::UploadTargets
+            | Route::ObjectPut { .. }
+            | Route::SignaturePut(_)
+            | Route::PutTrust
+            | Route::RefUpdate(_)
+            | Route::CommitLift(_)
+    );
+
+    if !matches!(routing, Routing::Multi) || !writes || !matches!(caller, Principal::Operator(_)) {
+        return Ok(());
+    }
+
+    if head.refs.get_trust().map_err(HeadError::internal)?.is_none() {
+        return Err(HeadError::forbidden(
+            "This warehouse has not been set up: the deployment's administrator establishes its \
+            trust first, and only then may an operator token write to it.",
+        ));
+    }
+
+    Ok(())
 }
 
 /// A parsed route: the protocol endpoint plus the path/query pieces it carries. The body is
@@ -521,7 +661,8 @@ fn signature_put_status(outcome: SignatureOutcome) -> StatusCode {
 
 /// Call the `Head` method a route names and shape its outcome into a response. Returning a
 /// [`HeadError`] here funnels every failure through the one status/JSON-body mapping.
-fn dispatch<O, R>(head: &Head<O, R>, route: Route, body: Vec<u8>) -> HeadResult<Response<Vec<u8>>>
+fn dispatch<O, R>(head: &Head<O, R>, caller: &Principal, route: Route, body: Vec<u8>)
+    -> HeadResult<Response<Vec<u8>>>
 where
     O: ObjectStore,
     R: RefStore,
@@ -538,7 +679,7 @@ where
         Route::UploadTargets => {
             let request: UploadTargetsRequest = parse_json(&body)?;
             reject_oversized_upload_targets(request.hashes.len())?;
-            let response = head.upload_targets(&request.session, &request.hashes)?;
+            let response = head.upload_targets(caller, &request.session, &request.hashes)?;
             Ok(json_response(StatusCode::OK, &response))
         }
 
@@ -560,7 +701,7 @@ where
         },
 
         Route::ObjectPut { hash, session } => {
-            match head.object_put(session.as_deref(), &hash, &body)? {
+            match head.object_put(caller, session.as_deref(), &hash, &body)? {
                 ObjectWriteResult::Stored { created: true } => Ok(empty(StatusCode::CREATED)),
                 ObjectWriteResult::Stored { created: false } => Ok(empty(StatusCode::OK)),
                 ObjectWriteResult::Redirect(url) =>
@@ -573,12 +714,12 @@ where
         }
 
         Route::SignaturePut(hash) => {
-            Ok(empty(signature_put_status(head.signature_put(&hash, &body)?)))
+            Ok(empty(signature_put_status(head.signature_put(caller, &hash, &body)?)))
         }
 
         Route::PutTrust => {
             let anchor: TrustAnchorDto = parse_json(&body)?;
-            match head.put_trust(&anchor)? {
+            match head.put_trust(caller, &anchor)? {
                 TrustResult::Established => Ok(empty(StatusCode::CREATED)),
                 TrustResult::Unchanged => Ok(empty(StatusCode::OK)),
             }
@@ -586,7 +727,7 @@ where
 
         Route::RefUpdate(name) => {
             let request: RefUpdateRequest = parse_json(&body)?;
-            head.ref_update(&name, &request)?;
+            head.ref_update(caller, &name, &request)?;
             Ok(empty(StatusCode::OK))
         }
 
@@ -611,7 +752,7 @@ where
         Route::CommitLift(session) => {
             let request: CommitLiftRequest = parse_json(&body)?;
             reject_oversized_commit(request.control_plane.len(), request.blobs.len())?;
-            head.commit_lift(&session, &request.control_plane, &request.blobs, request.more)?;
+            head.commit_lift(caller, &session, &request.control_plane, &request.blobs, request.more)?;
             Ok(empty(StatusCode::OK))
         }
     }
@@ -949,115 +1090,179 @@ mod tests {
         Request::builder().body(()).unwrap()
     }
 
-    /// `AuthConfig::Token(BearerToken::new(s).unwrap())`, spelled out once: every test below
-    /// wants a real, valid token and none of them are testing `BearerToken::new` itself (that is
-    /// `bearer_token_new_rejects_blank_and_keeps_everything_else` below), so the `.unwrap()`
-    /// belongs here, not repeated at every call site.
-    fn token_auth(token: &str) -> AuthConfig {
-        AuthConfig::Token(BearerToken::new(token.to_string()).unwrap())
+    /// The SHA-256 of `token`, as a deployer writes it into the environment.
+    fn hex_digest(token: &str) -> String {
+        sign_utils::to_hex(&Sha256::digest(token.as_bytes()))
     }
 
-    /// [`BearerToken::new`] is the *only* gate a blank credential must pass, from every
-    /// constructor of [`AuthConfig::Token`] — not just `auth_from`'s env path (PR #124 round 3,
-    /// F2: `AuthConfig::Token`'s payload used to be a bare `pub String`, so
-    /// `AuthConfig::Token(String::new())` was directly constructible, bypassing `auth_from`'s
-    /// filter entirely). Empty and whitespace-only are both rejected — the same rule
-    /// `forklift-server` applies to its own static token (PR #124 round 3, F1) — while a real
-    /// token survives untouched, including one with incidental internal whitespace that is not
-    /// entirely blank.
+    /// A variable source holding exactly `vars`.
+    fn vars(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: HashMap<String, String> =
+            vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |name| vars.get(name).cloned()
+    }
+
+    /// Credentials of a shared bearer `token` alone.
+    fn static_auth(token: &str) -> AuthConfig {
+        AuthConfig::Credentials(Credentials::new(Some(TokenDigest::of_token(token).unwrap()), Vec::new()).unwrap())
+    }
+
+    /// Credentials of a shared bearer and one operator token per `(token, identifier)`.
+    fn operator_auth(static_token: Option<&str>, operators: &[(&str, &str)]) -> AuthConfig {
+        let operators = operators
+            .iter()
+            .map(|(token, identifier)| (TokenDigest::of_token(token).unwrap(), identifier.to_string()))
+            .collect();
+        AuthConfig::Credentials(
+            Credentials::new(static_token.map(|token| TokenDigest::of_token(token).unwrap()), operators).unwrap(),
+        )
+    }
+
+    /// A configured digest is 64 lowercase hex characters, and never the digest of the empty
+    /// string: a configuration holding that would admit a blank bearer.
     #[test]
-    fn bearer_token_new_rejects_blank_and_keeps_everything_else() {
-        assert!(BearerToken::new(String::new()).is_err(), "empty must be rejected");
-        assert!(BearerToken::new("   ".to_string()).is_err(), "whitespace-only must be rejected");
+    fn a_token_digest_is_64_lowercase_hex_and_never_the_empty_strings() {
+        assert_eq!(TokenDigest::parse_hex(&hex_digest("secret")).unwrap(), TokenDigest::of_token("secret").unwrap());
+
+        assert!(TokenDigest::parse_hex(&hex_digest("")).is_err(), "the empty string's digest");
+        assert!(TokenDigest::parse_hex(&hex_digest("secret").to_uppercase()).is_err(), "uppercase");
+        assert!(TokenDigest::parse_hex(&hex_digest("secret")[1..]).is_err(), "63 characters");
+        assert!(TokenDigest::parse_hex(&format!("{}0", hex_digest("secret"))).is_err(), "65 characters");
+        assert!(TokenDigest::parse_hex(&format!("g{}", &hex_digest("secret")[1..])).is_err(), "a non-hex digit");
+        assert!(TokenDigest::parse_hex("").is_err(), "empty");
+        assert!(TokenDigest::parse_hex("secret").is_err(), "a plaintext token");
+
+        assert!(TokenDigest::of_token("").is_err(), "an empty token");
+        assert!(TokenDigest::of_token("   ").is_err(), "a whitespace-only token");
         assert_eq!(
-            BearerToken::new("secret".to_string()).unwrap().as_str(),
-            "secret",
-            "a real token must survive unchanged"
-        );
-        assert_eq!(
-            BearerToken::new(" has spaces ".to_string()).unwrap().as_str(),
-            " has spaces ",
-            "a real, non-blank token must not be trimmed — only entirely-blank is rejected"
+            TokenDigest::of_token(" has spaces ").unwrap(),
+            TokenDigest::parse_hex(&hex_digest(" has spaces ")).unwrap(),
+            "a real token is hashed untrimmed"
         );
     }
 
-    /// A blank `FORKLIFT_TOKEN` (empty or whitespace-only) is treated exactly like an unset one
-    /// — never a valid blank token — and the opt-out only takes effect (and only for the literal
-    /// `"1"`) when there is no real token at all: a token, once configured, always wins.
+    /// The cold-start matrix: a credential configured closes the head to everything else; no
+    /// credential is closed unless the literal opt-out says open; and every misconfiguration is
+    /// an error that fails the cold start rather than a quieter configuration.
     #[test]
-    fn auth_from_env_treats_a_blank_token_as_unset_and_only_the_opt_out_falls_back_to_open() {
-        assert_eq!(auth_from(Some("secret".to_string()), None), token_auth("secret"));
+    fn auth_from_env_resolves_credentials_and_refuses_every_misconfiguration() {
+        let digest = hex_digest("secret");
+        let ada = hex_digest("ada-token");
+
+        assert_eq!(auth_from(vars(&[("FORKLIFT_TOKEN_SHA256", &digest)])).unwrap(), static_auth("secret"));
         assert_eq!(
-            auth_from(Some("".to_string()), None),
+            auth_from(vars(&[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":"ada@example"}}"#, ada))])).unwrap(),
+            operator_auth(None, &[("ada-token", "ada@example")])
+        );
+        assert_eq!(
+            auth_from(vars(&[
+                ("FORKLIFT_TOKEN_SHA256", &digest),
+                ("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":"ada@example"}}"#, ada)),
+            ]))
+            .unwrap(),
+            operator_auth(Some("secret"), &[("ada-token", "ada@example")])
+        );
+
+        assert_eq!(auth_from(vars(&[])).unwrap(), AuthConfig::Closed, "nothing configured is closed");
+        assert_eq!(auth_from(vars(&[("FORKLIFT_OPEN_ACCESS", "1")])).unwrap(), AuthConfig::Open);
+        assert_eq!(auth_from(vars(&[("FORKLIFT_OPEN_ACCESS", "yes")])).unwrap(), AuthConfig::Closed, "only \"1\"");
+        assert_eq!(
+            auth_from(vars(&[("FORKLIFT_OPERATOR_TOKENS", "{}")])).unwrap(),
             AuthConfig::Closed,
-            "an empty token with no opt-out is closed, not a valid empty token"
+            "an empty map is no credential"
         );
-        assert_eq!(
-            auth_from(Some("   ".to_string()), None),
-            AuthConfig::Closed,
-            "a whitespace-only token with no opt-out is closed too — the same rule as empty"
+
+        let refused = |source: &[(&str, &str)], why: &str| {
+            let error = auth_from(vars(source)).expect_err(why);
+            assert!(!error.contains("secret"), "{}: the error must not echo a credential: {}", why, error);
+            error
+        };
+
+        let leftover = refused(&[("FORKLIFT_TOKEN", "secret")], "a plaintext token");
+        assert!(leftover.contains("FORKLIFT_TOKEN_SHA256"), "{}", leftover);
+        refused(&[("FORKLIFT_TOKEN", "secret"), ("FORKLIFT_TOKEN_SHA256", &digest)], "a plaintext token beside its digest");
+        refused(&[("FORKLIFT_TOKEN", "")], "even an empty plaintext token");
+
+        let open = refused(&[("FORKLIFT_TOKEN_SHA256", &digest), ("FORKLIFT_OPEN_ACCESS", "1")], "open beside a digest");
+        assert!(open.contains("FORKLIFT_OPEN_ACCESS"), "{}", open);
+        refused(
+            &[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":"ada@example"}}"#, ada)), ("FORKLIFT_OPEN_ACCESS", "1")],
+            "open beside operator tokens",
         );
-        assert_eq!(auth_from(None, None), AuthConfig::Closed, "no token, no opt-out: closed by default");
-        assert_eq!(auth_from(None, Some("1".to_string())), AuthConfig::Open, "the explicit opt-out");
-        assert_eq!(
-            auth_from(Some("".to_string()), Some("1".to_string())),
-            AuthConfig::Open,
-            "an empty token is unset, so the opt-out still applies"
+
+        refused(&[("FORKLIFT_TOKEN_SHA256", "")], "an empty digest");
+        refused(&[("FORKLIFT_TOKEN_SHA256", &hex_digest(""))], "the empty string's digest");
+        refused(&[("FORKLIFT_TOKEN_SHA256", "secret")], "a plaintext token in the digest variable");
+
+        refused(&[("FORKLIFT_OPERATOR_TOKENS", "not json")], "malformed JSON");
+        refused(&[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"["{}"]"#, ada))], "not an object");
+        refused(&[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":7}}"#, ada))], "a non-string identifier");
+        refused(&[("FORKLIFT_OPERATOR_TOKENS", r#"{"secret":"ada@example"}"#)], "a key that is not a digest");
+        refused(
+            &[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":"ada@example"}}"#, hex_digest("")))],
+            "the empty string's digest as a key",
         );
-        assert_eq!(
-            auth_from(Some("   ".to_string()), Some("1".to_string())),
-            AuthConfig::Open,
-            "a whitespace-only token is unset too, so the opt-out still applies"
+        refused(&[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":"  "}}"#, ada))], "a blank identifier");
+        refused(
+            &[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{0}":"ada@example","{0}":"eve@example"}}"#, ada))],
+            "one digest bound twice",
         );
-        assert_eq!(
-            auth_from(Some("secret".to_string()), Some("1".to_string())),
-            token_auth("secret"),
-            "a real token always wins over the opt-out"
-        );
-        assert_eq!(
-            auth_from(None, Some("yes".to_string())),
-            AuthConfig::Closed,
-            "only the literal \"1\" opts out"
+        refused(
+            &[
+                ("FORKLIFT_TOKEN_SHA256", &hex_digest("shared-secret")),
+                ("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":"ada@example"}}"#, hex_digest("shared-secret"))),
+            ],
+            "one digest bound as the shared bearer and as an operator",
         );
     }
 
-    /// `AuthConfig::Token`'s `Debug` must never print the bearer token — the same class of leak
-    /// `forklift-server::HookEndpoint`/`ConfigFile` close, applied to this head's own primary
-    /// credential (PR #124 round 2, F3). Checks both the value's absence and the field name's
-    /// presence, so a future edit cannot "fix" the match arm without the test noticing the
-    /// variant's own name vanished too.
+    /// Operator tokens alone suit one warehouse, never many: in multi routing nobody could set a
+    /// warehouse up. The shared bearer, or open access, suits either.
     #[test]
-    fn auth_config_debug_never_prints_the_token() {
-        let formatted = format!("{:?}", token_auth("s3cr3t-value"));
+    fn operator_tokens_alone_are_refused_for_multi_warehouse_routing() {
+        let operators_only = auth_from(vars(&[(
+            "FORKLIFT_OPERATOR_TOKENS",
+            &format!(r#"{{"{}":"ada@example"}}"#, hex_digest("ada-token")),
+        )]))
+        .unwrap();
+        let with_bearer = auth_from(vars(&[("FORKLIFT_TOKEN_SHA256", &hex_digest("shared-secret"))])).unwrap();
+        let single = Routing::Single("wh".to_string());
 
-        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
-        assert!(formatted.contains("Token"), "{}", formatted);
-        assert!(formatted.contains("redacted"), "{}", formatted);
+        assert!(check_auth_fits_routing(&operators_only, &Routing::Multi).unwrap_err().contains("FORKLIFT_TOKEN_SHA256"));
+        assert_eq!(check_auth_fits_routing(&operators_only, &single), Ok(()));
+        assert_eq!(check_auth_fits_routing(&with_bearer, &Routing::Multi), Ok(()));
+        assert_eq!(check_auth_fits_routing(&AuthConfig::Open, &Routing::Multi), Ok(()));
     }
 
-    /// `BearerToken`'s own `Debug` must redact too, independent of `AuthConfig::Token`'s hand
-    /// -written match arm (which never calls it) — belt-and-braces, in case a future path prints
-    /// a bare `BearerToken` rather than one wrapped in `AuthConfig`.
+    /// An identifier is bound exactly as configured: the office matches identifiers by exact
+    /// equality, so trimming one here would hand its token to a different user.
     #[test]
-    fn bearer_token_debug_never_prints_the_token() {
-        let formatted = format!("{:?}", BearerToken::new("s3cr3t-value".to_string()).unwrap());
+    fn an_operator_identifier_is_kept_untrimmed() {
+        let config = auth_from(vars(&[(
+            "FORKLIFT_OPERATOR_TOKENS",
+            &format!(r#"{{"{}":" ada@example"}}"#, hex_digest("ada-token")),
+        )]))
+        .unwrap();
 
-        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
-        assert!(formatted.contains("redacted"), "{}", formatted);
+        assert_eq!(
+            authenticate(&config, &request_with_bearer("ada-token")).unwrap(),
+            Principal::Operator(" ada@example".to_string())
+        );
     }
 
-    /// Pins the equality semantics a timing side channel can't be asserted in a unit test:
-    /// an exact match passes, and near-misses of every length relationship (equal, shorter,
-    /// longer) refuse — including the equal-length case, which is exactly what would slip
-    /// through a broken constant-time comparison that always agreed on length.
+    /// `Debug` never prints a digest or an identifier, only what is configured.
     #[test]
-    fn tokens_match_requires_an_exact_byte_for_byte_match() {
-        assert!(tokens_match("secret", "secret"));
-        assert!(!tokens_match("secret", "secrft"), "a same-length near-miss must refuse");
-        assert!(!tokens_match("secret", "secre"), "a shorter guess must refuse");
-        assert!(!tokens_match("secret", "secrets"), "a longer guess must refuse");
-        assert!(!tokens_match("", "secret"));
-        assert!(tokens_match("", ""));
+    fn auth_config_debug_never_prints_a_credential() {
+        let config = operator_auth(Some("s3cr3t-value"), &[("ada-token", "ada@example")]);
+        let formatted = format!("{:?}", config);
+
+        assert!(!formatted.contains(&hex_digest("s3cr3t-value")), "{}", formatted);
+        assert!(!formatted.contains(&hex_digest("ada-token")), "{}", formatted);
+        assert!(!formatted.contains("ada@example"), "{}", formatted);
+        assert!(formatted.contains("Credentials"), "{}", formatted);
+
+        let digest = format!("{:?}", TokenDigest::of_token("s3cr3t-value").unwrap());
+        assert!(digest.contains("redacted"), "{}", digest);
     }
 
     #[test]
@@ -1074,27 +1279,51 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_open_passes_every_request() {
+    fn authenticate_open_passes_every_request_as_open() {
         let auth = AuthConfig::Open;
-        assert!(authenticate(&auth, &request_with_no_header()).is_ok());
-        assert!(authenticate(&auth, &request_with_bearer("anything")).is_ok());
+        assert_eq!(authenticate(&auth, &request_with_no_header()).unwrap(), Principal::Open);
+        assert_eq!(authenticate(&auth, &request_with_bearer("anything")).unwrap(), Principal::Open);
     }
 
+    /// The shared bearer is [`Principal::Static`], an operator token is that operator, and
+    /// anything else — no header, a wrong or near-miss token, another scheme — is refused.
     #[test]
-    fn authenticate_token_requires_the_exact_bearer() {
-        let auth = token_auth("secret");
+    fn authenticate_resolves_each_token_to_its_principal() {
+        let auth = operator_auth(Some("secret"), &[("ada-token", "ada@example")]);
 
-        assert!(authenticate(&auth, &request_with_bearer("secret")).is_ok());
+        assert_eq!(authenticate(&auth, &request_with_bearer("secret")).unwrap(), Principal::Static);
+        assert_eq!(
+            authenticate(&auth, &request_with_bearer("ada-token")).unwrap(),
+            Principal::Operator("ada@example".to_string())
+        );
         assert!(authenticate(&auth, &request_with_no_header()).is_err());
         assert!(authenticate(&auth, &request_with_bearer("wrong")).is_err());
-        assert!(
-            authenticate(&auth, &request_with_bearer("secrft")).is_err(),
-            "an equal-length near miss must refuse"
-        );
+        assert!(authenticate(&auth, &request_with_bearer("secrft")).is_err(), "an equal-length near miss");
+        assert!(authenticate(&auth, &request_with_bearer("ada@example")).is_err(), "an identifier is not a token");
 
         let non_bearer =
             Request::builder().header(header::AUTHORIZATION, "Basic secret").body(()).unwrap();
         assert!(authenticate(&auth, &non_bearer).is_err(), "a non-Bearer scheme must refuse");
+
+        let operators_only = operator_auth(None, &[("ada-token", "ada@example")]);
+        assert!(authenticate(&operators_only, &request_with_bearer("secret")).is_err(), "no shared bearer");
+    }
+
+    /// A blank bearer is refused before anything is hashed, so no configured digest can ever
+    /// match one — not even a digest of that very blank string, which [`TokenDigest`]'s
+    /// constructors refuse but which is built here directly to show the check does not lean on
+    /// them.
+    #[test]
+    fn authenticate_refuses_a_blank_bearer_before_hashing_it() {
+        for blank in ["", "   "] {
+            let auth = AuthConfig::Credentials(Credentials {
+                static_token: Some(TokenDigest::hash(blank)),
+                operators: [(TokenDigest::hash(blank), "ada@example".to_string())].into_iter().collect(),
+            });
+
+            let error = authenticate(&auth, &request_with_bearer(blank)).unwrap_err();
+            assert_eq!(error.status, crate::error::Status::Unauthorized, "{:?}", blank);
+        }
     }
 
     /// RFC 7235 §2.1: `auth-scheme` is case-insensitive, so `bearer`/`BEARER`/mixed-case must
@@ -1103,7 +1332,7 @@ mod tests {
     /// refuse.
     #[test]
     fn authenticate_accepts_the_bearer_scheme_case_insensitively() {
-        let auth = token_auth("secret");
+        let auth = static_auth("secret");
 
         for scheme in ["bearer", "Bearer", "BEARER", "BeArEr"] {
             let request = Request::builder()
@@ -1128,7 +1357,7 @@ mod tests {
     fn closed_and_a_wrong_token_answer_the_identical_401() {
         let closed_error = authenticate(&AuthConfig::Closed, &request_with_no_header()).unwrap_err();
         let wrong_token_error = authenticate(
-            &token_auth("secret"),
+            &static_auth("secret"),
             &request_with_bearer("wrong"),
         ).unwrap_err();
 

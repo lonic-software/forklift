@@ -53,7 +53,10 @@ pub mod reissue;
 
 pub use aws::{AwsConfig, DynamoRefStore, S3ObjectStore};
 pub use blocking::AsyncBridge;
-pub use entrypoint::{auth_from_env, config_from_env, handle, AuthConfig, BearerToken, Routing};
+pub use entrypoint::{
+    auth_from_env, check_auth_fits_routing, config_from_env, handle, AuthConfig, Credentials, Routing,
+    TokenDigest,
+};
 pub use error::{HeadError, HeadResult, Status};
 pub use head::{BatchResult, Head};
 pub use store::{

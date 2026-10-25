@@ -177,8 +177,10 @@ run "c4_verifier_env_carries_table" {
 }
 
 # ---------------------------------------------------------------------------------------------
-# C5 — open access is not constructible: FORKLIFT_OPEN_ACCESS is absent from both env maps, and
-# an empty auth_token is a validation failure (never a valid empty token).
+# C5 — open access is not constructible: FORKLIFT_OPEN_ACCESS is absent from both env maps, a
+# control plane with no credential at all is a validation failure, and so is an empty auth_token
+# (never a valid empty token). The function holds credentials only as digests: no plaintext
+# FORKLIFT_TOKEN, which it would refuse to start with.
 # ---------------------------------------------------------------------------------------------
 
 run "c5_open_access_not_constructible" {
@@ -195,6 +197,62 @@ run "c5_open_access_not_constructible" {
   }
 }
 
+run "c5_auth_token_rendered_as_its_digest_only" {
+  command = apply
+
+  assert {
+    condition     = aws_lambda_function.control_plane.environment[0].variables["FORKLIFT_TOKEN_SHA256"] == sha256("a-test-token-that-is-long-enough")
+    error_message = "C5: the control plane must carry the shared token's SHA-256 as FORKLIFT_TOKEN_SHA256."
+  }
+
+  assert {
+    condition     = !contains(keys(aws_lambda_function.control_plane.environment[0].variables), "FORKLIFT_TOKEN")
+    error_message = "C5: the plaintext token must never reach the function's environment."
+  }
+
+  assert {
+    condition     = !contains(keys(aws_lambda_function.control_plane.environment[0].variables), "FORKLIFT_OPERATOR_TOKENS")
+    error_message = "C5: no operator tokens configured, so no FORKLIFT_OPERATOR_TOKENS."
+  }
+
+  assert {
+    condition     = !contains(keys(aws_lambda_function.verifier.environment[0].variables), "FORKLIFT_TOKEN_SHA256")
+    error_message = "C5: the verifier carries no credential."
+  }
+}
+
+run "c5_operator_tokens_alone_are_a_credential" {
+  command = apply
+
+  variables {
+    warehouse_id           = "wh"
+    auth_token             = null
+    operator_token_digests = { (sha256("an-operator-token")) = "ada@example" }
+  }
+
+  assert {
+    condition     = jsondecode(aws_lambda_function.control_plane.environment[0].variables["FORKLIFT_OPERATOR_TOKENS"]) == { (sha256("an-operator-token")) = "ada@example" }
+    error_message = "C5: the digest map must reach the control plane as FORKLIFT_OPERATOR_TOKENS."
+  }
+
+  assert {
+    condition     = !contains(keys(aws_lambda_function.control_plane.environment[0].variables), "FORKLIFT_TOKEN_SHA256")
+    error_message = "C5: no shared token configured, so no FORKLIFT_TOKEN_SHA256."
+  }
+}
+
+run "c5_no_credential_rejected" {
+  command = plan
+
+  variables {
+    auth_token = null
+  }
+
+  expect_failures = [
+    var.operator_token_digests,
+  ]
+}
+
 run "c5_empty_auth_token_rejected" {
   command = plan
 
@@ -204,6 +262,56 @@ run "c5_empty_auth_token_rejected" {
 
   expect_failures = [
     var.auth_token,
+  ]
+}
+
+run "c5_malformed_operator_digest_rejected" {
+  command = plan
+
+  variables {
+    operator_token_digests = { "an-operator-token" = "ada@example" }
+  }
+
+  expect_failures = [
+    var.operator_token_digests,
+  ]
+}
+
+run "c5_empty_strings_digest_rejected" {
+  command = plan
+
+  variables {
+    operator_token_digests = { (sha256("")) = "ada@example" }
+  }
+
+  expect_failures = [
+    var.operator_token_digests,
+  ]
+}
+
+run "c5_operator_tokens_alone_rejected_for_multi_warehouse" {
+  command = plan
+
+  variables {
+    auth_token             = null
+    operator_token_digests = { (sha256("an-operator-token")) = "ada@example" }
+  }
+
+  expect_failures = [
+    var.operator_token_digests,
+  ]
+}
+
+run "c5_shared_bearer_as_operator_token_rejected" {
+  command = plan
+
+  variables {
+    auth_token             = "0123456789abcdef-shared"
+    operator_token_digests = { (sha256("0123456789abcdef-shared")) = "ada@example" }
+  }
+
+  expect_failures = [
+    var.operator_token_digests,
   ]
 }
 

@@ -10,16 +10,18 @@ locals {
   control_plane_function_name = "${var.name_prefix}-control-plane"
   verifier_function_name      = "${var.name_prefix}-verifier"
 
-  # entrypoint::config_from_env (entrypoint.rs:84-112) is the whole configuration surface both
-  # binaries share. `aws_lambda_function`'s `environment.variables` is `map(string)` and rejects
-  # a null element at plan time, so every optional variable is merged in only when non-null
-  # rather than ever assigned null — this is what C4/C5's env-map asserts depend on.
+  # entrypoint::config_from_env is the whole configuration surface both binaries share, and
+  # entrypoint::auth_from_env the control plane's credentials on top of it.
+  # `aws_lambda_function`'s `environment.variables` is `map(string)` and rejects a null element
+  # at plan time, so every optional variable is merged in only when non-null rather than ever
+  # assigned null — this is what C4/C5's env-map asserts depend on.
   control_plane_env = merge(
     {
       FORKLIFT_S3_BUCKET      = aws_s3_bucket.this.bucket
       FORKLIFT_DYNAMODB_TABLE = aws_dynamodb_table.this.name
-      FORKLIFT_TOKEN          = var.auth_token
     },
+    var.auth_token != null ? { FORKLIFT_TOKEN_SHA256 = sha256(var.auth_token) } : {},
+    length(var.operator_token_digests) > 0 ? { FORKLIFT_OPERATOR_TOKENS = jsonencode(var.operator_token_digests) } : {},
     var.warehouse_id != null ? { FORKLIFT_WAREHOUSE_ID = var.warehouse_id } : {},
     var.default_pallet != null ? { FORKLIFT_DEFAULT_PALLET = var.default_pallet } : {},
     var.dev_endpoint_url != null ? { FORKLIFT_AWS_ENDPOINT_URL = var.dev_endpoint_url } : {},
@@ -28,7 +30,7 @@ locals {
   # The verifier calls the same config_from_env, so FORKLIFT_DYNAMODB_TABLE must be set even
   # though verify_and_promote never issues a single DynamoDB operation (the "operator quirk",
   # docs/DEPLOYMENT.md, pinned by C4) — a module that wires both functions from one config
-  # cannot forget this. No FORKLIFT_TOKEN (the verifier is never invoked by a bearer-carrying
+  # cannot forget this. No credential (the verifier is never invoked by a bearer-carrying
   # client — it is triggered by an S3 event, entrypoint.rs), no FORKLIFT_WAREHOUSE_ID (promotion
   # is content-addressed, not warehouse-scoped), no FORKLIFT_DEFAULT_PALLET (control-plane only).
   verifier_env = merge(
