@@ -465,6 +465,11 @@ The most recent bundle (see `BUNDLE_FORMAT.md`), or `404` when none was built. A
 is an optimization, never a source of truth: clients verify every record's hash and
 fall back to loose-object `GET`s for anything the bundle lacks.
 
+A head serves only a bundle in the version its build writes. forklift-server answers `404`
+while the file it holds is in another version (built before an upgrade), and logs a warning
+naming the rebuild, so a client does not download a file it would only refuse. A client that is
+served another version anyway skips it and fetches objects, as it does on a `404`.
+
 ## The flows
 
 **lift (push)** — for the office pallet first (when trust is established), then the

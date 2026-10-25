@@ -1,39 +1,59 @@
-# Bundle format — version `2026-07-13`
+# Bundle format — version `2026-10-25`
 
 A whole-warehouse bundle is a transport envelope around Forklift's native indexed packs. It is a
 clone-time optimization, never a source of truth: every incoming object is reconstructed and
 content-hash verified in quarantine, and the ordinary history walk fetches anything the bundle did
 not contain.
 
-Version `2026-07-13` removes the old clone-time impedance mismatch. Earlier bundles were one outer
+Version `2026-07-13` removed the old clone-time impedance mismatch. Earlier bundles were one outer
 zstd record stream; importing one decompressed every object and created one loose file per object.
-With durable writes enabled, that meant one file sync and directory sync per object. The current
-format carries the native `.pack`/`.idx` pairs directly, so a client verifies once and publishes a
-small number of aggregate files. Pack records are already individually zstd-compressed, so there is
-no redundant outer compression stream.
+With durable writes enabled, that meant one file sync and directory sync per object. The native
+format carries the `.pack`/`.idx` pairs directly, so a client verifies once and publishes a small
+number of aggregate files. Pack records are already individually zstd-compressed, so there is no
+redundant outer compression stream.
+
+Version `2026-10-25` keeps that envelope and ends it with a digest of every byte before it. A
+client can then tell a whole file from one assembled out of two downloads, or one whose bytes a
+crash lost, before it stores anything (see *Digest*, below).
 
 ## Transport envelope
 
 All integer fields in the envelope are unsigned and big-endian.
 
 ```text
-forklift-bundle 2026-07-13\n
+forklift-bundle 2026-10-25\n
 pack_count       u32
 pack table       pack_count × (data_length u64, index_length u64)
 pack sections    for each table row: data bytes, then index bytes
 signature_count  u64
 signatures       signature_count × (parcel_hash[64 lowercase ASCII hex], length u64, bytes[length])
+digest           32 bytes: blake3 of every byte above, the header line included
 EOF
 ```
 
 The table is separate from the sections so the reader can validate every declared count and length
 before it copies a byte into quarantine. The current limits are 4,096 packs, approximately 578 MiB
 per data section (the 512 MiB rollover plus one maximum-size object and framing), and 4,832,792
-bytes per index (the index of a 100,000-object pack, the object-count rollover). A header newline must occur within 128 bytes. Trailing bytes are rejected.
+bytes per index (the index of a 100,000-object pack, the object-count rollover). A header newline must occur within 128 bytes. Bytes between the signature section and the digest are rejected.
 
 Parcel signature sidecars remain a separate envelope section because they are addressed by the
 parcel they sign rather than by their own content hash. They retain their existing sidecar storage
 and audit semantics; the native-pack change applies to objects.
+
+## Digest
+
+The last 32 bytes are the blake3 digest of everything before them. Import reads the header line
+first, so a file in another version is reported unsupported whatever it ends with. It then hashes
+the whole file and compares, before it creates a temporary file, publishes a pack or stores a
+sidecar. A mismatch, or a file too short to end in a digest, is refused with an error of its own
+kind, and nothing of the file is stored.
+
+The digest exists for the signature section. Import hash-verifies every pack object, but it stores
+a signature payload after checking only its framing and the parcel it names, and a stored sidecar
+is never replaced by a later fetch. Without the digest, a file spliced from two builds could store a
+well-formed but wrong sidecar, and a genuine parcel would then audit as tampered. The digest is not
+a signature: it says the file is the one some builder wrote, not that the builder is trusted. Each
+object is still verified by its own hash.
 
 ## Native pack pair
 
@@ -86,7 +106,7 @@ another pack from the same envelope; import verifies the complete quarantined pa
 
 ## Import and publication
 
-Import is deliberately two-phase:
+Import is deliberately two-phase, and runs only once the whole file has matched its digest:
 
 1. Copy each exact-length pack and index section into hidden temporary files in the destination's
    real pack directory. Normal pack discovery sees only `.idx`, never these `.tmp` files.
@@ -97,7 +117,7 @@ Import is deliberately two-phase:
 4. Sync the handful of verified aggregate files, then publish data first and index last. The index
    is the reader-visible commit point. Finally sync the pack directory and invalidate the in-process
    pack cache.
-5. Import the signature sidecar section and require EOF. Each entry becomes its own sidecar file,
+5. Import the signature sidecar section and require the digest to follow it. Each entry becomes its own sidecar file,
    so it is admitted only when its hash names a parcel present in the store once the packs have
    landed, and only once per bundle. An entry naming a blob, a tree, an absent hash, or a parcel an
    earlier entry already signed rejects the bundle before its bytes are read. (The importer runs
@@ -117,9 +137,12 @@ sender.
 
 `forklift-server bundle` walks every user and meta pallet head in deterministic oldest-first order,
 including all reachable parcels, trees, blobs, and parcel signature sidecars. It builds bounded
-native packs in a temporary directory, writes the envelope to a sibling temporary file, syncs it,
-then atomically renames it to `.forklift/bundles/latest`. The server exposes that file at
-`GET /v1/bundles/latest`.
+native packs in a temporary directory, writes the envelope and its digest to a sibling temporary
+file, syncs it, then atomically renames it to `.forklift/bundles/latest`. The server exposes that
+file at `GET /v1/bundles/latest`, and answers `404` while the file there is in another version than
+it writes (one built before an upgrade) or too short to carry a header, logging a warning that
+names the rebuild. The next `forklift-server bundle` replaces it, as does the automatic rebuild
+after enough lifts on a server started with `--rebuild-after-lifts`.
 
 Chunked-file transport has not shipped. A reachable chunked file therefore refuses a whole bundle
 instead of producing an incomplete artifact. Likewise, a grandfathered object above the 64 MiB
@@ -149,10 +172,11 @@ Any other record kind, an unrequested hash, or a repeat rejects the response.
 
 ## Version handling
 
-A whole-bundle file is read only in the `2026-07-13` envelope. Any other header — a future version,
-or one of the record-stream versions whole bundles once used (`2026-07-11`, `2026-07-06`,
-`2026-07-03`) — is reported as unsupported: the client deletes the downloaded optimization and falls
-back to incremental verified fetches. A known-format integrity failure remains fatal.
+A whole-bundle file is read only in the `2026-10-25` envelope. Any other header — a future version,
+the previous native envelope (`2026-07-13`, which carries no digest), or one of the record-stream
+versions whole bundles once used (`2026-07-11`, `2026-07-06`, `2026-07-03`) — is reported as
+unsupported: the client deletes the downloaded optimization and falls back to incremental verified
+fetches. A known-format integrity failure, a digest mismatch included, remains fatal.
 
 ## Future extensions
 

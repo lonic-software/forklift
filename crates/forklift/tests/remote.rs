@@ -725,9 +725,7 @@ fn lift_franchise_lower_round_trip() {
 }
 
 /// A pass-through HTTP proxy in front of a real server that answers every batch fetch with a `404`,
-/// as a remote without the batch endpoint would. Everything else is forwarded unchanged, one
-/// request per connection (`Connection: close` on the forwarded request, so the server closes
-/// after its answer and the copy below ends).
+/// as a remote without the batch endpoint would.
 struct BatchlessProxy {
     url: String,
     batch_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -735,29 +733,53 @@ struct BatchlessProxy {
 
 impl BatchlessProxy {
     fn start(upstream: &str) -> BatchlessProxy {
+        let batch_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&batch_requests);
+        let proxy = InterceptingProxy::start(upstream, move |path| {
+            path.ends_with("/objects/batch").then(|| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            })
+        });
+
+        BatchlessProxy { url: proxy.url, batch_requests }
+    }
+}
+
+/// A pass-through HTTP proxy in front of a real server. A request whose path `intercept` answers
+/// gets that answer (a whole HTTP response); everything else is forwarded unchanged, one request
+/// per connection (`Connection: close` on the forwarded request, so the server closes after its
+/// answer and the copy below ends).
+struct InterceptingProxy {
+    url: String,
+}
+
+type Intercept = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
+
+impl InterceptingProxy {
+    fn start(upstream: &str, intercept: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static) -> InterceptingProxy {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let upstream = upstream.trim_start_matches("http://").trim_end_matches('/').to_string();
-        let batch_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = std::sync::Arc::clone(&batch_requests);
+        let intercept: std::sync::Arc<Intercept> = std::sync::Arc::new(intercept);
 
         // The acceptor lives for the rest of the test process, like `HookServer`'s.
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(downstream) = stream else { continue };
                 let upstream = upstream.clone();
-                let counted = std::sync::Arc::clone(&counted);
+                let intercept = std::sync::Arc::clone(&intercept);
 
-                std::thread::spawn(move || BatchlessProxy::serve(downstream, &upstream, &counted));
+                std::thread::spawn(move || InterceptingProxy::serve(downstream, &upstream, &*intercept));
             }
         });
 
-        BatchlessProxy { url, batch_requests }
+        InterceptingProxy { url }
     }
 
     fn serve(mut downstream: std::net::TcpStream,
              upstream: &str,
-             batch_requests: &std::sync::atomic::AtomicUsize) {
+             intercept: &Intercept) {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 8192];
 
@@ -795,9 +817,8 @@ impl BatchlessProxy {
 
         let path = request_line.split_whitespace().nth(1).unwrap_or_default();
 
-        if path.ends_with("/objects/batch") {
-            batch_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = downstream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        if let Some(answer) = intercept(path) {
+            let _ = downstream.write_all(&answer);
             return;
         }
 
@@ -2034,12 +2055,55 @@ fn a_bundle_that_lags_the_remote_heads_still_imports_with_its_signatures() {
     assert_success(&area.forklift("c", &["audit", "main"]));
 }
 
+/// A whole-warehouse bundle is read only in the version this build writes. A file in another one —
+/// an older record stream, or the previous native envelope a server not yet upgraded still serves —
+/// is set aside as unsupported, never imported by a reader that could not bound what it stores or
+/// check its digest, and the franchise completes through its verified walk. forklift-server itself
+/// answers such a file `404`, so a proxy stands in for a head that serves one anyway.
+///
+/// Revert: treat an unsupported bundle as a failed import in `franchise` → the clone fails → red.
 #[test]
-fn a_record_stream_bundle_file_is_refused_and_franchise_falls_back_to_the_walk() {
-    // A whole-warehouse bundle is read only in the native format. A file in an older
-    // record-stream format is set aside as unsupported, never imported by a reader that could not
-    // bound what it stores, and the franchise completes through its verified walk.
-    let area = TestArea::new("bundle-record-stream");
+fn a_bundle_in_another_version_is_refused_and_franchise_falls_back_to_the_walk() {
+    let area = TestArea::new("bundle-foreign-version");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/one.txt", "one\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "walked"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    for (name, foreign) in [("record-stream", "forklift-bundle 2026-07-11\nnever read"),
+                            ("previous-native", "forklift-bundle 2026-07-13\nnever read")] {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&served);
+        let proxy = InterceptingProxy::start(&server.url, move |path| {
+            path.ends_with("/bundles/latest").then(|| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    foreign.len(), foreign
+                ).into_bytes()
+            })
+        });
+
+        let franchised = area.forklift(".", &["franchise", &proxy.url, name]);
+        assert_success(&franchised);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1, "{}: the bundle was offered", name);
+        assert!(!stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
+        assert_eq!(area.read_file(&format!("{}/one.txt", name)), "one\n");
+        assert!(!area.path(&format!("{}/.forklift/bundles/latest", name)).exists(),
+                "{}: an unsupported bundle is not kept as the warehouse's own", name);
+    }
+}
+
+/// An upgraded forklift-server still holding a latest bundle built before the upgrade answers it
+/// `404`, and the franchise completes through its verified walk without it.
+///
+/// Revert: treat a `404` for the bundle as a failed download in `franchise` → the clone fails → red.
+#[test]
+fn a_server_holding_a_previous_version_bundle_still_franchises() {
+    let area = TestArea::new("bundle-server-previous-version");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "a", &server.url);
@@ -2049,17 +2113,14 @@ fn a_record_stream_bundle_file_is_refused_and_franchise_falls_back_to_the_walk()
     assert_success(&area.forklift("a", &["lift"]));
 
     server.rebuild_bundle(&area);
-    // The header alone decides: what follows it is never read.
-    let bundle = area.path("server-root/.forklift/bundles/latest");
-    assert!(bundle.is_file(), "the server wrote its bundle");
-    std::fs::write(&bundle, b"forklift-bundle 2026-07-11\nnever read").unwrap();
+    std::fs::write(area.path("server-root/.forklift/bundles/latest"),
+                   "forklift-bundle 2026-07-13\nbuilt before the upgrade").unwrap();
 
-    let franchised = area.forklift(".", &["franchise", &server.url, "c"]);
+    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
     assert_success(&franchised);
     assert!(!stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
-    assert_eq!(area.read_file("c/one.txt"), "one\n");
-    assert!(!area.path("c/.forklift/bundles/latest").exists(),
-            "an unsupported bundle is not kept as the warehouse's own");
+    assert_eq!(area.read_file("b/one.txt"), "one\n");
+    assert!(!area.path("b/.forklift/bundles/latest").exists());
 }
 
 #[test]
@@ -7034,8 +7095,9 @@ fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() 
 
     server.rebuild_bundle(&area);
 
-    // A recognized header (so it is not gracefully skipped as an unsupported future version)
-    // over a garbage payload (so importing it is a hard failure, not "nothing to import").
+    // A recognized header (so it is not gracefully skipped as an unsupported version) over a
+    // garbage payload with no digest (so import refuses it outright: a hard failure, not
+    // "nothing to import").
     let bundle_path = area.path("server-root/.forklift/bundles/latest");
     std::fs::write(&bundle_path, format!(
         "{}\nthis is not a valid pack section table",

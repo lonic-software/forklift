@@ -2978,6 +2978,10 @@ impl tokio::io::AsyncRead for PinnedFile {
 /// `GET /v1/bundles/latest` — the most recent bundle, when one was built. The file is
 /// streamed, never read into memory: bundles grow with the warehouse. The open handle
 /// keeps serving the old file even if a rebuild replaces it mid-transfer.
+///
+/// A file in another version than this build writes — one built before an upgrade — is answered
+/// `404`, as if none were built, with a warning naming the rebuild: a client would only download it
+/// to refuse it, then fall back to fetching objects anyway.
 async fn get_bundle(State(state): State<Arc<AppState>>,
                     headers: HeaderMap,
                     Path(params): Path<PathParams>) -> Response {
@@ -2997,26 +3001,59 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         bundle_utils::get_latest_bundle_path()
     };
 
-    match tokio::fs::File::open(&path).await {
-        Ok(file) => {
-            // The download holds the handle until its last byte, so the warehouse is never let go
-            // while it streams.
-            let stream = tokio_util::io::ReaderStream::new(PinnedFile { file, _warehouse: warehouse });
-
-            (
-                [
-                    (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
-                    // Already a zstd stream; the compression layer must not re-wrap.
-                    (axum::http::header::CONTENT_ENCODING, "identity"),
-                ],
-                Body::from_stream(stream),
-            ).into_response()
-        }
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            error_response((StatusCode::NOT_FOUND, "No bundle has been built.".to_string()))
+            return error_response((StatusCode::NOT_FOUND, "No bundle has been built.".to_string()));
         }
-        Err(e) => error_response(internal(format!("Error while opening the bundle: {}", e))),
+        Err(e) => return error_response(internal(format!("Error while opening the bundle: {}", e))),
+    };
+
+    // The header is read from the handle that streams, so the version judged is the file sent.
+    match bundle_is_current(&mut file).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                root = %warehouse.root.display(),
+                "the bundle is not in the format this server writes (built before an upgrade, or cut \
+                short); answering 404 until it is rebuilt with `forklift-server bundle --root <root>` \
+                (or the next automatic rebuild, when --rebuild-after-lifts is set)"
+            );
+            return error_response((
+                StatusCode::NOT_FOUND, "No bundle in the current format has been built.".to_string()
+            ));
+        }
+        Err(e) => return error_response(internal(format!("Error while reading the bundle: {}", e))),
     }
+
+    // The download holds the handle until its last byte, so the warehouse is never let go while
+    // it streams.
+    let stream = tokio_util::io::ReaderStream::new(PinnedFile { file, _warehouse: warehouse });
+
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            // Its packs are already compressed; the compression layer must not re-wrap them.
+            (axum::http::header::CONTENT_ENCODING, "identity"),
+        ],
+        Body::from_stream(stream),
+    ).into_response()
+}
+
+/// Whether the bundle `file` opens is in the version this build writes, leaving the handle back at
+/// its first byte so the whole file streams.
+async fn bundle_is_current(file: &mut tokio::fs::File) -> std::io::Result<bool> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut prefix = vec![0u8; bundle_utils::BUNDLE_HEADER.len() + 1];
+    let current = match file.read_exact(&mut prefix).await {
+        Ok(_) => bundle_utils::is_current_bundle_prefix(&prefix),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(e) => return Err(e),
+    };
+
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    Ok(current)
 }
 
 #[cfg(test)]
@@ -4374,7 +4411,7 @@ mod tests {
             let _scope = StorageRootScope::enter(&base.join("w1"));
             let path = bundle_utils::get_latest_bundle_path();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"bundle bytes").unwrap();
+            std::fs::write(&path, format!("{}\nbundle bytes", bundle_utils::BUNDLE_HEADER)).unwrap();
         }
 
         let response = get_bundle(State(Arc::clone(&state)), HeaderMap::new(),
@@ -4387,6 +4424,41 @@ mod tests {
         drop(response);
         drop(resolve_warehouse(&state, &warehouse_params("w3")).unwrap());
         assert!(!live_ids(&state).contains("w1"), "once the body is gone, the warehouse is idle");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A bundle in another version than this build writes is answered `404`, so a client falls
+    /// back to its object walk without downloading it; a current one is served whole, from its
+    /// first byte, although its header was read to judge it.
+    ///
+    /// Revert: serve whatever file is there → the previous-version file answers `200` → red. Drop
+    /// the seek back to the start → the current file's body loses its header line → red.
+    #[tokio::test]
+    async fn a_bundle_in_a_previous_version_is_answered_not_found() {
+        let base = scratch_dir("bundle-version");
+        let state = Arc::new(capped_state(&base, 2, &["w1"]));
+        let path = {
+            let _scope = StorageRootScope::enter(&base.join("w1"));
+            bundle_utils::get_latest_bundle_path()
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for previous in ["forklift-bundle 2026-07-13\nnative packs", "forklift-bundle 2026-07-11\nrecords", "short"] {
+            std::fs::write(&path, previous).unwrap();
+            let response = get_bundle(State(Arc::clone(&state)), HeaderMap::new(),
+                                      Path(warehouse_params("w1"))).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{:?}", previous);
+        }
+
+        let current = format!("{}\nthe rest of the bundle", bundle_utils::BUNDLE_HEADER);
+        std::fs::write(&path, &current).unwrap();
+        let response = get_bundle(State(Arc::clone(&state)), HeaderMap::new(),
+                                  Path(warehouse_params("w1"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], current.as_bytes(), "the whole file is served from its first byte");
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base);
