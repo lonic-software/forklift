@@ -473,7 +473,7 @@ pub struct ServeOptions {
 ///
 /// Module-private, not `pub` — unlike its previous home in `forklift-core::model::hooks`. This
 /// head's own outbound hook timeout is this head's own operational business, never a quantity a
-/// client budget may read: `forklift-core::util::remote_utils`'s `SINGLE_WRITE_ALLOWANCE` used to
+/// client budget may read: `forklift-core::util::remote_utils`'s single-write allowance used to
 /// import this exact constant to size a client-side deadline, which priced this head's specific
 /// hook behavior into an arithmetic that has to be honest against every head, including
 /// `forklift-aws-lambda`, which runs no hooks at all. Moving the constant here — so a
