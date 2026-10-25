@@ -167,4 +167,52 @@ mod tests {
         assert_eq!(painted(BOLD, true), "\x1b[1mx\x1b[0m");
         assert_eq!(painted(RED.faint(), false), "x");
     }
+
+    /// The lines of `source` before its test module that spell an escape character, by number.
+    fn escapes_outside_tests(source: &str) -> Vec<usize> {
+        const SPELLINGS: [&str; 5] = ["\\x1b", "\\x1B", "\\u{1b}", "\\u{1B}", "\\033"];
+
+        let lines: Vec<&str> = source.lines().collect();
+        let tests = (1..lines.len()).find(|&at| {
+            let item = lines[at].trim_start_matches("pub(crate) ");
+            item == "mod tests {" && lines[at - 1].starts_with("#[cfg(") && lines[at - 1].contains("test")
+        });
+
+        lines[..tests.unwrap_or(lines.len())].iter().enumerate()
+            .filter(|(_, line)| SPELLINGS.iter().any(|spelling| line.contains(spelling)))
+            .map(|(at, _)| at + 1)
+            .collect()
+    }
+
+    /// Every escape the CLI prints goes through this module, so `--color` and `NO_COLOR` govern
+    /// all of them: no other source file of the CLI spells an escape outside its test module.
+    #[test]
+    fn no_other_cli_source_spells_an_escape() {
+        let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut scanned = 0;
+        let mut found = Vec::new();
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()));
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && !path.ends_with("src/color.rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                scanned += 1;
+                found.extend(escapes_outside_tests(&source).into_iter().map(|line| (path.clone(), line)));
+            }
+        }
+
+        assert!(scanned > 20, "scanned only {} files", scanned);
+        assert!(found.is_empty(), "print escapes through crate::color: {:?}", found);
+    }
+
+    #[test]
+    fn the_escape_scan_reads_up_to_the_test_module_only() {
+        let source = "fn a() {}\nconst X: &str = \"\\u{1b}[1m\";\n#[cfg(test)]\nmod tests {\n    \"\\x1b[2J\"\n}\n";
+        assert_eq!(escapes_outside_tests(source), vec![2]);
+
+        let gated = "#[cfg(all(test, unix))]\npub(crate) mod tests {\n    \"\\033[0m\"\n}\n";
+        assert_eq!(escapes_outside_tests(gated), Vec::<usize>::new());
+        assert_eq!(escapes_outside_tests("\"\\033[0m\"\n#[cfg(test)]\nmod test_support;\n\"\\x1B\""), vec![1, 4]);
+    }
 }
