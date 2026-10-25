@@ -56,7 +56,7 @@ use crate::reissue::reissue;
 use crate::scratch::{materialize, materialize_state, Mirror, Scratch};
 use crate::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
-    RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
+    RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
 /// The `genesis` of a stored anchor's bytes.
@@ -468,7 +468,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             TrustWriteOutcome::OfficeMoved { current } => {
                 Err(self.adopts_mismatch(anchor.adopts.as_deref(), current.as_deref()))
             }
-            TrustWriteOutcome::Transient(_) => Err(self.anchor_write_contention()),
+            TrustWriteOutcome::Transient(cause) => Err(self.anchor_write_contention(cause)),
         }
     }
 
@@ -529,7 +529,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// Reached only once the head's own re-issues are spent or the invocation window cannot
     /// afford another, so the message says the head already retried rather than inviting the
     /// operator to wonder whether it did.
-    fn anchor_write_contention(&self) -> HeadError {
+    ///
+    /// When the last attempt's fate is unknown it may have landed, so the message claims nothing
+    /// about what was changed and sends the operator to read the anchor first.
+    fn anchor_write_contention(&self, cause: TransientCause) -> HeadError {
+        if cause == TransientCause::FateUnknown {
+            return HeadError::service_unavailable(
+                "The trust anchor write could not be confirmed: its last attempt timed out or \
+                failed inside the warehouse's storage, so it may or may not have been applied. \
+                Read the warehouse's trust anchor before running the re-genesis again — if it \
+                is already the new anchor, the re-genesis succeeded."
+                    .to_string(),
+            );
+        }
+
         HeadError::service_unavailable(
             "The trust anchor could not be replaced: the warehouse's storage stayed busy \
             through every attempt this request could afford, most likely another request \
@@ -854,7 +867,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             CasOutcome::Conflict { current } => Err(self.moved(&current, &request.old_head)),
             CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
             CasOutcome::AnchorMoved => Err(self.anchor_moved()),
-            CasOutcome::Transient(_) => Err(self.transient_contention()),
+            CasOutcome::Transient(cause) => Err(self.transient_contention(cause)),
         }
     }
 
@@ -1097,7 +1110,21 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// `update_ref` has no retry path of its own for this status, so the wording says "run the
     /// push again" — an instruction a person or a script can act on — and never "retry" bare,
     /// which would imply a client-side mechanism that does not exist.
-    fn transient_contention(&self) -> HeadError {
+    ///
+    /// When the last attempt's fate is unknown it may have landed, and running the identical push
+    /// again would then be refused as the pallet having moved — to the client's own new head. So
+    /// that message says the outcome is unknown and how to tell, rather than "nothing moved".
+    fn transient_contention(&self, cause: TransientCause) -> HeadError {
+        if cause == TransientCause::FateUnknown {
+            return HeadError::service_unavailable(
+                "The commit could not be confirmed: its last attempt timed out or failed inside \
+                the warehouse's storage, so it may or may not have been applied. Fetch the \
+                warehouse before pushing again — if the pallet is already at the pushed head, \
+                the push succeeded."
+                    .to_string(),
+            );
+        }
+
         HeadError::service_unavailable(
             "The commit could not complete: the warehouse's storage stayed busy through every \
             attempt this request could afford, most likely another push touching its office \

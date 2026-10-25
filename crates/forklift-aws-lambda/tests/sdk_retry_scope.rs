@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use forklift_aws_lambda::aws::build_stores;
@@ -40,11 +40,14 @@ type Counts = Arc<Mutex<HashMap<String, usize>>>;
 
 /// Start the stub and build a ref store pointed at it.
 async fn stub_store(mode: Stub) -> (DynamoRefStore, Counts) {
-    // The provider chain must find these rather than a developer's own profile; the values are
-    // the same in every test, so tests setting them concurrently cannot disagree.
-    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+    // The provider chain must find these rather than a developer's own profile. Set once, before
+    // any test's store exists: writing the environment while another thread reads it is a race.
+    static CREDENTIALS: Once = Once::new();
+    CREDENTIALS.call_once(|| {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+    });
 
     let counts: Counts = Default::default();
     let seen = counts.clone();

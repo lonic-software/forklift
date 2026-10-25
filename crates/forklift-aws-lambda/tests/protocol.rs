@@ -2274,6 +2274,37 @@ fn a_commit_that_stays_transient_is_attempted_four_times_under_one_token_then_an
     assert_ne!(both[0], both[4], "each request mints its own token");
 }
 
+/// A commit whose last attempt's fate is unknown may have landed, so its `503` must not say
+/// nothing moved: a client trusting that would push again and be told the pallet moved — to its
+/// own head. The message sends it to fetch first; a contended one keeps "nothing moved".
+#[test]
+fn a_commit_of_unknown_fate_answers_503_without_claiming_nothing_moved() {
+    let (_area, head, main_head) = uploaded_first_push(
+        "unknown-fate-cas",
+        TransientOnCommit {
+            refusal: CasOutcome::Transient(TransientCause::FateUnknown),
+            ..TransientOnCommit::always()
+        },
+    );
+
+    let err = head
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .expect_err("an unknown fate is still a refusal");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert!(err.message.contains("may or may not have been applied"), "{}", err.message);
+    assert!(err.message.contains("Fetch the warehouse"), "{}", err.message);
+    assert!(!err.message.contains("No input is known to have moved"), "{}", err.message);
+
+    let (_area, head, main_head) =
+        uploaded_first_push("contended-cas-message", TransientOnCommit::always());
+    let err = head
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .expect_err("contention outlasting the budget is a refusal");
+
+    assert!(err.message.contains("No input is known to have moved"), "{}", err.message);
+}
+
 /// The point of the loop: a commit refused once for contention, with nothing having moved,
 /// succeeds on its re-issue instead of reaching the client as a `503`.
 #[test]
@@ -3139,6 +3170,34 @@ fn an_anchor_write_that_stays_transient_is_attempted_four_times_then_answers_503
     let tokens = head.refs.tokens();
     assert_eq!(tokens.len(), 4);
     assert!(tokens.iter().all(|token| *token == tokens[0]), "one token per request: {tokens:?}");
+}
+
+/// An anchor write whose last attempt's fate is unknown may have planted the anchor, so its
+/// `503` must not say nothing was changed; it sends the operator to read the anchor first.
+#[test]
+fn an_anchor_write_of_unknown_fate_answers_503_without_claiming_nothing_changed() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        TransientOnAnchorWrite {
+            refusal: TrustWriteOutcome::Transient(TransientCause::FateUnknown),
+            ..TransientOnAnchorWrite::new(store.clone(), usize::MAX)
+        },
+    );
+
+    let err = head.put_trust(&mine).expect_err("an unknown fate is still a refusal");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert!(err.message.contains("may or may not have been applied"), "{}", err.message);
+    assert!(!err.message.contains("nothing was changed"), "{}", err.message);
+
+    let head = Head::new(MemoryObjectStore::new(), TransientOnAnchorWrite::new(store, usize::MAX));
+    let err = head.put_trust(&mine).expect_err("contention outlasting the budget is a refusal");
+
+    assert!(err.message.contains("nothing was changed"), "{}", err.message);
 }
 
 /// The anchor write has the commit's recovery, not a lesser one: refused once for contention, it

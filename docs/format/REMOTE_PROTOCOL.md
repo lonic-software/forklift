@@ -300,8 +300,11 @@ the two apart.
 A remote may also answer `503` when the write loses to unrelated concurrent traffic rather than
 to either value actually moving; that establishes nothing about the anchor and the request may
 simply be repeated. The AWS serverless head has already re-issued the write itself, within a
-small bounded budget, before it answers `503`, so the answer means the contention outlasted that
-budget. Clients do not retry it automatically.
+small bounded budget, before it answers `503`, so the answer means the write could not be
+completed within that budget. When the head's last attempt timed out or failed inside the
+backend, its outcome is unknown — the anchor may already be the new one — and the `503`'s
+message says so: read the trust anchor before repeating the request. Clients do not retry it
+automatically.
 
 A client that establishes trust locally (`office enroll`) while a remote is configured
 includes the remote's pallet heads in the anchor's boundary (and refuses to enroll when
@@ -366,10 +369,14 @@ actually changed (contention from another push touching a shared item, principal
 office pallet, rather than a value having moved). The head re-issues that transaction
 itself before answering — the transaction alone, never the audit, under one idempotency token
 per request, at most four attempts in all and only while its invocation window can afford
-another — so a `503` reaches the client only when the contention outlasted that budget. Unlike
-every other status in this section, `503` makes no claim about server or request state — a
-client should retry the identical request rather than treat it as a fault or re-read anything
-first.
+another — so a `503` reaches the client only when the transaction could not be completed within
+that budget. Unlike every other status in this section, `503` makes no claim about server or
+request state. Usually the transaction was refused outright and the identical request can
+simply be retried. When the last attempt instead timed out or failed inside the backend, its
+outcome is unknown and it may have landed; the `503`'s message says so, and a retry of the
+identical request would then be answered `409`, the pallet having moved to the client's own new
+head. So a client fetches before retrying such a `503`: a pallet already at the pushed head
+means the push succeeded.
 
 The consequence, stated plainly: a remote that has *lost* an object behind `old_head` no
 longer fails at ref-update time. It never failed on a lost tree or blob behind it either —

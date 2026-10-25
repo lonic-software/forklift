@@ -16,22 +16,25 @@
 //!   landed is a no-op success; of one that did not, it is the first application; of one that is
 //!   still running, it is `TransactionInProgressException`. A fresh token would apply a landed
 //!   attempt a second time and report the state it wrote as the pallet having moved.
-//! * **Only the wait depends on the cause.** Contention and unknown fate wait 50, 100 and 200 ms,
-//!   jittered (a chosen constant, not a measured one). An attempt in progress waits on the
+//! * **Only the wait depends on the cause.** Contention and unknown fate wait steps of 50, 100
+//!   and 200 ms, each jittered down to between half and all of the step (a chosen constant, not
+//!   a measured one). An attempt in progress waits on the
 //!   exponential schedule DynamoDB's model recommends for it, and its last re-issue is held back
 //!   until five seconds after the first attempt. No re-issue starts that could not finish within
 //!   [`ARM_LIMIT`] of the first attempt.
 //! * **The window is checked before each re-issue.** When the invocation deadline cannot cover
-//!   the wait plus one more [`TRANSACTION_ATTEMPT_TIMEOUT`], the loop stops at once, without
-//!   sleeping, and the caller answers `503` while there is still time to answer at all. A head
+//!   the wait plus one more [`TRANSACTION_ATTEMPT_TIMEOUT`] plus [`ANSWER_RESERVE`], the loop
+//!   stops at once, without sleeping, and the caller answers `503` while there is still time to
+//!   answer at all. A head
 //!   with no deadline (the test path) keeps the attempt cap and skips the window check.
 //!
 //! What the loop returns is the last attempt's outcome. A transient one there means the budget
 //! is spent or unaffordable, and the caller answers `503` — never `409`, which would claim an
 //! input moved.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
+
+use forklift_core::util::config_utils::mint_uuid_v4;
 
 use crate::store::{TransientCause, TRANSACTION_ATTEMPT_TIMEOUT};
 
@@ -41,6 +44,12 @@ pub const MAX_ATTEMPTS: u32 = 4;
 /// No re-issue starts unless it could finish this soon after the first attempt — the four-attempt
 /// timeline DynamoDB's model works through for `TransactionInProgressException`.
 pub const ARM_LIMIT: Duration = Duration::from_millis(7500);
+
+/// What a re-issue leaves of the invocation for answering after its attempt runs to the timeout:
+/// building the `503` and handing it back before the runtime stops the function. Without it, an
+/// attempt that ran to its timeout could end exactly at the deadline and leave the gateway to
+/// answer instead. A chosen margin, generous against a response that takes milliseconds.
+pub const ANSWER_RESERVE: Duration = Duration::from_millis(500);
 
 /// The first wait after contention or an unknown fate; each later one doubles it.
 const CONTENDED_BASE: Duration = Duration::from_millis(50);
@@ -52,21 +61,12 @@ const IN_PROGRESS_BASE: Duration = Duration::from_millis(500);
 /// so that the attempt still in progress has had time to finish.
 const IN_PROGRESS_SETTLE: Duration = Duration::from_secs(5);
 
-/// A fresh request token: 32 hex characters, unique per call within a process and, through the
-/// clock and process id, across the containers a function runs in. DynamoDB scopes a token to
-/// the account and region for ten minutes, so it needs to be unique, not secret.
+/// A fresh request token: a random UUID, 36 characters — DynamoDB's limit exactly. DynamoDB
+/// scopes a token to the account and region for ten minutes, across every container the function
+/// runs in, so it must be unique there, which is what drawing it from the OS's random source buys
+/// over anything derived from a clock, a process id or a counter that every cold start resets.
 pub fn request_token() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let mut hasher = blake3::Hasher::new();
-
-    hasher.update(&nanos.to_le_bytes());
-    hasher.update(&std::process::id().to_le_bytes());
-    hasher.update(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-    hasher.update(format!("{:?}", std::thread::current().id()).as_bytes());
-
-    hasher.finalize().to_hex()[..32].to_string()
+    mint_uuid_v4()
 }
 
 /// How long to wait before re-issue number `reissue` (1-based) after an attempt refused for
@@ -94,7 +94,8 @@ fn wait_before(reissue: u32, cause: TransientCause, elapsed: Duration, jitter: f
 }
 
 /// Whether a re-issue that waits `wait` from now, `elapsed` after the first attempt, can still
-/// finish both within the arm's own limit and before the invocation deadline.
+/// finish both within the arm's own limit and before the invocation deadline, with
+/// [`ANSWER_RESERVE`] still left for answering.
 fn affordable(elapsed: Duration, wait: Duration, now: SystemTime, deadline: Option<SystemTime>) -> bool {
     let finish = wait + TRANSACTION_ATTEMPT_TIMEOUT;
 
@@ -104,7 +105,7 @@ fn affordable(elapsed: Duration, wait: Duration, now: SystemTime, deadline: Opti
 
     match deadline {
         None => true,
-        Some(deadline) => now + finish <= deadline,
+        Some(deadline) => now + finish + ANSWER_RESERVE <= deadline,
     }
 }
 
@@ -194,20 +195,16 @@ mod tests {
     }
 
     /// A re-issue is refused when it could not finish inside the arm's limit, or before the
-    /// deadline — both counting the wait plus one whole attempt.
+    /// deadline with time left to answer — both counting the wait plus one whole attempt.
     #[test]
     fn a_reissue_is_affordable_only_if_it_can_finish_before_both_limits() {
         let now = SystemTime::now();
         let wait = Duration::from_millis(200);
+        let enough = now + wait + TRANSACTION_ATTEMPT_TIMEOUT + ANSWER_RESERVE;
 
         assert!(affordable(ZERO, wait, now, None));
-        assert!(affordable(ZERO, wait, now, Some(now + wait + TRANSACTION_ATTEMPT_TIMEOUT)));
-        assert!(!affordable(
-            ZERO,
-            wait,
-            now,
-            Some(now + wait + TRANSACTION_ATTEMPT_TIMEOUT - Duration::from_millis(1))
-        ));
+        assert!(affordable(ZERO, wait, now, Some(enough)));
+        assert!(!affordable(ZERO, wait, now, Some(enough - Duration::from_millis(1))));
         assert!(!affordable(ARM_LIMIT - TRANSACTION_ATTEMPT_TIMEOUT, wait, now, None));
     }
 
@@ -217,7 +214,7 @@ mod tests {
         let tokens: std::collections::HashSet<_> = (0..1000).map(|_| request_token()).collect();
 
         assert_eq!(tokens.len(), 1000);
-        assert!(tokens.iter().all(|token| token.len() == 32));
+        assert!(tokens.iter().all(|token| (1..=36).contains(&token.len())));
     }
 
     /// The jitter fraction is in range and differs across tokens, so requests refused by the

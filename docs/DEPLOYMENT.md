@@ -405,12 +405,14 @@ bills.** A transaction DynamoDB refuses without any condition failing — `Trans
 from another push touching the shared office item, a throughput throttle, an attempt still in
 progress, or an attempt whose outcome is unknown (a timeout, a lost response, an internal
 error) — is re-issued by the head itself: the identical transaction under the same
-`ClientRequestToken`, at most four attempts per client request, waiting 50/100/200 ms
-(jittered) between them, or DynamoDB's longer recommended schedule after
+`ClientRequestToken`, at most four attempts per client request, waiting steps of 50, 100 and
+200 ms between them (each jittered down to between half and all of the step), or DynamoDB's
+longer recommended schedule after
 `TransactionInProgressException`. The token is what makes this safe: re-issuing an attempt that
 actually landed returns success rather than applying it twice. The head checks the Lambda
 invocation's remaining time before each re-issue and answers `503` at once when it cannot cover
-the wait and another attempt (each attempt is cut off after 1 s), so a busy table yields a
+the wait, another attempt (each attempt is cut off after 1 s) and half a second left to answer,
+so a busy table yields a
 `503` the client can act on rather than an API Gateway `504`. The SDK's own retry is switched off
 for these two transactions only — every other DynamoDB and S3 call keeps the SDK default — so
 four attempts are four billed transactions, not up to twelve. Since a cancelled transaction
