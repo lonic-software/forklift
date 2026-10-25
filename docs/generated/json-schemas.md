@@ -1987,6 +1987,98 @@ A command not listed here either reports only the generic human-message shape `{
         "error"
       ],
       "type": "object"
+    },
+    "MirrorStatus": {
+      "description": "What the mirror did with one pallet.",
+      "oneOf": [
+        {
+          "const": "pushed",
+          "description": "The export was pushed to git.",
+          "type": "string"
+        },
+        {
+          "const": "up_to_date",
+          "description": "Git's branch already held the export.",
+          "type": "string"
+        },
+        {
+          "const": "already_ahead",
+          "description": "Git's branch was already past the export, at a later lift another warehouse mirrored.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The pallet cannot be mirrored (the remote lacks it, or git refuses its name as a branch).",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "Another mirror run held the mirror.",
+          "type": "string"
+        },
+        {
+          "const": "raced",
+          "description": "Git's branch kept moving while the push was retried.",
+          "type": "string"
+        },
+        {
+          "const": "diverged",
+          "description": "Git's branch holds a commit that is not part of the export; nothing was pushed.",
+          "type": "string"
+        },
+        {
+          "const": "layout_skew",
+          "description": "Git's branch was written in another export layout; nothing was pushed.",
+          "type": "string"
+        },
+        {
+          "const": "damaged",
+          "description": "The mirror's own repository holds something this build did not write.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "A fetch, export or push failed.",
+          "type": "string"
+        }
+      ]
+    },
+    "PalletMirror": {
+      "description": "One pallet's mirror outcome.",
+      "properties": {
+        "commit": {
+          "description": "The git commit the branch is at, when it is in step with the export.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exported": {
+          "description": "The parcels this run wrote as new git commits.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Why the pallet was skipped or not mirrored, with the step that clears it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pallet": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/MirrorStatus"
+        }
+      },
+      "required": [
+        "pallet",
+        "status",
+        "exported"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2025,6 +2117,17 @@ A command not listed here either reports only the generic human-message shape `{
         "type": "string"
       },
       "type": "array"
+    },
+    "mirror": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PalletMirror"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What the git mirror did with the lifted pallet (`mirror.url`, `mirror.auto`). Absent when\nno mirror applies to it. A mirror failure is reported here and never fails the lift."
     },
     "new_parcels": {
       "format": "uint",
@@ -2747,6 +2850,130 @@ A command not listed here either reports only the generic human-message shape `{
     "entries"
   ],
   "title": "ManifestView",
+  "type": "object"
+}
+```
+
+## `mirror`
+
+### `MirrorReport`
+
+```json
+{
+  "$defs": {
+    "MirrorStatus": {
+      "description": "What the mirror did with one pallet.",
+      "oneOf": [
+        {
+          "const": "pushed",
+          "description": "The export was pushed to git.",
+          "type": "string"
+        },
+        {
+          "const": "up_to_date",
+          "description": "Git's branch already held the export.",
+          "type": "string"
+        },
+        {
+          "const": "already_ahead",
+          "description": "Git's branch was already past the export, at a later lift another warehouse mirrored.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The pallet cannot be mirrored (the remote lacks it, or git refuses its name as a branch).",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "Another mirror run held the mirror.",
+          "type": "string"
+        },
+        {
+          "const": "raced",
+          "description": "Git's branch kept moving while the push was retried.",
+          "type": "string"
+        },
+        {
+          "const": "diverged",
+          "description": "Git's branch holds a commit that is not part of the export; nothing was pushed.",
+          "type": "string"
+        },
+        {
+          "const": "layout_skew",
+          "description": "Git's branch was written in another export layout; nothing was pushed.",
+          "type": "string"
+        },
+        {
+          "const": "damaged",
+          "description": "The mirror's own repository holds something this build did not write.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "A fetch, export or push failed.",
+          "type": "string"
+        }
+      ]
+    },
+    "PalletMirror": {
+      "description": "One pallet's mirror outcome.",
+      "properties": {
+        "commit": {
+          "description": "The git commit the branch is at, when it is in step with the export.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exported": {
+          "description": "The parcels this run wrote as new git commits.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Why the pallet was skipped or not mirrored, with the step that clears it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pallet": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/MirrorStatus"
+        }
+      },
+      "required": [
+        "pallet",
+        "status",
+        "exported"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a mirror run.",
+  "properties": {
+    "pallets": {
+      "description": "Each mirrored pallet's outcome.",
+      "items": {
+        "$ref": "#/$defs/PalletMirror"
+      },
+      "type": "array"
+    },
+    "url": {
+      "description": "The git remote mirrored to (`mirror.url`).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "url",
+    "pallets"
+  ],
+  "title": "MirrorReport",
   "type": "object"
 }
 ```
