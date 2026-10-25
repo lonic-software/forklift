@@ -4,10 +4,10 @@ use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::error::{self, CoreError, RefusalCode};
 use forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT;
 use forklift_core::model::remote::WarehouseInfo;
-use forklift_core::util::franchise_utils::{self, Admission, Attempt, Failure, FranchiseRecord, Phase, Request};
+use forklift_core::util::franchise_utils::{self, Admission, Attempt, BundleState, Failure, FranchiseRecord, Phase, Request};
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient, TorSettings};
+use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, BundleDownload, PartialBundle, RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
     bundle_utils, config_utils, file_utils, lock_utils, object_utils, operation_utils, pack_utils,
@@ -138,7 +138,7 @@ pub async fn handle_command(url: &str,
         token: token.clone(),
         request,
         genesis,
-        bundle_imported: false,
+        bundle: BundleState::None,
         attempt: Attempt::Running,
         start_census: 0,
         last_failure: None,
@@ -165,7 +165,7 @@ pub async fn handle_command(url: &str,
         forklift: absolute_target.join(FOLDER_NAME_FORKLIFT_ROOT),
         record,
         phase: Phase::Prepare,
-        bundle_imported_at_start: false,
+        bundle_at_start: BundleState::None,
         finishing: false,
     };
 
@@ -270,9 +270,9 @@ struct FranchiseAttempt {
     /// The part of the franchise in progress.
     phase: Phase,
 
-    /// Whether the bundle was imported when this attempt started, so importing it counts as
+    /// How far the bundle had got when this attempt started, so taking it further counts as
     /// progress.
-    bundle_imported_at_start: bool,
+    bundle_at_start: BundleState,
 
     /// Whether the franchise has begun removing its record: once the record is gone the warehouse
     /// is complete, and a failure must never write it back.
@@ -295,7 +295,7 @@ impl FranchiseAttempt {
         // A census that cannot be taken counts as progress: never told to give up on a guess.
         let progressed = franchise_utils::census(&self.forklift)
             .map_or(true, |census| census > self.record.start_census)
-            || (self.record.bundle_imported && !self.bundle_imported_at_start);
+            || franchise_utils::bundle_progressed(&self.bundle_at_start, &self.record.bundle);
 
         failure.retry = franchise_utils::bound_retry(failure.retry, &failure, self.record.last_failure.as_ref(), progressed);
 
@@ -310,6 +310,86 @@ impl FranchiseAttempt {
             Err(e) => error::append_to_message(refusal, &format!("(Recording the failure did not succeed: {})", e)),
         }
     }
+}
+
+/// Download the remote's bundle, resuming the download the record keeps, and import it. Returns
+/// what the import stored, or `None` when the remote has no bundle this build can use. The
+/// download is recorded as it is synced, so a failure leaves the next attempt only the rest to
+/// ask for. A downloaded file that fails import is never kept to be imported again: a kept one
+/// whose header or digest fails (also a header in a version this build does not read) was not all
+/// served under one tag, or a crash damaged it, so it is downloaded once more in full. A bundle
+/// downloaded in one piece in a version this build does not read is skipped; any other failure
+/// discards the download and fails the attempt.
+async fn fetch_and_import_bundle(attempt: &mut FranchiseAttempt,
+                                 client: &RemoteClient) -> Result<Option<bundle_utils::ImportStats>, String> {
+    let download = bundle_utils::get_bundle_download_path();
+
+    if let Some(parent) = download.parent() {
+        file_utils::create_folder_if_not_exists(parent)?;
+    }
+
+    let checkpoint_bytes = bundle_checkpoint_bytes();
+    let mut kept = attempt.record.bundle.partial().cloned();
+
+    loop {
+        let forklift = &attempt.forklift;
+        let record = &mut attempt.record;
+
+        // The record in memory is updated too: a failing attempt writes it back from there.
+        let mut checkpoint = |partial: Option<&PartialBundle>| {
+            record.bundle = partial.map_or(BundleState::None, |partial| BundleState::Partial(partial.clone()));
+            franchise_utils::write(forklift, record)
+        };
+
+        let resumed = match client.download_bundle(&download, kept.as_ref(), checkpoint_bytes, &mut checkpoint).await? {
+            BundleDownload::Absent => return Ok(None),
+            BundleDownload::Complete { resumed } => resumed,
+        };
+
+        let error = match bundle_utils::import_bundle(&download) {
+            Ok(imported) => {
+                // Published before it is recorded: a crash in between keeps the stored objects and
+                // costs only the download, never the warehouse's own latest bundle.
+                bundle_utils::publish_bundle_download()?;
+                attempt.record.bundle = BundleState::Imported;
+                franchise_utils::write(&attempt.forklift, &attempt.record)?;
+
+                return Ok(Some(imported));
+            }
+            Err(error) => error,
+        };
+
+        discard_bundle_download(attempt).map_err(|e| {
+            error::append_to_message(error.clone(), &format!("(Discarding the downloaded bundle did not succeed: {})", e))
+        })?;
+
+        if resumed && (bundle_utils::is_bundle_header_error(&error) || bundle_utils::is_bundle_digest_error(&error)) {
+            kept = None;
+            continue;
+        }
+
+        // A future envelope is only an optimization this client cannot use: the verified
+        // incremental-object walk goes on without it. Known-format corruption stays fatal.
+        return if bundle_utils::is_unsupported_bundle_error(&error) { Ok(None) } else { Err(error) };
+    }
+}
+
+/// Record that nothing of the bundle is kept, then remove its download: a removal that fails
+/// leaves only a file the next attempt clears.
+fn discard_bundle_download(attempt: &mut FranchiseAttempt) -> Result<(), String> {
+    attempt.record.bundle = BundleState::None;
+    franchise_utils::write(&attempt.forklift, &attempt.record)?;
+    bundle_utils::discard_bundle_download()
+}
+
+/// How often the bundle download is synced and recorded: `FORKLIFT_BUNDLE_CHECKPOINT_BYTES` if
+/// set to a positive number (tests cut a download after several checkpoints; not a user-facing
+/// knob), else [`remote::BUNDLE_CHECKPOINT_BYTES`].
+fn bundle_checkpoint_bytes() -> u64 {
+    std::env::var("FORKLIFT_BUNDLE_CHECKPOINT_BYTES").ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(remote::BUNDLE_CHECKPOINT_BYTES)
 }
 
 /// Switch into the claimed target, take its lock, decide admission again and run the franchise.
@@ -339,10 +419,14 @@ async fn enter_and_franchise(
         attempt.record.last_failure = previous.last_failure.clone();
     }
 
-    // A finished import is kept only for a full franchise: a sparse one has no bundle.
-    let keep_bundles = !sparse && previous.as_ref().is_some_and(|previous| previous.bundle_imported);
+    // A finished import or a kept download is kept only for a full franchise: a sparse one has no
+    // bundle.
+    let keep = match &previous {
+        Some(previous) if !sparse => previous.bundle.clone(),
+        _ => BundleState::None,
+    };
 
-    let outcome = match start_attempt(attempt, absolute_target, previous.as_ref(), keep_bundles) {
+    let outcome = match start_attempt(attempt, absolute_target, previous.as_ref(), &keep) {
         Ok(()) => franchise_into_prepared_target(attempt, resolution, fetch_scope, sparse, client, info).await,
         Err(e) => Err(e),
     };
@@ -368,31 +452,28 @@ fn readmit(directory: &str, absolute_target: &Path, url: &str, expected: &Expect
 
 /// Clear what an earlier attempt left (see `franchise_utils::prepare_resume`) and record this
 /// attempt's start: its request, its trust binding, and the census its progress is measured from.
-/// Until the start is recorded, a failure records the earlier attempt's import and census, so a
+/// Until the start is recorded, a failure records the earlier attempt's bundle and census, so a
 /// resume that fails while clearing claims nothing it did not keep.
 fn start_attempt(attempt: &mut FranchiseAttempt,
                  absolute_target: &Path,
                  previous: Option<&FranchiseRecord>,
-                 keep_bundles: bool) -> Result<(), String> {
+                 keep: &BundleState) -> Result<(), String> {
     if let Some(previous) = previous {
-        attempt.record.bundle_imported = previous.bundle_imported;
+        attempt.record.bundle = keep.clone();
         attempt.record.start_census = previous.start_census;
-        attempt.bundle_imported_at_start = previous.bundle_imported;
+        attempt.bundle_at_start = keep.clone();
     }
 
-    let discarded = franchise_utils::prepare_resume(absolute_target, previous, keep_bundles).map_err(|e| {
-        // Clearing stopped partway: an import counts as kept only if its store and bundle still are.
-        let kept = keep_bundles && attempt.record.bundle_imported && franchise_utils::holds_import(&attempt.forklift);
-        attempt.record.bundle_imported = kept;
-        attempt.bundle_imported_at_start = kept;
+    let kept = franchise_utils::prepare_resume(absolute_target, previous, keep).map_err(|e| {
+        // Clearing stopped partway: the bundle counts as kept only if what it needs still is.
+        let held = franchise_utils::held_bundle(&attempt.forklift, keep);
+        attempt.record.bundle = held.clone();
+        attempt.bundle_at_start = held;
         e
     })?;
 
-    // A discarded store took the imported objects with it: the bundle is imported again.
-    let keep_bundles = keep_bundles && !discarded;
-
-    attempt.record.bundle_imported = keep_bundles;
-    attempt.bundle_imported_at_start = keep_bundles;
+    attempt.record.bundle = kept.clone();
+    attempt.bundle_at_start = kept;
     attempt.record.start_census = franchise_utils::census(&attempt.forklift)?;
     attempt.record.attempt = Attempt::Running;
 
@@ -440,35 +521,15 @@ async fn franchise_into_prepared_target(
     // The bundle is a fast start, not a requirement: whatever it lacks (or if there is none) is
     // fetched loose by the history walk below. A sparse franchise skips it entirely — the bundle
     // is the whole store, which would defeat the point of fetching only a subtree. A resume whose
-    // earlier attempt finished the import keeps it and skips this too; a half download is never
-    // kept, so it is downloaded again.
+    // earlier attempt finished the import keeps it and skips this too, and one that kept part of
+    // the download asks only for the rest.
     attempt.phase = Phase::Bundle;
 
-    if !sparse && !attempt.record.bundle_imported {
-        let bundle_path = bundle_utils::get_latest_bundle_path();
-
-        if let Some(parent) = bundle_path.parent() {
-            file_utils::create_folder_if_not_exists(parent)?;
-        }
-
-        if client.fetch_bundle_to(&bundle_path).await? {
-            match bundle_utils::import_bundle(&bundle_path) {
-                Ok(imported) => {
-                    report.bundle_objects = Some(imported.stored_objects);
-                    report.bundle_signatures = Some(imported.stored_signatures);
-                    report.densify_suggested = imported.installed_packs;
-
-                    attempt.record.bundle_imported = true;
-                    franchise_utils::write(&attempt.forklift, &attempt.record)?;
-                }
-                Err(error) if bundle_utils::is_unsupported_bundle_error(&error) => {
-                    // A future envelope is only an optimization this client cannot use. Do not
-                    // retain it as this warehouse's own `latest` bundle; continue through the
-                    // verified incremental-object walk below. Known-format corruption stays fatal.
-                    let _ = std::fs::remove_file(&bundle_path);
-                }
-                Err(error) => return Err(error),
-            }
+    if !sparse && attempt.record.bundle != BundleState::Imported {
+        if let Some(imported) = fetch_and_import_bundle(attempt, client).await? {
+            report.bundle_objects = Some(imported.stored_objects);
+            report.bundle_signatures = Some(imported.stored_signatures);
+            report.densify_suggested = imported.installed_packs;
         }
     }
 
@@ -803,7 +864,7 @@ mod tests {
             token: None,
             request: Request { pallet: None, only: vec!["src/ap".to_string()] },
             genesis: Some("abc".to_string()),
-            bundle_imported: false,
+            bundle: BundleState::None,
             attempt: Attempt::Failed,
             start_census: 3,
             last_failure: Some(Failure {
@@ -872,7 +933,7 @@ mod tests {
             forklift,
             record: FranchiseRecord { attempt: Attempt::Running, last_failure: None, start_census: 0, ..record() },
             phase: Phase::Prepare,
-            bundle_imported_at_start: false,
+            bundle_at_start: BundleState::None,
             finishing: false,
         }
     }
@@ -903,7 +964,7 @@ mod tests {
     }
 
     /// A resume that fails while clearing what the earlier attempt left records that attempt's
-    /// import and census, never a fresh start it did not make.
+    /// import or download and census, never a fresh start it did not make.
     #[cfg(unix)]
     #[test]
     fn a_resume_that_fails_while_clearing_keeps_the_earlier_import_and_census() {
@@ -915,26 +976,39 @@ mod tests {
         // A `.forklift` that is a link: the resume refuses to clear through it.
         std::os::unix::fs::symlink(&elsewhere, target.join(".forklift")).unwrap();
 
-        let previous = FranchiseRecord { bundle_imported: true, start_census: 7, ..record() };
+        let previous = FranchiseRecord { bundle: BundleState::Imported, start_census: 7, ..record() };
         let recorded = root.join("record");
         std::fs::create_dir_all(recorded.join("objects")).unwrap();
         std::fs::create_dir_all(recorded.join("bundles")).unwrap();
 
         let mut resumed = attempt(recorded.clone());
-        assert!(start_attempt(&mut resumed, &target, Some(&previous), true).is_err());
-        assert!(resumed.record.bundle_imported);
-        assert!(resumed.bundle_imported_at_start);
+        assert!(start_attempt(&mut resumed, &target, Some(&previous), &BundleState::Imported).is_err());
+        assert_eq!(resumed.record.bundle, BundleState::Imported);
+        assert_eq!(resumed.bundle_at_start, BundleState::Imported);
         assert_eq!(resumed.record.start_census, 7);
 
         // A resume that was not keeping the bundle (a sparse one) never claims it.
         let mut sparse = attempt(recorded.clone());
-        assert!(start_attempt(&mut sparse, &target, Some(&previous), false).is_err());
-        assert!(!sparse.record.bundle_imported && !sparse.bundle_imported_at_start);
+        assert!(start_attempt(&mut sparse, &target, Some(&previous), &BundleState::None).is_err());
+        assert_eq!((sparse.record.bundle, sparse.bundle_at_start), (BundleState::None, BundleState::None));
+
+        // A kept download counts while its file holds what was recorded, and not once it is shorter.
+        let partial = BundleState::Partial(PartialBundle { etag: "\"t\"".to_string(), total: 10, length: 4 });
+        let downloading = FranchiseRecord { bundle: partial.clone(), ..previous.clone() };
+        std::fs::write(recorded.join("bundles/partial"), b"abcd").unwrap();
+        let mut kept = attempt(recorded.clone());
+        assert!(start_attempt(&mut kept, &target, Some(&downloading), &partial).is_err());
+        assert_eq!((kept.record.bundle, kept.bundle_at_start), (partial.clone(), partial.clone()));
+
+        std::fs::write(recorded.join("bundles/partial"), b"abc").unwrap();
+        let mut short = attempt(recorded.clone());
+        assert!(start_attempt(&mut short, &target, Some(&downloading), &partial).is_err());
+        assert_eq!((short.record.bundle, short.bundle_at_start), (BundleState::None, BundleState::None));
 
         // Nor does one whose clearing already took the bundle away.
-        std::fs::remove_dir(recorded.join("bundles")).unwrap();
+        std::fs::remove_dir_all(recorded.join("bundles")).unwrap();
         let mut cleared = attempt(recorded);
-        assert!(start_attempt(&mut cleared, &target, Some(&previous), true).is_err());
-        assert!(!cleared.record.bundle_imported && !cleared.bundle_imported_at_start);
+        assert!(start_attempt(&mut cleared, &target, Some(&previous), &BundleState::Imported).is_err());
+        assert_eq!((cleared.record.bundle, cleared.bundle_at_start), (BundleState::None, BundleState::None));
     }
 }

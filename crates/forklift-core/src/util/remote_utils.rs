@@ -530,7 +530,7 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// `connect_timeout(60s)` + `read_timeout(3s)` against a black-holed address failed at 3.002s,
 /// not 60s). That is why this is carried by only three of the module's read/metadata calls
 /// — [`RemoteClient::fetch_info`], [`RemoteClient::fetch_signature`],
-/// [`RemoteClient::fetch_bundle_to`] — each of whose server side does O(constant) work (a single
+/// [`RemoteClient::download_bundle`] — each of whose server side does O(constant) work (a single
 /// lookup, or serving an already-built file) before writing anything, so a flat 10s pre-first-byte
 /// budget is honest. `fetch_object` needs a much looser budget of its own
 /// ([`FETCH_OBJECT_READ_TIMEOUT`]) since its server side is size-dependent, not O(constant).
@@ -1312,7 +1312,7 @@ mod clients {
     #[derive(Clone, Copy)]
     pub(super) enum Posture {
         /// [`REMOTE_READ_TIMEOUT`]-bounded via a client-level `read_timeout`. For the
-        /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `fetch_bundle_to`.
+        /// O(constant)-pre-first-byte calls: `fetch_info`, `fetch_signature`, `download_bundle`.
         ///
         /// **Auto-follows redirects — never select this for a mutation.** The client this
         /// selects carries no `redirect::Policy::none()`, for the same reason [`Clients::http`]
@@ -1362,7 +1362,7 @@ mod clients {
         /// opposite shape: a remote that *does* start answering and then trickles bytes slowly,
         /// forever, resetting the clock on every byte (this file's own settled contract: a
         /// transfer that is moving bytes, however slowly, is never silence). For
-        /// `fetch_info`/`fetch_signature`/`fetch_bundle_to` that tolerance is the whole point — a
+        /// `fetch_info`/`fetch_signature`/`download_bundle` that tolerance is the whole point — a
         /// real, slow transfer must never be killed. For `resolve` it is a liability instead: the
         /// call is cosmetic display sugar whose fallback (pseudonyms) is free, so there is no
         /// reason to accept an unbounded wait for a slow-but-real trickle the way the other three
@@ -1739,12 +1739,16 @@ mod clients {
         /// boundedness, not operator-facing wording. The two adapters that cross that boundary are
         /// [`super::RemoteClient::response_from_send`] and
         /// [`super::RemoteClient::response_from_send_mutation`].
+        ///
+        /// `headers` are the request's conditions (a bundle download's `Range` and `If-Range`),
+        /// added before the body: never a `Content-Type`, which only [`SendBody`] decides.
         pub(super) async fn send_on(&self,
                                     posture: Posture,
                                     budgets: &super::Budgets,
                                     method: reqwest::Method,
                                     destination: RequestDestination<'_>,
-                                    body: SendBody) -> SendOutcome {
+                                    body: SendBody,
+                                    headers: reqwest::header::HeaderMap) -> SendOutcome {
             let connect_timeout = budgets.connect;
             let (total_deadline, head_deadline) = match &posture {
                 Posture::TotalDeadline(duration) => {
@@ -1786,7 +1790,7 @@ mod clients {
                 builder = builder.timeout(duration);
             }
 
-            let send_fut = body.apply(builder).send();
+            let send_fut = body.apply(builder.headers(headers)).send();
 
             // The three cells of `Result<Result<_, reqwest::Error>, Elapsed>` map one-to-one onto
             // the three `SendOutcome` variants, and the `Elapsed` is consumed here: it never
@@ -2544,10 +2548,20 @@ impl RemoteClient {
                      method: reqwest::Method,
                      path: &str,
                      body: SendBody) -> SendOutcome {
+        self.send_on_with(posture, method, path, body, reqwest::header::HeaderMap::new()).await
+    }
+
+    /// [`Self::send_on`] with request `headers` (see [`clients::Clients::send_on`]).
+    async fn send_on_with(&self,
+                          posture: Posture,
+                          method: reqwest::Method,
+                          path: &str,
+                          body: SendBody,
+                          headers: reqwest::header::HeaderMap) -> SendOutcome {
         self.clients.send_on(
             posture, &self.budgets, method,
             RequestDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path },
-            body,
+            body, headers,
         ).await
     }
 
@@ -2565,7 +2579,7 @@ impl RemoteClient {
             RequestDestination::Authenticated {
                 base: &origin, token: self.token.as_deref(), path: &path
             },
-            SendBody::Empty,
+            SendBody::Empty, reqwest::header::HeaderMap::new(),
         ).await
     }
 
@@ -2594,6 +2608,7 @@ impl RemoteClient {
                                body: SendBody) -> SendOutcome {
         self.clients.send_on(
             posture, &self.budgets, method, RequestDestination::Presigned { url }, body,
+            reqwest::header::HeaderMap::new(),
         ).await
     }
 
@@ -3284,7 +3299,7 @@ impl RemoteClient {
     /// therefore abandon a request a slow-hook deployment is still legitimately serving. Accepted
     /// deliberately: `resolve` is cosmetic display sugar and its fallback to pseudonyms is free
     /// (never a command failure), so giving up early is the right failure for this one call —
-    /// unlike `fetch_info`/`fetch_signature`/`fetch_bundle_to`, whose `BoundedReads` silence
+    /// unlike `fetch_info`/`fetch_signature`/`download_bundle`, whose `BoundedReads` silence
     /// budget never has to make this trade because a *silence* bound cannot mistake a
     /// slow-but-real transfer for a hang in the first place.
     ///
@@ -3530,11 +3545,22 @@ impl RemoteClient {
                                        path: &str,
                                        body: SendBody,
                                        what: &str) -> Result<SendOutcome, String> {
+        self.send_waiting_out_throttle_with(posture, method, path, body, reqwest::header::HeaderMap::new(), what).await
+    }
+
+    /// [`Self::send_waiting_out_throttle`] with request `headers`, sent again on every retry.
+    async fn send_waiting_out_throttle_with(&self,
+                                            posture: Posture,
+                                            method: reqwest::Method,
+                                            path: &str,
+                                            body: SendBody,
+                                            headers: reqwest::header::HeaderMap,
+                                            what: &str) -> Result<SendOutcome, String> {
         let deadline = tokio::time::Instant::now() + self.budgets.throttle_patience;
         let mut delay = RETRY_BACKOFF_START;
 
         loop {
-            let outcome = self.send_on(posture, method.clone(), path, body.clone()).await;
+            let outcome = self.send_on_with(posture, method.clone(), path, body.clone(), headers.clone()).await;
             let response = match outcome {
                 SendOutcome::Sent(response)
                     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => response,
@@ -4173,124 +4199,364 @@ impl RemoteClient {
         Ok(())
     }
 
-    /// Download the remote's latest bundle into a file. On [`Posture::BoundedReads`]: the bundle
-    /// is a **pre-built** file (whatever `forklift compact`/the equivalent server-side job last
-    /// produced), so the server's pre-first-byte work is O(constant) — serving an already-built
-    /// file — exactly the category [`REMOTE_READ_TIMEOUT`]'s flat budget is honest for. The
-    /// chunked `response.chunk()` loop below is precisely where the per-read, resets-on-progress
+    /// Download the remote's latest bundle into `path`, resuming `kept` when the remote still
+    /// serves the bundle it was cut from. On [`Posture::BoundedReads`]: the bundle is a
+    /// **pre-built** file, so the server's pre-first-byte work is O(constant) — serving an
+    /// already-built file — exactly the category [`REMOTE_READ_TIMEOUT`]'s flat budget is honest
+    /// for. The chunked `response.chunk()` loop is precisely where the per-read, resets-on-progress
     /// half of `read_timeout` matters: a bundle can be large, and a slow-but-steady download must
     /// never be treated as a stall.
     ///
-    /// Downloads to a fresh temp file beside `path` and only renames it into place once every
-    /// chunk has landed: `path` is this warehouse's *own* latest bundle, which
-    /// `forklift serve` would otherwise hand out as-is, and any failure along the way — the new
-    /// timeout very much included — must never leave a truncated (or otherwise stray) file
-    /// sitting at the real name. [`RemoveTempOnDrop`] guards every early return between creating
-    /// the temp file and the rename succeeding, not just the download loop, so `sync_all` or the
-    /// rename itself failing can never leave the temp copy behind either — a manual
-    /// `if let Err(e) = ... { remove_file; return Err(e) }` around only the download loop, which
-    /// an earlier version of this function used, does not cover those.
+    /// `path` is a download area, never a bundle this warehouse serves: the caller imports it and
+    /// only then publishes it as its own (see [`bundle_utils::publish_bundle_download`]).
     ///
-    /// The directory sync after the rename goes through [`file_utils::sync_dir_or_taint`], not
-    /// the plain [`file_utils::sync_dir`] every other call in this file uses for a `bounded_reads`
-    /// response: unlike those, this rename publishes a file at a durable, reused name inside
-    /// `forklift_root()` exactly like every other rename-into-place in the store
-    /// (`write_file_atomically`, pack publication) — the file is visible at `path` the instant
-    /// the rename returns, so a directory-sync failure right after leaves a *visible-but-not-
-    /// durability-proven* bundle with no record of that fact unless a taint is recorded, same as
-    /// any other object-store rename. `franchise` propagates a bare `Err` from this function
-    /// straight out of the whole command (its `?` bypasses the loose-object fallback walk
-    /// entirely — that fallback is only reached on `Ok(false)`/an unsupported-format import
-    /// error, never on a transport-level `Err` from this call) — so treating a lost bundle here
-    /// as "only an optimization" would be wrong for exactly the failure this fix introduces.
+    /// A download is kept across attempts only under a validator: a tag
+    /// [`is_resumable_bundle_tag`] accepts and a declared length. Under one, the bytes land in
+    /// `path` and `checkpoint` is told the length synced so far — when the download starts, every
+    /// `checkpoint_bytes`, when the last byte lands, and, best effort, when it fails — so a later
+    /// attempt can ask for the rest. `checkpoint` is told `None` when `path` holds nothing to
+    /// resume: the remote has no bundle, or sent no validator. Without one, `path` is removed on
+    /// any failure, so nothing is left behind.
+    ///
+    /// `kept` describes the first `kept.length` bytes of `path`, from an earlier attempt. A
+    /// complete one is returned with no request. Otherwise the rest is asked for with `Range`
+    /// under `If-Range`: a `206` is taken only when it starts at `kept.length`, carries
+    /// `kept.etag` and states `kept.total`, and a `200` restarts `path` under its own tag. Any
+    /// other `206`, and a `416`, drop `path` and fall back to one plain request.
     ///
     /// # Returns
-    /// * `Ok(true)`    - The bundle was downloaded.
-    /// * `Ok(false)`   - The remote has no bundle.
-    /// * `Err(String)` - On any other failure.
-    pub async fn fetch_bundle_to(&self, path: &std::path::Path) -> Result<bool, String> {
-        let posture = Posture::BoundedReads;
-        let outcome = self.send_waiting_out_throttle(
-            posture, reqwest::Method::GET, "/v1/bundles/latest", SendBody::Empty, "the bundle fetch"
-        ).await?;
-        let mut response = self.response_from_send("fetching the bundle", posture, outcome)?;
+    /// * `Ok(BundleDownload::Absent)`   - The remote has no bundle; `path` was removed.
+    /// * `Ok(BundleDownload::Complete)` - `path` holds the whole bundle.
+    /// * `Err(String)`                  - On any other failure.
+    pub async fn download_bundle(&self,
+                                 path: &std::path::Path,
+                                 kept: Option<&PartialBundle>,
+                                 checkpoint_bytes: u64,
+                                 checkpoint: &mut (dyn FnMut(Option<&PartialBundle>) -> Result<(), String> + Send))
+                                 -> Result<BundleDownload, String> {
+        let mut kept = kept.cloned();
 
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(false);
-        }
-
-        if !response.status().is_success() {
-            return Err(self.error_of(response, "the bundle").await);
-        }
-
-        // The same temp-path naming `write_file_atomically` uses elsewhere in the store — unique
-        // per write, in the same directory as the final name, so the eventual rename is a same-
-        // filesystem metadata-only operation. Not `write_file_atomically` itself: that takes the
-        // full content up front, which would put the whole bundle back in memory — exactly what
-        // streaming via `response.chunk()` exists to avoid.
-        let temp_path = file_utils::temp_path_for(path)?;
-        let mut file = std::fs::File::create(&temp_path)
-            .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
-        let mut cleanup = RemoveTempOnDrop::armed(&temp_path);
-
-        #[allow(clippy::disallowed_methods)] // streamed to the bundle file, never accumulated
-        while let Some(chunk) = response.chunk()
-            .await
-            .map_err(|e| self.describe_transport_error("downloading the bundle", posture, e))?
-        {
-            std::io::Write::write_all(&mut file, &chunk)
-                .map_err(|e| format!("Error while writing the bundle file: {}", e))?;
-        }
-
-        // Fsync via the still-open write handle, never by reopening `temp_path` — a handle
-        // reopened after the fact cannot force a durable fsync on every platform this runs on.
-        if file_utils::fsync_enabled() {
-            file.sync_all()
-                .map_err(|e| format!("Error while syncing the bundle file: {}", e))?;
-        }
-        drop(file);
-
-        file_utils::rename(&temp_path, path).map_err(|e| format!(
-            "Error while moving the bundle into place at \"{}\": {}", path.to_string_lossy(), e
-        ))?;
-
-        // The rename succeeded: `temp_path` no longer names anything, so there is nothing left
-        // for the guard to clean up regardless of what happens next.
-        cleanup.disarm();
-
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                file_utils::sync_dir_or_taint(parent, &[path])?;
+        if let Some(partial) = &kept {
+            if !holds_download(path, partial) {
+                remove_bundle_download(path)?;
+                checkpoint(None)?;
+                kept = None;
+            } else if partial.length == partial.total {
+                return Ok(BundleDownload::Complete { resumed: true });
+            } else if partial.length == 0 {
+                // Nothing kept to resume: the whole bundle comes in one piece, as from scratch.
+                kept = None;
             }
         }
 
-        Ok(true)
+        loop {
+            // Never encoded in transit: a decoded body loses the length and range that tie it to
+            // the bytes kept.
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::ACCEPT_ENCODING, reqwest::header::HeaderValue::from_static("identity"));
+
+            if let Some(partial) = &kept {
+                let header = |value: &str| reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("Error while asking for the rest of the bundle: {}", e));
+                headers.insert(reqwest::header::RANGE, header(&format!("bytes={}-", partial.length))?);
+                headers.insert(reqwest::header::IF_RANGE, header(&partial.etag)?);
+            }
+
+            let posture = Posture::BoundedReads;
+            let outcome = self.send_waiting_out_throttle_with(
+                posture, reqwest::Method::GET, "/v1/bundles/latest", SendBody::Empty, headers, "the bundle fetch"
+            ).await?;
+            let response = self.response_from_send("fetching the bundle", posture, outcome)?;
+            let status = response.status();
+
+            if status == reqwest::StatusCode::NOT_FOUND {
+                remove_bundle_download(path)?;
+                checkpoint(None)?;
+                return Ok(BundleDownload::Absent);
+            }
+
+            let resumed = match (status, &kept) {
+                (reqwest::StatusCode::PARTIAL_CONTENT, Some(partial)) if continues_download(&response, partial) => {
+                    kept.take()
+                }
+                (reqwest::StatusCode::PARTIAL_CONTENT | reqwest::StatusCode::RANGE_NOT_SATISFIABLE, Some(_)) => {
+                    // Not the rest of the bundle kept: start over with one plain request.
+                    drop(response);
+                    remove_bundle_download(path)?;
+                    checkpoint(None)?;
+                    kept = None;
+                    continue;
+                }
+                (reqwest::StatusCode::PARTIAL_CONTENT, None) => {
+                    return Err(CoreError::refusal(
+                        RefusalCode::RemoteProtocolViolation,
+                        format!(
+                            "The remote {} answered a request for its whole bundle with part of one.",
+                            self.base
+                        ),
+                        "Report it to whoever runs the remote; retrying gets the same answer.",
+                    ).into());
+                }
+                (status, _) if status.is_success() => None,
+                _ => return Err(self.error_of(response, "the bundle").await),
+            };
+
+            return self.receive_bundle(response, path, resumed, checkpoint_bytes, checkpoint).await;
+        }
+    }
+
+    /// Write the body of `response`, the bundle or (when `resumed`) the rest of it, into `path`;
+    /// see [`Self::download_bundle`].
+    async fn receive_bundle(&self,
+                            mut response: reqwest::Response,
+                            path: &std::path::Path,
+                            resumed: Option<PartialBundle>,
+                            checkpoint_bytes: u64,
+                            checkpoint: &mut (dyn FnMut(Option<&PartialBundle>) -> Result<(), String> + Send))
+                            -> Result<BundleDownload, String> {
+        let posture = Posture::BoundedReads;
+        let was_resumed = resumed.is_some();
+        let validator = resumed.clone().or_else(|| bundle_validator(&response));
+        let write_error = |e: std::io::Error| format!("Error while writing the bundle file: {}", e);
+
+        let Some(mut partial) = validator else {
+            // Nothing to resume from: download as a whole, and leave nothing behind on a failure.
+            remove_bundle_download(path)?;
+            checkpoint(None)?;
+
+            let mut file = std::fs::File::create(path)
+                .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
+            let mut cleanup = RemoveFileOnDrop::armed(path);
+
+            #[allow(clippy::disallowed_methods)] // streamed to the bundle file, never accumulated
+            while let Some(chunk) = response.chunk()
+                .await
+                .map_err(|e| self.describe_transport_error("downloading the bundle", posture, e))?
+            {
+                std::io::Write::write_all(&mut file, &chunk).map_err(write_error)?;
+            }
+
+            sync_download(&file)?;
+            cleanup.disarm();
+
+            return Ok(BundleDownload::Complete { resumed: false });
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(!was_resumed)
+            .open(path)
+            .map_err(|e| format!("Error while opening the bundle file: {}", e))?;
+
+        if was_resumed {
+            // Bytes past the kept length were never synced, so they are not trusted.
+            file.set_len(partial.length).map_err(write_error)?;
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0)).map_err(write_error)?;
+        } else {
+            checkpoint(Some(&partial))?;
+        }
+
+        let mut written = partial.length;
+        let mut unsynced = 0u64;
+
+        #[allow(clippy::disallowed_methods)] // streamed to the bundle file, never accumulated
+        let streamed: Result<(), String> = loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) if written == partial.total => break Ok(()),
+                Ok(None) => break Err(format!(
+                    "Error while downloading the bundle: it ended after {} of its {} bytes.", written, partial.total
+                )),
+                Err(e) => break Err(self.describe_transport_error("downloading the bundle", posture, e)),
+            };
+
+            if chunk.len() as u64 > partial.total - written {
+                break Err(format!(
+                    "Error while downloading the bundle: the remote sent more than its {} bytes.", partial.total
+                ));
+            }
+
+            if let Err(e) = std::io::Write::write_all(&mut file, &chunk) {
+                break Err(write_error(e));
+            }
+
+            written += chunk.len() as u64;
+            unsynced += chunk.len() as u64;
+
+            if unsynced >= checkpoint_bytes && written < partial.total {
+                if let Err(e) = sync_download(&file) {
+                    break Err(e);
+                }
+
+                partial.length = written;
+                checkpoint(Some(&partial))?;
+                unsynced = 0;
+            }
+        };
+
+        if let Err(error) = streamed {
+            // Best effort: keep what did land, so the next attempt asks only for the rest.
+            if written > partial.length && sync_download(&file).is_ok() {
+                partial.length = written;
+                let _ = checkpoint(Some(&partial));
+            }
+
+            return Err(error);
+        }
+
+        sync_download(&file)?;
+        partial.length = written;
+        checkpoint(Some(&partial))?;
+
+        Ok(BundleDownload::Complete { resumed: was_resumed })
     }
 }
 
-/// Removes the temp file at `path` when dropped, unless [`Self::disarm`] was called first.
-/// [`RemoteClient::fetch_bundle_to`]'s one use of this guards *every* early return between
-/// creating its temp file and the rename that publishes it succeeding — not just the download
-/// loop — so a later failure (`sync_all`, the rename itself) can never leave the temp copy behind
-/// either.
-struct RemoveTempOnDrop<'a> {
+/// How often a resumable bundle download is synced and its length recorded. A judgment figure,
+/// with no measured calibration: it caps what a crash can cost at one interval, and the extra
+/// syncs at one per interval.
+pub const BUNDLE_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The longest bundle tag a download is kept under. It only bounds a hostile header: the tags
+/// forklift-server sends are far shorter.
+const MAX_BUNDLE_TAG_BYTES: usize = 256;
+
+/// A bundle download kept from an earlier attempt: the first `length` bytes of the bundle the
+/// remote served under `etag`, which declared `total` bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialBundle {
+    /// The tag the remote served the bundle under, quotes included.
+    pub etag: String,
+
+    /// The bundle's whole length, as the remote declared it.
+    pub total: u64,
+
+    /// How much of it was synced to the download file. At most `total`.
+    pub length: u64,
+}
+
+/// What [`RemoteClient::download_bundle`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BundleDownload {
+    /// The remote has no bundle.
+    Absent,
+
+    /// The download file holds the whole bundle; `resumed` when some of it was kept from an
+    /// earlier attempt.
+    Complete { resumed: bool },
+}
+
+/// Whether a download may be kept under `tag`: a strong entity tag (quoted, so not weak), no
+/// longer than [`MAX_BUNDLE_TAG_BYTES`], of visible ASCII only.
+pub fn is_resumable_bundle_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+
+    (2..=MAX_BUNDLE_TAG_BYTES).contains(&bytes.len())
+        && bytes[0] == b'"'
+        && bytes[bytes.len() - 1] == b'"'
+        && bytes[1..bytes.len() - 1].iter().all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'"')
+}
+
+/// The validator a whole-bundle `response` carries, as an empty download under it: one
+/// resumable tag and one declared length, with the body sent as it is stored. `None` without
+/// both, so nothing is kept.
+fn bundle_validator(response: &reqwest::Response) -> Option<PartialBundle> {
+    let headers = response.headers();
+    let etag = single_header(headers, reqwest::header::ETAG).filter(|tag| is_resumable_bundle_tag(tag))?;
+    let total = single_header(headers, reqwest::header::CONTENT_LENGTH).and_then(parse_decimal)?;
+
+    is_identity_encoded(headers).then(|| PartialBundle { etag: etag.to_string(), total, length: 0 })
+}
+
+/// Whether the `206` in `response` is the rest of `kept`: it starts where `kept` ends, under the
+/// same tag, of the same total, with the body sent as it is stored.
+fn continues_download(response: &reqwest::Response, kept: &PartialBundle) -> bool {
+    let headers = response.headers();
+    let range = single_header(headers, reqwest::header::CONTENT_RANGE).and_then(parse_content_range);
+    let length = headers.get_all(reqwest::header::CONTENT_LENGTH).iter().count();
+
+    range == Some((kept.length, kept.total - 1, kept.total))
+        && single_header(headers, reqwest::header::ETAG) == Some(kept.etag.as_str())
+        && (length == 0 || single_header(headers, reqwest::header::CONTENT_LENGTH).and_then(parse_decimal) == Some(kept.total - kept.length))
+        && is_identity_encoded(headers)
+}
+
+/// The value of `name` in `headers`, when it is sent exactly once and is visible ASCII.
+fn single_header(headers: &reqwest::header::HeaderMap, name: reqwest::header::HeaderName) -> Option<&str> {
+    let mut values = headers.get_all(name).iter();
+
+    match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok().map(str::trim),
+        _ => None,
+    }
+}
+
+/// Whether the body in `headers` is sent as it is stored: no `Content-Encoding` but `identity`.
+fn is_identity_encoded(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.get_all(reqwest::header::CONTENT_ENCODING).iter()
+        .all(|value| value.to_str().is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity")))
+}
+
+/// A run of ASCII digits as a number.
+fn parse_decimal(text: &str) -> Option<u64> {
+    (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())).then(|| text.parse().ok()).flatten()
+}
+
+/// `bytes <first>-<last>/<total>` as its three numbers.
+fn parse_content_range(text: &str) -> Option<(u64, u64, u64)> {
+    let (unit, rest) = text.split_once(' ')?;
+    let (range, total) = rest.trim().split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+
+    unit.eq_ignore_ascii_case("bytes")
+        .then(|| Some((parse_decimal(first)?, parse_decimal(last)?, parse_decimal(total)?)))
+        .flatten()
+}
+
+/// Whether the download file at `path` still holds what `kept` says was synced to it: a file, not
+/// a link, at least that long.
+fn holds_download(path: &std::path::Path, kept: &PartialBundle) -> bool {
+    kept.length <= kept.total
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() >= kept.length)
+}
+
+/// Remove the download file at `path`, if there is one.
+fn remove_bundle_download(path: &std::path::Path) -> Result<(), String> {
+    file_utils::remove_unfollowed(path)
+}
+
+/// Sync a download through the handle that wrote it, never by reopening it: a handle reopened
+/// after the fact cannot force a durable fsync on every platform this runs on.
+fn sync_download(file: &std::fs::File) -> Result<(), String> {
+    if file_utils::fsync_enabled() {
+        file.sync_all().map_err(|e| format!("Error while syncing the bundle file: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Removes the file at `path` when dropped, unless [`Self::disarm`] was called first.
+/// [`RemoteClient::receive_bundle`] uses it for a download nothing could resume: it guards every
+/// early return between creating the file and the download finishing, so a failure never leaves
+/// a part of a bundle behind.
+struct RemoveFileOnDrop<'a> {
     path: &'a std::path::Path,
     armed: bool,
 }
 
-impl<'a> RemoveTempOnDrop<'a> {
-    fn armed(path: &'a std::path::Path) -> RemoveTempOnDrop<'a> {
-        RemoveTempOnDrop { path, armed: true }
+impl<'a> RemoveFileOnDrop<'a> {
+    fn armed(path: &'a std::path::Path) -> RemoveFileOnDrop<'a> {
+        RemoveFileOnDrop { path, armed: true }
     }
 
-    /// Call once the temp file has been consumed (renamed away) so `Drop` becomes a no-op —
-    /// there is nothing left at `path` to remove, and nothing wrong with there not being.
+    /// Call once the download finished, so `Drop` keeps the file.
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for RemoveTempOnDrop<'_> {
+impl Drop for RemoveFileOnDrop<'_> {
     fn drop(&mut self) {
         if self.armed {
             let _ = std::fs::remove_file(self.path);
@@ -9199,9 +9465,9 @@ mod tests {
         let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
         let client = fast_client(&url);
         let scratch = Scratch::new("throttled-bundle");
-        let fetched = runtime.block_on(client.fetch_bundle_to(&scratch.root.join("bundle")))
+        let fetched = runtime.block_on(download_whole_bundle(&client, &scratch.root.join("bundle")))
             .expect("a throttled bundle GET is re-sent, not failed");
-        assert!(!fetched, "the 404 after the throttle is no bundle");
+        assert_eq!(fetched, BundleDownload::Absent, "the 404 after the throttle is no bundle");
         assert_eq!(*requests.lock().unwrap(), 2);
 
         let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
@@ -10693,10 +10959,10 @@ mod tests {
         );
     }
 
-    /// `fetch_bundle_to` must be bounded exactly like `fetch_info` — same pin as
+    /// `download_bundle` must be bounded exactly like `fetch_info` — same pin as
     /// `fetch_signature`'s, for the same reason.
     #[test]
-    fn fetch_bundle_to_times_out_against_a_silent_remote() {
+    fn download_bundle_times_out_against_a_silent_remote() {
         let remote = SilentRemote::start();
         let client = fast_client(&remote.url);
         let dest = std::env::temp_dir().join(format!(
@@ -10707,12 +10973,12 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
-            tokio::time::timeout(hard_ceiling, client.fetch_bundle_to(&dest)).await
+            tokio::time::timeout(hard_ceiling, download_whole_bundle(&client, &dest)).await
         });
 
         let message = outcome
             .unwrap_or_else(|_| panic!(
-                "fetch_bundle_to hung past the test's own {:?} ceiling — no timeout fired at all",
+                "download_bundle hung past the test's own {:?} ceiling — no timeout fired at all",
                 hard_ceiling
             ))
             .expect_err("a silent remote must not appear to succeed");
@@ -10721,7 +10987,7 @@ mod tests {
             message.to_lowercase().contains("timed out"),
             "must fail specifically with a timeout, not some other transport error: {}", message
         );
-        // A silent remote never gets past headers, so no temp file is ever created here — the
+        // A silent remote never gets past headers, so no file is ever created here — the
         // dedicated test below is what actually exercises the mid-download cleanup.
         assert!(!dest.exists(), "no file should appear at the destination at all in this scenario");
 
@@ -10733,7 +10999,7 @@ mod tests {
     /// inspect the way its siblings above do (it is best-effort by contract: see its own doc), so
     /// this pins the one property their message-content assertions can't stand in for here: that
     /// the call actually completes within its own effective budget at all. Sibling coverage to
-    /// `fetch_info`/`fetch_signature`/`fetch_bundle_to`'s own `*_times_out_against_a_silent_remote`
+    /// `fetch_info`/`fetch_signature`/`download_bundle`'s own `*_times_out_against_a_silent_remote`
     /// tests above — every [`Posture::BoundedReads`]/[`Posture::TotalDeadline`] carrier gets one.
     ///
     /// **Verified not to distinguish [`Posture::TotalDeadline`] from [`Posture::BoundedReads`]
@@ -11256,14 +11522,15 @@ mod tests {
         );
     }
 
-    /// A mid-download failure — the new timeout being the routine case now — must never leave a
-    /// truncated file at the destination, which would otherwise be this warehouse's
-    /// own latest bundle. Unlike the silent-remote scenario above, [`LyingContentLengthRemote`]
-    /// gets past headers and writes a few real bytes before going quiet, so the temp file this
-    /// exercises genuinely exists (and has content) at the moment the timeout fires and the
-    /// cleanup runs.
+    /// A mid-download failure of a download nothing could resume — [`LyingContentLengthRemote`]
+    /// sends no tag — must never leave a truncated file at the destination. Unlike the
+    /// silent-remote scenario above, it gets past headers and writes a few real bytes before going
+    /// quiet, so the file this exercises genuinely exists (and has content) at the moment the
+    /// timeout fires and the cleanup runs.
+    ///
+    /// Revert: drop `RemoveFileOnDrop` from `receive_bundle` → the four bytes stay → red.
     #[test]
-    fn fetch_bundle_to_leaves_no_truncated_file_on_a_mid_download_timeout() {
+    fn download_bundle_leaves_no_truncated_file_on_a_mid_download_timeout() {
         let remote = LyingContentLengthRemote::start();
         let client = fast_client(&remote.url);
         let dest = std::env::temp_dir().join(format!(
@@ -11274,12 +11541,12 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
-            tokio::time::timeout(hard_ceiling, client.fetch_bundle_to(&dest)).await
+            tokio::time::timeout(hard_ceiling, download_whole_bundle(&client, &dest)).await
         });
 
         let message = outcome
             .unwrap_or_else(|_| panic!(
-                "fetch_bundle_to hung past the test's own {:?} ceiling — no timeout fired at all",
+                "download_bundle hung past the test's own {:?} ceiling — no timeout fired at all",
                 hard_ceiling
             ))
             .expect_err("a body that never completes must not appear to succeed");
@@ -11293,35 +11560,16 @@ mod tests {
             "a mid-download timeout must never leave a truncated file at the destination"
         );
 
-        // The cleanup must be pinned, not just its visible effect — a test that only
-        // checks `!dest.exists()` would still pass if the temp-file `remove_file` call were
-        // simply deleted, since the temp file is never renamed to `dest` in this scenario either
-        // way. Scoped to this test's own temp-file prefix (not a bare ".tmp" scan) since
-        // `std::env::temp_dir()` is shared with whatever else is running concurrently.
-        let dest_name = dest.file_name().unwrap().to_string_lossy().into_owned();
-        let temp_prefix = format!("{}.tmp", dest_name);
-        let leftover_temp_files: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(&temp_prefix))
-            .collect();
-        assert!(
-            leftover_temp_files.is_empty(),
-            "the temp file must be cleaned up on a mid-download failure, not just absent from \
-            the final destination: {:?}", leftover_temp_files
-        );
-
         let _ = std::fs::remove_file(&dest);
     }
 
     /// A completed download lands at the destination through the fsync-on path: the bundle is
-    /// synced through the handle that wrote it, then renamed into place. The integration suites
-    /// launch their binaries with durability off, so this in-process test is what still executes
-    /// `fetch_bundle_to`'s `sync_all` — the call that fails on Windows if the file is synced
-    /// through a handle without write access. It catches a sync that errors, not one removed.
+    /// synced through the handle that wrote it. The integration suites launch their binaries with
+    /// durability off, so this in-process test is what still executes `receive_bundle`'s
+    /// `sync_all` — the call that fails on Windows if the file is synced through a handle without
+    /// write access. It catches a sync that errors, not one removed.
     #[test]
-    fn fetch_bundle_to_syncs_and_publishes_a_complete_bundle() {
+    fn download_bundle_syncs_a_complete_bundle() {
         assert!(
             file_utils::fsync_enabled(),
             "this test exists to run the fsync-on path; unset FORKLIFT_FSYNC to run it"
@@ -11333,11 +11581,290 @@ mod tests {
         ));
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let fetched = runtime.block_on(client.fetch_bundle_to(&dest));
+        let fetched = runtime.block_on(download_whole_bundle(&client, &dest));
 
-        assert_eq!(fetched, Ok(true));
+        assert_eq!(fetched, Ok(BundleDownload::Complete { resumed: false }));
         assert_eq!(std::fs::read(&dest).unwrap(), b"a complete bundle");
         let _ = std::fs::remove_file(&dest);
+    }
+
+    /// Download the bundle with nothing kept and no record to checkpoint into.
+    async fn download_whole_bundle(client: &RemoteClient, path: &std::path::Path) -> Result<BundleDownload, String> {
+        client.download_bundle(path, None, BUNDLE_CHECKPOINT_BYTES, &mut |_| Ok(())).await
+    }
+
+    /// A remote that answers its `n`th request with `answers[n]`, a whole raw response after which
+    /// it closes the connection, and records each request's head. A request past the script is
+    /// answered `500`.
+    struct ScriptedBundleRemote {
+        url: String,
+        heads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedBundleRemote {
+        fn start(answers: Vec<Vec<u8>>) -> ScriptedBundleRemote {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&heads);
+
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(1) => head.push(byte[0]),
+                            _ => break,
+                        }
+                    }
+
+                    let index = {
+                        let mut heads = recorded.lock().unwrap();
+                        heads.push(String::from_utf8_lossy(&head).to_ascii_lowercase());
+                        heads.len() - 1
+                    };
+                    let answer = answers.get(index).cloned().unwrap_or_else(|| {
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                    });
+                    let _ = stream.write_all(&answer);
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            });
+
+            ScriptedBundleRemote { url, heads }
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.heads.lock().unwrap().clone()
+        }
+    }
+
+    /// A `200` for `body` under `tag` (none when `None`), declaring its whole length but sending
+    /// only its first `sent` bytes.
+    fn whole_bundle_answer(tag: Option<&str>, body: &[u8], sent: usize) -> Vec<u8> {
+        let tag = tag.map(|tag| format!("ETag: {}\r\n", tag)).unwrap_or_default();
+        let mut answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n", body.len(), tag
+        ).into_bytes();
+        answer.extend_from_slice(&body[..sent]);
+        answer
+    }
+
+    /// A `206` of `body` from `start` under `tag`, with `content_range` as given.
+    fn rest_of_bundle_answer(tag: &str, body: &[u8], start: usize, content_range: &str) -> Vec<u8> {
+        let mut answer = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: {}\r\nETag: {}\r\n\
+            Connection: close\r\n\r\n", body.len() - start, content_range, tag
+        ).into_bytes();
+        answer.extend_from_slice(&body[start..]);
+        answer
+    }
+
+    /// The value of `name` in a recorded (lowercased) request head.
+    fn head_value(head: &str, name: &str) -> Option<String> {
+        head.lines().find_map(|line| line.strip_prefix(&format!("{}:", name)).map(|value| value.trim().to_string()))
+    }
+
+    const BUNDLE_BODY: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCD";
+
+    /// Run one download of `path` against `remote`, collecting every checkpoint.
+    fn download_with(remote: &ScriptedBundleRemote,
+                     path: &std::path::Path,
+                     kept: Option<&PartialBundle>,
+                     checkpoint_bytes: u64) -> (Result<BundleDownload, String>, Vec<Option<PartialBundle>>) {
+        let client = fast_client(&remote.url);
+        let mut checkpoints = Vec::new();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let outcome = runtime.block_on(client.download_bundle(path, kept, checkpoint_bytes, &mut |partial| {
+            checkpoints.push(partial.cloned());
+            Ok(())
+        }));
+
+        (outcome, checkpoints)
+    }
+
+    fn kept_bundle(etag: &str, length: u64) -> PartialBundle {
+        PartialBundle { etag: etag.to_string(), total: BUNDLE_BODY.len() as u64, length }
+    }
+
+    /// A download cut off under a tag keeps what landed and records it, and the next one asks for
+    /// only the rest under the same tag and appends it.
+    ///
+    /// Reverts: no best-effort checkpoint on a failure → the record stops at 0 → red; a plain
+    /// request on resume → no `Range` → red; truncate the kept file on a `206` → red.
+    #[test]
+    fn a_cut_off_download_is_kept_and_resumed_for_the_rest_only() {
+        let scratch = Scratch::new("bundle-resume");
+        let path = scratch.root.join("partial");
+        let tag = "\"v1\"";
+
+        // The interval never comes round: only the checkpoint after the failure records the 21.
+        let remote = ScriptedBundleRemote::start(vec![whole_bundle_answer(Some(tag), BUNDLE_BODY, 21)]);
+        let (outcome, checkpoints) = download_with(&remote, &path, None, u64::MAX);
+        assert!(outcome.is_err(), "{:?}", outcome);
+        assert_eq!(checkpoints, vec![Some(kept_bundle(tag, 0)), Some(kept_bundle(tag, 21))]);
+        assert_eq!(std::fs::read(&path).unwrap(), &BUNDLE_BODY[..21]);
+
+        // Bytes past what was recorded are not trusted: they are cut before the rest is appended.
+        std::io::Write::write_all(&mut std::fs::OpenOptions::new().append(true).open(&path).unwrap(), b"junk").unwrap();
+        let rest = rest_of_bundle_answer(tag, BUNDLE_BODY, 21, "bytes 21-39/40");
+        let remote = ScriptedBundleRemote::start(vec![rest]);
+        let (outcome, checkpoints) = download_with(&remote, &path, Some(&kept_bundle(tag, 21)), 8);
+        assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: true }));
+        assert_eq!(std::fs::read(&path).unwrap(), BUNDLE_BODY);
+        assert_eq!(checkpoints.last(), Some(&Some(kept_bundle(tag, 40))));
+        assert!(!checkpoints.contains(&None), "{:?}", checkpoints);
+
+        let heads = remote.heads();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(head_value(&heads[0], "range").as_deref(), Some("bytes=21-"));
+        assert_eq!(head_value(&heads[0], "if-range").as_deref(), Some(tag));
+        assert_eq!(head_value(&heads[0], "accept-encoding").as_deref(), Some("identity"));
+    }
+
+    /// A kept download is resumed only by the rest of itself: a `206` that starts elsewhere, names
+    /// another tag or another total, and a `416`, drop it for one plain request, and a `200`
+    /// restarts it under its own tag.
+    ///
+    /// Revert: accept any `206` → the file is spliced → red.
+    #[test]
+    fn a_kept_download_restarts_on_any_answer_but_the_rest_it_asked_for() {
+        let scratch = Scratch::new("bundle-restart");
+        let path = scratch.root.join("partial");
+        let tag = "\"v1\"";
+        let fresh = whole_bundle_answer(Some("\"v2\""), BUNDLE_BODY, BUNDLE_BODY.len());
+        let refused = b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */40\r\nContent-Length: 0\r\n\
+            Connection: close\r\n\r\n".to_vec();
+
+        for (label, answer) in [
+            ("another start", rest_of_bundle_answer(tag, BUNDLE_BODY, 20, "bytes 20-39/40")),
+            ("another tag", rest_of_bundle_answer("\"v0\"", BUNDLE_BODY, 21, "bytes 21-39/40")),
+            ("another total", rest_of_bundle_answer(tag, BUNDLE_BODY, 21, "bytes 21-39/41")),
+            ("refused", refused),
+        ] {
+            std::fs::write(&path, &BUNDLE_BODY[..21]).unwrap();
+            let remote = ScriptedBundleRemote::start(vec![answer, fresh.clone()]);
+            let (outcome, checkpoints) = download_with(&remote, &path, Some(&kept_bundle(tag, 21)), 8);
+
+            assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: false }), "{}", label);
+            assert_eq!(std::fs::read(&path).unwrap(), BUNDLE_BODY, "{}", label);
+            assert_eq!(checkpoints.first(), Some(&None), "{}: the kept download is dropped first", label);
+            assert_eq!(checkpoints.last(), Some(&Some(kept_bundle("\"v2\"", 40))), "{}", label);
+
+            let heads = remote.heads();
+            assert_eq!(heads.len(), 2, "{}", label);
+            assert_eq!(head_value(&heads[1], "range"), None, "{}: the fallback asks for the whole bundle", label);
+        }
+
+        // A rebuilt bundle comes back whole under its new tag, and replaces the kept bytes.
+        std::fs::write(&path, b"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ").unwrap();
+        let remote = ScriptedBundleRemote::start(vec![fresh]);
+        let (outcome, checkpoints) = download_with(&remote, &path, Some(&kept_bundle(tag, 21)), 8);
+        assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: false }));
+        assert_eq!(std::fs::read(&path).unwrap(), BUNDLE_BODY);
+        assert_eq!(checkpoints.first(), Some(&Some(kept_bundle("\"v2\"", 0))));
+        assert_eq!(remote.heads().len(), 1);
+    }
+
+    /// A download kept whole goes straight to import: nothing is asked of the remote. One kept at no
+    /// bytes is asked for whole.
+    ///
+    /// Reverts: always request → the remote sees one → red; resume from byte 0 → a `Range` → red.
+    #[test]
+    fn a_complete_kept_download_needs_no_request() {
+        let scratch = Scratch::new("bundle-complete");
+        let path = scratch.root.join("partial");
+        std::fs::write(&path, BUNDLE_BODY).unwrap();
+
+        let remote = ScriptedBundleRemote::start(Vec::new());
+        let (outcome, checkpoints) = download_with(&remote, &path, Some(&kept_bundle("\"v1\"", 40)), 8);
+        assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: true }));
+        assert!(checkpoints.is_empty());
+        assert!(remote.heads().is_empty());
+
+        // One shorter than recorded is not kept: it is dropped and downloaded afresh.
+        std::fs::write(&path, &BUNDLE_BODY[..39]).unwrap();
+        let remote = ScriptedBundleRemote::start(vec![whole_bundle_answer(Some("\"v1\""), BUNDLE_BODY, 40)]);
+        let (outcome, checkpoints) = download_with(&remote, &path, Some(&kept_bundle("\"v1\"", 40)), 8);
+        assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: false }));
+        assert_eq!(checkpoints.first(), Some(&None));
+        assert_eq!(head_value(&remote.heads()[0], "range"), None);
+
+        // Nothing kept yet is no resume: the bundle is asked for whole, and comes in one piece.
+        std::fs::write(&path, b"").unwrap();
+        let remote = ScriptedBundleRemote::start(vec![whole_bundle_answer(Some("\"v1\""), BUNDLE_BODY, 40)]);
+        let (outcome, _) = download_with(&remote, &path, Some(&kept_bundle("\"v1\"", 0)), 8);
+        assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: false }));
+        assert_eq!(head_value(&remote.heads()[0], "range"), None);
+        assert_eq!(std::fs::read(&path).unwrap(), BUNDLE_BODY);
+    }
+
+    /// Without a resumable tag and a declared length nothing is kept: a cut-off download leaves no
+    /// file and records none, also when an earlier attempt had kept one.
+    ///
+    /// Reverts: checkpoint without a validator → a `Some` is recorded → red; keep the earlier
+    /// download → the file survives → red.
+    #[test]
+    fn a_download_without_a_validator_is_never_kept() {
+        let scratch = Scratch::new("bundle-no-validator");
+        let path = scratch.root.join("partial");
+
+        for (label, tag) in [("no tag", None), ("a weak tag", Some("W/\"v1\"")), ("an unquoted tag", Some("v1"))] {
+            for kept in [None, Some(kept_bundle("\"v1\"", 21))] {
+                if kept.is_some() {
+                    std::fs::write(&path, &BUNDLE_BODY[..21]).unwrap();
+                }
+
+                let remote = ScriptedBundleRemote::start(vec![whole_bundle_answer(tag, BUNDLE_BODY, 21)]);
+                let (outcome, checkpoints) = download_with(&remote, &path, kept.as_ref(), 8);
+                assert!(outcome.is_err(), "{}: {:?}", label, outcome);
+                assert!(!path.exists(), "{}: a download nothing can resume is not left behind", label);
+                assert!(!checkpoints.is_empty() && checkpoints.iter().all(Option::is_none), "{}: {:?}", label, checkpoints);
+            }
+        }
+
+        // No declared length: the bytes are read to the end of the connection, and not kept.
+        let mut undeclared = b"HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n".to_vec();
+        undeclared.extend_from_slice(BUNDLE_BODY);
+        let remote = ScriptedBundleRemote::start(vec![undeclared]);
+        let (outcome, checkpoints) = download_with(&remote, &path, None, 8);
+        assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: false }));
+        assert_eq!(std::fs::read(&path).unwrap(), BUNDLE_BODY);
+        assert_eq!(checkpoints, vec![None]);
+    }
+
+    /// A remote that no longer has a bundle drops the kept download and records none.
+    #[test]
+    fn a_bundle_gone_from_the_remote_drops_the_kept_download() {
+        let scratch = Scratch::new("bundle-gone");
+        let path = scratch.root.join("partial");
+        std::fs::write(&path, &BUNDLE_BODY[..21]).unwrap();
+
+        let gone = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let remote = ScriptedBundleRemote::start(vec![gone]);
+        let (outcome, checkpoints) = download_with(&remote, &path, Some(&kept_bundle("\"v1\"", 21)), 8);
+        assert_eq!(outcome, Ok(BundleDownload::Absent));
+        assert!(!path.exists());
+        assert_eq!(checkpoints, vec![None]);
+    }
+
+    /// A download is kept only under a strong, short tag of visible ASCII.
+    #[test]
+    fn only_strong_short_visible_tags_are_resumable() {
+        for tag in ["\"\"", "\"v1\"", "\"0123456789abcdef0123456789abcdef\"", &format!("\"{}\"", "a".repeat(254))] {
+            assert!(is_resumable_bundle_tag(tag), "{}", tag);
+        }
+
+        for tag in ["", "\"", "v1", "W/\"v1\"", "\"v 1\"", "\"v\"1\"", "\"v\u{e9}\"", "\"v\t\"",
+                    &format!("\"{}\"", "a".repeat(255))] {
+            assert!(!is_resumable_bundle_tag(tag), "{}", tag);
+        }
     }
 
     /// A remote that answers one request with `200` and the given body, then closes.

@@ -522,4 +522,6 @@ then lift) — protocol v1 has no remote-tracking refs.
 **franchise (clone)** — prepare an empty warehouse, adopt the remote's trust anchor,
 lower the office pallet and the default (or chosen) pallet, materialize the working
 directory. When `GET /v1/bundles/latest` succeeds, the bundle is imported first and the
-breadth-first walk only fetches what it lacked.
+breadth-first walk only fetches what it lacked. A franchise that fails partway keeps the bundle
+bytes it synced, with their tag and total, and its next attempt resumes them as described under
+`GET /v1/bundles/latest`.

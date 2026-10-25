@@ -902,7 +902,7 @@ mod tests {
             token: None,
             request: franchise_utils::Request { pallet: None, only: Vec::new() },
             genesis: None,
-            bundle_imported: false,
+            bundle: franchise_utils::BundleState::None,
             attempt: franchise_utils::Attempt::Running,
             start_census: 0,
             last_failure: None,
