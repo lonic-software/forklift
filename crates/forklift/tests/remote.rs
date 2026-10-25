@@ -754,10 +754,16 @@ struct InterceptingProxy {
     url: String,
 }
 
-type Intercept = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync;
+type Intercept = dyn Fn(&str, &str) -> Option<Vec<u8>> + Send + Sync;
 
 impl InterceptingProxy {
     fn start(upstream: &str, intercept: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static) -> InterceptingProxy {
+        InterceptingProxy::start_seeing(upstream, move |path, _| intercept(path))
+    }
+
+    /// As [`InterceptingProxy::start`], with `intercept` also given the request's head.
+    fn start_seeing(upstream: &str,
+                    intercept: impl Fn(&str, &str) -> Option<Vec<u8>> + Send + Sync + 'static) -> InterceptingProxy {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let upstream = upstream.trim_start_matches("http://").trim_end_matches('/').to_string();
@@ -817,7 +823,7 @@ impl InterceptingProxy {
 
         let path = request_line.split_whitespace().nth(1).unwrap_or_default();
 
-        if let Some(answer) = intercept(path) {
+        if let Some(answer) = intercept(path, &head) {
             let _ = downstream.write_all(&answer);
             return;
         }
@@ -2120,6 +2126,287 @@ fn a_server_holding_a_previous_version_bundle_still_franchises() {
     assert_success(&franchised);
     assert!(!stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
     assert_eq!(area.read_file("b/one.txt"), "one\n");
+    assert!(!area.path("b/.forklift/bundles/latest").exists());
+}
+
+/// A head in front of a real server that answers the bundle itself, from `answer(n, head)` for its
+/// `n`th bundle request (the head lowercased), and forwards everything else. Each bundle request's
+/// head is kept.
+struct BundleStub {
+    url: String,
+    heads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl BundleStub {
+    fn start(upstream: &str, answer: impl Fn(usize, &str) -> Vec<u8> + Send + Sync + 'static) -> BundleStub {
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&heads);
+        let proxy = InterceptingProxy::start_seeing(upstream, move |path, head| {
+            path.ends_with("/bundles/latest").then(|| {
+                let head = head.to_ascii_lowercase();
+                let index = {
+                    let mut heads = recorded.lock().unwrap();
+                    heads.push(head.clone());
+                    heads.len() - 1
+                };
+
+                answer(index, &head)
+            })
+        });
+
+        BundleStub { url: proxy.url, heads }
+    }
+
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
+    }
+}
+
+/// A `200` for `bundle` under `tag`, declaring its whole length but sending only its first `sent`
+/// bytes before the connection closes.
+fn bundle_answer(tag: &str, bundle: &[u8], sent: usize) -> Vec<u8> {
+    let mut answer = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+        bundle.len(), tag
+    ).into_bytes();
+    answer.extend_from_slice(&bundle[..sent]);
+    answer
+}
+
+/// The `206` that continues `bundle` from `start` under `tag`.
+fn rest_of_bundle_answer(tag: &str, bundle: &[u8], start: usize) -> Vec<u8> {
+    let mut answer = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nETag: {}\r\n\
+        Connection: close\r\n\r\n",
+        bundle.len() - start, start, bundle.len() - 1, bundle.len(), tag
+    ).into_bytes();
+    answer.extend_from_slice(&bundle[start..]);
+    answer
+}
+
+/// The value of `name` in a lowercased request head.
+fn request_header(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|line| line.strip_prefix(&format!("{}:", name)).map(|value| value.trim().to_string()))
+}
+
+/// The value of `key` in the franchise record of `directory`.
+fn franchise_record_value(area: &TestArea, directory: &str, key: &str) -> Option<String> {
+    area.read_file(&format!("{}/.forklift/franchise", directory)).lines()
+        .find_map(|line| line.strip_prefix(&format!("{}=", key)).map(str::to_string))
+}
+
+/// A remote warehouse whose bundle is large enough to cut after several small checkpoints, and
+/// that bundle's bytes.
+fn warehouse_with_a_bundle(area: &TestArea) -> (Server, Vec<u8>) {
+    let server = Server::start(area, None);
+
+    prepare_warehouse(area, "a", &server.url);
+    area.write_large_file("a/large.bin", 266, 96 * 1024);
+    area.write_file("a/one.txt", "one\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "bundled"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    server.rebuild_bundle(area);
+
+    let bundle = std::fs::read(area.path("server-root/.forklift/bundles/latest")).unwrap();
+    (server, bundle)
+}
+
+/// Run `franchise` into `directory`, checkpointing the bundle download every 8 KiB.
+fn franchise_checkpointing(area: &TestArea, url: &str, directory: &str) -> Output {
+    forklift_command()
+        .args(["--json", "franchise", url, directory])
+        .current_dir(area.path("."))
+        .env("FORKLIFT_GLOBAL_CONFIG", area.path("area-global.toml"))
+        .env("FORKLIFT_KEYS_DIR", area.path("shared-keys"))
+        .env("FORKLIFT_BUNDLE_CHECKPOINT_BYTES", "8192")
+        .output()
+        .unwrap()
+}
+
+/// A bundle download cut off part-way is kept, synced and recorded, and the next attempt asks for
+/// only the rest under the same tag and imports the whole.
+///
+/// Reverts: `fail()` writing the record without the download's last checkpoint → the record lags
+/// the file → red; `prepare_resume` dropping the download → a plain request → red; a plain request
+/// on resume → no `Range` → red.
+#[test]
+fn a_cut_off_bundle_download_is_resumed_for_the_rest_only() {
+    let area = TestArea::new("bundle-resume");
+    let (server, bundle) = warehouse_with_a_bundle(&area);
+    let cut = bundle.len() / 2 + 17;
+    let served = bundle.clone();
+    let stub = BundleStub::start(&server.url, move |index, _| match index {
+        0 => bundle_answer("\"t1\"", &served, cut),
+        _ => rest_of_bundle_answer("\"t1\"", &served, cut),
+    });
+
+    let failed = franchise_checkpointing(&area, &stub.url, "b");
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    assert_eq!(franchise_record_value(&area, "b", "bundle").as_deref(), Some("partial"));
+    assert_eq!(franchise_record_value(&area, "b", "bundle.etag").as_deref(), Some("\"t1\""));
+    assert_eq!(franchise_record_value(&area, "b", "bundle.total"), Some(bundle.len().to_string()));
+    assert_eq!(franchise_record_value(&area, "b", "bundle.length"), Some(cut.to_string()));
+    assert_eq!(std::fs::read(area.path("b/.forklift/bundles/partial")).unwrap(), &bundle[..cut]);
+
+    let resumed = franchise_checkpointing(&area, &stub.url, "b");
+    assert_success(&resumed);
+    assert!(json_of(&resumed)["data"].get("bundle_objects").is_some(), "{}", stdout(&resumed));
+    assert_eq!(area.read_file("b/one.txt"), "one\n");
+    assert!(area.path("b/.forklift/bundles/latest").is_file());
+    assert!(!area.path("b/.forklift/bundles/partial").exists());
+
+    let heads = stub.heads();
+    assert_eq!(heads.len(), 2);
+    assert_eq!(request_header(&heads[0], "range"), None);
+    assert_eq!(request_header(&heads[1], "range"), Some(format!("bytes={}-", cut)));
+    assert_eq!(request_header(&heads[1], "if-range").as_deref(), Some("\"t1\""));
+}
+
+/// A resumed download that does not reassemble the bundle — its rest from another build under the
+/// same tag, or its kept start damaged — is downloaded once more in full within the same attempt,
+/// and nothing of it is imported first.
+///
+/// Reverts: no restart → the attempt fails → red; restart only on the digest error → the damaged
+/// header fails the attempt → red.
+#[test]
+fn a_resumed_bundle_that_does_not_reassemble_is_downloaded_again_in_full() {
+    let area = TestArea::new("bundle-resume-spliced");
+    let (server, bundle) = warehouse_with_a_bundle(&area);
+    let cut = bundle.len() / 2;
+
+    for (name, damage_rest) in [("spliced", true), ("zeroed", false)] {
+        let served = bundle.clone();
+        let mut other_build = bundle.clone();
+        other_build[cut + 5] ^= 0xFF;
+        let stub = BundleStub::start(&server.url, move |index, _| match index {
+            0 => bundle_answer("\"t1\"", &served, cut),
+            1 if damage_rest => rest_of_bundle_answer("\"t1\"", &other_build, cut),
+            1 => rest_of_bundle_answer("\"t1\"", &served, cut),
+            _ => bundle_answer("\"t1\"", &served, served.len()),
+        });
+
+        assert!(!franchise_checkpointing(&area, &stub.url, name).status.success());
+
+        if !damage_rest {
+            let partial = area.path(&format!("{}/.forklift/bundles/partial", name));
+            let mut kept = std::fs::read(&partial).unwrap();
+            kept[..64].fill(0);
+            std::fs::write(&partial, kept).unwrap();
+        }
+
+        let resumed = franchise_checkpointing(&area, &stub.url, name);
+        assert_success(&resumed);
+        assert!(json_of(&resumed)["data"].get("bundle_objects").is_some(), "{}: {}", name, stdout(&resumed));
+
+        let heads = stub.heads();
+        assert_eq!(heads.len(), 3, "{}", name);
+        assert_eq!(request_header(&heads[1], "range"), Some(format!("bytes={}-", cut)), "{}", name);
+        assert_eq!(request_header(&heads[2], "range"), None, "{}: downloaded once more in full", name);
+    }
+}
+
+/// A bundle downloaded in one piece that fails its digest fails the attempt and keeps nothing: it
+/// was served whole, so downloading it again would only repeat the failure.
+///
+/// Revert: restart on every failure → the attempt downloads it again → red.
+#[test]
+fn a_bundle_failing_its_digest_in_one_piece_fails_the_attempt_and_keeps_nothing() {
+    let area = TestArea::new("bundle-one-piece-digest");
+    let (server, mut bundle) = warehouse_with_a_bundle(&area);
+    let middle = bundle.len() / 2;
+    bundle[middle] ^= 0xFF;
+    let stub = BundleStub::start(&server.url, move |_, _| bundle_answer("\"t1\"", &bundle, bundle.len()));
+
+    let failed = franchise_checkpointing(&area, &stub.url, "b");
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    assert_eq!(stub.heads().len(), 1);
+    assert_eq!(franchise_record_value(&area, "b", "bundle").as_deref(), Some("none"));
+    assert!(!area.path("b/.forklift/bundles/partial").exists());
+    assert!(!area.path("b/.forklift/bundles/latest").exists());
+}
+
+/// A complete bundle whose digest holds but whose contents do not import fails the attempt and
+/// keeps nothing, whether it came in one piece, was already whole at the attempt's start, or was
+/// completed by a `206`; once the head serves a good bundle, the next attempt downloads it afresh.
+///
+/// Revert: leave the record at partial → the next attempt resumes the bad file → red.
+#[test]
+fn a_digest_valid_bundle_that_fails_import_keeps_nothing() {
+    let area = TestArea::new("bundle-fails-import");
+    let (server, good) = warehouse_with_a_bundle(&area);
+
+    // The same bundle with a body byte changed and its digest sealed over the change.
+    let digested = good.len() - 32;
+    let mut bad = good[..digested].to_vec();
+    bad[digested / 2] ^= 0xFF;
+    let digest = blake3::hash(&bad);
+    bad.extend_from_slice(digest.as_bytes());
+    let cut = bad.len() / 2;
+
+    for (name, kept) in [("one-piece", None), ("kept-whole", Some(bad.len())), ("completed", Some(cut))] {
+        let (served_bad, served_good) = (bad.clone(), good.clone());
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt = std::sync::Arc::clone(&attempts);
+        let stub = BundleStub::start(&server.url, move |_, head| {
+            match (attempt.load(std::sync::atomic::Ordering::SeqCst), request_header(head, "range")) {
+                (0, None) if kept.is_some() => bundle_answer("\"t1\"", &served_bad, cut),
+                (0, None) => bundle_answer("\"t1\"", &served_bad, served_bad.len()),
+                (0, Some(_)) => rest_of_bundle_answer("\"t1\"", &served_bad, cut),
+                _ => bundle_answer("\"t2\"", &served_good, served_good.len()),
+            }
+        });
+
+        if kept.is_some() {
+            assert!(!franchise_checkpointing(&area, &stub.url, name).status.success(), "{}", name);
+        }
+
+        if kept == Some(bad.len()) {
+            // Whole but not yet imported, as a crash between the last byte and the import leaves it.
+            std::fs::write(area.path(&format!("{}/.forklift/bundles/partial", name)), &bad).unwrap();
+            let record = area.read_file(&format!("{}/.forklift/franchise", name))
+                .replace(&format!("bundle.length={}", cut), &format!("bundle.length={}", bad.len()));
+            area.write_file(&format!("{}/.forklift/franchise", name), &record);
+        }
+
+        let failed = franchise_checkpointing(&area, &stub.url, name);
+        assert!(!failed.status.success(), "{}: {}", name, stdout(&failed));
+        assert_eq!(franchise_record_value(&area, name, "bundle").as_deref(), Some("none"), "{}", name);
+        assert!(stdout(&failed).contains("is corrupt"), "{}: the import failed, not the envelope: {}", name, stdout(&failed));
+        assert_eq!(stub.heads().len(), if name == "completed" { 2 } else { 1 }, "{}: a whole kept file needs no request", name);
+        assert!(!area.path(&format!("{}/.forklift/bundles/partial", name)).exists(), "{}", name);
+
+        attempts.store(1, std::sync::atomic::Ordering::SeqCst);
+        let heads_before = stub.heads().len();
+        let finished = franchise_checkpointing(&area, &stub.url, name);
+        assert_success(&finished);
+        assert!(json_of(&finished)["data"].get("bundle_objects").is_some(), "{}: {}", name, stdout(&finished));
+        assert_eq!(request_header(&stub.heads()[heads_before], "range"), None, "{}: requested afresh", name);
+    }
+}
+
+/// A head that no longer has the bundle an earlier attempt kept part of drops that download, and
+/// the franchise completes through its verified walk.
+///
+/// Revert: skip the bundle phase on a `404` without clearing → the partial and its record stay → red.
+#[test]
+fn a_kept_bundle_download_the_head_no_longer_has_is_dropped() {
+    let area = TestArea::new("bundle-resume-gone");
+    let (server, bundle) = warehouse_with_a_bundle(&area);
+    let cut = bundle.len() / 2;
+    let stub = BundleStub::start(&server.url, move |index, _| match index {
+        0 => bundle_answer("\"t1\"", &bundle, cut),
+        _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    });
+
+    assert!(!franchise_checkpointing(&area, &stub.url, "b").status.success());
+    assert!(area.path("b/.forklift/bundles/partial").is_file());
+
+    let finished = franchise_checkpointing(&area, &stub.url, "b");
+    assert_success(&finished);
+    assert!(json_of(&finished)["data"].get("bundle_objects").is_none(), "{}", stdout(&finished));
+    assert_eq!(area.read_file("b/one.txt"), "one\n");
+    assert!(!area.path("b/.forklift/bundles/partial").exists());
     assert!(!area.path("b/.forklift/bundles/latest").exists());
 }
 

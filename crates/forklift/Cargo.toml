@@ -33,7 +33,8 @@ libc = { workspace = true }
 docgen = ["dep:schemars", "forklift-core/docgen"]
 
 [dev-dependencies]
-# The commit-graph tests check a shard's trailing checksum from the outside.
+# The commit-graph tests check a shard's trailing checksum from the outside, and the bundle
+# tests seal a digest over a damaged bundle.
 blake3 = { workspace = true }
 # The remote tests' mock hook endpoint verifies the signed hook requests with the
 # same MAC helper the server signs them with.
