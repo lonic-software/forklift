@@ -1,5 +1,6 @@
 use clap::CommandFactory;
 use crate::cli::Cli;
+use crate::color;
 use crate::output::{self, ErrorCode, ForkliftError};
 
 /// Handle the help command: print the command list, or the detailed help of one command
@@ -15,7 +16,10 @@ use crate::output::{self, ErrorCode, ForkliftError};
 /// * `Ok(())`      - If the help was printed.
 /// * `Err(ForkliftError)` - A `usage` failure, if no command with the given name exists.
 pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
-    let mut command = Cli::command();
+    // Each subcommand is cloned out of an unbuilt parent, which has not yet propagated its
+    // settings down, so every level takes `--color` itself.
+    let choice = color::chosen().for_clap();
+    let mut command = Cli::command().color(choice);
     let mut bin_name = command.get_name().to_string();
 
     for name in path {
@@ -36,7 +40,7 @@ pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
         // A standalone subcommand does not know its parent chain; rebuilding the binary
         // name keeps the usage line correct (e.g. "forklift office admit ...").
         bin_name = format!("{} {}", bin_name, command.get_name());
-        command = command.bin_name(bin_name.clone());
+        command = command.bin_name(bin_name.clone()).color(choice);
     }
 
     if output::is_json() {

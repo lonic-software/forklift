@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 /// When to colour human output (`--color`). The variants' doc comments are help text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ColorChoice {
-    /// Color on a terminal, unless NO_COLOR is set or TERM is `dumb`.
+    /// Color on a terminal, unless NO_COLOR is non-empty or TERM is unset or `dumb`.
     Auto,
     /// Always color, even into a pipe or a file.
     Always,
@@ -91,6 +91,8 @@ impl Style {
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 
+static CHOSEN: OnceLock<ColorChoice> = OnceLock::new();
+
 /// Decide, once for the process, whether human output is coloured. Called from `main` before the
 /// pager is set up; a second call is ignored. Until it runs, nothing is coloured.
 pub fn init(choice: ColorChoice) {
@@ -98,6 +100,13 @@ pub fn init(choice: ColorChoice) {
 
     let enabled = enabled_from(choice, std::io::stdout().is_terminal(), cfg!(windows), |name| std::env::var_os(name));
     let _ = ENABLED.set(enabled);
+    let _ = CHOSEN.set(choice);
+}
+
+/// The `--color` value [`init`] was given (`auto` before it runs), for help that clap renders
+/// after parsing, as `forklift help` does.
+pub fn chosen() -> ColorChoice {
+    CHOSEN.get().copied().unwrap_or(ColorChoice::Auto)
 }
 
 /// [`enabled_when`], reading `NO_COLOR` and `TERM` through `var`.
@@ -251,7 +260,12 @@ mod tests {
     /// module is a `mod tests {` line under a `#[cfg(...test...)]` one, through the next line that
     /// is a lone `}` (house style keeps its body indented).
     fn escapes_outside_tests(source: &str) -> Vec<usize> {
-        const SPELLINGS: [&str; 8] = ["\\x1b", "\\u{1b}", "\\u{001b}", "\\033", "\\x9b", "\\u{9b}", "0x1b", "\u{1b}"];
+        const SPELLINGS: [&str; 8] = ["\\x1b", "\\033", "\\x9b", "0x1b", "0o33", "27u8", "27_u8", "\u{1b}"];
+        // `\u{1b}` or `\u{9b}`, padded with any number of zeros.
+        let unicode = |line: &str| line.match_indices("\\u{").any(|(at, _)| {
+            let digits = line[at + 3..].trim_start_matches('0');
+            digits.starts_with("1b}") || digits.starts_with("9b}")
+        });
 
         let lines: Vec<&str> = source.lines().collect();
         let mut in_tests = false;
@@ -264,8 +278,8 @@ mod tests {
                 in_tests = *line != "}";
             } else {
                 let line = line.to_ascii_lowercase();
-                let spelt = SPELLINGS.iter().any(|spelling| line.contains(spelling))
-                    || line.contains("27 as char") || line.contains("27u8");
+                let spelt = SPELLINGS.iter().any(|spelling| line.contains(spelling)) || unicode(&line)
+                    || line.contains("27 as char") || line.contains("char::from(27");
                 if spelt {
                     found.push(at + 1);
                 }
@@ -306,9 +320,11 @@ mod tests {
         assert_eq!(escapes_outside_tests(gated), Vec::<usize>::new());
         assert_eq!(escapes_outside_tests("\"\\033[0m\"\n#[cfg(test)]\nmod test_support;\n\"\\x1B\""), vec![1, 4]);
 
-        let spellings = ["\\u{001B}[1m", "\\x9b1m", "\\u{9B}", "27 as char", "27u8", "\u{1b}[1m"];
+        let spellings = ["\\u{1b}[1m", "\\u{001B}[1m", "\\u{00001b}", "\\x9b1m", "\\u{9B}", "\\u{009b}31m",
+                         "27 as char", "char::from(27)", "27u8", "27_u8", "0o33", "\u{1b}[1m"];
         for spelling in spellings {
             assert_eq!(escapes_outside_tests(&format!("let x = \"{}\";", spelling)), vec![1], "{:?}", spelling);
         }
+        assert_eq!(escapes_outside_tests("let x = \"\\u{2b}\\u{10b}\";"), Vec::<usize>::new());
     }
 }

@@ -768,7 +768,9 @@ Like paging, color is for a terminal. By default (`--color auto`), `diff`, `hist
 `query`, `blame` and `haul show` color their output only when stdout is a terminal, the
 `NO_COLOR` environment variable is unset or empty, and `TERM` is set and not `dumb` (on
 Windows, an unset `TERM` is fine). Piped into a file or another program, the output is plain
-text. Paged output keeps its color, and help and usage errors follow `--color` too.
+text. Paged output keeps its color, and help and usage errors follow `--color` too. Without
+the flag, help and usage errors also read `CLICOLOR_FORCE` and `CLICOLOR=0`, which the other
+output ignores.
 
 - `--color always` colors even into a pipe or a file (for `less -R`, say), whatever
   `NO_COLOR` and `TERM` say.

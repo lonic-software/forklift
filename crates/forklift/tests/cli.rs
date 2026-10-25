@@ -3887,7 +3887,7 @@ fn piped_output_is_plain_unless_colour_is_forced() {
     assert!(forced.contains("\x1b[31m") && forced.contains("\x1b[32m"), "{:?}", forced);
 }
 
-/// clap's own usage errors follow `--color` too, and the flag's value is never read as the
+/// clap's own help and usage errors follow `--color` too, `forklift help` included, and the flag's value is never read as the
 /// command a failed parse names.
 #[test]
 fn usage_errors_follow_color_and_its_value_is_not_the_command() {
@@ -3900,6 +3900,13 @@ fn usage_errors_follow_color_and_its_value_is_not_the_command() {
     }
     let forced = warehouse.run(&["--color", "always", "diff", "--bogus"]);
     assert!(stderr(&forced).contains("\x1b["), "{:?}", stderr(&forced));
+
+    for args in [&["help"][..], &["help", "diff"], &["help", "office", "admit"], &["diff", "--help"]] {
+        let plain = stdout(&warehouse.run(args));
+        assert!(plain.contains("Usage") && !plain.contains('\x1b'), "{:?}: {:?}", args, plain);
+        let forced = stdout(&warehouse.run(&[&["--color", "always"][..], args].concat()));
+        assert!(forced.contains("\x1b["), "{:?}: {:?}", args, forced);
+    }
 
     for args in [&["--color", "never", "diff", "--bogus", "--json"][..], &["--color=never", "diff", "--bogus", "--json"]] {
         let failed = json(&warehouse.run(args));
