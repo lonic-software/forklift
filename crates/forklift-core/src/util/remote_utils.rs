@@ -562,18 +562,19 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// switched off for one specific request — so a call carries one exactly when the client its
 /// posture selects was built with one. [`clients::Clients`]'s field docs are the enumeration that
 /// stays current; what matters here is that the client `update_ref` rides
-/// ([`Posture::UnboundedNoRedirect`]'s, shared with the watchdog-guarded uploads) carries none, and must not be given one. **`update_ref` must never move to [`Posture::BoundedReads`]** —
-/// nor may the client it already rides acquire a `read_timeout`, which is the same hazard by a
-/// shorter route, and the cheaper-looking one now that a client combining no-auto-redirect *with* a
-/// silence budget exists to copy from: `update_ref`'s server side legitimately runs a
-/// parcel-closure audit walk — scoped by the history segment being pushed, which on a first lift
-/// into an empty pallet is the whole history — before its first response byte; that can take
-/// minutes with *no* bytes moving at all, which this constant would (correctly) call silence if it
-/// applied there. This is not an accident of wiring — FORK-94 found `update_ref`'s pre-first-byte
-/// cost is a *derived* quantity (an audit walk), unlike `missing_objects`/`upload_targets`, whose
-/// priced quantity is the request body's own enumerated content; giving it a flat silence budget
-/// before that walk-equivalence question is settled would be exactly the kind of guess this
-/// module's bounded clients exist to avoid.
+/// ([`Posture::UnboundedNoRedirect`]'s, shared with the watchdog-guarded uploads) carries none, and
+/// must not be given one. **`update_ref` must never move to [`Posture::BoundedReads`]** — nor may
+/// the client it already rides acquire a `read_timeout`, which is the same hazard by a shorter
+/// route, and the cheaper-looking one now that a client combining no-auto-redirect *with* a silence
+/// budget exists to copy from: `update_ref`'s server side legitimately runs a parcel-closure audit
+/// walk — scoped by the history segment being pushed, which on a first lift into an empty pallet is
+/// the whole history — before its first response byte; that can take minutes with *no* bytes moving
+/// at all, which this constant would (correctly) call silence if it applied there. This is not an
+/// accident of wiring — FORK-94 found `update_ref`'s pre-first-byte cost is a *derived* quantity
+/// (an audit walk), unlike `missing_objects`/`upload_targets`, whose priced quantity is the request
+/// body's own enumerated content; giving it a flat silence budget before that walk-equivalence
+/// question is settled would be exactly the kind of guess this module's bounded clients exist to
+/// avoid.
 ///
 /// This is client patience, not a bound derived from any specific head's measured cost: 10s of
 /// silence, on top of whichever connect budget applies, is a policy choice about how long this
@@ -871,10 +872,12 @@ const UPLOAD_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 ///
 /// **It bounds the head-wait, never the response.** Each call arms it as connect plus this floor
 /// around `send()` alone ([`Posture::HeadDeadline`], [`Posture::HeadDeadlineNoRedirect`]), and the
-/// body that follows has a budget of its own: [`FETCH_OBJECT_READ_TIMEOUT`]'s silence budget for a
-/// success body, [`RemoteClient::error_body_budget`] for a refusal's. So a refusal whose status line
-/// arrives just inside the floor still has its body read whole, and its code survives. A
-/// request-spanning deadline cut that body off and turned a typed refusal into an untyped timeout.
+/// body that follows has a budget of its own: for a success body [`FETCH_OBJECT_READ_TIMEOUT`]'s
+/// silence budget, plus, on the presence calls' size-capped answers, a total of the same head-wait
+/// figure counted from the status line; [`RemoteClient::error_body_budget`] for a refusal's. So a
+/// refusal whose status line arrives just inside the floor still has its body read whole, and its
+/// code survives. A request-spanning deadline cut that body off and turned a typed refusal into an
+/// untyped timeout.
 ///
 /// **A floor, raised by size where the call's own request says it should be.** `missing_objects`
 /// and `upload_targets` wait `max(floor, n * PRESENCE_ALLOWANCE_MS_PER_OP)` for a chunk of `n`
@@ -888,7 +891,8 @@ const UPLOAD_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 /// tail as a residual, or to redesign. Never to fold the head's cost into the arithmetic.
 ///
 /// - `forklift-aws-lambda`: the worst head-wait measured during FORK-104 was about 9.7s, inside the
-///   floor. That was a one-off measurement, not a re-runnable spike; nothing in the tree repeats it.
+///   floor. That was a one-off measurement, not a re-runnable spike; nothing in the tree
+///   repeats it.
 /// - `forklift-server`, `upload_signature`'s hook pair: the suite asserts each hook fails closed
 ///   within `[8s, 15s)` against a hook that never answers
 ///   (`tests::an_authentication_hook_that_never_answers_fails_closed_near_the_hook_timeout` and its
@@ -901,18 +905,18 @@ const UPLOAD_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 ///
 /// **Named residuals.** `upload_signature`'s handler on `forklift-server` reads the office state,
 /// which is O(roster). That server's hook-bound handlers run on its shared `spawn_blocking` pool,
-/// beside the minutes-long ref-update verification, so they can wait in its queue. And a Lambda cold
-/// start is uncalibrated here. Any of these surfaces as an uncertain-outcome error on a write that
-/// in fact succeeded. Every call this floor serves is idempotent, so a retry is the recovery. The
-/// floor is fixed rather than adaptive, so a retry against the same slow condition fails the same
-/// way.
+/// beside the minutes-long ref-update verification, so they can wait in its queue. And a Lambda
+/// cold start is uncalibrated here. Any of these surfaces as an uncertain-outcome error on a write
+/// that in fact succeeded. Every call this floor serves is idempotent, so a retry is the recovery.
+/// The floor is fixed rather than adaptive, so a retry against the same slow condition fails the
+/// same way.
 const RETRYABLE_HEAD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// **The phase-precedence pin for the retryable class.** The same ordering
 /// [`BATCH_HEAD_PATIENCE`]'s assert pins for `fetch_batch`: a head-wait timer must fire strictly
 /// before the client-level `read_timeout` on the same request, or a post-header stall and a
-/// head-wait expiry swap wordings. The scaled presence term is pinned at both wire caps for the same
-/// reason, since `presence_negotiation_budget` arms it as the head-wait.
+/// head-wait expiry swap wordings. The scaled presence term is pinned at both wire caps for the
+/// same reason, since `presence_negotiation_budget` arms it as the head-wait.
 const _: () = {
     assert!(
         RETRYABLE_HEAD_PATIENCE.as_nanos() < FETCH_OBJECT_READ_TIMEOUT.as_nanos(),
@@ -935,9 +939,8 @@ const _: () = {
 /// The conservative inline-verification throughput [`post_send_verify_budget`] assumes for the
 /// size-scaled part of its bound. Deliberately far below real-world `blake3` throughput (typically
 /// hundreds of MB/s to several GB/s single-threaded on modern hardware) to absorb a busy or loaded
-/// server without risking a false stall on a healthy one, while still keeping the bound
-/// meaningfully tighter than [`UPLOAD_SILENCE_BUDGET`]'s flat send-phase allowance for anything
-/// short of a maximum-size object.
+/// server without risking a false stall on a healthy one. At this rate a maximum-size object adds
+/// seconds, not minutes, on top of the retryable floor.
 const POST_SEND_VERIFY_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 
 /// The post-send component of an upload's watchdog budget, for an upload of `body_len` bytes:
@@ -950,10 +953,10 @@ const POST_SEND_VERIFY_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 /// retryable call makes, so the fixed part is the retryable floor. The size-scaled part is client
 /// patience for a head to check bytes this client already holds: an upload's server side has the
 /// whole body before it answers, and the one part of its work this client can size is proportional
-/// to `body_len`. That is all the scaling claims. The work a head does in this phase is **not** client-known. `forklift-server`
-/// runs its hooks there too, so a fixed base sized for dispatch overhead alone (it used to be 2s)
-/// abandoned healthy uploads behind a slow hook. The floor answers that as patience, without
-/// pricing any head's hooks.
+/// to `body_len`. That is all the scaling claims. The work a head does in this phase is **not**
+/// client-known. `forklift-server` runs its hooks there too, so a fixed base sized for dispatch
+/// overhead alone (it used to be 2s) abandoned healthy uploads behind a slow hook. The floor
+/// answers that as patience, without pricing any head's hooks.
 fn post_send_verify_budget(base: std::time::Duration, body_len: usize) -> std::time::Duration {
     base + std::time::Duration::from_secs_f64(
         body_len as f64 / POST_SEND_VERIFY_RATE_BYTES_PER_SEC as f64
@@ -962,17 +965,17 @@ fn post_send_verify_budget(base: std::time::Duration, body_len: usize) -> std::t
 
 /// The per-hash rate that [`RemoteClient::presence_negotiation_budget`] scales
 /// `missing_objects`/`upload_targets`'s head-wait by, once a chunk is large enough to lift it above
-/// [`RETRYABLE_HEAD_PATIENCE`]. Calibrated client policy: the scaling quantity (`n`, the hashes this
-/// client just sent) is the call's own, and the rate is checked against `does_object_exist`'s
+/// [`RETRYABLE_HEAD_PATIENCE`]. Calibrated client policy: the scaling quantity (`n`, the hashes
+/// this client just sent) is the call's own, and the rate is checked against `does_object_exist`'s
 /// (`file_utils.rs`) real per-hash cost, the primitive both calls' server side loops over, as an
 /// acceptance check rather than derived from it. `pub(crate)`, not `pub` — every sibling budget
 /// constant in this file ([`REMOTE_READ_TIMEOUT`], [`UPLOAD_SILENCE_BUDGET`],
 /// [`RETRYABLE_HEAD_PATIENCE`]) is module-private; this one only needs to reach `file_utils.rs`'s
 /// own FORK-92 measurement spike (`spike_fork92_presence_rate`, `cargo test --release -p
-/// forklift-core spike_fork92_presence_rate -- --ignored --nocapture`), which imports this exact constant rather
-/// than mirroring its value in a second, unlinked literal — a production change here cannot
-/// silently drift out of sync with what that spike actually checks. Same-crate reach is all that
-/// import needs, so `pub(crate)` is the right width, not a wider `pub`.
+/// forklift-core spike_fork92_presence_rate -- --ignored --nocapture`), which imports this exact
+/// constant rather than mirroring its value in a second, unlinked literal — a production change
+/// here cannot silently drift out of sync with what that spike actually checks. Same-crate reach is
+/// all that import needs, so `pub(crate)` is the right width, not a wider `pub`.
 pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 
 /// Every wall-clock budget a [`RemoteClient`] arms, carried by the instance rather than read from
@@ -1029,7 +1032,10 @@ impl Budgets {
     /// The phase-precedence pins, for budgets that are not the production ones: the compile-time
     /// asserts beside [`BATCH_HEAD_PATIENCE`], [`RETRYABLE_HEAD_PATIENCE`] and
     /// [`COMMIT_ATTEMPT_ALLOWANCE`] hold the production pairs, and this holds any other pair a test
-    /// builds, so no test runs against an ordering production can never have.
+    /// builds, so no test runs against an ordering production can never have. One pin is not
+    /// mirrored: the scaled presence term against `object_read` depends on the batch a test sends,
+    /// not on the budgets, so a test sending a batch too large for its own `object_read` trips
+    /// [`clients::check_head_deadline_payload`] at the send instead.
     #[cfg(test)]
     fn checked(self) -> Budgets {
         assert!(
@@ -1059,21 +1065,21 @@ impl Budgets {
 /// actually yields a chunk (the only signal available that the transfer is still moving — see
 /// [`UPLOAD_SILENCE_BUDGET`]'s doc), and a flag set once the stream is exhausted.
 ///
-/// That second half does **not** mean "stop bounding the wait". An earlier version of this fix
-/// did exactly that, on the theory that it matched `update_ref`'s own unbounded response wait,
-/// and the theory does not hold: `update_ref`'s wait is unbounded because its server-side work is
-/// the *pushed history segment*, unknowable in advance, while `upload_object`'s post-receive work
-/// is inline hash verification of the exact bytes just sent, bounded by a quantity — `body_len` —
-/// the client already has. A remote that reads the whole body and then wedges is an ordinary
-/// failure, and with this phase unbounded it hung exactly like the silent remote
-/// [`REMOTE_READ_TIMEOUT`]'s doc describes, on this exact path. What exhaustion changes is *which*
-/// budget [`clients::Clients::send_with_watchdog`] checks `silent_for()` against, not whether it
-/// checks at all — see that method's doc for the two-budget shape and why phase 2's budget still
-/// has to be generous: `is_exhausted()` means every chunk was handed to hyper, not that every byte
-/// reached the peer, so the post-exhaustion silence can legitimately include time the OS kernel
-/// (or hyper's own internal buffer) is still spending flushing an in-flight tail. A 64 MiB object
-/// on a 2 Mbit/s uplink can have several seconds of genuinely-still-moving tail queued the instant
-/// this flag flips.
+/// That second half does **not** mean "stop bounding the wait". An earlier version of this fix did
+/// exactly that, on the theory that it matched `update_ref`'s own unbounded response wait, and the
+/// theory does not hold: `update_ref`'s wait is unbounded because its server-side work is the
+/// *pushed history segment*, unknowable in advance, while `upload_object` is a small, idempotent
+/// write whose answer this client can wait for with ordinary retryable patience — the floor, plus a
+/// size-scaled part for the bytes just sent (see [`post_send_verify_budget`]). A remote that reads
+/// the whole body and then wedges is an ordinary failure, and with this phase unbounded it hung
+/// exactly like the silent remote [`REMOTE_READ_TIMEOUT`]'s doc describes, on this exact path. What
+/// exhaustion changes is *which* budget [`clients::Clients::send_with_watchdog`] checks
+/// `silent_for()` against, not whether it checks at all — see that method's doc for the two-budget
+/// shape and why phase 2's budget still has to be generous: `is_exhausted()` means every chunk was
+/// handed to hyper, not that every byte reached the peer, so the post-exhaustion silence can
+/// legitimately include time the OS kernel (or hyper's own internal buffer) is still spending
+/// flushing an in-flight tail. A 64 MiB object on a 2 Mbit/s uplink can have several seconds of
+/// genuinely-still-moving tail queued the instant this flag flips.
 struct UploadProgress {
     last_chunk: std::sync::Mutex<std::time::Instant>,
     exhausted: std::sync::atomic::AtomicBool,
@@ -1216,16 +1222,15 @@ fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwes
 /// anything else a caller could send by hand: [`Clients::send_on`], which takes a [`Posture`] — a
 /// required argument, not a default — plus a [`RequestDestination`], a method and a [`SendBody`],
 /// applies that posture's own payload (currently [`Posture::TotalDeadline`]'s total deadline, or
-/// [`Posture::HeadDeadline`]'s or [`Posture::HeadDeadlineNoRedirect`]'s head-wait budget) on whichever client `pick` chose, sends
-/// the request itself, and returns a [`SendOutcome`]; and
+/// [`Posture::HeadDeadline`]'s or [`Posture::HeadDeadlineNoRedirect`]'s head-wait budget) on
+/// whichever client `pick` chose, sends the request itself, and returns a [`SendOutcome`]; and
 /// [`Clients::send_with_watchdog`], which takes the upload's bytes and the pieces of a request,
 /// builds the watchdog-guarded body and the request itself, and returns a [`WatchdogOutcome`].
-/// Neither function can be skipped in favor of
-/// reaching `pick` directly, because nothing outside `mod clients` can name `pick` at all — that is
-/// a privacy error, not a convention. A new call site cannot reach any client, nor send a request
-/// of any kind, without the compiler forcing it through one of these two, payload-
-/// applying paths; there is no ambient "just use the default one" path left to fall into, and no
-/// lower-level escape hatch left standing beside them either.
+/// Neither function can be skipped in favor of reaching `pick` directly, because nothing outside
+/// `mod clients` can name `pick` at all — that is a privacy error, not a convention. A new call
+/// site cannot reach any client, nor send a request of any kind, without the compiler forcing it
+/// through one of these two, payload-applying paths; there is no ambient "just use the default
+/// one" path left to fall into, and no lower-level escape hatch left standing beside them either.
 ///
 /// **Why both of them own `send()` rather than returning a builder.** A `reqwest::RequestBuilder`
 /// handed back to a call site is a request this module has already stopped governing: the only
@@ -1416,10 +1421,10 @@ mod clients {
         },
         /// [`Self::HeadDeadlineNoRedirect`]'s two phases on the client that auto-follows a redirect
         /// and carries the same [`super::FETCH_OBJECT_READ_TIMEOUT`] silence budget
-        /// ([`Self::BoundedObjectReads`]'s): `head` bounds connect, request transmission and the wait
-        /// for the header section, and the silence budget bounds the body after it. Everything that
-        /// variant's doc says about the order of the two, the wording each expiry earns, and what
-        /// the pair does not promise holds here unchanged.
+        /// ([`Self::BoundedObjectReads`]'s): `head` bounds connect, request transmission and the
+        /// wait for the header section, and the silence budget bounds the body after it. Everything
+        /// that variant's doc says about the order of the two, the wording each expiry earns, and
+        /// what the pair does not promise holds here unchanged.
         ///
         /// For the retryable reads, `missing_objects` and `upload_targets`: read-only `POST`s that
         /// rode an auto-following client before this variant existed, and whose redirect, replayed
@@ -1850,9 +1855,9 @@ mod clients {
         ///   the connect allowance is added in; past that it resets on every chunk hyper pulls
         ///   (see [`super::UPLOAD_SILENCE_BUDGET`]).
         /// - `phase2_budget` (`phase1_budget + post_send_verify_budget(body_len)`) once every chunk
-        ///   has been handed off — the wait for the response. This phase is bounded at all because
-        ///   the remote's remaining work is verifying `body_len` bytes the client already knows
-        ///   the size of (see [`super::post_send_verify_budget`]). It folds the whole send-phase
+        ///   has been handed off — the wait for the response, which is the retryable class's
+        ///   head-wait: the floor plus a size-scaled part for the bytes just sent (see
+        ///   [`super::post_send_verify_budget`]). It folds the whole send-phase
         ///   allowance back in rather than using the verify budget alone, as a flush-time margin:
         ///   exhaustion means hyper has every chunk, not that the peer has every byte (see
         ///   [`super::UploadChunks`]), so the silence after it can include an in-flight tail still
@@ -1926,8 +1931,8 @@ mod clients {
     /// `RemoteClient::resolve_budget`, builds it as `connect_timeout + a positive addend` — never
     /// merely a post-connect budget on its own — so the connector's own timeout always fires first
     /// on a connect-phase stall, classifying it as `TransportFailure::ConnectTimedOut` rather than
-    /// `ReadTimedOut`. It satisfies this by construction, so it cannot fire against any call site this module actually has; it exists
-    /// to catch the next producer that doesn't.
+    /// `ReadTimedOut`. It satisfies this by construction, so it cannot fire against any call site
+    /// this module actually has; it exists to catch the next producer that doesn't.
     ///
     /// What a violating payload costs is the *wording*, not the figure. Were
     /// `duration <= connect_timeout`, that deadline would fire first and produce a bare `TimedOut`
@@ -1967,10 +1972,10 @@ mod clients {
 
     /// What [`clamp_head_deadline_payload`] raises a violating head-deadline payload by, above the
     /// `connect_timeout` that payload failed to clear. Deliberately small and deliberately
-    /// arbitrary: no producer in this module can reach that branch (each builds
-    /// `connect_timeout + a positive addend`), so this value is never armed against a real remote. Only its **strict positivity** is
-    /// load-bearing — that is what keeps the connector's own timeout firing first on a
-    /// connect-phase stall, and so keeps every [`SendOutcome::HeadWaitExpired`] describing a
+    /// arbitrary: no producer in this module can reach that branch (each builds `connect_timeout +
+    /// a positive addend`), so this value is never armed against a real remote. Only its **strict
+    /// positivity** is load-bearing — that is what keeps the connector's own timeout firing first
+    /// on a connect-phase stall, and so keeps every [`SendOutcome::HeadWaitExpired`] describing a
     /// connection that really was established.
     const HEAD_DEADLINE_REPAIR_ADDEND: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -1993,10 +1998,10 @@ mod clients {
     /// already arrived — when none had. Every producer satisfies both by construction: each is
     /// `connect_timeout` plus an addend a const assertion holds under
     /// [`super::FETCH_OBJECT_READ_TIMEOUT`] (see [`super::BATCH_HEAD_PATIENCE`]'s,
-    /// [`super::RETRYABLE_HEAD_PATIENCE`]'s and [`super::COMMIT_ATTEMPT_ALLOWANCE`]'s). This exists to catch the next producer, which is why
-    /// the upper fence is a `debug_assert!` and not a clamp: unlike the lower one, no repair value
-    /// is obviously right — a payload that big means the producer wanted something this posture
-    /// does not offer.
+    /// [`super::RETRYABLE_HEAD_PATIENCE`]'s and [`super::COMMIT_ATTEMPT_ALLOWANCE`]'s). This exists
+    /// to catch the next producer, which is why the upper fence is a `debug_assert!` and not a
+    /// clamp: unlike the lower one, no repair value is obviously right — a payload that big means
+    /// the producer wanted something this posture does not offer.
     ///
     /// Falsified in both directions by
     /// [`super::tests::the_head_deadline_payload_check_catches_a_violating_payload`] and
@@ -2025,8 +2030,8 @@ mod clients {
     }
 
     /// The head-deadline payload repair [`Clients::send_on`] performs — the
-    /// [`Posture::HeadDeadline`]/[`Posture::HeadDeadlineNoRedirect`] counterpart of [`check_total_deadline_payload`], and
-    /// deliberately **not** the same shape.
+    /// [`Posture::HeadDeadline`]/[`Posture::HeadDeadlineNoRedirect`] counterpart of
+    /// [`check_total_deadline_payload`], and deliberately **not** the same shape.
     ///
     /// Both guard the same producer rule — every payload is `connect_timeout + a positive addend`
     /// — but a violation costs differently. For a total deadline it costs a worse-than-intended
@@ -2739,25 +2744,26 @@ impl RemoteClient {
     /// The mutation counterpart of [`Self::describe_transport_error`], reached by five mutations
     /// (`update_ref`, `upload_object`, `put_presigned`, `upload_signature`, `put_trust`), none of
     /// which auto-follows a redirect, and by `commit_lift` for the transport failures it does not
-    /// retry ([`Self::unanswered_commit`]). Takes no `Posture` because its wording does not vary
-    /// by one: unlike the read path, a mutation's `ReadTimedOut` is always the same uncertain
-    /// shape regardless of which bound (if any) actually fired, so every one of them funnels
-    /// through the identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`] (moved
-    /// off the auto-following client by FORK-89); `upload_signature`/`put_trust` ride
+    /// retry ([`Self::unanswered_commit`]). Takes no `Posture` because its wording does not vary by
+    /// one: unlike the read path, a mutation's `ReadTimedOut` is always the same uncertain shape
+    /// regardless of which bound (if any) actually fired, so every one of them funnels through the
+    /// identical composer. `update_ref` rides [`Posture::UnboundedNoRedirect`] (moved off the
+    /// auto-following client by FORK-89); `upload_signature`/`put_trust` ride
     /// [`Posture::HeadDeadlineNoRedirect`] — bounded, on a never-auto-follow client, so their
     /// transport failures land here the same way, and their head-wait expiries reach the same
-    /// uncertainty wording through [`Self::response_from_send_mutation`]; `upload_object`/`put_presigned`
-    /// ride [`clients::Clients::send_with_watchdog`] directly, on the same never-auto-follow
-    /// client, but bypassing [`Posture`] entirely (moved by the earlier fix for the `303` redirect
-    /// hole, then off `Posture` again once a payload-free posture proved unable to guarantee the
-    /// watchdog was actually applied). `upload_object`/`put_presigned`'s
+    /// uncertainty wording through [`Self::response_from_send_mutation`];
+    /// `upload_object`/`put_presigned` ride [`clients::Clients::send_with_watchdog`] directly, on
+    /// the same never-auto-follow client, but bypassing [`Posture`] entirely (moved by the earlier
+    /// fix for the `303` redirect hole, then off `Posture` again once a payload-free posture proved
+    /// unable to guarantee the watchdog was actually applied). `upload_object`/`put_presigned`'s
     /// watchdog also produces a genuine `reqwest::Error` for an actual transport failure (as
     /// opposed to a watchdog kill, which produces no `reqwest::Error` at all — see
-    /// [`clients::WatchdogOutcome::Transport`]'s doc), so a transport failure on any of them
-    /// still lands here for anything `classify` can actually see (a connect failure, or a
-    /// `reqwest::Error`-bearing timeout on the response side — a fired client-level
-    /// `read_timeout` is exactly such a `reqwest::Error`, `is_timeout()` true, same as any other). Same [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`]
-    /// wording differs from the read path's: on these clients that case can only be a timeout on an
+    /// [`clients::WatchdogOutcome::Transport`]'s doc), so a transport failure on any of them still
+    /// lands here for anything `classify` can actually see (a connect failure, or a
+    /// `reqwest::Error`-bearing timeout on the response side — a fired client-level `read_timeout`
+    /// is exactly such a `reqwest::Error`, `is_timeout()` true, same as any other). Same
+    /// [`classify`] dispatch, but the [`TransportFailure::ReadTimedOut`] wording differs from the
+    /// read path's: on these clients that case can only be a timeout on an
     /// *established* connection — after the request bytes were already sent — so the settled
     /// contract requires the uncertainty be carried in the message rather than asserted away: it
     /// may have completed on the remote, and the caller must decide whether to check before
@@ -2952,10 +2958,10 @@ impl RemoteClient {
     /// Compose a loud, specific error for a `3xx` response to a mutation. Every call site that
     /// reaches this (`upload_object`, `put_presigned`, `update_ref`, `upload_signature`,
     /// `put_trust` — FORK-89 widened this from the original two) goes out on the never-auto-follow
-    /// client ([`Posture::UnboundedNoRedirect`] for `update_ref`, [`Posture::HeadDeadlineNoRedirect`]
-    /// for `upload_signature`/`put_trust`, or — for `upload_object`/`put_presigned` —
-    /// directly via [`clients::Clients::send_with_watchdog`]), which never
-    /// auto-follows *any* redirect status — so this is a local, unconditional invariant
+    /// client ([`Posture::UnboundedNoRedirect`] for `update_ref`,
+    /// [`Posture::HeadDeadlineNoRedirect`] for `upload_signature`/`put_trust`, or — for
+    /// `upload_object`/`put_presigned` — directly via [`clients::Clients::send_with_watchdog`]),
+    /// which never auto-follows *any* redirect status — so this is a local, unconditional invariant
     /// of *this client*, not a claim about how any particular `3xx` happens to behave under a
     /// dependency's redirect matrix. Do not turn it back into one: an earlier version of this doc
     /// asserted exactly that (which status codes `tower-http`'s auto-following policy skips for a
@@ -3044,6 +3050,31 @@ impl RemoteClient {
         })
     }
 
+    /// [`Self::read_json`] under a total `budget` counted from the status line, for a body whose
+    /// size the request bounds. The client's silence budget alone resets on every byte, so a
+    /// remote trickling a capped body could hold the call for as long as it likes; this is the
+    /// bound on how long the whole answer may take once its headers are in.
+    async fn read_json_within<T: serde::de::DeserializeOwned>(&self,
+                                                              response: reqwest::Response,
+                                                              cap: u64,
+                                                              action: &str,
+                                                              posture: Posture,
+                                                              what: &str,
+                                                              budget: std::time::Duration) -> Result<T, String> {
+        tokio::time::timeout(budget, self.read_json(response, cap, action, posture, what)).await
+            .unwrap_or_else(|_| Err(Self::body_deadline_message(action, budget)))
+    }
+
+    /// The message for a body that [`Self::read_json_within`]'s budget cut off: the headers came,
+    /// the whole answer did not. No "at least": the budget is a total, so the figure is exact.
+    fn body_deadline_message(action: &str, budget: std::time::Duration) -> String {
+        format!(
+            "Timed out while {}: the remote sent response headers but did not finish its answer \
+            within {:?} of them.",
+            action, budget
+        )
+    }
+
     /// Fetch the warehouse handshake and check the protocol version.
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
         let posture = Posture::BoundedReads;
@@ -3109,12 +3140,15 @@ impl RemoteClient {
     /// const block under [`RETRYABLE_HEAD_PATIENCE`] pins that both wire caps' scaled terms stay
     /// under it. `connect + 30s` below 6,000 hashes, `connect + 50s` at the 10,000 cap.
     ///
-    /// It bounds the status line only. The presence answer's body is then bounded by the client's
-    /// silence budget (`connect + object_read` per read), and a refusal's body by
-    /// [`Self::error_body_budget`] — so a refusal arriving late in the head-wait keeps its code.
+    /// Armed twice, each time from its own start: once on the wait for the status line, and once
+    /// more on the presence answer's body, counted from the status line
+    /// ([`Self::read_json_within`]). That body is capped by `n`, so the same figure is an honest
+    /// total for it, and the client's resetting silence budget cannot bound a trickle on its
+    /// own. A refusal's body is read under [`Self::error_body_budget`] instead — so a refusal
+    /// arriving late in the head-wait keeps its code.
     fn presence_negotiation_budget(&self, n: usize) -> std::time::Duration {
         let scaled = std::time::Duration::from_secs_f64(n as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0);
-        self.budgets.connect + self.budgets.retryable_head_patience.max(scaled)
+        self.retryable_head_budget().max(self.budgets.connect + scaled)
     }
 
     /// Ask which of the given objects the remote lacks (batched).
@@ -3122,12 +3156,12 @@ impl RemoteClient {
     /// Deliberately **not** on [`Posture::BoundedReads`]: the server side consults up to
     /// `MAX_MISSING_BATCH` (10,000) hashes before its first response byte, work that scales with
     /// the batch rather than being O(constant) — the settled contract puts that in the
-    /// scaled/measured-budget category, not the flat one `REMOTE_READ_TIMEOUT` is honest for.
-    /// Rides [`Posture::HeadDeadline`] instead, its head-wait sized per batch by
-    /// [`Self::presence_negotiation_budget`]. Accepted residual: a remote that takes longer than
-    /// that budget to answer — an overloaded or pathologically slow deployment — gets abandoned
-    /// rather than waited out; this call's error is already a
-    /// plain, retry-safe `Err`, so an ordinary retry is the recovery path, not a looser budget.
+    /// scaled/measured-budget category, not the flat one `REMOTE_READ_TIMEOUT` is honest for. Rides
+    /// [`Posture::HeadDeadline`] instead, its head-wait and then its answer's body each bounded per
+    /// batch by [`Self::presence_negotiation_budget`]. Accepted residual: a remote that takes
+    /// longer than that budget to answer — an overloaded or pathologically slow deployment — gets
+    /// abandoned rather than waited out; this call's error is already a plain, retry-safe `Err`, so
+    /// an ordinary retry is the recovery path, not a looser budget.
     pub async fn missing_objects(&self, hashes: &[String]) -> Result<Vec<String>, String> {
         let mut missing: Vec<String> = Vec::new();
 
@@ -3147,9 +3181,10 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the negotiation").await);
             }
 
-            let body: MissingObjectsResponse = self.read_json(
+            let body: MissingObjectsResponse = self.read_json_within(
                 response, body_utils::per_item_body_cap(batch.len(), MISSING_BODY_BYTES_PER_HASH),
                 "negotiating with the remote", posture, "negotiation response",
+                self.presence_negotiation_budget(batch.len()),
             ).await?;
 
             missing.extend(body.missing);
@@ -3317,7 +3352,7 @@ impl RemoteClient {
     /// The head-wait budget to arm for *this* client instance's [`Self::fetch_batch`] `POST` —
     /// folds this instance's own `connect_timeout` into [`BATCH_HEAD_PATIENCE`], the same shape
     /// [`Self::error_body_budget`]/[`Self::resolve_budget`]/[`Self::presence_negotiation_budget`]/
-    /// [`Self::single_write_budget`] already carry, for the identical reason: a Tor dial's 60s
+    /// [`Self::retryable_head_budget`] already carry, for the identical reason: a Tor dial's 60s
     /// connect allowance must never be undercut by a budget sized for a direct remote, or the bound
     /// expires during circuit build on every call and every retry. 50s direct, 105s over Tor.
     ///
@@ -3325,7 +3360,8 @@ impl RemoteClient {
     /// posture's *wording* depends on — see [`clients::clamp_head_deadline_payload`]: a payload at
     /// or below `connect_timeout` would let the head timer fire during connect, and
     /// [`Self::head_wait_expired_message`] would then assert an established connection that never
-    /// existed. This is the only producer of such a payload, and it satisfies the rule by
+    /// existed. Every producer of such a payload (this one, [`Self::presence_negotiation_budget`],
+    /// [`Self::retryable_head_budget`], and `commit_lift`'s attempt bound) satisfies the rule by
     /// construction; the seam clamps anyway, because "by construction" is a property of today's
     /// producers rather than of the released binary.
     ///
@@ -3770,7 +3806,8 @@ impl RemoteClient {
     /// `post_upload_targets`) walks up to `MAX_UPLOAD_TARGETS_BATCH` (1,000) hashes, checking each
     /// against on-disk object presence, before its first response byte — work that scales with the
     /// batch rather than being O(constant). Rides [`Posture::HeadDeadline`] like
-    /// `missing_objects`, its head-wait sized per batch by [`Self::presence_negotiation_budget`] —
+    /// `missing_objects`, its head-wait and body each bounded per batch by
+    /// [`Self::presence_negotiation_budget`] —
     /// same accepted residual: a remote slower than that budget gets abandoned rather than waited
     /// out, recovered by an ordinary retry rather than a looser budget.
     pub async fn upload_targets(&self,
@@ -3804,9 +3841,10 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the upload negotiation").await);
             }
 
-            let body: UploadTargetsResponse = self.read_json(
+            let body: UploadTargetsResponse = self.read_json_within(
                 response, body_utils::per_item_body_cap(batch.len(), UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
                 "negotiating upload targets", posture, "upload-targets response",
+                self.presence_negotiation_budget(batch.len()),
             ).await?;
 
             merged.present.extend(body.present);
@@ -3994,26 +4032,27 @@ impl RemoteClient {
         ).await.map(Some)
     }
 
-    /// The head-wait budget to arm for *this* client instance's call to [`Self::upload_signature`]
-    /// or [`Self::put_trust`]: this instance's own `connect_timeout` plus the retryable floor
-    /// ([`RETRYABLE_HEAD_PATIENCE`]), the same `connect + addend` shape every sibling budget
-    /// carries, so a Tor dial's 60s connect allowance is never undercut by a budget sized for a
-    /// direct remote. Its own `&self` method so a test can pin that the right instance field is
-    /// read — see `single_write_budget_reads_this_field_not_a_rival_constant`. 35s direct, 90s
-    /// over Tor.
+    /// The retryable class's head-wait for *this* client instance: its own `connect_timeout` plus
+    /// the retryable floor ([`RETRYABLE_HEAD_PATIENCE`]). [`Self::upload_signature`] and
+    /// [`Self::put_trust`] arm it as is; [`Self::presence_negotiation_budget`] raises it by batch
+    /// size, so the floor is derived in this one place. The same `connect + addend` shape every
+    /// sibling budget carries, so a Tor dial's 60s connect allowance is never undercut by a budget
+    /// sized for a direct remote. Its own `&self` method so a test can pin that the right instance
+    /// field is read — see `retryable_head_budget_reads_this_field_not_a_rival_constant`. 35s
+    /// direct, 90s over Tor.
     ///
     /// It bounds the wait for the status line only. A refusal's body is then read under
     /// [`Self::error_body_budget`], counted from the status line, so a refusal arriving late in the
     /// head-wait keeps its code — see `a_late_refusal_keeps_its_code_at_every_retryable_call`. The
-    /// total deadline these two used to ride spanned the body too, and cut such a refusal down to
-    /// its bare status reason.
-    fn single_write_budget(&self) -> std::time::Duration {
+    /// total deadline the two writes used to ride spanned the body too, and cut such a refusal down
+    /// to its bare status reason.
+    fn retryable_head_budget(&self) -> std::time::Duration {
         self.budgets.connect + self.budgets.retryable_head_patience
     }
 
     /// Upload a parcel's signature sidecar.
     ///
-    /// Rides [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::single_write_budget`] — not
+    /// Rides [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::retryable_head_budget`] — not
     /// an auto-following client: this call mutates the remote, and this client never
     /// auto-follows a redirect on a mutation — a local, unconditional invariant of *this client*,
     /// holding regardless of which status code or dependency version is in play (see
@@ -4027,7 +4066,7 @@ impl RemoteClient {
     pub async fn upload_signature(&self, parcel_hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading the signature of {}", parcel_hash);
         let outcome = self.send_on(
-            Posture::HeadDeadlineNoRedirect { head: self.single_write_budget() },
+            Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
             reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash),
             SendBody::Bytes(bytes),
         ).await;
@@ -4046,7 +4085,7 @@ impl RemoteClient {
 
     /// Establish the trust anchor on the remote (idempotent for an identical anchor).
     ///
-    /// Rides [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::single_write_budget`] — same
+    /// Rides [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::retryable_head_budget`] — same
     /// reasoning as [`Self::upload_signature`]'s doc: a mutation on this client never
     /// auto-follows any redirect, unconditionally, and before FORK-89 this call had no such
     /// guard at all. On `forklift-server` the handler does not wait for a concurrent lift's
@@ -4055,7 +4094,7 @@ impl RemoteClient {
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
         let action = "uploading the trust anchor";
         let outcome = self.send_on(
-            Posture::HeadDeadlineNoRedirect { head: self.single_write_budget() },
+            Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
             reqwest::Method::PUT, "/v1/trust",
             SendBody::json(anchor)?,
         ).await;
@@ -10389,8 +10428,8 @@ mod tests {
             client.batch_head_budget(), FAST.connect + FAST.batch_head_patience, "batch_head_budget"
         );
         assert_eq!(
-            client.single_write_budget(), FAST.connect + FAST.retryable_head_patience,
-            "single_write_budget"
+            client.retryable_head_budget(), FAST.connect + FAST.retryable_head_patience,
+            "retryable_head_budget"
         );
         assert_eq!(
             client.presence_negotiation_budget(0), FAST.connect + FAST.retryable_head_patience,
@@ -11306,13 +11345,13 @@ mod tests {
     // `resolve_gives_up_on_a_remote_that_never_stops_trickling` above for that exact failure mode,
     // on a different call) — and it no longer describes the module at all: the client
     // `Posture::HeadDeadlineNoRedirect` selects combines exactly those two axes. Both now ride
-    // it, their head-wait sized by `RemoteClient::single_write_budget` — the client that never
+    // it, their head-wait sized by `RemoteClient::retryable_head_budget` — the client that never
     // auto-follows a redirect, so the FORK-89 guard neither call ever loses stays in force, and a
     // head-wait that bounds the status line alone, so a late refusal keeps its typed body.
     // -----------------------------------------------------------------------------------
 
     /// `upload_signature` against a remote that connects and then never writes anything must
-    /// fail with a timeout close to its own `single_write_budget`, not hang forever (the rival
+    /// fail with a timeout close to its own `retryable_head_budget`, not hang forever (the rival
     /// this excludes: staying on the old unbounded posture, which this outer ceiling would catch
     /// as a hang), not close to a connect-blind flat budget that drops `self.budgets.connect`
     /// (the rival the lower bound excludes), and not close to a budget built from the production
@@ -11357,13 +11396,13 @@ mod tests {
             "elapsed {:?} is under {:?} (the midpoint between the connect-blind rival budget \
             {:?} and the true budget {:?}) — upload_signature returned close to a call site that \
             ignores self.budgets.connect, dropping it entirely, rather than folding it in via \
-            single_write_budget()",
+            retryable_head_budget()",
             elapsed, lower_bound, rival_flat_budget, effective_budget
         );
         assert!(
             elapsed < upper_bound,
             "elapsed {:?} is past {:?} (the midpoint between the true budget {:?} and the {:?} a \
-            hardcoded REMOTE_CONNECT_TIMEOUT would arm) — single_write_budget() is reading a \
+            hardcoded REMOTE_CONNECT_TIMEOUT would arm) — retryable_head_budget() is reading a \
             production constant rather than this instance's budgets",
             elapsed, upper_bound, effective_budget, rival_production_budget
         );
@@ -11412,13 +11451,13 @@ mod tests {
             "elapsed {:?} is under {:?} (the midpoint between the connect-blind rival budget \
             {:?} and the true budget {:?}) — put_trust returned close to a call site that \
             ignores self.budgets.connect, dropping it entirely, rather than folding it in via \
-            single_write_budget()",
+            retryable_head_budget()",
             elapsed, lower_bound, rival_flat_budget, effective_budget
         );
         assert!(
             elapsed < upper_bound,
             "elapsed {:?} is past {:?} (the midpoint between the true budget {:?} and the {:?} a \
-            hardcoded REMOTE_CONNECT_TIMEOUT would arm) — single_write_budget() is reading a \
+            hardcoded REMOTE_CONNECT_TIMEOUT would arm) — retryable_head_budget() is reading a \
             production constant rather than this instance's budgets",
             elapsed, upper_bound, effective_budget, rival_production_budget
         );
@@ -12423,7 +12462,7 @@ mod tests {
     /// as complete has cost a fresh defect on every attempt this module's history has made.
     ///
     /// The expected value is a literal for the reason
-    /// [`single_write_budget_reads_this_field_not_a_rival_constant`]'s own doc gives: written
+    /// [`retryable_head_budget_reads_this_field_not_a_rival_constant`]'s own doc gives: written
     /// symbolically as `SENTINEL_CONNECT_TIMEOUT + BATCH_HEAD_PATIENCE`, a change to the patience
     /// moves both sides of the assertion together and this test stays green through it.
     #[test]
@@ -12472,7 +12511,7 @@ mod tests {
         assert!(
             client.batch_head_budget() > TEST_TOR_CONNECT_TIMEOUT,
             "and it must strictly exceed the connect budget it was built with — the producer rule \
-            clamp_head_deadline_payload exists to repair, discharged here at the one producer"
+            clamp_head_deadline_payload exists to repair, discharged here at this producer"
         );
     }
 
@@ -12591,7 +12630,7 @@ mod tests {
     /// Mirrors [`error_body_budget_reads_this_field_not_a_rival_constant`]/
     /// [`resolve_budget_reads_this_field_not_a_rival_constant`]/
     /// [`presence_negotiation_budget_reads_this_field_not_a_rival_constant`] for
-    /// [`RemoteClient::single_write_budget`] — the identical gap: every end-to-end test of
+    /// [`RemoteClient::retryable_head_budget`] — the identical gap: every end-to-end test of
     /// `upload_signature`/`put_trust` builds a direct client via `RemoteClient::new`, where
     /// `self.budgets.connect` == [`REMOTE_CONNECT_TIMEOUT`] (5s), so a hardcoded-constant mutant
     /// (`REMOTE_CONNECT_TIMEOUT` in place of `self.budgets.connect`) is extensionally identical to
@@ -12611,7 +12650,7 @@ mod tests {
     /// defect on every attempt this module's history has tried it, so that claim is deliberately
     /// not made.
     #[test]
-    fn single_write_budget_reads_this_field_not_a_rival_constant() {
+    fn retryable_head_budget_reads_this_field_not_a_rival_constant() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9);
 
         let client = RemoteClient::new_test_with_budgets(
@@ -12620,9 +12659,9 @@ mod tests {
         );
 
         assert_eq!(
-            client.single_write_budget(),
+            client.retryable_head_budget(),
             std::time::Duration::from_secs(39),
-            "single_write_budget must be this instance's 9s connect_timeout plus the 30s \
+            "retryable_head_budget must be this instance's 9s connect_timeout plus the 30s \
             retryable floor. The expected value is a literal, deliberately, and not \
             `SENTINEL_CONNECT_TIMEOUT + RETRYABLE_HEAD_PATIENCE`: written symbolically, a change \
             to the floor's own arithmetic moves both sides of this assertion together and every \
@@ -12817,10 +12856,11 @@ mod tests {
         );
     }
 
-    /// The `upload_targets` counterpart of [`missing_objects_deadline_message_names_the_armed_head_wait`]
-    /// — a separate code path (its own `.send()` map_err site), so it gets its own test rather than
-    /// being parameterised into that one. Same defect, same fix, same rival table (that test's own
-    /// doc carries it; not repeated here).
+    /// The `upload_targets` counterpart of
+    /// [`missing_objects_deadline_message_names_the_armed_head_wait`] — a separate code path (its
+    /// own `.send()` map_err site), so it gets its own test rather than being parameterised into
+    /// that one. Same defect, same fix, same rival table (that test's own doc carries it; not
+    /// repeated here).
     #[test]
     fn upload_targets_deadline_message_names_the_armed_head_wait() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(440);
@@ -12915,14 +12955,11 @@ mod tests {
     /// every silent-remote test above — a fully silent remote never sends headers at all, so it
     /// never reaches the body read's error arm in the first place. Against
     /// [`PartialJsonThenSilentRemote`] it does: the head-wait bound is spent once the headers
-    /// arrive, so what ends the stalled body is the client's own silence budget
-    /// (`connect + object_read`, a per-read bound) — and the message must be that silence
-    /// message, not the JSON-parse-failure one, since the remote never sent garbage: it sent a
-    /// valid-so-far prefix and then nothing further.
-    ///
-    /// Also the falsifier for that body bound itself: a head-deadline posture riding a client
-    /// with no `read_timeout` would leave this body read waiting forever, and the outer ceiling
-    /// trips instead.
+    /// arrive, so what ends the stalled body is the body's own total budget (the same
+    /// `presence_negotiation_budget` figure, counted from the status line, and under the client's
+    /// silence budget) — and the message must be that body-deadline message, not the
+    /// JSON-parse-failure one, since the remote never sent garbage: it sent a valid-so-far prefix
+    /// and then nothing further.
     #[test]
     fn missing_objects_deadline_message_survives_a_partial_json_body() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(440);
@@ -12932,8 +12969,9 @@ mod tests {
             &remote.url, Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..FAST },
         );
         let hashes = vec!["a".repeat(64)];
-        let silence = SENTINEL_CONNECT_TIMEOUT + FAST.object_read;
-        let hard_ceiling = silence + std::time::Duration::from_secs(15);
+        let expected_budget = client.presence_negotiation_budget(hashes.len());
+        assert!(expected_budget < SENTINEL_CONNECT_TIMEOUT + FAST.object_read, "the body budget fires before the silence budget");
+        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -12948,10 +12986,10 @@ mod tests {
             .expect_err("a body that never completes must not appear to succeed");
 
         assert!(
-            message.contains(&format!("stopped sending, with no further bytes for at least {:?}", silence)),
-            "a partial JSON body followed by silence must compose the silence message naming \
-            this client's {:?} silence budget, not fall through to the unconditional \"not \
-            valid JSON\" message: {}", silence, message
+            message.contains(&format!("did not finish its answer within {:?}", expected_budget)),
+            "a partial JSON body followed by silence must compose the body-deadline message \
+            naming the armed {:?}, not fall through to the unconditional \"not valid JSON\" \
+            message: {}", expected_budget, message
         );
         assert!(
             !message.to_lowercase().contains("not valid json"),
@@ -13666,7 +13704,7 @@ mod tests {
             let remote = CommitRemote::start(vec![answer.clone()]);
             let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
             assert_eq!(client.presence_negotiation_budget(1), std::time::Duration::from_millis(900));
-            assert_eq!(client.single_write_budget(), std::time::Duration::from_millis(900));
+            assert_eq!(client.retryable_head_budget(), std::time::Duration::from_millis(900));
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let outcome = runtime.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -13743,8 +13781,9 @@ mod tests {
             &remote.url, Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..FAST },
         );
         let hashes = vec!["a".repeat(64)];
-        let silence = SENTINEL_CONNECT_TIMEOUT + FAST.object_read;
-        let hard_ceiling = silence + std::time::Duration::from_secs(15);
+        let expected_budget = client.presence_negotiation_budget(hashes.len());
+        assert!(expected_budget < SENTINEL_CONNECT_TIMEOUT + FAST.object_read, "the body budget fires before the silence budget");
+        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -13763,16 +13802,46 @@ mod tests {
         };
 
         assert!(
-            message.contains(&format!("stopped sending, with no further bytes for at least {:?}", silence)),
-            "a partial JSON body followed by silence must compose the silence message naming \
-            this client's {:?} silence budget, not fall through to the unconditional \"not \
-            valid JSON\" message: {}", silence, message
+            message.contains(&format!("did not finish its answer within {:?}", expected_budget)),
+            "a partial JSON body followed by silence must compose the body-deadline message \
+            naming the armed {:?}, not fall through to the unconditional \"not valid JSON\" \
+            message: {}", expected_budget, message
         );
         assert!(
             !message.to_lowercase().contains("not valid json"),
             "must not be the JSON-parse-failure message — the remote never finished sending, it \
             did not send garbage: {}", message
         );
+    }
+
+    /// The presence answers' body bound against a remote that never goes silent: headers at once,
+    /// then one byte every 200ms, never long enough for the client's silence budget to fire. Only
+    /// the body's own total budget ends it, at `presence_negotiation_budget`'s figure counted from
+    /// the status line; without that budget both calls wait out the whole 20s trickle and the
+    /// ceiling trips.
+    #[test]
+    fn presence_answers_give_up_on_a_remote_that_never_stops_trickling() {
+        let hashes = vec!["a".repeat(64)];
+        for call in ["missing_objects", "upload_targets"] {
+            let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(200));
+            let client = RemoteClient::new_test_with_budgets(&url, FAST);
+            let budget = client.presence_negotiation_budget(hashes.len());
+            let hard_ceiling = budget + std::time::Duration::from_secs(8);
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let outcome = runtime.block_on(async {
+                tokio::time::timeout(hard_ceiling, async {
+                    match call {
+                        "missing_objects" => client.missing_objects(&hashes).await.map(|_| ()),
+                        _ => client.upload_targets("session", &hashes).await.map(|_| ()),
+                    }
+                }).await
+            });
+
+            let message = outcome
+                .unwrap_or_else(|_| panic!("{}: a trickled answer held the call past {:?}", call, hard_ceiling))
+                .expect_err("an answer that never finishes");
+            assert!(message.contains(&format!("did not finish its answer within {:?}", budget)), "{}: {}", call, message);
+        }
     }
 
     /// Streams a body in `chunks`, sleeping `gap` before each one and flushing immediately after
@@ -15181,7 +15250,7 @@ mod tests {
 
     /// `upload_signature` must not silently follow a `303` to a `2xx` landing — the same hole,
     /// its own client selection (`send_on(Posture::HeadDeadlineNoRedirect { head: self
-    /// .single_write_budget() }, ...)`, the never-auto-follow client).
+    /// .retryable_head_budget() }, ...)`, the never-auto-follow client).
     #[test]
     fn upload_signature_does_not_follow_a_303_to_a_2xx_landing() {
         let (landing_url, landed) = start_landing_remote();
