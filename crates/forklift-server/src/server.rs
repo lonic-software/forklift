@@ -1082,15 +1082,13 @@ fn trust_one_way_door() -> HandlerError {
         door and cannot be replaced.".to_string())
 }
 
-/// Whether `PUT /v1/trust` wrote `requested`, from what its install returned; `read` is the anchor
-/// the request's decision was made against. An install found already in place, or refused because
-/// the office or the anchor moved while the anchor on disk is now the requested one, was an
-/// identical request's (or a bay's) doing: `Ok(false)`, the `200` with no event a request arriving
-/// after it gets. One refused because a different anchor was installed meanwhile gets the answer a
-/// request arriving after that install gets, the one-way door. Any other refusal is the request's
-/// own answer, as is a refusal whose anchor cannot be read back.
+/// Whether `PUT /v1/trust` wrote `requested`, from what its install returned. An install found
+/// already in place, or refused because the office or the anchor moved while the anchor on disk is
+/// now the requested one, was an identical request's (or a bay's) doing: `Ok(false)`, the `200`
+/// with no event a request arriving after it gets. One refused while the anchor on disk is now one
+/// `requested` is no re-genesis of gets the answer such a later request gets, the one-way door.
+/// Any other refusal is the request's own answer, as is a refusal whose anchor cannot be read back.
 fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpdateError>,
-                         read: Option<&TrustAnchorDto>,
                          requested: &TrustAnchorDto) -> Result<bool, HandlerError> {
     match installed {
         Ok(office_utils::TrustInstalled::Written) => Ok(true),
@@ -1098,7 +1096,9 @@ fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpda
         Err(error @ (RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved)) => {
             match office_utils::read_trust_anchor().map(|held| held.as_ref().map(TrustAnchorDto::from)) {
                 Ok(Some(held)) if held == *requested => Ok(false),
-                Ok(Some(held)) if Some(&held) != read => Err(trust_one_way_door()),
+                Ok(Some(held)) if requested.prior_genesis.as_deref() != Some(held.genesis.as_str()) => {
+                    Err(trust_one_way_door())
+                }
                 _ => Err(trust_install_refusal(error)),
             }
         }
@@ -2463,7 +2463,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     },
                 });
 
-                if !trust_install_outcome(installed, Some(&TrustAnchorDto::from(&existing)), &anchor)? {
+                if !trust_install_outcome(installed, &anchor)? {
                     return Ok(None);
                 }
 
@@ -2516,7 +2516,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     },
                 });
 
-                if !trust_install_outcome(installed, None, &anchor)? {
+                if !trust_install_outcome(installed, &anchor)? {
                     return Ok(None);
                 }
 
@@ -5666,8 +5666,8 @@ mod tests {
 
     // The loser of two different first contacts gets the answer a request arriving after the
     // winner gets, not an invitation to retry.
-    // Revert: put_trust answers a refused install whose re-read anchor differs from the one it
-    // read with the install's own refusal → the anchor-moved "retry" 409.
+    // Revert: put_trust answers a refused install whose re-read anchor it is no re-genesis of with
+    // the install's own refusal → the anchor-moved "retry" 409.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_loser_of_two_different_first_contacts_meets_the_one_way_door() {
         let other = TrustAnchorDto { enabled_at: 2, ..first_anchor(Vec::new()) };
