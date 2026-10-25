@@ -470,6 +470,24 @@ while the file it holds is in another version (built before an upgrade), and log
 naming the rebuild, so a client does not download a file it would only refuse. A client that is
 served another version anyway skips it and fetches objects, as it does on a `404`.
 
+A cut-off download can be resumed. A `200` carries the bundle's length in `Content-Length`, a
+strong `ETag` and `Accept-Ranges: bytes`. A request with `Range: bytes=N-` and `If-Range: E` gets
+`206 Partial Content` when `E` is the current bundle's tag and `N` is less than its length `L`.
+That response has `Content-Range: bytes N-(L-1)/L`, the same `ETag`, a `Content-Length` of `L - N`,
+and exactly the bytes from `N` on. Anything else gets `200` with the whole current bundle under its
+own tag (RFC 9110 `If-Range` semantics): a stale or weak tag, no `If-Range`, an offset at or past
+the end, or any other range form. A tag names one built file, never a path: a rebuild publishes a
+new file and gets a new tag, and a download that started before the rebuild finishes the file it
+began under that file's tag. Two builds may rarely share a tag. That is safe, because a resumed
+bundle is checked against its own digest before any of it is stored (see `BUNDLE_FORMAT.md`), so a
+collision costs one more full download, never a misread.
+
+A head need not support ranges. One that ignores `Range`, or sends no `ETag` or no
+`Content-Length`, stays correct: the client then downloads the bundle in full each time and keeps
+nothing it could not resume. A client accepts a `206` only when its `Content-Range` starts at the
+offset it asked for, its `ETag` is the tag it sent and its complete length is the one it recorded.
+It treats any other `206`, or a `416`, like a `200`: it drops what it kept and downloads in full.
+
 ## The flows
 
 **lift (push)** — for the office pallet first (when trust is established), then the
