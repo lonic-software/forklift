@@ -11,7 +11,7 @@ use crate::output::{self, CommandOutput};
 
 /// The export layout version: the `export/<N>` every exported commit's parcel line names. It covers
 /// every rule that fixes an exported object's bytes: the message shape and its parcel line, the
-/// identity mapping, the date form, the parent rule, the type-to-mode map, chunked-blob assembly
+/// identity mapping, the date form (pre-1970 written as the epoch), the parent rule, the type-to-mode map, chunked-blob assembly
 /// and filter-free hashing. Two builds on one layout write identical objects for the same parcel, so
 /// a change to any of those rules bumps it (the golden tip-hash test fails until it does).
 pub(crate) const EXPORT_LAYOUT: u32 = 1;

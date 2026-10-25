@@ -129,7 +129,8 @@ must be empty or new. **Lossy in this direction:** git has no home for the signe
 identity round-trips as the on-chain **identifier** — forklift never stores display names
 on-chain (zero-PII by design), so the git author name is that identifier (or `forklift`, when
 the identifier holds nothing git keeps in a name). The meta pallets (`@office`, `@manifest`)
-and tags are not exported.
+and tags are not exported. Dates are written in UTC (`+0000`), and git has no date before 1970,
+so a parcel stamped earlier exports as 1970-01-01.
 
 The export is deterministic: the same history exports to the same commit hashes on any
 machine, whatever your own git configuration says (it is shut out of every object write).
