@@ -377,7 +377,8 @@ would then be answered `409`, the pallet having moved to the client's own new he
 fetches before retrying any `503` here: a pallet already at the pushed head means the push
 succeeded, and a pallet still at `old_head` means the identical request can be sent again —
 though an attempt still in progress can land just after that fetch, so a resend answered `409`
-with the pallet at the pushed head is a push that succeeded, not a conflict. The
+calls for one more fetch: a pallet at the pushed head then is a push that succeeded, not a
+conflict, whatever the `409`'s message advises. The
 message says which kind of `503` it is for a person reading it; nothing in the status or headers
 distinguishes them, and a client must not parse the message to decide.
 
