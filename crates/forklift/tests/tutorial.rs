@@ -5,19 +5,20 @@
 //!
 //! The page is read, not mirrored: there is no second copy of the commands to keep in step. The
 //! tutorial runs commands through a small interpreter here, not through a shell, so it runs the
-//! same on every platform CI covers. Only the commands it knows are allowed; anything else is a
-//! failure that names the command, never a skipped step.
+//! same on every platform CI covers. Only the commands it knows are allowed, and only words a
+//! shell would pass through unchanged; anything else is a failure that names the command, never a
+//! skipped step or a step that runs differently from the reader's.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 mod common;
-use common::forklift_command;
+use common::{forklift_command, server_binary};
 
-/// The address the page tells the reader to serve on. The test serves on a free port instead,
-/// so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever the page
-/// shows it.
+/// The address the page tells the reader to serve on. The test serves on a port the server picks
+/// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever the
+/// page shows it.
 const TUTORIAL_ADDRESS: &str = "127.0.0.1:7171";
 
 /// What the page writes for text that differs from run to run (hashes, ids, dates).
@@ -32,17 +33,27 @@ struct Step {
     expected: Vec<String>,
 }
 
-/// Read the page's steps. Every fenced block must be a `console` block and must open with a `$`
-/// line, and no `$` line may sit outside one, so that a command the page shows is a command
-/// this test runs: a block in another language would otherwise be skipped without a word.
+/// Read the page's steps. Every fenced block must be a `console` block fenced with backticks at
+/// the start of the line, and must open with a `$` line; no `$` line may sit outside one, however
+/// it is indented. Otherwise a command the page shows, in a block of another kind or one nested
+/// in a list item, would be skipped without a word.
 fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     let mut steps: Vec<Step> = Vec::new();
     let mut in_block = false;
 
     for (index, line) in page.lines().enumerate() {
         let number = index + 1;
+        let trimmed = line.trim_start();
 
-        if let Some(info) = line.strip_prefix("```") {
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if trimmed.len() != line.len() || trimmed.starts_with("~~~") {
+                return Err(format!(
+                    "line {}: fence code blocks with ``` at the start of the line, so this test \
+                    sees them", number
+                ));
+            }
+
+            let info = &line[3..];
             if in_block {
                 if !info.is_empty() {
                     return Err(format!("line {}: a block closes with a bare ```", number));
@@ -61,7 +72,7 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
         }
 
         if !in_block {
-            if line.starts_with("$ ") {
+            if trimmed.starts_with("$ ") {
                 return Err(format!("line {}: a command outside a console block", number));
             }
             continue;
@@ -95,6 +106,61 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     Ok(steps)
 }
 
+/// Why a reader's shell would not run `command` the way this test does, if it would not. The
+/// test splits words as a POSIX shell does and runs them literally, so anything a shell expands
+/// or interprets is refused rather than run differently: globs, `~`, variables, command
+/// substitution, `!` history expansion (interactive zsh and bash expand it inside double quotes
+/// too), command lists and pipes, and redirection other than one trailing `>` or `>>`.
+fn shell_divergence(command: &str) -> Option<String> {
+    #[derive(PartialEq)]
+    enum Quote { None, Single, Double }
+
+    let mut quote = Quote::None;
+    let mut redirects = 0;
+    let mut previous = ' ';
+
+    for c in command.chars() {
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match c {
+                '"' => quote = Quote::None,
+                '$' | '`' | '\\' | '!' => return Some(format!("{:?} inside double quotes", c)),
+                _ => {}
+            },
+            Quote::None => match c {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '>' if previous == ' ' || previous == '>' => redirects += 1,
+                '*' | '?' | '[' | ']' | '~' | '$' | '`' | '\\' | '!' | '&' | '|' | ';' | '<' | '>'
+                | '(' | ')' | '{' | '}' | '#' => return Some(format!("an unquoted {:?}", c)),
+                _ => {}
+            },
+        }
+        previous = c;
+    }
+
+    if quote != Quote::None {
+        return Some("an unclosed quote".to_string());
+    }
+
+    let words = shlex::split(command)?;
+    let redirect = words.len() >= 2 && matches!(words[words.len() - 2].as_str(), ">" | ">>");
+    let expected = if !redirect { 0 } else if words[words.len() - 2] == ">>" { 2 } else { 1 };
+    if redirects != expected {
+        return Some("redirection other than one trailing > or >>".to_string());
+    }
+
+    if words[0] == "echo" && words.get(1).is_some_and(|word| word.starts_with('-')) {
+        return Some("echo with an option, which shells read differently".to_string());
+    }
+
+    None
+}
+
 /// Whether `actual` is `pattern` with each [`ELISION`] standing for any text, including none.
 fn line_matches(pattern: &str, actual: &str) -> bool {
     let mut pieces = pattern.split(ELISION);
@@ -126,24 +192,26 @@ fn output_matches(expected: &[String], actual: &[String]) -> bool {
 }
 
 /// What a reader sees: colour codes removed, line endings normalised, trailing blank lines and
-/// trailing spaces dropped.
+/// trailing spaces dropped. Only complete colour sequences (`ESC [`, digits and `;`, then `m`)
+/// are removed; any other escape is kept, so it shows up as a difference instead of hiding text.
 fn printed_lines(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
 
     let mut plain = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("\x1b[") {
+        plain.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let parameters = after.find(|c: char| !c.is_ascii_digit() && c != ';').unwrap_or(after.len());
+
+        if after[parameters..].starts_with('m') {
+            rest = &after[parameters + 1..];
+        } else {
+            plain.push_str("\x1b[");
+            rest = after;
         }
-        plain.push(c);
     }
+    plain.push_str(rest);
 
     let mut lines: Vec<String> = plain.lines().map(|line| line.trim_end().to_string()).collect();
     while lines.last().is_some_and(|line| line.is_empty()) {
@@ -152,26 +220,12 @@ fn printed_lines(bytes: &[u8]) -> Vec<String> {
     lines
 }
 
-/// `forklift-server`, found next to the CLI as the remote tests find it.
-fn server_binary() -> PathBuf {
-    let path = Path::new(env!("CARGO_BIN_EXE_forklift"))
-        .parent()
-        .expect("the forklift binary has a parent directory")
-        .join(format!("forklift-server{}", std::env::consts::EXE_SUFFIX));
-
-    assert!(
-        path.is_file(),
-        "forklift-server is not built at {}; run the tests via a workspace build",
-        path.display()
-    );
-
-    path
-}
-
 /// A server the page started, stopped when the run ends.
 struct Server {
+    line: usize,
     child: Child,
     _stdout: BufReader<ChildStdout>,
+    stderr: PathBuf,
 }
 
 impl Drop for Server {
@@ -186,13 +240,25 @@ impl Drop for Server {
 struct Reader {
     area: PathBuf,
     cwd: PathBuf,
+    /// Where the page's server really listens, once it has started.
+    address: Option<String>,
     servers: Vec<Server>,
 }
 
 impl Reader {
+    /// The reader's environment: none of the developer's forklift settings, debug switches or log
+    /// filters, which would change what a command prints.
     fn environment(&self, command: &mut Command) {
+        for (key, _) in std::env::vars_os() {
+            let key_text = key.to_string_lossy();
+            if key_text.starts_with("FORKLIFT_") || key_text.starts_with("RUST_LOG") {
+                command.env_remove(&key);
+            }
+        }
+
         command
             .current_dir(&self.cwd)
+            .env("FORKLIFT_FSYNC", "0")
             .env("FORKLIFT_GLOBAL_CONFIG", self.area.join("global.toml"))
             .env("FORKLIFT_KEYS_DIR", self.area.join("keys"))
             .stdin(Stdio::null());
@@ -212,8 +278,17 @@ impl Reader {
 
     /// Run one step and return its exit status and what it printed.
     fn run(&mut self, step: &Step) -> (Option<i32>, Vec<u8>) {
-        let mut words = shlex::split(&step.command)
-            .unwrap_or_else(|| panic!("line {}: cannot split {:?}", step.line, step.command));
+        let fail = |what: &dyn std::fmt::Display| -> ! {
+            panic!("docs/guide/tutorial.md line {}: `{}`: {}", step.line, step.command, what)
+        };
+
+        if let Some(reason) = shell_divergence(&step.command) {
+            fail(&format!(
+                "a shell would not run this as this test does ({}); rephrase the step", reason
+            ));
+        }
+
+        let mut words = shlex::split(&step.command).unwrap_or_else(|| fail(&"cannot split it"));
 
         let redirect = match words.len().checked_sub(2).map(|at| words[at].as_str()) {
             Some(">") | Some(">>") => {
@@ -225,23 +300,19 @@ impl Reader {
         };
 
         let unsupported = || -> ! {
-            panic!(
-                "line {}: the tutorial runs {:?}, which this test cannot run; use a command \
-                it knows (forklift, forklift-server, cd, mkdir, cat, echo > file) or teach it",
-                step.line, step.command
-            )
+            fail(&"this test cannot run it; use a command it knows (forklift, forklift-server, \
+                cd, mkdir, cat, echo > file) or teach it")
         };
 
         match (words[0].as_str(), redirect) {
             ("echo", Some((path, append))) => {
                 let text = words[1..].join(" ");
-                // A shell's echo treats a backslash differently from one shell to the next.
-                assert!(!text.contains('\\'), "line {}: echo with a backslash", step.line);
-
                 let mut file = std::fs::OpenOptions::new()
                     .create(true).write(true).append(append).truncate(!append)
-                    .open(self.cwd.join(path)).unwrap();
-                std::io::Write::write_all(&mut file, format!("{}\n", text).as_bytes()).unwrap();
+                    .open(self.cwd.join(path))
+                    .unwrap_or_else(|e| fail(&e));
+                std::io::Write::write_all(&mut file, format!("{}\n", text).as_bytes())
+                    .unwrap_or_else(|e| fail(&e));
                 (Some(0), Vec::new())
             }
             (_, Some(_)) => unsupported(),
@@ -253,19 +324,21 @@ impl Reader {
                     match part {
                         std::path::Component::ParentDir => assert!(target.pop()),
                         std::path::Component::Normal(name) => target.push(name),
-                        _ => panic!("line {}: cd takes a relative path", step.line),
+                        _ => fail(&"cd takes a relative path"),
                     }
                 }
-                assert!(target.is_dir(), "line {}: no folder {}", step.line, target.display());
+                if !target.is_dir() {
+                    fail(&format!("no folder {}", target.display()));
+                }
                 self.cwd = target;
                 (Some(0), Vec::new())
             }
             ("mkdir", None) if words.len() == 2 => {
-                std::fs::create_dir(self.cwd.join(&words[1])).unwrap();
+                std::fs::create_dir(self.cwd.join(&words[1])).unwrap_or_else(|e| fail(&e));
                 (Some(0), Vec::new())
             }
             ("cat", None) if words.len() == 2 => {
-                (Some(0), std::fs::read(self.cwd.join(&words[1])).unwrap())
+                (Some(0), std::fs::read(self.cwd.join(&words[1])).unwrap_or_else(|e| fail(&e)))
             }
             ("forklift", None) => {
                 let mut command = forklift_command();
@@ -274,33 +347,44 @@ impl Reader {
             }
             ("forklift-server", None) if words.get(1).map(String::as_str) == Some("serve") => {
                 // The page leaves the server running in a second terminal; here it runs in the
-                // background, and what the step shows is its startup line.
+                // background on a port it picks itself, and what the step shows is its startup
+                // line. What it prints on stderr is checked when the run ends.
                 let mut command = Command::new(server_binary());
-                command.args(&words[1..]).env("FORKLIFT_FSYNC", "0");
+                command.args(words[1..].iter().map(|word| word.replace(TUTORIAL_ADDRESS, "127.0.0.1:0")));
                 self.environment(&mut command);
-                let mut child = command.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+
+                let stderr = self.area.join(format!("server-{}.stderr", step.line));
+                let stderr_file = std::fs::File::create(&stderr).unwrap();
+                let mut child = command.stdout(Stdio::piped()).stderr(stderr_file).spawn().unwrap();
 
                 let mut stdout = BufReader::new(child.stdout.take().unwrap());
                 let mut line = String::new();
-                stdout.read_line(&mut line).unwrap();
+                stdout.read_line(&mut line).unwrap_or_else(|e| fail(&e));
 
-                self.servers.push(Server { child, _stdout: stdout });
+                let bound = line.trim().rsplit(' ').next().unwrap_or("");
+                if let Some(address) = bound.strip_prefix("http://") {
+                    self.address = Some(address.to_string());
+                }
+
+                self.servers.push(Server { line: step.line, child, _stdout: stdout, stderr });
                 (Some(0), line.into_bytes())
             }
             ("forklift-server", None) => {
                 let mut command = Command::new(server_binary());
-                command.args(&words[1..]).env("FORKLIFT_FSYNC", "0");
+                command.args(&words[1..]);
                 self.capture(command)
             }
             _ => unsupported(),
         }
     }
-}
 
-/// A free local port for the tutorial's server.
-fn free_address() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().to_string()
+    /// The page's text for this machine: its server address replaced by the real one.
+    fn localize(&self, text: &str) -> String {
+        match &self.address {
+            Some(address) => text.replace(TUTORIAL_ADDRESS, address),
+            None => text.to_string(),
+        }
+    }
 }
 
 fn tutorial_path() -> PathBuf {
@@ -316,24 +400,36 @@ fn tutorial_runs_as_written() {
     let _ = std::fs::remove_dir_all(&area);
     std::fs::create_dir_all(&area).unwrap();
 
-    let address = free_address();
-    let mut reader = Reader { area: area.clone(), cwd: area.join("reader"), servers: Vec::new() };
+    let mut reader = Reader { area: area.clone(), cwd: area.join("reader"), address: None, servers: Vec::new() };
     std::fs::create_dir(&reader.cwd).unwrap();
 
     for step in &steps {
         let step = Step {
             line: step.line,
-            command: step.command.replace(TUTORIAL_ADDRESS, &address),
-            expected: step.expected.iter().map(|line| line.replace(TUTORIAL_ADDRESS, &address)).collect(),
+            command: reader.localize(&step.command),
+            expected: step.expected.clone(),
         };
 
         let (status, output) = reader.run(&step);
         let printed = printed_lines(&output);
+        let expected: Vec<String> = step.expected.iter().map(|line| reader.localize(line)).collect();
 
         assert!(
-            status == Some(0) && output_matches(&step.expected, &printed),
+            status == Some(0) && output_matches(&expected, &printed),
             "docs/guide/tutorial.md line {}: `{}` exited {:?} and printed\n{}\n\nThe page shows\n{}",
-            step.line, step.command, status, printed.join("\n"), step.expected.join("\n")
+            step.line, step.command, status, printed.join("\n"), expected.join("\n")
+        );
+    }
+
+    // A server's second terminal shows its stderr too, and the page shows none; and a server
+    // that died mid-run would surface only as a confusing failure of a later step.
+    for server in &mut reader.servers {
+        let exited = server.child.try_wait().unwrap();
+        let stderr = std::fs::read_to_string(&server.stderr).unwrap();
+        assert!(
+            exited.is_none() && stderr.is_empty(),
+            "docs/guide/tutorial.md line {}: the server exited ({:?}) or printed on stderr:\n{}",
+            server.line, exited, stderr
         );
     }
 
@@ -369,6 +465,11 @@ fn output_must_match_line_for_line() {
 #[test]
 fn printed_lines_are_what_a_reader_sees() {
     assert_eq!(printed_lines(b"\x1b[33mparcel 1\x1b[0m  \r\nnext\n\n"), vec!["parcel 1", "next"]);
+    assert_eq!(printed_lines(b"\x1b[1;32mok\x1b[m"), vec!["ok"]);
+
+    // Anything but a colour sequence stays, so it cannot swallow the text after it.
+    assert_eq!(printed_lines(b"a\x1b[12\nb"), vec!["a\x1b[12", "b"]);
+    assert_eq!(printed_lines(b"\x1b]8;;x\x07link"), vec!["\x1b]8;;x\x07link"]);
 }
 
 #[test]
@@ -382,9 +483,39 @@ fn every_command_on_the_page_is_one_the_test_runs() {
     assert!(refused("```console\n```\n"));
     assert!(refused("```console\n$ forklift prepare\n"));
 
+    // A block nested in a list item, a tilde fence, and an indented code block.
+    assert!(refused("1. Prepare:\n   ```console\n   $ forklift prepare\n   ```\n"));
+    assert!(refused("~~~console\n$ forklift prepare\n~~~\n"));
+    assert!(refused("text\n\n    $ forklift prepare\n"));
+
     let steps = parse_steps("text\n```console\n$ a\nout\n$ b\n```\n\n```console\n$ c\n```\n").unwrap();
     let commands: Vec<&str> = steps.iter().map(|step| step.command.as_str()).collect();
     assert_eq!(commands, ["a", "b", "c"]);
     assert_eq!(steps[0].expected, ["out"]);
     assert!(steps[1].expected.is_empty());
+}
+
+#[test]
+fn only_commands_a_shell_runs_unchanged_are_run() {
+    let runs = |command: &str| shell_divergence(command).is_none();
+
+    assert!(runs("forklift stack \"First parcel\""));
+    assert!(runs("echo 'Hello, world!' > readme.md"));
+    assert!(runs("echo \"text\" >> notes.md"));
+    assert!(runs("echo '^build(/.*)?$' > .forkliftignore"));
+    assert!(runs("cd ../hello"));
+
+    assert!(!runs("echo \"Hello, world!\" > readme.md"));
+    assert!(!runs("forklift load *.md"));
+    assert!(!runs("cd ~"));
+    assert!(!runs("echo $HOME > f"));
+    assert!(!runs("echo \"$HOME\" > f"));
+    assert!(!runs("forklift load a && forklift stack m"));
+    assert!(!runs("forklift history | head"));
+    assert!(!runs("forklift load a; forklift stack m"));
+    assert!(!runs("echo -n x > f"));
+    assert!(!runs("echo a>f"));
+    assert!(!runs("echo a > f > g"));
+    assert!(!runs("forklift stack \"unclosed"));
+    assert!(!runs("forklift stack m # a comment"));
 }

@@ -7,30 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use forklift_core::util::progress_utils::Progress;
 
-/// Path to the compiled forklift binary (provided by cargo for integration tests).
-const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
-
 mod common;
-use common::{forklift_command, hold_store_access};
-
-/// Path to the compiled forklift-server binary. Cargo exposes `CARGO_BIN_EXE_*` only
-/// for the package's own binaries, so the server is located next to the CLI (both land
-/// in the same target directory when the workspace builds).
-fn server_binary() -> PathBuf {
-    let path = Path::new(FORKLIFT)
-        .parent()
-        .expect("the forklift binary has a parent directory")
-        .join(format!("forklift-server{}", std::env::consts::EXE_SUFFIX));
-
-    assert!(
-        path.is_file(),
-        "forklift-server is not built at {}; run the tests via a workspace build \
-        (plain \"cargo test\").",
-        path.to_string_lossy()
-    );
-
-    path
-}
+use common::{forklift_command, hold_store_access, server_binary};
 
 /// `forklift-server` with fsync off, for the same reason as [`forklift_command`].
 fn server_command() -> Command {

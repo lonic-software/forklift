@@ -42,9 +42,9 @@ Add a file, and a build folder that should never be tracked. A `.forkliftignore`
 root holds one regular expression per line, matched against `/`-separated paths:
 
 ```console
-$ echo "Hello, world!" > readme.md
+$ echo 'Hello, world!' > readme.md
 $ mkdir build
-$ echo "compiled output" > build/app.bin
+$ echo 'compiled output' > build/app.bin
 $ echo '^build(/.*)?$' > .forkliftignore
 ```
 
@@ -82,7 +82,7 @@ $ forklift config operator.identifier
 Change the greeting. `diff` shows the change line by line before you stage it:
 
 ```console
-$ echo "Hello, forklift!" > readme.md
+$ echo 'Hello, forklift!' > readme.md
 $ forklift diff
 modified: readme.md
   1   - Hello, world!
@@ -118,7 +118,7 @@ A **pallet** is a branch. `palletize` creates one and shifts to it:
 ```console
 $ forklift palletize shout
 Created pallet "shout" and shifted to it.
-$ echo "HELLO, FORKLIFT!" > readme.md
+$ echo 'HELLO, FORKLIFT!' > readme.md
 $ forklift load readme.md
 $ forklift stack "Shout the greeting"
 Stacked parcel … on pallet "shout".
@@ -131,7 +131,7 @@ $ forklift shift main
 Shifted to pallet "main" (head …).
 $ cat readme.md
 Hello, forklift!
-$ echo "Hello, forklift and friends!" > readme.md
+$ echo 'Hello, forklift and friends!' > readme.md
 $ forklift load readme.md
 $ forklift stack "Greet friends too"
 Stacked parcel … on pallet "main".
@@ -165,7 +165,7 @@ Resolve it by writing the file you want, then load and stack. The stack complete
 consolidation as a parcel with two parents:
 
 ```console
-$ echo "HELLO, FORKLIFT AND FRIENDS!" > readme.md
+$ echo 'HELLO, FORKLIFT AND FRIENDS!' > readme.md
 $ forklift load readme.md
 $ forklift stack "Consolidate shout"
 Stacked parcel … on pallet "main".
@@ -186,7 +186,7 @@ Reference: [Branching and merging](cli.md#4-branching-and-merging).
 pallet head, and `park pop` brings them back, staged:
 
 ```console
-$ echo "A half-finished idea" >> readme.md
+$ echo 'A half-finished idea' >> readme.md
 $ forklift park
 Parked the work in progress as … and reset to the pallet head.
 $ forklift stocktake
@@ -236,7 +236,7 @@ Genesis parcel:    …
 Identity root key: …
 
 From now on every parcel stacked in this warehouse must be signed. This cannot be undone (a lockout is handled by archiving and re-preparing the warehouse).
-$ echo "Signed from here on." > notes.md
+$ echo 'Signed from here on.' > notes.md
 $ forklift load notes.md
 $ forklift stack "Add notes"
 Stacked parcel … on pallet "main".
@@ -298,7 +298,7 @@ Make a change in the copy and lift it:
 
 ```console
 $ cd hello-copy
-$ echo "Edited in the copy." >> notes.md
+$ echo 'Edited in the copy.' >> notes.md
 $ forklift load notes.md
 $ forklift stack "Edit notes in the copy"
 Stacked parcel … on pallet "main".
