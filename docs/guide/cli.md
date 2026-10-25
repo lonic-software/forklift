@@ -8,7 +8,7 @@ Conventions in this guide:
 - `forklift <command>` — most commands have a short alias, shown in the
   [command list](../generated/commands.md) and in each command's `forklift help <command>`.
 - Three global flags apply to every command: `-v`/`--verbose` (more detail),
-  `--json` (machine output — see [Machine & agent output](#machine--agent-output)),
+  `--json` (machine output — see [Machine & agent output](#8-machine--agent-output)),
   and `--no-pager` (see [Paging](#paging) below).
 - `forklift help` lists everything; `forklift help <command>` explains one command
   (subcommands work too: `forklift help office admit`).

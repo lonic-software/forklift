@@ -9,7 +9,7 @@ prints. A `…` stands for text that differs on your machine, such as hashes, id
 commands are written for a POSIX shell:
 the macOS or Linux terminal, or Git Bash on Windows.
 
-The test suite runs this page. `crates/forklift/tests/tutorial.rs` executes every command block
+The test suite runs this page. `crates/forklift/tests/guide_pages.rs` executes every command block
 below, in order, and fails if any command fails or prints something other than what is shown here,
 so the page cannot drift from the CLI.
 
@@ -323,6 +323,7 @@ Reference: [Working with remotes](cli.md#6-working-with-remotes).
 
 ## 8. Where to go next
 
+- [`concepts.md`](concepts.md): what forklift does that git cannot, and where each part is documented.
 - [`glossary.md`](glossary.md): every forklift term, with its git equivalent.
 - [`cli.md`](cli.md): every command and flag, by workflow.
 - [`trust-and-identity.md`](trust-and-identity.md): users, roles, agents, and key protection.

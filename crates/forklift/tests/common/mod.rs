@@ -54,3 +54,77 @@ pub fn hold_store_access(root: &std::path::Path, exclusive: bool) -> std::fs::Fi
 
     file
 }
+
+/// The repository's root folder.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn repository_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+}
+
+/// Every Markdown page in the repository, sorted: the ones git tracks and the new ones it does not
+/// ignore, so a page is checked before it is committed. Asking git, not walking folders, keeps a
+/// page anywhere in the tree from being missed and a build folder from being read.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn tracked_pages() -> Vec<std::path::PathBuf> {
+    let root = repository_root();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.md"])
+        .output()
+        .expect("the documentation tests list the pages with git, which must be on PATH");
+    assert!(
+        output.status.success(),
+        "the documentation tests need a git checkout to list the pages: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut pages: Vec<std::path::PathBuf> = String::from_utf8(output.stdout)
+        .unwrap()
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .map(|name| root.join(name))
+        .filter(|path| path.is_file()) // A page deleted but not yet staged is still listed.
+        .collect();
+    pages.sort();
+    pages.dedup();
+    pages
+}
+
+/// A Markdown fence line: its character (`` ` `` or `~`), how many of them, and its info string.
+/// Up to three spaces of indent are allowed, as CommonMark allows.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn fence(line: &str) -> Option<(char, usize, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[indent..];
+    let character = rest.chars().next().filter(|&c| c == '`' || c == '~')?;
+    let length = rest.len() - rest.trim_start_matches(character).len();
+    if indent > 3 || length < 3 {
+        return None;
+    }
+    Some((character, length, rest[length..].trim()))
+}
+
+/// The page's lines with fenced code blocks blanked, so text shown inside an example is not read
+/// as prose. Line numbers are kept. A fence closes only on a line of the same character, at least
+/// as long, with no info string.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn prose_lines(page: &str) -> Vec<&str> {
+    let mut open: Option<(char, usize)> = None;
+    page.lines()
+        .map(|line| match (open, fence(line)) {
+            (None, Some((character, length, _))) => {
+                open = Some((character, length));
+                ""
+            }
+            (Some((character, length)), Some((closing, closing_length, info)))
+                if closing == character && closing_length >= length && info.is_empty() =>
+            {
+                open = None;
+                ""
+            }
+            (Some(_), _) => "",
+            (None, None) => line,
+        })
+        .collect()
+}
