@@ -285,7 +285,7 @@ contention.** Two things decide almost every row:
   341 → 391 ms for 8000 files, 18 cores) and reverted — concurrent small-file create/write/`chmod`
   contends on the OS's directory/inode metadata locks. See the ranked recommendations above.
 
-- **`bundle` — deterministic pack assembly, done (FORK-192).** The `2026-07-13` envelope carries
+- **`bundle` — deterministic pack assembly, done (FORK-192).** The native envelope carries
   independently-compressed native records, so the build plans its records in a serial walk, then
   workers read, verify and compress them ahead of the ordered append; the walk's own tree reads
   are prefetched per parcel (the trees that differ from the first parent's). The delta-chain

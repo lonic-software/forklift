@@ -17,10 +17,16 @@ use crate::util::{
 };
 
 /// The uncompressed ASCII header line (without the newline) that opens every whole-warehouse
-/// bundle this build writes. Version 4 makes the object payload one or more native `.pack`/`.idx`
+/// bundle this build writes. Version 4 made the object payload one or more native `.pack`/`.idx`
 /// pairs: transport bytes become the client's permanent indexed store instead of being exploded
-/// into one durably-synced loose file per object.
-pub const BUNDLE_HEADER: &str = "forklift-bundle 2026-07-13";
+/// into one durably-synced loose file per object. Version 5 ends the file with a digest of every
+/// byte before it ([`BUNDLE_DIGEST_BYTES`]), so a file assembled from two downloads is refused
+/// before import stores anything.
+pub const BUNDLE_HEADER: &str = "forklift-bundle 2026-10-25";
+
+/// The length of the blake3 digest that ends a whole-warehouse bundle: the digest of every byte
+/// before it, the header line included.
+pub const BUNDLE_DIGEST_BYTES: usize = 32;
 
 /// Version 3: one outer zstd stream of `O` records. The format of partial bundles
 /// (`objects/batch`, subtree fetches) only, which are imported as they stream in, each record
@@ -77,6 +83,10 @@ const FILE_NAME_LATEST: &str = "latest";
 /// treating that as "no bundle" would hide a broken or hostile server artifact.
 const UNKNOWN_BUNDLE_HEADER_PREFIX: &str = "Unknown bundle header ";
 
+/// Stable discriminator for a bundle file whose bytes are not the ones its builder wrote: its
+/// digest does not match, or it ends before one. Nothing of such a file has been stored.
+const BUNDLE_DIGEST_PREFIX: &str = "The bundle does not match its digest";
+
 /// What a bundle build packed.
 pub struct BuildStats {
     /// Objects stored in full (`'O'` records).
@@ -114,6 +124,20 @@ pub fn get_latest_bundle_path() -> PathBuf {
 /// objects through the version-independent API.
 pub fn is_unsupported_bundle_error(error: &str) -> bool {
     error.starts_with(UNKNOWN_BUNDLE_HEADER_PREFIX)
+}
+
+/// Whether an import failure means the file is not the bytes its builder wrote (see
+/// [`BUNDLE_DIGEST_BYTES`]). The check runs before import writes anything, so nothing of the file
+/// was stored.
+pub fn is_bundle_digest_error(error: &str) -> bool {
+    error.starts_with(BUNDLE_DIGEST_PREFIX)
+}
+
+/// Whether `prefix`, the first bytes of a file, opens a bundle in the version this build writes
+/// and reads. A shorter prefix than the header line and its newline is not.
+pub fn is_current_bundle_prefix(prefix: &[u8]) -> bool {
+    prefix.strip_prefix(BUNDLE_HEADER.as_bytes())
+        .is_some_and(|rest| rest.first() == Some(&b'\n'))
 }
 
 /// Build a bundle of the whole warehouse: every parcel reachable from any pallet head,
@@ -184,10 +208,11 @@ pub fn build_bundle() -> Result<BuildStats, String> {
     Ok(stats)
 }
 
-/// Write the version-4 transport envelope around already-finalized native packs. The small length
+/// Write the version-5 transport envelope around already-finalized native packs. The small length
 /// table precedes the pack bytes so an importer can validate every declaration before streaming
-/// any section to quarantine. Pack data is already internally compressed; wrapping it in another
-/// zstd stream would only prevent direct installation and add CPU for no gain.
+/// any section to quarantine, and the digest of everything written ends the file. Pack data is
+/// already internally compressed; wrapping it in another zstd stream would only prevent direct
+/// installation and add CPU for no gain.
 fn write_native_bundle(bundle_path: &Path,
                        artifacts: &[pack_utils::TransportPackArtifact],
                        signature_path: &Path,
@@ -219,7 +244,10 @@ fn write_envelope_and_publish(temporary_path: &Path,
                               signature_count: usize) -> Result<(), String> {
     let file = std::fs::File::create(temporary_path)
         .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
-    let mut writer = std::io::BufWriter::new(file);
+    let mut writer = DigestingWriter {
+        inner: std::io::BufWriter::new(file),
+        hasher: blake3::Hasher::new(),
+    };
 
     writer.write_all(BUNDLE_HEADER.as_bytes())
         .and_then(|_| writer.write_all(b"\n"))
@@ -245,6 +273,9 @@ fn write_envelope_and_publish(temporary_path: &Path,
         .map_err(|e| format!("Error while writing the bundle signature count: {}", e))?;
     copy_file_into(signature_path, &mut writer, "signature section")?;
 
+    let DigestingWriter { inner: mut writer, hasher } = writer;
+    writer.write_all(hasher.finalize().as_bytes())
+        .map_err(|e| format!("Error while writing the bundle digest: {}", e))?;
     writer.flush().map_err(|e| format!("Error while flushing the bundle file: {}", e))?;
     if file_utils::fsync_enabled() {
         writer.get_ref().sync_all()
@@ -278,6 +309,24 @@ fn write_signature_record(writer: &mut impl Write,
         .and_then(|_| writer.write_all(&(sidecar.len() as u64).to_be_bytes()))
         .and_then(|_| writer.write_all(sidecar))
         .map_err(|e| format!("Error while staging a bundle signature: {}", e))
+}
+
+/// A writer that hashes every byte it passes on, for the digest that ends the envelope.
+struct DigestingWriter<W: Write> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: Write> Write for DigestingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn copy_file_into(path: &Path,
@@ -859,15 +908,18 @@ fn write_record<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
 /// so an import never stores more bytes than the file holds. Any other header — including the
 /// record-stream formats a whole bundle once used — is refused with the error
 /// [`is_unsupported_bundle_error`] recognizes, on which a clone falls back to its verified walk.
-/// Objects already present are skipped; every stored object is hash-verified; a mismatching
-/// record fails the import (the bundle is corrupt — nothing unverified may land).
+/// A file that does not match its digest is refused with the error [`is_bundle_digest_error`]
+/// recognizes, before anything is stored. Objects already present are skipped; every stored object
+/// is hash-verified; a mismatching record fails the import (the bundle is corrupt — nothing
+/// unverified may land).
 ///
 /// # Arguments
 /// * `path` - The bundle file.
 ///
 /// # Returns
 /// * `Ok(ImportStats)` - What was stored.
-/// * `Err(String)`     - On an unknown header, a corrupt record, or an I/O error.
+/// * `Err(String)`     - On an unknown header, a digest mismatch, a corrupt record, or an I/O
+///   error.
 pub fn import_bundle(path: &Path) -> Result<ImportStats, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("Error while opening the bundle file: {}", e))?;
@@ -975,7 +1027,7 @@ impl Admitter {
 /// most one record in memory, and storing only what `admission` allows.
 ///
 /// Only a version-3 bundle is accepted: that is what every batch and subtree producer writes, and
-/// it is the version whose records stream. A whole-warehouse version-4 bundle imports through
+/// it is the version whose records stream. A whole-warehouse bundle imports through
 /// temporary pack files and has no business arriving here, so it is refused rather than imported
 /// by a path this one was never meant to take.
 ///
@@ -1029,8 +1081,14 @@ fn read_bundle_header<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<u8>, St
     Ok(header)
 }
 
-/// Import a bundle from a reader (see `import_bundle`).
-fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStats, String> {
+/// Import a bundle from a reader (see `import_bundle`). The header is read first, so a file in
+/// another version is reported unsupported whatever its last bytes are; then the whole file is
+/// checked against its digest before anything is written, so a file that is not the bytes its
+/// builder wrote leaves nothing behind.
+fn import_bundle_reader<R>(mut reader: R) -> Result<ImportStats, String>
+where
+    R: std::io::BufRead + std::io::Seek,
+{
     let header = read_bundle_header(&mut reader)?;
 
     if header != BUNDLE_HEADER.as_bytes() {
@@ -1040,7 +1098,48 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
         ));
     }
 
-    import_native_bundle_reader(&mut reader)
+    let body_length = verify_bundle_digest(&mut reader)?;
+
+    // The body ends where the digest starts, so the end-of-file check below sees the digest as
+    // the end and not as trailing bytes.
+    import_native_bundle_reader(&mut reader.take(body_length))
+}
+
+/// Check the whole bundle `reader` holds against the digest that ends it, and leave `reader` back
+/// where it was, just past the header. Returns the length of the body between the header and the
+/// digest.
+fn verify_bundle_digest<R: Read + std::io::Seek>(reader: &mut R) -> Result<u64, String> {
+    use std::io::SeekFrom;
+
+    let seek_error = |e: std::io::Error| {
+        format!("Error while reading the bundle for its digest: {}", e)
+    };
+    let body_start = reader.stream_position().map_err(seek_error)?;
+    let total = reader.seek(SeekFrom::End(0)).map_err(seek_error)?;
+    let digested = total.checked_sub(BUNDLE_DIGEST_BYTES as u64)
+        .filter(|digested| *digested >= body_start)
+        .ok_or_else(|| {
+            format!("{}: it ends before its digest ({} bytes).", BUNDLE_DIGEST_PREFIX, total)
+        })?;
+
+    reader.seek(SeekFrom::Start(0)).map_err(seek_error)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut digested_part = reader.by_ref().take(digested);
+    hasher.update_reader(&mut digested_part).map_err(seek_error)?;
+    let mut recorded = [0u8; BUNDLE_DIGEST_BYTES];
+    if digested_part.limit() != 0 || reader.read_exact(&mut recorded).is_err() {
+        return Err(format!("{}: it shrank while it was being read.", BUNDLE_DIGEST_PREFIX));
+    }
+
+    if hasher.finalize().as_bytes() != &recorded {
+        return Err(format!(
+            "{}: the file is not the one its builder wrote, so nothing of it is imported.",
+            BUNDLE_DIGEST_PREFIX
+        ));
+    }
+
+    reader.seek(SeekFrom::Start(body_start)).map_err(seek_error)?;
+    Ok(digested - body_start)
 }
 
 /// Import the zstd record stream that follows a version-3 header, storing only the records
@@ -1118,9 +1217,9 @@ fn import_record_stream<R: std::io::BufRead>(reader: R, mut admitter: Admitter) 
     Ok(stats)
 }
 
-/// Import a version-4 whole-warehouse bundle: quarantine and verify its native pack pairs, publish
-/// those aggregate files, then store the signature sidecars that follow, each admitted only for a
-/// parcel those packs carry.
+/// Import the body of a version-5 whole-warehouse bundle, between its header and its digest:
+/// quarantine and verify its native pack pairs, publish those aggregate files, then store the
+/// signature sidecars that follow, each admitted only for a parcel those packs carry.
 fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, String> {
     let pack_count = read_u32_be(reader, "native pack count")? as usize;
     if pack_count > pack_utils::MAX_TRANSPORT_PACKS {
@@ -1211,7 +1310,7 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
     let mut trailing = [0u8; 1];
     match reader.read(&mut trailing) {
         Ok(0) => Ok(stats),
-        Ok(_) => Err("The bundle has trailing bytes after its signature section.".to_string()),
+        Ok(_) => Err("The bundle has bytes between its signature section and its digest.".into()),
         Err(e) => Err(format!("Error while checking the end of the bundle: {}", e)),
     }
 }
@@ -1705,23 +1804,38 @@ mod tests {
         (std::fs::read(&stats.path).unwrap(), parcel_object.hash.clone(), blob_object.hash.clone())
     }
 
+    /// `bundle` without the digest that ends it.
+    fn unsealed(bundle: &[u8]) -> &[u8] {
+        &bundle[..bundle.len() - BUNDLE_DIGEST_BYTES]
+    }
+
+    /// `bytes` ended with their own digest, as the builder ends a bundle: a test that changes a
+    /// built bundle re-seals it, so the import reaches the check the test is about instead of
+    /// refusing the digest.
+    fn sealed(mut bytes: Vec<u8>) -> Vec<u8> {
+        let digest = blake3::hash(&bytes);
+        bytes.extend(digest.as_bytes());
+        bytes
+    }
+
     /// `bundle` (from [`build_tiny_native_bundle`]) with its signature section replaced by
-    /// `entries`. That section is the bundle's last bytes: a count, then one hash, length and
+    /// `entries`, re-sealed. That section ends the body: a count, then one hash, length and
     /// sidecar.
     fn with_signature_section(bundle: &[u8], entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let body = unsealed(bundle);
         let sidecar = raw_signature_sidecar("test-key", b"test-signature");
-        let start = bundle.len() - 8 - (64 + 8 + sidecar.len());
-        assert_eq!(u64::from_be_bytes(bundle[start..start + 8].try_into().unwrap()), 1,
+        let start = body.len() - 8 - (64 + 8 + sidecar.len());
+        assert_eq!(u64::from_be_bytes(body[start..start + 8].try_into().unwrap()), 1,
             "the tiny bundle's signature section holds one entry");
 
-        let mut bytes = bundle[..start].to_vec();
+        let mut bytes = body[..start].to_vec();
         bytes.extend((entries.len() as u64).to_be_bytes());
         for (hash, payload) in entries {
             bytes.extend(hash.as_bytes());
             bytes.extend((payload.len() as u64).to_be_bytes());
             bytes.extend(*payload);
         }
-        bytes
+        sealed(bytes)
     }
 
     /// Each signature entry becomes its own sidecar file, so one is admitted only for a parcel the
@@ -1798,6 +1912,7 @@ mod tests {
         let data_start = table + 4 + pack_count as usize * 16;
         assert!(data_len > 12, "the native pack must contain at least one record");
         bundle_bytes[data_start + 12] = 0xff; // first record's kind byte
+        let bundle_bytes = sealed(unsealed(&bundle_bytes).to_vec());
 
         let _destination = Scratch::new("bundle-corrupt-dst");
         let error = import_bundle_bytes(&bundle_bytes).err()
@@ -1808,6 +1923,80 @@ mod tests {
         assert_eq!(status.loose_objects, 0);
         assert_eq!(status.packed_objects, 0);
         assert!(status.packs.is_empty());
+    }
+
+    /// A bundle that is not the bytes its builder wrote is refused with the digest error before
+    /// anything is stored. The first case changes one byte of the signature payload, the bytes a
+    /// splice of two downloads could get wrong while every structural check still passes: without
+    /// the digest, its packs would publish and the wrong sidecar would be stored. The others
+    /// change the digest itself, and cut the file before its digest is complete.
+    ///
+    /// Revert: skip `verify_bundle_digest` → the first case imports (packs published, sidecar
+    /// stored) and the second refuses the digest as trailing bytes → red.
+    #[test]
+    fn a_bundle_that_does_not_match_its_digest_is_refused_before_anything_is_stored() {
+        let (bundle, parcel_hash, _) = build_tiny_native_bundle("bundle-digest-src");
+
+        {
+            let _destination = Scratch::new("bundle-digest-control");
+            let stats = import_bundle_bytes(&bundle).unwrap();
+            assert_eq!((stats.stored_objects, stats.stored_signatures), (3, 1), "the untouched bundle imports");
+        }
+
+        let mut spliced_signature = bundle.clone();
+        let last_body_byte = bundle.len() - BUNDLE_DIGEST_BYTES - 1;
+        spliced_signature[last_body_byte] ^= 0x01;
+        let mut wrong_digest = bundle.clone();
+        *wrong_digest.last_mut().unwrap() ^= 0x01;
+        let cut_short = bundle[..BUNDLE_HEADER.len() + 1 + BUNDLE_DIGEST_BYTES - 1].to_vec();
+
+        for (name, bytes) in [("spliced signature", spliced_signature), ("wrong digest", wrong_digest),
+                              ("cut before its digest", cut_short)] {
+            let _destination = Scratch::new("bundle-digest-refused");
+            let error = import_bundle_bytes(&bytes).err()
+                .unwrap_or_else(|| panic!("{}: a bundle that does not match its digest must be refused", name));
+            assert!(is_bundle_digest_error(&error), "{}: {}", name, error);
+            assert!(!is_unsupported_bundle_error(&error), "{}: {}", name, error);
+
+            // The fresh destination has no objects folder, and import creates one for its first
+            // quarantine temp: its absence shows nothing at all was written.
+            assert!(!Path::new(&file_utils::get_path_objects_root()).exists(),
+                "{}: nothing is written, not even a quarantine temp", name);
+            assert_eq!(sign_utils::load_raw_parcel_signature(&parcel_hash).unwrap(), None,
+                "{}: no sidecar is stored", name);
+        }
+    }
+
+    /// The header decides the version before the digest is looked at: a bundle in the previous
+    /// native version, which carries no digest, is reported unsupported (so a clone falls back to
+    /// its walk) and not as a digest failure (which would fail it).
+    ///
+    /// Revert: run `verify_bundle_digest` before the header check → the old file's last 32 bytes
+    /// are not its digest, so it is refused as a digest error → red.
+    #[test]
+    fn a_previous_version_bundle_is_unsupported_and_not_a_digest_failure() {
+        let (bundle, _, _) = build_tiny_native_bundle("bundle-previous-version-src");
+        let body = &unsealed(&bundle)[BUNDLE_HEADER.len()..];
+        let mut previous = b"forklift-bundle 2026-07-13".to_vec();
+        previous.extend(body);
+
+        let _destination = Scratch::new("bundle-previous-version-dst");
+        let error = import_bundle_bytes(&previous).err().expect("a previous-version bundle must be refused");
+        assert!(is_unsupported_bundle_error(&error), "{}", error);
+        assert!(!is_bundle_digest_error(&error), "{}", error);
+        assert!(!Path::new(&file_utils::get_path_objects_root()).exists(), "nothing is written");
+    }
+
+    #[test]
+    fn only_the_current_header_line_is_a_current_bundle_prefix() {
+        let (bundle, _, _) = build_tiny_native_bundle("bundle-current-prefix");
+        assert!(is_current_bundle_prefix(&bundle));
+        assert!(is_current_bundle_prefix(format!("{}\n", BUNDLE_HEADER).as_bytes()));
+
+        for prefix in [BUNDLE_HEADER.to_string(), format!("{}0\n", BUNDLE_HEADER),
+                       "forklift-bundle 2026-07-13\n".to_string(), String::new()] {
+            assert!(!is_current_bundle_prefix(prefix.as_bytes()), "{:?}", prefix);
+        }
     }
 
     /// A destination that already carries a *different* sidecar for a bundled parcel keeps its

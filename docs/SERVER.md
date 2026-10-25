@@ -248,6 +248,9 @@ revocation by more than about a day.
   Successive versions of a file are **delta-compressed** (`docs/format/BUNDLE_FORMAT.md`,
   §9.1 #1), so the bundle moves each change rather than every whole file; the reconstructed
   objects are hash-verified on import, and older clients fall back to loose objects.
+  After an upgrade that changes the bundle format, the server answers `404` for the old
+  file (clients fetch loose objects meanwhile) and logs a warning until the next build
+  replaces it, so run `forklift-server bundle` once after upgrading.
   Unlike `gc`, `bundle` is **safe to run against a live server** — it never deletes an object
   and writes atomically, so you can refresh a served root's bundle without downtime.
 - **GC:** `forklift-server gc --root … [--grace-hours 24]` deletes objects no live
