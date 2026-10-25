@@ -293,7 +293,8 @@ transport rule reaches, and of what the content-level audit checks independently
 short: a validly-signed, non-revoked parcel on an ordinary pallet passes
 `audit`/`verify_pallet_history` regardless of its signer's role or `pallets` grant — neither is
 checked there (the grant is consulted by the server's transport gate, `authority_utils::may_move`,
-and by `haul_utils::may_record_merge`, never by the audit) — but the **office** pallet is the exception: every
+and, for a `@haul` merged-state cell only, by the content rule `haul_utils::may_record_merge`;
+never for an ordinary pallet's history) — but the **office** pallet is the exception: every
 office-modifying parcel is checked in content audit against its signer's role
 (the office chain walk, `verify_office_chain`, which a client and `audit` run as well as both heads), regardless of how, or whether, the caller authenticated. A server
 run with only the shared static token, an `--open` server, or the AWS serverless head does not

@@ -960,9 +960,9 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
         // unified the rule the token check above used to lack); what still differs between them
         // is normalization, not presence — a token's real, non-blank value is compared byte-exact
         // and never trimmed (above), and an identity's real, non-blank value is *also* never
-        // trimmed: `authority_utils::office_user_of` matches it by exact equality against the tracked office
-        // roster, so trimming a legitimately whitespace-padded identifier here would be the
-        // reason it can never match again (see
+        // trimmed: `authority_utils::office_user_of` matches it by exact equality against the
+        // tracked office roster, so trimming a legitimately whitespace-padded identifier here
+        // would be the reason it can never match again (see
         // `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed` below).
         // Deliberately does not echo `token` into the message — unlike the blank-token case
         // above, `token` here is a real, live credential, and printing it would leak it into the
@@ -1414,7 +1414,9 @@ fn emit_event(state: &Arc<AppState>, event: HookEvent) {
 /// an unkeyed seam would occasionally rendezvous with one of *their* requests instead of
 /// the armed test's own, hanging it. `Mutex`, not thread-local: the gate runs on
 /// whichever `spawn_blocking` thread tokio schedules the request onto, which is never
-/// the thread a test arms this from.
+/// the thread a test arms this from. The gate reaches it for every operator decision,
+/// allowed or refused; an upload never does.
+///
 /// The armed seam: the identifier to rendezvous on, the channel the checkpoint
 /// signals it has been reached, and the gate it then waits on.
 #[cfg(test)]
@@ -2561,12 +2563,14 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // and never leaks whether some other precondition also happened to fail.
             if let Principal::Operator(identifier) = &principal {
                 let office_state = office_state_at(&office_head)?;
-                authority_utils::may_move(&principal, &anchor, &office_state, &pallet_ref).map_err(forbidden)?;
+                let decision = authority_utils::may_move(&principal, &anchor, &office_state, &pallet_ref);
 
                 // No-op outside a test that has armed the seam for this identifier (see
                 // `office_lookup_test_checkpoint`'s doc): a falsifier's rendezvous point, right
-                // where this decision is fixed and before the write it authorizes.
+                // where this decision is fixed, whichever way it went, and before the write it
+                // authorizes.
                 office_lookup_test_checkpoint(identifier);
+                decision.map_err(forbidden)?;
             }
 
             // An early refusal, before the audit below spends anything on a request that cannot

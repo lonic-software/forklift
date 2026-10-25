@@ -677,7 +677,7 @@
 </div>
 
 <h3>8.9 Request topology — the provider never proxies</h3>
-<p>The CLI talks to the provider <em>once</em> (to get a credential); all data-plane work goes <b>directly</b> to <code>forklift-server</code> / the AWS head. Enforcement lives with the data path (the server, extending today's <code>check_auth</code> / <code>office_user_of</code>); the provider is the decision/administration authority that issues verifiable tokens or populates a shared store. <b>Bytes never flow through the provider</b> — proxying a data-plane-heavy protocol would double bandwidth and force the proxy to re-parse route semantics.</p>
+<p>The CLI talks to the provider <em>once</em> (to get a credential); all data-plane work goes <b>directly</b> to <code>forklift-server</code> / the AWS head. Enforcement lives with the data path (each head, extending today's <code>check_auth</code> and the shared authority rules in forklift-core's <code>authority_utils</code>); the provider is the decision/administration authority that issues verifiable tokens or populates a shared store. <b>Bytes never flow through the provider</b> — proxying a data-plane-heavy protocol would double bandwidth and force the proxy to re-parse route semantics.</p>
 <div class="flow"><pre>1  forklift login       CLI ─────────▶ Provider          (once per session)
                         ◀─────────────  signed token (identity + grants, short TTL)
 2  lift/lower/fetch     CLI ─────────▶ forklift-server    (token in header; bytes go direct)
