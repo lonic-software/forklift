@@ -69,7 +69,6 @@ impl TestWarehouse {
     /// to compact.
     fn prepare_with_a_parcel(&self) {
         assert_success(&self.run(&["prepare"]));
-        assert_success(&self.run(&["config", "--global", "operator.name", "Test Operator"]));
         assert_success(&self.run(&["config", "--global", "operator.identifier", "test@forklift"]));
 
         for index in 0..20 {
@@ -208,7 +207,6 @@ fn import_git_reports_its_phases_on_the_channel() {
     git(&["commit", "-qm", "second commit"]);
 
     assert_success(&warehouse.run(&["prepare"]));
-    assert_success(&warehouse.run(&["config", "--global", "operator.name", "Test Operator"]));
     assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "test@forklift"]));
 
     let (output, lines) = run_and_collect(&warehouse, &["import-git", "."]);

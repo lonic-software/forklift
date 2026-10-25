@@ -234,7 +234,6 @@ fn harvest(warehouse: &Path) -> Harvest {
 /// Configure an operator in a fresh warehouse dir (prepare + identity).
 fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["prepare"]);
-    area.forklift(dir, &["config", "--global", "operator.name", "AWS Head Tester"]);
     area.forklift(dir, &["config", "--global", "operator.identifier", "tester@forklift"]);
 }
 
@@ -723,7 +722,6 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
 
         let sign = |identifier: &str, key_id: &str| {
             let actor = forklift_core::model::operator::Operator {
-                name: identifier.to_string(),
                 identifier: identifier.to_string(),
             };
             office_utils::build_and_sign_office_parcel(
@@ -738,7 +736,6 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
         let mut demoted = state.clone();
         demoted.users.iter_mut().find(|user| user.identifier == worker).unwrap().role = office_utils::Role::Writer;
         let admin = forklift_core::model::operator::Operator {
-            name: "tester@forklift".to_string(),
             identifier: "tester@forklift".to_string(),
         };
         let demotion = office_utils::build_and_sign_office_parcel(

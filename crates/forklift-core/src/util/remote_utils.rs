@@ -7445,8 +7445,7 @@ async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str)
 /// empty map and the pseudonymous identifiers stay on screen. Resolution is display
 /// sugar, never a verification input, so it can never fail a command.
 pub async fn resolve_office_display_names() -> BTreeMap<String, String> {
-    // No remote means no directory to ask; only local profile names exist, and those
-    // are already the operator's own.
+    // No remote means no directory to ask, and Forklift holds no names of its own.
     let Ok(client) = RemoteClient::from_config() else {
         return BTreeMap::new();
     };

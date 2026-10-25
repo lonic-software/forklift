@@ -205,7 +205,6 @@ touch_files() {
 # ── build the corpus ─────────────────────────────────────────────────────────
 echo "-> building the corpus ($N_FILES files across $DIRS dirs)…"
 fl prepare >/dev/null
-fl config --global operator.name "Bench Operator" >/dev/null
 fl config --global operator.identifier "bench@forklift" >/dev/null
 
 gen_initial_files

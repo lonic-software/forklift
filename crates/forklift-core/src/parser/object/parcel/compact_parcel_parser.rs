@@ -52,7 +52,6 @@ mod tests {
         ParcelAction {
             operator: Operator {
                 identifier: "1a2b3c4d-0000-4000-8000-1234567890ab".to_string(),
-                name: "Máté".to_string(),
             },
             action: ParcelActionType::Author,
             description: description.map(|d| d.to_string()),
@@ -79,9 +78,7 @@ mod tests {
         assert_eq!(parsed.tree_hash, parcel.tree_hash);
         assert_eq!(parsed.parents, parcel.parents);
         assert_eq!(parsed.actions.len(), 1);
-        // Only the opaque operator id crosses the wire; display data never does.
         assert_eq!(parsed.actions[0].operator.identifier, "1a2b3c4d-0000-4000-8000-1234567890ab");
-        assert_eq!(parsed.actions[0].operator.name, "1a2b3c4d-0000-4000-8000-1234567890ab");
         assert_eq!(parsed.actions[0].description.as_deref(), Some("added the thing"));
         assert_eq!(parsed.actions[0].timestamp, parcel.actions[0].timestamp);
         assert_eq!(parsed.description.as_deref(), Some("A parcel description."));

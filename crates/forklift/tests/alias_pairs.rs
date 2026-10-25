@@ -37,7 +37,6 @@ impl Warehouse {
 
         let warehouse = Warehouse { base, root, home };
         warehouse.run_ok(&["prepare"]);
-        warehouse.run_ok(&["config", "operator.name", "spike@forklift"]);
         warehouse.run_ok(&["config", "operator.identifier", "spike@forklift"]);
 
         for (path, content) in files.iter().chain(&[("staged.txt", "staged\n"), ("unstaged.txt", "unstaged\n")]) {

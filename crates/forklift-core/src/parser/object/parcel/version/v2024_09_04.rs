@@ -152,12 +152,7 @@ fn read_actions(offset: usize, content: &[u8]) -> Result<(Vec<ParcelAction>, usi
             .filter(|description| !description.is_empty());
 
         actions.push(ParcelAction {
-            operator: Operator {
-                identifier: operator_identifier.clone(),
-                // Display data is resolved from the opaque operator id outside the
-                // object layer; the id itself is the fallback display form.
-                name: operator_identifier
-            },
+            operator: Operator { identifier: operator_identifier },
             action: action_type,
             description,
             timestamp: action_time,

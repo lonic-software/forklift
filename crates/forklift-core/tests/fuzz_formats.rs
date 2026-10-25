@@ -140,7 +140,6 @@ fn parcel_seed(rng: &mut Rng) -> Parcel {
     let action = |rng: &mut Rng| ParcelAction {
         operator: Operator {
             identifier: "1a2b3c4d-0000-4000-8000-1234567890ab".to_string(),
-            name: "ignored-on-the-wire".to_string(),
         },
         action: if rng.bool() { ParcelActionType::Author } else { ParcelActionType::Stack },
         // A description is either absent or non-empty: the builder normalizes `Some("")` to

@@ -365,7 +365,6 @@ fn prepare_warehouse(area: &TestArea, name: &str, remote_url: &str) {
     std::fs::create_dir_all(area.path(name)).unwrap();
 
     assert_success(&area.forklift(name, &["prepare"]));
-    assert_success(&area.forklift(name, &["config", "--global", "operator.name", "Remote Tester"]));
     assert_success(&area.forklift(name, &["config", "--global", "operator.identifier", "tester@forklift"]));
     assert_success(&area.forklift(name, &["config", "remote.url", remote_url]));
 }
@@ -4456,7 +4455,6 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
     // remote and skip the remote-heads union entirely, so the boundary is exactly `[U3]`.
     std::fs::create_dir_all(area.path("w")).unwrap();
     assert_success(&area.forklift("w", &["prepare"]));
-    assert_success(&area.forklift("w", &["config", "--global", "operator.name", "Origin Tester"]));
     assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "tester@forklift"]));
 
     // U1, U2, U3: three unsigned, pre-office stacks on `main`.
@@ -4571,7 +4569,6 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "w", &server.url);
-    assert_success(&area.forklift("w", &["config", "--global", "operator.name", "Admin"]));
     assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "admin@forklift"]));
 
     area.write_file("w/base.txt", "base\n");

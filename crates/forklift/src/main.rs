@@ -390,8 +390,8 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Config { global, unset, key, value } =>
             commands::config::handle_command(global, unset, key, value),
         Command::Profile { action } => match action {
-            Some(ProfileAction::Create { name, display_name, identifier }) =>
-                commands::profile::create(&name, display_name, identifier),
+            Some(ProfileAction::Create { name, identifier }) =>
+                commands::profile::create(&name, identifier),
             Some(ProfileAction::Use { name }) => commands::profile::use_profile(&name),
             Some(ProfileAction::List) | None => commands::profile::list(),
         },

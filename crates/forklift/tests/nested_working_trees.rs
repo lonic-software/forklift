@@ -38,7 +38,6 @@ impl Warehouse {
 
         let warehouse = Warehouse { base, root, home };
         warehouse.run_ok(&["prepare"]);
-        warehouse.run_ok(&["config", "operator.name", "nested@forklift"]);
         warehouse.run_ok(&["config", "operator.identifier", "nested@forklift"]);
 
         warehouse
@@ -508,7 +507,6 @@ fn import_git_refuses_a_metadata_folder_below_the_top_level() {
         .output()
         .unwrap();
     assert!(run(&["prepare"]).status.success());
-    assert!(run(&["config", "operator.name", "nested@forklift"]).status.success());
     assert!(run(&["config", "operator.identifier", "nested@forklift"]).status.success());
 
     let import = run(&["import-git", "."]);

@@ -154,10 +154,8 @@ impl BlamedParcel {
 
         let identifier = author.operator.identifier.clone();
 
-        // A resolved name wins; the parser's identifier-as-name fallback is dropped.
-        let name = names.get(&identifier).cloned().or_else(|| {
-            (author.operator.name != identifier).then(|| author.operator.name.clone())
-        });
+        // Names come only from the remote's directory; an operator it does not name has none.
+        let name = names.get(&identifier).cloned();
 
         // The signed office record carries the class and supervisor (§7.1). A human (the
         // default) shows neither — only automated authorship is worth calling out.

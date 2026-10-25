@@ -1121,6 +1121,5 @@ fn harvest(warehouse: &Path) -> Harvest {
 
 fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["prepare"]);
-    area.forklift(dir, &["config", "--global", "operator.name", "AWS Edge Tester"]);
     area.forklift(dir, &["config", "--global", "operator.identifier", "tester@forklift"]);
 }

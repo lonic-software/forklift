@@ -67,7 +67,6 @@ Two more terms you'll meet:
 
 ```sh
 forklift prepare                          # create a warehouse here
-forklift config operator.name "Ada"       # who you are (optional; an id is minted otherwise)
 
 echo "hello" > readme.txt
 forklift load .                            # stage everything

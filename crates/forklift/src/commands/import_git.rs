@@ -960,7 +960,6 @@ fn parse_commit(text: &str) -> Result<GitCommit, String> {
 /// Parse a git identity line: `Name <email> <unix-seconds> <tz-offset>`.
 fn parse_identity(text: &str) -> Result<(Operator, i64), String> {
     let email_start = text.find(" <").ok_or("A git identity has no email.".to_string())?;
-    let name = text[..email_start].trim().to_string();
 
     let after_lt = email_start + 2;
     let email_len = text[after_lt..].find('>').ok_or("A git identity has an unterminated email.".to_string())?;
@@ -972,8 +971,9 @@ fn parse_identity(text: &str) -> Result<(Operator, i64), String> {
         .and_then(|value| value.parse::<i64>().ok())
         .ok_or("A git identity has no timestamp.".to_string())?;
 
-    // The email is the stable, pseudonymous id; the name is local display data.
-    Ok((Operator { name, identifier: email }, time))
+    // The email becomes the operator id. Forklift records no names (the chain is pseudonymous),
+    // so the git author name is not kept.
+    Ok((Operator { identifier: email }, time))
 }
 
 /// Refuse `name` as an entry of the git tree `git_hash`, at `path_prefix` from the root, if some

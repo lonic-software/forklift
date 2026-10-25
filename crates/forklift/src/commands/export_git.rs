@@ -537,8 +537,9 @@ fn create_export_temp(recipe_hash: &str, counter: &std::sync::atomic::AtomicU64)
 /// The (name, email) and unix time of a parcel's authoring action (`want_author`) or its
 /// stacking action, falling back to the first action of any kind (every parcel has one).
 ///
-/// Both are cleaned the way git cleans an identity, so git writes them as given. A name that cleans
-/// to nothing, which git refuses, falls back to the cleaned identifier, then to "forklift".
+/// Forklift records no names, so both name and email are the operator id, cleaned the way git cleans
+/// an identity so git writes it as given. An id that cleans to nothing, which git refuses as a name,
+/// is named "forklift".
 fn action_identity(parcel: &Parcel, want_author: bool) -> ((String, String), i64) {
     let action = parcel.actions.iter()
         .find(|action| matches!(action.action, ParcelActionType::Author) == want_author)
@@ -547,9 +548,7 @@ fn action_identity(parcel: &Parcel, want_author: bool) -> ((String, String), i64
     match action {
         Some(action) => {
             let email = without_crud(&action.operator.identifier);
-            let name = [without_crud(&action.operator.name), email.clone()].into_iter()
-                .find(|name| !name.is_empty())
-                .unwrap_or_else(|| "forklift".to_string());
+            let name = if email.is_empty() { "forklift".to_string() } else { email.clone() };
             ((name, email), action.timestamp.timestamp())
         }
         None => (("forklift".to_string(), "forklift@localhost".to_string()), 0),
@@ -768,7 +767,7 @@ mod tests {
 
     fn action(action: ParcelActionType, operator: &str, seconds: i64) -> ParcelAction {
         ParcelAction {
-            operator: Operator { name: operator.to_string(), identifier: operator.to_string() },
+            operator: Operator { identifier: operator.to_string() },
             action,
             description: None,
             timestamp: DateTime::<Utc>::from_timestamp(seconds, 0).unwrap(),

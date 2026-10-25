@@ -62,7 +62,9 @@ forklift import-git .
 
 One-way migration of a git repo's history into the warehouse: git commits become
 parcels, trees become trees, blobs become blobs, and each **local branch becomes a
-pallet** (git's author/committer split maps onto forklift's author/stack). A branch's pallet
+pallet** (git's author/committer split maps onto forklift's author/stack). An author or committer
+becomes the operator id of their git email; the git name is not kept, since forklift records no
+names (so `export-git` later writes that email as the author name). A branch's pallet
 name is its name lowercased, with every character a pallet name does not allow replaced by `-`,
 and any part that would then start with `-` prefixed with `branch` (`@wip` becomes `branch-wip`).
 Before anything is converted, the import refuses, naming the branches, when a mapped name is
@@ -126,8 +128,8 @@ the current pallet, and its working tree is checked out). The point is that tryi
 reversible — your code history is never trapped. Requires `git` on your PATH; the target path
 must be empty or new. **Lossy in this direction:** git has no home for the signed office, the
 `@manifest` (approvals/provenance) or per-parcel signatures, so those are dropped. Author
-identity round-trips as the on-chain **identifier** — forklift never stores display names
-on-chain (zero-PII by design), so the git author name is that identifier (or `forklift`, when
+identity round-trips as the on-chain **identifier** — forklift records no display names
+(zero-PII by design), so the git author name is that identifier (or `forklift`, when
 the identifier holds nothing git keeps in a name). The meta pallets (`@office`, `@manifest`)
 and tags are not exported. Dates are written in UTC (`+0000`), and git has no date before 1970,
 so a parcel stamped earlier exports as 1970-01-01.
@@ -194,11 +196,13 @@ so git receives nothing it already holds.
 ### `config` — who you are, and settings
 
 Identity is zero-configuration: if you never set anything, an opaque operator id
-(a UUID) is minted on first use and your history is pseudonymous. To be
-recognizable, set a name:
+(a UUID) is minted on first use and your history is pseudonymous. Forklift records
+no names: `history`, `blame`, `tag` and `office list` show a name only when the
+remote's directory supplies one for an id, and the id otherwise. To act under an id
+of your choosing, set it:
 
 ```sh
-forklift config operator.name "Ada Lovelace"
+forklift config --global operator.identifier ada@example.com
 ```
 
 `config` has four forms:
@@ -1734,7 +1738,7 @@ forklift office retire <key>      # revoke a key
 
 ```sh
 forklift profile list
-forklift profile create work --display-name "Work Me"
+forklift profile create work
 forklift profile use work
 ```
 
@@ -2119,7 +2123,6 @@ value. Known keys:
 
 | Key | Meaning |
 |-----|---------|
-| `operator.name` | Your display name (local only — never written on-chain). |
 | `operator.identifier` | Your on-chain operator id (opaque; a UUID is minted if unset). |
 | `operator.profile` | The named profile this warehouse acts under (see `profile`). |
 | `remote.url` | The remote warehouse URL (for `lift`/`lower`). Can be a Tor `.onion` — see [Reaching a remote over Tor](#reaching-a-remote-over-tor). |
@@ -2171,13 +2174,14 @@ Refused, in either file:
 |---------|-----|
 | `[opperator]`, or any other unknown section | a mistyped section header hides every key inside it |
 | `identifer = "ada"` | an unknown key inside a known section — the typo that mints over your identity |
+| `name = "Ada"` in `[operator]` | Forklift records no names, so there is no such key — delete the line. Names come only from a remote's directory |
 | `[[operator]]`, `[[profile.work]]` | an array-of-tables where a table is expected |
 | `operator = 5` | a section that is not a table at all |
 | `loose = 6700`, `tor = true` | every value is a **string on disk**, including the numeric and boolean ones — write `"6700"` and `"on"` |
 | `torProxy` spelled `torproxy` | keys are case-sensitive |
 | `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
 | `auto = "flase"`, `loose = "10k"` | `maintenance.auto` accepts only the spellings listed above, and `maintenance.loose`/`maintenance.packs` only a whole number. A typo here used to leave maintenance on, or fall back to the default threshold, without a word |
-| an unknown field in a `[profile.<name>]` section | profiles hold `identifier` and `name`, nothing else |
+| an unknown field in a `[profile.<name>]` section | profiles hold only `identifier` |
 | any key set to `""` (or to whitespace) | a key holds a value or is absent, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry. Remove a section key with `forklift config --unset <key>` (add `--global` for the global file); a `[profile.<name>]` field the command cannot address, so remove that one in an editor |
 
 **A write is refused unless the file it would leave on disk parses completely.** The check is on
@@ -2194,7 +2198,7 @@ ever edited with the command.
 Set / read / remove:
 
 ```sh
-forklift config operator.name "Ada"
+forklift config remote.url https://forklift.example.com
 forklift config --global operator.identifier ada@example.com
 forklift config remote.token
 forklift config --unset remote.token

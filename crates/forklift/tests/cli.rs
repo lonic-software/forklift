@@ -151,7 +151,6 @@ fn assert_only_the_ignore_file_is_untracked(warehouse: &TestWarehouse) {
 /// Configure the operator identity (in the test-scoped global configuration), which
 /// stacking parcels requires.
 fn configure_operator(warehouse: &TestWarehouse) {
-    assert_success(&warehouse.run(&["config", "--global", "operator.name", "Test Operator"]));
     assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "test@forklift"]));
 }
 
@@ -422,36 +421,36 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
     assert!(warehouse.root.join(".forklift/config/warehouse.toml").exists());
 
     // Global values work without a warehouse and act as the fallback.
-    assert_success(&warehouse.run(&["config", "--global", "operator.name", "Global Name"]));
+    assert_success(&warehouse.run(&["config", "--global", "remote.url", "https://global.example"]));
     assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "global@id"]));
 
-    let effective_name = warehouse.run(&["config", "operator.name"]);
-    assert_success(&effective_name);
-    assert_eq!(stdout(&effective_name).trim(), "Global Name");
+    let effective_url = warehouse.run(&["config", "remote.url"]);
+    assert_success(&effective_url);
+    assert_eq!(stdout(&effective_url).trim(), "https://global.example");
 
     // A warehouse-level value overrides the global one...
-    assert_success(&warehouse.run(&["config", "operator.name", "Warehouse Name"]));
-    let overridden = warehouse.run(&["config", "operator.name"]);
+    assert_success(&warehouse.run(&["config", "remote.url", "https://warehouse.example"]));
+    let overridden = warehouse.run(&["config", "remote.url"]);
     assert_success(&overridden);
-    assert_eq!(stdout(&overridden).trim(), "Warehouse Name");
+    assert_eq!(stdout(&overridden).trim(), "https://warehouse.example");
 
     // ...but reading the global scope explicitly still returns the global value.
-    let global_name = warehouse.run(&["config", "--global", "operator.name"]);
-    assert_success(&global_name);
-    assert_eq!(stdout(&global_name).trim(), "Global Name");
+    let global_url = warehouse.run(&["config", "--global", "remote.url"]);
+    assert_success(&global_url);
+    assert_eq!(stdout(&global_url).trim(), "https://global.example");
 
     // The template's comments survive a value being set.
     let warehouse_config = std::fs::read_to_string(
         warehouse.root.join(".forklift/config/warehouse.toml")
     ).unwrap();
     assert!(warehouse_config.contains("# Forklift warehouse configuration."));
-    assert!(warehouse_config.contains("Warehouse Name"));
+    assert!(warehouse_config.contains("https://warehouse.example"));
 
     // Listing shows the effective values and where they come from.
     let listing = warehouse.run(&["config"]);
     assert_success(&listing);
     let listing_output = stdout(&listing);
-    assert!(listing_output.contains("operator.name = Warehouse Name (warehouse)"));
+    assert!(listing_output.contains("remote.url = https://warehouse.example (warehouse)"));
     assert!(listing_output.contains("operator.identifier = global@id (global)"));
 
     // Unknown keys are rejected instead of silently doing nothing.
@@ -461,10 +460,43 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
 
     // An unset key is an error on read.
     std::fs::remove_file(warehouse.home.join("global-config.toml")).unwrap();
-    assert_success(&warehouse.run(&["config", "operator.name"]));
+    assert_success(&warehouse.run(&["config", "remote.url"]));
     let unset = warehouse.run(&["config", "operator.identifier"]);
     assert!(!unset.status.success());
     assert!(stderr(&unset).contains("not set"));
+}
+
+/// Forklift records no names, so a file that still sets one is refused like any other unknown
+/// key — loudly, naming the file and the key — never read as if the name were shown somewhere.
+#[test]
+fn a_config_file_that_sets_a_name_is_refused() {
+    let warehouse = TestWarehouse::new("config-name-refused");
+    assert_success(&warehouse.run(&["prepare"]));
+
+    let global = warehouse.home.join("global-config.toml");
+    let local = warehouse.root.join(".forklift/config/warehouse.toml");
+    let template = std::fs::read_to_string(&local).unwrap();
+    let name = "\"operator.name\" is not a known configuration key";
+    for (file, content, key) in [
+        (&global, "[operator]\nidentifier = \"op-1\"\nname = \"Ada\"\n", name),
+        (&global, "[profile.work]\nidentifier = \"op-2\"\nname = \"Work\"\n", "\"profile.work.name\" is not a known profile field"),
+        (&local, "[operator]\nname = \"Ada\"\n", name),
+    ] {
+        std::fs::write(&global, "").unwrap();
+        std::fs::write(&local, &template).unwrap();
+        std::fs::write(file, content).unwrap();
+        let refused = warehouse.run(&["config"]);
+        assert!(!refused.status.success(), "{content:?} must refuse: {}", stdout(&refused));
+        let message = stderr(&refused);
+        assert!(message.contains(key), "unexpected: {message}");
+        let file_name = file.file_name().unwrap().to_str().unwrap();
+        assert!(message.contains(file_name), "the refusal must name the file: {message}");
+    }
+    std::fs::write(&local, &template).unwrap();
+
+    let set = warehouse.run(&["config", "operator.name", "Ada"]);
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("Unknown configuration key"), "{}", stderr(&set));
 }
 
 /// FORK-117's contract, at the surface where it is most visible: _a configuration file either
@@ -4387,11 +4419,10 @@ fn office_manages_users_and_keys_as_signed_tracked_metadata() {
     assert_success(&enroll);
     assert!(stdout(&enroll).contains("established trust"));
 
-    // Office records carry only the opaque operator id (the display name never goes
-    // on-chain), and the genesis key is pinned as the identity root.
+    // Office records carry only the opaque operator id, and the genesis key is pinned as the
+    // identity root.
     let list = stdout(&warehouse.run(&["office", "list"]));
     assert!(list.contains("test@forklift — admin"), "unexpected list: {}", list);
-    assert!(!list.contains("Test Operator"), "display data must not reach the office: {}", list);
     assert!(list.contains("active, on this machine"));
     assert!(list.contains("identity root"), "unexpected list: {}", list);
 
@@ -6783,7 +6814,7 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     configure_operator(&warehouse);
 
     // Create a named profile; its id is minted (none given).
-    let created = warehouse.run(&["profile", "create", "work", "--display-name", "Work Me"]);
+    let created = warehouse.run(&["profile", "create", "work"]);
     assert_success(&created);
 
     // Creating it again is refused.
@@ -6967,44 +6998,6 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
     assert!(stdout(&warehouse.run(&["config", "remote.tor"])).contains("on"));
 }
 
-/// A refused profile creation leaves nothing behind. Creation used to be two writes, and a value
-/// refused by the second left the first on disk.
-///
-/// `profile create --display-name "" work` minted an identifier, wrote `[profile.work]`, then refused the
-/// empty display name — reporting failure while leaving a profile behind that made the obvious
-/// retry fail too ("the profile \"work\" already exists"), with no command able to remove it.
-/// The fixture is the *second* field for that reason: refusing on the first would prove nothing
-/// about ordering.
-///
-/// Two mechanisms now hold this, and either alone does: `create_profile` refuses its inputs
-/// before writing anything, and creation is a single write of every field. Measured:
-/// with the up-front checks removed this test stays green; with them removed *and* the write split
-/// per field it goes red.
-#[test]
-fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
-    let warehouse = TestWarehouse::new("profile-create-is-all-or-nothing");
-    assert_success(&warehouse.run(&["prepare"]));
-
-    let created = warehouse.run(&["profile", "create", "work", "--display-name", ""]);
-    assert!(!created.status.success(), "an empty display name must refuse: {}", stdout(&created));
-    assert!(
-        stderr(&created).contains("cannot be empty"),
-        "unexpected refusal: {}", stderr(&created)
-    );
-
-    // Nothing was written: the global file either does not exist or holds no profile section.
-    let global_config = warehouse.home.join("global-config.toml");
-    let content = std::fs::read_to_string(&global_config).unwrap_or_default();
-    assert!(
-        !content.contains("[profile.work]"),
-        "a refused creation must leave no profile behind: {content}"
-    );
-
-    // And the retry that used to be locked out succeeds.
-    let retry = warehouse.run(&["profile", "create", "work", "--display-name", "Work Me"]);
-    assert_success(&retry);
-}
-
 /// An empty value is refused with the fact alone wherever no advice is true on every path, and with
 /// "omit it" where the value came from an option. `--unset` is never suggested: it needs the right
 /// scope, fails for a key that is not set, and cannot address a profile field, so any hint built
@@ -7019,11 +7012,11 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     // `config`, both scopes, a key that is set and one that is not: the same bare fact. The
     // global case runs inside a warehouse, where an `--unset` without `--global` used to be
     // suggested and would have targeted the wrong file.
-    assert_success(&warehouse.run(&["config", "--global", "operator.name", "Ada"]));
+    assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "ada"]));
 
     for (args, key) in [
-        (vec!["config", "--global", "operator.name", ""], "operator.name"),
-        (vec!["config", "operator.name", "   "], "operator.name"),
+        (vec!["config", "--global", "operator.identifier", ""], "operator.identifier"),
+        (vec!["config", "operator.identifier", "   "], "operator.identifier"),
         (vec!["config", "remote.token", ""], "remote.token"),
     ] {
         let refused = warehouse.run(&args);
@@ -7032,8 +7025,8 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     }
 
     // The refused write left the value it would have replaced.
-    let read = warehouse.run(&["config", "--global", "operator.name"]);
-    assert_eq!(stdout(&read).trim(), "Ada", "a refused write must leave the file as it was");
+    let read = warehouse.run(&["config", "--global", "operator.identifier"]);
+    assert_eq!(stdout(&read).trim(), "ada", "a refused write must leave the file as it was");
 
     // An unknown key is reported as unknown, not as empty: the key is checked first.
     let refused = warehouse.run(&["config", "operator.nmae", ""]);
@@ -7043,15 +7036,12 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     );
 
     // The `profile create` door: nothing is on disk yet, so the advice is about the option.
-    for (args, option) in [
-        (["profile", "create", "work", "--display-name", ""], "--display-name"),
-        (["profile", "create", "work", "--id", "  "], "--id"),
-    ] {
-        let refused = warehouse.run(&args);
-        assert!(!refused.status.success(), "{option} \"\" must refuse: {}", stdout(&refused));
+    for id in ["", "  "] {
+        let refused = warehouse.run(&["profile", "create", "work", "--id", id]);
+        assert!(!refused.status.success(), "--id {id:?} must refuse: {}", stdout(&refused));
 
         let message = stderr(&refused);
-        assert!(message.contains(option), "the refusal must name the option: {message}");
+        assert!(message.contains("--id"), "the refusal must name the option: {message}");
         assert!(message.contains("Omit it"), "the refusal must say what to do: {message}");
         assert!(
             !message.contains("file") && !message.contains("--unset"),
@@ -7062,14 +7052,14 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     // The parse door: a bad *global* file read from inside a warehouse. The message names the
     // file and says to fix it — and offers no `--unset`, which here would carry no `--global`
     // and could not succeed while another entry in the file was also bad.
-    std::fs::write(&global_config, "[operator]\nidentifier = \"op-1\"\nname = \"\"\n").unwrap();
+    std::fs::write(&global_config, "[operator]\nidentifier = \"op-1\"\n[remote]\nurl = \"\"\n").unwrap();
 
-    let read = warehouse.run(&["config", "operator.name"]);
+    let read = warehouse.run(&["config", "remote.url"]);
     assert!(!read.status.success(), "a file holding an empty value must refuse");
 
     let message = stderr(&read);
     assert!(message.contains("global-config.toml"), "the refusal must name the file: {message}");
-    assert!(message.contains("\"operator.name\" cannot be empty."), "unexpected: {message}");
+    assert!(message.contains("\"remote.url\" cannot be empty."), "unexpected: {message}");
     assert!(message.contains("Fix the file by hand"), "unexpected: {message}");
     assert!(!message.contains("--unset"), "the parse door may not suggest --unset: {message}");
 }
@@ -8956,8 +8946,8 @@ fn config_unset_removes_a_value() {
     assert!(stderr(&unknown).contains("Unknown configuration key"), "{}", stderr(&unknown));
 
     // --json emits the envelope for a successful unset.
-    assert_success(&warehouse.run(&["config", "operator.name", "Temp"]));
-    let json_unset = warehouse.run(&["config", "--unset", "operator.name", "--json"]);
+    assert_success(&warehouse.run(&["config", "remote.token", "temp"]));
+    let json_unset = warehouse.run(&["config", "--unset", "remote.token", "--json"]);
     assert_success(&json_unset);
     assert_eq!(json(&json_unset)["ok"], true);
     assert_eq!(json(&json_unset)["command"], "config");
