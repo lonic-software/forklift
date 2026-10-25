@@ -16,6 +16,7 @@ pub mod journal_utils;
 pub mod haul_utils;
 pub mod sign_utils;
 pub mod merge_utils;
+pub mod mirror_utils;
 pub mod meta_tree;
 pub mod kv_utils;
 pub mod stack_utils;

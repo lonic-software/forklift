@@ -81,6 +81,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
             retained_shared: plan.retained_shared,
             kept_unlifted: plan.kept_unlifted,
             kept_for_hauls: plan.kept_for_hauls,
+            kept_for_mirror: plan.kept_for_mirror,
             kept_for_deleted: plan.kept_for_deleted,
             unlifted_pallets: plan.unlifted_pallets.clone(),
             all_resumed,
@@ -109,6 +110,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
         retained_shared: plan.retained_shared,
         kept_unlifted: plan.kept_unlifted,
         kept_for_hauls: plan.kept_for_hauls,
+        kept_for_mirror: plan.kept_for_mirror,
         kept_for_deleted: plan.kept_for_deleted,
         unlifted_pallets: plan.unlifted_pallets,
         all_resumed,
@@ -285,6 +287,11 @@ pub(crate) struct PruneReport {
     /// reopening it proposes the same head.
     kept_for_hauls: usize,
 
+    /// Candidates kept because the git mirror's roots hold history the remote is not known to
+    /// hold, where no pallet or haul reaches it. Normally zero, since the mirror exports only what
+    /// the remote held; a later prune frees them once the remote holds that history again.
+    kept_for_mirror: usize,
+
     /// Candidates kept because lifting the unlifted history of a pallet deleted here reads them,
     /// while `undo` can still bring that pallet back. Lifting cannot free these; a later prune
     /// does once the delete can no longer be undone.
@@ -380,6 +387,15 @@ impl CommandOutput for PruneReport {
                 merged and its target lifted. A closed haul keeps them, since reopening it proposes \
                 the same head.",
                 self.kept_for_hauls
+            );
+        }
+
+        if self.kept_for_mirror > 0 {
+            println!(
+                "{} object(s) were kept because the git mirror's roots record holds history the \
+                remote is not known to hold, and no pallet or haul does; some may be the only copy. \
+                A later prune frees them once the remote holds that history again.",
+                self.kept_for_mirror
             );
         }
 

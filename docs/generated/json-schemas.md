@@ -966,6 +966,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The result of a git export.",
   "properties": {
     "blobs": {
+      "description": "The git blobs written. A file unchanged from its parcel's first parent is reused, not\nwritten again.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -993,6 +994,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "trees": {
+      "description": "The git trees written. A tree unchanged from its parcel's first parent is reused, not\nwritten again.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -4474,6 +4476,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_for_mirror": {
+      "description": "Candidates kept because the git mirror's roots hold history the remote is not known to\nhold, where no pallet or haul reaches it. Normally zero, since the mirror exports only what\nthe remote held; a later prune frees them once the remote holds that history again.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "kept_unlifted": {
       "description": "Candidates kept because lifting history the remote does not hold reads them: work stacked\nhere and never lifted, or lifted to a remote head not lowered here since. Some may be the\nonly copy, the rest are base trees the lift compares against; a later prune of the same\npath frees them once that history is lifted.",
       "format": "uint",
@@ -4530,6 +4538,7 @@ A command not listed here either reports only the generic human-message shape `{
     "retained_shared",
     "kept_unlifted",
     "kept_for_hauls",
+    "kept_for_mirror",
     "kept_for_deleted",
     "unlifted_pallets",
     "all_resumed"

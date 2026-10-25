@@ -127,8 +127,15 @@ reversible — your code history is never trapped. Requires `git` on your PATH; 
 must be empty or new. **Lossy in this direction:** git has no home for the signed office, the
 `@manifest` (approvals/provenance) or per-parcel signatures, so those are dropped. Author
 identity round-trips as the on-chain **identifier** — forklift never stores display names
-on-chain (zero-PII by design), so the git author name is that identifier. The meta pallets
-(`@office`, `@manifest`) are not exported.
+on-chain (zero-PII by design), so the git author name is that identifier (or `forklift`, when
+the identifier holds nothing git keeps in a name). The meta pallets (`@office`, `@manifest`)
+and tags are not exported. Dates are written in UTC (`+0000`), and git has no date before 1970,
+so a parcel stamped earlier exports as 1970-01-01.
+
+The export is deterministic: the same history exports to the same commit hashes on any
+machine, whatever your own git configuration says (it is shut out of every object write).
+Each commit message ends in a `Forklift-Parcel: <parcel> export/<N>` line naming the parcel
+it came from and the export format it was written in.
 
 ### `config` — who you are, and settings
 
@@ -1597,11 +1604,13 @@ last `lower`) keeps whatever lifting it would read under the path. The report co
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
 then run the same `scope-prune` again, which frees the rest. Other work that exists only here is
 never freed either, whatever its path: content loaded but not yet stacked, parked parcels, an
-unfinished consolidation, the head a haul not yet merged proposes, and the history of a deleted
-pallet while `undo` can still bring it back, in any bay. The report counts those last two keeps
-apart (`kept_for_hauls`, `kept_for_deleted`), since lifting cannot free them; a haul's goes once
-it is merged and its target lifted (a closed haul keeps it, since reopening proposes the same
-head), a deleted pallet's once the delete leaves the undo journal. So you can park edits
+unfinished consolidation, the head a haul not yet merged proposes, history the git mirror's
+roots record holds, and the history of a deleted pallet while `undo` can still bring it back, in
+any bay. The report counts those last three keeps apart (`kept_for_hauls`, `kept_for_mirror`,
+`kept_for_deleted`), since lifting cannot free them; a haul's goes once it is merged and its
+target lifted (a closed haul keeps it, since reopening proposes the same head), the mirror's once
+the remote holds it again, a deleted pallet's once
+the delete leaves the undo journal. So you can park edits
 under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
 `expand` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
