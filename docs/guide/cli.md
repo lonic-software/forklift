@@ -766,8 +766,9 @@ instead of scrolling off the top:
 
 Like paging, color is for a terminal. By default (`--color auto`), `diff`, `history`,
 `query`, `blame` and `haul show` color their output only when stdout is a terminal, the
-`NO_COLOR` environment variable is unset or empty, and `TERM` is not `dumb`. Piped into a
-file or another program, the output is plain text. Paged output keeps its color.
+`NO_COLOR` environment variable is unset or empty, and `TERM` is set and not `dumb` (on
+Windows, an unset `TERM` is fine). Piped into a file or another program, the output is plain
+text. Paged output keeps its color, and help and usage errors follow `--color` too.
 
 - `--color always` colors even into a pipe or a file (for `less -R`, say), whatever
   `NO_COLOR` and `TERM` say.

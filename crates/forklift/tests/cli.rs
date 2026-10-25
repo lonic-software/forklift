@@ -3828,8 +3828,8 @@ fn diff_renders_many_files_in_path_order_in_every_mode() {
 }
 
 /// Colour is for a terminal: piped, every coloured surface prints plain text unless
-/// `--color always` asks for it, and the flag outranks `NO_COLOR`. (The terminal arm is pinned
-/// by `color::enabled_when`'s unit tests; a test's stdout is always a pipe.)
+/// `--color always` asks for it, which a set `NO_COLOR` does not undo. (A test's stdout is always
+/// a pipe, so the terminal arm and NO_COLOR's own effect are pinned by `color`'s unit tests.)
 #[test]
 fn piped_output_is_plain_unless_colour_is_forced() {
     let warehouse = TestWarehouse::new("color-piped");
@@ -3885,6 +3885,26 @@ fn piped_output_is_plain_unless_colour_is_forced() {
     let forced = stdout(&warehouse.run(&["--color", "always", "diff"]));
     assert!(forced.contains("\x1b[1mmodified: a.txt\x1b[0m"), "{:?}", forced);
     assert!(forced.contains("\x1b[31m") && forced.contains("\x1b[32m"), "{:?}", forced);
+}
+
+/// clap's own usage errors follow `--color` too, and the flag's value is never read as the
+/// command a failed parse names.
+#[test]
+fn usage_errors_follow_color_and_its_value_is_not_the_command() {
+    let warehouse = TestWarehouse::new("color-usage");
+
+    for args in [&["diff", "--bogus"][..], &["--color", "never", "diff", "--bogus"], &["--color=never", "diff", "--bogus"]] {
+        let output = warehouse.run(args);
+        assert_eq!(output.status.code(), Some(2), "{:?}", args);
+        assert!(stderr(&output).contains("--bogus") && !stderr(&output).contains('\x1b'), "{:?}: {:?}", args, stderr(&output));
+    }
+    let forced = warehouse.run(&["--color", "always", "diff", "--bogus"]);
+    assert!(stderr(&forced).contains("\x1b["), "{:?}", stderr(&forced));
+
+    for args in [&["--color", "never", "diff", "--bogus", "--json"][..], &["--color=never", "diff", "--bogus", "--json"]] {
+        let failed = json(&warehouse.run(args));
+        assert_eq!(failed["command"], "diff", "{:?}: {}", args, failed);
+    }
 }
 
 /// The `FORKLIFT_DEBUG_PACK_COUNTS` lines of a run: (pack-folder reads, preloads that landed).

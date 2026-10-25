@@ -850,9 +850,9 @@ fn format_diff_lines(out: &mut String, diffs: &[Diff]) {
         let old_number = diff.line_number_old.map(|n| n.to_string()).unwrap_or_default();
         let new_number = diff.line_number_new.map(|n| n.to_string()).unwrap_or_default();
 
-        let line = format!("{:>old_width$} {:>new_width$} {} {}",
-                           old_number, new_number, sign, String::from_utf8_lossy(&diff.line));
-        let _ = writeln!(out, "  {}", color::paint(style, line));
+        let line = String::from_utf8_lossy(&diff.line);
+        let _ = writeln!(out, "  {}", color::paint(style, format_args!("{:>old_width$} {:>new_width$} {} {}",
+                                                                      old_number, new_number, sign, line)));
     }
 }
 
