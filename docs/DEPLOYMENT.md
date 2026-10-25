@@ -400,6 +400,24 @@ derives from. On-demand billing absorbs this without a capacity-planning step; o
 capacity, size write throughput against how many pallets this warehouse had at its last
 enrollment or re-genesis, not just the fixed item count.
 
+**A contended transaction is re-issued by the head, up to four attempts, and every attempt
+bills.** A transaction DynamoDB refuses without any condition failing — `TransactionConflict`
+from another push touching the shared office item, a throughput throttle, an attempt still in
+progress, or an attempt whose outcome is unknown (a timeout, a lost response, an internal
+error) — is re-issued by the head itself: the identical transaction under the same
+`ClientRequestToken`, at most four attempts per client request, waiting 50/100/200 ms
+(jittered) between them, or DynamoDB's longer recommended schedule after
+`TransactionInProgressException`. The token is what makes this safe: re-issuing an attempt that
+actually landed returns success rather than applying it twice. The head checks the Lambda
+invocation's remaining time before each re-issue and answers `503` at once when it cannot cover
+the wait and another attempt (each attempt is cut off after 1 s), so a busy table yields a
+`503` the client can act on rather than an API Gateway `504`. The SDK's own retry is switched off
+for these two transactions only — every other DynamoDB and S3 call keeps the SDK default — so
+four attempts are four billed transactions, not up to twelve. Since a cancelled transaction
+still consumes its capacity, the worst case per request is four times the figures above: 24 WCU
+for a trusted lift's commit and 16 for a re-genesis, with items ≤ 1 KB. The expected case is
+still one attempt.
+
 ### TTL
 
 **None used.** No item this crate writes ever needs to expire — a pallet head and the trust

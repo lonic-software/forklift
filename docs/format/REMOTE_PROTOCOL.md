@@ -299,7 +299,9 @@ mismatch present from the start: the remedy is identical, and the client cannot 
 the two apart.
 A remote may also answer `503` when the write loses to unrelated concurrent traffic rather than
 to either value actually moving; that establishes nothing about the anchor and the request may
-simply be repeated. Clients do not retry it automatically.
+simply be repeated. The AWS serverless head has already re-issued the write itself, within a
+small bounded budget, before it answers `503`, so the answer means the contention outlasted that
+budget. Clients do not retry it automatically.
 
 A client that establishes trust locally (`office enroll`) while a remote is configured
 includes the remote's pallet heads in the anchor's boundary (and refuses to enroll when
@@ -361,9 +363,13 @@ already passed, and is reported `409` there too. That same head can additionally
 **`503`**: its commit is a single backend transaction, and the backend's own concurrency
 control can cancel it for a reason that establishes nothing about whether any input
 actually changed (contention from another push touching a shared item, principally the
-office pallet, rather than a value having moved). Unlike every other status in this
-section, `503` makes no claim about server or request state — a client should retry the
-identical request rather than treat it as a fault or re-read anything first.
+office pallet, rather than a value having moved). The head re-issues that transaction
+itself before answering — the transaction alone, never the audit, under one idempotency token
+per request, at most four attempts in all and only while its invocation window can afford
+another — so a `503` reaches the client only when the contention outlasted that budget. Unlike
+every other status in this section, `503` makes no claim about server or request state — a
+client should retry the identical request rather than treat it as a fault or re-read anything
+first.
 
 The consequence, stated plainly: a remote that has *lost* an object behind `old_head` no
 longer fails at ref-update time. It never failed on a lost tree or blob behind it either —

@@ -2885,12 +2885,18 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
 struct TransientOnAnchorWrite {
     inner: Arc<MemoryRefStore>,
     refusals: usize,
+    refusal: TrustWriteOutcome,
     tokens: std::sync::Mutex<Vec<String>>,
 }
 
 impl TransientOnAnchorWrite {
     fn new(inner: Arc<MemoryRefStore>, refusals: usize) -> TransientOnAnchorWrite {
-        TransientOnAnchorWrite { inner, refusals, tokens: Default::default() }
+        TransientOnAnchorWrite {
+            inner,
+            refusals,
+            refusal: TrustWriteOutcome::Transient(TransientCause::Contended),
+            tokens: Default::default(),
+        }
     }
 
     fn tokens(&self) -> Vec<String> {
@@ -2953,7 +2959,7 @@ impl RefStore for TransientOnAnchorWrite {
         };
 
         if attempt <= self.refusals {
-            return Ok(TrustWriteOutcome::Transient(TransientCause::Contended));
+            return Ok(self.refusal.clone());
         }
 
         self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
@@ -3149,6 +3155,28 @@ fn an_anchor_write_refused_transiently_once_is_reissued_and_lands() {
     assert_eq!(head.refs.tokens().len(), 2);
     let (planted, _) = store.get_trust().unwrap().expect("an anchor");
     assert!(TrustAnchorDto::from(&planted) == mine, "the re-genesis anchor is the one planted");
+}
+
+/// A moved office head is the client's to act on; the anchor write answers it on the first
+/// attempt rather than re-issuing a transaction that can only be refused again.
+#[test]
+fn a_moved_office_head_refuses_the_anchor_write_on_the_first_attempt() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(
+        MemoryObjectStore::new(),
+        TransientOnAnchorWrite {
+            refusal: TrustWriteOutcome::OfficeMoved { current: Some("1".repeat(64)) },
+            ..TransientOnAnchorWrite::new(store, usize::MAX)
+        },
+    );
+
+    let err = head.put_trust(&mine).expect_err("the office moved");
+
+    assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(head.refs.tokens().len(), 1);
 }
 
 /// The window check guards the anchor write as it does the commit.
