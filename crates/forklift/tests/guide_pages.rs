@@ -1,11 +1,11 @@
-//! Runs `docs/guide/tutorial.md`: every command in its `console` blocks, in order, against a
-//! scratch folder, checking each command's exit status and everything it prints. A renamed flag,
-//! a reworded message or a reordered step the page still shows fails this test, so the tutorial
-//! cannot drift from the CLI.
+//! Runs the guide pages that teach by example, [`RUN_PAGES`]: every command in a page's `console`
+//! blocks, in order, against a scratch folder of its own, checking each command's exit status and
+//! everything it prints. A renamed flag, a reworded message or a reordered step a page still shows
+//! fails this test, so the pages cannot drift from the CLI.
 //!
-//! The page is read, not mirrored: there is no second copy of the commands to keep in step. The
-//! tutorial runs commands through a small interpreter here, not through a shell, so it runs the
-//! same on every platform CI covers. Only the commands it knows are allowed, and only words a
+//! A page is read, not mirrored: there is no second copy of the commands to keep in step. The
+//! commands run through a small interpreter here, not through a shell, so they run the same on
+//! every platform CI covers. Only the commands it knows are allowed, and only words a
 //! shell would pass through unchanged; anything else is a failure that names the command, never a
 //! skipped step or a step that runs differently from the reader's.
 
@@ -16,10 +16,13 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 mod common;
 use common::{forklift_command, server_binary};
 
-/// The address the page tells the reader to serve on. The test serves on a port the server picks
-/// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever the
+/// The pages under `docs/guide/` this test runs, each from an empty folder.
+const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md"];
+
+/// The address the pages tell the reader to serve on. The test serves on a port the server picks
+/// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever a
 /// page shows it.
-const TUTORIAL_ADDRESS: &str = "127.0.0.1:7171";
+const PAGE_ADDRESS: &str = "127.0.0.1:7171";
 
 /// What the page writes for text that differs from run to run (hashes, ids, dates).
 const ELISION: char = '…';
@@ -71,7 +74,7 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
                 steps.push(Step { line: number, command: String::new(), expected: Vec::new() });
             } else {
                 return Err(format!(
-                    "line {}: a \"{}\" block; every block in the tutorial is a console block, \
+                    "line {}: a \"{}\" block; every block on the page is a console block, \
                     which this test runs", number, info
                 ));
             }
@@ -264,6 +267,8 @@ impl Drop for Server {
 /// The reader's machine: a scratch folder, their current folder inside it, and a global
 /// configuration and key folder of their own, so the run never touches the developer's.
 struct Reader {
+    /// The page being run, as failure messages name it.
+    page: String,
     area: PathBuf,
     cwd: PathBuf,
     /// Where the page's server really listens, once it has started.
@@ -304,8 +309,9 @@ impl Reader {
 
     /// Run one step and return its exit status and what it printed.
     fn run(&mut self, step: &Step) -> (Option<i32>, Vec<u8>) {
+        let page = self.page.clone();
         let fail = |what: &dyn std::fmt::Display| -> ! {
-            panic!("docs/guide/tutorial.md line {}: `{}`: {}", step.line, step.command, what)
+            panic!("{} line {}: `{}`: {}", page, step.line, step.command, what)
         };
 
         if let Some(reason) = shell_divergence(&step.command) {
@@ -376,7 +382,7 @@ impl Reader {
                 // background on a port it picks itself, and what the step shows is its startup
                 // line. What it prints on stderr is checked when the run ends.
                 let mut command = Command::new(server_binary());
-                command.args(words[1..].iter().map(|word| word.replace(TUTORIAL_ADDRESS, "127.0.0.1:0")));
+                command.args(words[1..].iter().map(|word| word.replace(PAGE_ADDRESS, "127.0.0.1:0")));
                 self.environment(&mut command);
 
                 let stderr = self.area.join(format!("server-{}.stderr", step.line));
@@ -423,26 +429,35 @@ impl Reader {
     /// The page's text for this machine: its server address replaced by the real one.
     fn localize(&self, text: &str) -> String {
         match &self.address {
-            Some(address) => text.replace(TUTORIAL_ADDRESS, address),
+            Some(address) => text.replace(PAGE_ADDRESS, address),
             None => text.to_string(),
         }
     }
 }
 
-fn tutorial_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/tutorial.md")
+fn guide_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide").join(name)
 }
 
-#[test]
-fn tutorial_runs_as_written() {
-    let page = std::fs::read_to_string(tutorial_path()).unwrap();
-    let steps = parse_steps(&page).unwrap_or_else(|error| panic!("docs/guide/tutorial.md, {}", error));
+/// Run one page of [`RUN_PAGES`] from an empty folder, failing on the first step that fails or
+/// prints something other than what the page shows.
+fn run_page(name: &str) {
+    let label = format!("docs/guide/{}", name);
+    let page = std::fs::read_to_string(guide_path(name)).unwrap();
+    let steps = parse_steps(&page).unwrap_or_else(|error| panic!("{}, {}", label, error));
 
-    let area = std::env::temp_dir().join(format!("forklift-tutorial-{}", std::process::id()));
+    let stem = name.trim_end_matches(".md");
+    let area = std::env::temp_dir().join(format!("forklift-{}-{}", stem, std::process::id()));
     let _ = std::fs::remove_dir_all(&area);
     std::fs::create_dir_all(&area).unwrap();
 
-    let mut reader = Reader { area: area.clone(), cwd: area.join("reader"), address: None, servers: Vec::new() };
+    let mut reader = Reader {
+        page: label.clone(),
+        area: area.clone(),
+        cwd: area.join("reader"),
+        address: None,
+        servers: Vec::new(),
+    };
     std::fs::create_dir(&reader.cwd).unwrap();
 
     for step in &steps {
@@ -458,8 +473,8 @@ fn tutorial_runs_as_written() {
 
         assert!(
             status == Some(0) && output_matches(&expected, &printed),
-            "docs/guide/tutorial.md line {}: `{}` exited {:?} and printed\n{}\n\nThe page shows\n{}{}",
-            step.line, step.command, status, printed.join("\n"), expected.join("\n"),
+            "{} line {}: `{}` exited {:?} and printed\n{}\n\nThe page shows\n{}{}",
+            label, step.line, step.command, status, printed.join("\n"), expected.join("\n"),
             reader.server_trouble()
         );
     }
@@ -467,10 +482,38 @@ fn tutorial_runs_as_written() {
     // A server's second terminal shows its stderr too, and the page shows none. A server that
     // died mid-run is reported with the step that failed because of it.
     let trouble = reader.server_trouble();
-    assert!(trouble.is_empty(), "docs/guide/tutorial.md:{}", trouble);
+    assert!(trouble.is_empty(), "{}:{}", label, trouble);
 
     drop(reader);
     let _ = std::fs::remove_dir_all(&area);
+}
+
+#[test]
+fn tutorial_runs_as_written() {
+    run_page("tutorial.md");
+}
+
+#[test]
+fn concepts_run_as_written() {
+    run_page("concepts.md");
+}
+
+/// A page that shows commands in a `console` block promises they run as shown, so a guide page
+/// with one is either run here or a failure: adding examples to a page cannot leave them unrun.
+#[test]
+fn every_guide_page_with_console_blocks_is_run() {
+    for entry in std::fs::read_dir(guide_path("")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let page = std::fs::read_to_string(&path).unwrap();
+        if page.lines().any(|line| line.trim_start().starts_with("```console")) {
+            assert!(RUN_PAGES.contains(&name.as_str()), "docs/guide/{} has console blocks; add it to RUN_PAGES", name);
+        }
+    }
+
+    for name in RUN_PAGES {
+        assert!(guide_path(name).is_file(), "RUN_PAGES names docs/guide/{}, which does not exist", name);
+    }
 }
 
 #[test]

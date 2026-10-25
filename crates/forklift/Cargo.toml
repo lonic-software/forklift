@@ -39,7 +39,7 @@ blake3 = { workspace = true }
 # The remote tests' mock hook endpoint verifies the signed hook requests with the
 # same MAC helper the server signs them with.
 serde_json = { workspace = true }
-# The tutorial test splits the page's commands as a POSIX shell would. Already in the tree, at the
+# The guide-page test splits the pages' commands as a POSIX shell would. Already in the tree, at the
 # version Cargo.lock pins.
 shlex = "2"
 

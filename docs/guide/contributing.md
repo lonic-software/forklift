@@ -307,9 +307,12 @@ Documentation is part of the change, not a follow-up. When a change alters:
 
 - **a command's flags, name, or behavior** → update [`cli.md`](cli.md), and run `bin/gen-docs`
   when its name, alias or one-line help changed;
-- **anything [`tutorial.md`](tutorial.md) runs or shows** → update the page. The `tutorial` test
-  in `crates/forklift/tests/` runs its commands in order and fails when one fails or prints
-  something other than the page shows;
+- **anything [`tutorial.md`](tutorial.md) or [`concepts.md`](concepts.md) runs or shows** →
+  update the page. The `guide_pages` test in `crates/forklift/tests/` runs each page's commands
+  in order and fails when one fails or prints something other than the page shows. A guide page
+  that gains a `console` block must be added to that test's `RUN_PAGES`, which it enforces;
+- **a heading another page links to** → fix the links. The `doc_links` test fails on a relative
+  link to a missing file or a missing heading;
 - **trust / office / key behavior** → update [`trust-and-identity.md`](trust-and-identity.md);
 - **server flags / ops** → update [`../SERVER.md`](../SERVER.md);
 - **the `--json` envelope, error codes, or MCP tools** → update
