@@ -12,8 +12,8 @@
 
 use forklift_aws_lambda::aws::{build_clients, DynamoOps, S3Ops};
 use forklift_aws_lambda::{
-    auth_from_env, check_auth_fits_routing, config_from_env, handle, AsyncBridge, AuthConfig, AwsConfig, DynamoRefStore,
-    Head, Routing, S3ObjectStore,
+    auth_from_env, check_auth_fits_routing, config_from_env, handle, AsyncBridge, AuthConfig,
+    AwsConfig, DynamoRefStore, Head, Routing, S3ObjectStore,
 };
 use std::time::SystemTime;
 
