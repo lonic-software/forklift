@@ -292,8 +292,8 @@ per-operator token, or an `authentication` hook — never a property of the sign
 transport rule reaches, and of what the content-level audit checks independently of it. In
 short: a validly-signed, non-revoked parcel on an ordinary pallet passes
 `audit`/`verify_pallet_history` regardless of its signer's role or `pallets` grant — neither is
-checked there (`may_write_pallet` has exactly one call site in the workspace outside its own
-unit test, the server's transport gate) — but the **office** pallet is the exception: every
+checked there (the grant is consulted by the server's transport gate, `authority_utils::may_move`,
+and by `haul_utils::may_record_merge`, never by the audit) — but the **office** pallet is the exception: every
 office-modifying parcel is checked in content audit against its signer's role
 (the office chain walk, `verify_office_chain`, which a client and `audit` run as well as both heads), regardless of how, or whether, the caller authenticated. A server
 run with only the shared static token, an `--open` server, or the AWS serverless head does not
