@@ -1,10 +1,10 @@
-# Why Forklift: what it does that git cannot
+# Why Forklift: what it does that git does not
 
 Forklift keeps git's model of history (content-addressed snapshots, branches as movable pointers,
 three-way merges), so most of what you know from git carries over. This page is about the rest:
-the things git cannot do, or can only do through a hosting service that keeps them outside the
-repository. Each section names the problem, shows how Forklift handles it, and links to the
-reference that covers it in full.
+what git leaves to a hosting service, to configuration you assemble yourself, or to you. Each
+section names the problem, shows how Forklift handles it, and links to the reference that covers
+it in full.
 
 For a side-by-side comparison with git, jujutsu, sapling and pijul, see
 [the VCS comparison](../COMPARISON.md). For a first walk through the commands, start with
@@ -64,10 +64,9 @@ Office chain verified back to genesis ….
 Pallet "main" verified: 1 signed parcel(s) valid, 1 legacy parcel(s) predate trust and are unsigned.
 ```
 
-A stripped or forged signature, an unknown key, a parcel outside its signer's role, or an office
-chain that does not reach the genesis fails the audit with a non-zero exit. A forklift server runs
-the same checks before it accepts a push, so a remote cannot be pushed into a state a local
-`audit` would reject.
+A stripped or forged signature, a key the office does not know, or an office chain that does not
+reach the genesis fails the audit with a non-zero exit. A server that holds an anchor checks the
+signatures of what is pushed to it too, but your own `audit` is the check that counts.
 
 Two more properties follow from keeping trust in the warehouse:
 
@@ -111,9 +110,9 @@ Reference: [Agents, bots, and services](trust-and-identity.md#7-agents-bots-and-
 
 ## 3. Collaboration metadata in the repository
 
-**The problem.** In git, reviews, approvals, pull requests, release notes and CI status live in a
-hosting service's database. They are not signed, they are not in your clone, and they stay behind
-if you move.
+**The problem.** git can sign a tag and attach a note to a commit, but reviews, approvals, pull
+requests and CI status live in a hosting service's database. They are not signed, they are not in
+your clone, and they stay behind if you move.
 
 **How Forklift handles it.** They live in the warehouse, on **meta pallets**: `@manifest` for
 approvals, review notes and AI provenance, `@kv` for your own keys and values on any parcel,
@@ -134,9 +133,10 @@ v0.1.0  …  by … (admin)  First release
 ```
 
 Meta pallets travel with `lift`, `lower` and `franchise`, and `history @kv` (or `@manifest`,
-`@tags`, `@haul`) is the audit trail of every change to one. When two people change one concurrently, `lower` replays your changes onto the
-remote's instead of merging, since the entries are independent signed records; only two writes to
-the same entry conflict, and `lower --keep` settles which one stays.
+`@tags`, `@haul`) is the audit trail of every change to one. When two people change one
+concurrently, `lower` replays your changes onto the remote's instead of merging, since the
+entries are independent signed records; only two writes to the same entry conflict, and
+`lower --keep` settles which one stays.
 
 Reference: [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf),
 [`kv`](cli.md#kv--custom-metadata-on-parcels), [`tag`](cli.md#tag--signed-tags--releases) and
@@ -144,13 +144,14 @@ Reference: [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf),
 
 ## 4. Sparse warehouses
 
-**The problem.** A git clone downloads every file of every version. git trims that with two
-separate features, partial clone for what is downloaded and sparse-checkout for what is on disk,
-each configured on its own.
+**The problem.** A git clone downloads every file of every version unless you combine partial
+clone, for what is downloaded, with sparse-checkout, for what is on disk. They are separate
+features with separate commands, and the rest of git does not know which paths you left out.
 
-**How Forklift handles it.** A sparse warehouse fetches only the paths you ask for. Everything
-else stays **sealed by hash**: the signed parcels commit to its exact content, so it cannot be
-substituted, only fetched later.
+**How Forklift handles it.** Sparseness is one concept across the commands: a sparse warehouse
+fetches only the paths you ask for, and everything else stays **sealed by hash**, pinned to the
+content the signed parcels commit to and fetched later only on request. `audit`, `scope` and
+`expand` all know where the boundary is.
 
 To try it, share the warehouse through a local server. Prepare an empty warehouse for it to serve:
 
@@ -235,22 +236,25 @@ Reference: [`franchise`](cli.md#franchise--clone-fr),
 
 ## 5. Built for serverless hosting
 
-**The problem.** A git server is a stateful process: it negotiates which objects to send and
-builds a pack for each fetch. Hosting it means running and scaling those processes.
+**The problem.** A git remote that accepts pushes runs git on the server: a process that
+negotiates which objects to send and builds a pack for each fetch. Hosting it means running and
+scaling those processes, and trusting what they serve.
 
-**How Forklift handles it.** A Forklift remote is untrusted storage plus thin verifiers. The
-client verifies everything it downloads by hash, and the remote verifies what it accepts: objects
-by their hash, and pushed pallets by the same signature checks `audit` runs. You rely on a remote
-to keep your data available, not to keep it honest: it cannot hand you content or history that
-does not verify. That is what lets it be object storage behind small functions.
+**How Forklift handles it.** A Forklift remote is storage plus thin verifiers. It checks every
+object it accepts against its hash. The client checks everything it downloads by hash and
+signature, so altered content or forged history from a remote is caught. What you still rely on a
+remote for is availability and freshness: it could withhold data or keep serving an older signed
+head, and at first contact you verify its genesis yourself. That is what lets it be object storage
+behind small functions.
 
 There are two server **heads** behind one protocol:
 
 - **`forklift-server`**, the one you ran above: a single self-hosted binary, for your own machine
   or a container. See [Running a server](../SERVER.md).
 - **The AWS head** (`forklift-aws-lambda`): API Gateway and two Lambda functions in front of S3
-  and DynamoDB. Object bytes move directly between the client and S3 on presigned URLs, so they
-  never pass through a function. See [the deployment reference](../DEPLOYMENT.md).
+  and DynamoDB. Uploads and downloads of objects go directly between the client and S3 on
+  presigned URLs instead of through the API; the functions read an upload only to check its
+  hash. See [the deployment reference](../DEPLOYMENT.md).
 
 Reference: [Working with remotes](cli.md#6-working-with-remotes) and the
 [remote protocol](../format/REMOTE_PROTOCOL.md).
@@ -266,7 +270,8 @@ on disk durably. If a write fails in the one window where that could break, Fork
 is affected, and every command refuses with a coded error until `heal` resolves it. The next
 command usually resolves it on its own. An operation that is interrupted part-way (a merge, a
 shift, a park) is likewise recorded, and `heal` finishes or reverses it. On a healthy warehouse
-there is nothing to do:
+there is nothing to do. (One stale lock remains: a `forklift-server` that is hard-killed leaves
+its serve lock behind; see [Running a server](../SERVER.md).)
 
 ```console
 $ forklift heal
@@ -278,21 +283,22 @@ Reference: [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-op
 
 ## 7. Parallel by default
 
-**The problem.** A version control system that walks a large tree one file at a time leaves most
-of a modern machine idle.
+**The problem.** git parallelizes some operations, such as checkout and packing, each behind its
+own setting. Work done one file at a time leaves most of a modern machine idle.
 
-**How Forklift handles it.** Forklift is written to use every core, and spreads work across them
-wherever measurement shows it pays: hashing the working tree for `stocktake` and building the
+**How Forklift handles it.** Forklift is designed to use every core by default, and spreads work
+across them wherever measurement shows it pays: hashing the working tree for `stocktake` and building the
 inventory, for example. Not every operation gains from it, and some were measured and kept serial.
 [The parallelization plan](../PARALLELIZATION_PLAN.md) lists every operation, whether it runs in
 parallel today, and why.
 
 ## 8. A first-class machine interface
 
-**The problem.** Scripts and AI agents that drive git parse output written for people, which
-changes between versions.
+**The problem.** git has stable machine formats for some commands (`--porcelain`,
+`--format`, `-z`), each its own. Errors are messages written for people, and an agent has no
+description of the command surface to work from.
 
-**How Forklift handles it.** Every command takes `--json` and prints one versioned envelope:
+**How Forklift handles it.** Every command takes `--json` and prints the same versioned envelope:
 
 ```console
 $ forklift stocktake --json

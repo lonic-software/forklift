@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 mod common;
-use common::{forklift_command, server_binary};
+use common::{fence, forklift_command, repository_root, server_binary, tracked_pages};
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
 const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md"];
@@ -436,7 +436,7 @@ impl Reader {
 }
 
 fn guide_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide").join(name)
+    repository_root().join("docs/guide").join(name)
 }
 
 /// Run one page of [`RUN_PAGES`] from an empty folder, failing on the first step that fails or
@@ -498,17 +498,27 @@ fn concepts_run_as_written() {
     run_page("concepts.md");
 }
 
-/// A page that shows commands in a `console` block promises they run as shown, so a guide page
-/// with one is either run here or a failure: adding examples to a page cannot leave them unrun.
+/// A page that shows commands in a `console` block promises they run as shown, so a page with one
+/// is either run here or a failure: adding examples to a page cannot leave them unrun. Every page
+/// git tracks is read, and a fence counts in any form `parse_steps` would refuse as well as the
+/// one it runs.
 #[test]
-fn every_guide_page_with_console_blocks_is_run() {
-    for entry in std::fs::read_dir(guide_path("")).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+fn every_page_with_console_blocks_is_run() {
+    for path in tracked_pages() {
         let page = std::fs::read_to_string(&path).unwrap();
-        if page.lines().any(|line| line.trim_start().starts_with("```console")) {
-            assert!(RUN_PAGES.contains(&name.as_str()), "docs/guide/{} has console blocks; add it to RUN_PAGES", name);
+        let has_console = page.lines().any(|line| {
+            fence(line).is_some_and(|(_, _, info)| info.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("console")))
+        });
+        if !has_console {
+            continue;
         }
+
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            path == guide_path(&name) && RUN_PAGES.contains(&name.as_str()),
+            "{} has console blocks; move it to docs/guide and add it to RUN_PAGES",
+            path.display()
+        );
     }
 
     for name in RUN_PAGES {

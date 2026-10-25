@@ -2,76 +2,56 @@
 //! a `#fragment` names a heading of that page as GitHub renders it. A renamed heading or a moved
 //! page fails this test instead of leaving a link that goes nowhere.
 //!
-//! The pages are found by listing the folders, not from a list kept here: every `.md` file at the
-//! repository root and anywhere under `docs/`.
+//! The pages are every `.md` file git tracks, so a page added anywhere is checked without being
+//! listed here.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+#[allow(dead_code)] // The half of the module that launches binaries is not used here.
+mod common;
 
-fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
-}
+use common::{prose_lines, repository_root, tracked_pages};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-/// Every Markdown page this test checks.
-fn pages() -> Vec<PathBuf> {
-    fn walk(folder: &Path, pages: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(folder).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(&path, pages);
-            } else if path.extension().is_some_and(|extension| extension == "md") {
-                pages.push(path);
-            }
-        }
-    }
-
-    let root = repository_root();
-    let mut pages: Vec<PathBuf> = std::fs::read_dir(&root)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.is_file() && path.extension().is_some_and(|extension| extension == "md"))
-        .collect();
-    walk(&root.join("docs"), &mut pages);
-    pages.sort();
-    pages
-}
-
-/// The page's lines with fenced code blocks blanked, so a link shown inside an example is not
-/// read as one. Line numbers are kept.
-fn prose_lines(page: &str) -> Vec<&str> {
-    let mut in_fence = false;
-    page.lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                in_fence = !in_fence;
-                ""
-            } else if in_fence {
-                ""
-            } else {
-                line
-            }
-        })
-        .collect()
-}
-
-/// The targets of the inline links `[text](target)` on one line, outside code spans.
-fn link_targets(line: &str) -> Vec<String> {
-    let mut outside_code = String::new();
-    for (index, piece) in line.split('`').enumerate() {
-        if index % 2 == 0 {
-            outside_code.push_str(piece);
-        }
-        outside_code.push(' ');
-    }
-
+/// The targets of the inline links `[text](target)` on a page, with their line numbers, outside
+/// code. A code span may wrap onto the next line, so whether a backtick run opens or closes one
+/// carries across lines, until the blank line that ends the paragraph.
+fn link_targets(page: &str) -> Vec<(usize, String)> {
     let mut targets = Vec::new();
-    let mut rest = outside_code.as_str();
-    while let Some(at) = rest.find("](") {
-        let after = &rest[at + 2..];
-        let end = after.find([')', ' ']).unwrap_or(after.len());
-        targets.push(after[..end].to_string());
-        rest = &after[end..];
+    let mut code_span: Option<usize> = None;
+    for (index, line) in prose_lines(page).into_iter().enumerate() {
+        if line.trim().is_empty() {
+            code_span = None;
+            continue;
+        }
+
+        let mut outside_code = String::new();
+        let mut rest = line;
+        while !rest.is_empty() {
+            let ticks = rest.len() - rest.trim_start_matches('`').len();
+            if ticks > 0 {
+                code_span = match code_span {
+                    None => Some(ticks),
+                    Some(open) if open == ticks => None,
+                    open => open,
+                };
+                outside_code.push(' ');
+                rest = &rest[ticks..];
+                continue;
+            }
+            let next = rest.find('`').unwrap_or(rest.len());
+            if code_span.is_none() {
+                outside_code.push_str(&rest[..next]);
+            }
+            rest = &rest[next..];
+        }
+
+        let mut rest = outside_code.as_str();
+        while let Some(at) = rest.find("](") {
+            let after = &rest[at + 2..];
+            let end = after.find([')', ' ']).unwrap_or(after.len());
+            targets.push((index + 1, after[..end].to_string()));
+            rest = &after[end..];
+        }
     }
     targets
 }
@@ -103,7 +83,7 @@ fn anchors(path: &Path) -> HashSet<String> {
         return anchors;
     }
 
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for line in prose_lines(&page) {
         let level = line.chars().take_while(|&c| c == '#').count();
         if !(1..=6).contains(&level) || !line[level..].starts_with(' ') {
@@ -119,6 +99,9 @@ fn anchors(path: &Path) -> HashSet<String> {
 
 /// What is wrong with one link on `page`, if anything.
 fn broken(page: &Path, target: &str) -> Option<String> {
+    if target.is_empty() {
+        return Some("an empty target; a link must not wrap after its opening parenthesis".to_string());
+    }
     if target.contains(':') && !target.starts_with('#') && !target.starts_with('.') {
         return None; // A URL (https:, mailto:), which this test does not fetch.
     }
@@ -146,19 +129,20 @@ fn broken(page: &Path, target: &str) -> Option<String> {
 
 #[test]
 fn every_relative_link_resolves() {
-    let pages = pages();
-    assert!(pages.iter().any(|page| page.ends_with("docs/guide/cli.md")), "no guide pages found");
+    let root = repository_root();
+    let pages = tracked_pages();
+    for expected in ["docs/guide/cli.md", "infra/aws-serverless/README.md"] {
+        assert!(pages.contains(&root.join(expected)), "{} is not among the pages read", expected);
+    }
 
     let mut problems = Vec::new();
     let mut checked = 0;
     for page in &pages {
         let text = std::fs::read_to_string(page).unwrap();
-        for (index, line) in prose_lines(&text).into_iter().enumerate() {
-            for target in link_targets(line) {
-                checked += 1;
-                if let Some(problem) = broken(page, &target) {
-                    problems.push(format!("{}:{}: ({}) {}", page.display(), index + 1, target, problem));
-                }
+        for (line, target) in link_targets(&text) {
+            checked += 1;
+            if let Some(problem) = broken(page, &target) {
+                problems.push(format!("{}:{}: ({}) {}", page.display(), line, target, problem));
             }
         }
     }
@@ -177,10 +161,29 @@ fn anchors_are_github_heading_anchors() {
 
 #[test]
 fn links_are_read_outside_code_only() {
-    assert_eq!(link_targets("see [a](cli.md#x) and [b](../SERVER.md)"), ["cli.md#x", "../SERVER.md"]);
-    assert_eq!(link_targets("[a](x.md \"title\")"), ["x.md"]);
-    assert!(link_targets("`[not](a link)` and plain text").is_empty());
+    let targets = |page: &str| -> Vec<String> { link_targets(page).into_iter().map(|(_, target)| target).collect() };
+
+    assert_eq!(targets("see [a](cli.md#x) and [b](../SERVER.md)"), ["cli.md#x", "../SERVER.md"]);
+    assert_eq!(targets("[a](x.md \"title\")"), ["x.md"]);
+    assert_eq!(targets("[`code` text](x.md)"), ["x.md"]);
+    assert!(targets("`[not](a link)` and plain text").is_empty());
+    assert!(targets("``a ` [not](a link)`` and plain text").is_empty());
+
+    // A code span that wraps: the link after it on the next line is still read.
+    assert_eq!(link_targets("ends with `a span\nthat wraps` then [a](x.md)."), [(2, "x.md".to_string())]);
+    // A blank line ends a paragraph, so an unclosed backtick does not hide the next one's links.
+    assert_eq!(targets("a stray ` backtick\n\n[a](x.md)"), ["x.md"]);
+    // A target wrapped onto the next line is read as empty, which is reported, not skipped.
+    assert_eq!(targets("[a](\nx.md)"), [""]);
+}
+
+#[test]
+fn a_fence_closes_only_on_its_own_kind() {
     assert_eq!(prose_lines("a\n```sh\n[x](y)\n```\nb"), ["a", "", "", "", "b"]);
+    assert_eq!(prose_lines("~~~\n```\n[x](y)\n~~~\nb"), ["", "", "", "", "b"]);
+    assert_eq!(prose_lines("````\n```\n[x](y)\n````\nb"), ["", "", "", "", "b"]);
+    assert_eq!(prose_lines("```\n```sh\nc\n```\nb"), ["", "", "", "", "b"]);
+    assert_eq!(prose_lines("    ```\na"), ["    ```", "a"]);
 }
 
 #[test]
@@ -198,6 +201,7 @@ fn a_link_to_a_missing_page_or_heading_is_broken() {
     assert_eq!(broken(&page, "notes.txt"), None);
     assert_eq!(broken(&page, "https://example.com/a#b"), None);
 
+    assert!(broken(&page, "").is_some());
     assert!(broken(&page, "#title-2").is_some());
     assert!(broken(&page, "#not-a-heading").is_some());
     assert!(broken(&page, "missing.md").is_some());
