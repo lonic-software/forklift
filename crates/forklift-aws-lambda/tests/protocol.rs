@@ -2135,6 +2135,9 @@ struct TransientOnCommit {
     inner: MemoryRefStore,
     refusals: usize,
     refusal: CasOutcome,
+    /// What the first attempt answers instead of `refusal`, when set: a request whose attempts
+    /// disagree, as when an attempt of unknown fate is followed by contention.
+    first: Option<CasOutcome>,
     tokens: std::sync::Mutex<Vec<String>>,
 }
 
@@ -2148,6 +2151,7 @@ impl TransientOnCommit {
             inner: MemoryRefStore::new(),
             refusals,
             refusal: CasOutcome::Transient(TransientCause::Contended),
+            first: None,
             tokens: Default::default(),
         }
     }
@@ -2189,6 +2193,12 @@ impl RefStore for TransientOnCommit {
             tokens.push(request_token.to_string());
             tokens.len()
         };
+
+        if attempt == 1 {
+            if let Some(first) = &self.first {
+                return Ok(first.clone());
+            }
+        }
 
         if attempt <= self.refusals {
             return Ok(self.refusal.clone());
@@ -2274,27 +2284,41 @@ fn a_commit_that_stays_transient_is_attempted_four_times_under_one_token_then_an
     assert_ne!(both[0], both[4], "each request mints its own token");
 }
 
-/// A commit whose last attempt's fate is unknown may have landed, so its `503` must not say
-/// nothing moved: a client trusting that would push again and be told the pallet moved — to its
-/// own head. The message sends it to fetch first; a contended one keeps "nothing moved".
+/// A commit any of whose attempts may have landed must not answer that nothing moved: a client
+/// trusting that would push again and be told the pallet moved — to its own head. That holds
+/// when the uncertain attempt is not the last: under one token, an attempt of unknown fate can
+/// still commit after the attempts behind it are refused for contention. An attempt still in
+/// progress is uncertain in the same way. Only a request refused for contention throughout keeps
+/// "nothing moved".
 #[test]
 fn a_commit_of_unknown_fate_answers_503_without_claiming_nothing_moved() {
-    let (_area, head, main_head) = uploaded_first_push(
-        "unknown-fate-cas",
-        TransientOnCommit {
-            refusal: CasOutcome::Transient(TransientCause::FateUnknown),
-            ..TransientOnCommit::always()
-        },
-    );
+    let uncertain = [
+        ("unknown-fate-cas", None, TransientCause::FateUnknown),
+        ("unknown-then-contended-cas", Some(TransientCause::FateUnknown), TransientCause::Contended),
+        ("in-progress-cas", None, TransientCause::InProgress),
+    ];
 
-    let err = head
-        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
-        .expect_err("an unknown fate is still a refusal");
+    for (name, first, then) in uncertain {
+        let (_area, head, main_head) = uploaded_first_push(
+            name,
+            TransientOnCommit {
+                refusal: CasOutcome::Transient(then),
+                first: first.map(CasOutcome::Transient),
+                ..TransientOnCommit::always()
+            },
+        );
+        // Near enough the deadline that an in-progress refusal is not waited out.
+        let head = head.with_deadline(std::time::SystemTime::now() + std::time::Duration::from_secs(3));
 
-    assert_eq!(err.status, Status::ServiceUnavailable);
-    assert!(err.message.contains("may or may not have been applied"), "{}", err.message);
-    assert!(err.message.contains("Fetch the warehouse"), "{}", err.message);
-    assert!(!err.message.contains("No input is known to have moved"), "{}", err.message);
+        let err = head
+            .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+            .expect_err("an uncertain outcome is still a refusal");
+
+        assert_eq!(err.status, Status::ServiceUnavailable);
+        assert!(err.message.contains("may or may not have been applied"), "{name}: {}", err.message);
+        assert!(err.message.contains("Fetch the warehouse"), "{name}: {}", err.message);
+        assert!(!err.message.contains("No input is known to have moved"), "{name}: {}", err.message);
+    }
 
     let (_area, head, main_head) =
         uploaded_first_push("contended-cas-message", TransientOnCommit::always());
@@ -2917,6 +2941,8 @@ struct TransientOnAnchorWrite {
     inner: Arc<MemoryRefStore>,
     refusals: usize,
     refusal: TrustWriteOutcome,
+    /// What the first attempt answers instead of `refusal`, when set.
+    first: Option<TrustWriteOutcome>,
     tokens: std::sync::Mutex<Vec<String>>,
 }
 
@@ -2926,6 +2952,7 @@ impl TransientOnAnchorWrite {
             inner,
             refusals,
             refusal: TrustWriteOutcome::Transient(TransientCause::Contended),
+            first: None,
             tokens: Default::default(),
         }
     }
@@ -2988,6 +3015,12 @@ impl RefStore for TransientOnAnchorWrite {
             tokens.push(request_token.to_string());
             tokens.len()
         };
+
+        if attempt == 1 {
+            if let Some(first) = &self.first {
+                return Ok(first.clone());
+            }
+        }
 
         if attempt <= self.refusals {
             return Ok(self.refusal.clone());
@@ -3172,27 +3205,36 @@ fn an_anchor_write_that_stays_transient_is_attempted_four_times_then_answers_503
     assert!(tokens.iter().all(|token| *token == tokens[0]), "one token per request: {tokens:?}");
 }
 
-/// An anchor write whose last attempt's fate is unknown may have planted the anchor, so its
-/// `503` must not say nothing was changed; it sends the operator to read the anchor first.
+/// An anchor write any of whose attempts may have planted the anchor — the last, or an earlier
+/// one of unknown fate followed by contention — must not answer that nothing was changed; it
+/// sends the operator to read the anchor first.
 #[test]
 fn an_anchor_write_of_unknown_fate_answers_503_without_claiming_nothing_changed() {
     let office_head = "0".repeat(64);
     let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
 
     let mine = re_genesis(&anchor_v1, &office_head, 'c');
-    let head = Head::new(
-        MemoryObjectStore::new(),
-        TransientOnAnchorWrite {
-            refusal: TrustWriteOutcome::Transient(TransientCause::FateUnknown),
-            ..TransientOnAnchorWrite::new(store.clone(), usize::MAX)
-        },
-    );
+    let uncertain = [
+        (None, TransientCause::FateUnknown),
+        (Some(TransientCause::FateUnknown), TransientCause::Contended),
+    ];
 
-    let err = head.put_trust(&mine).expect_err("an unknown fate is still a refusal");
+    for (first, then) in uncertain {
+        let head = Head::new(
+            MemoryObjectStore::new(),
+            TransientOnAnchorWrite {
+                refusal: TrustWriteOutcome::Transient(then),
+                first: first.map(TrustWriteOutcome::Transient),
+                ..TransientOnAnchorWrite::new(store.clone(), usize::MAX)
+            },
+        );
 
-    assert_eq!(err.status, Status::ServiceUnavailable);
-    assert!(err.message.contains("may or may not have been applied"), "{}", err.message);
-    assert!(!err.message.contains("nothing was changed"), "{}", err.message);
+        let err = head.put_trust(&mine).expect_err("an uncertain outcome is still a refusal");
+
+        assert_eq!(err.status, Status::ServiceUnavailable);
+        assert!(err.message.contains("may or may not have been applied"), "{}", err.message);
+        assert!(!err.message.contains("nothing was changed"), "{}", err.message);
+    }
 
     let head = Head::new(MemoryObjectStore::new(), TransientOnAnchorWrite::new(store, usize::MAX));
     let err = head.put_trust(&mine).expect_err("contention outlasting the budget is a refusal");

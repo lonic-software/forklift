@@ -35,6 +35,7 @@
 //! tokio refuses to let a runtime worker block on the futures an SDK-backed store bridges.
 //! See `blocking.rs`.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -434,14 +435,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         //
         // A transient refusal is re-issued, alone and under one request token, before it is
         // answered (see `reissue.rs`); what reaches this match is the last attempt's outcome.
+        // Whether *any* attempt may have landed is kept apart from it: under one token, an
+        // earlier attempt of unknown fate can still commit after a later one is refused.
         let replacement = anchor.to_anchor();
+        let uncertain = Cell::new(false);
         let outcome = reissue(
             self.deadline,
             |token| {
                 self.refs.replace_trust(&replacement, &existing_bytes, office_head.as_deref(), token)
             },
             |outcome| match outcome {
-                TrustWriteOutcome::Transient(cause) => Some(*cause),
+                TrustWriteOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
                 _ => None,
             },
         )
@@ -468,7 +472,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             TrustWriteOutcome::OfficeMoved { current } => {
                 Err(self.adopts_mismatch(anchor.adopts.as_deref(), current.as_deref()))
             }
-            TrustWriteOutcome::Transient(cause) => Err(self.anchor_write_contention(cause)),
+            TrustWriteOutcome::Transient(_) => Err(self.anchor_write_contention(uncertain.get())),
         }
     }
 
@@ -530,17 +534,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// afford another, so the message says the head already retried rather than inviting the
     /// operator to wonder whether it did.
     ///
-    /// When the last attempt's fate is unknown it may have landed, so the message claims nothing
+    /// When `uncertain` — some attempt of this request may yet land — the message claims nothing
     /// about what was changed and sends the operator to read the anchor first.
-    fn anchor_write_contention(&self, cause: TransientCause) -> HeadError {
-        if cause == TransientCause::FateUnknown {
-            return HeadError::service_unavailable(
-                "The trust anchor write could not be confirmed: its last attempt timed out or \
-                failed inside the warehouse's storage, so it may or may not have been applied. \
-                Read the warehouse's trust anchor before running the re-genesis again — if it \
-                is already the new anchor, the re-genesis succeeded."
-                    .to_string(),
-            );
+    fn anchor_write_contention(&self, uncertain: bool) -> HeadError {
+        if uncertain {
+            return HeadError::service_unavailable(format!(
+                "The trust anchor write could not be confirmed: {} Read the warehouse's trust \
+                anchor before running the re-genesis again — if it is already the new anchor, the \
+                re-genesis succeeded.",
+                UNCONFIRMED
+            ));
         }
 
         HeadError::service_unavailable(
@@ -841,7 +844,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // concurrent lift to this same pallet always has (FORK-95 design memo, "Two
         // instantiations of one invariant" / claim C13). A refusal that shows no input moved is
         // re-issued — the transaction alone, never the audit — under one request token and one
-        // bounded budget before it is answered (claim C14, arm two; see `reissue.rs`).
+        // bounded budget before it is answered (claim C14, arm two; see `reissue.rs`). As for the
+        // anchor write, whether any attempt may have landed is tracked across all of them.
+        let uncertain = Cell::new(false);
         let outcome = reissue(
             self.deadline,
             |token| {
@@ -856,7 +861,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 )
             },
             |outcome| match outcome {
-                CasOutcome::Transient(cause) => Some(*cause),
+                CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
                 _ => None,
             },
         )
@@ -867,7 +872,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             CasOutcome::Conflict { current } => Err(self.moved(&current, &request.old_head)),
             CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
             CasOutcome::AnchorMoved => Err(self.anchor_moved()),
-            CasOutcome::Transient(cause) => Err(self.transient_contention(cause)),
+            CasOutcome::Transient(_) => Err(self.transient_contention(uncertain.get())),
         }
     }
 
@@ -1111,18 +1116,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// push again" — an instruction a person or a script can act on — and never "retry" bare,
     /// which would imply a client-side mechanism that does not exist.
     ///
-    /// When the last attempt's fate is unknown it may have landed, and running the identical push
-    /// again would then be refused as the pallet having moved — to the client's own new head. So
-    /// that message says the outcome is unknown and how to tell, rather than "nothing moved".
-    fn transient_contention(&self, cause: TransientCause) -> HeadError {
-        if cause == TransientCause::FateUnknown {
-            return HeadError::service_unavailable(
-                "The commit could not be confirmed: its last attempt timed out or failed inside \
-                the warehouse's storage, so it may or may not have been applied. Fetch the \
-                warehouse before pushing again — if the pallet is already at the pushed head, \
-                the push succeeded."
-                    .to_string(),
-            );
+    /// When `uncertain` — some attempt of this request may yet land — running the identical push
+    /// again could be refused as the pallet having moved, to the client's own new head. So that
+    /// message says the outcome is unknown and how to tell, rather than "nothing moved".
+    fn transient_contention(&self, uncertain: bool) -> HeadError {
+        if uncertain {
+            return HeadError::service_unavailable(format!(
+                "The commit could not be confirmed: {} Fetch the warehouse before pushing again — \
+                if the pallet is already at the pushed head, the push succeeded.",
+                UNCONFIRMED
+            ));
         }
 
         HeadError::service_unavailable(
@@ -1221,4 +1224,20 @@ fn upload_discarded(message: String) -> HeadError {
         message,
         "Run the lift again; it uploads the object afresh.",
     )))
+}
+
+/// Why an uncertain transaction's `503` cannot say what happened, shared by both of its messages.
+const UNCONFIRMED: &str = "an attempt timed out, failed inside the warehouse's storage, or was \
+    still being applied when this request ran out of attempts, so it may or may not have been \
+    applied.";
+
+/// Pass `cause` through to the re-issue loop, first noting in `uncertain` whether this attempt
+/// may yet land. Only a refusal for contention shows the attempt did not: an unknown fate may
+/// have committed, and an attempt in progress is one still being applied.
+fn noting_uncertainty(uncertain: &Cell<bool>, cause: TransientCause) -> TransientCause {
+    if cause != TransientCause::Contended {
+        uncertain.set(true);
+    }
+
+    cause
 }
