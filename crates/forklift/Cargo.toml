@@ -39,6 +39,9 @@ blake3 = { workspace = true }
 # The remote tests' mock hook endpoint verifies the signed hook requests with the
 # same MAC helper the server signs them with.
 serde_json = { workspace = true }
+# The tutorial test splits the page's commands as a POSIX shell would. Already in the tree, at the
+# version Cargo.lock pins.
+shlex = "2"
 
 [target.'cfg(windows)'.dev-dependencies]
 # The metadata-alias test asks NTFS for the 8.3 short name it gave `.forklift`.

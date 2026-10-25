@@ -15,21 +15,10 @@ use forklift_core::util::gc_utils;
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
 mod common;
-use common::forklift_command;
+use common::{forklift_command, server_binary};
 
 /// The git config file every launch here reads as its global one: none.
 const NO_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
-
-fn server_binary() -> PathBuf {
-    let path = Path::new(FORKLIFT)
-        .parent()
-        .expect("the forklift binary has a parent directory")
-        .join(format!("forklift-server{}", std::env::consts::EXE_SUFFIX));
-
-    assert!(path.is_file(), "forklift-server is not built at {}; run the tests via a workspace build.", path.display());
-
-    path
-}
 
 /// A scratch area for one test: warehouses, the server root, the git mirror and the shared
 /// operator configuration all live under it, and it is deleted when the test ends.

@@ -1199,6 +1199,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "shlex",
  "tokio",
  "windows-sys 0.60.2",
 ]

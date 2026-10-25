@@ -17,6 +17,25 @@ pub fn test_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// `forklift-server`, found next to the CLI. Cargo exposes `CARGO_BIN_EXE_*` only for this
+/// package's own binaries, but a workspace build puts both in the same target directory.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn server_binary() -> std::path::PathBuf {
+    let path = std::path::Path::new(env!("CARGO_BIN_EXE_forklift"))
+        .parent()
+        .expect("the forklift binary has a parent directory")
+        .join(format!("forklift-server{}", std::env::consts::EXE_SUFFIX));
+
+    assert!(
+        path.is_file(),
+        "forklift-server is not built at {}; run the tests via a workspace build \
+        (plain \"cargo test\").",
+        path.display()
+    );
+
+    path
+}
+
 /// Hold the store-access lock of the warehouse at `root` from this test process, the way another
 /// forklift process would: shared like a writer in another bay, or exclusive like a running
 /// repack, gc or scope-prune. The kernel lock is held for as long as the returned file is open.
