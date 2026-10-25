@@ -519,7 +519,8 @@ fn a_hook_decline_is_quoted_and_not_a_race() {
 }
 
 /// Memo test 7: a commit pushed by hand on top of the mirrored tip is a divergence naming it, not
-/// "already ahead": it carries no parcel line.
+/// "already ahead", even under a later commit whose last line names a parcel of the pallet's lifted
+/// history: the hand-written one carries no parcel line.
 ///
 /// Revert: drop the N..G parcel-line check → "already ahead", exit 0.
 #[test]
@@ -531,7 +532,8 @@ fn a_foreign_commit_stacked_on_the_tip_is_a_divergence() {
     let mirrored = tip(&fixture.git, "main").unwrap();
     let tree = git_ok(&fixture.git, &["rev-parse", &format!("{}^{{tree}}", mirrored)]);
     let foreign = write_commit(&fixture.git, &tree, &[&mirrored], "Hand-written\n");
-    git_ok(&fixture.git, &["update-ref", "refs/heads/main", &foreign, &mirrored]);
+    let labelled = write_commit(&fixture.git, &tree, &[&foreign], &format!("Copied\n\n{}\n", parcel_line(&fixture.first)));
+    git_ok(&fixture.git, &["update-ref", "refs/heads/main", &labelled, &mirrored]);
 
     let refused = area.forklift("a", &["mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
@@ -591,7 +593,7 @@ fn a_rewritten_exported_commit_is_refused_with_the_delete_step() {
     let area = &fixture.area;
 
     area.stack("a", "code.txt", "v2\n", "second");
-    area.lift("a");
+    let second = area.lift("a")["head"].as_str().unwrap().to_string();
     area.forklift_ok("a", &["mirror"]);
 
     let mirror = fixture.mirror_dir("a");
@@ -599,7 +601,8 @@ fn a_rewritten_exported_commit_is_refused_with_the_delete_step() {
     let parent = git_ok(&mirror, &["rev-parse", &format!("{}^", exported)]);
     let tree = git_ok(&mirror, &["rev-parse", &format!("{}^{{tree}}", exported)]);
 
-    for line in [parcel_line(&fixture.first), format!("Forklift-Parcel: {} export/2", fixture.first)] {
+    // Another parcel of the history, in this layout; the right parcel, in another layout.
+    for line in [parcel_line(&fixture.first), format!("Forklift-Parcel: {} export/2", second)] {
         let rewritten = write_commit(&mirror, &tree, &[&parent], &format!("second\n\n{}\n", line));
         git_ok(&mirror, &["update-ref", "refs/forklift/exported/main", &rewritten]);
 
