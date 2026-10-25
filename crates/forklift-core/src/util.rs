@@ -9,6 +9,7 @@ pub mod pack_utils;
 pub mod config_utils;
 pub mod lock_utils;
 pub mod office_utils;
+pub mod authority_utils;
 pub mod manifest_utils;
 pub mod deliver_utils;
 pub mod bay_utils;

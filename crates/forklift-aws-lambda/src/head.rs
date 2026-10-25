@@ -591,7 +591,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// what an office role would say about *that caller*, and — outside the office pallet —
     /// regardless of what it would say about the *signer* too: an operator enrolled as
     /// `reader`, or a `writer` granted only some other pallet, can sign and push this pallet's
-    /// history because nothing here consults `may_write_pallet` at all. The
+    /// history because no transport rule here consults `may_write_pallet` (only the `@haul`
+    /// content rule does, for a merged-state cell). The
     /// audit runs against a scratch warehouse mirrored from the object store; the atomic CAS is
     /// the DynamoDB conditional write of [`RefStore::compare_and_set_head`].
     pub fn ref_update(&self, name: &str, request: &RefUpdateRequest) -> HeadResult<()> {

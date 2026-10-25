@@ -678,10 +678,10 @@ fn a_trusted_lift_runs_the_audit_through_http() {
 /// endpoint, so it exists regardless of what that endpoint would do.
 ///
 /// **Invert this when operator identity lands:** the day this head grows a caller-identity
-/// mechanism and a `may_write_pallet`-style transport gate (mirroring `forklift-server`'s
-/// `Principal::Operator` path), a request carrying only the shared bearer — resolving to no
-/// operator identity — should be refused for at least one pallet class, and that assertion's
-/// `200` must become a `403`. Each assertion below flips independently: the office push flipping
+/// mechanism and calls the shared transport rule `forklift_core`'s `authority_utils::may_move`
+/// (as `forklift-server`'s `Principal::Operator` path does), a request carrying only the shared
+/// bearer — resolving to no operator identity — should be refused for at least one pallet class,
+/// and that assertion's `200` must become a `403`. Each assertion below flips independently: the office push flipping
 /// says nothing about whether the main push would too, and vice versa, which is the point of
 /// keeping them on separate fixtures.
 #[test]
