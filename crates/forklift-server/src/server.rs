@@ -3041,7 +3041,8 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
     };
     let length = metadata.len();
     let etag = bundle_etag(&metadata);
-    let offset = match requested_range(&headers, etag.as_deref(), length) {
+    let range = requested_range(&headers, etag.as_deref(), length);
+    let offset = match range {
         BundleRange::Whole => 0,
         BundleRange::From(start) => start,
         BundleRange::Unsatisfiable => length,
@@ -3073,15 +3074,15 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
                                 HeaderValue::from_str(&etag).expect("a quoted run of hex digits"));
     }
 
-    let content_range = match offset {
-        0 => None,
-        _ if offset == length => {
+    let content_range = match range {
+        BundleRange::Whole => None,
+        BundleRange::Unsatisfiable => {
             *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
             Some(format!("bytes */{}", length))
         }
-        _ => {
+        BundleRange::From(start) => {
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
-            Some(format!("bytes {}-{}/{}", offset, length - 1, length))
+            Some(format!("bytes {}-{}/{}", start, length - 1, length))
         }
     };
 
@@ -4690,12 +4691,13 @@ mod tests {
         assert_eq!(header(&headers, "content-length"), Some((length - start).to_string().as_str()));
         assert_eq!(header(&headers, "etag"), Some(etag.as_str()));
 
-        // The last byte alone is still a range; so is one asked for with no `If-Range`, and one
-        // spelled with another case and spaces.
+        // The last byte alone is still a range, and so is the whole file asked for from byte 0; so
+        // is one asked for with no `If-Range`, and one spelled with another case and spaces.
         let last = format!("bytes={}-", length - 1);
         let spelled = format!(" Bytes = {}- ", start);
-        let unconditional: [(&str, &[(&'static str, &str)], usize); 3] = [
+        let unconditional: [(&str, &[(&'static str, &str)], usize); 4] = [
             ("the last byte", &[("range", &last), ("if-range", &etag)], length - 1),
+            ("the first byte on", &[("range", "bytes=0-"), ("if-range", &etag)], 0),
             ("no If-Range", &[("range", "bytes=5-")], 5),
             ("another spelling", &[("range", &spelled), ("if-range", &etag)], start),
         ];
