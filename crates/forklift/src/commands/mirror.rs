@@ -346,6 +346,36 @@ fn read_commit(repo: &GitRepo, commit: &str) -> Result<RawCommit, Problem> {
     Ok(RawCommit { tree, parents, bytes })
 }
 
+/// Check an exported ref's commit one level down: it has the parcel's distinct parents, each
+/// exported as that parent. A tip rewritten to name another parcel of the history fails here,
+/// since nothing above the tip says which parcel it must name.
+fn check_parents(repo: &GitRepo, commit: &str, raw: &RawCommit, parcel: &str, parents: &[String]) -> Result<(), Problem> {
+    let parents = export_git::distinct(parents);
+    check_parent_count(commit, raw, parcel, parents.len())?;
+
+    for (parent, parent_commit) in parents.into_iter().zip(&raw.parents) {
+        if !read_commit(repo, parent_commit)?.names(parent) {
+            return Err(damaged(format!(
+                "holds commit {} for parcel {}, but its parent {} does not name parcel {}",
+                commit, parcel, parent_commit, parent
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_parent_count(commit: &str, raw: &RawCommit, parcel: &str, distinct: usize) -> Result<(), Problem> {
+    if distinct != raw.parents.len() {
+        return Err(damaged(format!(
+            "holds commit {} with {} parent(s), where parcel {} has {}",
+            commit, raw.parents.len(), parcel, distinct
+        )));
+    }
+
+    Ok(())
+}
+
 /// A commit this build exported, which a run may build on: its parcel is in the local store.
 #[derive(Clone)]
 struct Boundary {
@@ -386,7 +416,9 @@ impl<'a> Run<'a> {
             let parcel = raw.exported_parcel(&commit)?;
 
             if file_utils::does_object_exist(&parcel)? {
-                exporter.seed(&parcel, &commit, &raw.tree, &object_utils::load_parcel(&parcel)?.tree_hash);
+                let loaded = object_utils::load_parcel(&parcel)?;
+                check_parents(repo, &commit, &raw, &parcel, &loaded.parents)?;
+                exporter.seed(&parcel, &commit, &raw.tree, &loaded.tree_hash);
                 boundaries.push(Boundary { parcel, commit });
             }
         }
@@ -581,12 +613,7 @@ impl<'a> Run<'a> {
             }
 
             let parents = export_git::distinct(&loaded.parents);
-            if parents.len() != raw.parents.len() {
-                return Err(damaged(format!(
-                    "holds commit {} with {} parent(s), where parcel {} has {}",
-                    commit, raw.parents.len(), parcel, parents.len()
-                )));
-            }
+            check_parent_count(&commit, &raw, &parcel, parents.len())?;
 
             for (parent, parent_commit) in parents.into_iter().zip(raw.parents) {
                 if parent == target || graph_utils::generation(parent)? > target_generation {
