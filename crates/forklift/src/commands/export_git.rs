@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use serde::Serialize;
 use forklift_core::enums::dir_entry_type::DirEntryType;
@@ -8,6 +8,13 @@ use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::util::{file_utils, object_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
+
+/// The export layout version: the `export/<N>` every exported commit's parcel line names. It covers
+/// every rule that fixes an exported object's bytes: the message shape and its parcel line, the
+/// identity mapping, the date form, the parent rule, the type-to-mode map, chunked-blob assembly
+/// and filter-free hashing. Two builds on one layout write identical objects for the same parcel, so
+/// a change to any of those rules bumps it (the golden tip-hash test fails until it does).
+pub(crate) const EXPORT_LAYOUT: u32 = 1;
 
 /// Handle the export-git command (§7.8): one-way export of this warehouse's history into a
 /// new git repository — the escape hatch that makes trying forklift reversible. Parcels
@@ -18,6 +25,10 @@ use crate::output::{self, CommandOutput};
 /// office, the `@manifest` (approvals / provenance) or per-parcel signatures, so those are
 /// dropped — the guarantee is "your code history is never trapped", not a lossless round
 /// trip. Requires `git` on PATH.
+///
+/// The objects are deterministic (§9.8): every commit ends in a line naming its parcel and the
+/// export layout, and no git configuration or environment of the user's reaches an object write, so
+/// the same history exports to the same commits on any machine.
 ///
 /// # Arguments
 /// * `path` - Where to create the git repository (must be empty or nonexistent).
@@ -58,23 +69,24 @@ pub fn handle_command(path: &str) -> Result<(), String> {
 
     std::fs::create_dir_all(target)
         .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
-    git(path, &["init", "-q"])?;
+    let repo = GitRepo::create(target)?;
 
-    let mut exporter = Exporter::new(path);
+    let mut exporter = Exporter::new(&repo);
 
     // Convert every parcel reachable from the branch heads, parents before children so a
     // commit's parents are already written when git-commit-tree needs them.
     let order = topological_order(&pallets.iter().map(|(_, head)| head.clone()).collect::<Vec<_>>())?;
     for parcel in &order {
-        exporter.convert_commit(parcel)?;
+        exporter.export_parcel(parcel)?;
     }
 
-    // Point each branch at its commit.
+    // Point each branch at its commit. Refs and the checkout write no objects, so they run under
+    // the user's own configuration: from here on the repository is theirs.
     let mut branches: Vec<String> = Vec::new();
     for (name, head) in &pallets {
-        let commit = exporter.commits.get(head).cloned()
+        let commit = exporter.exported.get(head).map(|exported| exported.commit.clone())
             .ok_or(format!("pallet \"{}\" head was not exported", name))?;
-        git(path, &["update-ref", &format!("refs/heads/{}", name), &commit])?;
+        repo.run_as_user(&["update-ref", &format!("refs/heads/{}", name), &commit])?;
         branches.push(name.clone());
     }
 
@@ -84,15 +96,15 @@ pub fn handle_command(path: &str) -> Result<(), String> {
         .or_else(|| branches.first().cloned());
 
     if let Some(branch) = &current {
-        git(path, &["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)])?;
-        git(path, &["checkout", "-f", "-q", branch])?;
+        repo.run_as_user(&["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)])?;
+        repo.run_as_user(&["checkout", "-f", "-q", branch])?;
     }
 
     output::emit(&ExportReport {
         path: path.to_string(),
-        commits: exporter.commits.len(),
-        trees: exporter.trees.len(),
-        blobs: exporter.blobs.len(),
+        commits: exporter.exported.len(),
+        trees: exporter.trees_written,
+        blobs: exporter.blobs_written,
         branches,
         current,
     });
@@ -100,123 +112,249 @@ pub fn handle_command(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes forklift objects into a git repository, memoizing by forklift hash so each object
-/// is written once even when branches share history.
-struct Exporter<'a> {
-    path: &'a str,
-    blobs: HashMap<String, String>,
-    trees: HashMap<String, String>,
-    commits: HashMap<String, String>,
+/// The variables that tell git which repository to act on. A git call into a repository Forklift
+/// names by path never inherits them, even under the user's own configuration.
+const REPOSITORY_VARIABLES: &[&str] = &[
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES",
+];
+
+/// A git repository Forklift created and writes objects into, with a configuration Forklift alone
+/// writes (§9.8).
+pub(crate) struct GitRepo {
+    path: PathBuf,
+}
+
+impl GitRepo {
+    /// Create a sha1 repository at the existing, empty folder `path`, configured so nothing in it
+    /// rewrites what Forklift hands git: on macOS `git init` turns core.precomposeunicode on, which
+    /// rewrites an NFD name.
+    pub(crate) fn create(path: &Path) -> Result<GitRepo, String> {
+        let repo = GitRepo { path: path.to_path_buf() };
+        repo.run(&["init", "-q", "--object-format=sha1"], None)?;
+        repo.run(&["config", "core.precomposeunicode", "false"], None)?;
+
+        Ok(repo)
+    }
+
+    /// Run `git <args>` in this repository under the isolated configuration every object write
+    /// needs: no system config, an empty global config and no inherited `GIT_*` variable (the
+    /// caller adds identity and dates through `env`). The user's configuration reached object ids
+    /// through at least four channels (a commit encoding, CRLF filters, the default object format,
+    /// unicode precomposition), so it is shut out as a class rather than key by key.
+    ///
+    /// # Returns
+    /// * `Ok(String)`  - Git's stdout.
+    /// * `Err(String)` - If git could not be run or failed; the message quotes git.
+    fn run_isolated(&self, args: &[&str], env: &[(&str, &str)], input: Option<&[u8]>) -> Result<String, String> {
+        let mut command = self.command(|key| key.starts_with("GIT_"));
+        // A missing global config file also reads as empty, so this holds on a git that does not
+        // map /dev/null.
+        command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+
+        run_git(command, args, input)
+    }
+
+    fn run(&self, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+        self.run_isolated(args, &[], input)
+    }
+
+    /// Run `git <args>` in this repository under the user's own configuration, for a call that
+    /// writes no object.
+    fn run_as_user(&self, args: &[&str]) -> Result<String, String> {
+        run_git(self.command(|key| REPOSITORY_VARIABLES.contains(&key)), args, None)
+    }
+
+    /// `git -C <path>`, with every inherited variable `strip` names removed.
+    fn command(&self, strip: impl Fn(&str) -> bool) -> Command {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(&self.path);
+
+        // Windows treats variable names case-insensitively, so compare uppercased.
+        for (key, _) in std::env::vars_os() {
+            if strip(&key.to_string_lossy().to_ascii_uppercase()) {
+                command.env_remove(&key);
+            }
+        }
+
+        command
+    }
+}
+
+/// One parcel's exported commit, with the trees a child converts against (D4).
+struct ExportedCommit {
+    commit: String,
+    git_tree: String,
+    forklift_tree: String,
+}
+
+/// Writes forklift parcels into a git repository as commits. A parcel's tree is converted against
+/// its first parent's: whatever is unchanged takes its git hash from the parent's exported tree, so
+/// a parcel costs git processes in proportion to its changed paths, not to its tree's size.
+pub(crate) struct Exporter<'a> {
+    repo: &'a GitRepo,
+    exported: HashMap<String, ExportedCommit>,
+    trees_written: usize,
+    blobs_written: usize,
 }
 
 impl<'a> Exporter<'a> {
-    fn new(path: &'a str) -> Exporter<'a> {
-        Exporter { path, blobs: HashMap::new(), trees: HashMap::new(), commits: HashMap::new() }
+    pub(crate) fn new(repo: &'a GitRepo) -> Exporter<'a> {
+        Exporter { repo, exported: HashMap::new(), trees_written: 0, blobs_written: 0 }
     }
 
     /// Write one parcel as a git commit (its parents must already be written).
-    fn convert_commit(&mut self, forklift_hash: &str) -> Result<String, String> {
-        if let Some(hash) = self.commits.get(forklift_hash) {
-            return Ok(hash.clone());
+    pub(crate) fn export_parcel(&mut self, forklift_hash: &str) -> Result<String, String> {
+        if let Some(exported) = self.exported.get(forklift_hash) {
+            return Ok(exported.commit.clone());
         }
 
         let parcel = object_utils::load_parcel(forklift_hash)?;
-        let tree = self.convert_tree(&parcel.tree_hash)?;
 
-        let mut args: Vec<String> = vec!["commit-tree".to_string(), tree];
-        for parent in &parcel.parents {
-            let commit = self.commits.get(parent)
-                .ok_or("a parent commit was not exported before its child".to_string())?;
-            args.push("-p".to_string());
-            args.push(commit.clone());
+        // Git drops a repeated -p, so the parent list goes in with repeats removed and the first
+        // occurrence kept: the i-th distinct parent's commit is then the commit's i-th parent.
+        let mut parents: Vec<&ExportedCommit> = Vec::new();
+        for parent in distinct(&parcel.parents) {
+            parents.push(self.exported.get(parent)
+                .ok_or("a parent commit was not exported before its child".to_string())?);
         }
-        args.push("-m".to_string());
-        args.push(parcel.description.clone().unwrap_or_default());
+        let base = parents.first().map(|parent| (parent.forklift_tree.clone(), parent.git_tree.clone()));
+        let mut args: Vec<String> = parents.iter()
+            .flat_map(|parent| ["-p".to_string(), parent.commit.clone()])
+            .collect();
+
+        let tree = self.convert_tree(&parcel.tree_hash, base.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
+        args.splice(0..0, ["commit-tree".to_string(), tree.clone()]);
 
         // Git's author/committer come from the environment; map them from the parcel's
         // Author and Stack actions so authorship and dates survive.
         let (author, author_time) = action_identity(&parcel, true);
         let (committer, committer_time) = action_identity(&parcel, false);
+        let (author_date, committer_date) = (git_date(author_time), git_date(committer_time));
 
-        let commit = git_env(
-            self.path,
+        // The message goes on stdin: git rewrites an argument (core.precomposeunicode), never stdin.
+        let commit = self.repo.run_isolated(
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
             &[
                 ("GIT_AUTHOR_NAME", &author.0), ("GIT_AUTHOR_EMAIL", &author.1),
-                ("GIT_AUTHOR_DATE", &format!("{} +0000", author_time)),
+                ("GIT_AUTHOR_DATE", &author_date),
                 ("GIT_COMMITTER_NAME", &committer.0), ("GIT_COMMITTER_EMAIL", &committer.1),
-                ("GIT_COMMITTER_DATE", &format!("{} +0000", committer_time)),
+                ("GIT_COMMITTER_DATE", &committer_date),
             ],
-        )?;
-        let commit = commit.trim().to_string();
+            Some(commit_message(&parcel, forklift_hash).as_bytes()),
+        )?.trim().to_string();
 
-        self.commits.insert(forklift_hash.to_string(), commit.clone());
+        self.exported.insert(forklift_hash.to_string(), ExportedCommit {
+            commit: commit.clone(),
+            git_tree: tree,
+            forklift_tree: parcel.tree_hash,
+        });
 
         Ok(commit)
     }
 
-    /// Write one forklift tree as a git tree (recursively).
-    fn convert_tree(&mut self, forklift_hash: &str) -> Result<String, String> {
-        if let Some(hash) = self.trees.get(forklift_hash) {
-            return Ok(hash.clone());
+    /// Write one forklift tree as a git tree (recursively), against `base`: the forklift tree at the
+    /// same path in the first parent, with the git tree it was exported as. An entry whose forklift
+    /// hash matches the base's entry of the same name and kind reuses that entry's git hash. Only
+    /// the hash: the mode is always recomputed from the entry's own type.
+    fn convert_tree(&mut self, forklift_hash: &str, base: Option<(&str, &str)>) -> Result<String, String> {
+        if let Some((base_forklift, base_git)) = base {
+            if base_forklift == forklift_hash {
+                return Ok(base_git.to_string());
+            }
         }
 
         let tree = object_utils::load_tree(forklift_hash)?;
+        let (base_tree, base_entries) = match base {
+            Some((base_forklift, base_git)) => (Some(object_utils::load_tree(base_forklift)?), self.list_tree(base_git)?),
+            None => (None, HashMap::new()),
+        };
+        // The git hash of the base's file `name`, when its forklift hash is `hash`.
+        let reusable_blob = |name: &str, hash: &str| -> Option<String> {
+            base_tree.as_ref().and_then(|base| base.get_file(name))
+                .filter(|base_item| base_item.hash == hash)
+                .and_then(|_| base_entries.get(name))
+                .filter(|(kind, _)| kind == "blob")
+                .map(|(_, git_hash)| git_hash.clone())
+        };
+
         let mut entries = String::new();
 
         for (name, item) in tree.get_files() {
-            let (mode, kind) = match item.item_type {
-                DirEntryType::Executable | DirEntryType::ExecutableChunked => ("100755", "blob"),
-                DirEntryType::SymbolicLink => ("120000", "blob"),
-                _ => ("100644", "blob"),
+            let mode = match item.item_type {
+                DirEntryType::Executable | DirEntryType::ExecutableChunked => "100755",
+                DirEntryType::SymbolicLink => "120000",
+                _ => "100644",
             };
-            // A chunked file's hash is a recipe: stream-assemble it into the git blob rather than
-            // loading it as a blob (which would fail) or reading it whole into memory.
-            let blob = if item.item_type.is_chunked() {
-                self.convert_chunked_blob(&item.hash)?
-            } else {
-                self.convert_blob(&item.hash)?
+            let blob = match reusable_blob(name, &item.hash) {
+                Some(blob) => blob,
+                // A chunked file's hash is a recipe: stream-assemble it into the git blob rather
+                // than loading it as a blob (which would fail) or reading it whole into memory.
+                None if item.item_type.is_chunked() => self.convert_chunked_blob(&item.hash)?,
+                None => self.convert_blob(&item.hash)?,
             };
-            entries.push_str(&format!("{} {} {}\t{}\0", mode, kind, blob, name));
+            entries.push_str(&format!("{} blob {}\t{}\0", mode, blob, name));
         }
 
         for (name, item) in tree.get_subtrees() {
-            let subtree = self.convert_tree(&item.hash)?;
+            // Converted against the base's subtree of the same name, which returns its git hash
+            // outright when the two are equal.
+            let base_subtree = base_tree.as_ref().and_then(|base| base.get_subtree(name))
+                .and_then(|base_item| base_entries.get(name)
+                    .filter(|(kind, _)| kind == "tree")
+                    .map(|(_, git_hash)| (base_item.hash.as_str(), git_hash.as_str())));
+            let subtree = self.convert_tree(&item.hash, base_subtree)?;
             entries.push_str(&format!("040000 tree {}\t{}\0", subtree, name));
         }
 
         // NUL-terminated (`-z`): a name may hold a newline or tab, and without `-z` mktree also
         // C-unquotes a name that begins with `"`, writing a different name than the tree holds.
         // A name never holds NUL (the tree parser refuses one), so NUL frames every entry.
-        let git_hash = git_stdin(self.path, &["mktree", "-z"], entries.as_bytes())?.trim().to_string();
-
-        self.trees.insert(forklift_hash.to_string(), git_hash.clone());
+        let git_hash = self.repo.run(&["mktree", "-z"], Some(entries.as_bytes()))?.trim().to_string();
+        self.trees_written += 1;
 
         Ok(git_hash)
     }
 
-    /// Write one forklift blob as a git blob.
-    fn convert_blob(&mut self, forklift_hash: &str) -> Result<String, String> {
-        if let Some(hash) = self.blobs.get(forklift_hash) {
-            return Ok(hash.clone());
+    /// The entries of the git tree `git_hash`: name to (kind, hash). Read with `-z`, since plain
+    /// ls-tree C-quotes an awkward name.
+    fn list_tree(&self, git_hash: &str) -> Result<HashMap<String, (String, String)>, String> {
+        let listing = self.repo.run(&["ls-tree", "-z", git_hash], None)?;
+        let mut entries = HashMap::new();
+
+        for entry in listing.split_terminator('\0') {
+            // "<mode> SP <kind> SP <hash> TAB <name>"
+            let parsed = entry.split_once('\t').and_then(|(info, name)| {
+                let mut fields = info.split(' ');
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some(_), Some(kind), Some(hash)) => Some((name, kind, hash)),
+                    _ => None,
+                }
+            });
+            let (name, kind, hash) = parsed.ok_or(format!("git ls-tree printed an entry this build cannot read: \"{}\"", entry))?;
+            entries.insert(name.to_string(), (kind.to_string(), hash.to_string()));
         }
 
-        let content = object_utils::load_blob(forklift_hash)?.content;
-        let git_hash = git_stdin(self.path, &["hash-object", "-w", "--stdin"], &content)?.trim().to_string();
+        Ok(entries)
+    }
 
-        self.blobs.insert(forklift_hash.to_string(), git_hash.clone());
+    /// Write one forklift blob as a git blob. Hashing from stdin applies no filter.
+    fn convert_blob(&mut self, forklift_hash: &str) -> Result<String, String> {
+        let content = object_utils::load_blob(forklift_hash)?.content;
+        let git_hash = self.repo.run(&["hash-object", "-w", "--stdin"], Some(&content))?.trim().to_string();
+        self.blobs_written += 1;
 
         Ok(git_hash)
     }
 
     /// Write one chunked forklift file as a git blob by stream-assembling its recipe to a temp
     /// file (bounded to one chunk in memory at a time, integrity-verified), then hashing that file
-    /// into the git object store. The assembled bytes round-trip exactly.
+    /// into the git object store. The assembled bytes round-trip exactly: `--no-filters`, since a
+    /// path, unlike stdin, picks up the repository's attributes and end-of-line conversion.
     fn convert_chunked_blob(&mut self, recipe_hash: &str) -> Result<String, String> {
-        if let Some(hash) = self.blobs.get(recipe_hash) {
-            return Ok(hash.clone());
-        }
-
         let (temp_path, file) = create_export_temp(recipe_hash, &TEMP_COUNTER)?;
 
         let assemble = || -> Result<(), String> {
@@ -232,12 +370,11 @@ impl<'a> Exporter<'a> {
         }
 
         let temp_str = temp_path.to_string_lossy().into_owned();
-        let git_hash = git(self.path, &["hash-object", "-w", "--", &temp_str])
+        let git_hash = self.repo.run(&["hash-object", "-w", "--no-filters", "--", &temp_str], None)
             .map(|h| h.trim().to_string());
         let _ = std::fs::remove_file(&temp_path);
         let git_hash = git_hash?;
-
-        self.blobs.insert(recipe_hash.to_string(), git_hash.clone());
+        self.blobs_written += 1;
 
         Ok(git_hash)
     }
@@ -263,6 +400,9 @@ fn create_export_temp(recipe_hash: &str, counter: &std::sync::atomic::AtomicU64)
 
 /// The (name, email) and unix time of a parcel's authoring action (`want_author`) or its
 /// stacking action, falling back to the first action of any kind (every parcel has one).
+///
+/// Both are cleaned the way git cleans an identity, so git writes them as given. A name that cleans
+/// to nothing, which git refuses, falls back to the cleaned identifier, then to "forklift".
 fn action_identity(parcel: &Parcel, want_author: bool) -> ((String, String), i64) {
     let action = parcel.actions.iter()
         .find(|action| matches!(action.action, ParcelActionType::Author) == want_author)
@@ -270,15 +410,49 @@ fn action_identity(parcel: &Parcel, want_author: bool) -> ((String, String), i64
 
     match action {
         Some(action) => {
-            let name = if action.operator.name.is_empty() {
-                action.operator.identifier.clone()
-            } else {
-                action.operator.name.clone()
-            };
-            ((name, action.operator.identifier.clone()), action.timestamp.timestamp())
+            let email = without_crud(&action.operator.identifier);
+            let name = [without_crud(&action.operator.name), email.clone()].into_iter()
+                .find(|name| !name.is_empty())
+                .unwrap_or_else(|| "forklift".to_string());
+            ((name, email), action.timestamp.timestamp())
         }
         None => (("forklift".to_string(), "forklift@localhost".to_string()), 0),
     }
+}
+
+/// `value` as git writes it into an identity (ident.c): trimmed of "crud" (control characters,
+/// space and `,:;<>"\'`) at both ends, with every newline, `<` and `>` inside dropped.
+fn without_crud(value: &str) -> String {
+    let crud = |c: char| c <= ' ' || matches!(c, ',' | ':' | ';' | '<' | '>' | '"' | '\\' | '\'');
+
+    value.trim_matches(crud).chars().filter(|c| !matches!(c, '\n' | '<' | '>')).collect()
+}
+
+/// A git date for unix time `seconds`. The `@` form, since git reads a bare number before March
+/// 1973 as something other than a unix time and refuses it.
+fn git_date(seconds: i64) -> String {
+    format!("@{} +0000", seconds)
+}
+
+/// The last line of every exported commit's message: the parcel it was exported from, and the
+/// export layout it was written in.
+pub(crate) fn parcel_line(parcel_hash: &str) -> String {
+    format!("Forklift-Parcel: {} export/{}", parcel_hash, EXPORT_LAYOUT)
+}
+
+/// The commit message for `parcel`: its description without trailing newlines, a blank line, and
+/// the parcel line; only the parcel line when the description is empty.
+fn commit_message(parcel: &Parcel, parcel_hash: &str) -> String {
+    match parcel.description.as_deref().map(|d| d.trim_end_matches('\n')).filter(|d| !d.is_empty()) {
+        Some(description) => format!("{}\n\n{}\n", description, parcel_line(parcel_hash)),
+        None => format!("{}\n", parcel_line(parcel_hash)),
+    }
+}
+
+/// `items` with repeats removed, first occurrence kept, in order.
+fn distinct(items: &[String]) -> Vec<&String> {
+    let mut seen = HashSet::new();
+    items.iter().filter(|item| seen.insert(*item)).collect()
 }
 
 /// Parcels reachable from `heads`, ordered parents-before-children (so a commit is written
@@ -309,67 +483,24 @@ fn topological_order(heads: &[String]) -> Result<Vec<String>, String> {
     Ok(order)
 }
 
-/// Run `git -C <path> <args>` and return trimmed stdout as a string.
-fn git(path: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C").arg(path)
+/// Run `command` (`git -C <path>`) with `args`, `input` on stdin (or none at all, so git never
+/// waits on the terminal), returning its stdout.
+fn run_git(mut command: Command, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+    let mut child = command
         .args(args)
-        .output()
-        .map_err(|e| format!("Could not run git (is it installed and on your PATH?): {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    String::from_utf8(output.stdout)
-        .map_err(|_| format!("git {} produced non-UTF-8 output.", args.join(" ")))
-}
-
-/// Run a git command with `input` on stdin, returning its stdout.
-fn git_stdin(path: &str, args: &[&str], input: &[u8]) -> Result<String, String> {
-    let mut child = Command::new("git")
-        .arg("-C").arg(path)
-        .args(args)
-        .stdin(Stdio::piped())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Could not run git: {}", e))?;
+        .map_err(|e| format!("Could not run git (is it installed and on your PATH?): {}", e))?;
 
-    child.stdin.take().expect("stdin is piped").write_all(input)
-        .map_err(|e| format!("Error while writing to git: {}", e))?;
+    if let Some(input) = input {
+        child.stdin.take().expect("stdin is piped").write_all(input)
+            .map_err(|e| format!("Error while writing to git: {}", e))?;
+    }
 
     let output = child.wait_with_output()
         .map_err(|e| format!("Error while running git: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    String::from_utf8(output.stdout)
-        .map_err(|_| format!("git {} produced non-UTF-8 output.", args.join(" ")))
-}
-
-/// Run `git -C <path> <args>` with extra environment variables (the author/committer
-/// identity for `commit-tree`).
-fn git_env(path: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(path).args(args);
-
-    for (key, value) in env {
-        command.env(key, value);
-    }
-
-    let output = command.output()
-        .map_err(|e| format!("Could not run git: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -389,7 +520,13 @@ fn git_env(path: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, St
 pub(crate) struct ExportReport {
     path: String,
     commits: usize,
+
+    /// The git trees written. A tree unchanged from its parcel's first parent is reused, not
+    /// written again.
     trees: usize,
+
+    /// The git blobs written. A file unchanged from its parcel's first parent is reused, not
+    /// written again.
     blobs: usize,
 
     /// The branches created (one per user pallet).
@@ -430,6 +567,246 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::blob::Blob;
+    use forklift_core::model::chunk::Chunk;
+    use forklift_core::model::operator::Operator;
+    use forklift_core::model::parcel_action::ParcelAction;
+    use forklift_core::model::recipe::{Recipe, RecipeChunk};
+    use forklift_core::model::tree_item::TreeItem;
+    use crate::test_support::Warehouse;
+
+    /// A file of a fixture tree: its name, type and content (a chunked type is stored as a recipe
+    /// over `chunks`).
+    enum Entry<'a> {
+        File(&'a str, DirEntryType, &'a [u8]),
+        Chunked(&'a str, DirEntryType, &'a [&'a [u8]]),
+        Dir(&'a str, Vec<Entry<'a>>),
+    }
+
+    fn store_blob(content: &[u8]) -> String {
+        let mut blob = LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() });
+        blob.store().unwrap();
+        blob.hash
+    }
+
+    fn store_recipe(chunks: &[&[u8]]) -> String {
+        let mut recipe_chunks = Vec::new();
+        for chunk in chunks {
+            let mut object = LooseObjectBuilder::build_chunk(&Chunk { content: chunk.to_vec() });
+            object.store().unwrap();
+            recipe_chunks.push(RecipeChunk { hash: object.hash, size: chunk.len() as u64 });
+        }
+        let whole = chunks.concat();
+        let mut recipe = LooseObjectBuilder::build_recipe(&Recipe {
+            content_hash: object_utils::hash_object_bytes(&whole),
+            total_size: whole.len() as u64,
+            chunks: recipe_chunks,
+        });
+        recipe.store().unwrap();
+        recipe.hash
+    }
+
+    fn store_tree(entries: &[Entry]) -> String {
+        let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        for entry in entries {
+            let child = match entry {
+                Entry::File(name, kind, content) => TreeItem::new(name.to_string(), store_blob(content), *kind),
+                Entry::Chunked(name, kind, chunks) => TreeItem::new(name.to_string(), store_recipe(chunks), *kind),
+                Entry::Dir(name, entries) => TreeItem::new(name.to_string(), store_tree(entries), DirEntryType::Tree),
+            };
+            root.add_child(child);
+        }
+        let mut tree = LooseObjectBuilder::build_tree(&root);
+        tree.store().unwrap();
+        tree.hash
+    }
+
+    fn action(action: ParcelActionType, operator: &str, seconds: i64) -> ParcelAction {
+        ParcelAction {
+            operator: Operator { name: operator.to_string(), identifier: operator.to_string() },
+            action,
+            description: None,
+            timestamp: DateTime::<Utc>::from_timestamp(seconds, 0).unwrap(),
+        }
+    }
+
+    fn store_parcel(tree: &str, parents: &[&str], actions: Vec<ParcelAction>, description: Option<&str>) -> String {
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree.to_string(),
+            parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            actions,
+            description: description.map(str::to_string),
+        });
+        parcel.store().unwrap();
+        parcel.hash
+    }
+
+    /// A fresh repository for `warehouse` to export into.
+    fn create_repo(warehouse: &Warehouse) -> GitRepo {
+        let path = warehouse.root.join("exported");
+        std::fs::create_dir_all(&path).unwrap();
+        GitRepo::create(&path).unwrap()
+    }
+
+    /// Export `head`'s history into `repo`, returning its commit.
+    fn export(exporter: &mut Exporter, head: &str) -> String {
+        for parcel in topological_order(&[head.to_string()]).unwrap() {
+            exporter.export_parcel(&parcel).unwrap();
+        }
+        exporter.exported[head].commit.clone()
+    }
+
+    fn git_bytes(repo: &GitRepo, args: &[&str]) -> Vec<u8> {
+        let output = repo.command(|key| key.starts_with("GIT_")).args(args).output().unwrap();
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        output.stdout
+    }
+
+    /// Test 11 (layout pin): a fixture exercising every rule the export layout covers exports to
+    /// a fixed tip hash. A change to the mode map, chunk assembly, message shape, identity
+    /// mapping, date form or parent rule moves it, and must bump [`EXPORT_LAYOUT`] (and this
+    /// literal) with it.
+    ///
+    /// The fixture holds a chunked file, an executable, a symlink, an empty file and nested
+    /// folders; a parcel dated 1970-01-02, which git refuses in the bare date form (test 19); an
+    /// author who is not the stacker; an operator whose name git would strip to nothing; an empty
+    /// description; and a merge whose parent list repeats a parent.
+    #[test]
+    fn a_fixed_history_exports_to_a_fixed_tip() {
+        let warehouse = Warehouse::storage_only("export-layout-pin");
+
+        let first = store_tree(&[
+            Entry::File("README", DirEntryType::Normal, b"hello\n"),
+            Entry::File("run.sh", DirEntryType::Executable, b"#!/bin/sh\necho hi\n"),
+            Entry::File("link", DirEntryType::SymbolicLink, b"README"),
+            Entry::File("empty", DirEntryType::Normal, b""),
+            Entry::Chunked("big.bin", DirEntryType::NormalChunked, &[b"chunk one\r\n", b"chunk two\r\n"]),
+            Entry::Dir("a", vec![Entry::Dir("b", vec![Entry::File("c.txt", DirEntryType::Normal, b"deep\n")])]),
+        ]);
+        let second = store_tree(&[
+            Entry::File("README", DirEntryType::Normal, b"hello\n"),
+            Entry::File("run.sh", DirEntryType::Normal, b"#!/bin/sh\necho hi\n"),
+            Entry::File("link", DirEntryType::SymbolicLink, b"README"),
+            Entry::File("empty", DirEntryType::Normal, b""),
+            Entry::Chunked("big.bin", DirEntryType::ExecutableChunked, &[b"chunk one\r\n", b"chunk two\r\n"]),
+            Entry::Dir("a", vec![Entry::Dir("b", vec![Entry::File("c.txt", DirEntryType::Normal, b"deeper\n")])]),
+        ]);
+        let third = store_tree(&[Entry::File("README", DirEntryType::Normal, b"merged\n")]);
+
+        let root = store_parcel(&first, &[], vec![
+            action(ParcelActionType::Author, "alice@example.com", 1_000_000_000),
+            action(ParcelActionType::Stack, "bob@example.com", 1_000_000_100),
+        ], Some("first\n\nwith a body\n"));
+        let crud = store_parcel(&second, &[&root], vec![
+            action(ParcelActionType::Author, " <;> ", 86_400),
+        ], None);
+        let merge = store_parcel(&third, &[&crud, &root, &crud], vec![
+            action(ParcelActionType::Stack, "carol@example.com", 1_700_000_000),
+        ], Some("merge"));
+
+        let repo = create_repo(&warehouse);
+        let mut exporter = Exporter::new(&repo);
+        let tip = export(&mut exporter, &merge);
+
+        let commit = |hash: &str| String::from_utf8(git_bytes(&repo, &["cat-file", "commit", hash])).unwrap();
+        let merge_commit = commit(&tip);
+        let parents: Vec<&str> = merge_commit.lines().filter_map(|line| line.strip_prefix("parent ")).collect();
+        assert_eq!(parents, [exporter.exported[&crud].commit.as_str(), exporter.exported[&root].commit.as_str()],
+            "repeats removed, first occurrence kept: {}", merge_commit);
+        assert!(merge_commit.ends_with(&format!("merge\n\nForklift-Parcel: {} export/1\n", merge)), "{}", merge_commit);
+
+        let crud_commit = commit(&exporter.exported[&crud].commit);
+        assert!(crud_commit.contains("\nauthor forklift <> 86400 +0000\n"), "{}", crud_commit);
+        assert!(crud_commit.ends_with(&format!("\n\nForklift-Parcel: {} export/1\n", crud)), "{}", crud_commit);
+
+        let root_commit = commit(&exporter.exported[&root].commit);
+        assert!(root_commit.contains("\nauthor alice@example.com <alice@example.com> 1000000000 +0000\n"), "{}", root_commit);
+        assert!(root_commit.contains("\ncommitter bob@example.com <bob@example.com> 1000000100 +0000\n"), "{}", root_commit);
+
+        git_bytes(&repo, &["fsck", "--strict"]);
+        assert_eq!(tip, "66677f9fc675b41891d4f168fb280606e0aac682", "the export layout's pinned tip moved");
+    }
+
+    /// Test 15 (reuse): a parcel changing one file deep in a large tree writes only that file's blob
+    /// and the trees on its path.
+    #[test]
+    fn a_one_file_change_writes_only_its_path() {
+        let warehouse = Warehouse::storage_only("export-reuse");
+
+        let names: Vec<String> = (0..40).map(|n| format!("file-{}", n)).collect();
+        let tree = |changed: &[u8]| {
+            let files = |dir: &str| -> Vec<(String, Vec<u8>)> {
+                names.iter().map(|name| (name.clone(), format!("{}/{}\n", dir, name).into_bytes())).collect()
+            };
+            let (left, right) = (files("left"), files("right"));
+            let mut left_entries: Vec<Entry> = left.iter().map(|(name, content)| Entry::File(name, DirEntryType::Normal, content)).collect();
+            left_entries.push(Entry::File("changed", DirEntryType::Normal, changed));
+            let right_entries: Vec<Entry> = right.iter().map(|(name, content)| Entry::File(name, DirEntryType::Normal, content)).collect();
+            store_tree(&[Entry::Dir("left", vec![Entry::Dir("inner", left_entries)]), Entry::Dir("right", right_entries)])
+        };
+
+        let first = store_parcel(&tree(b"one\n"), &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some("one"));
+        let second = store_parcel(&tree(b"two\n"), &[&first], vec![action(ParcelActionType::Stack, "op", 2_000)], Some("two"));
+
+        let repo = create_repo(&warehouse);
+        let mut exporter = Exporter::new(&repo);
+        export(&mut exporter, &first);
+        let (trees, blobs) = (exporter.trees_written, exporter.blobs_written);
+        assert_eq!((trees, blobs), (4, 81));
+
+        export(&mut exporter, &second);
+        assert_eq!((exporter.trees_written - trees, exporter.blobs_written - blobs), (3, 1),
+            "the changed blob and the root, left and left/inner trees");
+    }
+
+    /// Test 1's filter half: a chunked file is hashed byte for byte even in a repository whose own
+    /// attributes and config would convert its line endings, as hashing it by path otherwise does.
+    #[test]
+    fn a_chunked_file_is_hashed_without_filters() {
+        let warehouse = Warehouse::storage_only("export-no-filters");
+        let content: &[&[u8]] = &[b"one\r\n", b"two\r\n"];
+        let tree = store_tree(&[Entry::Chunked("crlf.txt", DirEntryType::NormalChunked, content)]);
+        let parcel = store_parcel(&tree, &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some("crlf"));
+
+        let repo = create_repo(&warehouse);
+        let git_dir = warehouse.root.join("exported").join(".git");
+        std::fs::create_dir_all(git_dir.join("info")).unwrap();
+        std::fs::write(git_dir.join("info").join("attributes"), "* text\n").unwrap();
+        git_bytes(&repo, &["config", "core.autocrlf", "true"]);
+
+        let mut exporter = Exporter::new(&repo);
+        let commit = export(&mut exporter, &parcel);
+
+        assert_eq!(git_bytes(&repo, &["cat-file", "blob", &format!("{}:crlf.txt", commit)]), content.concat());
+    }
+
+    /// Test 1's message half: an NFD description reaches the commit byte for byte. On macOS, where
+    /// git precomposes arguments, a message passed with -m comes back NFC.
+    #[test]
+    fn an_nfd_description_is_kept_byte_for_byte() {
+        let warehouse = Warehouse::storage_only("export-nfd");
+        let description = "Cafe\u{301}";
+        let tree = store_tree(&[Entry::File("README", DirEntryType::Normal, b"x\n")]);
+        let parcel = store_parcel(&tree, &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some(description));
+
+        let repo = create_repo(&warehouse);
+        let mut exporter = Exporter::new(&repo);
+        let commit = export(&mut exporter, &parcel);
+
+        let raw = git_bytes(&repo, &["cat-file", "commit", &commit]);
+        let message = String::from_utf8(raw).unwrap();
+        assert!(message.contains(&format!("\n\n{}\n\nForklift-Parcel: ", description)), "{:?}", message);
+    }
+
+    #[test]
+    fn git_s_identity_cleaning_is_matched() {
+        assert_eq!(without_crud("  Ada <x> Lovelace, "), "Ada x Lovelace");
+        assert_eq!(without_crud(" <;> "), "");
+        assert_eq!(without_crud("..."), "...");
+        assert_eq!(without_crud("a\nb"), "ab");
+    }
 
     /// A killed earlier process with this one's id can leave its temp file at the very name the
     /// next export draws. The export steps past it rather than failing, and leaves it alone.
