@@ -1076,18 +1076,29 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
     }
 }
 
-/// Whether `PUT /v1/trust` wrote `requested`, from what its install returned. An install found
-/// already in place, or refused because the office or the anchor moved while the anchor on disk is
-/// now the requested one, was an identical request's (or a bay's) doing: `Ok(false)`, the `200`
-/// with no event a request arriving after it gets. Any other refusal is the request's own answer.
+/// The `409` for a trust anchor that would replace a different one without being its re-genesis.
+fn trust_one_way_door() -> HandlerError {
+    (StatusCode::CONFLICT, "This warehouse already has a different trust anchor; trust is a one-way \
+        door and cannot be replaced.".to_string())
+}
+
+/// Whether `PUT /v1/trust` wrote `requested`, from what its install returned; `read` is the anchor
+/// the request's decision was made against. An install found already in place, or refused because
+/// the office or the anchor moved while the anchor on disk is now the requested one, was an
+/// identical request's (or a bay's) doing: `Ok(false)`, the `200` with no event a request arriving
+/// after it gets. One refused because a different anchor was installed meanwhile gets the answer a
+/// request arriving after that install gets, the one-way door. Any other refusal is the request's
+/// own answer, as is a refusal whose anchor cannot be read back.
 fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpdateError>,
+                         read: Option<&TrustAnchorDto>,
                          requested: &TrustAnchorDto) -> Result<bool, HandlerError> {
     match installed {
         Ok(office_utils::TrustInstalled::Written) => Ok(true),
         Ok(office_utils::TrustInstalled::AlreadyInPlace) => Ok(false),
         Err(error @ (RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved)) => {
-            match office_utils::read_trust_anchor().map_err(internal)? {
-                Some(held) if TrustAnchorDto::from(&held) == *requested => Ok(false),
+            match office_utils::read_trust_anchor().map(|held| held.as_ref().map(TrustAnchorDto::from)) {
+                Ok(Some(held)) if held == *requested => Ok(false),
+                Ok(Some(held)) if Some(&held) != read => Err(trust_one_way_door()),
                 _ => Err(trust_install_refusal(error)),
             }
         }
@@ -2409,11 +2420,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 let is_regenesis = anchor.prior_genesis.as_deref() == Some(existing.genesis.as_str());
 
                 if !is_regenesis {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "This warehouse already has a different trust anchor; trust is \
-                        a one-way door and cannot be replaced.".to_string()
-                    ));
+                    return Err(trust_one_way_door());
                 }
 
                 if !matches!(principal, Principal::Static | Principal::Open) {
@@ -2456,7 +2463,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     },
                 });
 
-                if !trust_install_outcome(installed, &anchor)? {
+                if !trust_install_outcome(installed, Some(&TrustAnchorDto::from(&existing)), &anchor)? {
                     return Ok(None);
                 }
 
@@ -2509,7 +2516,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     },
                 });
 
-                if !trust_install_outcome(installed, &anchor)? {
+                if !trust_install_outcome(installed, None, &anchor)? {
                     return Ok(None);
                 }
 
@@ -5598,11 +5605,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Two identical first-contact trust PUTs, the first parked at its install while the second
-    /// installs; with `move_office`, a bay then also stacks the office before the first resumes, so
-    /// its install is refused rather than found in place. Returns the parked PUT's status and the
-    /// second's.
-    async fn identical_first_contacts(name: &str, move_office: bool) -> (StatusCode, StatusCode) {
+    /// Two first-contact trust PUTs, the first (of [`first_anchor`]) parked at its install while
+    /// the second (of `second_anchor`) installs; with `move_office`, a bay then also stacks the
+    /// office before the first resumes, so its install is refused rather than found in place.
+    /// Returns the parked PUT's status and body, and the second's status.
+    async fn racing_first_contacts(name: &str, second_anchor: TrustAnchorDto, move_office: bool)
+                                   -> (StatusCode, String, StatusCode) {
         let (root, _scope) = trust_warehouse(name);
         let state = Arc::new(single_mode_state(root.clone()));
 
@@ -5612,7 +5620,7 @@ mod tests {
         ));
         reached.recv_timeout(std::time::Duration::from_secs(5)).expect("the first PUT must park at its install");
 
-        let second = put_trust(State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(Vec::new())))
+        let second = put_trust(State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(second_anchor.clone()))
             .await.into_response().status();
 
         if move_office {
@@ -5622,11 +5630,20 @@ mod tests {
         }
 
         gate.send(()).unwrap();
-        let parked = parked.await.unwrap().into_response().status();
+        let parked = parked.await.unwrap().into_response();
+        let parked_status = parked.status();
+        let parked_body = body_text(parked).await;
 
-        assert!(office_utils::read_trust_anchor().unwrap().is_some_and(|anchor| TrustAnchorDto::from(&anchor) == first_anchor(Vec::new())),
-            "the requested anchor must be installed");
+        assert!(office_utils::read_trust_anchor().unwrap().is_some_and(|anchor| TrustAnchorDto::from(&anchor) == second_anchor),
+            "the second PUT's anchor must be installed");
         let _ = std::fs::remove_dir_all(&root);
+
+        (parked_status, parked_body, second)
+    }
+
+    /// Two identical first-contact trust PUTs: [`racing_first_contacts`]'s statuses.
+    async fn identical_first_contacts(name: &str, move_office: bool) -> (StatusCode, StatusCode) {
+        let (parked, _, second) = racing_first_contacts(name, first_anchor(Vec::new()), move_office).await;
 
         (parked, second)
     }
@@ -5645,6 +5662,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn identical_racing_first_contacts_establish_trust_once_when_the_office_moves_between() {
         assert_eq!(identical_first_contacts("put-trust-identical-moved", true).await, (StatusCode::OK, StatusCode::CREATED));
+    }
+
+    // The loser of two different first contacts gets the answer a request arriving after the
+    // winner gets, not an invitation to retry.
+    // Revert: put_trust answers a refused install whose re-read anchor differs from the one it
+    // read with the install's own refusal → the anchor-moved "retry" 409.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_loser_of_two_different_first_contacts_meets_the_one_way_door() {
+        let other = TrustAnchorDto { enabled_at: 2, ..first_anchor(Vec::new()) };
+        let (parked, body, second) = racing_first_contacts("put-trust-different", other, false).await;
+
+        assert_eq!((parked, second), (StatusCode::CONFLICT, StatusCode::CREATED));
+        assert!(body.contains("trust is a one-way door"), "{}", body);
     }
 
     /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
