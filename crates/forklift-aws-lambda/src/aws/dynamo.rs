@@ -61,8 +61,11 @@
 
 use std::collections::HashMap;
 
+use aws_sdk_dynamodb::config::retry::RetryConfig;
+use aws_sdk_dynamodb::config::timeout::TimeoutConfig;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_smithy_runtime_api::client::result::SdkError;
 use aws_sdk_dynamodb::types::{
     AttributeValue, CancellationReason, ConditionCheck, Put, ReturnValuesOnConditionCheckFailure,
     TransactWriteItem, Update,
@@ -76,7 +79,8 @@ use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
 use crate::store::{
-    CasOutcome, OfficePrecondition, RefStore, TrustOutcome, TrustWriteOutcome,
+    CasOutcome, OfficePrecondition, RefStore, TransientCause, TrustOutcome, TrustWriteOutcome,
+    TRANSACTION_ATTEMPT_TIMEOUT,
 };
 
 /// The partition-key attribute: the warehouse id.
@@ -356,7 +360,7 @@ enum Refusal {
     /// attribute it reports — a head, or the anchor's bytes.
     Moved(Precondition, Option<HashMap<String, AttributeValue>>),
     /// Refused for a reason that establishes nothing about whether any input moved.
-    Transient,
+    Transient(TransientCause),
 }
 
 impl ConditionedTransaction {
@@ -370,41 +374,115 @@ impl ConditionedTransaction {
         self.layout.push(conditions_on);
     }
 
-    /// Issue the transaction. `Ok(None)` committed; `Ok(Some(_))` was cancelled and attributed;
-    /// `Err` is a fault.
+    /// Issue one attempt of the transaction under `request_token`. `Ok(None)` committed;
+    /// `Ok(Some(_))` was refused and attributed; `Err` is a fault.
     ///
-    /// Only `SdkError::ServiceError` carries a modelled error at all, so the four other
-    /// `SdkError` variants — construction, timeout, dispatch and response failures — reach the
-    /// fault arm here. Three of them leave the transaction's fate genuinely unknown to the caller
-    /// and belong on a transient arm with an idempotency token behind it, which is FORK-95's
-    /// retry slice; routing them there before that machinery exists would answer `503` to a
-    /// client with nothing able to act on it, widening a debt this crate already carries rather
-    /// than paying it.
-    async fn send(self, client: &DynamoOps, label: &str) -> Result<Option<Refusal>, String> {
-        let request = client.transact_write_items().set_transact_items(Some(self.items));
+    /// The partition is over the whole `SdkError` surface, not only its modelled branch (FORK-95
+    /// design memo, claim C14):
+    ///
+    /// * `ConstructionFailure` was never dispatched, so nothing can have committed — a fault.
+    /// * `TimeoutError`, `DispatchFailure` and `ResponseError` leave the attempt's fate unknown:
+    ///   it may have committed. That is the case the request token exists for, so they are
+    ///   transient and the head re-issues under the same token.
+    /// * `ServiceError` is partitioned over `TransactWriteItemsError`'s variants by name, in
+    ///   [`classify_service_error`].
+    ///
+    /// Anything else (`SdkError` is `#[non_exhaustive]`) is a fault rather than a guess.
+    ///
+    /// The SDK's own retry is disabled for this one call, and the attempt is bounded by
+    /// [`TRANSACTION_ATTEMPT_TIMEOUT`]. Left on the shared default (`RetryConfig::standard()`,
+    /// three attempts with 1 s and 2 s waits) one store call could be three billed transactions
+    /// and several seconds the head's remaining-window check never saw. With it off, one call is
+    /// one transaction and the head's budget is exact. Both transactions this store issues go
+    /// through here, and nothing else in the crate overrides the client's configuration.
+    ///
+    /// The token is set explicitly because the SDK's own fill-in is per `send()`: it would keep
+    /// the token across its internal retries but mint a fresh one for every re-issue the head
+    /// makes, and a fresh token is what turns a re-issue of an attempt that already landed into
+    /// a second transaction refused by the state the first one wrote.
+    async fn send(
+        self,
+        client: &DynamoOps,
+        label: &str,
+        request_token: &str,
+    ) -> Result<Option<Refusal>, String> {
+        let request = client
+            .transact_write_items()
+            .set_transact_items(Some(self.items))
+            .client_request_token(request_token)
+            .customize()
+            .config_override(
+                aws_sdk_dynamodb::Config::builder()
+                    .retry_config(RetryConfig::disabled())
+                    .timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_attempt_timeout(TRANSACTION_ATTEMPT_TIMEOUT)
+                            .build(),
+                    ),
+            );
 
         match request.send().await {
             Ok(_) => Ok(None),
-            Err(err) => match err.as_service_error() {
-                Some(TransactWriteItemsError::TransactionCanceledException(failure)) => {
-                    classify(&self.layout, failure.cancellation_reasons()).map(Some)
+            Err(SdkError::ServiceError(context)) => {
+                match classify_service_error(&self.layout, context.err()) {
+                    Some(classified) => classified.map(Some),
+                    None => Err(describe(label, SdkError::ServiceError(context))),
                 }
-                _ => Err(describe(label, err)),
-            },
+            }
+            Err(
+                SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_),
+            ) => Ok(Some(Refusal::Transient(TransientCause::FateUnknown))),
+            Err(err) => Err(describe(label, err)),
         }
     }
+}
+
+/// Route a modelled `TransactWriteItems` error to an arm, naming every variant the pinned SDK
+/// declares (FORK-95 design memo, claim C14). `None` is arm three — a fault, described by the
+/// caller from the error itself — and is reached only by the variants listed for it, plus
+/// whatever a later SDK adds (the enum is `#[non_exhaustive]`, and an unknown variant is not
+/// guessed into a retry).
+///
+/// Every transient variant here was retried inside the SDK before its retry was scoped off at
+/// this call, so naming each one is what keeps disabling that retry from silently turning any of
+/// them into a `500`.
+fn classify_service_error(
+    layout: &[Precondition],
+    err: &TransactWriteItemsError,
+) -> Option<Result<Refusal, String>> {
+    use TransactWriteItemsError as E;
+
+    let cause = match err {
+        E::TransactionCanceledException(failure) => {
+            return Some(classify(layout, failure.cancellation_reasons()));
+        }
+        E::ProvisionedThroughputExceededException(_)
+        | E::ThrottlingException(_)
+        | E::RequestLimitExceeded(_) => TransientCause::Contended,
+        // What a same-token re-issue meets while an earlier attempt is still running.
+        E::TransactionInProgressException(_) => TransientCause::InProgress,
+        // "An error occurred on the server side": nothing says whether the attempt applied.
+        E::InternalServerError(_) => TransientCause::FateUnknown,
+        // `IdempotentParameterMismatchException` means this request's token was reused with
+        // different actions, which the head never does; `InvalidEndpointException`,
+        // `ResourceNotFoundException` and anything unmodelled are configuration or service
+        // faults that a re-issue cannot fix.
+        _ => return None,
+    };
+
+    Some(Ok(Refusal::Transient(cause)))
 }
 
 /// Attribute a cancellation to the precondition it names, by position in `layout`.
 ///
 /// A cancellation that names no moved precondition — every position reads "no error" (both the
-/// literal string `"None"` and an absent code mean that; the API Reference and the pinned SDK
-/// model disagree on which one DynamoDB actually sends, so both must read the same way here) — is
-/// reported as a fault rather than guessed at: attributing it to one of the inputs would be
-/// wrong. This is not a corner. The reason list is positional, so every cancellation either
-/// transaction can produce contains at least one no-error position, and a three-action
-/// transaction refused on one condition contains two. What is forbidden is the inverse — reading
-/// a no-error position as if it named the failure — not the recognition of an absent code.
+/// literal string `"None"` and an absent code mean that; the pinned SDK model allows either, and
+/// real DynamoDB sends `"None"`) — is reported as a fault rather than guessed at: attributing it
+/// to one of the inputs would be wrong. This is not a corner. The reason list is positional, so
+/// every cancellation either transaction can produce contains at least one no-error position, and
+/// a three-action transaction refused on one condition contains two. What is forbidden is the
+/// inverse — reading a no-error position as if it named the failure — not the recognition of an
+/// absent code.
 ///
 /// A list whose length does not match the number of actions submitted names no position reliably
 /// and lands in the same fault arm, as does an absent or empty one.
@@ -412,26 +490,17 @@ impl ConditionedTransaction {
 /// `ConditionalCheckFailed` takes precedence over any transient code: a transaction that was
 /// going to be refused for a moved input would be refused again on re-issue, so reporting the
 /// transient code first would spend a retry budget on a `409` wearing a `503`'s clothes. Only
-/// once no position failed a condition does a `TransactionConflict` anywhere in the list read as
-/// contention rather than a moved value.
+/// once no position failed a condition is the list read for contention — and then *every*
+/// position that names a code must name a transient one (`TransactionConflict`,
+/// `ThrottlingError`, `ProvisionedThroughputExceeded`). A list mixing a transient code with any
+/// other, such as a `ValidationError`, would fail the same way on every re-issue, so it is a
+/// fault, not a reason to spend the budget.
 ///
-/// `TransactionConflict` is the one transient cause classified explicitly rather than falling
-/// into the fault arm, because it is not merely inherited risk but **contention these
-/// transactions themselves introduce**: both of them `ConditionCheck` the single `@office` item,
+/// `TransactionConflict` is the transient cause these transactions most expect, because it is
+/// contention they themselves introduce: both of them `ConditionCheck` the single `@office` item,
 /// which every trusted lift in the warehouse also touches, so an office lift racing any other
 /// pallet's push — or a re-genesis merely running alongside an ordinary push — can cancel one of
-/// them for a reason that establishes nothing about whether it was ever actually wrong. See
-/// [`CasOutcome::Transient`] for why that is answered as a retryable refusal rather than a fault.
-/// Every other transient cause still falls to the fault arm: FORK-95's retry slice inherits the
-/// loop that answers all of them uniformly and gives it a request token to de-duplicate against.
-///
-/// **Recorded gap, not built here**: neither transaction carries a `ClientRequestToken`.
-/// `TransactWriteItems` is the one DynamoDB call AWS documents an idempotency token for; without
-/// one, an SDK-level retry of a request that actually committed re-issues it as a *new*
-/// transaction whose own conditions then fail against the state it just wrote, and the client is
-/// told a value moved for a write that succeeded. This is **not a regression** — the single-item
-/// writes these replaced had the identical hazard for the identical reason — but it is real, and
-/// giving it a token per sub-cause is exactly the policy FORK-95's retry slice owns.
+/// them for a reason that establishes nothing about whether it was ever actually wrong.
 fn classify(layout: &[Precondition], reasons: &[CancellationReason]) -> Result<Refusal, String> {
     if reasons.len() != layout.len() {
         return Err(format!(
@@ -448,8 +517,14 @@ fn classify(layout: &[Precondition], reasons: &[CancellationReason]) -> Result<R
         }
     }
 
-    if reasons.iter().any(|reason| reason.code() == Some("TransactionConflict")) {
-        return Ok(Refusal::Transient);
+    let named: Vec<&str> =
+        reasons.iter().filter_map(CancellationReason::code).filter(|code| *code != "None").collect();
+    let transient = |code: &&str| {
+        matches!(*code, "TransactionConflict" | "ThrottlingError" | "ProvisionedThroughputExceeded")
+    };
+
+    if !named.is_empty() && named.iter().all(transient) {
+        return Ok(Refusal::Transient(TransientCause::Contended));
     }
 
     Err(format!(
@@ -468,6 +543,7 @@ impl RefStore for DynamoRefStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compare_and_set_head(
         &self,
         namespace: PalletNamespace,
@@ -476,6 +552,7 @@ impl RefStore for DynamoRefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
         let entity = pallet_entity(namespace, name);
         let office_entity = pallet_entity(PalletNamespace::Meta, OFFICE_PALLET_NAME);
@@ -509,11 +586,11 @@ impl RefStore for DynamoRefStore {
 
             transaction.push(self.anchor_condition_check(anchor), Precondition::Anchor);
 
-            let refusal = transaction.send(&self.client, "DynamoDB ref-update commit").await?;
+            let refusal = transaction.send(&self.client, "DynamoDB ref-update commit", request_token).await?;
 
             Ok(match refusal {
                 None => CasOutcome::Committed,
-                Some(Refusal::Transient) => CasOutcome::Transient,
+                Some(Refusal::Transient(cause)) => CasOutcome::Transient(cause),
                 Some(Refusal::Moved(Precondition::PalletHead, item)) => {
                     CasOutcome::Conflict { current: item.as_ref().and_then(head_of) }
                 }
@@ -657,6 +734,7 @@ impl RefStore for DynamoRefStore {
         anchor: &TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         let dto = TrustAnchorDto::from(anchor);
         let json = serde_json::to_string(&dto)
@@ -676,11 +754,11 @@ impl RefStore for DynamoRefStore {
                 Precondition::OfficeHead,
             );
 
-            let refusal = transaction.send(&self.client, "DynamoDB anchor write").await?;
+            let refusal = transaction.send(&self.client, "DynamoDB anchor write", request_token).await?;
 
             Ok(match refusal {
                 None => TrustWriteOutcome::Replaced,
-                Some(Refusal::Transient) => TrustWriteOutcome::Transient,
+                Some(Refusal::Transient(cause)) => TrustWriteOutcome::Transient(cause),
                 Some(Refusal::Moved(Precondition::Anchor, item)) => {
                     let current = item.as_ref().and_then(anchor_of);
 
@@ -796,8 +874,84 @@ mod tests {
 
         assert!(matches!(
             classify(&ref_update_layout(), &reasons).expect("a transient cause, not a fault"),
-            Refusal::Transient
+            Refusal::Transient(TransientCause::Contended)
         ));
+    }
+
+    /// Throttling arrives as a cancellation code too, not only as a top-level variant, and is
+    /// re-issued like a conflict rather than answered as a fault.
+    #[test]
+    fn throttle_cancellation_codes_are_transient() {
+        for code in ["ThrottlingError", "ProvisionedThroughputExceeded"] {
+            let reasons = vec![reason("None"), reason(code), reason("TransactionConflict")];
+
+            assert!(
+                matches!(
+                    classify(&ref_update_layout(), &reasons),
+                    Ok(Refusal::Transient(TransientCause::Contended))
+                ),
+                "{code}"
+            );
+        }
+    }
+
+    /// A transient code alongside one that would fail every re-issue identically is a fault: the
+    /// re-issue loop would only spend the budget reaching the same refusal.
+    #[test]
+    fn a_transient_code_beside_a_permanent_one_is_a_fault_not_a_retry() {
+        let reasons =
+            vec![reason("TransactionConflict"), reason("ValidationError"), reason("None")];
+
+        assert!(classify(&ref_update_layout(), &reasons).is_err());
+    }
+
+    /// Every modelled variant the pinned SDK declares is routed by name: the five transient ones
+    /// to the cause that sets their wait, and the rest to the fault arm. Disabling the SDK's own
+    /// retry at the call site is safe only because none of the five falls through to a `500`.
+    #[test]
+    fn every_modelled_transact_write_items_error_is_routed_by_name() {
+        use aws_sdk_dynamodb::types::error::{
+            IdempotentParameterMismatchException, InternalServerError, InvalidEndpointException,
+            ProvisionedThroughputExceededException, RequestLimitExceeded,
+            ResourceNotFoundException, ThrottlingException, TransactionInProgressException,
+        };
+        use TransactWriteItemsError as E;
+
+        let transient = [
+            (
+                E::ProvisionedThroughputExceededException(
+                    ProvisionedThroughputExceededException::builder().build(),
+                ),
+                TransientCause::Contended,
+            ),
+            (E::ThrottlingException(ThrottlingException::builder().build()), TransientCause::Contended),
+            (E::RequestLimitExceeded(RequestLimitExceeded::builder().build()), TransientCause::Contended),
+            (
+                E::TransactionInProgressException(TransactionInProgressException::builder().build()),
+                TransientCause::InProgress,
+            ),
+            (E::InternalServerError(InternalServerError::builder().build()), TransientCause::FateUnknown),
+        ];
+
+        for (err, expected) in transient {
+            match classify_service_error(&ref_update_layout(), &err) {
+                Some(Ok(Refusal::Transient(cause))) => assert_eq!(cause, expected, "{err:?}"),
+                _ => panic!("{err:?} must be transient"),
+            }
+        }
+
+        let faults = [
+            E::IdempotentParameterMismatchException(
+                IdempotentParameterMismatchException::builder().build(),
+            ),
+            E::InvalidEndpointException(InvalidEndpointException::builder().build()),
+            E::ResourceNotFoundException(ResourceNotFoundException::builder().build()),
+            E::generic(aws_smithy_types::error::ErrorMetadata::builder().code("Mystery").build()),
+        ];
+
+        for err in faults {
+            assert!(classify_service_error(&ref_update_layout(), &err).is_none(), "{err:?}");
+        }
     }
 
     /// `ConditionalCheckFailed` takes precedence over a `TransactionConflict` elsewhere in the

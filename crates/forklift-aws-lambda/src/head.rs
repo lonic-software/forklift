@@ -35,8 +35,10 @@
 //! tokio refuses to let a runtime worker block on the futures an SDK-backed store bridges.
 //! See `blocking.rs`.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::remote::{
@@ -51,10 +53,11 @@ use forklift_core::util::{
 };
 
 use crate::error::{HeadError, HeadResult};
+use crate::reissue::reissue;
 use crate::scratch::{materialize, materialize_state, Mirror, Scratch};
 use crate::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
-    RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
+    RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
 /// The `genesis` of a stored anchor's bytes.
@@ -119,12 +122,19 @@ pub struct Head<O: ObjectStore, R: RefStore> {
     pub objects: O,
     pub refs: R,
     scratch: ScratchSource,
+    /// When the invocation this head serves must have answered by. A transient refusal is
+    /// re-issued only while what remains covers the wait and one more attempt (see
+    /// `reissue.rs`); `None` keeps the attempt cap and skips that check.
+    deadline: Option<SystemTime>,
 }
 
 impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// Assemble a head over the two stores, mirroring into a fresh scratch per request.
+    ///
+    /// It has no invocation deadline, so a transient refusal is re-issued up to the attempt cap
+    /// without a window check; [`with_deadline`](Self::with_deadline) adds one.
     pub fn new(objects: O, refs: R) -> Head<O, R> {
-        Head { objects, refs, scratch: ScratchSource::Ephemeral }
+        Head { objects, refs, scratch: ScratchSource::Ephemeral, deadline: None }
     }
 
     /// Assemble a head that reuses one scratch warehouse across warm invocations, so the
@@ -133,8 +143,28 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// `warehouse_id` must identify the warehouse these stores serve, and nothing else: an
     /// object found in the scratch is treated as present in the object store, and that
     /// inference is only sound within one warehouse (see [`Scratch::shared`]).
-    pub fn pooled(objects: O, refs: R, warehouse_id: impl Into<String>) -> Head<O, R> {
-        Head { objects, refs, scratch: ScratchSource::Pooled(warehouse_id.into()) }
+    ///
+    /// `deadline` is when the invocation must have answered by — on Lambda, the runtime
+    /// context's deadline. It is required here, unlike on [`new`](Self::new), because this is the
+    /// constructor the deployed function uses, and a head re-issuing transactions blind to its
+    /// window could spend it and leave the gateway to answer `504` instead of this head a `503`.
+    pub fn pooled(
+        objects: O,
+        refs: R,
+        warehouse_id: impl Into<String>,
+        deadline: SystemTime,
+    ) -> Head<O, R> {
+        Head {
+            objects,
+            refs,
+            scratch: ScratchSource::Pooled(warehouse_id.into()),
+            deadline: Some(deadline),
+        }
+    }
+
+    /// The same head, bounded by an invocation deadline.
+    pub fn with_deadline(self, deadline: SystemTime) -> Head<O, R> {
+        Head { deadline: Some(deadline), ..self }
     }
 
     /// The scratch warehouse this request mirrors into.
@@ -402,11 +432,26 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // through a door this code calls one-way; and the office head could move between the
         // `adopts` test and the write, planting an anchor that drops precisely the history that
         // test protects.
-        match self
-            .refs
-            .replace_trust(&anchor.to_anchor(), &existing_bytes, office_head.as_deref())
-            .map_err(HeadError::internal)?
-        {
+        //
+        // A transient refusal is re-issued, alone and under one request token, before it is
+        // answered (see `reissue.rs`); what reaches this match is the last attempt's outcome.
+        // Whether *any* attempt may have landed is kept apart from it: under one token, an
+        // earlier attempt of unknown fate can still commit after a later one is refused.
+        let replacement = anchor.to_anchor();
+        let uncertain = Cell::new(false);
+        let outcome = reissue(
+            self.deadline,
+            |token| {
+                self.refs.replace_trust(&replacement, &existing_bytes, office_head.as_deref(), token)
+            },
+            |outcome| match outcome {
+                TrustWriteOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
+                _ => None,
+            },
+        )
+        .map_err(HeadError::internal)?;
+
+        match outcome {
             TrustWriteOutcome::Replaced => Ok(TrustResult::Established),
             // Someone else planted the identical anchor inside this request's window. The
             // read-side `existing_dto == *anchor` check above answers exactly this case with
@@ -427,7 +472,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             TrustWriteOutcome::OfficeMoved { current } => {
                 Err(self.adopts_mismatch(anchor.adopts.as_deref(), current.as_deref()))
             }
-            TrustWriteOutcome::Transient => Err(self.anchor_write_contention()),
+            TrustWriteOutcome::Transient(_) => Err(self.anchor_write_contention(uncertain.get())),
         }
     }
 
@@ -484,13 +529,29 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// names a push, a commit and a ref update, and this path is none of the three — a client
     /// told to "run the push again" for a re-genesis it issued would be looking for an operation
     /// it never performed.
-    fn anchor_write_contention(&self) -> HeadError {
+    ///
+    /// Reached only once the head's own re-issues are spent or the invocation window cannot
+    /// afford another, so the message says the head already retried rather than inviting the
+    /// operator to wonder whether it did.
+    ///
+    /// When `uncertain` — some attempt of this request may yet land — the message claims nothing
+    /// about what was changed and sends the operator to read the anchor first.
+    fn anchor_write_contention(&self, uncertain: bool) -> HeadError {
+        if uncertain {
+            return HeadError::service_unavailable(format!(
+                "The trust anchor write could not be confirmed: {} Read the warehouse's trust \
+                anchor before running the re-genesis again — if it is already the new anchor, the \
+                re-genesis succeeded.",
+                UNCONFIRMED
+            ));
+        }
+
         HeadError::service_unavailable(
-            "The trust anchor could not be replaced: another request is concurrently touching \
-            a shared item on this warehouse, likely its office pallet. Neither the anchor nor \
-            the office head is known to have moved, and nothing was changed. Run the \
-            re-genesis again once the other request has settled — this client does not retry \
-            it automatically."
+            "The trust anchor could not be replaced: the warehouse's storage stayed busy \
+            through every attempt this request could afford, most likely another request \
+            touching its office pallet at the same time. Neither the anchor nor the office head \
+            is known to have moved, and nothing was changed. Run the re-genesis again once the \
+            other request has settled."
                 .to_string(),
         )
     }
@@ -781,24 +842,37 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // above consumed — the pallet's own head, the office head (when read), and the trust
         // anchor — so a concurrent office lift or re-genesis refuses this update exactly as a
         // concurrent lift to this same pallet always has (FORK-95 design memo, "Two
-        // instantiations of one invariant" / claim C13).
-        match self
-            .refs
-            .compare_and_set_head(
-                namespace,
-                &bare,
-                request.old_head.as_deref(),
-                &request.new_head,
-                office_head_for_commit,
-                anchor_bytes.as_deref(),
-            )
-            .map_err(HeadError::internal)?
-        {
+        // instantiations of one invariant" / claim C13). A refusal that shows no input moved is
+        // re-issued — the transaction alone, never the audit — under one request token and one
+        // bounded budget before it is answered (claim C14, arm two; see `reissue.rs`). As for the
+        // anchor write, whether any attempt may have landed is tracked across all of them.
+        let uncertain = Cell::new(false);
+        let outcome = reissue(
+            self.deadline,
+            |token| {
+                self.refs.compare_and_set_head(
+                    namespace,
+                    &bare,
+                    request.old_head.as_deref(),
+                    &request.new_head,
+                    office_head_for_commit,
+                    anchor_bytes.as_deref(),
+                    token,
+                )
+            },
+            |outcome| match outcome {
+                CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
+                _ => None,
+            },
+        )
+        .map_err(HeadError::internal)?;
+
+        match outcome {
             CasOutcome::Committed => Ok(()),
             CasOutcome::Conflict { current } => Err(self.moved(&current, &request.old_head)),
             CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
             CasOutcome::AnchorMoved => Err(self.anchor_moved()),
-            CasOutcome::Transient => Err(self.transient_contention()),
+            CasOutcome::Transient(_) => Err(self.transient_contention(uncertain.get())),
         }
     }
 
@@ -1030,27 +1104,35 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         )
     }
 
-    /// The `503` for a commit cancelled by DynamoDB's own concurrency control
-    /// (`TransactionConflict`) rather than by any of the three preconditions moving — most
-    /// often another push racing this one for the shared office item. Unlike `moved`/
-    /// `office_moved`/`anchor_moved`, this does not claim any value changed, so it must never
-    /// be worded as one of those: a retry may succeed with nothing having moved at all.
+    /// The `503` for a commit refused for a reason that shows no input moved — most often
+    /// DynamoDB's own concurrency control (`TransactionConflict`) with another push racing this
+    /// one for the shared office item. Unlike `moved`/`office_moved`/`anchor_moved`, this does not
+    /// claim any value changed, so it must never be worded as one of those: a later attempt may
+    /// succeed with nothing having moved at all.
     ///
-    /// **The message must not promise automation this crate does not have** (PR #116 review,
-    /// finding 4). No client-side retry loop or classifier recognizes this status yet — the
-    /// client's `update_ref` (`forklift-core`'s `remote_utils.rs`) has no retry path at all to
-    /// extend, unlike the lift commit, which already owns one (`commit_one_batch`'s deadline-bounded
-    /// loop, keyed on the `Forklift-Commit: not-ready` header this answer never carries); building
-    /// an equivalent for ref updates is new retry machinery this design gives to FORK-95 slice
-    /// 3 (arm two, claim C14), not this one. So the wording below says "run the push again",
-    /// never "retry" bare — an instruction a human (or a script) can act on without implying a
-    /// client-side mechanism that does not exist.
-    fn transient_contention(&self) -> HeadError {
+    /// Reached only after the head has re-issued the commit itself as many times as one budget
+    /// and the invocation window allow (claim C14, arm two; `reissue.rs`). The client's
+    /// `update_ref` has no retry path of its own for this status, so the wording says "run the
+    /// push again" — an instruction a person or a script can act on — and never "retry" bare,
+    /// which would imply a client-side mechanism that does not exist.
+    ///
+    /// When `uncertain` — some attempt of this request may yet land — running the identical push
+    /// again could be refused as the pallet having moved, to the client's own new head. So that
+    /// message says the outcome is unknown and how to tell, rather than "nothing moved".
+    fn transient_contention(&self, uncertain: bool) -> HeadError {
+        if uncertain {
+            return HeadError::service_unavailable(format!(
+                "The commit could not be confirmed: {} Fetch the warehouse before pushing again — \
+                if the pallet is already at the pushed head, the push succeeded.",
+                UNCONFIRMED
+            ));
+        }
+
         HeadError::service_unavailable(
-            "The commit could not complete: another push is concurrently touching a shared \
-            item on this warehouse, likely its office pallet. No input is known to have \
-            moved. Run the push again once the other push has settled — this client does not \
-            retry ref updates automatically."
+            "The commit could not complete: the warehouse's storage stayed busy through every \
+            attempt this request could afford, most likely another push touching its office \
+            pallet at the same time. No input is known to have moved. Run the push again once \
+            the other push has settled."
                 .to_string(),
         )
     }
@@ -1142,4 +1224,20 @@ fn upload_discarded(message: String) -> HeadError {
         message,
         "Run the lift again; it uploads the object afresh.",
     )))
+}
+
+/// Why an uncertain transaction's `503` cannot say what happened, shared by both of its messages.
+const UNCONFIRMED: &str = "an attempt timed out, failed inside the warehouse's storage, or was \
+    still being applied when this request ran out of attempts, so it may or may not have been \
+    applied.";
+
+/// Pass `cause` through to the re-issue loop, first noting in `uncertain` whether this attempt
+/// may yet land. Only a refusal for contention shows the attempt did not: an unknown fate may
+/// have committed, and an attempt in progress is one still being applied.
+fn noting_uncertainty(uncertain: &Cell<bool>, cause: TransientCause) -> TransientCause {
+    if cause != TransientCause::Contended {
+        uncertain.set(true);
+    }
+
+    cause
 }

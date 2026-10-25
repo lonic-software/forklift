@@ -295,6 +295,9 @@ impl RefStore for MemoryRefStore {
         Ok(self.state.lock().unwrap().heads.get(&Self::key(namespace, name)).cloned())
     }
 
+    // One mutex makes every commit atomic in one step, so there is never an attempt whose
+    // fate is unknown and nothing for a request token to deduplicate.
+    #[allow(clippy::too_many_arguments)]
     fn compare_and_set_head(
         &self,
         namespace: PalletNamespace,
@@ -303,6 +306,7 @@ impl RefStore for MemoryRefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        _request_token: &str,
     ) -> Result<CasOutcome, String> {
         let key = Self::key(namespace, name);
         let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
@@ -402,6 +406,7 @@ impl RefStore for MemoryRefStore {
         anchor: &TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        _request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         let incoming = TrustAnchorDto::from(anchor);
         let json = Self::encode(anchor)?;

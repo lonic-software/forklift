@@ -19,6 +19,7 @@ use http::{Request, Response};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
@@ -97,8 +98,9 @@ impl RefStore for SharedRefs {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
         self.0.list_refs()
@@ -120,8 +122,9 @@ impl RefStore for SharedRefs {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.0.replace_trust(anchor, expected_anchor, office_head)
+        self.0.replace_trust(anchor, expected_anchor, office_head, request_token)
     }
 }
 
@@ -766,6 +769,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
                 &office_head,
                 OfficePrecondition::NotConsumed,
                 Some(stored_anchor.as_str()),
+                &request_token(),
             )
             .expect("seed the office ref directly"),
         CasOutcome::Committed,
