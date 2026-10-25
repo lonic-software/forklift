@@ -40,12 +40,17 @@ struct Step {
 fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     let mut steps: Vec<Step> = Vec::new();
     let mut in_block = false;
-    let mut after_blank = true;
+    // Whether an indented line here would start a code block: after a blank line, a heading or
+    // a fence, where it cannot continue a paragraph.
+    let mut code_may_start = true;
 
     for (index, line) in page.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim_start();
-        let follows_blank = std::mem::replace(&mut after_blank, trimmed.is_empty());
+        let starts_code = std::mem::replace(
+            &mut code_may_start,
+            trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("```"),
+        );
 
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             if trimmed.len() != line.len() || trimmed.starts_with("~~~") {
@@ -77,7 +82,7 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
             if trimmed.starts_with("$ ") {
                 return Err(format!("line {}: a command outside a console block", number));
             }
-            if follows_blank && !trimmed.is_empty() && (line.starts_with("    ") || line.starts_with('\t')) {
+            if starts_code && !trimmed.is_empty() && (line.starts_with("    ") || line.starts_with('\t')) {
                 return Err(format!(
                     "line {}: an indented code block; show commands in a console block, which \
                     this test runs", number
@@ -520,6 +525,8 @@ fn every_command_on_the_page_is_one_the_test_runs() {
     assert!(refused("text\n\n    $ forklift prepare\n"));
     assert!(refused("text\n\n    forklift prepare\n"));
     assert!(refused("text\n\n\tforklift prepare\n"));
+    assert!(refused("## Heading\n    forklift prepare\n"));
+    assert!(refused("```console\n$ a\n```\n    forklift prepare\n"));
     assert!(refused("```console\n$   \n```\n"));
     assert!(parse_steps("- item\n    continued\n").is_ok());
 
