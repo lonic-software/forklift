@@ -1179,3 +1179,42 @@ fn copy_dir(from: &Path, to: &Path) {
         }
     }
 }
+
+/// A pallet whose exported commit is damaged is refused alone: the other pallets of the run still
+/// go through.
+///
+/// Revert: fail the run on the first exported ref that cannot become a boundary → main is not
+/// pushed.
+#[test]
+fn a_damaged_export_refuses_only_its_own_pallet() {
+    let fixture = Fixture::new("damaged-one");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["palletize", "feat"]);
+    area.stack("a", "feat.txt", "feat\n", "feat only");
+    area.lift("a");
+    area.forklift_ok("a", &["shift", "main"]);
+    area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
+    area.forklift_ok("a", &["mirror"]);
+
+    // feat's tip now names main's first parcel, which has no parent.
+    let mirror = fixture.mirror_dir("a");
+    let exported = git_ok(&mirror, &["rev-parse", "refs/forklift/exported/feat"]);
+    let parent = git_ok(&mirror, &["rev-parse", &format!("{}^", exported)]);
+    let tree = git_ok(&mirror, &["rev-parse", &format!("{}^{{tree}}", exported)]);
+    let rewritten = write_commit(&mirror, &tree, &[&parent], &format!("first\n\n{}\n", parcel_line(&fixture.first)));
+    git_ok(&mirror, &["update-ref", "refs/forklift/exported/feat", &rewritten]);
+
+    area.stack("a", "code.txt", "v2\n", "second");
+    let second = area.lift("a")["head"].as_str().unwrap().to_string();
+
+    let run = area.forklift("a", &["--json", "mirror"]);
+    assert_eq!(run.status.code(), Some(33), "{}", stdout(&run));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    let details = &document["error"]["details"];
+    assert_eq!(outcome(details, "main")["status"], "pushed", "{}", document);
+    assert_eq!(outcome(details, "feat")["status"], "damaged", "{}", document);
+    assert!(outcome(details, "feat")["message"].as_str().unwrap().contains("Delete .forklift/mirror.git"), "{}", document);
+    assert_eq!(last_line(&fixture.git, &tip(&fixture.git, "main").unwrap()), parcel_line(&second));
+}

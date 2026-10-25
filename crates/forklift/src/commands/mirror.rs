@@ -399,6 +399,14 @@ struct Boundary {
     commit: String,
 }
 
+/// An exported ref whose parcel is not in the local store yet, with its commit as read at the
+/// start of the run.
+struct Pending {
+    pallet: String,
+    boundary: Boundary,
+    raw: RawCommit,
+}
+
 /// One mirror run over the mirror's repository.
 struct Run<'a> {
     repo: &'a GitRepo,
@@ -413,7 +421,10 @@ struct Run<'a> {
     boundaries: Vec<Boundary>,
     /// Exported refs whose parcel is not in the local store yet: each becomes a boundary once a
     /// fetch brings its parcel in.
-    pending: Vec<Boundary>,
+    pending: Vec<Pending>,
+    /// Why an exported ref could not become a boundary, by pallet: reported for that pallet
+    /// alone, whichever pallet's fetch brought its parcel in.
+    refused: BTreeMap<String, Problem>,
     progress: Progress,
 }
 
@@ -431,9 +442,10 @@ impl<'a> Run<'a> {
     /// parcel is in the local store are the boundaries the export builds on.
     fn start(repo: &'a GitRepo, client: &'a RemoteClient, url: String, unattended: bool) -> Result<Run<'a>, Problem> {
         let mut pending = Vec::new();
-        for (_, commit) in exported_refs(repo)? {
-            let parcel = read_commit(repo, &commit)?.exported_parcel(&commit)?;
-            pending.push(Boundary { parcel, commit });
+        for (pallet, commit) in exported_refs(repo)? {
+            let raw = read_commit(repo, &commit)?;
+            let parcel = raw.exported_parcel(&commit)?;
+            pending.push(Pending { pallet, boundary: Boundary { parcel, commit }, raw });
         }
 
         let mut run = Run {
@@ -445,33 +457,43 @@ impl<'a> Run<'a> {
             exporter: Exporter::new(repo),
             boundaries: Vec::new(),
             pending,
+            refused: BTreeMap::new(),
             progress: events::progress(),
         };
-        run.promote()?;
+        run.promote();
 
         Ok(run)
     }
 
     /// Make a boundary of every pending exported ref whose parcel is now in the local store,
-    /// checking its commit's parents first.
-    fn promote(&mut self) -> Result<(), Problem> {
+    /// checking its commit's parents first. One that fails the check is set aside for its own
+    /// pallet's outcome; the run goes on without it.
+    fn promote(&mut self) {
         let mut still_pending = Vec::new();
 
-        for boundary in std::mem::take(&mut self.pending) {
-            if !file_utils::does_object_exist(&boundary.parcel)? {
-                still_pending.push(boundary);
-                continue;
+        for pending in std::mem::take(&mut self.pending) {
+            match self.promote_one(&pending) {
+                Ok(true) => self.boundaries.push(pending.boundary),
+                Ok(false) => still_pending.push(pending),
+                Err(problem) => { self.refused.insert(pending.pallet, problem); }
             }
-
-            let raw = read_commit(self.repo, &boundary.commit)?;
-            let loaded = object_utils::load_parcel(&boundary.parcel)?;
-            check_parents(self.repo, &boundary.commit, &raw, &boundary.parcel, &loaded.parents)?;
-            self.exporter.seed(&boundary.parcel, &boundary.commit, &raw.tree, &loaded.tree_hash);
-            self.boundaries.push(boundary);
         }
 
         self.pending = still_pending;
-        Ok(())
+    }
+
+    /// Seed one pending exported ref, if its parcel is in the local store.
+    fn promote_one(&mut self, pending: &Pending) -> Result<bool, Problem> {
+        let Boundary { parcel, commit } = &pending.boundary;
+        if !file_utils::does_object_exist(parcel)? {
+            return Ok(false);
+        }
+
+        let loaded = object_utils::load_parcel(parcel)?;
+        check_parents(self.repo, commit, &pending.raw, parcel, &loaded.parents)?;
+        self.exporter.seed(parcel, commit, &pending.raw.tree, &loaded.tree_hash);
+
+        Ok(true)
     }
 
     /// Mirror one pallet at `remote_head` (its head on the Forklift remote), keeping `record` up to
@@ -501,7 +523,10 @@ impl<'a> Run<'a> {
 
         let roots: Vec<String> = record.values().cloned().collect();
         remote_utils::fetch_history_within(self.client, head, &roots, &self.progress).await?;
-        self.promote()?;
+        self.promote();
+        if let Some(problem) = self.refused.remove(pallet) {
+            return Err(problem);
+        }
 
         let mut git = self.fetch_branch(pallet)?;
 
@@ -720,7 +745,7 @@ impl<'a> Run<'a> {
         };
         let roots: Vec<String> = self.boundaries.iter().map(|boundary| boundary.parcel.clone()).collect();
         remote_utils::fetch_history_within(self.client, remote_head, &roots, &self.progress).await?;
-        self.promote()?;
+        self.promote();
 
         if file_utils::does_object_exist(&parcel)? && merge_utils::is_ancestor(&parcel, remote_head)? {
             return Ok(Verdict::AlreadyAhead);
