@@ -322,8 +322,8 @@ limit the server enforces itself, because it gates disk-fill abuse behind verifi
 **The single-writer rule:** exactly one serving process per warehouse root; a second server
 on the same root is refused at startup, since the serve lock it needs is held. Do not point two
 machines at the same root over NFS either: the ref lock that orders every ref write is a file
-lock, which network filesystems do not reliably honour across machines. Horizontal scale-out is what the AWS head's DynamoDB conditional writes are for
-(DESIGN.html §4.6).
+lock, which network filesystems do not reliably honour across machines. Horizontal scale-out is
+what the AWS head's DynamoDB conditional writes are for (DESIGN.html §4.6).
 
 ## systemd
 
