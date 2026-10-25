@@ -1292,7 +1292,7 @@ mod tests {
             sources.mirror_roots = vec![head.clone()];
             sources
         };
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], mirroring(&deleted)).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], mirroring(&deleted)).unwrap();
         assert_eq!(plan.to_free, vec![f.web_blob.clone()], "the mirror's history is kept like a deleted pallet's");
         assert_eq!((plan.kept_for_mirror, plan.kept_for_deleted, plan.kept_unlifted), (3, 0, 0));
         let mut both = proposing(&deleted);
