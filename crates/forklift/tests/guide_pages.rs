@@ -220,29 +220,13 @@ fn output_matches(expected: &[String], actual: &[String]) -> bool {
         && expected.iter().zip(actual).all(|(pattern, line)| line_matches(pattern, line))
 }
 
-/// What a reader sees: colour codes removed, line endings normalised, trailing blank lines and
-/// trailing spaces dropped. Only complete colour sequences (`ESC [`, digits and `;`, then `m`)
-/// are removed; any other escape is kept, so it shows up as a difference instead of hiding text.
+/// What a reader sees: line endings normalised, trailing blank lines and trailing spaces dropped.
+/// Escapes are kept. The commands print into a file, where forklift writes no colour, so an
+/// escape sequence in the output is a difference from the page, never something to strip.
 fn printed_lines(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
 
-    let mut plain = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find("\x1b[") {
-        plain.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let parameters = after.find(|c: char| !c.is_ascii_digit() && c != ';').unwrap_or(after.len());
-
-        if after[parameters..].starts_with('m') {
-            rest = &after[parameters + 1..];
-        } else {
-            plain.push_str("\x1b[");
-            rest = after;
-        }
-    }
-    plain.push_str(rest);
-
-    let mut lines: Vec<String> = plain.lines().map(|line| line.trim_end().to_string()).collect();
+    let mut lines: Vec<String> = text.lines().map(|line| line.trim_end().to_string()).collect();
     while lines.last().is_some_and(|line| line.is_empty()) {
         lines.pop();
     }
@@ -553,12 +537,10 @@ fn output_must_match_line_for_line() {
 
 #[test]
 fn printed_lines_are_what_a_reader_sees() {
-    assert_eq!(printed_lines(b"\x1b[33mparcel 1\x1b[0m  \r\nnext\n\n"), vec!["parcel 1", "next"]);
-    assert_eq!(printed_lines(b"\x1b[1;32mok\x1b[m"), vec!["ok"]);
+    assert_eq!(printed_lines(b"parcel 1  \r\nnext\n\n"), vec!["parcel 1", "next"]);
 
-    // Anything but a colour sequence stays, so it cannot swallow the text after it.
-    assert_eq!(printed_lines(b"a\x1b[12\nb"), vec!["a\x1b[12", "b"]);
-    assert_eq!(printed_lines(b"\x1b]8;;x\x07link"), vec!["\x1b]8;;x\x07link"]);
+    // A colour sequence stays, so leaked colour fails the page instead of being hidden.
+    assert_eq!(printed_lines(b"\x1b[33mparcel 1\x1b[0m"), vec!["\x1b[33mparcel 1\x1b[0m"]);
 }
 
 #[test]

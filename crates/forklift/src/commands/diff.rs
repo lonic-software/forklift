@@ -14,6 +14,7 @@ use forklift_core::util::{
     chunk_utils, diff, fanout_utils, file_utils, merge_utils, object_utils, pallet_utils,
     stocktake_utils,
 };
+use crate::color;
 use crate::output::{self, CommandOutput};
 
 /// One side of a file diff: text bytes to line-diff, or an opaque binary (a chunked large file,
@@ -236,8 +237,8 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
     let head_tree_hash = head_tree_hash.as_deref();
     let blocks = format_blocks(&selected, |change| {
         if change.kind == ChangeKind::Conflict {
-            return Ok(format!("\x1b[1mconflict: {}\x1b[0m\n  (unresolved — resolve the file and \"load\" it)\n",
-                              change.path));
+            return Ok(format!("{}\n  (unresolved — resolve the file and \"load\" it)\n",
+                              color::paint(color::BOLD, format_args!("conflict: {}", change.path))));
         }
 
         let (old_content, old_kind) = match (change.kind, &change.moved_from) {
@@ -797,7 +798,7 @@ fn format_file_diff(kind: ChangeKind,
 
     let mut out = String::new();
 
-    let _ = writeln!(out, "\x1b[1m{}: {}\x1b[0m", kind, path);
+    let _ = writeln!(out, "{}", color::paint(color::BOLD, format_args!("{}: {}", kind, path)));
 
     // A chmod alone changes no line, so without this its block would be a bare header.
     if let Some((old_kind, new_kind)) = mode {
@@ -839,23 +840,19 @@ fn format_diff_lines(out: &mut String, diffs: &[Diff]) {
         .unwrap_or(0);
 
     for diff in diffs {
-        let (color, sign) = match diff.diff_type {
-            DiffType::Add => ("\x1b[32m", '+'),
-            DiffType::NoOp => ("", ' '),
-            DiffType::Remove => ("\x1b[31m", '-'),
+        let (style, sign) = match diff.diff_type {
+            DiffType::Add => (color::GREEN, '+'),
+            DiffType::NoOp => (color::PLAIN, ' '),
+            DiffType::Remove => (color::RED, '-'),
         };
-
-        let faint = if diff.is_whitespace_only { "\x1b[2m" } else { "" };
+        let style = if diff.is_whitespace_only { style.faint() } else { style };
 
         let old_number = diff.line_number_old.map(|n| n.to_string()).unwrap_or_default();
         let new_number = diff.line_number_new.map(|n| n.to_string()).unwrap_or_default();
 
-        let _ = writeln!(
-            out,
-            "  {}{}{:>old_width$} {:>new_width$} {} {}\x1b[0m",
-            color, faint, old_number, new_number, sign,
-            String::from_utf8_lossy(&diff.line)
-        );
+        let line = String::from_utf8_lossy(&diff.line);
+        let _ = writeln!(out, "  {}", color::paint(style, format_args!("{:>old_width$} {:>new_width$} {} {}",
+                                                                      old_number, new_number, sign, line)));
     }
 }
 

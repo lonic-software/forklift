@@ -42,6 +42,21 @@ pub struct Cli {
     )]
     pub no_pager: bool,
 
+    /// When to color output: auto (on a terminal), always, or never.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "WHEN",
+        default_value_t = crate::color::ColorChoice::Auto,
+        long_help = "When to color human output. auto, the default, colors only when stdout is a \
+                     terminal, NO_COLOR is unset or empty, and TERM is set and not `dumb` (on \
+                     Windows, TERM may be unset), so a pipe or a file gets plain text. always and \
+                     never override all of these. Paged output keeps its color; help and usage \
+                     errors follow the flag too."
+    )]
+    pub color: crate::color::ColorChoice,
+
     #[command(subcommand)]
     pub command: Command,
 }

@@ -8,6 +8,7 @@ use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cli;
+pub mod color;
 pub mod commands;
 #[cfg(feature = "docgen")]
 pub mod docgen;
@@ -63,6 +64,9 @@ async fn async_main() {
     let cli = parse_or_exit();
 
     output::set_mode(if cli.json { OutputMode::Json } else { OutputMode::Human });
+
+    // Before the pager below takes over stdout, which would make a terminal look like a pipe.
+    color::init(cli.color);
 
     // A quit pager or a closed `| head` should stop us cleanly, not panic (git's behavior).
     pager::restore_sigpipe();
@@ -133,7 +137,13 @@ async fn async_main() {
 fn parse_or_exit() -> Cli {
     let args: Vec<OsString> = std::env::args_os().collect();
 
-    let error = match Cli::command().try_get_matches_from(&args) {
+    // clap colours its own help and usage errors, so it follows `--color` as the commands do.
+    let mut command = Cli::command();
+    if let Some(choice) = color::from_args(&args) {
+        command = command.color(choice.for_clap());
+    }
+
+    let error = match command.try_get_matches_from(&args) {
         Ok(mut matches) => {
             output::set_command(matches.subcommand_name());
 
@@ -161,20 +171,27 @@ fn parse_or_exit() -> Cli {
 }
 
 /// The canonical name of the top-level command the arguments name, when the parse that would
-/// have said so failed. The global options are all flags that take no value, so the first
-/// argument that is not an option is the command, or an alias of one, or nothing known. A help
-/// or version flag before it, alone or in a short-flag cluster (`-vh`), means clap answered at
-/// the top level, so no command ran.
+/// have said so failed. The global options are flags that take no value, except `--color`, whose
+/// value is skipped when it is a separate word, so the first other argument that is not an option
+/// is the command, or an alias of one, or nothing known. A help or version flag before it, alone
+/// or in a short-flag cluster (`-vh`), means clap answered at the top level, so no command ran.
 fn named_command(args: &[OsString]) -> Option<String> {
     let asks_help_or_version = |arg: &str| match arg.strip_prefix("--") {
         Some(long) => long == "help" || long == "version",
         None => arg.starts_with('-') && arg.contains(['h', 'V']),
     };
 
-    let token = args.iter().skip(1)
+    let mut words = args.iter().skip(1)
         .map(|arg| arg.to_string_lossy())
-        .take_while(|arg| !asks_help_or_version(arg))
-        .find(|arg| !arg.starts_with('-'))?;
+        .take_while(|arg| !asks_help_or_version(arg));
+    let token = loop {
+        let word = words.next()?;
+        if word == "--color" {
+            words.next();
+        } else if !word.starts_with('-') {
+            break word;
+        }
+    };
     let token = token.as_ref();
 
     Cli::command().get_subcommands()

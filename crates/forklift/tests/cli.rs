@@ -3806,11 +3806,9 @@ fn diff_renders_many_files_in_path_order_in_every_mode() {
     let expected: String = sorted.iter()
         .map(|name| format!("modified: {}|- old {}|+ new {}|", name, name, name))
         .collect();
-    // One line per header and changed line, stripped of colour and line-number columns.
+    // One line per header and changed line, stripped of line-number columns.
     let digest = |output: &Output| -> String {
         stdout(output).lines()
-            .map(|line| line.replace("\x1b[1m", "").replace("\x1b[0m", "").replace("\x1b[31m", "")
-                .replace("\x1b[32m", ""))
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
                 let trimmed = line.trim_start_matches(|c: char| c == ' ' || c.is_ascii_digit()).to_string();
@@ -3827,6 +3825,93 @@ fn diff_renders_many_files_in_path_order_in_every_mode() {
     let staged = warehouse.run(&["diff", "--staged"]);
     assert_success(&staged);
     assert_eq!(digest(&staged), expected, "{}", stdout(&staged));
+}
+
+/// Colour is for a terminal: piped, every coloured surface prints plain text unless
+/// `--color always` asks for it, which a set `NO_COLOR` does not undo. (A test's stdout is always
+/// a pipe, so the terminal arm and NO_COLOR's own effect are pinned by `color`'s unit tests.)
+#[test]
+fn piped_output_is_plain_unless_colour_is_forced() {
+    let warehouse = TestWarehouse::new("color-piped");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("a.txt", "old\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["palletize", "feature"]));
+    warehouse.write_file("b.txt", "feature\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    assert_success(&warehouse.run(&["haul", "open", "--target", "main", "--source", "feature",
+                                    "--title", "t", "-m", "m"]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"]
+        .as_str().unwrap().to_string();
+    warehouse.write_file("a.txt", "new\n");
+
+    // Each coloured surface, with text it must print either way.
+    let surfaces: [(&[&str], &str); 7] = [
+        (&["diff"], "modified: a.txt"),
+        (&["diff"], "+ new"),
+        (&["history"], "parcel "),
+        (&["history", "--oneline"], " first"),
+        (&["query"], "parcel "),
+        (&["query", "--oneline"], " first"),
+        (&["blame", "a.txt"], ") old"),
+    ];
+    let show = ["haul", "show", id.as_str()];
+    let haul = (&show[..], "haul ");
+
+    for (args, text) in surfaces.iter().copied().chain([haul]) {
+        for plain in [args.to_vec(), [&["--color", "never"][..], args].concat(),
+                      [&["--color", "auto"][..], args].concat()] {
+            let output = warehouse.run(&plain);
+            assert_success(&output);
+            assert!(stdout(&output).contains(text) && !stdout(&output).contains('\x1b'),
+                    "{:?}: {:?}", plain, stdout(&output));
+        }
+
+        let forced = [&["--color", "always"][..], args].concat();
+        for env in [&[][..], &[("NO_COLOR", "1")][..]] {
+            let output = warehouse.run_with_env(&forced, env);
+            assert_success(&output);
+            assert!(stdout(&output).contains("\x1b["),
+                    "{:?} {:?}: {:?}", forced, env, stdout(&output));
+        }
+    }
+
+    let forced = stdout(&warehouse.run(&["--color", "always", "diff"]));
+    assert!(forced.contains("\x1b[1mmodified: a.txt\x1b[0m"), "{:?}", forced);
+    assert!(forced.contains("\x1b[31m") && forced.contains("\x1b[32m"), "{:?}", forced);
+}
+
+/// clap's own help and usage errors follow `--color` too, `forklift help` included, and the
+/// flag's value is never read as the command a failed parse names.
+#[test]
+fn usage_errors_follow_color_and_its_value_is_not_the_command() {
+    let warehouse = TestWarehouse::new("color-usage");
+
+    for args in [&["diff", "--bogus"][..], &["--color", "never", "diff", "--bogus"], &["--color=never", "diff", "--bogus"]] {
+        let output = warehouse.run(args);
+        assert_eq!(output.status.code(), Some(2), "{:?}", args);
+        assert!(stderr(&output).contains("--bogus") && !stderr(&output).contains('\x1b'), "{:?}: {:?}", args, stderr(&output));
+    }
+    let forced = warehouse.run(&["--color", "always", "diff", "--bogus"]);
+    assert!(stderr(&forced).contains("\x1b["), "{:?}", stderr(&forced));
+
+    for args in [&["help"][..], &["help", "diff"], &["help", "office", "admit"], &["diff", "--help"]] {
+        let plain = stdout(&warehouse.run(args));
+        assert!(plain.contains("Usage") && !plain.contains('\x1b'), "{:?}: {:?}", args, plain);
+        let forced = stdout(&warehouse.run(&[&["--color", "always"][..], args].concat()));
+        assert!(forced.contains("\x1b["), "{:?}: {:?}", args, forced);
+    }
+
+    for args in [&["--color", "never", "diff", "--bogus", "--json"][..], &["--color=never", "diff", "--bogus", "--json"]] {
+        let failed = json(&warehouse.run(args));
+        assert_eq!(failed["command"], "diff", "{:?}: {}", args, failed);
+    }
 }
 
 /// The `FORKLIFT_DEBUG_PACK_COUNTS` lines of a run: (pack-folder reads, preloads that landed).

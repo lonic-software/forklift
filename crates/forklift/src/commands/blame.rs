@@ -6,6 +6,7 @@ use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::util::office_utils::OfficeState;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::{blame_utils, object_utils, office_utils, pallet_utils, remote_utils};
+use crate::color;
 use crate::output::{self, CommandOutput};
 
 /// Handle the blame command (git's "blame"/"annotate"): attribute every line of a file to
@@ -204,8 +205,8 @@ impl CommandOutput for Blame {
 
             // git-blame layout: hash, author, date, line number, then the line.
             println!(
-                "\x1b[33m{}\x1b[0m ({:<author_width$} {} {:>number_width$}) {}",
-                short,
+                "{} ({:<author_width$} {} {:>number_width$}) {}",
+                color::paint(color::YELLOW, short),
                 author,
                 date,
                 line.number,
