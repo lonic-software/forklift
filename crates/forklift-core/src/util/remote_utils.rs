@@ -4332,6 +4332,25 @@ impl Drop for RemoveTempOnDrop<'_> {
 pub async fn fetch_history(client: &RemoteClient,
                            head: &str,
                            progress: &Progress) -> Result<FetchStats, String> {
+    fetch_history_within(client, head, &[], progress).await
+}
+
+/// [`fetch_history`], also bounded by `roots`: parcels whose closures are known complete without a
+/// ref naming them. The git mirror passes its roots record (§9.8), whose parcels gc keeps live with
+/// their closures, so a pallet the warehouse holds no ref for is not walked again from genesis.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to fetch from.
+/// * `roots`  - Further parcels whose whole closure is present (absent ones are ignored).
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
+/// * `Err(String)`    - If a transfer or verification failed.
+pub async fn fetch_history_within(client: &RemoteClient,
+                                  head: &str,
+                                  roots: &[String],
+                                  progress: &Progress) -> Result<FetchStats, String> {
     let mut stats = FetchStats::default();
 
     progress.status("Fetching history");
@@ -4339,10 +4358,15 @@ pub async fn fetch_history(client: &RemoteClient,
     // Every local ref head — user pallets and meta pallets alike — and therefore every
     // closure already known complete. Empty for a franchise into a fresh warehouse, which
     // walks everything, as it must.
-    let complete: Vec<String> = pallet_utils::all_pallet_refs()?
+    let mut complete: Vec<String> = pallet_utils::all_pallet_refs()?
         .into_iter()
         .map(|(_, head)| head)
         .collect();
+    for root in roots {
+        if file_utils::does_object_exist(root)? {
+            complete.push(root.clone());
+        }
+    }
 
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
     let mut seen_parcels: HashSet<String> = HashSet::new();

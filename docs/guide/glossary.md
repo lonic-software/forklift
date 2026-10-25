@@ -89,6 +89,7 @@ The everyday verbs map onto git like this:
 | `peek` | `cat-file` | inspect one object |
 | `blame` | `blame` | who wrote each line |
 | `import-git` / `export-git` | none | migrate a git repository in, or back out |
+| `mirror` | none | keep a git remote's branches in step with the remote's pallets |
 
 Every command, with its short alias, is listed in
 [the generated command list](../generated/commands.md).

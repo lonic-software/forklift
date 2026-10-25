@@ -35,7 +35,10 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 6 (this one): `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
+/// Version 7 (this one): the `mirror` command exists, `lift` carries `mirror` when it mirrored
+/// (or tried to mirror) the pallet it lifted, and the `mirror_incomplete` error code exists (with
+/// the run's report as `details`).
+/// Version 6: `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
 /// (`degraded` or `endpoint_absent`) when the remote's batch download stopped being used and the
 /// rest of the command fetched one object at a time (`office accept-regenesis` says so in its
 /// message instead). An error document does not carry it.
@@ -51,7 +54,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -487,6 +490,10 @@ error_codes! {
     /// A lift's commit named a blob the remote holds neither staged nor in the warehouse: the
     /// upload was discarded or never arrived. Running the lift again uploads it afresh.
     StagedUploadDiscarded,
+
+    /// A mirror run left at least one pallet out of step with git. `error.details` carries the
+    /// run's report, `{url, pallets}`.
+    MirrorIncomplete,
 }
 
 impl ErrorCode {
@@ -524,6 +531,7 @@ impl ErrorCode {
             ErrorCode::FranchiseIncomplete => RefusalCode::FranchiseIncomplete.as_str(),
             ErrorCode::OnlyPrefixNotFound => RefusalCode::OnlyPrefixNotFound.as_str(),
             ErrorCode::StagedUploadDiscarded => RefusalCode::StagedUploadDiscarded.as_str(),
+            ErrorCode::MirrorIncomplete => RefusalCode::MirrorIncomplete.as_str(),
         }
     }
 
@@ -564,6 +572,7 @@ impl ErrorCode {
             ErrorCode::FranchiseIncomplete => 30,
             ErrorCode::OnlyPrefixNotFound => 31,
             ErrorCode::StagedUploadDiscarded => 32,
+            ErrorCode::MirrorIncomplete => 33,
         }
     }
 
@@ -647,6 +656,9 @@ impl ErrorCode {
             ErrorCode::StagedUploadDiscarded =>
                 "A lift's commit named an upload the remote no longer holds (discarded or never \
                  received); running the lift again uploads it afresh",
+            ErrorCode::MirrorIncomplete =>
+                "A mirror run left at least one pallet out of step with git; the others went \
+                 through, and each failed pallet's message names its step",
         }
     }
 
@@ -683,6 +695,7 @@ impl ErrorCode {
             RefusalCode::FranchiseIncomplete => ErrorCode::FranchiseIncomplete,
             RefusalCode::OnlyPrefixNotFound => ErrorCode::OnlyPrefixNotFound,
             RefusalCode::StagedUploadDiscarded => ErrorCode::StagedUploadDiscarded,
+            RefusalCode::MirrorIncomplete => ErrorCode::MirrorIncomplete,
         }
     }
 }
@@ -1117,6 +1130,7 @@ mod tests {
             (RefusalCode::FranchiseIncomplete, "franchise_incomplete", 30),
             (RefusalCode::OnlyPrefixNotFound, "only_prefix_not_found", 31),
             (RefusalCode::StagedUploadDiscarded, "staged_upload_discarded", 32),
+            (RefusalCode::MirrorIncomplete, "mirror_incomplete", 33),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

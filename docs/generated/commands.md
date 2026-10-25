@@ -60,6 +60,7 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `manifest provenance` |  |  | Record how a parcel was produced: model, tool, session (AI provenance) |
 | `manifest show` |  |  | Show the manifest entries attached to a parcel |
 | `mcp` |  |  | Serve the command surface to an AI agent as MCP tools (stdio) |
+| `mirror` |  |  | Mirror the remote's pallets to a git remote (mirror.url), never by force |
 | `narrow` |  |  | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) |
 | `office` | `o` |  | Manage the warehouse office: users and signing keys |
 | `office enroll` |  |  | Enroll the configured operator and establish trust — one-way! |

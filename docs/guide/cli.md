@@ -137,6 +137,60 @@ machine, whatever your own git configuration says (it is shut out of every objec
 Each commit message ends in a `Forklift-Parcel: <parcel> export/<N>` line naming the parcel
 it came from and the export format it was written in.
 
+### `mirror` — keep a git remote in step
+
+```sh
+forklift config mirror.url git@github.com:me/project.git
+forklift mirror
+```
+
+A continuous, one-way `export-git`: each pallet the Forklift remote holds becomes the git
+branch of the same name at `mirror.url`, with the same commits `export-git` writes. Only what
+the Forklift remote holds is mirrored, never a parcel you stacked but did not lift. The
+pallets are those in `mirror.pallets` (comma-separated), or every pallet the remote holds when
+it is unset. Requires `remote.url` and `git` on your PATH.
+
+The export is kept in the warehouse's own git repository, `.forklift/mirror.git`, and each run
+exports only the parcels added since the last one. The first run in a warehouse exports each
+pallet's whole history, and for a pallet you never lowered it first fetches that history from
+the remote; the warehouse then keeps it, so the cost is paid once. Set `mirror.pallets` to
+narrow it. Fetches and pushes run under your own git configuration, so your credential helper
+and ssh keys work as they do for `git push`, but they run no git hooks. A relative `mirror.url`
+is read from the warehouse's root folder, from every bay. A URL beginning with `-` is refused.
+
+**Never by force.** Each pallet's git branch is fetched and compared with the export first:
+
+- git's branch is missing or behind the export: it is pushed, as a fast-forward;
+- git already holds the export: nothing to do;
+- git is ahead, at a later lift another warehouse mirrored: nothing to do ("already ahead");
+- git holds a commit that is not part of the export (someone pushed to the branch directly):
+  the pallet is refused as **diverged**, naming the commit, and nothing is pushed. Return the
+  branch to an ancestor of the export, then run `forklift mirror` again;
+- git's branch was written in another export format (a different Forklift version): refused as
+  **layout skew**, naming both formats.
+
+If git's branch moves while a push is in flight, the run fetches again and re-compares, up to
+three times. A push git declines for any other reason (a protected branch, a hook) is reported
+with git's own message.
+
+After a successful `lift`, the lifted pallet is mirrored too when `mirror.url` is set and
+`mirror.auto` is on (the default), and the outcome is a line of lift's report (the `mirror`
+field under `--json`). A mirror failure never fails the lift: the lift has already landed, and
+the next lift of that pallet or `forklift mirror` catches git up. Inside a lift, git may not
+prompt for credentials; one that would fails at once and is reported.
+
+A pallet whose name git does not accept as a branch name (`feature.lock`, `a..b`) is skipped,
+as is one in `mirror.pallets` the remote does not have; neither is a failure. `mirror` fails
+with `mirror_incomplete` (exit 33) when any pallet is refused or its push fails, after the
+others went through; under `--json` the error's `details` carry the whole run's report. Tags, the
+signed office, the `@manifest` and signatures are not mirrored: git has no equivalent. Refuses
+in a scoped bay or a sparse franchise, which hold only part of each tree. Two runs never share
+the mirror: a run that finds another in progress reports it busy and stops.
+
+If `mirror` reports that `.forklift/mirror.git` holds something it did not write, delete that
+folder and run `forklift mirror` again: it exports everything once more, byte for byte the same,
+so git receives nothing it already holds.
+
 ### `config` — who you are, and settings
 
 Identity is zero-configuration: if you never set anything, an opaque operator id
@@ -2054,6 +2108,9 @@ value. Known keys:
 | `maintenance.auto` | Auto-compact after mutating commands: `true`/`1`/`on`/`yes` or `false`/`0`/`off`/`no` (default on). |
 | `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
+| `mirror.url` | The git remote `mirror` pushes to (see [`mirror`](#mirror--keep-a-git-remote-in-step)). |
+| `mirror.pallets` | The pallets to mirror, comma-separated (default: every pallet the remote holds). The first mirror fetches the history of each one you never lowered, and the warehouse keeps it. |
+| `mirror.auto` | Mirror the lifted pallet after each `lift`, spelled as `maintenance.auto` (default on). The mirror runs inside the lift, so the warehouse stays locked until git has answered. |
 
 **A configuration file either parses completely, or the command that needed it refuses**, naming
 the file and the offending key. There is no partial read. That matters because "unset" is not

@@ -17,6 +17,9 @@ const FILE_NAME_STORE_ACCESS_LOCK: &str = "store-access.lock";
 /// The name of the ref lock sidecar (inside the shared forklift root folder). Never deleted.
 const FILE_NAME_REF_LOCK: &str = "refs.lock";
 
+/// The name of the mirror lock sidecar (inside the shared forklift root folder). Never deleted.
+pub const FILE_NAME_MIRROR_LOCK: &str = "mirror.lock";
+
 /// The name of the base-folder lock sidecar of a multi-warehouse server (inside the base folder).
 /// Never deleted. It starts with a dot, which no warehouse id may, so it is never served as one.
 pub const FILE_NAME_BASE_SERVE_LOCK: &str = ".forklift-server.lock";
@@ -403,6 +406,37 @@ impl BaseServeLock {
                 "Another forklift server is already serving the warehouses folder \"{}\".",
                 base.to_string_lossy()
             )),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
+    }
+}
+
+/// The lock a git mirror run holds for its whole run (§9.8): the mirror repository
+/// (`.forklift/mirror.git`) and the mirror roots record are shared by every bay, so two runs, from
+/// any bays, never write them at once.
+///
+/// A *kernel* lock (`File::try_lock`) on a sidecar in the shared forklift root that is never
+/// deleted, like [`StoreAccessLock`], so a killed run leaves nothing stale. A run that finds it
+/// held does not wait: it reports the mirror busy.
+pub struct MirrorLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+impl MirrorLock {
+    /// Take the mirror lock without waiting.
+    ///
+    /// # Returns
+    /// * `Ok(Some(MirrorLock))` - The lock (released when dropped).
+    /// * `Ok(None)`             - Another mirror run holds it.
+    /// * `Err(String)`          - If the sidecar could not be opened or locked.
+    pub fn try_acquire() -> Result<Option<MirrorLock>, String> {
+        let path = absolute(forklift_root().join(FILE_NAME_MIRROR_LOCK));
+        let file = open_lock_sidecar(&path)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Some(MirrorLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
         }
     }

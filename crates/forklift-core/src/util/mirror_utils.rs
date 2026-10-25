@@ -9,7 +9,7 @@
 //! loses no data; it costs a later fetch and re-export.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::globals::forklift_root;
 use crate::util::{file_utils, object_utils, pallet_utils};
 
@@ -22,6 +22,23 @@ const HEADER: &str = "forklift mirror roots 1";
 /// Where the record lives.
 pub fn mirror_roots_path() -> PathBuf {
     forklift_root().join(FILE_NAME_MIRROR_ROOTS)
+}
+
+/// The mirror's git repository's folder name, at the shared `.forklift` root beside the record.
+pub const FOLDER_NAME_MIRROR_REPOSITORY: &str = "mirror.git";
+
+/// Where the mirror's git repository lives: a bare repository only Forklift writes.
+pub fn mirror_repository_path() -> PathBuf {
+    forklift_root().join(FOLDER_NAME_MIRROR_REPOSITORY)
+}
+
+/// The folder holding the shared `.forklift`: where the mirror reads a relative `mirror.url`
+/// from, the same folder from every bay.
+pub fn warehouse_root() -> PathBuf {
+    let root = forklift_root();
+    let root = std::path::absolute(&root).unwrap_or(root);
+
+    root.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Read the record: each mirrored pallet's root parcel. No record is an empty one.

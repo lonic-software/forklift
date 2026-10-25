@@ -123,6 +123,9 @@ const REPOSITORY_VARIABLES: &[&str] = &[
 /// writes (§9.8).
 pub(crate) struct GitRepo {
     path: PathBuf,
+    /// A bare repository is addressed by `GIT_DIR`, so a damaged one fails instead of git
+    /// discovering a repository around it.
+    bare: bool,
 }
 
 impl GitRepo {
@@ -132,11 +135,29 @@ impl GitRepo {
     pub(crate) fn create(path: &Path) -> Result<GitRepo, String> {
         let path = std::path::absolute(path)
             .map_err(|e| format!("Error while resolving \"{}\": {}", path.display(), e))?;
-        let repo = GitRepo { path };
+        let repo = GitRepo { path, bare: false };
         repo.run(&["init", "-q", "--object-format=sha1"], None)?;
         repo.run(&["config", "core.precomposeunicode", "false"], None)?;
 
         Ok(repo)
+    }
+
+    /// Create a bare sha1 repository at the existing, empty folder `path`, configured as
+    /// [`GitRepo::create`] configures one.
+    pub(crate) fn create_bare(path: &Path) -> Result<GitRepo, String> {
+        let repo = GitRepo::open_bare(path)?;
+        repo.run(&["init", "-q", "--bare", "--object-format=sha1"], None)?;
+        repo.run(&["config", "core.precomposeunicode", "false"], None)?;
+
+        Ok(repo)
+    }
+
+    /// The bare repository at `path`, which [`GitRepo::create_bare`] created.
+    pub(crate) fn open_bare(path: &Path) -> Result<GitRepo, String> {
+        let path = std::path::absolute(path)
+            .map_err(|e| format!("Error while resolving \"{}\": {}", path.display(), e))?;
+
+        Ok(GitRepo { path, bare: true })
     }
 
     /// Run `git <args>` in this repository under the isolated configuration every object write
@@ -149,13 +170,7 @@ impl GitRepo {
     /// * `Ok(String)`  - Git's stdout.
     /// * `Err(String)` - If git could not be run or failed; the message quotes git.
     fn run_isolated(&self, args: &[&str], env: &[(&str, &str)], input: Option<&[u8]>) -> Result<String, String> {
-        let mut command = self.command(|key| key.starts_with("GIT_"));
-        // A missing global config file also reads as empty, so this holds on a git that does not
-        // map /dev/null. A git before 2.32 ignores GIT_CONFIG_GLOBAL and reads the global config
-        // from the home folder, so that points at a folder that does not exist.
-        let no_home = self.path.join(".git").join("forklift-no-home");
-        command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("HOME", &no_home).env("XDG_CONFIG_HOME", &no_home);
+        let mut command = self.isolated_command();
         for (key, value) in env {
             command.env(key, value);
         }
@@ -163,8 +178,19 @@ impl GitRepo {
         run_git(command, args, input)
     }
 
-    fn run(&self, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+    pub(crate) fn run(&self, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
         self.run_isolated(args, &[], input)
+    }
+
+    /// Run `git <args>` under the isolated configuration and return its raw output whatever its
+    /// exit status, for a call whose status is an answer (`merge-base --is-ancestor`) or whose
+    /// output is not text (`cat-file` of a commit someone else wrote).
+    ///
+    /// # Returns
+    /// * `Ok(Output)`  - Git's status, stdout and stderr.
+    /// * `Err(String)` - If git could not be run.
+    pub(crate) fn output(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        git_output(self.isolated_command(), args, None)
     }
 
     /// Run `git <args>` in this repository under the user's own configuration, for a call that
@@ -173,10 +199,63 @@ impl GitRepo {
         run_git(self.command(|key| REPOSITORY_VARIABLES.contains(&key)), args, None)
     }
 
+    /// Run a `git fetch` or `git push` against another repository under the user's own
+    /// configuration, so credential helpers keep working, and return its raw output whatever its
+    /// exit status. Git runs in `from`, so a relative URL is read from there, and runs no hook:
+    /// the user's own hooks are for their repositories, not this one. Stdin is always null. When
+    /// `unattended`, git must not prompt either: a lift holds its locks while it waits, so a prompt
+    /// git or Git Credential Manager would show fails at once instead (a helper's own window, or an
+    /// ssh passphrase prompt, is not covered).
+    ///
+    /// # Returns
+    /// * `Ok(Output)`  - Git's status, stdout and stderr.
+    /// * `Err(String)` - If git could not be run.
+    pub(crate) fn network(&self, args: &[&str], from: &Path, unattended: bool) -> Result<std::process::Output, String> {
+        // No `-C`, which would read a relative URL from the repository: GIT_DIR finds it instead.
+        let mut command = self.stripped_command(|key| REPOSITORY_VARIABLES.contains(&key));
+        command.current_dir(from).env("GIT_DIR", self.git_dir());
+        let mut no_hooks = std::ffi::OsString::from("core.hooksPath=");
+        no_hooks.push(self.git_dir().join("forklift-no-hooks"));
+        command.arg("-c").arg(no_hooks);
+        if unattended {
+            command.env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never");
+        }
+
+        git_output(command, args, None)
+    }
+
+    /// `git -C <path>` under the isolated configuration (see [`GitRepo::run_isolated`]).
+    fn isolated_command(&self) -> Command {
+        let mut command = self.command(|key| key.starts_with("GIT_"));
+        // A missing global config file also reads as empty, so this holds on a git that does not
+        // map /dev/null. A git before 2.32 ignores GIT_CONFIG_GLOBAL and reads the global config
+        // from the home folder, so that points at a folder that does not exist.
+        let no_home = self.git_dir().join("forklift-no-home");
+        command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", &no_home).env("XDG_CONFIG_HOME", &no_home);
+
+        command
+    }
+
+    /// The repository's git folder.
+    fn git_dir(&self) -> PathBuf {
+        if self.bare { self.path.clone() } else { self.path.join(".git") }
+    }
+
     /// `git -C <path>`, with every inherited variable `strip` names removed.
     fn command(&self, strip: impl Fn(&str) -> bool) -> Command {
-        let mut command = Command::new("git");
+        let mut command = self.stripped_command(strip);
         command.arg("-C").arg(&self.path);
+        if self.bare {
+            command.env("GIT_DIR", &self.path);
+        }
+
+        command
+    }
+
+    /// `git`, with every inherited variable `strip` names removed.
+    fn stripped_command(&self, strip: impl Fn(&str) -> bool) -> Command {
+        let mut command = Command::new("git");
 
         // Windows treats variable names case-insensitively, so compare uppercased.
         for (key, _) in std::env::vars_os() {
@@ -221,6 +300,21 @@ impl<'a> Exporter<'a> {
             trees_written: 0,
             blobs_written: 0,
         }
+    }
+
+    /// Record that `parcel` is already in the repository as `commit`, whose git tree is
+    /// `git_tree`: a commit this build wrote in this layout, which a child is built on (D2).
+    pub(crate) fn seed(&mut self, parcel: &str, commit: &str, git_tree: &str, forklift_tree: &str) {
+        self.exported.insert(parcel.to_string(), ExportedCommit {
+            commit: commit.to_string(),
+            git_tree: git_tree.to_string(),
+            forklift_tree: forklift_tree.to_string(),
+        });
+    }
+
+    /// The commit `parcel` was written or seeded as in this run, if it was.
+    pub(crate) fn commit_of(&self, parcel: &str) -> Option<&str> {
+        self.exported.get(parcel).map(|exported| exported.commit.as_str())
     }
 
     /// Write one parcel as a git commit (its parents must already be written).
@@ -493,7 +587,7 @@ fn commit_message(parcel: &Parcel, parcel_hash: &str) -> String {
 }
 
 /// `items` with repeats removed, first occurrence kept, in order.
-fn distinct(items: &[String]) -> Vec<&String> {
+pub(crate) fn distinct(items: &[String]) -> Vec<&String> {
     let mut seen = HashSet::new();
     items.iter().filter(|item| seen.insert(*item)).collect()
 }
@@ -528,7 +622,24 @@ fn topological_order(heads: &[String]) -> Result<Vec<String>, String> {
 
 /// Run `command` (`git -C <path>`) with `args`, `input` on stdin (or none at all, so git never
 /// waits on the terminal), returning its stdout.
-fn run_git(mut command: Command, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+fn run_git(command: Command, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+    let output = git_output(command, args, input)?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|_| format!("git {} produced non-UTF-8 output.", args.join(" ")))
+}
+
+/// Run `command` with `args` and `input` as [`run_git`] does, returning its output whatever its
+/// exit status.
+fn git_output(mut command: Command, args: &[&str], input: Option<&[u8]>) -> Result<std::process::Output, String> {
     let mut child = command
         .args(args)
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -542,19 +653,8 @@ fn run_git(mut command: Command, args: &[&str], input: Option<&[u8]>) -> Result<
             .map_err(|e| format!("Error while writing to git: {}", e))?;
     }
 
-    let output = child.wait_with_output()
-        .map_err(|e| format!("Error while running git: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    String::from_utf8(output.stdout)
-        .map_err(|_| format!("git {} produced non-UTF-8 output.", args.join(" ")))
+    child.wait_with_output()
+        .map_err(|e| format!("Error while running git: {}", e))
 }
 
 /// The result of a git export.

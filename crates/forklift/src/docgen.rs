@@ -329,6 +329,7 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "expand" => commands::expand::__docgen_schemas(),
         "export-git" => commands::export_git::__docgen_schemas(),
         "franchise" => commands::franchise::__docgen_schemas(),
+        "mirror" => commands::mirror::__docgen_schemas(),
         "haul" => commands::haul::__docgen_schemas(),
         "heal" => commands::heal::__docgen_schemas(),
         "history" => commands::history::__docgen_schemas(),
