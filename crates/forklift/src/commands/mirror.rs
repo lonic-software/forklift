@@ -526,6 +526,12 @@ impl<'a> Run<'a> {
             )));
         };
 
+        // A tip found damaged at the start is refused before its history is fetched; one the
+        // fetch brings in is checked after it.
+        if let Some(problem) = self.refused.remove(pallet) {
+            return Err(problem);
+        }
+
         let roots: Vec<String> = record.values().cloned().collect();
         remote_utils::fetch_history_within(self.client, head, &roots, &self.progress).await?;
         self.promote();
