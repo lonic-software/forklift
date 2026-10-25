@@ -547,8 +547,9 @@ const REMOTE_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::fro
 /// strictly the tighter of the two, so no client-level read timeout can fire before the status
 /// line. See the comment at each call site. `missing_objects`/`upload_targets` take the same two
 /// phases on a redirect-following client ([`Posture::HeadDeadline`]): a head-wait sized by
-/// [`RemoteClient::presence_negotiation_budget`], then the same object-read silence budget for the
-/// body. `resolve` is unbounded by *this* mechanism too (no
+/// [`RemoteClient::presence_negotiation_budget`], then the same object-read silence budget on the
+/// body, inside a total sized by the body's byte cap ([`RemoteClient::presence_body_budget`]).
+/// `resolve` is unbounded by *this* mechanism too (no
 /// client-level `read_timeout`), but is not left unbounded outright: it rides
 /// [`Posture::TotalDeadline`] instead, a genuine per-request `RequestBuilder::timeout` the module
 /// applies itself rather than the call site — sized at `connect_timeout + REMOTE_READ_TIMEOUT`,
@@ -873,10 +874,10 @@ const UPLOAD_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 /// **It bounds the head-wait, never the response.** Each call arms it as connect plus this floor
 /// around `send()` alone ([`Posture::HeadDeadline`], [`Posture::HeadDeadlineNoRedirect`]), and the
 /// body that follows has a budget of its own: for a success body [`FETCH_OBJECT_READ_TIMEOUT`]'s
-/// silence budget, plus, on the presence calls' size-capped answers, a total of the same head-wait
-/// figure counted from the status line; [`RemoteClient::error_body_budget`] for a refusal's. So a
-/// refusal whose status line arrives just inside the floor still has its body read whole, and its
-/// code survives. A request-spanning deadline cut that body off and turned a typed refusal into an
+/// silence budget, plus, on the presence calls' size-capped answers, a total sized by the cap
+/// ([`RemoteClient::presence_body_budget`]); [`RemoteClient::error_body_budget`] for a refusal's.
+/// So a refusal whose status line arrives just inside the floor still has its body read whole, and
+/// its code survives. A request-spanning deadline cut that body off and turned a typed refusal into an
 /// untyped timeout.
 ///
 /// **A floor, raised by size where the call's own request says it should be.** `missing_objects`
@@ -942,6 +943,14 @@ const _: () = {
 /// server without risking a false stall on a healthy one. At this rate a maximum-size object adds
 /// seconds, not minutes, on top of the retryable floor.
 const POST_SEND_VERIFY_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+
+/// The slowest delivery [`RemoteClient::presence_body_budget`] waits out for a presence answer's
+/// body, applied to the body's cap rather than to its length. Client patience for a slow link, not
+/// a price on server work: by the time this clock runs the server has answered, and what is left
+/// is transfer. The cap it multiplies is sized for the largest answer a head may send (an
+/// `upload-targets` answer is allowed 8 KiB per hash, against about 500 bytes in practice), so a
+/// real answer gets many times the time this rate alone would grant it.
+const PRESENCE_BODY_RATE_BYTES_PER_SEC: u64 = 64 * 1024;
 
 /// The post-send component of an upload's watchdog budget, for an upload of `body_len` bytes:
 /// `base` (production passes [`RETRYABLE_HEAD_PATIENCE`]) plus `body_len` at
@@ -1431,6 +1440,10 @@ mod clients {
         /// with its body, asks the same question again. reqwest drops the `Authorization` header on
         /// a cross-origin hop. **Never select this for a mutation**, for the reason
         /// [`Self::BoundedReads`]'s doc gives.
+        ///
+        /// The silence budget alone leaves a body that keeps trickling unbounded. Both calls'
+        /// answers are capped by the request, so each reads its body through
+        /// [`super::RemoteClient::read_json_within`], whose total is sized by that cap.
         HeadDeadline {
             head: std::time::Duration,
         },
@@ -3050,17 +3063,18 @@ impl RemoteClient {
         })
     }
 
-    /// [`Self::read_json`] under a total `budget` counted from the status line, for a body whose
-    /// size the request bounds. The client's silence budget alone resets on every byte, so a
-    /// remote trickling a capped body could hold the call for as long as it likes; this is the
-    /// bound on how long the whole answer may take once its headers are in.
+    /// [`Self::read_json`] under a total counted from the status line,
+    /// [`Self::presence_body_budget`] for `cap`, for a body whose size the request bounds. The client's silence budget alone
+    /// resets on every byte, so a remote trickling a capped body could hold the call for as long
+    /// as it likes; this is the bound on how long the whole answer may take once its headers are
+    /// in. Derived from `cap` here rather than passed in, so the total cannot drift from the cap.
     async fn read_json_within<T: serde::de::DeserializeOwned>(&self,
                                                               response: reqwest::Response,
                                                               cap: u64,
                                                               action: &str,
                                                               posture: Posture,
-                                                              what: &str,
-                                                              budget: std::time::Duration) -> Result<T, String> {
+                                                              what: &str) -> Result<T, String> {
+        let budget = self.presence_body_budget(cap);
         tokio::time::timeout(budget, self.read_json(response, cap, action, posture, what)).await
             .unwrap_or_else(|_| Err(Self::body_deadline_message(action, budget)))
     }
@@ -3073,6 +3087,20 @@ impl RemoteClient {
             within {:?} of them.",
             action, budget
         )
+    }
+
+    /// The total budget for a presence answer's body of at most `cap` bytes, counted from its
+    /// status line: this client's silence budget (`connect + object_read`, the gap the body's
+    /// transport already tolerates) plus `cap` at [`PRESENCE_BODY_RATE_BYTES_PER_SEC`]. A budget of
+    /// its own, not the head-wait's: the head-wait waits on server work, while what remains once
+    /// the headers are in is a transfer whose size the request bounds.
+    ///
+    /// Floored at the silence budget, and strictly above it (a cap is never zero), so a remote
+    /// that goes quiet straight after its headers is reported as silence, and this figure is met
+    /// only by one that keeps sending more slowly than the rate.
+    fn presence_body_budget(&self, cap: u64) -> std::time::Duration {
+        bounded_read_timeout(self.budgets.connect, self.budgets.object_read)
+            + std::time::Duration::from_secs_f64(cap as f64 / PRESENCE_BODY_RATE_BYTES_PER_SEC as f64)
     }
 
     /// Fetch the warehouse handshake and check the protocol version.
@@ -3140,12 +3168,9 @@ impl RemoteClient {
     /// const block under [`RETRYABLE_HEAD_PATIENCE`] pins that both wire caps' scaled terms stay
     /// under it. `connect + 30s` below 6,000 hashes, `connect + 50s` at the 10,000 cap.
     ///
-    /// Armed twice, each time from its own start: once on the wait for the status line, and once
-    /// more on the presence answer's body, counted from the status line
-    /// ([`Self::read_json_within`]). That body is capped by `n`, so the same figure is an honest
-    /// total for it, and the client's resetting silence budget cannot bound a trickle on its
-    /// own. A refusal's body is read under [`Self::error_body_budget`] instead — so a refusal
-    /// arriving late in the head-wait keeps its code.
+    /// It bounds the wait for the status line only. A success body is read under
+    /// [`Self::presence_body_budget`], sized by its byte cap, and a refusal's under
+    /// [`Self::error_body_budget`] — so a refusal arriving late in the head-wait keeps its code.
     fn presence_negotiation_budget(&self, n: usize) -> std::time::Duration {
         let scaled = std::time::Duration::from_secs_f64(n as f64 * PRESENCE_ALLOWANCE_MS_PER_OP / 1000.0);
         self.retryable_head_budget().max(self.budgets.connect + scaled)
@@ -3157,9 +3182,10 @@ impl RemoteClient {
     /// `MAX_MISSING_BATCH` (10,000) hashes before its first response byte, work that scales with
     /// the batch rather than being O(constant) — the settled contract puts that in the
     /// scaled/measured-budget category, not the flat one `REMOTE_READ_TIMEOUT` is honest for. Rides
-    /// [`Posture::HeadDeadline`] instead, its head-wait and then its answer's body each bounded per
-    /// batch by [`Self::presence_negotiation_budget`]. Accepted residual: a remote that takes
-    /// longer than that budget to answer — an overloaded or pathologically slow deployment — gets
+    /// [`Posture::HeadDeadline`] instead, its head-wait bounded per batch by
+    /// [`Self::presence_negotiation_budget`] and its answer's body by
+    /// [`Self::presence_body_budget`]. Accepted residual: a remote that takes
+    /// longer than either budget to answer — an overloaded or pathologically slow deployment — gets
     /// abandoned rather than waited out; this call's error is already a plain, retry-safe `Err`, so
     /// an ordinary retry is the recovery path, not a looser budget.
     pub async fn missing_objects(&self, hashes: &[String]) -> Result<Vec<String>, String> {
@@ -3184,7 +3210,6 @@ impl RemoteClient {
             let body: MissingObjectsResponse = self.read_json_within(
                 response, body_utils::per_item_body_cap(batch.len(), MISSING_BODY_BYTES_PER_HASH),
                 "negotiating with the remote", posture, "negotiation response",
-                self.presence_negotiation_budget(batch.len()),
             ).await?;
 
             missing.extend(body.missing);
@@ -3806,10 +3831,10 @@ impl RemoteClient {
     /// `post_upload_targets`) walks up to `MAX_UPLOAD_TARGETS_BATCH` (1,000) hashes, checking each
     /// against on-disk object presence, before its first response byte — work that scales with the
     /// batch rather than being O(constant). Rides [`Posture::HeadDeadline`] like
-    /// `missing_objects`, its head-wait and body each bounded per batch by
-    /// [`Self::presence_negotiation_budget`] —
-    /// same accepted residual: a remote slower than that budget gets abandoned rather than waited
-    /// out, recovered by an ordinary retry rather than a looser budget.
+    /// `missing_objects`, its head-wait bounded per batch by [`Self::presence_negotiation_budget`]
+    /// and its body by [`Self::presence_body_budget`] — same accepted residual: a remote slower
+    /// than either budget gets abandoned rather than waited out, recovered by an ordinary retry
+    /// rather than a looser budget.
     pub async fn upload_targets(&self,
                                 session: &str,
                                 hashes: &[String]) -> Result<Option<UploadTargetsResponse>, String> {
@@ -3844,7 +3869,6 @@ impl RemoteClient {
             let body: UploadTargetsResponse = self.read_json_within(
                 response, body_utils::per_item_body_cap(batch.len(), UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
                 "negotiating upload targets", posture, "upload-targets response",
-                self.presence_negotiation_budget(batch.len()),
             ).await?;
 
             merged.present.extend(body.present);
@@ -10763,6 +10787,14 @@ mod tests {
     /// the sibling posture — which is what makes it the fixture that isolates
     /// [`Posture::TotalDeadline`]'s one distinguishing property: firing anyway.
     fn start_continuously_trickling_remote(total_bytes: usize, gap: std::time::Duration) -> String {
+        start_trickling_remote_after(std::time::Duration::ZERO, total_bytes, gap)
+    }
+
+    /// [`start_continuously_trickling_remote`] with its headers held back for `head_delay` after
+    /// the request is read.
+    fn start_trickling_remote_after(head_delay: std::time::Duration,
+                                    total_bytes: usize,
+                                    gap: std::time::Duration) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
 
@@ -10771,6 +10803,7 @@ mod tests {
 
             if let Ok((mut stream, _)) = listener.accept() {
                 let _ = read_test_request(&mut stream);
+                std::thread::sleep(head_delay);
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
@@ -12530,6 +12563,34 @@ mod tests {
     /// floor holds unchanged up to the batch whose scaled cost equals it (6,000 hashes at 5ms
     /// each against 30s), and above it the budget grows by exactly the per-hash rate. A sum of
     /// floor and scaled term would fail the first assertion; a flat constant the last two.
+    /// [`RemoteClient::presence_body_budget`] at both calls' largest batch, pinned as literals
+    /// against the direct production budgets, plus the instance read on [`FAST`]: a figure built
+    /// from production constants rather than `self.budgets` names neither.
+    #[test]
+    fn presence_body_budget_is_the_silence_budget_plus_the_cap_at_the_body_rate() {
+        let production = RemoteClient::new_test_with_budgets("http://127.0.0.1:1", PRODUCTION_MIRROR);
+        assert_eq!(
+            production.presence_body_budget(
+                body_utils::per_item_body_cap(MAX_MISSING_BATCH, MISSING_BODY_BYTES_PER_HASH)
+            ),
+            std::time::Duration::from_secs_f64(65.0 + 20.53125),
+            "a full missing batch: 65s of silence budget plus 1,345,536 bytes at 64 KiB/s"
+        );
+        assert_eq!(
+            production.presence_body_budget(
+                body_utils::per_item_body_cap(MAX_UPLOAD_TARGETS_BATCH, UPLOAD_TARGETS_BODY_BYTES_PER_HASH)
+            ),
+            std::time::Duration::from_secs(191),
+            "a full upload-targets batch: 65s of silence budget plus 8,257,536 bytes at 64 KiB/s"
+        );
+        let fast = RemoteClient::new_test_with_budgets("http://127.0.0.1:1", FAST);
+        assert_eq!(
+            fast.presence_body_budget(64 * 1024),
+            FAST.connect + FAST.object_read + std::time::Duration::from_secs(1),
+            "presence_body_budget must fold in this instance's connect and object-read budgets"
+        );
+    }
+
     #[test]
     fn presence_negotiation_budget_reads_n() {
         let client = RemoteClient::new_test_with_budgets(
@@ -12955,11 +13016,10 @@ mod tests {
     /// every silent-remote test above — a fully silent remote never sends headers at all, so it
     /// never reaches the body read's error arm in the first place. Against
     /// [`PartialJsonThenSilentRemote`] it does: the head-wait bound is spent once the headers
-    /// arrive, so what ends the stalled body is the body's own total budget (the same
-    /// `presence_negotiation_budget` figure, counted from the status line, and under the client's
-    /// silence budget) — and the message must be that body-deadline message, not the
-    /// JSON-parse-failure one, since the remote never sent garbage: it sent a valid-so-far prefix
-    /// and then nothing further.
+    /// arrive, so what ends the stalled body is the client's silence budget (the body's total,
+    /// `presence_body_budget`, sits strictly above it) — and the message must be the silence
+    /// message, not the JSON-parse-failure one, since the remote never sent garbage: it sent a
+    /// valid-so-far prefix and then nothing further.
     #[test]
     fn missing_objects_deadline_message_survives_a_partial_json_body() {
         const SENTINEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(440);
@@ -12969,9 +13029,11 @@ mod tests {
             &remote.url, Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..FAST },
         );
         let hashes = vec!["a".repeat(64)];
-        let expected_budget = client.presence_negotiation_budget(hashes.len());
-        assert!(expected_budget < SENTINEL_CONNECT_TIMEOUT + FAST.object_read, "the body budget fires before the silence budget");
-        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
+        let silence = SENTINEL_CONNECT_TIMEOUT + FAST.object_read;
+        let body_budget =
+            client.presence_body_budget(body_utils::per_item_body_cap(1, MISSING_BODY_BYTES_PER_HASH));
+        assert!(body_budget > silence, "the silence budget fires before the body's total");
+        let hard_ceiling = body_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -12986,10 +13048,10 @@ mod tests {
             .expect_err("a body that never completes must not appear to succeed");
 
         assert!(
-            message.contains(&format!("did not finish its answer within {:?}", expected_budget)),
-            "a partial JSON body followed by silence must compose the body-deadline message \
-            naming the armed {:?}, not fall through to the unconditional \"not valid JSON\" \
-            message: {}", expected_budget, message
+            message.contains(&format!("no further bytes for at least {:?}", silence)),
+            "a partial JSON body followed by silence must compose the silence message naming the \
+            armed {:?}, not fall through to the unconditional \"not valid JSON\" message: {}",
+            silence, message
         );
         assert!(
             !message.to_lowercase().contains("not valid json"),
@@ -13781,9 +13843,11 @@ mod tests {
             &remote.url, Budgets { connect: SENTINEL_CONNECT_TIMEOUT, ..FAST },
         );
         let hashes = vec!["a".repeat(64)];
-        let expected_budget = client.presence_negotiation_budget(hashes.len());
-        assert!(expected_budget < SENTINEL_CONNECT_TIMEOUT + FAST.object_read, "the body budget fires before the silence budget");
-        let hard_ceiling = expected_budget + std::time::Duration::from_secs(15);
+        let silence = SENTINEL_CONNECT_TIMEOUT + FAST.object_read;
+        let body_budget =
+            client.presence_body_budget(body_utils::per_item_body_cap(1, UPLOAD_TARGETS_BODY_BYTES_PER_HASH));
+        assert!(body_budget > silence, "the silence budget fires before the body's total");
+        let hard_ceiling = body_budget + std::time::Duration::from_secs(15);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let outcome = runtime.block_on(async {
@@ -13802,10 +13866,10 @@ mod tests {
         };
 
         assert!(
-            message.contains(&format!("did not finish its answer within {:?}", expected_budget)),
-            "a partial JSON body followed by silence must compose the body-deadline message \
-            naming the armed {:?}, not fall through to the unconditional \"not valid JSON\" \
-            message: {}", expected_budget, message
+            message.contains(&format!("no further bytes for at least {:?}", silence)),
+            "a partial JSON body followed by silence must compose the silence message naming the \
+            armed {:?}, not fall through to the unconditional \"not valid JSON\" message: {}",
+            silence, message
         );
         assert!(
             !message.to_lowercase().contains("not valid json"),
@@ -13814,20 +13878,28 @@ mod tests {
         );
     }
 
-    /// The presence answers' body bound against a remote that never goes silent: headers at once,
-    /// then one byte every 200ms, never long enough for the client's silence budget to fire. Only
-    /// the body's own total budget ends it, at `presence_negotiation_budget`'s figure counted from
-    /// the status line; without that budget both calls wait out the whole 20s trickle and the
-    /// ceiling trips.
+    /// The presence answers' body bound against a remote that never goes silent: headers after
+    /// `HEAD_DELAY`, inside the head-wait, then one byte every 200ms, never long enough for the
+    /// client's silence budget to fire. Only the body's own total ends it, at
+    /// `presence_body_budget`'s figure for that call's cap; without it both calls wait out the
+    /// whole 20s trickle and the ceiling trips. The lower bound pins that the total is counted
+    /// from the status line: counted from the request, it would fire `HEAD_DELAY` early.
     #[test]
     fn presence_answers_give_up_on_a_remote_that_never_stops_trickling() {
+        const HEAD_DELAY: std::time::Duration = std::time::Duration::from_millis(1_200);
+
         let hashes = vec!["a".repeat(64)];
-        for call in ["missing_objects", "upload_targets"] {
-            let url = start_continuously_trickling_remote(100, std::time::Duration::from_millis(200));
+        assert!(HEAD_DELAY < FAST.connect + FAST.retryable_head_patience, "the headers land inside the head-wait");
+        for (call, per_hash) in [
+            ("missing_objects", MISSING_BODY_BYTES_PER_HASH),
+            ("upload_targets", UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
+        ] {
+            let url = start_trickling_remote_after(HEAD_DELAY, 100, std::time::Duration::from_millis(200));
             let client = RemoteClient::new_test_with_budgets(&url, FAST);
-            let budget = client.presence_negotiation_budget(hashes.len());
-            let hard_ceiling = budget + std::time::Duration::from_secs(8);
+            let budget = client.presence_body_budget(body_utils::per_item_body_cap(hashes.len(), per_hash));
+            let hard_ceiling = HEAD_DELAY + budget + std::time::Duration::from_secs(8);
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let started = std::time::Instant::now();
             let outcome = runtime.block_on(async {
                 tokio::time::timeout(hard_ceiling, async {
                     match call {
@@ -13840,7 +13912,13 @@ mod tests {
             let message = outcome
                 .unwrap_or_else(|_| panic!("{}: a trickled answer held the call past {:?}", call, hard_ceiling))
                 .expect_err("an answer that never finishes");
+            let elapsed = started.elapsed();
             assert!(message.contains(&format!("did not finish its answer within {:?}", budget)), "{}: {}", call, message);
+            assert!(
+                elapsed >= HEAD_DELAY + budget,
+                "{}: gave up after {:?}, before the headers' {:?} plus the body's {:?} — the total \
+                is not counted from the status line", call, elapsed, HEAD_DELAY, budget
+            );
         }
     }
 
