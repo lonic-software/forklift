@@ -8314,6 +8314,54 @@ fn spike_fork126_lower_takes_unsigned_history_from_a_stripped_remote() {
     assert!(stderr(&audited).contains("carries no signature") || stdout(&audited).contains("carries no signature"));
 }
 
+/// SPIKE (FORK-126): a partial client that lowers a post-enrollment pallet whose unsigned
+/// pre-enrollment ancestry is bounded only by another pallet's boundary head cannot resolve the
+/// trust boundary, though the remote is honest.
+#[test]
+fn spike_fork126_partial_client_hits_the_boundary_gap() {
+    let area = TestArea::new("spike-126-gap");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift("a", &["palletize", "side"]));
+    area.write_file("a/code.txt", "s1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "s1"]));
+    let s1 = std::fs::read_to_string(area.path("a/.forklift/pallets/side")).unwrap().trim().to_string();
+    area.write_file("a/code.txt", "s2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "s2"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift("a", &["shift", "main"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift("a", &["palletize", "y", &s1]));
+    area.write_file("a/code.txt", "y\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "signed"]));
+    let lifted = area.forklift("a", &["lift"]);
+    println!("lift y: {}{}", stdout(&lifted), stderr(&lifted));
+    assert_success(&lifted);
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    let lowered = area.forklift("b", &["lower", "y"]);
+    println!("lower y: {}{}", stdout(&lowered), stderr(&lowered));
+    assert_success(&lowered);
+
+    let audited = area.forklift("b", &["audit", "y"]);
+    println!("audit: {}{}", stdout(&audited), stderr(&audited));
+    assert!(!audited.status.success());
+    let text = format!("{}{}", stdout(&audited), stderr(&audited));
+    assert!(text.contains("cannot resolve the trust boundary"), "{}", text);
+}
+
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
