@@ -123,7 +123,8 @@ Usage: verify.sh <api-endpoint> <bucket-name> <table-name> <auth-token> [warehou
   table-name        The stack's table_name output. Accepted for symmetry with the module's
                      outputs (endpoint/bucket/table) even though this script does not query
                      DynamoDB directly today.
-  auth-token        The bearer token configured as this stack's auth_token (FORKLIFT_TOKEN).
+  auth-token        The bearer token configured as this stack's auth_token (the function holds
+                     only its digest, FORKLIFT_TOKEN_SHA256).
   warehouse-prefix  Optional. Pass "/warehouses/<id>" when the stack was deployed with a
                      non-null warehouse_id (multi-warehouse mode). Omit entirely for
                      single-warehouse mode (fixed /v1/... routes) — this is what

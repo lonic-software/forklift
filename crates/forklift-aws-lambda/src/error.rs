@@ -25,9 +25,8 @@ pub enum Status {
     /// binds admins too), a *signer* who lacked the office role (or self-service right) it
     /// needed as of that parcel's own signing, or a key endorsed by someone whose authority
     /// does not cover it. An inauthentic chain, or an overstep already in the held office, is a
-    /// `422` instead. Not a
-    /// caller role or grant — this crate has no caller-identity concept to check one against,
-    /// so this is never about who transported the request.
+    /// `422` instead. It is also the refusal of the caller itself: an operator token whose
+    /// office role or pallet grants do not admit the route (`authority_utils`'s `Denied`).
     Forbidden,
     /// `404` — no such warehouse, object, signature or bundle.
     NotFound,

@@ -231,9 +231,9 @@ verifier functions** (the [remote protocol](format/REMOTE_PROTOCOL.md) is the re
     of S3 and DynamoDB. Object uploads and downloads go directly between the client and S3
     on presigned URLs instead of through the API (signatures, which are small, come through
     it); the functions verify what is uploaded and audit each ref update. You deploy it into your own AWS account; see
-    [the deployment reference](DEPLOYMENT.md). It cannot yet authorize per pallet: every
-    caller holding its token has the same privileges
-    ([what the token controls](DEPLOYMENT.md#what-the-bearer-token-does--and-does-not--control)).
+    [the deployment reference](DEPLOYMENT.md). Like the server, it takes per-operator tokens
+    judged by the office's roles and pallet grants
+    ([what the tokens control](DEPLOYMENT.md#what-the-bearer-tokens-do--and-do-not--control)).
 
 There is no managed Forklift hosting service. **[Forklift has no hosted offering; you run the
 server or deploy the AWS head yourself.]**
@@ -506,8 +506,6 @@ honest that it is also a **bet on a future** that has not fully arrived.
 - 🔭 **Lazy history** — fetch parcels and trees on demand, so clone cost is bounded by the tip
   rather than by history length, as part of making a warehouse a bounded cache over its remote.
   *Planned.*
-- 🔭 **Per-pallet authorization on the AWS head**, which today has no per-caller identity.
-  `forklift-server` already has per-operator tokens with pallet grants.
 - 🔭 **Server metrics** (bytes and objects transferred, CAS conflicts, audit failures) and a
   **bundle auto-rebuild policy**. *Planned* (logs and a health check have shipped).
 

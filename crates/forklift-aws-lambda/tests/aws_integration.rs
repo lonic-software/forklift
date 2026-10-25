@@ -1609,7 +1609,7 @@ struct ShimState {
 /// blocking thread (every `Head` method blocks on its store's futures), convert back.
 /// Headers are dropped on purpose: the shim always calls `handle` with `AuthConfig::Open` (see
 /// below), so only the method, path/query and body matter — a real deployment configures
-/// `AuthConfig::Token` instead and this shim would need to forward the header.
+/// `AuthConfig::Credentials` instead and this shim would need to forward the header.
 async fn shim_handler(
     axum::extract::State(state): axum::extract::State<Arc<ShimState>>,
     method: http::Method,
