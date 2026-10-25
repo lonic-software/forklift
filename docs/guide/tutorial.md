@@ -24,8 +24,8 @@ forklift …
 ```
 
 You need no account and no configuration. Forklift identifies you by an opaque **operator id**,
-minted the first time you record anything. One machine can act as several operators, each with its
-own id: see `profile` under [`config`](cli.md#config--who-you-are-and-settings).
+minted the first time you record anything. One machine can act as different operators in different
+warehouses: see `profile` in [Identity, signing, and agents](cli.md#7-identity-signing-and-agents).
 
 ## 2. Create a warehouse
 
