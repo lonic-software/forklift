@@ -2457,6 +2457,117 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
     );
 }
 
+/// A grant revoked by an office lift landing between the move gate's office read and the commit
+/// refuses the move. The gate judges the office head the update read once, and the commit is
+/// conditioned on that same head, so the revocation moving the office refuses the commit rather
+/// than racing it. Were the gate to judge an office read of its own, earlier than the one the
+/// commit is conditioned on, the writer whose grant was just revoked would land the move.
+#[test]
+fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
+    let area = Area::new("grant-revoked-mid-update");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+
+    let writer = "wes@forklift";
+    area.forklift("wh", &["config", "operator.identifier", writer]);
+    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    let admit: Vec<&str> = keygen.lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .collect();
+    area.forklift("wh", &admit);
+    area.forklift("wh", &["office", "role", writer, "writer", "--pallet", "main"]);
+
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed one"]);
+
+    let granted = harvest(&area.path("wh"));
+    let office_granted = granted.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_v1 = granted.head_of("main").expect("main v1");
+
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "app.txt"]);
+    area.forklift("wh", &["stack", "signed two"]);
+
+    // The revocation: the writer keeps their role and key, but not main.
+    area.forklift("wh", &["office", "role", writer, "writer", "--pallet", "side"]);
+
+    let latest = harvest(&area.path("wh"));
+    let anchor = latest.trust.clone().expect("trust established");
+    let office_revoked = latest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let main_v2 = latest.head_of("main").expect("main v2");
+    assert_ne!(office_granted, office_revoked);
+
+    let caller = Principal::Operator(writer.to_string());
+    let office_wire = format!("@{}", OFFICE_PALLET_NAME);
+    let advance = RefUpdateRequest { old_head: Some(main_v1.clone()), new_head: main_v2.clone() };
+
+    // Trust, the granting office and main v1, set up by the administrator.
+    let set_up = || {
+        let store = Arc::new(MemoryRefStore::new());
+        let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+        upload_all(&setup, &latest);
+        setup.put_trust(&Principal::Static, &anchor).expect("put trust");
+        setup
+            .ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office_granted.clone() })
+            .expect("lift the granting office");
+        setup
+            .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+            .expect("lift main v1");
+        store
+    };
+
+    // Controls: under the granting office the writer moves main; under the revoking one, not.
+    let store = set_up();
+    let granted_head = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+    upload_all(&granted_head, &latest);
+    granted_head.ref_update(&caller, "main", &advance).expect("the granted writer moves main");
+
+    let store = set_up();
+    let revoking = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+    upload_all(&revoking, &latest);
+    revoking
+        .ref_update(&Principal::Static, &office_wire, &RefUpdateRequest {
+            old_head: Some(office_granted.clone()),
+            new_head: office_revoked.clone(),
+        })
+        .expect("lift the revoking office");
+    let err = revoking.ref_update(&caller, "main", &advance).expect_err("the revoked writer");
+    assert_eq!(err.status, Status::Forbidden, "{}", err.message);
+
+    // The race: the revoking office lands right after the update's one office read.
+    let store = set_up();
+    let attack = Head::new(
+        MemoryObjectStore::new(),
+        OfficeMovesAfterTheSnapshot {
+            inner: store.clone(),
+            move_to: office_revoked.clone(),
+            fired: Cell::new(false),
+        },
+    );
+    upload_all(&attack, &latest);
+
+    let err = attack.ref_update(&caller, "main", &advance).expect_err("the grant was revoked mid-update");
+    assert_eq!(err.status, Status::Conflict, "{}", err.message);
+    let (code, _, _) = forklift_core::error::deframe(&err.message).expect("a classified refusal");
+    assert_eq!(code, "remote_ahead", "{}", err.message);
+    assert!(err.message.to_lowercase().contains("office"), "{}", err.message);
+
+    assert_eq!(
+        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").as_deref(),
+        Some(main_v1.as_str()),
+        "main did not move"
+    );
+    assert_eq!(
+        store.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).expect("get").as_deref(),
+        Some(office_revoked.as_str()),
+        "the revocation landed"
+    );
+}
+
 /// On a warehouse with no anchor the audit never reads the office head at all — both the
 /// office-chain mirror and the whole trust block in `ref_update` are gated on
 /// `anchor.is_some()` — so the commit must not condition on it either. No head lifts an office
