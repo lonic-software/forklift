@@ -20,6 +20,8 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_OBJECTS_ROOT};
 use crate::util::{file_utils, record_utils, remote_utils, taint_utils, warehouse_utils};
+use crate::util::bundle_utils::{FILE_NAME_DOWNLOAD, FILE_NAME_LATEST, FOLDER_NAME_BUNDLES};
+use crate::util::remote_utils::PartialBundle;
 use crate::util::warehouse_utils::Placement;
 use crate::util::record_utils::RecordError;
 
@@ -28,13 +30,10 @@ pub const FILE_NAME_FRANCHISE: &str = "franchise";
 
 /// The [`record_utils`] kind and version of the record.
 const FRANCHISE_RECORD: &str = "franchise";
-const FRANCHISE_VERSION: u32 = 1;
+const FRANCHISE_VERSION: u32 = 2;
 
 /// The name of the warehouse lock file, which a resume keeps: it is the resume's own.
 const FILE_NAME_LOCK: &str = "lock";
-
-/// The folder of the warehouse's bundles, which a resume keeps only after a finished import.
-const FOLDER_NAME_BUNDLES: &str = "bundles";
 
 /// Whether the latest attempt is still running (or was killed) or returned a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +110,43 @@ impl Phase {
     }
 }
 
+/// How far the remote's bundle got.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BundleState {
+    /// Nothing of it is kept: not downloaded, not resumable, or discarded.
+    None,
+
+    /// Part or all of it is downloaded, not yet imported: the download file holds the first
+    /// `length` bytes, synced (see [`remote_utils::RemoteClient::download_bundle`]).
+    Partial(PartialBundle),
+
+    /// It was imported in full.
+    Imported,
+}
+
+impl BundleState {
+    /// The download this state keeps, if it keeps one.
+    pub fn partial(&self) -> Option<&PartialBundle> {
+        match self {
+            BundleState::Partial(partial) => Some(partial),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the bundle went further during an attempt that started at `start` and stands at `now`:
+/// it was imported, more of it was recorded under the same tag, or some of it was recorded under
+/// another tag.
+pub fn bundle_progressed(start: &BundleState, now: &BundleState) -> bool {
+    match (start, now) {
+        (BundleState::Imported, _) => false,
+        (_, BundleState::Imported) => true,
+        (BundleState::Partial(start), BundleState::Partial(now)) if start.etag == now.etag => now.length > start.length,
+        (_, BundleState::Partial(now)) => now.length > 0,
+        (_, BundleState::None) => false,
+    }
+}
+
 /// What an attempt was asked to franchise, beyond the URL: the parts a resume may change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Request {
@@ -153,8 +189,8 @@ pub struct FranchiseRecord {
     /// remote announced on first contact. `None` when the remote announced no anchor.
     pub genesis: Option<String>,
 
-    /// Whether the remote's bundle was imported in full.
-    pub bundle_imported: bool,
+    /// How far the remote's bundle got.
+    pub bundle: BundleState,
 
     /// The latest attempt's state.
     pub attempt: Attempt,
@@ -180,7 +216,17 @@ impl FranchiseRecord {
             entries.push(format!("genesis={}", genesis));
         }
 
-        entries.push(format!("bundle={}", if self.bundle_imported { "imported" } else { "none" }));
+        match &self.bundle {
+            BundleState::None => entries.push("bundle=none".to_string()),
+            BundleState::Imported => entries.push("bundle=imported".to_string()),
+            BundleState::Partial(partial) => {
+                entries.push("bundle=partial".to_string());
+                entries.push(format!("bundle.etag={}", partial.etag));
+                entries.push(format!("bundle.total={}", partial.total));
+                entries.push(format!("bundle.length={}", partial.length));
+            }
+        }
+
         entries.push(format!("attempt={}", self.attempt.as_str()));
         entries.push(format!("census={}", self.start_census));
 
@@ -206,7 +252,10 @@ impl FranchiseRecord {
         let mut token = None;
         let mut request = Request::default();
         let mut genesis = None;
-        let mut bundle_imported = None;
+        let mut bundle = None;
+        let mut bundle_etag = None;
+        let mut bundle_total = None;
+        let mut bundle_length = None;
         let mut attempt = None;
         let mut start_census = None;
         let mut failure_request = Request::default();
@@ -224,11 +273,13 @@ impl FranchiseRecord {
                 "pallet" => request.pallet = Some(value),
                 "only" => request.only.push(value),
                 "genesis" => genesis = Some(value),
-                "bundle" => bundle_imported = Some(match value.as_str() {
-                    "imported" => true,
-                    "none" => false,
+                "bundle" => bundle = Some(match value.as_str() {
+                    "none" | "partial" | "imported" => value,
                     _ => return Err(malformed("bundle")),
                 }),
+                "bundle.etag" => bundle_etag = Some(value),
+                "bundle.total" => bundle_total = Some(value.parse::<u64>().map_err(|_| malformed("bundle.total"))?),
+                "bundle.length" => bundle_length = Some(value.parse::<u64>().map_err(|_| malformed("bundle.length"))?),
                 "attempt" => attempt = Some(match value.as_str() {
                     "running" => Attempt::Running,
                     "failed" => Attempt::Failed,
@@ -252,12 +303,22 @@ impl FranchiseRecord {
             _ => return Err(malformed("failure")),
         };
 
+        let bundle = match (bundle.as_deref(), bundle_etag, bundle_total, bundle_length) {
+            (Some("none"), None, None, None) => BundleState::None,
+            (Some("imported"), None, None, None) => BundleState::Imported,
+            (Some("partial"), Some(etag), Some(total), Some(length))
+                if length <= total && remote_utils::is_resumable_bundle_tag(&etag) => {
+                BundleState::Partial(PartialBundle { etag, total, length })
+            }
+            _ => return Err(malformed("bundle")),
+        };
+
         Ok(FranchiseRecord {
             url: url.ok_or_else(|| malformed("url"))?,
             token,
             request,
             genesis,
-            bundle_imported: bundle_imported.ok_or_else(|| malformed("bundle"))?,
+            bundle,
             attempt: attempt.ok_or_else(|| malformed("attempt"))?,
             start_census: start_census.ok_or_else(|| malformed("census"))?,
             last_failure,
@@ -535,17 +596,23 @@ fn list_names(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
 ///    records. Without an anchor to verify against (`record` is `None`, or recorded no genesis),
 ///    every kept signature sidecar is deleted too, so the resume fetches them again exactly as a
 ///    fresh franchise would.
-/// 2. Every entry of `.forklift` but the object store, the record, the held lock and, when
-///    `keep_bundles`, the bundles. Refs above all: the history walk stops at any parcel a local
-///    ref holds, and a ref an earlier attempt wrote is complete only at that attempt's scope.
-/// 3. Every entry of the target but `.forklift`: the partial working tree.
+/// 2. Every entry of `.forklift` but the object store, the record, the held lock and, unless
+///    `keep` is [`BundleState::None`], the bundles. Refs above all: the history walk stops at any
+///    parcel a local ref holds, and a ref an earlier attempt wrote is complete only at that
+///    attempt's scope.
+/// 3. Every entry of the bundles but the one file `keep` names: the download, cut back to the
+///    length `keep` says was synced (and removed when shorter), or the latest bundle once
+///    imported. So a temp a killed download left never lingers.
+/// 4. Every entry of the target but `.forklift`: the partial working tree.
 ///
 /// Nothing is followed through a link at any level below the target, which the user named: a
-/// `.forklift` that is not a real folder is refused, an object store or fan-out folder that is
-/// not one is removed as itself, and every other link is removed as itself.
+/// `.forklift` that is not a real folder is refused, an object store, fan-out or bundles folder
+/// that is not one is removed as itself, and every other link is removed as itself.
 ///
-/// Returns whether the object store was discarded, so nothing an earlier attempt stored is kept.
-pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bundles: bool) -> Result<bool, String> {
+/// Returns what is kept of the bundle: `keep`, or [`BundleState::None`] when its file is gone, or
+/// for an import when the object store was discarded, so nothing an earlier attempt stored is
+/// kept.
+pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &BundleState) -> Result<BundleState, String> {
     let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
     let objects = forklift.join(FOLDER_NAME_OBJECTS_ROOT);
 
@@ -582,16 +649,23 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bund
         remove_signature_sidecars(&objects)?;
     }
 
+    let keep = match keep {
+        BundleState::Imported if discarded => &BundleState::None,
+        keep => keep,
+    };
+
     for name in list_names(&forklift)? {
         let kept = name == FOLDER_NAME_OBJECTS_ROOT
             || name == FILE_NAME_FRANCHISE
             || name == FILE_NAME_LOCK
-            || (keep_bundles && name == FOLDER_NAME_BUNDLES);
+            || (*keep != BundleState::None && name == FOLDER_NAME_BUNDLES);
 
         if !kept {
             file_utils::remove_unfollowed(&forklift.join(&name))?;
         }
     }
+
+    let bundle = keep_bundle(&forklift.join(FOLDER_NAME_BUNDLES), keep)?;
 
     for name in list_names(target)? {
         if name != FOLDER_NAME_FORKLIFT_ROOT {
@@ -602,7 +676,63 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep_bund
     file_utils::sync_dir(&forklift)?;
     file_utils::sync_dir(target)?;
 
-    Ok(discarded)
+    Ok(bundle)
+}
+
+/// Clear the bundles folder but the one file `keep` names (step 3 of [`prepare_resume`]), and
+/// return what is kept. A bundles folder that is not a real one is removed as itself.
+fn keep_bundle(bundles: &Path, keep: &BundleState) -> Result<BundleState, String> {
+    let name = match keep {
+        BundleState::None => return Ok(BundleState::None),
+        BundleState::Partial(_) => FILE_NAME_DOWNLOAD,
+        BundleState::Imported => FILE_NAME_LATEST,
+    };
+
+    if !is_real_dir(bundles)? {
+        file_utils::remove_unfollowed(bundles)?;
+        return Ok(BundleState::None);
+    }
+
+    for entry in list_names(bundles)? {
+        if entry != name {
+            file_utils::remove_unfollowed(&bundles.join(&entry))?;
+        }
+    }
+
+    let kept = match keep {
+        BundleState::Partial(partial) => cut_download(&bundles.join(name), partial)?,
+        keep => keep.clone(),
+    };
+
+    file_utils::sync_dir(bundles)?;
+
+    Ok(kept)
+}
+
+/// Cut the download at `path` back to the length `partial` says was synced: bytes past it never
+/// were, so they are not trusted. A download that is not a file, or is shorter, is removed.
+fn cut_download(path: &Path, partial: &PartialBundle) -> Result<BundleState, String> {
+    if !holds_download(path, partial) {
+        file_utils::remove_unfollowed(path)?;
+        return Ok(BundleState::None);
+    }
+
+    let file = std::fs::OpenOptions::new().write(true).open(path)
+        .map_err(|e| format!("Error while opening \"{}\": {}", path.to_string_lossy(), e))?;
+    let cut_error = |e: std::io::Error| format!("Error while cutting \"{}\" back: {}", path.to_string_lossy(), e);
+
+    file.set_len(partial.length).map_err(cut_error)?;
+
+    if file_utils::fsync_enabled() {
+        file.sync_all().map_err(cut_error)?;
+    }
+
+    Ok(BundleState::Partial(partial.clone()))
+}
+
+/// Whether `path` is a file, not a link, at least as long as `partial` says was synced to it.
+fn holds_download(path: &Path, partial: &PartialBundle) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() >= partial.length)
 }
 
 /// Remove `recorded`, a path inside the object store relative to `forklift`, judging every level
@@ -626,11 +756,18 @@ fn remove_in_store(forklift: &Path, recorded: &Path) -> Result<PathBuf, String> 
     Ok(parent)
 }
 
-/// Whether `forklift` still holds what a finished bundle import left: the object store and the
-/// bundles, each a real folder.
-pub fn holds_import(forklift: &Path) -> bool {
-    is_real_dir(&forklift.join(FOLDER_NAME_OBJECTS_ROOT)).unwrap_or(false)
-        && is_real_dir(&forklift.join(FOLDER_NAME_BUNDLES)).unwrap_or(false)
+/// What `forklift` still holds of the bundle `state` describes, after a clearing that stopped
+/// partway: an import needs the object store and the bundles, each a real folder, and a download
+/// its file in a real bundles folder, at least as long as recorded.
+pub fn held_bundle(forklift: &Path, state: &BundleState) -> BundleState {
+    let bundles = forklift.join(FOLDER_NAME_BUNDLES);
+    let held = is_real_dir(&bundles).unwrap_or(false) && match state {
+        BundleState::None => false,
+        BundleState::Partial(partial) => holds_download(&bundles.join(FILE_NAME_DOWNLOAD), partial),
+        BundleState::Imported => is_real_dir(&forklift.join(FOLDER_NAME_OBJECTS_ROOT)).unwrap_or(false),
+    };
+
+    if held { state.clone() } else { BundleState::None }
 }
 
 /// Whether `path`, relative to `.forklift`, names something inside the object store.
@@ -875,7 +1012,7 @@ mod tests {
             token: Some("se=cret\nline".to_string()),
             request: Request { pallet: Some("main".to_string()), only: vec!["docs".to_string(), "src/a b".to_string()] },
             genesis: Some("abc".to_string()),
-            bundle_imported: true,
+            bundle: BundleState::Imported,
             attempt: Attempt::Failed,
             start_census: 42,
             last_failure: Some(Failure {
@@ -898,6 +1035,52 @@ mod tests {
         assert_eq!(FranchiseRecord::from_bytes(&bare.to_bytes()), Ok(bare));
     }
 
+    /// Each bundle state round-trips, a kept download with a tag that holds quotes and the
+    /// record's own separator among them.
+    ///
+    /// Revert: write a kept download without its tag, or read it back as `none` → red.
+    #[test]
+    fn a_record_round_trips_each_bundle_state() {
+        let partial = PartialBundle { etag: "\"a=b'c\"".to_string(), total: 1 << 40, length: 7 };
+
+        for bundle in [BundleState::None, BundleState::Imported, BundleState::Partial(partial.clone())] {
+            let record = FranchiseRecord { bundle, ..record() };
+            assert_eq!(FranchiseRecord::from_bytes(&record.to_bytes()), Ok(record));
+        }
+
+        // A kept download is read only whole and consistent: a missing field, a length past the
+        // total, or a tag no download is kept under is a torn record, never `none`.
+        let text = String::from_utf8(FranchiseRecord { bundle: BundleState::Partial(partial), ..record() }.to_bytes()).unwrap();
+        for torn in [
+            text.replacen("bundle.length=7\n", "", 1),
+            text.replacen("bundle.length=7\n", &format!("bundle.length={}\n", (1u64 << 40) + 1), 1),
+            text.replacen("bundle.etag=\"a=b'c\"\n", "bundle.etag=W/\"a\"\n", 1),
+            text.replacen("bundle=partial\n", "bundle=none\n", 1),
+        ] {
+            assert_ne!(torn, text);
+            assert!(matches!(FranchiseRecord::from_bytes(torn.as_bytes()), Err(MarkerError::Torn(_))), "{}", torn);
+        }
+    }
+
+    /// The bundle went further when it was imported, when more of it was recorded under one tag,
+    /// or when some of it was recorded under another.
+    #[test]
+    fn bundle_progress_is_an_import_or_more_bytes_recorded() {
+        let at = |etag: &str, length| BundleState::Partial(PartialBundle { etag: etag.to_string(), total: 10, length });
+
+        assert!(bundle_progressed(&BundleState::None, &BundleState::Imported));
+        assert!(bundle_progressed(&at("\"a\"", 4), &BundleState::Imported));
+        assert!(bundle_progressed(&at("\"a\"", 4), &at("\"a\"", 5)));
+        assert!(bundle_progressed(&at("\"a\"", 4), &at("\"b\"", 1)));
+        assert!(bundle_progressed(&BundleState::None, &at("\"a\"", 1)));
+
+        assert!(!bundle_progressed(&BundleState::Imported, &BundleState::Imported));
+        assert!(!bundle_progressed(&at("\"a\"", 4), &at("\"a\"", 4)));
+        assert!(!bundle_progressed(&at("\"a\"", 4), &at("\"b\"", 0)));
+        assert!(!bundle_progressed(&BundleState::None, &at("\"a\"", 0)));
+        assert!(!bundle_progressed(&at("\"a\"", 4), &BundleState::None));
+    }
+
     #[test]
     fn a_record_this_build_cannot_read_is_never_read_as_none() {
         let bytes = record().to_bytes();
@@ -906,8 +1089,13 @@ mod tests {
         assert!(matches!(FranchiseRecord::from_bytes(&bytes[..bytes.len() - 1]), Err(MarkerError::Torn(_))));
 
         // Another version, and a field this build does not know: foreign.
-        let other = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 1", "/forklift-franchise 2", 1);
+        let other = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 2", "/forklift-franchise 3", 1);
         assert!(matches!(FranchiseRecord::from_bytes(other.as_bytes()), Err(MarkerError::Foreign(_))));
+
+        // A version-1 record, from before a download was kept, is foreign like any other.
+        let first = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 2", "/forklift-franchise 1", 1);
+        assert_ne!(first.as_bytes(), &bytes[..]);
+        assert!(matches!(FranchiseRecord::from_bytes(first.as_bytes()), Err(MarkerError::Foreign(_))));
 
         let extra = format!("{}later=1\n", String::from_utf8(bytes).unwrap());
         assert!(matches!(FranchiseRecord::from_bytes(extra.as_bytes()), Err(MarkerError::Foreign(_))));
@@ -980,7 +1168,7 @@ mod tests {
         assert_eq!(admit(&dir), Ok(Admission::Resume(Some(record()))));
 
         // A torn record is debris only while nothing else stands.
-        std::fs::write(record_path(&forklift), b"/forklift-franchise 1\nurl=x").unwrap();
+        std::fs::write(record_path(&forklift), b"/forklift-franchise 2\nurl=x").unwrap();
         assert!(admit(&dir).is_err(), "a torn record beside other entries is refused");
         std::fs::remove_file(dir.join("half-written")).unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
@@ -1014,7 +1202,7 @@ mod tests {
         std::fs::write(dir.join("half-written"), b"x").unwrap();
         write(&forklift, &record()).unwrap();
 
-        prepare_resume(&dir, Some(&record()), false).unwrap();
+        prepare_resume(&dir, Some(&record()), &BundleState::None).unwrap();
 
         let mut kept = list_names(&forklift).unwrap();
         kept.sort();
@@ -1025,10 +1213,48 @@ mod tests {
         // Unanchored: the sidecars go too, and a finished bundle is kept when asked.
         std::fs::create_dir_all(forklift.join("bundles")).unwrap();
         let unanchored = FranchiseRecord { genesis: None, ..record() };
-        prepare_resume(&dir, Some(&unanchored), true).unwrap();
+        assert_eq!(prepare_resume(&dir, Some(&unanchored), &BundleState::Imported), Ok(BundleState::Imported));
         assert!(!objects.join("ab/cdef.sig").exists());
         assert!(objects.join("ab/cdef").exists());
         assert!(forklift.join("bundles").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A resume keeps only the bundle file its record names: the download, cut back to the length
+    /// recorded as synced, or the imported latest bundle. Anything else in the bundles folder — a
+    /// temp a killed download left — goes, and a download shorter than recorded is dropped.
+    ///
+    /// Revert: keep the bundles folder whole → the stray survives → red.
+    #[test]
+    fn a_resume_keeps_only_the_bundle_file_its_record_names() {
+        let dir = temp_dir("resume-bundle");
+        let forklift = dir.join(".forklift");
+        let bundles = forklift.join("bundles");
+        let partial = BundleState::Partial(PartialBundle { etag: "\"t\"".to_string(), total: 10, length: 4 });
+        let populate = |download: &[u8]| {
+            std::fs::create_dir_all(&bundles).unwrap();
+            std::fs::write(bundles.join("partial"), download).unwrap();
+            std::fs::write(bundles.join("latest"), b"latest").unwrap();
+            std::fs::write(bundles.join("partial.tmp.1"), b"stray").unwrap();
+        };
+
+        populate(b"abcdef");
+        assert_eq!(prepare_resume(&dir, Some(&record()), &partial), Ok(partial.clone()));
+        assert_eq!(list_names(&bundles).unwrap(), vec!["partial"]);
+        assert_eq!(std::fs::read(bundles.join("partial")).unwrap(), b"abcd", "cut back to the synced length");
+
+        populate(b"abc");
+        assert_eq!(prepare_resume(&dir, Some(&record()), &partial), Ok(BundleState::None));
+        assert!(list_names(&bundles).unwrap().is_empty(), "a download shorter than recorded is dropped");
+
+        populate(b"abcd");
+        assert_eq!(prepare_resume(&dir, Some(&record()), &BundleState::Imported), Ok(BundleState::Imported));
+        assert_eq!(list_names(&bundles).unwrap(), vec!["latest"]);
+
+        populate(b"abcd");
+        assert_eq!(prepare_resume(&dir, Some(&record()), &BundleState::None), Ok(BundleState::None));
+        assert!(!bundles.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1168,7 +1394,7 @@ mod tests {
         std::fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(&outside_forklift, linked.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         assert!(admit(&linked).is_err());
-        assert!(prepare_resume(&linked, Some(&record()), false).is_err());
+        assert!(prepare_resume(&linked, Some(&record()), &BundleState::None).is_err());
         assert!(outside_forklift.join("refs").is_dir());
 
         let store_linked = root.join("store-linked");
@@ -1176,7 +1402,10 @@ mod tests {
         std::fs::create_dir_all(&forklift).unwrap();
         write(&forklift, &record()).unwrap();
         std::os::unix::fs::symlink(&outside, forklift.join(FOLDER_NAME_OBJECTS_ROOT)).unwrap();
-        assert_eq!(prepare_resume(&store_linked, Some(&record()), false), Ok(true));
+        std::fs::create_dir_all(forklift.join("bundles")).unwrap();
+        std::fs::write(forklift.join("bundles/latest"), b"x").unwrap();
+        // The store is discarded, so the import it held is not kept.
+        assert_eq!(prepare_resume(&store_linked, Some(&record()), &BundleState::Imported), Ok(BundleState::None));
         assert!(std::fs::symlink_metadata(forklift.join(FOLDER_NAME_OBJECTS_ROOT)).is_err());
 
         let fan_out_linked = root.join("fan-out-linked");

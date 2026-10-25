@@ -73,10 +73,14 @@ thread_local! {
 }
 
 /// The folder (inside the forklift root) where bundles live.
-const FOLDER_NAME_BUNDLES: &str = "bundles";
+pub(crate) const FOLDER_NAME_BUNDLES: &str = "bundles";
 
 /// The file name of the most recent bundle.
-const FILE_NAME_LATEST: &str = "latest";
+pub(crate) const FILE_NAME_LATEST: &str = "latest";
+
+/// The file name of a remote's bundle while it is downloaded and imported: kept across franchise
+/// attempts, and published as `latest` only once imported.
+pub(crate) const FILE_NAME_DOWNLOAD: &str = "partial";
 
 /// Stable discriminator for the one bundle failure on which a clone can safely fall back to its
 /// ordinary incremental-object walk. Corruption in a *known* format remains fatal; silently
@@ -86,6 +90,10 @@ const UNKNOWN_BUNDLE_HEADER_PREFIX: &str = "Unknown bundle header ";
 /// Stable discriminator for a bundle file whose bytes are not the ones its builder wrote: its
 /// digest does not match, or it ends before one. Nothing of such a file has been stored.
 const BUNDLE_DIGEST_PREFIX: &str = "The bundle does not match its digest";
+
+/// Stable discriminators for a file whose header could not be read as any bundle's.
+const NOT_A_BUNDLE_PREFIX: &str = "This does not look like a forklift bundle";
+const BUNDLE_HEADER_READ_PREFIX: &str = "Error while reading the bundle header";
 
 /// What a bundle build packed.
 pub struct BuildStats {
@@ -117,6 +125,44 @@ pub fn get_latest_bundle_path() -> PathBuf {
     forklift_root()
         .join(FOLDER_NAME_BUNDLES)
         .join(FILE_NAME_LATEST)
+}
+
+/// The path a remote's bundle is downloaded to in the current warehouse (see
+/// [`publish_bundle_download`]).
+pub fn get_bundle_download_path() -> PathBuf {
+    forklift_root()
+        .join(FOLDER_NAME_BUNDLES)
+        .join(FILE_NAME_DOWNLOAD)
+}
+
+/// Remove the current warehouse's bundle download, if there is one, without following it.
+pub fn discard_bundle_download() -> Result<(), String> {
+    file_utils::remove_unfollowed(&get_bundle_download_path())
+}
+
+/// Publish the current warehouse's imported bundle download as its own latest bundle, which
+/// `forklift serve` hands out as it is. The rename is made durable like any other rename into the
+/// store: a folder sync that fails records a taint instead of leaving it unproven.
+pub fn publish_bundle_download() -> Result<(), String> {
+    let download = get_bundle_download_path();
+    let latest = get_latest_bundle_path();
+
+    file_utils::rename(&download, &latest).map_err(|e| format!(
+        "Error while moving the bundle into place at \"{}\": {}", latest.to_string_lossy(), e
+    ))?;
+
+    match latest.parent() {
+        Some(parent) => file_utils::sync_dir_or_taint(parent, &[&latest]),
+        None => Ok(()),
+    }
+}
+
+/// Whether an import failure means the file's header could not be read as a bundle's in any
+/// version, or names one this build does not read. Nothing of such a file was stored.
+pub fn is_bundle_header_error(error: &str) -> bool {
+    is_unsupported_bundle_error(error)
+        || error.starts_with(NOT_A_BUNDLE_PREFIX)
+        || error.starts_with(BUNDLE_HEADER_READ_PREFIX)
 }
 
 /// Whether an import failure means only that this build does not understand the envelope version.
@@ -1067,12 +1113,12 @@ fn read_bundle_header<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<u8>, St
     let mut limited = reader.by_ref().take(MAX_HEADER_BYTES as u64);
 
     std::io::BufRead::read_until(&mut limited, b'\n', &mut header)
-        .map_err(|e| format!("Error while reading the bundle header: {}", e))?;
+        .map_err(|e| format!("{}: {}", BUNDLE_HEADER_READ_PREFIX, e))?;
 
     if header.last() != Some(&b'\n') {
         return Err(format!(
-            "This does not look like a forklift bundle: no newline within the first {} bytes.",
-            MAX_HEADER_BYTES
+            "{}: no newline within the first {} bytes.",
+            NOT_A_BUNDLE_PREFIX, MAX_HEADER_BYTES
         ));
     }
 
