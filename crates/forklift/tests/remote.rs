@@ -8260,3 +8260,65 @@ fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
     assert!(stderr(&refused).contains("nothing was deleted"), "{}", stderr(&refused));
     assert!(area.path("b/.forklift/pallets/feat").exists());
 }
+
+/// SPIKE (FORK-126): a remote stripped of both its anchor and its office serves unsigned history,
+/// and a warehouse holding an anchor lowers it unverified. Asserts today's defect.
+#[test]
+fn spike_fork126_lower_takes_unsigned_history_from_a_stripped_remote() {
+    let area = TestArea::new("spike-126");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    area.write_file("a/code.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "signed"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert!(area.path("b/.forklift/trust").is_file());
+
+    // Strip both the anchor and the office ref from the server's storage.
+    std::fs::remove_file(area.path("server-root/.forklift/trust")).unwrap();
+    let mut office = Vec::new();
+    for entry in walk(&area.path("server-root/.forklift")) {
+        if entry.file_name().map(|n| n == "office").unwrap_or(false) && entry.is_file() {
+            office.push(entry);
+        }
+    }
+    println!("office refs: {:?}", office);
+    assert_eq!(office.len(), 1, "{:?}", office);
+    std::fs::remove_file(&office[0]).unwrap();
+
+    // A client with no anchor lifts an unsigned parcel; the anchorless server takes it.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "c"]));
+    assert!(!area.path("c/.forklift/trust").exists());
+    area.write_file("c/code.txt", "forged\n");
+    assert_success(&area.forklift("c", &["load", "."]));
+    assert_success(&area.forklift("c", &["stack", "forged"]));
+    assert_success(&area.forklift("c", &["lift"]));
+
+    // DEFECT: b, holding the anchor, fast-forwards to the unsigned parcel.
+    let lowered = area.forklift("b", &["lower"]);
+    println!("lower: {}{}", stdout(&lowered), stderr(&lowered));
+    assert_success(&lowered);
+    assert_eq!(std::fs::read_to_string(area.path("b/code.txt")).unwrap(), "forged\n");
+
+    // Only an audit notices.
+    let audited = area.forklift("b", &["audit"]);
+    println!("audit: {}{}", stdout(&audited), stderr(&audited));
+    assert!(!audited.status.success());
+    assert!(stderr(&audited).contains("carries no signature") || stdout(&audited).contains("carries no signature"));
+}
+
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() { out.extend(walk(&path)); } else { out.push(path); }
+    }
+    out
+}
