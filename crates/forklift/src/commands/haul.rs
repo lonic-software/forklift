@@ -5,6 +5,7 @@ use forklift_core::util::meta_tree::MetaSigner;
 use forklift_core::util::office_utils::{self, OfficeState};
 use forklift_core::util::{config_utils, file_utils, merge_utils, object_utils, pallet_utils};
 use crate::cli::HaulAction;
+use crate::color;
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower;
 use crate::output::{self, CommandOutput};
@@ -591,7 +592,8 @@ impl CommandOutput for HaulDetail {
     fn render_human(&self) {
         // A haul syncs in from `@haul`, where nothing bounds its strings, so every one of them
         // is sanitized for the terminal (never for `--json`).
-        println!("\x1b[33mhaul {}\x1b[0m — {}", short(&self.id), sanitize(&self.title));
+        println!("{} — {}", color::paint(color::YELLOW, format_args!("haul {}", short(&self.id))),
+                 sanitize(&self.title));
         println!("{} → {}   [{}]", sanitize(&self.source), sanitize(&self.target), sanitize(&self.status));
         println!("opened by {}", sanitize(&self.opener));
         println!("head {}", short(&self.head));

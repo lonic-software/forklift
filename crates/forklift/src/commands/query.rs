@@ -9,6 +9,7 @@ use forklift_core::util::query_utils::{
     self, Boundary, MatchTrust, QueryMatch, QueryOutcome, QueryParams, TrustMode,
 };
 use forklift_core::util::{office_utils, pallet_utils, scope_utils};
+use crate::color;
 use crate::output::{self, CommandOutput};
 
 /// The query command's flag inputs, one struct so the CLI arm stays readable.
@@ -272,7 +273,7 @@ fn render_oneline(out: &mut impl Write, found: &QueryMatch) -> std::io::Result<(
         .and_then(|description| description.lines().next())
         .unwrap_or("");
     let abbrev = &found.hash[..found.hash.len().min(ABBREV)];
-    writeln!(out, "\x1b[33m{}\x1b[0m {}", abbrev, sanitize(subject))
+    writeln!(out, "{} {}", color::paint(color::YELLOW, abbrev), sanitize(subject))
 }
 
 /// The human trust suffix for a match's identity line: a bare word for every trust except
@@ -316,7 +317,7 @@ fn render_match(
         writeln!(out)?;
     }
 
-    writeln!(out, "\x1b[33mparcel {}\x1b[0m", found.hash)?;
+    writeln!(out, "{}", color::paint(color::YELLOW, format_args!("parcel {}", found.hash)))?;
 
     // The identity line: who this parcel resolves to at the query's trust level. The operator,
     // supervisor and description below come out of a parcel or the office, either of which may

@@ -8,6 +8,7 @@ use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cli;
+pub mod color;
 pub mod commands;
 #[cfg(feature = "docgen")]
 pub mod docgen;
@@ -63,6 +64,9 @@ async fn async_main() {
     let cli = parse_or_exit();
 
     output::set_mode(if cli.json { OutputMode::Json } else { OutputMode::Human });
+
+    // Before the pager below takes over stdout, which would make a terminal look like a pipe.
+    color::init(cli.color);
 
     // A quit pager or a closed `| head` should stop us cleanly, not panic (git's behavior).
     pager::restore_sigpipe();

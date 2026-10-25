@@ -7,9 +7,9 @@ you oriented fast.
 Conventions in this guide:
 - `forklift <command>` — most commands have a short alias, shown in the
   [command list](../generated/commands.md) and in each command's `forklift help <command>`.
-- Three global flags apply to every command: `-v`/`--verbose` (more detail),
+- Four global flags apply to every command: `-v`/`--verbose` (more detail),
   `--json` (machine output — see [Machine & agent output](#8-machine--agent-output)),
-  and `--no-pager` (see [Paging](#paging) below).
+  `--no-pager` (see [Paging](#paging) below) and `--color` (see [Color](#color)).
 - `forklift help` lists everything; `forklift help <command>` explains one command
   (subcommands work too: `forklift help office admit`).
 
@@ -761,6 +761,17 @@ instead of scrolling off the top:
   file) streams raw — never a pager. `history` streams as it walks, so
   `forklift history | head` (or quitting the pager early) stops the walk instead of
   reading the whole graph.
+
+### Color
+
+Like paging, color is for a terminal. By default (`--color auto`), `diff`, `history`,
+`query`, `blame` and `haul show` color their output only when stdout is a terminal, the
+`NO_COLOR` environment variable is unset or empty, and `TERM` is not `dumb`. Piped into a
+file or another program, the output is plain text. Paged output keeps its color.
+
+- `--color always` colors even into a pipe or a file (for `less -R`, say), whatever
+  `NO_COLOR` and `TERM` say.
+- `--color never` never colors.
 
 **For agents**, page `--json` output with a cursor rather than a pager:
 `forklift history -n 20 --json` returns 20 parcels plus a `next` cursor; pass it as
@@ -1787,7 +1798,7 @@ optional positionals share one param
 prefixes the path of the binary it found; the document is not a runnable `pult.yaml` on its
 own.
 
-The global `--json`, `--verbose` and `--no-pager` are not params: they are the caller's
+The global `--json`, `--verbose`, `--no-pager` and `--color` are not params: they are the caller's
 choice of rendering. `help`, `mcp` and `self-schema` itself are left out. The bearer token
 of `franchise --token` and a `config` value are marked secret. An argument shape the
 document cannot express exactly is refused with an error naming the command and argument,
