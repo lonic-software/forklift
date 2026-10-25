@@ -646,9 +646,10 @@ the same type `forklift-server` resolves its callers to:
 
 * **The function holds digests, never plaintext tokens.** A Lambda's environment is part of the
   function's configuration, readable by anyone who may read that configuration, so a token never
-  goes there. Compute a digest with any common tool — `printf '%s' "$TOKEN" | shasum -a 256`,
-  `openssl dgst -sha256`, or Terraform's `sha256()` (which the module in `infra/aws-serverless`
-  does for you). Tokens are high-entropy secrets, so an unsalted digest gives nothing away.
+  goes there. Compute a digest with any common tool —
+  `printf '%s' "$TOKEN" | shasum -a 256 | cut -d' ' -f1` (the bare 64 hex characters, without
+  the trailing ` -` that `shasum` prints), or Terraform's `sha256()` (which the module in
+  `infra/aws-serverless` does for you). Tokens are high-entropy secrets, so an unsalted digest gives nothing away.
 * **`FORKLIFT_TOKEN_SHA256`** is the shared bearer's digest. A client presenting that token as
   `Authorization: Bearer <token>` is `Principal::Static`: **the deployment's administrator
   credential**, full access to every pallet under every office rule. The comparison is
@@ -658,9 +659,10 @@ the same type `forklift-server` resolves its callers to:
   `Principal::Operator(id)`, and the office's roles and per-pallet grants apply to it (below).
   Identifiers are matched exactly against the office roster, never trimmed. Either variable alone
   is a complete configuration; both together are fine.
-* **Every misconfiguration fails the cold start**, so the function never serves on a credential
-  set it half understood: a digest that is not 64 lowercase hex characters; the digest of the
-  empty string; a blank identifier; one digest bound twice; `FORKLIFT_OPEN_ACCESS=1` beside any
+* **A misconfiguration fails the cold start**, so the function never serves on a credential set
+  it half understood: a digest that is not 64 lowercase hex characters; the digest of the empty
+  string; a blank identifier; one digest bound twice, or bound both as the shared bearer and as an
+  operator; `FORKLIFT_OPEN_ACCESS=1` beside any
   credential; and **any `FORKLIFT_TOKEN` at all** — a plaintext token left over from an older
   configuration is refused rather than silently ignored. Move it to `FORKLIFT_TOKEN_SHA256` as a
   digest.
@@ -702,7 +704,10 @@ carries exactly its office identity's authority**, judged by the same office rul
 
 Until the warehouse is trusted, or while its office has no roster yet (the bootstrap window
 before the office is first lifted), no operator is judged against the office and every
-authenticated caller passes these rules. The window is not a hole: a trusted warehouse refuses a
+authenticated caller passes these rules. In multi-warehouse mode (no `FORKLIFT_WAREHOUSE_ID`),
+where every well-formed id answers, an untrusted id is one nobody has set up: an operator token
+is refused (`403`) every write to it, establishing its trust included, so only the shared bearer
+sets a warehouse up — as only the static token creates one on `forklift-server`. The window is not a hole: a trusted warehouse refuses a
 working or meta pallet outright until its office is lifted, and the office's own first lift is
 pinned by its own compare-and-set.
 

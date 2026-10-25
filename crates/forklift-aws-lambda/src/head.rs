@@ -35,8 +35,8 @@
 //! See `blocking.rs`.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use forklift_core::error::{CoreError, RefusalCode};
@@ -122,6 +122,14 @@ enum ScratchSource {
     Pooled(String),
 }
 
+/// Office states the authority rules have read, by office head. An office head is a content
+/// hash, so the state at one is the same in every warehouse and at every later time: an entry is
+/// never stale, only evicted. It spares an operator's every upload the office tree walk.
+static OFFICE_STATES: OnceLock<Mutex<HashMap<String, OfficeState>>> = OnceLock::new();
+
+/// How many office states [`OFFICE_STATES`] keeps; past it, one is dropped to make room.
+const MAX_CACHED_OFFICE_STATES: usize = 32;
+
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
     pub objects: O,
@@ -183,8 +191,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// The office state at an office head **already read once by the caller**, for the
     /// authority rules: the head's whole tree is mirrored into the scratch and read there, the
     /// stored state as `forklift-server` reads it (no chain verification — the ref update's
-    /// audit verifies the chain it commits on). An unborn office, and an untrusted warehouse
-    /// (whose office the rules never consult), are the empty state.
+    /// audit verifies the chain it commits on), then kept in [`OFFICE_STATES`]. An unborn
+    /// office, and an untrusted warehouse (whose office the rules never consult), are the empty
+    /// state.
     fn office_state_at(&self, anchor: &Option<TrustAnchor>, office_head: Option<&str>) -> HeadResult<OfficeState> {
         let empty = OfficeState { users: Vec::new(), keys: Vec::new() };
 
@@ -192,13 +201,30 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             return Ok(empty);
         };
 
+        let states = OFFICE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+
+        if let Some(state) = states.lock().map_err(|e| HeadError::internal(e.to_string()))?.get(office_head) {
+            return Ok(state.clone());
+        }
+
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
-        scratch.scoped(|| {
-            materialize_state(&self.objects, office_head, &mut Mirror::default())?;
-            office_utils::read_office_state_of(office_head)
-        })
-        .map_err(HeadError::internal)
+        let state = scratch
+            .scoped(|| {
+                materialize_state(&self.objects, office_head, &mut Mirror::default())?;
+                office_utils::read_office_state_of(office_head)
+            })
+            .map_err(HeadError::internal)?;
+
+        let mut states = states.lock().map_err(|e| HeadError::internal(e.to_string()))?;
+        if states.len() >= MAX_CACHED_OFFICE_STATES {
+            if let Some(evicted) = states.keys().next().cloned() {
+                states.remove(&evicted);
+            }
+        }
+        states.insert(office_head.to_string(), state.clone());
+
+        Ok(state)
     }
 
     /// Authorize an upload: may this caller put bytes (objects, signatures, a staged lift) into

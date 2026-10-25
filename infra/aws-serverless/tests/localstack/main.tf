@@ -115,7 +115,7 @@ variable "verifier_package" {
 }
 
 variable "auth_token" {
-  description = "The bearer token for this run (unused by Layer 2's exercise, which never calls the control plane — required by the module regardless)."
+  description = "The bearer token for this run (unused by Layer 2's exercise, which never calls the control plane — the module refuses a configuration with no credential)."
   type        = string
   sensitive   = true
 }

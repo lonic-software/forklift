@@ -47,7 +47,7 @@ variable "auth_token" {
 variable "operator_token_digests" {
   description = <<-EOT
     Per-operator bearer tokens, by digest: a map from each token's SHA-256 (64 lowercase hex
-    characters, e.g. `printf %s "$TOKEN" | shasum -a 256`) to the office identifier it
+    characters: `printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1`) to the office identifier it
     authenticates as (`FORKLIFT_OPERATOR_TOKENS`). Each request made with such a token is judged
     by the warehouse's office: its role and pallet grants decide what it may upload and move.
     The plaintext tokens never pass through this module. Optional, but at least one of
@@ -67,6 +67,13 @@ variable "operator_token_digests" {
   validation {
     condition     = var.auth_token != null || length(var.operator_token_digests) > 0
     error_message = "Set auth_token, operator_token_digests, or both: a control plane with no credential would refuse every request."
+  }
+
+  # The function refuses this too, at cold start: its shared-bearer match is tried first, so the
+  # operator binding would be dead and its holder an administrator.
+  validation {
+    condition     = !contains(keys(var.operator_token_digests), sha256(var.auth_token == null ? "" : var.auth_token))
+    error_message = "An operator_token_digests key is the digest of auth_token: the shared bearer and an operator token must differ."
   }
 }
 

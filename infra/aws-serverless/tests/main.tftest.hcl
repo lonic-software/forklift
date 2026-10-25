@@ -288,6 +288,19 @@ run "c5_empty_strings_digest_rejected" {
   ]
 }
 
+run "c5_shared_bearer_as_operator_token_rejected" {
+  command = plan
+
+  variables {
+    auth_token             = "0123456789abcdef-shared"
+    operator_token_digests = { (sha256("0123456789abcdef-shared")) = "ada@example" }
+  }
+
+  expect_failures = [
+    var.operator_token_digests,
+  ]
+}
+
 # ---------------------------------------------------------------------------------------------
 # C6 — the deployed IAM policies equal an independently rendered copy of the same crate JSON
 # (pins Terraform<->JSON; JSON<->code is C11 in the crate, not this test).

@@ -53,7 +53,9 @@ use forklift_core::model::remote::{
     MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
 use forklift_core::util::authority_utils::Principal;
+use forklift_core::util::object_utils::is_object_hash;
 use forklift_core::util::pallet_utils::{validate_pallet_name, DEFAULT_PALLET_NAME};
+use forklift_core::util::sign_utils;
 use forklift_core::util::warehouse_utils;
 
 use crate::aws::AwsConfig;
@@ -153,20 +155,15 @@ impl TokenDigest {
     /// Parse a configured digest: exactly 64 lowercase hex characters, never the digest of the
     /// empty string.
     pub fn parse_hex(hex: &str) -> Result<TokenDigest, String> {
-        let well_formed = hex.len() == 64
-            && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        // An object hash's spelling is exactly a SHA-256 digest's: 64 lowercase hex characters.
+        let malformed = || "a token digest must be 64 lowercase hex characters (a SHA-256 digest)".to_string();
 
-        if !well_formed {
-            return Err("a token digest must be 64 lowercase hex characters (a SHA-256 digest)".to_string());
+        if !is_object_hash(hex) {
+            return Err(malformed());
         }
 
-        let mut digest = [0u8; 32];
-        for (index, pair) in hex.as_bytes().chunks(2).enumerate() {
-            let pair = std::str::from_utf8(pair).map_err(|e| e.to_string())?;
-            digest[index] = u8::from_str_radix(pair, 16).map_err(|e| e.to_string())?;
-        }
-
-        let digest = TokenDigest(digest);
+        let bytes = sign_utils::from_hex(hex).map_err(|()| malformed())?;
+        let digest = TokenDigest(bytes.try_into().map_err(|_| malformed())?);
         if digest == TokenDigest::hash("") {
             return Err("a token digest must not be the SHA-256 of the empty string".to_string());
         }
@@ -211,7 +208,9 @@ pub struct Credentials {
 
 impl Credentials {
     /// Assemble the accepted credentials. Refused when there are none at all, when an
-    /// identifier is blank, and when one digest is bound twice.
+    /// identifier is blank, and when one digest is bound twice — among the operators, or as both
+    /// the shared bearer and an operator, where the shared bearer's match would silently make
+    /// that operator an administrator.
     pub fn new(static_token: Option<TokenDigest>,
                operators: Vec<(TokenDigest, String)>) -> Result<Credentials, String> {
         if static_token.is_none() && operators.is_empty() {
@@ -222,6 +221,10 @@ impl Credentials {
         for (digest, identifier) in operators {
             if identifier.trim().is_empty() {
                 return Err("an operator token is bound to a blank identifier".to_string());
+            }
+
+            if static_token == Some(digest) {
+                return Err("an operator token's digest is also the shared bearer's".to_string());
             }
 
             if bound.insert(digest, identifier).is_some() {
@@ -459,10 +462,51 @@ where
         Err(message) => return error_response(HeadError::internal(message)),
     };
 
+    if let Err(error) = require_set_up_for(routing, &head, &caller, &route) {
+        return error_response(error);
+    }
+
     match dispatch(&head, &caller, route, request.into_body()) {
         Ok(response) => response,
         Err(error) => error_response(error),
     }
+}
+
+/// In multi-warehouse routing every well-formed id answers, so a warehouse with no trust anchor
+/// is one nobody has set up. An operator token may not write to it — nor establish its trust,
+/// which would hand the id to whoever held any token. Setting a warehouse up is the shared
+/// bearer's (or an open head's), as creating one is the static token's on `forklift-server`.
+/// A single-warehouse head serves the one warehouse its deployer configured, and there the
+/// office rules alone decide. An anchor, once present, is never removed (a re-genesis replaces
+/// it), so the warehouse cannot fall back out of this check before the route commits.
+fn require_set_up_for<O, R>(routing: &Routing, head: &Head<O, R>, caller: &Principal, route: &Route)
+    -> HeadResult<()>
+where
+    O: ObjectStore,
+    R: RefStore,
+{
+    let writes = matches!(
+        route,
+        Route::UploadTargets
+            | Route::ObjectPut { .. }
+            | Route::SignaturePut(_)
+            | Route::PutTrust
+            | Route::RefUpdate(_)
+            | Route::CommitLift(_)
+    );
+
+    if !matches!(routing, Routing::Multi) || !writes || !matches!(caller, Principal::Operator(_)) {
+        return Ok(());
+    }
+
+    if head.refs.get_trust().map_err(HeadError::internal)?.is_none() {
+        return Err(HeadError::forbidden(
+            "This warehouse has not been set up: the deployment's administrator establishes its \
+            trust first, and only then may an operator token write to it.",
+        ));
+    }
+
+    Ok(())
 }
 
 /// A parsed route: the protocol endpoint plus the path/query pieces it carries. The body is
@@ -1034,7 +1078,7 @@ mod tests {
 
     /// The SHA-256 of `token`, as a deployer writes it into the environment.
     fn hex_digest(token: &str) -> String {
-        Sha256::digest(token.as_bytes()).iter().map(|byte| format!("{:02x}", byte)).collect()
+        sign_utils::to_hex(&Sha256::digest(token.as_bytes()))
     }
 
     /// A variable source holding exactly `vars`.
@@ -1148,6 +1192,13 @@ mod tests {
         refused(
             &[("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{0}":"ada@example","{0}":"eve@example"}}"#, ada))],
             "one digest bound twice",
+        );
+        refused(
+            &[
+                ("FORKLIFT_TOKEN_SHA256", &hex_digest("shared-secret")),
+                ("FORKLIFT_OPERATOR_TOKENS", &format!(r#"{{"{}":"ada@example"}}"#, hex_digest("shared-secret"))),
+            ],
+            "one digest bound as the shared bearer and as an operator",
         );
     }
 

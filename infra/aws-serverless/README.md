@@ -120,7 +120,8 @@ Build the two zips with `cargo lambda build --release --arm64` (see
   (`docs/DEPLOYMENT.md`, "What the bearer tokens do — and do not — control").
 - **Multi-warehouse mode shares one credential set.** When `warehouse_id` is left null, the same
   tokens are accepted for every warehouse id; each warehouse's own office still decides what an
-  operator token may do there.
+  operator token may do there, and only `auth_token` sets a new warehouse id up (establishes its
+  trust).
 - **Wrong-architecture package.** Not preventable in HCL; if you build an x86_64 zip and deploy
   with the arm64 default (or vice versa), every invocation fails with an exec-format error.
   `docs/DEPLOYMENT.md`'s verification checklist catches this on its first step.

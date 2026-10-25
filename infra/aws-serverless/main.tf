@@ -11,9 +11,10 @@ locals {
   verifier_function_name      = "${var.name_prefix}-verifier"
 
   # entrypoint::config_from_env is the whole configuration surface both binaries share, and
-  # entrypoint::auth_from_env the control plane's credentials on top of it. `aws_lambda_function`'s `environment.variables` is `map(string)` and rejects
-  # a null element at plan time, so every optional variable is merged in only when non-null
-  # rather than ever assigned null — this is what C4/C5's env-map asserts depend on.
+  # entrypoint::auth_from_env the control plane's credentials on top of it.
+  # `aws_lambda_function`'s `environment.variables` is `map(string)` and rejects a null element
+  # at plan time, so every optional variable is merged in only when non-null rather than ever
+  # assigned null — this is what C4/C5's env-map asserts depend on.
   control_plane_env = merge(
     {
       FORKLIFT_S3_BUCKET      = aws_s3_bucket.this.bucket

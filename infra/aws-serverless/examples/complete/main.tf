@@ -37,17 +37,25 @@ variable "verifier_package" {
 }
 
 variable "auth_token" {
-  description = "The bearer token the deployed head will require."
+  description = "The shared bearer token: the deployment's administrator credential. Optional when operator_token_digests is set."
   type        = string
   sensitive   = true
+  default     = null
+}
+
+variable "operator_token_digests" {
+  description = "Per-operator tokens, as a map from each token's SHA-256 (64 lowercase hex characters) to its office identifier."
+  type        = map(string)
+  default     = {}
 }
 
 module "forklift" {
   source = "../.."
 
-  control_plane_package = var.control_plane_package
-  verifier_package      = var.verifier_package
-  auth_token            = var.auth_token
+  control_plane_package  = var.control_plane_package
+  verifier_package       = var.verifier_package
+  auth_token             = var.auth_token
+  operator_token_digests = var.operator_token_digests
 }
 
 output "api_endpoint" {

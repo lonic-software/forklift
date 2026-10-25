@@ -992,6 +992,40 @@ fn an_untrusted_warehouse_admits_any_operator() {
     assert_eq!(status(&fixture.call(bearing("nobody-token", post_json("/v1/pallets/main", &main)))), 200);
 }
 
+/// Multi-warehouse routing answers every id, so an id nobody has set up is not open to an
+/// operator token: it may neither write there nor claim the id by establishing its trust. Once
+/// the administrator has established trust, the office rules decide as anywhere else.
+#[test]
+fn in_multi_warehouse_routing_an_operator_writes_only_where_the_administrator_set_up() {
+    let area = Area::new("operator-multi");
+    let (harvest, _, main_head) = rostered_warehouse(&area);
+    let anchor = harvest.trust.clone().expect("trust established");
+    let fixture = Fixture { routing: Routing::Multi, ..seeded(&harvest) };
+
+    let fresh = b"bytes for a warehouse nobody set up".to_vec();
+    let fresh_hash = object_utils::hash_object_bytes(&fresh);
+    let object = || put_bytes(&format!("/warehouses/new/v1/objects/{}", fresh_hash), fresh.clone());
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+
+    for token in ["wes-token", "nobody-token"] {
+        assert_eq!(status(&fixture.call(bearing(token, put_json("/warehouses/new/v1/trust", &anchor)))), 403, "{}", token);
+        assert_eq!(status(&fixture.call(bearing(token, object()))), 403, "{}", token);
+        assert_eq!(
+            status(&fixture.call(bearing(token, post_json("/warehouses/new/v1/pallets/main", &main)))),
+            403,
+            "{}",
+            token
+        );
+        assert_eq!(status(&fixture.call(bearing(token, get("/warehouses/new/v1/warehouse")))), 200, "reads stay open");
+    }
+
+    let info: WarehouseInfo = body_json(&fixture.call(bearing("admin-secret", get("/warehouses/new/v1/warehouse"))));
+    assert!(info.trust.is_none(), "no operator established trust");
+
+    assert_eq!(status(&fixture.call(bearing("admin-secret", put_json("/warehouses/new/v1/trust", &anchor)))), 201);
+    assert_eq!(status(&fixture.call(bearing("nobody-token", object()))), 201, "set up, with no roster yet");
+}
+
 /// Trust established, office not yet lifted: there is no roster, so the gate admits every
 /// operator (the office's own first lift must get through). Nothing else may land in that
 /// window, because the commit is not conditioned on the office: a working pallet is refused by
