@@ -1198,23 +1198,32 @@ fn a_damaged_export_refuses_only_its_own_pallet() {
     area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
     area.forklift_ok("a", &["mirror"]);
 
-    // feat's tip now names main's first parcel, which has no parent.
     let mirror = fixture.mirror_dir("a");
     let exported = git_ok(&mirror, &["rev-parse", "refs/forklift/exported/feat"]);
     let parent = git_ok(&mirror, &["rev-parse", &format!("{}^", exported)]);
     let tree = git_ok(&mirror, &["rev-parse", &format!("{}^{{tree}}", exported)]);
-    let rewritten = write_commit(&mirror, &tree, &[&parent], &format!("first\n\n{}\n", parcel_line(&fixture.first)));
-    git_ok(&mirror, &["update-ref", "refs/forklift/exported/feat", &rewritten]);
+    let feat = git_ok(&mirror, &["log", "-1", "--format=%B", &exported]);
+    let feat_parcel = feat.trim_end().rsplit('\n').next().unwrap()
+        .strip_prefix("Forklift-Parcel: ").unwrap().split(' ').next().unwrap().to_string();
 
-    area.stack("a", "code.txt", "v2\n", "second");
-    let second = area.lift("a")["head"].as_str().unwrap().to_string();
+    // feat's tip names main's first parcel, which has no parent (caught checking its parents);
+    // then feat's own parcel in another layout (caught reading its last line).
+    let lines = [parcel_line(&fixture.first), format!("Forklift-Parcel: {} export/2", feat_parcel)];
+    for (round, line) in lines.iter().enumerate() {
+        let rewritten = write_commit(&mirror, &tree, &[&parent], &format!("feat\n\n{}\n", line));
+        git_ok(&mirror, &["update-ref", "refs/forklift/exported/feat", &rewritten]);
 
-    let run = area.forklift("a", &["--json", "mirror"]);
-    assert_eq!(run.status.code(), Some(33), "{}", stdout(&run));
-    let document: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
-    let details = &document["error"]["details"];
-    assert_eq!(outcome(details, "main")["status"], "pushed", "{}", document);
-    assert_eq!(outcome(details, "feat")["status"], "damaged", "{}", document);
-    assert!(outcome(details, "feat")["message"].as_str().unwrap().contains("Delete .forklift/mirror.git"), "{}", document);
-    assert_eq!(last_line(&fixture.git, &tip(&fixture.git, "main").unwrap()), parcel_line(&second));
+        area.stack("a", "code.txt", &format!("v{}\n", round + 2), "next");
+        let head = area.lift("a")["head"].as_str().unwrap().to_string();
+
+        let run = area.forklift("a", &["--json", "mirror"]);
+        assert_eq!(run.status.code(), Some(33), "{}: {}", line, stdout(&run));
+        let document: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+        let details = &document["error"]["details"];
+        assert_eq!(outcome(details, "main")["status"], "pushed", "{}: {}", line, document);
+        assert_eq!(outcome(details, "feat")["status"], "damaged", "{}: {}", line, document);
+        assert!(outcome(details, "feat")["message"].as_str().unwrap().contains("Delete .forklift/mirror.git"),
+            "{}: {}", line, document);
+        assert_eq!(last_line(&fixture.git, &tip(&fixture.git, "main").unwrap()), parcel_line(&head));
+    }
 }

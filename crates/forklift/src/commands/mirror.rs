@@ -439,13 +439,18 @@ enum Verdict {
 
 impl<'a> Run<'a> {
     /// Start a run: every exported ref must end in this build's parcel line (D2), and those whose
-    /// parcel is in the local store are the boundaries the export builds on.
+    /// parcel is in the local store are the boundaries the export builds on. One that does not is
+    /// set aside for its own pallet's outcome.
     fn start(repo: &'a GitRepo, client: &'a RemoteClient, url: String, unattended: bool) -> Result<Run<'a>, Problem> {
         let mut pending = Vec::new();
+        let mut refused = BTreeMap::new();
         for (pallet, commit) in exported_refs(repo)? {
-            let raw = read_commit(repo, &commit)?;
-            let parcel = raw.exported_parcel(&commit)?;
-            pending.push(Pending { pallet, boundary: Boundary { parcel, commit }, raw });
+            let read = read_commit(repo, &commit)
+                .and_then(|raw| raw.exported_parcel(&commit).map(|parcel| (raw, parcel)));
+            match read {
+                Ok((raw, parcel)) => pending.push(Pending { pallet, boundary: Boundary { parcel, commit }, raw }),
+                Err(problem) => { refused.insert(pallet, problem); }
+            }
         }
 
         let mut run = Run {
@@ -457,7 +462,7 @@ impl<'a> Run<'a> {
             exporter: Exporter::new(repo),
             boundaries: Vec::new(),
             pending,
-            refused: BTreeMap::new(),
+            refused,
             progress: events::progress(),
         };
         run.promote();
