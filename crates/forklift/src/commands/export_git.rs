@@ -201,15 +201,22 @@ impl GitRepo {
 
     /// Run a `git fetch` or `git push` against another repository under the user's own
     /// configuration, so credential helpers keep working, and return its raw output whatever its
-    /// exit status. Stdin is always null. When `unattended`, git must not prompt either: a lift
-    /// holds its locks while it waits, so a prompt git or Git Credential Manager would show fails
-    /// at once instead (a helper's own window, or an ssh passphrase prompt, is not covered).
+    /// exit status. Git runs in `from`, so a relative URL is read from there, and runs no hook:
+    /// the user's own hooks are for their repositories, not this one. Stdin is always null. When
+    /// `unattended`, git must not prompt either: a lift holds its locks while it waits, so a prompt
+    /// git or Git Credential Manager would show fails at once instead (a helper's own window, or an
+    /// ssh passphrase prompt, is not covered).
     ///
     /// # Returns
     /// * `Ok(Output)`  - Git's status, stdout and stderr.
     /// * `Err(String)` - If git could not be run.
-    pub(crate) fn network(&self, args: &[&str], unattended: bool) -> Result<std::process::Output, String> {
-        let mut command = self.command(|key| REPOSITORY_VARIABLES.contains(&key));
+    pub(crate) fn network(&self, args: &[&str], from: &Path, unattended: bool) -> Result<std::process::Output, String> {
+        // No `-C`, which would read a relative URL from the repository: GIT_DIR finds it instead.
+        let mut command = self.stripped_command(|key| REPOSITORY_VARIABLES.contains(&key));
+        command.current_dir(from).env("GIT_DIR", self.git_dir());
+        let mut no_hooks = std::ffi::OsString::from("core.hooksPath=");
+        no_hooks.push(self.git_dir().join("forklift-no-hooks"));
+        command.arg("-c").arg(no_hooks);
         if unattended {
             command.env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never");
         }
@@ -223,26 +230,38 @@ impl GitRepo {
         // A missing global config file also reads as empty, so this holds on a git that does not
         // map /dev/null. A git before 2.32 ignores GIT_CONFIG_GLOBAL and reads the global config
         // from the home folder, so that points at a folder that does not exist.
-        let no_home = if self.bare { self.path.clone() } else { self.path.join(".git") }.join("forklift-no-home");
+        let no_home = self.git_dir().join("forklift-no-home");
         command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("HOME", &no_home).env("XDG_CONFIG_HOME", &no_home);
 
         command
     }
 
+    /// The repository's git folder.
+    fn git_dir(&self) -> PathBuf {
+        if self.bare { self.path.clone() } else { self.path.join(".git") }
+    }
+
     /// `git -C <path>`, with every inherited variable `strip` names removed.
     fn command(&self, strip: impl Fn(&str) -> bool) -> Command {
-        let mut command = Command::new("git");
+        let mut command = self.stripped_command(strip);
         command.arg("-C").arg(&self.path);
+        if self.bare {
+            command.env("GIT_DIR", &self.path);
+        }
+
+        command
+    }
+
+    /// `git`, with every inherited variable `strip` names removed.
+    fn stripped_command(&self, strip: impl Fn(&str) -> bool) -> Command {
+        let mut command = Command::new("git");
 
         // Windows treats variable names case-insensitively, so compare uppercased.
         for (key, _) in std::env::vars_os() {
             if strip(&key.to_string_lossy().to_ascii_uppercase()) {
                 command.env_remove(&key);
             }
-        }
-        if self.bare {
-            command.env("GIT_DIR", &self.path);
         }
 
         command

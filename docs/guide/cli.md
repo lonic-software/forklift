@@ -155,7 +155,8 @@ exports only the parcels added since the last one. The first run in a warehouse 
 pallet's whole history, and for a pallet you never lowered it first fetches that history from
 the remote; the warehouse then keeps it, so the cost is paid once. Set `mirror.pallets` to
 narrow it. Fetches and pushes run under your own git configuration, so your credential helper
-and ssh keys work as they do for `git push`.
+and ssh keys work as they do for `git push`, but they run no git hooks. A relative `mirror.url`
+is read from the warehouse's root folder, from every bay. A URL beginning with `-` is refused.
 
 **Never by force.** Each pallet's git branch is fetched and compared with the export first:
 
@@ -179,8 +180,9 @@ the next lift of that pallet or `forklift mirror` catches git up. Inside a lift,
 prompt for credentials; one that would fails at once and is reported.
 
 A pallet whose name git does not accept as a branch name (`feature.lock`, `a..b`) is skipped,
-as is one in `mirror.pallets` the remote does not have; neither is a failure. `mirror` exits
-nonzero when any pallet is refused or its push fails, after the others went through. Tags, the
+as is one in `mirror.pallets` the remote does not have; neither is a failure. `mirror` fails
+with `mirror_incomplete` (exit 33) when any pallet is refused or its push fails, after the
+others went through; under `--json` the error's `details` carry the whole run's report. Tags, the
 signed office, the `@manifest` and signatures are not mirrored: git has no equivalent. Refuses
 in a scoped bay or a sparse franchise, which hold only part of each tree. Two runs never share
 the mirror: a run that finds another in progress reports it busy and stops.

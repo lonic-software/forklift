@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::lock_utils::MirrorLock;
@@ -40,7 +41,8 @@ const GIT_STEP: &str = "Fix the cause git reports, then run \"forklift mirror\".
 /// # Returns
 /// * `Ok(())`      - If every mirrored pallet is in step (or was skipped as not mirrorable).
 /// * `Err(String)` - If the mirror is not configured, busy or damaged, or a pallet was refused or
-///                   its push failed (after the rest went through).
+///                   its push failed (after the rest went through: `mirror_incomplete`, with the
+///                   run's report as its details).
 pub async fn handle_command() -> Result<(), String> {
     refuse_partial_view()?;
 
@@ -91,13 +93,20 @@ pub async fn handle_command() -> Result<(), String> {
         report.render_in_step();
     }
 
-    Err(format!(
+    let message = format!(
         "Did not mirror {} of {} pallet(s):\n{}",
         failed.len(),
         report.pallets.len(),
         failed.iter().map(|outcome| format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default()))
             .collect::<Vec<_>>().join("\n")
-    ))
+    );
+
+    Err(CoreError::refusal_with_details(
+        RefusalCode::MirrorIncomplete,
+        message,
+        "Follow the step each pallet's message names, then run \"forklift mirror\" again.",
+        serde_json::json!(report),
+    ).into())
 }
 
 /// Mirror the pallet a lift just landed, at the head it landed (the lift trigger). Runs only when
@@ -180,7 +189,10 @@ fn refuse_partial_view() -> Result<(), CoreError> {
 
 /// The configured `mirror.url`, if any.
 fn mirror_url() -> Result<Option<String>, String> {
-    Ok(config_utils::get_effective_value(config_utils::KEY_MIRROR_URL)?.map(|(url, _)| url))
+    // Checked again here: a value written to the file by hand never passed `forklift config`.
+    config_utils::get_effective_value(config_utils::KEY_MIRROR_URL)?
+        .map(|(url, _)| config_utils::parse_mirror_url(&url))
+        .transpose()
 }
 
 fn busy_message() -> String {
@@ -298,8 +310,9 @@ impl RawCommit {
     fn parcel_line(&self) -> Option<(String, String)> {
         let rest = self.last_line().strip_prefix("Forklift-Parcel: ")?.to_string();
         let (parcel, layout) = rest.split_once(" export/")?;
+        let numbered = !layout.is_empty() && layout.bytes().all(|byte| byte.is_ascii_digit());
 
-        object_utils::is_object_hash(parcel).then(|| (parcel.to_string(), layout.to_string()))
+        (object_utils::is_object_hash(parcel) && numbered).then(|| (parcel.to_string(), layout.to_string()))
     }
 
     /// Whether this commit ends in exactly the parcel line this build writes for `parcel`.
@@ -312,9 +325,12 @@ impl RawCommit {
     fn exported_parcel(&self, commit: &str) -> Result<String, Problem> {
         match self.parcel_line() {
             Some((parcel, _)) if self.names(&parcel) => Ok(parcel),
-            Some((_, layout)) => Err(damaged(format!(
+            Some((_, layout)) if layout != EXPORT_LAYOUT.to_string() => Err(damaged(format!(
                 "holds commit {}, written in export layout {}; this build writes export layout {}",
                 commit, layout, EXPORT_LAYOUT
+            ))),
+            Some(_) => Err(damaged(format!(
+                "holds commit {}, whose last line is not the parcel line this build writes", commit
             ))),
             None => Err(damaged(format!("holds commit {}, which does not name the parcel it was exported from", commit))),
         }
@@ -388,10 +404,16 @@ struct Run<'a> {
     repo: &'a GitRepo,
     client: &'a RemoteClient,
     url: String,
+    /// Where git's network calls run, so a relative `url` is read from the warehouse's root
+    /// (the folder holding the shared `.forklift`), from any bay.
+    from: PathBuf,
     /// A lift's trigger: git must fail rather than prompt.
     unattended: bool,
     exporter: Exporter<'a>,
     boundaries: Vec<Boundary>,
+    /// Exported refs whose parcel is not in the local store yet: each becomes a boundary once a
+    /// fetch brings its parcel in.
+    pending: Vec<Boundary>,
     progress: Progress,
 }
 
@@ -408,22 +430,48 @@ impl<'a> Run<'a> {
     /// Start a run: every exported ref must end in this build's parcel line (D2), and those whose
     /// parcel is in the local store are the boundaries the export builds on.
     fn start(repo: &'a GitRepo, client: &'a RemoteClient, url: String, unattended: bool) -> Result<Run<'a>, Problem> {
-        let mut exporter = Exporter::new(repo);
-        let mut boundaries = Vec::new();
-
+        let mut pending = Vec::new();
         for (_, commit) in exported_refs(repo)? {
-            let raw = read_commit(repo, &commit)?;
-            let parcel = raw.exported_parcel(&commit)?;
-
-            if file_utils::does_object_exist(&parcel)? {
-                let loaded = object_utils::load_parcel(&parcel)?;
-                check_parents(repo, &commit, &raw, &parcel, &loaded.parents)?;
-                exporter.seed(&parcel, &commit, &raw.tree, &loaded.tree_hash);
-                boundaries.push(Boundary { parcel, commit });
-            }
+            let parcel = read_commit(repo, &commit)?.exported_parcel(&commit)?;
+            pending.push(Boundary { parcel, commit });
         }
 
-        Ok(Run { repo, client, url, unattended, exporter, boundaries, progress: events::progress() })
+        let mut run = Run {
+            repo,
+            client,
+            url,
+            from: mirror_utils::warehouse_root(),
+            unattended,
+            exporter: Exporter::new(repo),
+            boundaries: Vec::new(),
+            pending,
+            progress: events::progress(),
+        };
+        run.promote()?;
+
+        Ok(run)
+    }
+
+    /// Make a boundary of every pending exported ref whose parcel is now in the local store,
+    /// checking its commit's parents first.
+    fn promote(&mut self) -> Result<(), Problem> {
+        let mut still_pending = Vec::new();
+
+        for boundary in std::mem::take(&mut self.pending) {
+            if !file_utils::does_object_exist(&boundary.parcel)? {
+                still_pending.push(boundary);
+                continue;
+            }
+
+            let raw = read_commit(self.repo, &boundary.commit)?;
+            let loaded = object_utils::load_parcel(&boundary.parcel)?;
+            check_parents(self.repo, &boundary.commit, &raw, &boundary.parcel, &loaded.parents)?;
+            self.exporter.seed(&boundary.parcel, &boundary.commit, &raw.tree, &loaded.tree_hash);
+            self.boundaries.push(boundary);
+        }
+
+        self.pending = still_pending;
+        Ok(())
     }
 
     /// Mirror one pallet at `remote_head` (its head on the Forklift remote), keeping `record` up to
@@ -453,6 +501,7 @@ impl<'a> Run<'a> {
 
         let roots: Vec<String> = record.values().cloned().collect();
         remote_utils::fetch_history_within(self.client, head, &roots, &self.progress).await?;
+        self.promote()?;
 
         let mut git = self.fetch_branch(pallet)?;
 
@@ -464,7 +513,9 @@ impl<'a> Run<'a> {
         record.insert(pallet.to_string(), head.to_string());
         mirror_utils::write_mirror_roots(record)?;
 
-        for _ in 0..PUSH_ATTEMPTS {
+        // Classified once more after the last attempt's re-fetch, so a race that ends in step is
+        // reported as such.
+        for attempt in 0..=PUSH_ATTEMPTS {
             match self.classify(pallet, &commit, git.as_deref()).await? {
                 Verdict::UpToDate => return Ok(PalletMirror::in_step(pallet, MirrorStatus::UpToDate, &commit, exported)),
                 Verdict::AlreadyAhead => {
@@ -483,11 +534,13 @@ impl<'a> Run<'a> {
                     write one layout, or mirror to a new repository.",
                     pallet, foreign, layout, EXPORT_LAYOUT
                 ))),
+                Verdict::Push if attempt == PUSH_ATTEMPTS => break,
                 Verdict::Push => {}
             }
 
             let pushed = self.repo.network(
                 &["push", "--porcelain", &self.url, &format!("{}{}:{}", EXPORTED_PREFIX, pallet, branch)],
+                &self.from,
                 self.unattended,
             )?;
             if pushed.status.success() {
@@ -517,6 +570,7 @@ impl<'a> Run<'a> {
         let local = format!("{}{}", REMOTE_PREFIX, pallet);
         let fetched = self.repo.network(
             &["fetch", "-q", "--no-tags", &self.url, &format!("+refs/heads/{}:{}", pallet, local)],
+            &self.from,
             self.unattended,
         )?;
 
@@ -525,7 +579,7 @@ impl<'a> Run<'a> {
         }
 
         // Fetching a branch git does not have fails; tell that apart from a failure to reach git.
-        let listed = self.repo.network(&["ls-remote", &self.url, &format!("refs/heads/{}", pallet)], self.unattended)?;
+        let listed = self.repo.network(&["ls-remote", &self.url, &format!("refs/heads/{}", pallet)], &self.from, self.unattended)?;
         if listed.status.success() && listed.stdout.trim_ascii().is_empty() {
             self.repo.run(&["update-ref", "-d", &local], None)?;
             return Ok(None);
@@ -626,7 +680,7 @@ impl<'a> Run<'a> {
     }
 
     /// Compare git's tip `git` with the export's `commit` (D3).
-    async fn classify(&self, pallet: &str, commit: &str, git: Option<&str>) -> Result<Verdict, Problem> {
+    async fn classify(&mut self, pallet: &str, commit: &str, git: Option<&str>) -> Result<Verdict, Problem> {
         let Some(git) = git else { return Ok(Verdict::Push) };
 
         if git == commit {
@@ -666,6 +720,7 @@ impl<'a> Run<'a> {
         };
         let roots: Vec<String> = self.boundaries.iter().map(|boundary| boundary.parcel.clone()).collect();
         remote_utils::fetch_history_within(self.client, remote_head, &roots, &self.progress).await?;
+        self.promote()?;
 
         if file_utils::does_object_exist(&parcel)? && merge_utils::is_ancestor(&parcel, remote_head)? {
             return Ok(Verdict::AlreadyAhead);

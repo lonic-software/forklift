@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 6,
+  "schema": 7,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 6,
+  "schema": 7,
   "command": "stocktake",
   "ok": false,
   "error": {
@@ -83,7 +83,12 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 6** (current): `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
+**Schema 7** (current): the `mirror` command exists; `lift` carries `mirror` when it
+mirrored the pallet it lifted (or tried to, and says why it did not); and a mirror run that leaves
+a pallet out of step with git fails with `mirror_incomplete` (exit 33), whose `details` carry the
+run's report, the same `{url, pallets}` a successful run returns.
+
+**Schema 6**: `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
 (`degraded` or `endpoint_absent`) when the remote's batch download stopped being used and the
 rest of the command fetched one object at a time; absent when it stayed open. `office
 accept-regenesis` says so in its `message` instead. An error document does not carry it.
@@ -416,6 +421,16 @@ pallet unmoved.
 A first-contact adoption is not a refusal: the command succeeds, reports the genesis as
 `data.adopted_genesis`, and writes a `trust_adopted` warning (below) with the same `details`
 shape, `what_changed: "first_contact"` and no `previous`.
+
+### A mirror run left behind: `mirror_incomplete`
+
+`forklift mirror` goes through every mirrored pallet even when one fails. When any was refused
+(diverged, layout skew, a mirror repository it did not write), its push failed or raced, or
+another run held the mirror, the command fails with `mirror_incomplete` (exit 33) after the rest
+went through. `error.details` is the run's report, the same `{url, pallets}` shape a successful
+run returns as `data`: each entry's `status` says what happened to that pallet and its
+`message` names the step. A failure before any pallet is tried (no `mirror.url`, a busy or
+damaged mirror) is not this code.
 
 ### Catching up: `behind`, `remote_ahead`, `diverged`, `target_not_covered`
 

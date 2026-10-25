@@ -134,6 +134,24 @@ pub fn parse_switch(key: &str, value: &str) -> Result<bool, String> {
     ))
 }
 
+/// What a [`KEY_MIRROR_URL`] value means: the git URL (or path) the mirror pushes to, as git reads
+/// it. One beginning with "-" is refused, since git would read it as an option.
+///
+/// # Returns
+/// * `Ok(String)`  - The URL.
+/// * `Err(String)` - If it is empty or begins with "-".
+pub fn parse_mirror_url(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() || value.starts_with('-') {
+        return Err(format!(
+            "\"{}\" is not a valid value for {}: give a git URL or path that does not begin with \"-\" \
+            (write a path beginning with \"-\" as \"./-...\").",
+            value, KEY_MIRROR_URL
+        ));
+    }
+
+    Ok(value.to_string())
+}
+
 /// What a [`KEY_MIRROR_PALLETS`] value means: the pallet names it lists, comma-separated, each
 /// trimmed. Every item must be a valid pallet name; an empty item (`main,,feat`) is refused, not
 /// skipped.
@@ -1146,6 +1164,7 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
         }
         KEY_MAINTENANCE_AUTO | KEY_MIRROR_AUTO => { parse_switch(key, value)?; }
         KEY_MIRROR_PALLETS => { parse_mirror_pallets(value)?; }
+        KEY_MIRROR_URL => { parse_mirror_url(value)?; }
         KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => { parse_maintenance_threshold(key, value)?; }
         _ => {}
     }
@@ -1839,7 +1858,8 @@ mod tests {
     }
 
     /// `mirror.pallets` is read as the trimmed names it lists, stored normalized, and refused at
-    /// both ends when an item is empty or not a pallet name; `mirror.auto` is a switch.
+    /// both ends when an item is empty or not a pallet name; `mirror.auto` is a switch; a
+    /// `mirror.url` git would read as an option is refused at both ends.
     #[test]
     fn mirror_values_are_read_as_written_or_refused() {
         assert_eq!(parse_mirror_pallets(" main , feat,main"), Ok(vec!["main".to_string(), "feat".to_string()]));
@@ -1850,6 +1870,13 @@ mod tests {
             assert!(parse(&format!("[mirror]\npallets = \"{}\"\n", refused)).is_err(),
                     "the file check must refuse {refused:?} too");
         }
+
+        for refused in ["--upload-pack=touch x", "-x"] {
+            assert!(validate_value(KEY_MIRROR_URL, refused).is_err(), "{refused:?} must be refused");
+            assert!(parse(&format!("[mirror]\nurl = \"{}\"\n", refused)).is_err(),
+                    "the file check must refuse {refused:?} too");
+        }
+        assert_eq!(parse_mirror_url("./-repo.git"), Ok("./-repo.git".to_string()));
 
         assert_eq!(parse_switch(KEY_MIRROR_AUTO, " Off "), Ok(false));
         assert_eq!(

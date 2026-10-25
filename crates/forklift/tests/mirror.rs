@@ -385,6 +385,16 @@ fn a_foreign_commit_on_the_git_branch_is_a_divergence_and_stays() {
     assert_eq!(lifted["mirror"]["status"], "diverged", "{}", lifted);
     assert!(lifted["mirror"]["message"].as_str().unwrap().contains(&foreign), "{}", lifted);
     assert_eq!(tip(&fixture.git, "main").unwrap(), foreign);
+
+    // An explicit run fails, and its JSON error still carries the report.
+    let explicit = area.forklift("a", &["--json", "mirror"]);
+    assert_eq!(explicit.status.code(), Some(33), "{}", stdout(&explicit));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&explicit)).unwrap();
+    assert_eq!(document["error"]["code"], "mirror_incomplete", "{}", document);
+    let details = &document["error"]["details"];
+    assert_eq!(details["url"], fixture.git.to_str().unwrap(), "{}", document);
+    assert_eq!(outcome(details, "main")["status"], "diverged", "{}", document);
+    assert_eq!(tip(&fixture.git, "main").unwrap(), foreign);
 }
 
 /// Memo test 5: a git-side amend that keeps the parcel line is a divergence, and nothing built on
@@ -937,8 +947,11 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
     let bay = area.path("bay");
     area.forklift_ok("a", &["bay", "add", "full", bay.to_str().unwrap()]);
 
-    install_hook(&fixture.mirror_dir("a"), "pre-push", &format!(
-        "touch '{}'\nsleep 30\nexit 1\n", area.path("holding").display()
+    // Holds the lock in the exported ref's update, before the push.
+    install_hook(&fixture.mirror_dir("a"), "reference-transaction", &format!(
+        "[ \"$1\" = committed ] || exit 0\ngrep -q refs/forklift/exported/main || exit 0\n\
+        touch '{}'\nsleep 30\n",
+        area.path("holding").display()
     ));
 
     let mut holder = area.forklift_in(&area.path("a")).arg("mirror")
@@ -955,7 +968,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
 
     holder.kill().unwrap();
     holder.wait().unwrap();
-    std::fs::remove_file(fixture.mirror_dir("a").join("hooks").join("pre-push")).unwrap();
+    std::fs::remove_file(fixture.mirror_dir("a").join("hooks").join("reference-transaction")).unwrap();
 
     let report = area.json("bay", &["mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
@@ -1036,4 +1049,133 @@ fn an_unreadable_roots_record_is_rebuilt_from_the_exported_refs() {
     std::fs::write(fixture.roots_record("a"), "not a record\n").unwrap();
     area.forklift_ok("a", &["mirror"]);
     assert_eq!(pallets(record_entries(&fixture.roots_record("a"))), ["feat", "main"]);
+}
+
+/// A relative `mirror.url` is read from the warehouse's root, from the main tree and from a bay
+/// alike, never from the mirror's own repository.
+///
+/// Revert: run git's network calls in the mirror's repository → "../git.git" names a folder
+/// inside `.forklift`, and the run fails.
+#[test]
+fn a_relative_url_is_read_from_the_warehouse_root() {
+    let fixture = Fixture::new("relative");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["config", "mirror.url", "../git.git"]);
+    let report = area.json("a", &["mirror"]);
+    assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
+
+    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.stack("a", "code.txt", "v2\n", "second");
+    let second = area.lift("a")["head"].as_str().unwrap().to_string();
+    let bay = area.path("bay");
+    area.forklift_ok("a", &["bay", "add", "full", bay.to_str().unwrap()]);
+
+    let report = area.json("bay", &["mirror"]);
+    assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
+    assert_eq!(last_line(&fixture.git, &tip(&fixture.git, "main").unwrap()), parcel_line(&second));
+}
+
+/// The hooks of the mirror's own repository (and so the user's global hooks folder) never run
+/// on the mirror's fetches and pushes.
+///
+/// Revert: drop the empty hooks path → the pre-push hook runs and declines the push.
+#[cfg(unix)]
+#[test]
+fn hooks_never_run_on_the_mirror_network_calls() {
+    let fixture = Fixture::new("no-hooks");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["mirror"]);
+    install_hook(&fixture.mirror_dir("a"), "pre-push", &format!(
+        "touch '{}'\nexit 1\n", area.path("hooked").display()
+    ));
+
+    area.stack("a", "code.txt", "v2\n", "second");
+    let lifted = area.lift("a");
+    assert_eq!(lifted["mirror"]["status"], "pushed", "{}", lifted);
+    assert!(!area.path("hooked").exists(), "the pre-push hook ran");
+}
+
+/// A push still rejected on its last attempt is classified once more after the re-fetch: git's
+/// branch, moved by the racer to the export itself, ends the run up to date, not raced.
+///
+/// Revert: report "raced" straight after the last rejection → "raced".
+#[cfg(unix)]
+#[test]
+fn a_race_that_ends_at_the_export_is_up_to_date() {
+    let fixture = Fixture::new("last-race");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    for version in ["v2", "v3", "v4"] {
+        area.stack("a", "code.txt", &format!("{}\n", version), version);
+        area.lift("a");
+    }
+
+    // Export the three new parcels elsewhere, and give git their commits off its branch.
+    let scratch = area.path("scratch.git");
+    git_ok(&area.root, &["init", "-q", "--bare", "scratch.git"]);
+    area.forklift_ok("a", &["config", "mirror.url", scratch.to_str().unwrap()]);
+    area.forklift_ok("a", &["mirror"]);
+    let export = tip(&scratch, "main").unwrap();
+    git_ok(&scratch, &["push", "-q", fixture.git.to_str().unwrap(), "main:refs/held/main"]);
+    area.forklift_ok("a", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
+
+    // Every push is declined while main moves one step closer, reaching the export on the third.
+    install_hook(&fixture.git, "pre-receive", &format!(
+        "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'\n\
+        case $n in 1) t='{export}~2';; 2) t='{export}~1';; *) t='{export}';; esac\n\
+        (unset $(env | sed -n 's/^\\(GIT_[A-Za-z_]*\\)=.*/\\1/p'); \
+        git --git-dir='{git}' update-ref refs/heads/main \"$t\") >> '{log}' 2>&1\nexit 1\n",
+        count = area.path("attempts").display(),
+        export = export,
+        git = fixture.git.display(),
+        log = area.path("hook.log").display(),
+    ));
+
+    let report = area.json("a", &["mirror"]);
+    assert_eq!(std::fs::read_to_string(area.path("attempts")).unwrap().trim(), "3", "{}", report);
+    assert_eq!(outcome(&report, "main")["status"], "up_to_date", "{}", report);
+    assert_eq!(tip(&fixture.git, "main").unwrap(), export);
+}
+
+/// An exported ref whose parcel this warehouse fetches only during the run becomes a boundary
+/// once fetched: a franchise handed another warehouse's mirror repository writes nothing again.
+///
+/// Revert: take the boundaries once, before the fetch → feat's parcel is exported again.
+#[test]
+fn an_exported_parcel_fetched_by_the_run_is_built_on() {
+    let fixture = Fixture::new("promote");
+    let area = &fixture.area;
+
+    fixture.franchise("b");
+    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["palletize", "feat"]);
+    area.stack("a", "feat.txt", "feat\n", "feat only");
+    area.lift("a");
+    area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
+    let report = area.json("a", &["mirror"]);
+    assert_eq!(outcome(&report, "feat")["status"], "pushed", "{}", report);
+
+    copy_dir(&fixture.mirror_dir("a"), &fixture.mirror_dir("b"));
+    area.forklift_ok("b", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
+    area.forklift_ok("b", &["config", "mirror.pallets", "main,feat"]);
+
+    let report = area.json("b", &["mirror"]);
+    assert_eq!(outcome(&report, "feat")["status"], "up_to_date", "{}", report);
+    assert_eq!(outcome(&report, "feat")["exported"], 0, "{}", report);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &to.join(entry.file_name()));
+        } else {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
 }
