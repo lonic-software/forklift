@@ -368,7 +368,7 @@ fn maintenance_auto_enabled() -> Result<bool, String> {
     use crate::util::config_utils;
 
     match config_utils::get_effective_value(config_utils::KEY_MAINTENANCE_AUTO)? {
-        Some((value, _)) => config_utils::parse_maintenance_auto(&value),
+        Some((value, _)) => config_utils::parse_switch(config_utils::KEY_MAINTENANCE_AUTO, &value),
         None => Ok(true),
     }
 }

@@ -24,6 +24,14 @@ pub fn mirror_roots_path() -> PathBuf {
     forklift_root().join(FILE_NAME_MIRROR_ROOTS)
 }
 
+/// The mirror's git repository's folder name, at the shared `.forklift` root beside the record.
+pub const FOLDER_NAME_MIRROR_REPOSITORY: &str = "mirror.git";
+
+/// Where the mirror's git repository lives: a bare repository only Forklift writes.
+pub fn mirror_repository_path() -> PathBuf {
+    forklift_root().join(FOLDER_NAME_MIRROR_REPOSITORY)
+}
+
 /// Read the record: each mirrored pallet's root parcel. No record is an empty one.
 ///
 /// # Returns

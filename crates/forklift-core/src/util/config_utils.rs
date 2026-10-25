@@ -5,6 +5,7 @@ use crate::globals::forklift_root;
 use crate::model::operator::Operator;
 use crate::util::file_utils;
 use crate::util::lock_utils::ConfigFileLock;
+use crate::util::pallet_utils;
 use crate::util::remote_utils;
 
 /// The folder inside the forklift root that holds configuration files. The warehouse-level
@@ -77,18 +78,19 @@ pub const REMOTE_TOR_VALUES: [&str; 3] = ["auto", "on", "off"];
 pub const KEY_REMOTE_TOR_PROXY: &str = "remote.torProxy";
 
 /// Whether background object-store maintenance (auto-compaction) runs after mutating
-/// commands: one of [`MAINTENANCE_AUTO_ON`] or [`MAINTENANCE_AUTO_OFF`]; default is on.
+/// commands: one of [`SWITCH_ON`] or [`SWITCH_OFF`]; default is on.
 pub const KEY_MAINTENANCE_AUTO: &str = "maintenance.auto";
 
-/// The [`KEY_MAINTENANCE_AUTO`] spellings that mean on.
-pub const MAINTENANCE_AUTO_ON: [&str; 4] = ["true", "1", "on", "yes"];
+/// The spellings that mean on, for a key that is a switch ([`KEY_MAINTENANCE_AUTO`],
+/// [`KEY_MIRROR_AUTO`]).
+pub const SWITCH_ON: [&str; 4] = ["true", "1", "on", "yes"];
 
-/// The [`KEY_MAINTENANCE_AUTO`] spellings that mean off.
+/// The spellings that mean off, for a key that is a switch.
 ///
 /// Anything outside the two lists is refused rather than read as one of them. Reading only the
 /// off-list and treating the rest as on made `auto = "flase"` a silent "on" — the opposite of
 /// what was typed, with nothing to say so.
-pub const MAINTENANCE_AUTO_OFF: [&str; 4] = ["false", "0", "off", "no"];
+pub const SWITCH_OFF: [&str; 4] = ["false", "0", "off", "no"];
 
 /// The loose-object count above which background maintenance packs the store (default 6700).
 pub const KEY_MAINTENANCE_LOOSE: &str = "maintenance.loose";
@@ -96,28 +98,69 @@ pub const KEY_MAINTENANCE_LOOSE: &str = "maintenance.loose";
 /// The pack count above which background maintenance consolidates the packs (default 20).
 pub const KEY_MAINTENANCE_PACKS: &str = "maintenance.packs";
 
-/// What a [`KEY_MAINTENANCE_AUTO`] value means — the one reading the file check and the
-/// maintenance decision share, so a value the file admits is never read as something else.
-/// Case- and surrounding-whitespace-insensitive.
+/// The git remote `forklift mirror` pushes the mirrored pallets to (§9.8). Unset, nothing is
+/// mirrored.
+pub const KEY_MIRROR_URL: &str = "mirror.url";
+
+/// The pallets the mirror keeps in step, comma-separated (see [`parse_mirror_pallets`]); every
+/// user pallet on the remote when unset.
+pub const KEY_MIRROR_PALLETS: &str = "mirror.pallets";
+
+/// Whether a lift mirrors the pallet it lifted when [`KEY_MIRROR_URL`] is set: one of
+/// [`SWITCH_ON`] or [`SWITCH_OFF`]; default is on.
+pub const KEY_MIRROR_AUTO: &str = "mirror.auto";
+
+/// What the value of a switch `key` means — the one reading the file check and every consumer
+/// share, so a value the file admits is never read as something else. Case- and
+/// surrounding-whitespace-insensitive.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether background maintenance is on.
-/// * `Err(String)` - If the value is in neither [`MAINTENANCE_AUTO_ON`] nor [`MAINTENANCE_AUTO_OFF`].
-pub fn parse_maintenance_auto(value: &str) -> Result<bool, String> {
+/// * `Ok(bool)`    - Whether the switch is on.
+/// * `Err(String)` - If the value is in neither [`SWITCH_ON`] nor [`SWITCH_OFF`].
+pub fn parse_switch(key: &str, value: &str) -> Result<bool, String> {
     let normalized = value.trim().to_ascii_lowercase();
 
-    if MAINTENANCE_AUTO_ON.contains(&normalized.as_str()) {
+    if SWITCH_ON.contains(&normalized.as_str()) {
         return Ok(true);
     }
-    if MAINTENANCE_AUTO_OFF.contains(&normalized.as_str()) {
+    if SWITCH_OFF.contains(&normalized.as_str()) {
         return Ok(false);
     }
 
     Err(format!(
         "\"{}\" is not a valid value for {}. Use one of: {}.",
-        value, KEY_MAINTENANCE_AUTO,
-        MAINTENANCE_AUTO_ON.iter().chain(MAINTENANCE_AUTO_OFF.iter()).copied().collect::<Vec<_>>().join(", ")
+        value, key,
+        SWITCH_ON.iter().chain(SWITCH_OFF.iter()).copied().collect::<Vec<_>>().join(", ")
     ))
+}
+
+/// What a [`KEY_MIRROR_PALLETS`] value means: the pallet names it lists, comma-separated, each
+/// trimmed. Every item must be a valid pallet name; an empty item (`main,,feat`) is refused, not
+/// skipped.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The pallets, in the order listed, without repeats.
+/// * `Err(String)`     - If an item is empty or not a valid pallet name.
+pub fn parse_mirror_pallets(value: &str) -> Result<Vec<String>, String> {
+    let mut pallets: Vec<String> = Vec::new();
+
+    for item in value.split(',').map(str::trim) {
+        if item.is_empty() {
+            return Err(format!(
+                "\"{}\" is not a valid value for {}: it has an empty pallet name. List pallet names \
+                separated by commas, e.g. \"main,release\".",
+                value, KEY_MIRROR_PALLETS
+            ));
+        }
+        pallet_utils::validate_pallet_name(item)
+            .map_err(|why| format!("\"{}\" is not a valid value for {}: {}", value, KEY_MIRROR_PALLETS, why))?;
+
+        if !pallets.iter().any(|pallet| pallet == item) {
+            pallets.push(item.to_string());
+        }
+    }
+
+    Ok(pallets)
 }
 
 /// What a [`KEY_MAINTENANCE_LOOSE`] or [`KEY_MAINTENANCE_PACKS`] value means: a whole,
@@ -143,10 +186,10 @@ pub fn parse_maintenance_threshold(key: &str, value: &str) -> Result<usize, Stri
 
 /// The configuration keys Forklift understands, in `section.key` form.
 /// Setting a key outside this list is rejected (it would silently do nothing).
-pub const KNOWN_KEYS: [&str; 11] = [
+pub const KNOWN_KEYS: [&str; 14] = [
     KEY_OPERATOR_NAME, KEY_OPERATOR_IDENTIFIER, KEY_OPERATOR_PROFILE, KEY_REMOTE_URL, KEY_REMOTE_TOKEN,
     KEY_REMOTE_ORIGIN, KEY_REMOTE_TOR, KEY_REMOTE_TOR_PROXY, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE,
-    KEY_MAINTENANCE_PACKS,
+    KEY_MAINTENANCE_PACKS, KEY_MIRROR_URL, KEY_MIRROR_PALLETS, KEY_MIRROR_AUTO,
 ];
 
 /// The global-config section that holds the named profiles (`[profile.<name>]`).
@@ -178,6 +221,8 @@ pub struct ConfigFile {
     pub remote: RemoteSection,
     /// `[maintenance]` — background object-store maintenance.
     pub maintenance: MaintenanceSection,
+    /// `[mirror]` — the git mirror.
+    pub mirror: MirrorSection,
     /// `[profile.<name>]` sections, in file order (global configuration only in practice —
     /// nothing writes them to a warehouse file, but parsing them there is not an error).
     pub profiles: Vec<(String, ProfileRecord)>,
@@ -218,6 +263,17 @@ pub struct MaintenanceSection {
     pub loose: Option<String>,
     /// [`KEY_MAINTENANCE_PACKS`].
     pub packs: Option<String>,
+}
+
+/// The `[mirror]` section of a [`ConfigFile`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MirrorSection {
+    /// [`KEY_MIRROR_URL`].
+    pub url: Option<String>,
+    /// [`KEY_MIRROR_PALLETS`].
+    pub pallets: Option<String>,
+    /// [`KEY_MIRROR_AUTO`].
+    pub auto: Option<String>,
 }
 
 /// One `[profile.<name>]` section. Both fields are optional in the same sense as every other
@@ -268,6 +324,9 @@ impl ConfigFile {
             KEY_MAINTENANCE_AUTO    => &self.maintenance.auto,
             KEY_MAINTENANCE_LOOSE   => &self.maintenance.loose,
             KEY_MAINTENANCE_PACKS   => &self.maintenance.packs,
+            KEY_MIRROR_URL          => &self.mirror.url,
+            KEY_MIRROR_PALLETS      => &self.mirror.pallets,
+            KEY_MIRROR_AUTO         => &self.mirror.auto,
             _                       => return None,
         };
 
@@ -302,6 +361,9 @@ impl ConfigFile {
             KEY_MAINTENANCE_AUTO    => &mut self.maintenance.auto,
             KEY_MAINTENANCE_LOOSE   => &mut self.maintenance.loose,
             KEY_MAINTENANCE_PACKS   => &mut self.maintenance.packs,
+            KEY_MIRROR_URL          => &mut self.mirror.url,
+            KEY_MIRROR_PALLETS      => &mut self.mirror.pallets,
+            KEY_MIRROR_AUTO         => &mut self.mirror.auto,
             _ => return Err(format!(
                 "Internal error: \"{}\" is a known configuration key with no field to hold it.",
                 key
@@ -1082,7 +1144,8 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
                 value, KEY_REMOTE_TOR, REMOTE_TOR_VALUES.join(", ")
             ));
         }
-        KEY_MAINTENANCE_AUTO => { parse_maintenance_auto(value)?; }
+        KEY_MAINTENANCE_AUTO | KEY_MIRROR_AUTO => { parse_switch(key, value)?; }
+        KEY_MIRROR_PALLETS => { parse_mirror_pallets(value)?; }
         KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => { parse_maintenance_threshold(key, value)?; }
         _ => {}
     }
@@ -1132,8 +1195,8 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
 /// The spelling of `value` that [`set_value`] actually writes for `key`.
 ///
 /// A constrained key is stored normalized, so what lands on disk is literally one of the
-/// spellings the guide enumerates ([`REMOTE_TOR_VALUES`], [`MAINTENANCE_AUTO_ON`] /
-/// [`MAINTENANCE_AUTO_OFF`]), or a bare number. `forklift config remote.tor
+/// spellings the guide enumerates ([`REMOTE_TOR_VALUES`], [`SWITCH_ON`] /
+/// [`SWITCH_OFF`]), or a bare number. `forklift config remote.tor
 /// "  ON  "` otherwise left `tor = "  ON  "` in the file: admissible, correctly understood, and
 /// not a member of the documented set — a value whose correctness rested on every reader
 /// applying the same normalization forever. Normalizing once, here, means the stored value
@@ -1144,7 +1207,9 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
 fn storable_value(key: &str, value: &str) -> String {
     match key {
         KEY_REMOTE_TOR => remote_utils::normalize_tor_value(value),
-        KEY_MAINTENANCE_AUTO => value.trim().to_ascii_lowercase(),
+        KEY_MAINTENANCE_AUTO | KEY_MIRROR_AUTO => value.trim().to_ascii_lowercase(),
+        KEY_MIRROR_PALLETS => parse_mirror_pallets(value)
+            .map_or_else(|_| value.to_string(), |pallets| pallets.join(",")),
         KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => parse_maintenance_threshold(key, value)
             .map_or_else(|_| value.to_string(), |count| count.to_string()),
         _ => value.to_string(),
@@ -1530,7 +1595,9 @@ mod tests {
             // get different numbers, so a field holding the other key's value cannot pass.
             let value = match key {
                 KEY_REMOTE_TOR => REMOTE_TOR_VALUES[0].to_string(),
-                KEY_MAINTENANCE_AUTO => MAINTENANCE_AUTO_OFF[0].to_string(),
+                KEY_MAINTENANCE_AUTO => SWITCH_OFF[0].to_string(),
+                KEY_MIRROR_AUTO => SWITCH_OFF[1].to_string(),
+                KEY_MIRROR_PALLETS => "main,feat".to_string(),
                 KEY_MAINTENANCE_LOOSE => "6701".to_string(),
                 KEY_MAINTENANCE_PACKS => "21".to_string(),
                 _ => format!("value-of-{}", key),
@@ -1771,6 +1838,26 @@ mod tests {
         }
     }
 
+    /// `mirror.pallets` is read as the trimmed names it lists, stored normalized, and refused at
+    /// both ends when an item is empty or not a pallet name; `mirror.auto` is a switch.
+    #[test]
+    fn mirror_values_are_read_as_written_or_refused() {
+        assert_eq!(parse_mirror_pallets(" main , feat,main"), Ok(vec!["main".to_string(), "feat".to_string()]));
+        assert_eq!(storable_value(KEY_MIRROR_PALLETS, " main , feat,main"), "main,feat");
+
+        for refused in ["main,,feat", "main,", "main,@office", "main,a b"] {
+            assert!(validate_value(KEY_MIRROR_PALLETS, refused).is_err(), "{refused:?} must be refused");
+            assert!(parse(&format!("[mirror]\npallets = \"{}\"\n", refused)).is_err(),
+                    "the file check must refuse {refused:?} too");
+        }
+
+        assert_eq!(parse_switch(KEY_MIRROR_AUTO, " Off "), Ok(false));
+        assert_eq!(
+            validate_value(KEY_MIRROR_AUTO, "flase"),
+            Err("\"flase\" is not a valid value for mirror.auto. Use one of: true, 1, on, yes, false, 0, off, no.".to_string())
+        );
+    }
+
     /// Every `maintenance.*` value the file admits is read as the setting it names, and every
     /// other value is refused by both the file check and the reader — a typo is never read as
     /// the default or as the opposite of what was typed.
@@ -1781,7 +1868,7 @@ mod tests {
             ("false", false), ("0", false), ("off", false), ("no", false), ("\tNo", false),
         ] {
             assert!(validate_value(KEY_MAINTENANCE_AUTO, spelling).is_ok(), "{spelling:?} should be admissible");
-            assert_eq!(parse_maintenance_auto(spelling), Ok(on), "{spelling:?} read as the wrong setting");
+            assert_eq!(parse_switch(KEY_MAINTENANCE_AUTO, spelling), Ok(on), "{spelling:?} read as the wrong setting");
         }
 
         for typo in ["flase", "of", "enabled", "2"] {
@@ -1792,7 +1879,7 @@ mod tests {
                 format!("\"{typo}\" is not a valid value for maintenance.auto. \
                          Use one of: true, 1, on, yes, false, 0, off, no.")
             );
-            assert!(parse_maintenance_auto(typo).is_err(), "the reader must refuse {typo:?} too");
+            assert!(parse_switch(KEY_MAINTENANCE_AUTO, typo).is_err(), "the reader must refuse {typo:?} too");
         }
 
         for key in [KEY_MAINTENANCE_LOOSE, KEY_MAINTENANCE_PACKS] {
@@ -1939,7 +2026,7 @@ mod tests {
     /// The section list an error offers is derived from `KNOWN_KEYS`, not maintained beside it.
     #[test]
     fn known_sections_are_derived_from_the_key_list() {
-        assert_eq!(known_sections(), vec!["operator", "remote", "maintenance", SECTION_PROFILE]);
+        assert_eq!(known_sections(), vec!["operator", "remote", "maintenance", "mirror", SECTION_PROFILE]);
 
         for key in KNOWN_KEYS {
             assert!(is_known_section(key.split_once('.').unwrap().0), "unhandled section in \"{}\"", key);

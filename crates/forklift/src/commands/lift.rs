@@ -9,6 +9,7 @@ use forklift_core::util::{
 };
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower::{self, MetaPalletFailure};
+use crate::commands::mirror::{self, PalletMirror};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -112,6 +113,7 @@ pub async fn handle_command() -> Result<(), String> {
             uploaded_objects: 0,
             uploaded_signatures: 0,
             batch_lane: None,
+            mirror: None,
         };
 
         let lifted = remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await;
@@ -146,6 +148,10 @@ pub async fn handle_command() -> Result<(), String> {
 
             return Err(lower::meta_failure_error(&report.meta_failed));
         }
+
+        // Only a lift that ends in its success result mirrors (§9.8), and its outcome never fails
+        // the lift: a pallet left behind is caught up by the next lift or `forklift mirror`.
+        report.mirror = mirror::after_lift(&client, &pallet, &head).await;
 
         output::emit(&report);
 
@@ -311,6 +317,11 @@ pub(crate) struct LiftReport {
     /// when it did. Absent when it stayed open.
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_lane: Option<BatchLaneClosure>,
+
+    /// What the git mirror did with the lifted pallet (`mirror.url`, `mirror.auto`). Absent when
+    /// no mirror applies to it. A mirror failure is reported here and never fails the lift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror: Option<PalletMirror>,
 }
 
 /// Whether a count is zero (for skipping it in the JSON envelope).
@@ -354,6 +365,10 @@ impl CommandOutput for LiftReport {
         }
 
         output::print_batch_lane(self.batch_lane);
+
+        if let Some(mirror) = &self.mirror {
+            mirror.render_line();
+        }
     }
 }
 

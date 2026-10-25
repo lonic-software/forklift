@@ -550,6 +550,19 @@ pub enum Command {
         root: Option<String>,
     },
 
+    /// Mirror the remote's pallets to a git remote (mirror.url), never by force
+    #[command(
+        long_about = "Keep the git remote at mirror.url in step with the pallets the Forklift \
+                      remote holds (mirror.pallets, or every user pallet). Each pallet's remote head \
+                      is fetched, exported incrementally into .forklift/mirror.git, and pushed to the \
+                      git branch of the same name, never by force: a git branch holding a commit the \
+                      export does not is refused, and left as it is. Only lifted heads are mirrored. \
+                      Tags, the signed office, the @manifest and signatures are not mirrored. With \
+                      mirror.auto on (the default), every lift mirrors the pallet it lifted. \
+                      Requires git on PATH."
+    )]
+    Mirror,
+
     /// Manage the warehouse office: users and signing keys
     #[command(
         visible_alias = "o",
@@ -1714,6 +1727,7 @@ impl Command {
                 | Command::Haul { .. }
                 | Command::Kv { .. }
                 | Command::Manifest { .. }
+                | Command::Mirror
                 | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Palletize { .. }
@@ -1822,6 +1836,7 @@ impl Command {
                 | Command::Haul { .. }
                 | Command::Kv { .. }
                 | Command::Manifest { .. }
+                | Command::Mirror
                 | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Palletize { .. }
