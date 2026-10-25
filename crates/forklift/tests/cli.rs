@@ -5275,6 +5275,56 @@ fn export_git_writes_the_history_into_a_git_repo() {
     assert!(!warehouse.run(&["export-git", out_str]).status.success());
 }
 
+/// Test 1 of the export design: the user's git configuration and environment never reach an
+/// exported object. The same history exports to the same tip under a clean environment and under
+/// one carrying every channel found to move object ids: a global config with a non-UTF-8 commit
+/// encoding, CRLF conversion, an attributes file and a sha256 default (shut out by the empty global
+/// config), GIT_DEFAULT_HASH (by the GIT_* strip and the explicit sha1 init), and a
+/// command-line-style config injection through GIT_CONFIG_COUNT (by the strip). The history holds a
+/// chunked CRLF file and an NFD message, which those channels would rewrite.
+#[test]
+fn export_git_writes_the_same_tip_under_a_hostile_git_environment() {
+    let warehouse = TestWarehouse::new("export-git-hostile-env");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("README.md", "one\r\n");
+    warehouse.write_file("big.txt", &"a line of text\r\n".repeat(600_000));
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "Cafe\u{301}"]));
+
+    let clean_home = warehouse.root.join("clean-home");
+    let hostile_home = warehouse.root.join("hostile-home");
+    std::fs::create_dir_all(&clean_home).unwrap();
+    std::fs::create_dir_all(&hostile_home).unwrap();
+    std::fs::write(hostile_home.join("attributes"), "* text\n").unwrap();
+    std::fs::write(hostile_home.join(".gitconfig"), format!(
+        "[i18n]\n\tcommitEncoding = ISO-8859-1\n[core]\n\tautocrlf = true\n\tattributesFile = {}\n\
+        [init]\n\tdefaultObjectFormat = sha256\n",
+        hostile_home.join("attributes").to_str().unwrap().replace('\\', "/")
+    )).unwrap();
+
+    let export = |name: &str, env: &[(&str, &str)]| -> String {
+        let out = warehouse.root.join(name);
+        assert_success(&warehouse.run_with_env(&["export-git", out.to_str().unwrap()], env));
+        let output = Command::new("git").args(["rev-parse", "main"]).current_dir(&out).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+
+    let clean = clean_home.to_str().unwrap();
+    let hostile = hostile_home.to_str().unwrap();
+    let clean_tip = export("clean", &[("HOME", clean), ("XDG_CONFIG_HOME", clean)]);
+    let hostile_tip = export("hostile", &[
+        ("HOME", hostile), ("XDG_CONFIG_HOME", hostile),
+        ("GIT_DEFAULT_HASH", "sha256"),
+        ("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "i18n.commitEncoding"), ("GIT_CONFIG_VALUE_0", "ISO-8859-1"),
+    ]);
+
+    assert_eq!(clean_tip.len(), 40, "a sha1 repository: {}", clean_tip);
+    assert_eq!(hostile_tip, clean_tip);
+}
+
 /// Tree names holding a newline or tab, or beginning with a quote, export byte for byte. Fed to
 /// `git mktree` newline-delimited, the first two split an entry and the third is C-unquoted into a
 /// different name. Unix only: Windows file names cannot hold these characters.
