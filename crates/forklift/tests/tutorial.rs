@@ -35,15 +35,17 @@ struct Step {
 
 /// Read the page's steps. Every fenced block must be a `console` block fenced with backticks at
 /// the start of the line, and must open with a `$` line; no `$` line may sit outside one, however
-/// it is indented. Otherwise a command the page shows, in a block of another kind or one nested
-/// in a list item, would be skipped without a word.
+/// it is indented, and there may be no indented code block. Otherwise a command the page shows,
+/// in a block of another kind or one nested in a list item, would be skipped without a word.
 fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     let mut steps: Vec<Step> = Vec::new();
     let mut in_block = false;
+    let mut after_blank = true;
 
     for (index, line) in page.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim_start();
+        let follows_blank = std::mem::replace(&mut after_blank, trimmed.is_empty());
 
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             if trimmed.len() != line.len() || trimmed.starts_with("~~~") {
@@ -75,10 +77,19 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
             if trimmed.starts_with("$ ") {
                 return Err(format!("line {}: a command outside a console block", number));
             }
+            if follows_blank && !trimmed.is_empty() && (line.starts_with("    ") || line.starts_with('\t')) {
+                return Err(format!(
+                    "line {}: an indented code block; show commands in a console block, which \
+                    this test runs", number
+                ));
+            }
             continue;
         }
 
         if let Some(command) = line.strip_prefix("$ ") {
+            if command.trim().is_empty() {
+                return Err(format!("line {}: a `$` with no command", number));
+            }
             let opening = steps.last_mut().filter(|step| step.command.is_empty());
             match opening {
                 Some(step) => {
@@ -135,6 +146,8 @@ fn shell_divergence(command: &str) -> Option<String> {
                 '\'' => quote = Quote::Single,
                 '"' => quote = Quote::Double,
                 '>' if previous == ' ' || previous == '>' => redirects += 1,
+                // zsh expands a word starting with `=` to a command's path.
+                '=' if previous == ' ' => return Some("a word starting with an unquoted '='".to_string()),
                 '*' | '?' | '[' | ']' | '~' | '$' | '`' | '\\' | '!' | '&' | '|' | ';' | '<' | '>'
                 | '(' | ')' | '{' | '}' | '#' => return Some(format!("an unquoted {:?}", c)),
                 _ => {}
@@ -148,6 +161,9 @@ fn shell_divergence(command: &str) -> Option<String> {
     }
 
     let words = shlex::split(command)?;
+    if words.is_empty() {
+        return Some("no command".to_string());
+    }
     let redirect = words.len() >= 2 && matches!(words[words.len() - 2].as_str(), ">" | ">>");
     let expected = if !redirect { 0 } else if words[words.len() - 2] == ">>" { 2 } else { 1 };
     if redirects != expected {
@@ -156,6 +172,11 @@ fn shell_divergence(command: &str) -> Option<String> {
 
     if words[0] == "echo" && words.get(1).is_some_and(|word| word.starts_with('-')) {
         return Some("echo with an option, which shells read differently".to_string());
+    }
+
+    // zsh's and dash's echo expand escapes like `\n` even inside single quotes; bash's does not.
+    if words[0] == "echo" && command.contains('\\') {
+        return Some("echo with a backslash, which shells read differently".to_string());
     }
 
     None
@@ -378,6 +399,22 @@ impl Reader {
         }
     }
 
+    /// Each server that has exited or printed on stderr, with what it printed; empty if none has.
+    fn server_trouble(&mut self) -> String {
+        let mut trouble = String::new();
+        for server in &mut self.servers {
+            let exited = server.child.try_wait().unwrap();
+            let stderr = std::fs::read_to_string(&server.stderr).unwrap();
+            if exited.is_some() || !stderr.is_empty() {
+                trouble.push_str(&format!(
+                    "\n\nThe server started at line {} exited ({:?}) or printed on stderr:\n{}",
+                    server.line, exited, stderr
+                ));
+            }
+        }
+        trouble
+    }
+
     /// The page's text for this machine: its server address replaced by the real one.
     fn localize(&self, text: &str) -> String {
         match &self.address {
@@ -416,22 +453,16 @@ fn tutorial_runs_as_written() {
 
         assert!(
             status == Some(0) && output_matches(&expected, &printed),
-            "docs/guide/tutorial.md line {}: `{}` exited {:?} and printed\n{}\n\nThe page shows\n{}",
-            step.line, step.command, status, printed.join("\n"), expected.join("\n")
+            "docs/guide/tutorial.md line {}: `{}` exited {:?} and printed\n{}\n\nThe page shows\n{}{}",
+            step.line, step.command, status, printed.join("\n"), expected.join("\n"),
+            reader.server_trouble()
         );
     }
 
-    // A server's second terminal shows its stderr too, and the page shows none; and a server
-    // that died mid-run would surface only as a confusing failure of a later step.
-    for server in &mut reader.servers {
-        let exited = server.child.try_wait().unwrap();
-        let stderr = std::fs::read_to_string(&server.stderr).unwrap();
-        assert!(
-            exited.is_none() && stderr.is_empty(),
-            "docs/guide/tutorial.md line {}: the server exited ({:?}) or printed on stderr:\n{}",
-            server.line, exited, stderr
-        );
-    }
+    // A server's second terminal shows its stderr too, and the page shows none. A server that
+    // died mid-run is reported with the step that failed because of it.
+    let trouble = reader.server_trouble();
+    assert!(trouble.is_empty(), "docs/guide/tutorial.md:{}", trouble);
 
     drop(reader);
     let _ = std::fs::remove_dir_all(&area);
@@ -487,6 +518,10 @@ fn every_command_on_the_page_is_one_the_test_runs() {
     assert!(refused("1. Prepare:\n   ```console\n   $ forklift prepare\n   ```\n"));
     assert!(refused("~~~console\n$ forklift prepare\n~~~\n"));
     assert!(refused("text\n\n    $ forklift prepare\n"));
+    assert!(refused("text\n\n    forklift prepare\n"));
+    assert!(refused("text\n\n\tforklift prepare\n"));
+    assert!(refused("```console\n$   \n```\n"));
+    assert!(parse_steps("- item\n    continued\n").is_ok());
 
     let steps = parse_steps("text\n```console\n$ a\nout\n$ b\n```\n\n```console\n$ c\n```\n").unwrap();
     let commands: Vec<&str> = steps.iter().map(|step| step.command.as_str()).collect();
@@ -518,4 +553,8 @@ fn only_commands_a_shell_runs_unchanged_are_run() {
     assert!(!runs("echo a > f > g"));
     assert!(!runs("forklift stack \"unclosed"));
     assert!(!runs("forklift stack m # a comment"));
+    assert!(!runs("echo 'a\\nb' > f"));
+    assert!(!runs("forklift config operator.name =ada"));
+    assert!(runs("forklift config remote.url --opt=a=b"));
+    assert!(!runs("  "));
 }
