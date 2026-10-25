@@ -877,8 +877,8 @@ const UPLOAD_WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 /// silence budget, plus, on the presence calls' size-capped answers, a total sized by the cap
 /// ([`RemoteClient::presence_body_budget`]); [`RemoteClient::error_body_budget`] for a refusal's.
 /// So a refusal whose status line arrives just inside the floor still has its body read whole, and
-/// its code survives. A request-spanning deadline cut that body off and turned a typed refusal into an
-/// untyped timeout.
+/// its code survives. A request-spanning deadline cut that body off and turned a typed refusal into
+/// an untyped timeout.
 ///
 /// **A floor, raised by size where the call's own request says it should be.** `missing_objects`
 /// and `upload_targets` wait `max(floor, n * PRESENCE_ALLOWANCE_MS_PER_OP)` for a chunk of `n`
@@ -1443,7 +1443,7 @@ mod clients {
         ///
         /// The silence budget alone leaves a body that keeps trickling unbounded. Both calls'
         /// answers are capped by the request, so each reads its body through
-        /// [`super::RemoteClient::read_json_within`], whose total is sized by that cap.
+        /// [`super::RemoteClient::read_presence_json`], whose total is sized by that cap.
         HeadDeadline {
             head: std::time::Duration,
         },
@@ -3063,23 +3063,24 @@ impl RemoteClient {
         })
     }
 
-    /// [`Self::read_json`] under a total counted from the status line,
-    /// [`Self::presence_body_budget`] for `cap`, for a body whose size the request bounds. The client's silence budget alone
-    /// resets on every byte, so a remote trickling a capped body could hold the call for as long
-    /// as it likes; this is the bound on how long the whole answer may take once its headers are
-    /// in. Derived from `cap` here rather than passed in, so the total cannot drift from the cap.
-    async fn read_json_within<T: serde::de::DeserializeOwned>(&self,
-                                                              response: reqwest::Response,
-                                                              cap: u64,
-                                                              action: &str,
-                                                              posture: Posture,
-                                                              what: &str) -> Result<T, String> {
+    /// [`Self::read_json`] for a presence answer, under a total counted from the status line:
+    /// [`Self::presence_body_budget`] for `cap`, a body whose size the request bounds. The client's
+    /// silence budget alone resets on every byte, so a remote trickling a capped body could hold
+    /// the call for as long as it likes; this is the bound on how long the whole answer may take
+    /// once its headers are in. Derived from `cap` here rather than passed in, so the total cannot
+    /// drift from the cap; a body read at another rate or floor needs its own reader.
+    async fn read_presence_json<T: serde::de::DeserializeOwned>(&self,
+                                                                response: reqwest::Response,
+                                                                cap: u64,
+                                                                action: &str,
+                                                                posture: Posture,
+                                                                what: &str) -> Result<T, String> {
         let budget = self.presence_body_budget(cap);
         tokio::time::timeout(budget, self.read_json(response, cap, action, posture, what)).await
             .unwrap_or_else(|_| Err(Self::body_deadline_message(action, budget)))
     }
 
-    /// The message for a body that [`Self::read_json_within`]'s budget cut off: the headers came,
+    /// The message for a body that [`Self::read_presence_json`]'s budget cut off: the headers came,
     /// the whole answer did not. No "at least": the budget is a total, so the figure is exact.
     fn body_deadline_message(action: &str, budget: std::time::Duration) -> String {
         format!(
@@ -3207,7 +3208,7 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the negotiation").await);
             }
 
-            let body: MissingObjectsResponse = self.read_json_within(
+            let body: MissingObjectsResponse = self.read_presence_json(
                 response, body_utils::per_item_body_cap(batch.len(), MISSING_BODY_BYTES_PER_HASH),
                 "negotiating with the remote", posture, "negotiation response",
             ).await?;
@@ -3866,7 +3867,7 @@ impl RemoteClient {
                 return Err(self.error_of(response, "the upload negotiation").await);
             }
 
-            let body: UploadTargetsResponse = self.read_json_within(
+            let body: UploadTargetsResponse = self.read_presence_json(
                 response, body_utils::per_item_body_cap(batch.len(), UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
                 "negotiating upload targets", posture, "upload-targets response",
             ).await?;
