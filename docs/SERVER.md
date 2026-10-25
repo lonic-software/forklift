@@ -165,7 +165,7 @@ one authenticated via this token file or an `authentication` hook, never to the 
 (`crates/forklift-server/src/server.rs`) runs against a ref-update request, in the order it
 runs:
 
-| # | Check | Function (file:line) | Runs when | What it verifies | What it does *not* cover |
+| # | Check | Function | Runs when | What it verifies | What it does *not* cover |
 |---|-------|----------------------|-----------|-------------------|---------------------------|
 | 1 | Authentication | `check_auth` | every request | resolves the request to a `Principal`: `Operator(id)` (a per-operator token or `authentication` hook), `Static` (the shared `--token`), or `Open` (no auth configured, `--open`) | nothing about what that principal may do |
 | 2 | Admission hook | `check_admission`, called for a ref update from `post_ref_update` | every principal, every ref update, only when `[hooks] admission_url` is configured (below) | a deployer-supplied soft-policy decision (quotas, plan limits, suspensions), given the pallet name — regardless of how the caller authenticated | not an office role/grant check; a no-op when unconfigured |
