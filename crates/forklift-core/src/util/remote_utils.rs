@@ -4243,11 +4243,17 @@ impl RemoteClient {
                 kept = None;
             } else if partial.length == partial.total {
                 return Ok(BundleDownload::Complete { resumed: true });
+            } else if partial.length == 0 {
+                // Nothing kept to resume: the whole bundle comes in one piece, as from scratch.
+                kept = None;
             }
         }
 
         loop {
+            // Never encoded in transit: a decoded body loses the length and range that tie it to
+            // the bytes kept.
             let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::ACCEPT_ENCODING, reqwest::header::HeaderValue::from_static("identity"));
 
             if let Some(partial) = &kept {
                 let header = |value: &str| reqwest::header::HeaderValue::from_str(value)
@@ -11719,6 +11725,7 @@ mod tests {
         assert_eq!(heads.len(), 1);
         assert_eq!(head_value(&heads[0], "range").as_deref(), Some("bytes=21-"));
         assert_eq!(head_value(&heads[0], "if-range").as_deref(), Some(tag));
+        assert_eq!(head_value(&heads[0], "accept-encoding").as_deref(), Some("identity"));
     }
 
     /// A kept download is resumed only by the rest of itself: a `206` that starts elsewhere, names
@@ -11765,9 +11772,10 @@ mod tests {
         assert_eq!(remote.heads().len(), 1);
     }
 
-    /// A download kept whole goes straight to import: nothing is asked of the remote.
+    /// A download kept whole goes straight to import: nothing is asked of the remote. One kept at no
+    /// bytes is asked for whole.
     ///
-    /// Revert: always request → the remote sees one → red.
+    /// Reverts: always request → the remote sees one → red; resume from byte 0 → a `Range` → red.
     #[test]
     fn a_complete_kept_download_needs_no_request() {
         let scratch = Scratch::new("bundle-complete");
@@ -11787,6 +11795,14 @@ mod tests {
         assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: false }));
         assert_eq!(checkpoints.first(), Some(&None));
         assert_eq!(head_value(&remote.heads()[0], "range"), None);
+
+        // Nothing kept yet is no resume: the bundle is asked for whole, and comes in one piece.
+        std::fs::write(&path, b"").unwrap();
+        let remote = ScriptedBundleRemote::start(vec![whole_bundle_answer(Some("\"v1\""), BUNDLE_BODY, 40)]);
+        let (outcome, _) = download_with(&remote, &path, Some(&kept_bundle("\"v1\"", 0)), 8);
+        assert_eq!(outcome, Ok(BundleDownload::Complete { resumed: false }));
+        assert_eq!(head_value(&remote.heads()[0], "range"), None);
+        assert_eq!(std::fs::read(&path).unwrap(), BUNDLE_BODY);
     }
 
     /// Without a resumable tag and a declared length nothing is kept: a cut-off download leaves no

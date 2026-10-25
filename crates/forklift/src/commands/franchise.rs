@@ -316,9 +316,10 @@ impl FranchiseAttempt {
 /// what the import stored, or `None` when the remote has no bundle this build can use. The
 /// download is recorded as it is synced, so a failure leaves the next attempt only the rest to
 /// ask for. A downloaded file that fails import is never kept to be imported again: a kept one
-/// whose header or digest fails was not all served under one tag (or a crash damaged it), so it
-/// is downloaded once more in full; any other is discarded, and a bundle in a version this build
-/// does not read is skipped, while any other failure fails the attempt.
+/// whose header or digest fails (also a header in a version this build does not read) was not all
+/// served under one tag, or a crash damaged it, so it is downloaded once more in full. A bundle
+/// downloaded in one piece in a version this build does not read is skipped; any other failure
+/// discards the download and fails the attempt.
 async fn fetch_and_import_bundle(attempt: &mut FranchiseAttempt,
                                  client: &RemoteClient) -> Result<Option<bundle_utils::ImportStats>, String> {
     let download = bundle_utils::get_bundle_download_path();
@@ -347,9 +348,11 @@ async fn fetch_and_import_bundle(attempt: &mut FranchiseAttempt,
 
         let error = match bundle_utils::import_bundle(&download) {
             Ok(imported) => {
+                // Published before it is recorded: a crash in between keeps the stored objects and
+                // costs only the download, never the warehouse's own latest bundle.
+                bundle_utils::publish_bundle_download()?;
                 attempt.record.bundle = BundleState::Imported;
                 franchise_utils::write(&attempt.forklift, &attempt.record)?;
-                bundle_utils::publish_bundle_download()?;
 
                 return Ok(Some(imported));
             }
