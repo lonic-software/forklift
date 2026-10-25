@@ -1023,6 +1023,17 @@ pub struct TrustInstall<'a> {
     pub pallets: PalletsPrecondition,
 }
 
+/// What a successful [`install_trust`] did: a caller announcing a trust change tells its own write
+/// from one that was already in place, which another bay or request made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustInstalled {
+    /// This call wrote the anchor (and moved the office, if the install named one).
+    Written,
+
+    /// The anchor and the office already carried the install; nothing was written.
+    AlreadyInPlace,
+}
+
 /// Install a trust anchor and move the office to the head it governs, in one hold of the ref
 /// lock: the only way an anchor is written. The one-way door: an anchor is replaced only by a
 /// re-genesis whose chain of custody matches (`replaces`), never removed.
@@ -1036,15 +1047,17 @@ pub struct TrustInstall<'a> {
 /// inside the hold), and anything else fails naming both.
 ///
 /// An install whose anchor and office are both already in place succeeds without writing: another
-/// bay installed the same trust (accepted the same re-genesis) first.
+/// bay or request installed the same trust (accepted the same re-genesis) first.
 ///
 /// # Returns
-/// * `Ok(())`              - The anchor and the office both carry the install.
+/// * `Ok(Written)`         - This call wrote the install; the anchor and the office both carry it.
+/// * `Ok(AlreadyInPlace)`  - The anchor and the office already carried the install; nothing was
+///                           written and no precondition was checked.
 /// * `Err(RefUpdateError)` - `OfficeMoved`, `AnchorMoved` or `PalletsMoved` if what the caller read
 ///                           moved (nothing was written); `Failed` if the chain of custody does
 ///                           not match or a write failed (the warehouse is as before, unless the
 ///                           message says otherwise).
-pub fn install_trust(install: &TrustInstall) -> Result<(), RefUpdateError> {
+pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdateError> {
     if let Some(replaced) = install.replaces {
         let replaced = std::str::from_utf8(replaced)
             .map_err(|e| format!("The trust file is not valid UTF-8: {}", e))
@@ -1072,7 +1085,7 @@ pub fn install_trust(install: &TrustInstall) -> Result<(), RefUpdateError> {
 
     if read_trust_anchor_bytes()?.as_deref() == Some(bytes.as_slice())
         && pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.as_deref() == office_target {
-        return Ok(());
+        return Ok(TrustInstalled::AlreadyInPlace);
     }
 
     pallet_utils::check_preconditions(&lock, &RefPreconditions {
@@ -1085,7 +1098,7 @@ pub fn install_trust(install: &TrustInstall) -> Result<(), RefUpdateError> {
     })?;
 
     let error = match write_trust_install(&lock, install, &bytes) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(TrustInstalled::Written),
         Err(error) => error,
     };
 

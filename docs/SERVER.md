@@ -91,11 +91,14 @@ objects were deleted between its requests is refused at the ref update (`422`) a
 retried; nothing is ever left pointing at a deleted object. The auto-rebuild lift count
 (`rebuild_after_lifts`) starts again from zero when a warehouse is let go.
 
-A warehouse's storage can also be written by a local bay or process, which the server's own
-serialization of requests does not hold out. So a ref update's verification is checked again,
-under the warehouse's ref lock, just before the write. If the pallet, the office head or the
-trust anchor that verification judged it against moved meanwhile, the update is refused with
-`409` and writes nothing; a client lowers, or re-reads, and retries. `PUT /v1/trust` is
+The server does not queue requests against each other: a ref update's verification, however
+long, runs beside every other request to the warehouse. A warehouse's storage can also be written
+by a local bay or process. So what a ref update's verification judged it against is checked
+again, under the warehouse's ref lock, just before the write. If the pallet moved meanwhile, the
+update is refused with `409` and writes nothing; a client lowers and retries. If the office head
+or the trust anchor moved, the server decides the update again against what stands now, up to
+three times in all, and only then refuses it with `409`; a grant revoked meanwhile is refused
+with `403`, as a later request would be. `PUT /v1/trust` is
 checked the same way: the anchor and the office it governs are installed under one hold of the
 ref lock, and only while the office head is still the one the request was judged against and
 every pallet head here is one the anchor's boundary holds. Otherwise it is refused with `409`
@@ -316,10 +319,11 @@ Request timeouts, connection limits and rate limiting also belong to the proxy l
 (nginx/caddy/haproxy do this better than any embedded knob). `max_body_mb` is the one
 limit the server enforces itself, because it gates disk-fill abuse behind verification.
 
-**The single-writer rule:** exactly one serving process per warehouse root. The ref CAS
-mutex is in-process — do not point two processes (or two machines over NFS) at the same
-root. Horizontal scale-out is what the AWS head's DynamoDB conditional writes are for
-(DESIGN.html §4.6).
+**The single-writer rule:** exactly one serving process per warehouse root; a second server
+on the same root is refused at startup, since the serve lock it needs is held. Do not point two
+machines at the same root over NFS either: the ref lock that orders every ref write is a file
+lock, which network filesystems do not reliably honour across machines. Horizontal scale-out is
+what the AWS head's DynamoDB conditional writes are for (DESIGN.html §4.6).
 
 ## systemd
 

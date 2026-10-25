@@ -1,10 +1,10 @@
 //! The HTTP surface of the server head: one handler per protocol endpoint.
 //!
 //! Every handler does its filesystem work inside `spawn_blocking` (the storage code is
-//! synchronous by design) under the resolved warehouse's storage-root scope, and the
-//! mutations with ordering requirements — the ref-update CAS and the one-way door of
-//! trust establishment — are serialized by a per-warehouse mutex, so they can never
-//! interleave between two lifts.
+//! synchronous by design) under the resolved warehouse's storage-root scope. Nothing here
+//! serializes requests: the mutations with ordering requirements — a ref update and the one-way
+//! door of trust establishment — each commit through core's compare-and-set, which checks under
+//! the warehouse's ref lock that what the decision read still stands, and refuses otherwise.
 //!
 //! Two serving modes share every handler: `--root` serves a single warehouse at
 //! `/v1/…`, `--warehouses` serves each subdirectory of a base folder at
@@ -45,13 +45,9 @@ use forklift_core::util::{
 };
 use subtle::ConstantTimeEq;
 
-/// One served warehouse: its storage root and its write mutex.
+/// One served warehouse: its storage root, its bundle-rebuild state and the locks it is served
+/// under.
 struct WarehouseHandle {
-    /// Serializes warehouse mutations with ordering requirements: the CAS
-    /// read-check-write of a ref update and the one-way door of trust establishment
-    /// must never interleave.
-    writes: Mutex<()>,
-
     /// The warehouse root; every blocking storage closure enters it as a storage-root
     /// scope (the process never changes its working directory, which is what lets one
     /// process serve several roots).
@@ -83,7 +79,6 @@ impl WarehouseHandle {
     /// served warehouse is built with [`WarehouseHandle::serving`].
     fn new(root: PathBuf) -> WarehouseHandle {
         WarehouseHandle {
-            writes: Mutex::new(()),
             root,
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
@@ -313,7 +308,8 @@ struct AppState {
     rebuild_after_lifts: Option<u32>,
 
     /// The live handles of the warehouses served (multi mode). Exactly one handle may ever exist
-    /// per warehouse id — a second handle would mean a second write mutex.
+    /// per warehouse id — a second handle would need a second serve lock, which the first refuses,
+    /// and would keep bundle-rebuild state of its own.
     warehouses: Mutex<WarehouseRegistry>,
 
     /// The configured hooks (`docs/format/HOOK_PROTOCOL.md`) — the typed seam a
@@ -1080,6 +1076,36 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
     }
 }
 
+/// The `409` for a trust anchor that would replace a different one without being its re-genesis.
+fn trust_one_way_door() -> HandlerError {
+    (StatusCode::CONFLICT, "This warehouse already has a different trust anchor; trust is a one-way \
+        door and cannot be replaced.".to_string())
+}
+
+/// Whether `PUT /v1/trust` wrote `requested`, from what its install returned. An install found
+/// already in place, or refused because the office or the anchor moved while the anchor on disk is
+/// now the requested one, was an identical request's (or a bay's) doing: `Ok(false)`, the `200`
+/// with no event a request arriving after it gets. One refused while the anchor on disk is now one
+/// `requested` is no re-genesis of gets the answer such a later request gets, the one-way door.
+/// Any other refusal is the request's own answer, as is a refusal whose anchor cannot be read back.
+fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpdateError>,
+                         requested: &TrustAnchorDto) -> Result<bool, HandlerError> {
+    match installed {
+        Ok(office_utils::TrustInstalled::Written) => Ok(true),
+        Ok(office_utils::TrustInstalled::AlreadyInPlace) => Ok(false),
+        Err(error @ (RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved)) => {
+            match office_utils::read_trust_anchor().map(|held| held.as_ref().map(TrustAnchorDto::from)) {
+                Ok(Some(held)) if held == *requested => Ok(false),
+                Ok(Some(held)) if requested.prior_genesis.as_deref() != Some(held.genesis.as_str()) => {
+                    Err(trust_one_way_door())
+                }
+                _ => Err(trust_install_refusal(error)),
+            }
+        }
+        Err(error) => Err(trust_install_refusal(error)),
+    }
+}
+
 /// Map an internal storage error to a 500.
 fn internal(message: String) -> HandlerError {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -1393,8 +1419,8 @@ fn emit_event(state: &Arc<AppState>, event: HookEvent) {
 
 /// Test-only seam (FORK-95 falsifier): a rendezvous, not a fixed sleep like
 /// `remote_utils::test_retrieval_delay` — what a test needs to pin here is not a
-/// duration but an ordering (is the write lock already held at this instant, or not
-/// yet?), and a duration long enough to be safe against scheduling jitter would also
+/// duration but an ordering (a revocation landing after the authorization answer is
+/// fixed and before the write), and a duration long enough to be safe against scheduling jitter would also
 /// be long enough to slow every other test that happens to call `office_user_of`
 /// while it runs. Keyed by identifier, not a bare on/off flag: several other tests in
 /// this file exercise `office_user_of` concurrently (different threads, same
@@ -1430,37 +1456,56 @@ fn office_lookup_test_checkpoint(identifier: &str) {
 #[cfg(not(test))]
 fn office_lookup_test_checkpoint(_identifier: &str) {}
 
-/// The key [`REF_WRITE_TEST_SEAM`] arms `PUT /v1/trust` under: no pallet name holds a `/`.
+/// The key [`REF_WRITE_TEST_SEAMS`] arms `PUT /v1/trust` under: no pallet name holds a `/`.
 const TRUST_WRITE_SEAM: &str = "/v1/trust";
 
+/// How many times a ref update decides at most: a further attempt runs only when the write found
+/// that the office or the trust anchor its decision consumed moved meanwhile.
+const REF_UPDATE_ATTEMPTS: u32 = 3;
+
+/// The armed write seams: by the warehouse's forklift root and the name each is armed for, the
+/// closure every checkpoint for that pair runs.
 #[cfg(test)]
-type RefWriteSeam = Option<(String, Box<dyn FnOnce() + Send>)>;
+type RefWriteSeams = BTreeMap<(PathBuf, String), Box<dyn FnMut() + Send>>;
 
 /// Test seam: a ref update for the armed pallet name (or `PUT /v1/trust`, armed as
-/// [`TRUST_WRITE_SEAM`]) runs the armed closure after its decision and before its write, so a test
-/// can move what the decision read in exactly that window. Keyed and a `Mutex` for the same
-/// reasons as [`OFFICE_LOOKUP_TEST_SEAM`].
+/// [`TRUST_WRITE_SEAM`]) in the armed warehouse runs the armed closure after each decision and
+/// before its write, so a test can move what the decision read in exactly that window, on every
+/// attempt. The closure is taken out of the slot and run with the slot unlocked, then put back, so
+/// a closure that parks never blocks another request's checkpoint (which finds the slot empty and
+/// runs nothing). Keyed and a `Mutex` for the same reasons as [`OFFICE_LOOKUP_TEST_SEAM`]; keyed by
+/// warehouse too, so tests arming the same name in their own warehouses never meet.
 #[cfg(test)]
-static REF_WRITE_TEST_SEAM: Mutex<RefWriteSeam> = Mutex::new(None);
+static REF_WRITE_TEST_SEAMS: Mutex<RefWriteSeams> = Mutex::new(BTreeMap::new());
 
 #[cfg(test)]
 fn ref_write_test_checkpoint(name: &str) {
-    let armed = {
-        let mut slot = REF_WRITE_TEST_SEAM.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (forklift_core::globals::forklift_root(), name.to_string());
+    let armed = REF_WRITE_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
 
-        match slot.as_ref() {
-            Some((armed_for, _)) if armed_for == name => slot.take(),
-            _ => None,
-        }
-    };
-
-    if let Some((_, run)) = armed {
+    if let Some(mut run) = armed {
         run();
+
+        REF_WRITE_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(run);
     }
 }
 
 #[cfg(not(test))]
 fn ref_write_test_checkpoint(_name: &str) {}
+
+/// Test counter: the decisions each ref update made, by warehouse forklift root and pallet name.
+#[cfg(test)]
+static REF_UPDATE_ATTEMPTS_TEST_COUNT: Mutex<BTreeMap<(PathBuf, String), u32>> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn ref_update_attempt_test_count(name: &str) {
+    let key = (forklift_core::globals::forklift_root(), name.to_string());
+
+    *REF_UPDATE_ATTEMPTS_TEST_COUNT.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(0) += 1;
+}
+
+#[cfg(not(test))]
+fn ref_update_attempt_test_count(_name: &str) {}
 
 /// Derive the office state from a head **already read once by the caller** — the two
 /// arms C9 requires, in one place so neither can be reinstated independently. `Some`
@@ -1470,8 +1515,7 @@ fn ref_write_test_checkpoint(_name: &str) {}
 ///
 /// Derived at each use rather than eagerly: on a ref update by a non-operator principal
 /// to a user pallet nothing consumes it, and the read costs one object per enrolled user
-/// and per key — paid inside the write lock, where it lengthens the section every other
-/// push serializes behind.
+/// and per key, on every attempt the update decides.
 fn office_state_at(office_head: &Option<String>) -> Result<office_utils::OfficeState, HandlerError> {
     match office_head {
         Some(head) => office_utils::read_office_state_of(head).map_err(internal),
@@ -1854,7 +1898,7 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
         Ok(creation) => {
             // Serve it the way every request does: the registry's handle when this warehouse is
             // already served (a re-PUT stays an idempotent 200), else a locked one built under
-            // the registry mutex, so exactly one handle (one write mutex) ever exists per
+            // the registry mutex, so exactly one handle ever exists per
             // warehouse. Never `serving` directly: the serve lock refuses even its own holder.
             let served = resolve_warehouse(&state, &params);
 
@@ -2360,12 +2404,10 @@ async fn put_trust(State(state): State<Arc<AppState>>,
 
     let warehouse_id = params.get("warehouse").cloned();
 
+    // Trust establishment is a one-way door, held by the install's preconditions rather than by
+    // ordering requests: two first contacts can both read "no anchor" below, and the second to
+    // install finds the anchor no longer absent and is refused (or finds its own anchor in place).
     let result = blocking(Arc::clone(&warehouse), move || {
-        // Trust establishment is a one-way door: without the write lock, two first
-        // contacts could both read "no anchor" and race their differing geneses.
-        let _guard = warehouse.writes.lock()
-            .map_err(|_| internal("The write lock is poisoned.".to_string()))?;
-
         match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
             Some((existing, existing_bytes)) => {
                 if TrustAnchorDto::from(&existing) == anchor {
@@ -2378,11 +2420,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 let is_regenesis = anchor.prior_genesis.as_deref() == Some(existing.genesis.as_str());
 
                 if !is_regenesis {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "This warehouse already has a different trust anchor; trust is \
-                        a one-way door and cannot be replaced.".to_string()
-                    ));
+                    return Err(trust_one_way_door());
                 }
 
                 if !matches!(principal, Principal::Static | Principal::Open) {
@@ -2408,20 +2446,13 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     )));
                 }
 
-                tracing::warn!(
-                    old_genesis = existing.genesis,
-                    new_genesis = anchor.genesis,
-                    adopts = anchor.adopts.as_deref().unwrap_or(""),
-                    "TRUST RESET: the trust anchor was replaced by a re-genesis"
-                );
-
                 ref_write_test_checkpoint(TRUST_WRITE_SEAM);
 
                 // The anchor and the office head the tests above read are the install's
                 // preconditions, and the boundary it records holds every pallet head: a bay of
                 // this warehouse moving either meanwhile refuses the install rather than planting
                 // an anchor over history it never adopted.
-                office_utils::install_trust(&office_utils::TrustInstall {
+                let installed = office_utils::install_trust(&office_utils::TrustInstall {
                     anchor: &anchor.to_anchor(),
                     replaces: Some(&existing_bytes),
                     office: office_head.as_deref(),
@@ -2430,8 +2461,18 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::AllButOffice,
                     },
-                })
-                .map_err(trust_install_refusal)?;
+                });
+
+                if !trust_install_outcome(installed, &anchor)? {
+                    return Ok(None);
+                }
+
+                tracing::warn!(
+                    old_genesis = existing.genesis,
+                    new_genesis = anchor.genesis,
+                    adopts = anchor.adopts.as_deref().unwrap_or(""),
+                    "TRUST RESET: the trust anchor was replaced by a re-genesis"
+                );
 
                 let mut event = HookEvent::new(EVENT_TRUST_RESET);
                 event.detail = Some(anchor.genesis.clone());
@@ -2464,7 +2505,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
 
                 ref_write_test_checkpoint(TRUST_WRITE_SEAM);
 
-                office_utils::install_trust(&office_utils::TrustInstall {
+                let installed = office_utils::install_trust(&office_utils::TrustInstall {
                     anchor: &anchor.to_anchor(),
                     replaces: None,
                     office: None,
@@ -2473,8 +2514,11 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::UserPallets,
                     },
-                })
-                .map_err(trust_install_refusal)?;
+                });
+
+                if !trust_install_outcome(installed, &anchor)? {
+                    return Ok(None);
+                }
 
                 let mut event = HookEvent::new(EVENT_TRUST_ESTABLISHED);
                 event.detail = Some(anchor.genesis.clone());
@@ -2529,8 +2573,6 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         _ => None,
     };
 
-    let handle = Arc::clone(&warehouse);
-
     let result = blocking(Arc::clone(&warehouse), move || {
         // Parse the qualified reference: a meta pallet arrives as `@office`. The server
         // routes by *namespace*, never by a hard-coded name (DESIGN.html §3.3).
@@ -2547,220 +2589,238 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 
         let pallet_rules = if is_meta { meta_tree::meta_rules(&bare) } else { None };
 
-        // The CAS read-check-write is one critical section against other requests. The trust
-        // anchor and office state are read here too, once, so transport authorization below and
-        // the audit that follows consume exactly the same values. This lock holds out only other
-        // requests, not a local bay of the warehouse: the final write conditions on the anchor's
-        // bytes and the office head being the ones read here, so a bay moving either meanwhile
-        // refuses the write rather than committing what a stale audit settled.
-        let _guard = handle.writes.lock()
-            .map_err(|_| internal("The write lock is poisoned.".to_string()))?;
+        // The closure check's proof, kept from the first attempt for the ones after it.
+        let mut verified_closure: Option<pallet_utils::VerifiedClosure> = None;
+        let mut attempt = 0;
 
-        let (anchor, anchor_bytes) = match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
-            Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
-            None => (None, None),
-        };
+        loop {
+            attempt += 1;
 
-        // The office head, read once, is an `Option`: `Some` derives the state
-        // through the hash-taking accessor (content-addressed reads only, no second
-        // head lookup); `None` is the ordinary bootstrap window — trust established
-        // but the office not yet lifted — not an error.
-        let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(internal)?;
-        let office_head_read = office_head.clone();
+            ref_update_attempt_test_count(&name);
 
-        // Transport authorization: may this principal move this ref? The role and
-        // the pallet grants come from the office — signed, tracked metadata — read
-        // against the anchor and office state the audit below consumes, not a second,
-        // independent read of them. Decided before the CAS and object-presence checks
-        // below, as it always was: an unauthorized request is refused on authorization
-        // and never leaks whether some other precondition also happened to fail.
-        if let Principal::Operator(identifier) = &principal {
-            let office_state = office_state_at(&office_head)?;
-            if let Some(user) = office_user_of(identifier, &anchor, &office_state)? {
-                let allowed = if is_meta {
-                    // Anyone but a reader may transport a meta pallet's history. Content
-                    // authorization below differs by meta pallet, not a uniform "signer's
-                    // role" check: @office's parcels are checked, per parcel, against the
-                    // signer's role (`verify_office_chain`); a meta pallet's against
-                    // its own rules (`verify_meta_content`), which for @tags include an
-                    // admin rule. No meta pallet gets a pallet grant check.
-                    user.role != office_utils::Role::Reader
-                } else {
-                    user.may_write_pallet(&bare)
-                };
+            // The trust anchor and office state are read once per attempt, so transport
+            // authorization below and the audit that follows consume exactly the same values.
+            // Nothing holds another request or a local bay of the warehouse out meanwhile: the final
+            // write conditions on the anchor's bytes and the office head being the ones read here,
+            // so a writer moving either refuses the write rather than committing what a stale audit
+            // settled, and the update then decides again from fresh reads.
+            let (anchor, anchor_bytes) = match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
+                Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
+                None => (None, None),
+            };
 
-                if !allowed {
+            // The office head, read once, is an `Option`: `Some` derives the state
+            // through the hash-taking accessor (content-addressed reads only, no second
+            // head lookup); `None` is the ordinary bootstrap window — trust established
+            // but the office not yet lifted — not an error.
+            let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(internal)?;
+            let office_head_read = office_head.clone();
+
+            // Transport authorization: may this principal move this ref? The role and
+            // the pallet grants come from the office — signed, tracked metadata — read
+            // against the anchor and office state the audit below consumes, not a second,
+            // independent read of them. Decided before the CAS and object-presence checks
+            // below, as it always was: an unauthorized request is refused on authorization
+            // and never leaks whether some other precondition also happened to fail.
+            if let Principal::Operator(identifier) = &principal {
+                let office_state = office_state_at(&office_head)?;
+                if let Some(user) = office_user_of(identifier, &anchor, &office_state)? {
+                    let allowed = if is_meta {
+                        // Anyone but a reader may transport a meta pallet's history. Content
+                        // authorization below differs by meta pallet, not a uniform "signer's
+                        // role" check: @office's parcels are checked, per parcel, against the
+                        // signer's role (`verify_office_chain`); a meta pallet's against
+                        // its own rules (`verify_meta_content`), which for @tags include an
+                        // admin rule. No meta pallet gets a pallet grant check.
+                        user.role != office_utils::Role::Reader
+                    } else {
+                        user.may_write_pallet(&bare)
+                    };
+
+                    if !allowed {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            format!(
+                                "\"{}\" ({}) may not move pallet \"{}\".",
+                                identifier, user.role.as_str(), name
+                            )
+                        ));
+                    }
+                }
+            }
+
+            // An early refusal, before the audit below spends anything on a request that cannot
+            // land. It is not the guard: the write at the end is the compare-and-set.
+            let current = pallet_utils::get_pallet_head_in(namespace, &bare).map_err(internal)?;
+
+            if current != request.old_head {
+                return Err(pallet_moved(current.as_deref(), request.old_head.as_deref()));
+            }
+
+            // The head is stored as given; a spelling the ref reader refuses is the request's fault,
+            // and on a case-insensitive filesystem the presence check below would not catch it.
+            if !forklift_core::util::object_utils::is_object_hash(&request.new_head) {
+                return Err(unprocessable(
+                    "The new head is not an object hash (64 lowercase hex characters).".to_string()
+                ));
+            }
+
+            if !file_utils::does_object_exist(&request.new_head).map_err(internal)? {
+                return Err(unprocessable(format!(
+                    "The new head {} has not been uploaded.",
+                    request.new_head
+                )));
+            }
+
+            // A ref must never point at missing history. The write below takes this verification
+            // rather than walking the history a second time, and a further attempt reuses it: it
+            // covers the request's two heads, whose content no other writer can change.
+            let verified = match verified_closure.take() {
+                Some(verified) => verified,
+                None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
+                    .map_err(unprocessable)?,
+            };
+
+            if let Some(old_head) = &request.old_head {
+                // The one sanctioned non-fast-forward: the office lift right after a
+                // re-genesis, where the (already replaced) anchor adopts exactly the head
+                // being moved away from — the old chain is pinned, not dropped.
+                let adopted_reset = is_office
+                    && anchor.as_ref().and_then(|anchor| anchor.adopts.as_deref()) == Some(old_head.as_str());
+
+                if !adopted_reset && !merge_utils::is_ancestor(old_head, &request.new_head).map_err(internal)? {
                     return Err((
-                        StatusCode::FORBIDDEN,
-                        format!(
-                            "\"{}\" ({}) may not move pallet \"{}\".",
-                            identifier, user.role.as_str(), name
-                        )
+                        StatusCode::CONFLICT,
+                        "The update is not a fast-forward; the protocol has no force \
+                        push. Lower, consolidate, and lift the merge.".to_string()
                     ));
                 }
             }
-        }
 
-        // An early refusal, before the audit below spends anything on a request that cannot
-        // land. It is not the guard: the write at the end is the compare-and-set.
-        let current = pallet_utils::get_pallet_head_in(namespace, &bare).map_err(internal)?;
+            // The events of this update (delivered after the commit): the ref move, plus
+            // any revocations an office update carries — the old office state must be
+            // read *before* the head moves.
+            let mut events: Vec<HookEvent> = Vec::new();
 
-        if current != request.old_head {
-            return Err(pallet_moved(current.as_deref(), request.old_head.as_deref()));
-        }
+            let mut ref_event = HookEvent::new(EVENT_PALLET_UPDATED);
+            ref_event.warehouse = warehouse_id.clone();
+            ref_event.operator = acting_operator.clone();
+            ref_event.pallet = Some(name.clone());
+            ref_event.old_head = request.old_head.clone();
+            ref_event.new_head = Some(request.new_head.clone());
+            events.push(ref_event);
 
-        // The head is stored as given; a spelling the ref reader refuses is the request's fault,
-        // and on a case-insensitive filesystem the presence check below would not catch it.
-        if !forklift_core::util::object_utils::is_object_hash(&request.new_head) {
-            return Err(unprocessable(
-                "The new head is not an object hash (64 lowercase hex characters).".to_string()
-            ));
-        }
+            if is_office {
+                // The office chain carries the keys; it must verify against the anchor.
+                let anchor = anchor.ok_or(unprocessable(
+                    "Establish the trust anchor (PUT /v1/trust) before lifting the office.".to_string()
+                ))?;
 
-        if !file_utils::does_object_exist(&request.new_head).map_err(internal)? {
-            return Err(unprocessable(format!(
-                "The new head {} has not been uploaded.",
-                request.new_head
-            )));
-        }
+                // Authentic is not authorized: the walk also holds every office parcel within
+                // its *signer's* privileges (admins change anything; everyone else only their
+                // own keys). That is a content invariant, so it holds no matter which token
+                // transported the chain. Its refusal is a 403 when the lift brought the overstep,
+                // and a 422 when the office already held it.
+                let new_office_state = audit_utils::verify_office_chain_memoized(&anchor, &request.new_head)
+                    .map_err(|error| office_lift_refusal(error, office_head.as_deref()))?;
 
-        // A ref must never point at missing history. The write below takes this verification
-        // rather than walking the history a second time.
-        let verified = audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
-            .map_err(unprocessable)?;
+                // Newly revoked keys (active before, revoked after) become events. The
+                // pre-lift roster is the office state already read above: on this branch
+                // the office pallet *is* the target pallet, so its pre-lift head is
+                // exactly the request's old head, which the pallet-head check above
+                // already pinned this update to.
+                let old_office_state = office_state_at(&office_head)?;
 
-        if let Some(old_head) = &request.old_head {
-            // The one sanctioned non-fast-forward: the office lift right after a
-            // re-genesis, where the (already replaced) anchor adopts exactly the head
-            // being moved away from — the old chain is pinned, not dropped.
-            let adopted_reset = is_office
-                && anchor.as_ref().and_then(|anchor| anchor.adopts.as_deref()) == Some(old_head.as_str());
+                for key in &new_office_state.keys {
+                    let was_active = old_office_state.find_key(&key.key_id)
+                        .map(|old| old.is_active())
+                        .unwrap_or(true);
 
-            if !adopted_reset && !merge_utils::is_ancestor(old_head, &request.new_head).map_err(internal)? {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "The update is not a fast-forward; the protocol has no force \
-                    push. Lower, consolidate, and lift the merge.".to_string()
-                ));
-            }
-        }
-
-        // The events of this update (delivered after the commit): the ref move, plus
-        // any revocations an office update carries — the old office state must be
-        // read *before* the head moves.
-        let mut events: Vec<HookEvent> = Vec::new();
-
-        let mut ref_event = HookEvent::new(EVENT_PALLET_UPDATED);
-        ref_event.warehouse = warehouse_id.clone();
-        ref_event.operator = acting_operator.clone();
-        ref_event.pallet = Some(name.clone());
-        ref_event.old_head = request.old_head.clone();
-        ref_event.new_head = Some(request.new_head.clone());
-        events.push(ref_event);
-
-        if is_office {
-            // The office chain carries the keys; it must verify against the anchor.
-            let anchor = anchor.ok_or(unprocessable(
-                "Establish the trust anchor (PUT /v1/trust) before lifting the office.".to_string()
-            ))?;
-
-            // Authentic is not authorized: the walk also holds every office parcel within
-            // its *signer's* privileges (admins change anything; everyone else only their
-            // own keys). That is a content invariant, so it holds no matter which token
-            // transported the chain. Its refusal is a 403 when the lift brought the overstep,
-            // and a 422 when the office already held it.
-            let new_office_state = audit_utils::verify_office_chain_memoized(&anchor, &request.new_head)
-                .map_err(|error| office_lift_refusal(error, office_head.as_deref()))?;
-
-            // Newly revoked keys (active before, revoked after) become events. The
-            // pre-lift roster is the office state already read above: on this branch
-            // the office pallet *is* the target pallet, so its pre-lift head is
-            // exactly the request's old head, which the pallet-head check above
-            // already pinned this update to.
-            let old_office_state = office_state_at(&office_head)?;
-
-            for key in &new_office_state.keys {
-                let was_active = old_office_state.find_key(&key.key_id)
-                    .map(|old| old.is_active())
-                    .unwrap_or(true);
-
-                if key.retired_at.is_some() && was_active {
-                    let mut event = HookEvent::new(EVENT_KEY_REVOKED);
-                    event.warehouse = warehouse_id.clone();
-                    event.operator = Some(key.operator.clone());
-                    event.key_id = Some(key.key_id.clone());
-                    event.detail = key.revocation_reason
-                        .map(|reason| reason.as_str().to_string());
-                    events.push(event);
+                    if key.retired_at.is_some() && was_active {
+                        let mut event = HookEvent::new(EVENT_KEY_REVOKED);
+                        event.warehouse = warehouse_id.clone();
+                        event.operator = Some(key.operator.clone());
+                        event.key_id = Some(key.key_id.clone());
+                        event.detail = key.revocation_reason
+                            .map(|reason| reason.as_str().to_string());
+                        events.push(event);
+                    }
                 }
+            } else if let Some(rules) = pallet_rules {
+                // A meta pallet exists only under an office, so a missing anchor or
+                // office refuses here instead of skipping the check. Its content check subsumes
+                // the signature audit below: every new parcel must be signed by an office key,
+                // stamp only its own cells, and keep the pallet's rules.
+                meta_tree::verify_meta_update(
+                    &bare,
+                    rules,
+                    meta_tree::Admission::Admit,
+                    anchor.as_ref(),
+                    office_head.as_deref(),
+                    request.old_head.as_deref(),
+                    &request.new_head
+                ).map_err(unprocessable)?;
+            } else if let Some(anchor) = anchor {
+                // A trusted warehouse accepts nothing a local audit would reject. This is the
+                // user-pallet path (the office and the meta-tree pallets took the branches above). The office head is the one
+                // already read above, not a second lookup.
+                let office_head = office_head.ok_or(unprocessable(
+                    "Trust is established but the office pallet is missing; lift the \
+                    office first.".to_string()
+                ))?;
+
+                let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
+                    .map_err(|error| unprocessable(error.into()))?;
+
+                // Incremental: everything reachable from old_head was verified when
+                // old_head was committed, so only the new slice is audited.
+                audit_utils::verify_pallet_history(
+                    &request.new_head,
+                    &anchor,
+                    &office_state,
+                    request.old_head.as_deref()
+                ).map_err(unprocessable)?;
             }
-        } else if let Some(rules) = pallet_rules {
-            // A meta pallet exists only under an office, so a missing anchor or
-            // office refuses here instead of skipping the check. Its content check subsumes
-            // the signature audit below: every new parcel must be signed by an office key,
-            // stamp only its own cells, and keep the pallet's rules.
-            meta_tree::verify_meta_update(
-                &bare,
-                rules,
-                meta_tree::Admission::Admit,
-                anchor.as_ref(),
-                office_head.as_deref(),
-                request.old_head.as_deref(),
-                &request.new_head
-            ).map_err(unprocessable)?;
-        } else if let Some(anchor) = anchor {
-            // A trusted warehouse accepts nothing a local audit would reject. This is the
-            // user-pallet path (the office and the meta-tree pallets took the branches above). The office head is the one
-            // already read above, not a second lookup.
-            let office_head = office_head.ok_or(unprocessable(
-                "Trust is established but the office pallet is missing; lift the \
-                office first.".to_string()
-            ))?;
 
-            let office_state = audit_utils::verify_office_chain_memoized(&anchor, &office_head)
-                .map_err(|error| unprocessable(error.into()))?;
+            ref_write_test_checkpoint(&name);
 
-            // Incremental: everything reachable from old_head was verified when
-            // old_head was committed, so only the new slice is audited.
-            audit_utils::verify_pallet_history(
-                &request.new_head,
-                &anchor,
-                &office_state,
-                request.old_head.as_deref()
-            ).map_err(unprocessable)?;
+            // The compare-and-set against the request's old head, under the warehouse's ref lock, so a
+            // local bay's writer that moved the ref since the check above is refused, not overwritten;
+            // and so is one that moved the office or the anchor the decision above consumed.
+            let preconditions = RefPreconditions {
+                office: OfficePrecondition::At(office_head_read),
+                anchor: match anchor_bytes {
+                    Some(bytes) => AnchorPrecondition::Bytes(bytes),
+                    None => AnchorPrecondition::Absent,
+                },
+                pallets: PalletsPrecondition::NotConsumed,
+            };
+
+            match pallet_utils::update_pallet_head_verified(
+                namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified
+            ) {
+                Ok(()) => return Ok(events),
+                // The office or the anchor the decision consumed moved under it, the pallet did
+                // not: decide again against what stands now, rather than tell the client to lower a
+                // pallet that never moved. A grant revoked meanwhile is then refused as a later
+                // request is.
+                Err(RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved)
+                    if attempt < REF_UPDATE_ATTEMPTS => {
+                    verified_closure = Some(verified);
+                }
+                Err(RefUpdateError::Moved(moved)) => {
+                    return Err(pallet_moved(moved.found.as_deref(), request.old_head.as_deref()));
+                }
+                Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
+                Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
+                Err(moved @ (RefUpdateError::PalletsMoved { .. } | RefUpdateError::WitnessMoved { .. })) => {
+                    return Err((StatusCode::CONFLICT, moved.to_string()));
+                }
+                Err(incomplete @ RefUpdateError::Incomplete { .. }) => return Err(unprocessable(incomplete.to_string())),
+                Err(RefUpdateError::Failed(e)) => return Err(internal(e)),
+            }
+
         }
-
-        ref_write_test_checkpoint(&name);
-
-        // The compare-and-set against the request's old head, under the warehouse's ref lock, so a
-        // local bay's writer that moved the ref since the check above is refused, not overwritten;
-        // and so is one that moved the office or the anchor the decision above consumed.
-        let preconditions = RefPreconditions {
-            office: OfficePrecondition::At(office_head_read),
-            anchor: match anchor_bytes {
-                Some(bytes) => AnchorPrecondition::Bytes(bytes),
-                None => AnchorPrecondition::Absent,
-            },
-            pallets: PalletsPrecondition::NotConsumed,
-        };
-
-        match pallet_utils::update_pallet_head_verified(
-            namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified
-        ) {
-            Ok(()) => {}
-            Err(RefUpdateError::Moved(moved)) => {
-                return Err(pallet_moved(moved.found.as_deref(), request.old_head.as_deref()));
-            }
-            Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
-            Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
-            Err(moved @ (RefUpdateError::PalletsMoved { .. } | RefUpdateError::WitnessMoved { .. })) => {
-                return Err((StatusCode::CONFLICT, moved.to_string()));
-            }
-            Err(incomplete @ RefUpdateError::Incomplete { .. }) => return Err(unprocessable(incomplete.to_string())),
-            Err(RefUpdateError::Failed(e)) => return Err(internal(e)),
-        }
-
-        Ok(events)
     }).await;
 
     match result {
@@ -2981,7 +3041,7 @@ mod tests {
             office: office.as_deref(),
             new_office: None,
             pallets: PalletsPrecondition::NotConsumed,
-        })
+        }).map(|_| ())
     }
     /// The durable-taint machinery (module `taint_utils` in `forklift_core`) is activation-gated
     /// all-or-nothing: a process that taints or gates existence checks without ever healing them
@@ -3974,7 +4034,7 @@ mod tests {
 
         let first = resolve_warehouse(&state, &params).unwrap();
         let second = resolve_warehouse(&state, &params).unwrap();
-        assert!(Arc::ptr_eq(&first, &second), "the same warehouse must reuse one write mutex");
+        assert!(Arc::ptr_eq(&first, &second), "the same warehouse must reuse one handle");
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -5114,40 +5174,29 @@ mod tests {
         (OfficeLookupSeamGuard, reached_rx, gate_tx)
     }
 
-    /// Falsifier 1 (reverted → red): a stale, pre-lock authorization read must not be
-    /// able to let a push commit after the grant it relied on was revoked.
+    /// Falsifier: a push whose grant is revoked while it is audited is refused, as a request
+    /// arriving after the revocation would be, rather than committed on the office it read.
     ///
-    /// This is deliberately not a wall-clock race — the interleaving it needs is
-    /// exactly the one this fix closes, and no fixed delay can be sized against the
-    /// window it produces: on the fixed shape that window has zero width, so any
-    /// wall-clock trigger either always loses the race (proving nothing) or is
-    /// flaky. Instead it drives a real, lock-respecting office revocation into the
-    /// checkpoint `office_user_of` reaches right after fixing its decision, and asks
-    /// the one question that actually distinguishes the two shapes: is `handle.writes`
-    /// — the very mutex quinn's own commit is about to take — already held at that
-    /// instant?
+    /// Not a wall-clock race: the revocation is driven into the checkpoint `office_user_of` reaches
+    /// right after fixing its authorization answer, a real admin-signed office parcel moving the
+    /// office ref while quinn's push holds a decision that still grants her "main". Her write then
+    /// finds the office moved, and the update decides again against the office that stands now,
+    /// in which she is a reader.
     ///
-    /// - Reverted (`office_user_of` reads for itself, called before the lock): the
-    ///   answer is no — nothing has taken the lock yet. A revocation lands in that
-    ///   free window, through the same lock a real `post_ref_update("@office", ...)`
-    ///   would use, and quinn's push still commits on data read before it.
-    /// - Fixed: the answer is yes — quinn's own request already holds it, so nothing
-    ///   lock-respecting can have landed here, and the push must simply succeed on
-    ///   what it legitimately read.
-    ///
-    /// A fake, never-uploaded `new_head` (the trick several sibling tests use to stop
-    /// short of the deep audit) can't stand in here: it fails on object presence
-    /// before authorization would ever matter, in *both* shapes, so the two would be
-    /// indistinguishable. This needs a push that can really commit if authorization
-    /// wrongly lets it through — hence a real, signed, already-uploaded parcel.
-    // Multi-threaded runtime, not the default current-thread one: the test body
-    // below blocks its own thread synchronously on `reached.recv_timeout` while
-    // `push` (spawned, not awaited yet) needs an executor thread free to poll it —
-    // on a current-thread runtime the test's own blocking wait would starve the
-    // only thread able to make `push` progress at all, and the checkpoint would
-    // never fire.
+    /// A fake, never-uploaded `new_head` (the trick several sibling tests use to stop short of the
+    /// deep audit) can't stand in here: it fails on object presence before authorization would ever
+    /// matter, so a wrong implementation would be refused too. This needs a push that can really
+    /// commit if authorization wrongly lets it through — hence a real, signed, uploaded parcel.
+    // Reverts: answer the write's `OfficeMoved` without deciding again → the office-moved 409;
+    // the final write passes `OfficePrecondition::NotConsumed` → 200 on a revoked grant.
+    //
+    // Multi-threaded runtime, not the default current-thread one: the test body below blocks its
+    // own thread synchronously on `reached.recv_timeout` while `push` (spawned, not awaited yet)
+    // needs an executor thread free to poll it — on a current-thread runtime the test's own
+    // blocking wait would starve the only thread able to make `push` progress at all, and the
+    // checkpoint would never fire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_grant_revoked_through_the_write_lock_cannot_land_in_an_unlocked_window() {
+    async fn a_grant_revoked_while_its_push_is_audited_is_refused_on_the_new_office() {
         let fixture = OfficeFixture::genesis("post-ref-revoke-race");
         let quinn_key_id = fixture.admit(
             "quinn-seam", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
@@ -5158,10 +5207,6 @@ mod tests {
         let mut operator_tokens = HashMap::new();
         operator_tokens.insert("tok-quinn-seam".to_string(), "quinn-seam".to_string());
         let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
-        let ServeMode::Single(handle) = &state.mode else {
-            unreachable!("single_mode_state always builds ServeMode::Single")
-        };
-        let handle = Arc::clone(handle);
 
         let (_seam, reached, gate) = arm_office_lookup_checkpoint("quinn-seam");
 
@@ -5174,41 +5219,27 @@ mod tests {
         reached.recv_timeout(std::time::Duration::from_secs(5))
             .expect("office_user_of must reach its test checkpoint");
 
-        let expected_status = match handle.writes.try_lock() {
-            Ok(guard) => {
-                // The vulnerable window: the lock is free even though quinn-seam's push
-                // already has its authorization answer. Revoke her through the same
-                // lock a real concurrent office update would use.
-                let mut office_state = office_utils::read_office_state().unwrap();
-                office_state.users.iter_mut()
-                    .find(|user| user.identifier == "quinn-seam")
-                    .expect("quinn-seam must be enrolled")
-                    .role = Role::Reader;
-                office_utils::stack_office_parcel(
-                    &office_state, &fixture.admin, "revoke quinn".to_string(), &fixture.admin_key_id,
-                    forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref(),
-                    &RefPreconditions::NONE,
-                ).unwrap();
-                drop(guard);
-
-                StatusCode::FORBIDDEN
-            }
-            Err(_) => {
-                // No window: quinn's own request already holds the lock, so nothing
-                // lock-respecting could have landed here. Nothing to revoke against —
-                // the push must simply succeed.
-                StatusCode::OK
-            }
-        };
+        let mut office_state = office_utils::read_office_state().unwrap();
+        office_state.users.iter_mut()
+            .find(|user| user.identifier == "quinn-seam")
+            .expect("quinn-seam must be enrolled")
+            .role = Role::Reader;
+        office_utils::stack_office_parcel(
+            &office_state, &fixture.admin, "revoke quinn".to_string(), &fixture.admin_key_id,
+            forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref(),
+            &RefPreconditions::NONE,
+        ).unwrap();
 
         gate.send(()).expect("the push's checkpoint must still be waiting on the gate");
-        let status = push.await.unwrap().into_response().status();
+        let response = push.await.unwrap().into_response();
 
-        assert_eq!(
-            status, expected_status,
-            "quinn's grant was revoked through the write lock; the push's own status ({}) \
-            must match what that lock's state at decision time predicted", status
-        );
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("main").unwrap(), None,
+            "a revoked grant must not move the pallet");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_text(response).await;
+        assert!(body.contains("\\\"quinn-seam\\\" (reader) may not move pallet \\\"main\\\"."), "{}", body);
+        assert_eq!(ref_update_attempts(&fixture.root, "main"), 2,
+            "the refusal comes from deciding again against the new office");
     }
 
     /// Falsifier 2 (reverted → red): the office-head `Option` this fix reads once has
@@ -5307,19 +5338,60 @@ mod tests {
         // correct on both the passing and the panicking path.
     }
 
-    /// Arm the write seam for `name` with `run`.
-    fn arm_write_seam(name: &str, run: impl FnOnce() + Send + 'static) {
-        *REF_WRITE_TEST_SEAM.lock().unwrap() = Some((name.to_string(), Box::new(run)));
+    /// Clears one armed write seam when the test's scope ends, including on panic, so a failed
+    /// test cannot leave a live arm behind.
+    struct WriteSeamGuard((PathBuf, String));
+
+    impl Drop for WriteSeamGuard {
+        fn drop(&mut self) {
+            REF_WRITE_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        }
+    }
+
+    /// Arm the write seam for `name` in the warehouse at `root` with `run`, which every checkpoint
+    /// for that pair runs until the returned guard drops.
+    fn arm_write_seam(root: &std::path::Path, name: &str, run: impl FnMut() + Send + 'static) -> WriteSeamGuard {
+        let key = (root.join(FOLDER_NAME_FORKLIFT_ROOT), name.to_string());
+        REF_WRITE_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), Box::new(run));
+
+        WriteSeamGuard(key)
+    }
+
+    /// Arm the write seam for `name` in the warehouse at `root` to park its first checkpoint until
+    /// the returned sender sends (or drops), signalling the returned receiver when it parks. Later
+    /// checkpoints run through.
+    fn park_first_write(root: &std::path::Path, name: &str)
+        -> (WriteSeamGuard, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut parked = false;
+
+        let guard = arm_write_seam(root, name, move || {
+            if !std::mem::replace(&mut parked, true) {
+                let _ = reached_tx.send(());
+                let _ = gate_rx.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        });
+
+        (guard, reached_rx, gate_tx)
+    }
+
+    /// How many times ref updates to `name` in the warehouse at `root` decided.
+    fn ref_update_attempts(root: &std::path::Path, name: &str) -> u32 {
+        let key = (root.join(FOLDER_NAME_FORKLIFT_ROOT), name.to_string());
+
+        REF_UPDATE_ATTEMPTS_TEST_COUNT.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied().unwrap_or(0)
     }
 
     async fn body_text(response: Response) -> String {
         String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
     }
 
-    // Revert: the final write passes `OfficePrecondition::NotConsumed` → the push lands, judged
-    // against an office that no longer stands.
+    // Reverts: the final write passes `OfficePrecondition::NotConsumed` → the push lands on the
+    // first attempt, judged against an office that no longer stands; the attempt bound raised to
+    // four → four attempts.
     #[tokio::test]
-    async fn a_push_whose_office_moved_after_its_audit_is_refused_and_writes_nothing() {
+    async fn a_push_whose_office_moves_after_every_audit_is_refused_after_three_attempts() {
         let fixture = OfficeFixture::genesis("post-ref-office-moved");
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["office-moved".to_string()], IdentityClass::Human, None);
         let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
@@ -5328,13 +5400,16 @@ mod tests {
         operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
         let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
 
-        // A local bay of this warehouse moves the office between the audit and the write.
-        let office = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap();
-        let moved = "e".repeat(64);
-        let to = moved.clone();
-        arm_write_seam("office-moved", move || {
-            forklift_core::util::pallet_utils::update_meta_pallet_head(
-                OFFICE_PALLET_NAME, office.as_deref(), &to, &RefPreconditions::NONE,
+        // A local bay of this warehouse stacks a real office parcel between every audit and its
+        // write, so each decision reads an office that verifies and is gone by the write.
+        let admin = fixture.admin.clone();
+        let admin_key_id = fixture.admin_key_id.clone();
+        let _seam = arm_write_seam(&fixture.root, "office-moved", move || {
+            let office_state = office_utils::read_office_state().unwrap();
+            office_utils::stack_office_parcel(
+                &office_state, &admin, "a bay moves the office".to_string(), &admin_key_id,
+                forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().as_deref(),
+                &RefPreconditions::NONE,
             ).unwrap();
         });
 
@@ -5346,14 +5421,16 @@ mod tests {
         assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("office-moved").unwrap(), None,
             "the pallet must be unchanged");
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let moved = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().unwrap();
         let body = body_text(response).await;
         assert!(body.contains(&format!("The office pallet moved during the audit: its head is now {}.", moved)), "{}", body);
+        assert_eq!(ref_update_attempts(&fixture.root, "office-moved"), 3);
     }
 
     // Revert: the final write passes `AnchorPrecondition::NotConsumed` → the push lands, judged
     // against an anchor that no longer stands.
     #[tokio::test]
-    async fn a_push_whose_anchor_changed_after_its_audit_is_refused_and_writes_nothing() {
+    async fn a_push_whose_anchor_changes_after_every_audit_is_refused_after_three_attempts() {
         let fixture = OfficeFixture::genesis("post-ref-anchor-moved");
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["anchor-moved".to_string()], IdentityClass::Human, None);
         let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
@@ -5362,9 +5439,9 @@ mod tests {
         operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
         let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
 
-        // The anchor's bytes change between the audit and the write.
+        // The anchor's bytes change between every audit and its write.
         let trust = fixture.root.join(FOLDER_NAME_FORKLIFT_ROOT).join("trust");
-        arm_write_seam("anchor-moved", move || {
+        let _seam = arm_write_seam(&fixture.root, "anchor-moved", move || {
             let mut bytes = std::fs::read(&trust).unwrap();
             bytes.extend_from_slice(b"# changed\n");
             std::fs::write(&trust, bytes).unwrap();
@@ -5380,6 +5457,93 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = body_text(response).await;
         assert!(body.contains("The trust anchor changed during the audit; re-read the warehouse and retry."), "{}", body);
+        assert_eq!(ref_update_attempts(&fixture.root, "anchor-moved"), 3);
+    }
+
+    /// A ref update to `name` from an unborn head, by an open principal, as a spawned task.
+    fn spawn_open_push(state: &Arc<AppState>, name: &str, new_head: String) -> tokio::task::JoinHandle<Response> {
+        tokio::spawn(post_ref_update(
+            State(Arc::clone(state)), HeaderMap::new(), Path(ref_update_params(name)),
+            Json(RefUpdateRequest { old_head: None, new_head }),
+        ))
+    }
+
+    // Revert: a mutex shared by every ref update around post_ref_update's blocking closure → the
+    // second push waits behind the parked one and the bounded wait runs out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_push_does_not_hold_up_a_push_to_another_pallet() {
+        let (root, _scope) = trust_warehouse("post-ref-parked-other-pallet");
+        let parked_head = store_bare_parcel("parked");
+        let free_head = store_bare_parcel("free");
+        let state = Arc::new(single_mode_state(root.clone()));
+
+        let (_seam, reached, gate) = park_first_write(&root, "parked");
+        let parked = spawn_open_push(&state, "parked", parked_head.clone());
+        reached.recv_timeout(std::time::Duration::from_secs(5)).expect("the first push must park at its write");
+
+        let free = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_open_push(&state, "free", free_head.clone()))
+            .await
+            .expect("a push to another pallet must not wait for the parked one")
+            .unwrap();
+        assert_eq!(free.status(), StatusCode::OK);
+
+        gate.send(()).unwrap();
+        assert_eq!(parked.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("parked").unwrap(), Some(parked_head));
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("free").unwrap(), Some(free_head));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Revert: one mutex around both post_ref_update's and put_trust's blocking closures → the trust
+    // PUT waits behind the parked push and the bounded wait runs out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_push_does_not_hold_up_trust_establishment() {
+        let (root, _scope) = trust_warehouse("post-ref-parked-trust");
+        let parked_head = store_bare_parcel("parked");
+        let state = Arc::new(single_mode_state(root.clone()));
+
+        let (_seam, reached, gate) = park_first_write(&root, "parked");
+        let parked = spawn_open_push(&state, "parked", parked_head);
+        reached.recv_timeout(std::time::Duration::from_secs(5)).expect("the push must park at its write");
+
+        let trust = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            put_trust(State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(Vec::new()))),
+        ).await.expect("trust establishment must not wait for the parked push").into_response();
+        assert_eq!(trust.status(), StatusCode::CREATED);
+
+        gate.send(()).unwrap();
+        parked.await.unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Reverts: the final write expects the pallet's current head instead of the request's old head
+    // → the loser overwrites the winner (200); the loop also deciding again on `Moved` → a second
+    // attempt for the loser.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_loser_of_two_pushes_from_one_head_is_refused_after_one_attempt() {
+        let (root, _scope) = trust_warehouse("post-ref-same-pallet");
+        let loser_head = store_bare_parcel("loser");
+        let winner_head = store_bare_parcel("winner");
+        let state = Arc::new(single_mode_state(root.clone()));
+
+        let (_seam, reached, gate) = park_first_write(&root, "contested");
+        let loser = spawn_open_push(&state, "contested", loser_head);
+        reached.recv_timeout(std::time::Duration::from_secs(5)).expect("the loser must park at its write");
+
+        let winner = spawn_open_push(&state, "contested", winner_head.clone()).await.unwrap();
+        assert_eq!(winner.status(), StatusCode::OK);
+
+        gate.send(()).unwrap();
+        let loser = loser.await.unwrap();
+
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("contested").unwrap(), Some(winner_head.clone()),
+            "the winner's head must stand");
+        assert_eq!(loser.status(), StatusCode::CONFLICT);
+        let body = body_text(loser).await;
+        assert!(body.contains(&winner_head), "the refusal names the head that won: {}", body);
+        assert_eq!(ref_update_attempts(&root, "contested"), 2, "one attempt each");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A first anchor for an empty warehouse, adopting nothing.
@@ -5402,7 +5566,7 @@ mod tests {
     async fn a_first_anchor_whose_office_was_born_meanwhile_is_refused_and_writes_nothing() {
         let (root, _scope) = trust_warehouse("put-trust-office-born");
         let state = Arc::new(single_mode_state(root.clone()));
-        arm_write_seam(TRUST_WRITE_SEAM, || {
+        let _seam = arm_write_seam(&root, TRUST_WRITE_SEAM, || {
             forklift_core::util::pallet_utils::update_meta_pallet_head(
                 OFFICE_PALLET_NAME, None, &"e".repeat(64), &RefPreconditions::NONE,
             ).unwrap();
@@ -5439,6 +5603,78 @@ mod tests {
         ).await.into_response();
         assert!(accepted.status().is_success(), "a boundary holding every head installs: {}", accepted.status());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two first-contact trust PUTs, the first (of [`first_anchor`]) parked at its install while
+    /// the second (of `second_anchor`) installs; with `move_office`, a bay then also stacks the
+    /// office before the first resumes, so its install is refused rather than found in place.
+    /// Returns the parked PUT's status and body, and the second's status.
+    async fn racing_first_contacts(name: &str, second_anchor: TrustAnchorDto, move_office: bool)
+                                   -> (StatusCode, String, StatusCode) {
+        let (root, _scope) = trust_warehouse(name);
+        let state = Arc::new(single_mode_state(root.clone()));
+
+        let (_seam, reached, gate) = park_first_write(&root, TRUST_WRITE_SEAM);
+        let parked = tokio::spawn(put_trust(
+            State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(Vec::new())),
+        ));
+        reached.recv_timeout(std::time::Duration::from_secs(5)).expect("the first PUT must park at its install");
+
+        let second = put_trust(State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(second_anchor.clone()))
+            .await.into_response().status();
+
+        if move_office {
+            forklift_core::util::pallet_utils::update_meta_pallet_head(
+                OFFICE_PALLET_NAME, None, &"e".repeat(64), &RefPreconditions::NONE,
+            ).unwrap();
+        }
+
+        gate.send(()).unwrap();
+        let parked = parked.await.unwrap().into_response();
+        let parked_status = parked.status();
+        let parked_body = body_text(parked).await;
+
+        assert!(office_utils::read_trust_anchor().unwrap().is_some_and(|anchor| TrustAnchorDto::from(&anchor) == second_anchor),
+            "the second PUT's anchor must be installed");
+        let _ = std::fs::remove_dir_all(&root);
+
+        (parked_status, parked_body, second)
+    }
+
+    /// Two identical first-contact trust PUTs: [`racing_first_contacts`]'s statuses.
+    async fn identical_first_contacts(name: &str, move_office: bool) -> (StatusCode, StatusCode) {
+        let (parked, _, second) = racing_first_contacts(name, first_anchor(Vec::new()), move_office).await;
+
+        (parked, second)
+    }
+
+    // Only a `201` emits EVENT_TRUST_ESTABLISHED (put_trust's `Ok(Some(event))` arm answers both),
+    // so one `201` between the two is exactly one event.
+    // Revert: put_trust answers `TrustInstalled::AlreadyInPlace` as it answers `Written` → the
+    // parked PUT also answers 201, a second event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identical_racing_first_contacts_establish_trust_once() {
+        assert_eq!(identical_first_contacts("put-trust-identical", false).await, (StatusCode::OK, StatusCode::CREATED));
+    }
+
+    // Revert: put_trust answers a refused install without re-reading the anchor → the parked PUT
+    // gets the office-moved 409 for an anchor that is the one it asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identical_racing_first_contacts_establish_trust_once_when_the_office_moves_between() {
+        assert_eq!(identical_first_contacts("put-trust-identical-moved", true).await, (StatusCode::OK, StatusCode::CREATED));
+    }
+
+    // The loser of two different first contacts gets the answer a request arriving after the
+    // winner gets, not an invitation to retry.
+    // Revert: put_trust answers a refused install whose re-read anchor it is no re-genesis of with
+    // the install's own refusal → the anchor-moved "retry" 409.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_loser_of_two_different_first_contacts_meets_the_one_way_door() {
+        let other = TrustAnchorDto { enabled_at: 2, ..first_anchor(Vec::new()) };
+        let (parked, body, second) = racing_first_contacts("put-trust-different", other, false).await;
+
+        assert_eq!((parked, second), (StatusCode::CONFLICT, StatusCode::CREATED));
+        assert!(body.contains("trust is a one-way door"), "{}", body);
     }
 
     /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
@@ -5540,9 +5776,8 @@ mod tests {
     /// activity. `office_head`/`office_state`/`anchor` are read fresh into local
     /// variables inside each request's own closure (never shared or cached across
     /// requests), so there is no channel through which one push could observe or be
-    /// blocked by another's *unrelated* pallet — the shared write lock still
-    /// serializes the two commits (as it always has, unaffected by this slice), but
-    /// serialization is not refusal: both must still land as 200s.
+    /// refused for another's *unrelated* pallet: both must land as 200s. (That neither
+    /// waits for the other is pinned by `a_parked_push_does_not_hold_up_a_push_to_another_pallet`.)
     ///
     /// Unlike the other two falsifiers, this one is not known to discriminate a
     /// plausible wrong implementation of *this* diff — see this test's mention in the

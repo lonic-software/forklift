@@ -19,9 +19,9 @@
 //! [`RefStore`] is the single consistency point — pallet heads and the trust anchor. On
 //! AWS it is DynamoDB, and its one non-idempotent operation,
 //! [`RefStore::compare_and_set_head`], is a conditional write: exactly the CAS that lets the
-//! serverless head scale horizontally where the server head needs an in-process mutex
-//! (§4.5, §4.6). It conditions on all three of a ref update's movable inputs at once — the
-//! pallet's own head, the office head, and the trust anchor — as one DynamoDB transaction,
+//! serverless head scale horizontally, where the server head's compare-and-set rests on a file
+//! lock on one machine's filesystem (§4.5, §4.6). It conditions on all three of a ref update's
+//! movable inputs at once — the pallet's own head, the office head, and the trust anchor — as one DynamoDB transaction,
 //! so nothing this store cannot see move can make a commit outlive the audit it followed
 //! (FORK-95 design memo, "The invariant" / claim C6). Unlike the filesystem, object storage
 //! has no directory walk, so ref enumeration is an explicit primitive
