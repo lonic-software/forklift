@@ -63,7 +63,6 @@ irm https://raw.githubusercontent.com/lonic-software/forklift/main/install.ps1 |
 
 ```sh
 forklift prepare                          # create a warehouse here
-forklift config operator.name "Ada"       # optional; an id is minted otherwise
 echo "hello" > readme.txt
 forklift load .                            # stage everything
 forklift stack "first parcel"             # commit

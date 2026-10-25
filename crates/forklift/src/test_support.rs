@@ -87,7 +87,6 @@ pub(crate) fn configure_operator() {
     use forklift_core::util::config_utils;
 
     config_utils::set_value(config_utils::KEY_OPERATOR_IDENTIFIER, "test-operator", ConfigScope::Warehouse).unwrap();
-    config_utils::set_value(config_utils::KEY_OPERATOR_NAME, "Test Operator", ConfigScope::Warehouse).unwrap();
 }
 
 /// Store a parcel of `tree` on `parents`; returns its hash.

@@ -4182,7 +4182,7 @@ mod tests {
             parents: Vec::new(),
             actions: vec![crate::model::parcel_action::ParcelAction {
                 operator: crate::model::operator::Operator {
-                    name: "test".to_string(), identifier: "op@x".to_string(),
+                    identifier: "op@x".to_string(),
                 },
                 action: ParcelActionType::Stack,
                 description: None,

@@ -108,7 +108,6 @@ fn json(output: &Output) -> serde_json::Value {
 }
 
 fn configure_operator(warehouse: &TestWarehouse) {
-    assert_success(&warehouse.run(&["config", "--global", "operator.name", "Test Operator"]));
     assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "test@forklift"]));
 }
 

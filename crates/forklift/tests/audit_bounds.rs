@@ -46,7 +46,6 @@ impl Warehouse {
 
         let warehouse = Warehouse { root, home };
         warehouse.run_ok(&["prepare"]);
-        warehouse.run_ok(&["config", "operator.name", "audit@forklift"]);
         warehouse.run_ok(&["config", "operator.identifier", "audit@forklift"]);
         warehouse.run_ok(&["office", "enroll"]);
 

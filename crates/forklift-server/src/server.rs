@@ -5080,7 +5080,7 @@ mod tests {
             let scope = StorageRootScope::enter(&root);
             warehouse_utils::prepare_warehouse().unwrap();
 
-            let admin = Operator { name: "alice".to_string(), identifier: "alice".to_string() };
+            let admin = Operator { identifier: "alice".to_string() };
             let (key_id, public_key) = forklift_core::util::sign_utils::generate_keypair(&admin.identifier).unwrap();
             let pop = office_utils::sign_key_pop(&key_id, &public_key, &admin.identifier).unwrap();
             let root_key = office_utils::endorse_key(&public_key, &admin.identifier, &key_id, &pop, 1_700_000_000).unwrap();
@@ -5445,7 +5445,7 @@ mod tests {
     async fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not() {
         let fixture = OfficeFixture::genesis("post-ref-self-promotion");
         let bob_key_id = fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
-        let bob = Operator { name: "bob".to_string(), identifier: "bob".to_string() };
+        let bob = Operator { identifier: "bob".to_string() };
 
         assert_eq!(lift_bob_promotion(&fixture, &bob, &bob_key_id).await, StatusCode::FORBIDDEN);
         assert_eq!(lift_bob_promotion(&fixture, &fixture.admin, &fixture.admin_key_id).await, StatusCode::OK);
@@ -5458,7 +5458,7 @@ mod tests {
     async fn a_held_overstep_under_a_legitimate_lift_is_unprocessable_not_forbidden() {
         let fixture = OfficeFixture::genesis("post-ref-held-overstep");
         let bob_key_id = fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
-        let bob = Operator { name: "bob".to_string(), identifier: "bob".to_string() };
+        let bob = Operator { identifier: "bob".to_string() };
 
         let mut promoted = office_utils::read_office_state().unwrap();
         promoted.users.iter_mut().find(|user| user.identifier == "bob").unwrap().role = Role::Admin;
@@ -5495,7 +5495,7 @@ mod tests {
         let fixture = OfficeFixture::genesis("post-ref-untracked-office-signer");
         fixture.admit("bob", Role::Writer, Vec::new(), IdentityClass::Human, None);
 
-        let stranger = Operator { name: "mallory".to_string(), identifier: "mallory".to_string() };
+        let stranger = Operator { identifier: "mallory".to_string() };
         let (stranger_key_id, _) = forklift_core::util::sign_utils::generate_keypair("mallory").unwrap();
 
         assert_eq!(
@@ -5653,7 +5653,7 @@ mod tests {
         let quinn_key_id = fixture.admit(
             "quinn-seam", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
         );
-        let quinn = Operator { name: "quinn-seam".to_string(), identifier: "quinn-seam".to_string() };
+        let quinn = Operator { identifier: "quinn-seam".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn-seam's push");
 
         let mut operator_tokens = HashMap::new();
@@ -5724,7 +5724,7 @@ mod tests {
 
         warehouse_utils::prepare_warehouse().unwrap();
 
-        let admin = Operator { name: "alice".to_string(), identifier: "alice".to_string() };
+        let admin = Operator { identifier: "alice".to_string() };
         let (key_id, public_key) =
             forklift_core::util::sign_utils::generate_keypair(&admin.identifier).unwrap();
         let pop = office_utils::sign_key_pop(&key_id, &public_key, &admin.identifier).unwrap();
@@ -5846,7 +5846,7 @@ mod tests {
     async fn a_push_whose_office_moves_after_every_audit_is_refused_after_three_attempts() {
         let fixture = OfficeFixture::genesis("post-ref-office-moved");
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["office-moved".to_string()], IdentityClass::Human, None);
-        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
+        let quinn = Operator { identifier: "quinn".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
         let mut operator_tokens = HashMap::new();
         operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
@@ -5885,7 +5885,7 @@ mod tests {
     async fn a_push_whose_anchor_changes_after_every_audit_is_refused_after_three_attempts() {
         let fixture = OfficeFixture::genesis("post-ref-anchor-moved");
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["anchor-moved".to_string()], IdentityClass::Human, None);
-        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
+        let quinn = Operator { identifier: "quinn".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
         let mut operator_tokens = HashMap::new();
         operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
@@ -6206,7 +6206,7 @@ mod tests {
 
         warehouse_utils::prepare_warehouse().unwrap();
 
-        let actor = Operator { name: "alice".to_string(), identifier: "alice".to_string() };
+        let actor = Operator { identifier: "alice".to_string() };
         let (key_id, _) = forklift_core::util::sign_utils::generate_keypair(&actor.identifier).unwrap();
         let new_head = store_signed_parcel(&actor, &key_id, Vec::new(), "@kv without an office");
 
@@ -6247,8 +6247,8 @@ mod tests {
             "roger", Role::Writer, vec!["side".to_string()], IdentityClass::Human, None
         );
 
-        let quinn = Operator { name: "quinn".to_string(), identifier: "quinn".to_string() };
-        let roger = Operator { name: "roger".to_string(), identifier: "roger".to_string() };
+        let quinn = Operator { identifier: "quinn".to_string() };
+        let roger = Operator { identifier: "roger".to_string() };
         let quinn_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
         let roger_head = store_signed_parcel(&roger, &roger_key_id, Vec::new(), "roger's push");
 

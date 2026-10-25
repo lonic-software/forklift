@@ -2730,7 +2730,7 @@ pub(crate) mod tests {
     #[test]
     fn the_office_writer_refuses_a_state_no_reader_would_accept() {
         let (scope, dir) = enter_scratch_warehouse("writer-refuses");
-        let actor = crate::model::operator::Operator { name: "op".to_string(), identifier: "op@x".to_string() };
+        let actor = crate::model::operator::Operator { identifier: "op@x".to_string() };
         let (public_key, key_id) = bound_key(7);
         let (_, other_id) = bound_key(9);
         let key = parse_key_record(&key_record_for(&public_key, "")).unwrap();

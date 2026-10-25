@@ -3377,7 +3377,6 @@ mod tests {
             crate::util::warehouse_utils::prepare_warehouse().unwrap();
 
             let admin = crate::model::operator::Operator {
-                name: "alice".to_string(),
                 identifier: ALICE.to_string(),
             };
             let (admin_key_id, admin_pub) = sign_utils::generate_keypair(&admin.identifier).unwrap();
@@ -3628,7 +3627,7 @@ mod tests {
         let (bob_key_id, admitted_head) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
-        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+        let bob = crate::model::operator::Operator { identifier: BOB.to_string() };
 
         // The domain is non-empty: the chain up to the admission verifies.
         assert!(verify_office_chain(&fixture.anchor, &admitted_head).is_ok());
@@ -3723,7 +3722,7 @@ mod tests {
         let (bob_key_id, _) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
-        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+        let bob = crate::model::operator::Operator { identifier: BOB.to_string() };
 
         let (new_key_id, new_public) = sign_utils::generate_keypair(BOB).unwrap();
         let pop = crate::util::office_utils::sign_key_pop(&new_key_id, &new_public, BOB).unwrap();
@@ -3762,7 +3761,7 @@ mod tests {
         let (bob_key_id, _) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
-        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+        let bob = crate::model::operator::Operator { identifier: BOB.to_string() };
 
         let (device_key_id, device_public) = sign_utils::generate_keypair(BOB).unwrap();
         let pop = crate::util::office_utils::sign_key_pop(&device_key_id, &device_public, BOB).unwrap();
@@ -3840,7 +3839,7 @@ mod tests {
         let (carol_key_id, _) = fixture.admit(
             CAROL, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
-        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+        let bob = crate::model::operator::Operator { identifier: BOB.to_string() };
 
         // The admin revokes Carol's key: a legitimate change, so the domain is non-empty.
         let mut revoked = crate::util::office_utils::read_office_state().unwrap();
@@ -3887,7 +3886,7 @@ mod tests {
         let (bob_key_id, bob_admitted) = fixture.admit(
             BOB, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
-        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
+        let bob = crate::model::operator::Operator { identifier: BOB.to_string() };
 
         let mut promoted = crate::util::office_utils::read_office_state().unwrap();
         promoted.users.iter_mut().find(|user| user.identifier == BOB).unwrap().role = Role::Admin;
@@ -3942,8 +3941,8 @@ mod tests {
         let (carol_key_id, _) = fixture.admit(
             CAROL, Role::Writer, crate::util::office_utils::IdentityClass::Human, None
         );
-        let bob = crate::model::operator::Operator { name: BOB.to_string(), identifier: BOB.to_string() };
-        let carol = crate::model::operator::Operator { name: CAROL.to_string(), identifier: CAROL.to_string() };
+        let bob = crate::model::operator::Operator { identifier: BOB.to_string() };
+        let carol = crate::model::operator::Operator { identifier: CAROL.to_string() };
 
         let before = crate::util::office_utils::read_office_state().unwrap();
         let mut revoked = before.clone();

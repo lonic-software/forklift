@@ -1854,7 +1854,7 @@ mod tests {
     }
 
     fn actor(identifier: &str) -> Operator {
-        Operator { name: identifier.to_string(), identifier: identifier.to_string() }
+        Operator { identifier: identifier.to_string() }
     }
 
     fn text(content: &str) -> Table {

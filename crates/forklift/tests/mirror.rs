@@ -257,7 +257,6 @@ fn prepare_warehouse(area: &TestArea, name: &str, remote_url: &str) {
     std::fs::create_dir_all(area.path(name)).unwrap();
 
     area.forklift_ok(name, &["prepare"]);
-    area.forklift_ok(name, &["config", "--global", "operator.name", "Mirror Tester"]);
     area.forklift_ok(name, &["config", "--global", "operator.identifier", "tester@forklift"]);
     area.forklift_ok(name, &["config", "remote.url", remote_url]);
 }
@@ -637,7 +636,6 @@ fn a_repeated_parent_mirrors_on_every_run() {
     git_ok(&source, &["branch", "feat", &a]);
 
     area.forklift_ok("source", &["prepare"]);
-    area.forklift_ok("source", &["config", "--global", "operator.name", "Mirror Tester"]);
     area.forklift_ok("source", &["config", "--global", "operator.identifier", "tester@forklift"]);
     area.forklift_ok("source", &["import-git", "."]);
     area.forklift_ok("source", &["config", "remote.url", &server.url]);

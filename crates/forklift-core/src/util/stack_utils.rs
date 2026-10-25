@@ -602,7 +602,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = crate::globals::StorageRootScope::enter(&root);
-        let operator = Operator { name: "Test".to_string(), identifier: "test".to_string() };
+        let operator = Operator { identifier: "test".to_string() };
 
         let signing = resolve_signing_key(&operator).unwrap();
         assert_eq!(signing.key_id(), None, "no anchor: the choice is unsigned");

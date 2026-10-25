@@ -194,11 +194,13 @@ so git receives nothing it already holds.
 ### `config` — who you are, and settings
 
 Identity is zero-configuration: if you never set anything, an opaque operator id
-(a UUID) is minted on first use and your history is pseudonymous. To be
-recognizable, set a name:
+(a UUID) is minted on first use and your history is pseudonymous. Forklift records
+no names: `history`, `blame`, `tag` and `office list` show a name only when the
+remote's directory supplies one for an id, and the id otherwise. To act under an id
+of your choosing, set it:
 
 ```sh
-forklift config operator.name "Ada Lovelace"
+forklift config --global operator.identifier ada@example.com
 ```
 
 `config` has four forms:
@@ -1734,7 +1736,7 @@ forklift office retire <key>      # revoke a key
 
 ```sh
 forklift profile list
-forklift profile create work --display-name "Work Me"
+forklift profile create work
 forklift profile use work
 ```
 
@@ -2119,7 +2121,6 @@ value. Known keys:
 
 | Key | Meaning |
 |-----|---------|
-| `operator.name` | Your display name (local only — never written on-chain). |
 | `operator.identifier` | Your on-chain operator id (opaque; a UUID is minted if unset). |
 | `operator.profile` | The named profile this warehouse acts under (see `profile`). |
 | `remote.url` | The remote warehouse URL (for `lift`/`lower`). Can be a Tor `.onion` — see [Reaching a remote over Tor](#reaching-a-remote-over-tor). |
@@ -2170,14 +2171,14 @@ Refused, in either file:
 | Written | Why |
 |---------|-----|
 | `[opperator]`, or any other unknown section | a mistyped section header hides every key inside it |
-| `identifer = "ada"` | an unknown key inside a known section — the typo that mints over your identity |
+| `identifer = "ada"`, `name = "Ada"` | an unknown key inside a known section — the typo that mints over your identity. There is no `name` key: Forklift records no names |
 | `[[operator]]`, `[[profile.work]]` | an array-of-tables where a table is expected |
 | `operator = 5` | a section that is not a table at all |
 | `loose = 6700`, `tor = true` | every value is a **string on disk**, including the numeric and boolean ones — write `"6700"` and `"on"` |
 | `torProxy` spelled `torproxy` | keys are case-sensitive |
 | `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
 | `auto = "flase"`, `loose = "10k"` | `maintenance.auto` accepts only the spellings listed above, and `maintenance.loose`/`maintenance.packs` only a whole number. A typo here used to leave maintenance on, or fall back to the default threshold, without a word |
-| an unknown field in a `[profile.<name>]` section | profiles hold `identifier` and `name`, nothing else |
+| an unknown field in a `[profile.<name>]` section | profiles hold only `identifier` |
 | any key set to `""` (or to whitespace) | a key holds a value or is absent, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry. Remove a section key with `forklift config --unset <key>` (add `--global` for the global file); a `[profile.<name>]` field the command cannot address, so remove that one in an editor |
 
 **A write is refused unless the file it would leave on disk parses completely.** The check is on
@@ -2194,7 +2195,7 @@ ever edited with the command.
 Set / read / remove:
 
 ```sh
-forklift config operator.name "Ada"
+forklift config remote.url https://forklift.example.com
 forklift config --global operator.identifier ada@example.com
 forklift config remote.token
 forklift config --unset remote.token

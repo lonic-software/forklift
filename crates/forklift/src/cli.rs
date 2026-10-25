@@ -195,7 +195,7 @@ pub enum Command {
     /// Read or change configuration values
     #[command(
         visible_alias = "cfg",
-        long_about = "Read or change configuration values (e.g. \"operator.name\"). Without a key, \
+        long_about = "Read or change configuration values (e.g. \"remote.url\"). Without a key, \
                       every known key is listed; with a key, its value is printed; with a key and a \
                       value, the value is set; with --unset, the key is removed (e.g. clearing a \
                       \"remote.token\"). Values are stored in the current warehouse by default; \
@@ -210,7 +210,7 @@ pub enum Command {
         #[arg(long, conflicts_with = "value")]
         unset: bool,
 
-        /// The configuration key (e.g. "operator.name"); omit it to list every key
+        /// The configuration key (e.g. "remote.url"); omit it to list every key
         key: Option<String>,
 
         /// The value to set the key to; omit it to print the current value
@@ -1681,10 +1681,6 @@ pub enum ProfileAction {
     Create {
         /// The profile name (e.g. "work")
         name: String,
-
-        /// The display name (local only; falls back to the operator id)
-        #[arg(long = "display-name", value_name = "DISPLAY_NAME")]
-        display_name: Option<String>,
 
         /// The operator id (e.g. one issued by a hosting provider); minted when omitted
         #[arg(long = "id", value_name = "OPERATOR_ID")]

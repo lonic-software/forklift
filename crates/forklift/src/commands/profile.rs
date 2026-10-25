@@ -4,7 +4,7 @@ use forklift_core::util::{config_utils, sign_utils, warehouse_utils};
 use crate::output::{self, CommandOutput};
 
 // The profile command — named identity bundles in the global configuration
-// (`[profile.<name>]` sections holding an operator id and a display name), selected
+// (`[profile.<name>]` sections holding an operator id), selected
 // per warehouse via `operator.profile`. Profiles keep one machine's identities apart:
 // which operator id a warehouse acts under, and which local keys belong to whom (the
 // key-owner manifest in the key directory).
@@ -23,13 +23,11 @@ pub fn list() -> Result<(), String> {
         Some(identifier) => ProfileEntry {
             name: "default".to_string(),
             identifier: Some(identifier.clone()),
-            display_name: None,
             local_keys: sign_utils::keys_owned_by(identifier)?.len(),
         },
         None => ProfileEntry {
             name: "default".to_string(),
             identifier: None,
-            display_name: None,
             local_keys: 0,
         },
     };
@@ -40,7 +38,6 @@ pub fn list() -> Result<(), String> {
         named.push(ProfileEntry {
             name: name.clone(),
             identifier: Some(identity.identifier.clone()),
-            display_name: (!identity.name.is_empty()).then(|| identity.name.clone()),
             local_keys: sign_utils::keys_owned_by(&identity.identifier)?.len(),
         });
     }
@@ -68,9 +65,6 @@ pub(crate) struct ProfileEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     identifier: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
-
     local_keys: usize,
 }
 
@@ -84,16 +78,10 @@ impl CommandOutput for ProfileList {
         }
 
         for entry in &self.profiles {
-            let display = match &entry.display_name {
-                Some(name) => format!(" \"{}\"", name),
-                None => String::new(),
-            };
-
             println!(
-                "{} — {}{} ({} local key(s))",
+                "{} — {} ({} local key(s))",
                 entry.name,
                 entry.identifier.as_deref().unwrap_or(""),
-                display,
                 entry.local_keys
             );
         }
@@ -107,14 +95,8 @@ impl CommandOutput for ProfileList {
 
 /// Create a named profile, minting an operator id unless one is supplied (a hosting
 /// provider hands out its own ids).
-pub fn create(profile: &str,
-              display_name: Option<String>,
-              identifier: Option<String>) -> Result<(), String> {
-    let identity = config_utils::create_profile(
-        profile,
-        display_name.as_deref(),
-        identifier.as_deref()
-    )?;
+pub fn create(profile: &str, identifier: Option<String>) -> Result<(), String> {
+    let identity = config_utils::create_profile(profile, identifier.as_deref())?;
 
     output::message(format!(
         "Created profile \"{}\" with operator id {}.\n\

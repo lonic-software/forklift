@@ -431,19 +431,19 @@ into a state a local `audit` would reject.
 ## 11. Profiles and pseudonymity
 
 The chain stores only operator ids and public keys — **zero PII**. A hosting
-provider maps ids to display names behind its own policy; locally, your
-`operator.name` is display-only and never leaves your machine.
+provider maps ids to display names behind its own policy, and that directory is the
+only source of names Forklift shows — it keeps none of its own.
 
 **Profiles** let one machine act as different operators in different warehouses —
 a personal identity and one per organization:
 
 ```sh
-forklift profile create work --display-name "Work Me"   # mints an id
+forklift profile create work                            # mints an id
 forklift profile create acme --id acme-issued-id        # or use a provider-issued id
 forklift profile use work                                # this warehouse now acts as "work"
 forklift profile list                                    # profiles and the local keys each holds
 ```
 
-A warehouse selects a profile with `operator.profile`; the profile's id and name
-then take precedence over the plain `operator.*` values. The key directory keeps
+A warehouse selects a profile with `operator.profile`; the profile's id
+then takes precedence over the plain `operator.*` values. The key directory keeps
 an owner manifest so a machine can tell its identities' keys apart.

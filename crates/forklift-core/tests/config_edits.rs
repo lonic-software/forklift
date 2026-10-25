@@ -79,12 +79,12 @@ fn while_locked<T: Send + 'static>(config: &Path,
 }
 
 fn an_edit_waits_for_the_lock_and_loads_only_after_taking_it(root: &Path) {
-    let config = fresh_global(root, "t1", Some("[operator]\nname = \"Ada\"\n"));
+    let config = fresh_global(root, "t1", Some("[remote]\ntoken = \"ada\"\n"));
 
     let stored = while_locked(
         &config,
         || config_utils::set_value("remote.url", "https://example.com/w", ConfigScope::Global),
-        || std::fs::write(&config, "[operator]\nname = \"Ada\"\nidentifier = \"written-meanwhile\"\n").unwrap(),
+        || std::fs::write(&config, "[remote]\ntoken = \"ada\"\n[operator]\nidentifier = \"written-meanwhile\"\n").unwrap(),
     );
     stored.unwrap();
 
@@ -115,7 +115,7 @@ fn a_profile_name_is_claimed_under_the_lock(root: &Path) {
 
     let created = while_locked(
         &config,
-        || config_utils::create_profile("work", None, None),
+        || config_utils::create_profile("work", None),
         || std::fs::write(&config, "[profile.work]\nidentifier = \"created-elsewhere\"\n").unwrap(),
     );
 
@@ -137,11 +137,11 @@ fn a_profile_name_is_claimed_under_the_lock(root: &Path) {
 fn a_reader_holding_the_old_file_still_reads_it_whole(root: &Path) {
     use std::io::Read;
 
-    let old = "[operator]\nname = \"Old\"\n";
+    let old = "[operator]\nidentifier = \"old\"\n";
     let config = fresh_global(root, "t3", Some(old));
     let mut reader = std::fs::File::open(&config).unwrap();
 
-    config_utils::set_value("operator.name", "New", ConfigScope::Global).unwrap();
+    config_utils::set_value("operator.identifier", "new", ConfigScope::Global).unwrap();
 
     let mut content = String::new();
     reader.read_to_string(&mut content).unwrap();
@@ -155,11 +155,11 @@ fn a_config_write_is_never_deferred_into_a_bulk_store_session(root: &Path) {
     fresh_global(root, "t4", None);
 
     let session = BulkStoreSession::open().unwrap();
-    config_utils::set_value("operator.name", "During", ConfigScope::Global).unwrap();
-    let read = config_utils::get_scoped_value("operator.name", ConfigScope::Global);
+    config_utils::set_value("operator.identifier", "during", ConfigScope::Global).unwrap();
+    let read = config_utils::get_scoped_value("operator.identifier", ConfigScope::Global);
     drop(session);
 
-    assert_eq!(read.unwrap().as_deref(), Some("During"), "a config write must be visible at once, not at the session's finish");
+    assert_eq!(read.unwrap().as_deref(), Some("during"), "a config write must be visible at once, not at the session's finish");
 }
 
 /// The link and its target are one file under one lock: the lock is held on the *target's*
@@ -170,7 +170,7 @@ fn a_symlinked_config_is_written_through_and_shares_its_targets_lock(root: &Path
     std::fs::create_dir_all(&folder).unwrap();
     let target = folder.join("real.toml");
     let link = folder.join("link.toml");
-    std::fs::write(&target, "[operator]\nname = \"Ada\"\n").unwrap();
+    std::fs::write(&target, "[remote]\ntoken = \"ada\"\n").unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
     std::env::set_var("FORKLIFT_GLOBAL_CONFIG", &link);
 
@@ -198,7 +198,7 @@ fn a_dangling_symlinked_config_is_refused_not_replaced(root: &Path) {
     std::os::unix::fs::symlink(folder.join("gone.toml"), &link).unwrap();
     std::env::set_var("FORKLIFT_GLOBAL_CONFIG", &link);
 
-    let refusal = config_utils::set_value("operator.name", "Ada", ConfigScope::Global)
+    let refusal = config_utils::set_value("operator.identifier", "ada", ConfigScope::Global)
         .expect_err("a write through a dangling link must refuse");
     // "cannot be written" is the write path's own refusal; the read path's says "cannot be read".
     assert!(refusal.contains("cannot be written"), "unexpected refusal: {refusal}");
@@ -233,7 +233,7 @@ fn a_dangling_symlinked_config_folder_is_refused_before_anything_is_created(root
     std::os::unix::fs::symlink(folder.join("gone"), &linked_folder).unwrap();
     std::env::set_var("FORKLIFT_GLOBAL_CONFIG", linked_folder.join("global.toml"));
 
-    let refusal = config_utils::set_value("operator.name", "Ada", ConfigScope::Global)
+    let refusal = config_utils::set_value("operator.identifier", "ada", ConfigScope::Global)
         .expect_err("a write through a dangling folder link must refuse");
     assert!(refusal.contains("cannot be written"), "unexpected refusal: {refusal}");
     assert!(refusal.contains("symbolic link"), "the refusal must name the link: {refusal}");
@@ -253,7 +253,7 @@ fn a_replaced_config_keeps_its_permissions(root: &Path) {
     // nothing cannot match it by accident, whatever umask the test runs under.
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o604)).unwrap();
 
-    config_utils::set_value("operator.name", "Ada", ConfigScope::Global).unwrap();
+    config_utils::set_value("operator.identifier", "ada", ConfigScope::Global).unwrap();
 
     let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o604, "an edit must keep the file's permissions, got {mode:o}");

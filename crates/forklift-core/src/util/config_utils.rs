@@ -26,9 +26,6 @@ const FILE_NAME_GLOBAL_CONFIG: &str = ".forkliftconfig";
 /// from the real home directory and lets users relocate their configuration.
 const ENV_GLOBAL_CONFIG_PATH: &str = "FORKLIFT_GLOBAL_CONFIG";
 
-/// The display name of the operator. Local only — never written on-chain.
-pub const KEY_OPERATOR_NAME: &str = "operator.name";
-
 /// The operator's on-chain id — an opaque string. Minted as a UUID when unset (so
 /// chains are pseudonymous by default); a hosting provider supplies its own minted id;
 /// a team may set any string, accepting that it is public in every clone, forever.
@@ -204,8 +201,8 @@ pub fn parse_maintenance_threshold(key: &str, value: &str) -> Result<usize, Stri
 
 /// The configuration keys Forklift understands, in `section.key` form.
 /// Setting a key outside this list is rejected (it would silently do nothing).
-pub const KNOWN_KEYS: [&str; 14] = [
-    KEY_OPERATOR_NAME, KEY_OPERATOR_IDENTIFIER, KEY_OPERATOR_PROFILE, KEY_REMOTE_URL, KEY_REMOTE_TOKEN,
+pub const KNOWN_KEYS: [&str; 13] = [
+    KEY_OPERATOR_IDENTIFIER, KEY_OPERATOR_PROFILE, KEY_REMOTE_URL, KEY_REMOTE_TOKEN,
     KEY_REMOTE_ORIGIN, KEY_REMOTE_TOR, KEY_REMOTE_TOR_PROXY, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE,
     KEY_MAINTENANCE_PACKS, KEY_MIRROR_URL, KEY_MIRROR_PALLETS, KEY_MIRROR_AUTO,
 ];
@@ -215,7 +212,6 @@ const SECTION_PROFILE: &str = "profile";
 
 /// The fields a profile may hold.
 const PROFILE_FIELD_IDENTIFIER: &str = "identifier";
-const PROFILE_FIELD_NAME: &str = "name";
 
 /// The refusal for an empty profile name — one spelling, shared by every command that takes one.
 pub const EMPTY_PROFILE_NAME: &str = "A profile name cannot be empty.";
@@ -249,8 +245,6 @@ pub struct ConfigFile {
 /// The `[operator]` section of a [`ConfigFile`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OperatorSection {
-    /// [`KEY_OPERATOR_NAME`].
-    pub name: Option<String>,
     /// [`KEY_OPERATOR_IDENTIFIER`].
     pub identifier: Option<String>,
     /// [`KEY_OPERATOR_PROFILE`].
@@ -294,27 +288,24 @@ pub struct MirrorSection {
     pub auto: Option<String>,
 }
 
-/// One `[profile.<name>]` section. Both fields are optional in the same sense as every other
+/// One `[profile.<name>]` section. Its one field is optional in the same sense as every other
 /// key: absent from a file that parsed. An absent identifier is minted on first use
-/// (see [`get_operator`]); an absent display name falls back to the identifier.
+/// (see [`get_operator`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProfileRecord {
     /// The profile's on-chain operator id.
     pub identifier: Option<String>,
-    /// The profile's display name (local only).
-    pub name: Option<String>,
 }
 
 impl ProfileRecord {
     /// The identity this profile names, in the shape the rest of the tool consumes.
     ///
-    /// An absent field becomes an empty string, which is the "fill this in" signal
-    /// [`get_operator`] acts on (mint an identifier, fall the name back to it). That is a
+    /// An absent identifier becomes an empty string, which is the "fill this in" signal
+    /// [`get_operator`] acts on (mint one). That is a
     /// *presence* question, not a parse question: a profile that reached this point came out
     /// of a file that parsed completely.
     fn to_operator(&self) -> Operator {
         Operator {
-            name: self.name.clone().unwrap_or_default(),
             identifier: self.identifier.clone().unwrap_or_default(),
         }
     }
@@ -331,7 +322,6 @@ impl ConfigFile {
     /// * `None`       - The key is absent from this file.
     pub fn get(&self, key: &str) -> Option<&str> {
         let value = match key {
-            KEY_OPERATOR_NAME       => &self.operator.name,
             KEY_OPERATOR_IDENTIFIER => &self.operator.identifier,
             KEY_OPERATOR_PROFILE    => &self.operator.profile,
             KEY_REMOTE_URL          => &self.remote.url,
@@ -368,7 +358,6 @@ impl ConfigFile {
     /// * `Err(String)` - `key` is in [`KNOWN_KEYS`] but has no field here (a bug in this module).
     fn store(&mut self, key: &str, value: &str) -> Result<(), String> {
         let field = match key {
-            KEY_OPERATOR_NAME       => &mut self.operator.name,
             KEY_OPERATOR_IDENTIFIER => &mut self.operator.identifier,
             KEY_OPERATOR_PROFILE    => &mut self.operator.profile,
             KEY_REMOTE_URL          => &mut self.remote.url,
@@ -500,10 +489,10 @@ fn parse_profiles(item: &toml_edit::Item, path: &Path) -> Result<Vec<(String, Pr
         let mut record = ProfileRecord::default();
 
         for (field, value) in table.iter() {
-            if field != PROFILE_FIELD_IDENTIFIER && field != PROFILE_FIELD_NAME {
+            if field != PROFILE_FIELD_IDENTIFIER {
                 return Err(not_valid(path, format!(
-                    "\"{}.{}.{}\" is not a known profile field. Known fields: {}, {}.",
-                    SECTION_PROFILE, name, field, PROFILE_FIELD_IDENTIFIER, PROFILE_FIELD_NAME
+                    "\"{}.{}.{}\" is not a known profile field. The only field is {}.",
+                    SECTION_PROFILE, name, field, PROFILE_FIELD_IDENTIFIER
                 )));
             }
 
@@ -520,10 +509,7 @@ fn parse_profiles(item: &toml_edit::Item, path: &Path) -> Result<Vec<(String, Pr
             require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, name, field), value)
                 .map_err(|detail| not_valid(path, detail))?;
 
-            match field {
-                PROFILE_FIELD_IDENTIFIER => record.identifier = Some(value.to_string()),
-                _                        => record.name = Some(value.to_string()),
-            }
+            record.identifier = Some(value.to_string());
         }
 
         parsed.push((name.to_string(), record));
@@ -587,11 +573,11 @@ const WAREHOUSE_CONFIG_TEMPLATE: &str = r#"# Forklift warehouse configuration.
 # configuration (the ".forkliftconfig" file in your home directory).
 #
 # Set values with "forklift config <key> <value>", e.g.:
-#   forklift config operator.name "Your Name"
+#   forklift config remote.url "https://forklift.example.com"
 #
 # operator.identifier is the on-chain operator id. Leave it unset to stay
 # pseudonymous (a UUID is minted automatically on first use); a hosting provider
-# sets its own. The name is local display data — it is never written into parcels.
+# sets its own. Forklift records no names: a remote's directory supplies them.
 # operator.profile selects a named identity from the global configuration instead.
 
 [operator]
@@ -784,15 +770,13 @@ pub fn unset_value(key: &str, scope: ConfigScope) -> Result<(), String> {
 }
 
 /// Get the operator identity for parcel authorship. Identity is zero-configuration:
-/// when no identifier is set, a UUID is minted (chains are pseudonymous by default),
-/// and the display name falls back to the identifier.
+/// when no identifier is set, a UUID is minted (chains are pseudonymous by default).
 ///
 /// Resolution order:
-/// 1. `operator.profile` (warehouse overrides global) → the named profile's
-///    identifier/name from the global configuration, minting the profile's identifier
-///    on first use.
-/// 2. `operator.identifier` / `operator.name` (warehouse overrides global), minting a
-///    global identifier on first use.
+/// 1. `operator.profile` (warehouse overrides global) → the named profile's identifier
+///    from the global configuration, minting it on first use.
+/// 2. `operator.identifier` (warehouse overrides global), minting a global identifier on
+///    first use.
 ///
 /// # Returns
 /// * `Ok(Operator)` - The resolved operator.
@@ -812,10 +796,6 @@ pub fn get_operator() -> Result<Operator, String> {
             identity.identifier = mint_profile_identifier(&profile)?;
         }
 
-        if identity.name.is_empty() {
-            identity.name = identity.identifier.clone();
-        }
-
         return Ok(identity);
     }
 
@@ -824,11 +804,7 @@ pub fn get_operator() -> Result<Operator, String> {
         None => mint_global_identifier()?,
     };
 
-    let name = get_effective_value(KEY_OPERATOR_NAME)?
-        .map(|(name, _)| name)
-        .unwrap_or_else(|| identifier.clone());
-
-    Ok(Operator { name, identifier })
+    Ok(Operator { identifier })
 }
 
 /// The global `operator.identifier`, minted and written if the global file still has none.
@@ -886,7 +862,7 @@ fn mint_profile_identifier(profile: &str) -> Result<String, String> {
         }
 
         let minted = mint_uuid_v4();
-        set_profile_fields_in_document(&mut document, path, profile, &[(PROFILE_FIELD_IDENTIFIER, &minted)])?;
+        set_profile_identifier_in_document(&mut document, path, profile, &minted)?;
 
         write_validated(path, &document)?;
 
@@ -923,26 +899,25 @@ pub fn list_profiles() -> Result<Vec<(String, Operator)>, String> {
         .collect())
 }
 
-/// Set fields of a named profile in a parsed global configuration document, creating the profile
-/// section when it does not exist yet — **all of them in one edit**, so a profile is never left
-/// holding some of the fields it was given. Writing the document is the caller's, inside the
+/// Set the identifier of a named profile in a parsed global configuration document, creating the
+/// profile section when it does not exist yet. Writing the document is the caller's, inside the
 /// edit lock it read the document under (see [`edit_locked`]).
 ///
 /// # Arguments
-/// * `document` - The global configuration document.
-/// * `path`     - The file it came from, named in a refusal.
-/// * `profile`  - The profile name.
-/// * `fields`   - The `(field, value)` pairs to set (`identifier` and/or `name`).
+/// * `document`   - The global configuration document.
+/// * `path`       - The file it came from, named in a refusal.
+/// * `profile`    - The profile name.
+/// * `identifier` - The operator id to record.
 ///
 /// # Returns
-/// * `Ok(())`      - Every field was set in `document`.
-/// * `Err(String)` - A name or value is empty, a field is not `identifier`/`name` or is given
-///                   twice, or `profile` (or the `[profile]` section itself) is present but is not
-///                   a table. The input checks run before `document` is touched.
-fn set_profile_fields_in_document(document: &mut DocumentMut,
-                                  path: &Path,
-                                  profile: &str,
-                                  fields: &[(&str, &str)]) -> Result<(), String> {
+/// * `Ok(())`      - The identifier was set in `document`.
+/// * `Err(String)` - The profile name or the identifier is empty, or `profile` (or the `[profile]`
+///                   section itself) is present but is not a table. The input checks run before
+///                   `document` is touched.
+fn set_profile_identifier_in_document(document: &mut DocumentMut,
+                                      path: &Path,
+                                      profile: &str,
+                                      identifier: &str) -> Result<(), String> {
     // The write-side half of the parse's emptiness rule, so this function cannot lay down the
     // entry the parse refuses.
     //
@@ -956,38 +931,17 @@ fn set_profile_fields_in_document(document: &mut DocumentMut,
     // understood, and refusing it on load would turn someone else's harmless litter into a file
     // that no command can read. The strict parse is for values that would be *misread*.
     //
-    // Every check in this function — the name, the values, and the field checks below — is a
-    // precondition, not a live defence: both callers already exclude every case —
-    // `create_profile` validates its inputs with its own wording before calling and passes only
-    // the two known fields once each, and `mint_profile_identifier` is reached with an
-    // `operator.profile` that `validate_value` refuses when empty, with a freshly minted
-    // identifier. No caller can reach them, so a unit test calls this function directly on an
-    // in-memory document. Re-check this list if a third caller appears.
+    // Both checks are preconditions, not live defences: both callers already exclude every
+    // case — `create_profile` validates its inputs with its own wording before calling, and
+    // `mint_profile_identifier` is reached with an `operator.profile` that `validate_value`
+    // refuses when empty, with a freshly minted identifier. No caller can reach them, so a unit
+    // test calls this function directly on an in-memory document. Re-check this if a third caller
+    // appears.
     if is_blank(profile) {
         return Err(EMPTY_PROFILE_NAME.to_string());
     }
 
-    // A caller error, not a file error, so not `not_valid`: an unknown field would be written
-    // and then refused by the very parse `write_validated` runs, blaming the user's file for a
-    // bug in the caller; a duplicate would be written twice with the last value silently winning.
-    for (index, (field, _)) in fields.iter().enumerate() {
-        if *field != PROFILE_FIELD_IDENTIFIER && *field != PROFILE_FIELD_NAME {
-            return Err(format!(
-                "Internal error: \"{}\" is not a profile field (expected \"{}\" or \"{}\").",
-                field, PROFILE_FIELD_IDENTIFIER, PROFILE_FIELD_NAME
-            ));
-        }
-
-        if fields[..index].iter().any(|(earlier, _)| earlier == field) {
-            return Err(format!(
-                "Internal error: the profile field \"{}\" was given more than once.", field
-            ));
-        }
-    }
-
-    for (field, value) in fields {
-        require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, profile, field), value)?;
-    }
+    require_non_empty(&format!("{}.{}.{}", SECTION_PROFILE, profile, PROFILE_FIELD_IDENTIFIER), identifier)?;
 
     let section_item = document.entry(SECTION_PROFILE).or_insert(toml_edit::table());
     let actual = section_item.type_name();
@@ -1012,19 +966,15 @@ fn set_profile_fields_in_document(document: &mut DocumentMut,
         SECTION_PROFILE, profile, SECTION_PROFILE, profile, actual
     )))?;
 
-    for (field, value) in fields {
-        table.insert(field, toml_edit::value(*value));
-    }
+    table.insert(PROFILE_FIELD_IDENTIFIER, toml_edit::value(identifier));
 
     Ok(())
 }
 
-/// Create a named profile: record its display name and identifier, minting an
-/// identifier when none is given.
+/// Create a named profile: record its identifier, minting one when none is given.
 ///
 /// # Arguments
 /// * `profile`    - The profile name.
-/// * `name`       - The display name (`None` leaves it to fall back to the identifier).
 /// * `identifier` - The on-chain id (`None` mints a UUID).
 ///
 /// # Returns
@@ -1032,9 +982,7 @@ fn set_profile_fields_in_document(document: &mut DocumentMut,
 /// * `Err(String)`  - If an input is empty, the profile already exists, or the write failed.
 ///                    The configuration file is not changed in any of these cases (see
 ///                    [`edit_locked`] for what may be created beside it).
-pub fn create_profile(profile: &str,
-                      name: Option<&str>,
-                      identifier: Option<&str>) -> Result<Operator, String> {
+pub fn create_profile(profile: &str, identifier: Option<&str>) -> Result<Operator, String> {
     // This door's own wording, checked before anything is read or written. Nothing exists on
     // disk at this point, so the generic "remove the entry" advice would point at an entry that
     // is not there — what the user can actually do is omit the option, and only this door knows
@@ -1052,24 +1000,7 @@ pub fn create_profile(profile: &str,
         );
     }
 
-    if name.is_some_and(is_blank) {
-        return Err(
-            "The display name (--display-name) cannot be empty. Omit it to show the operator id instead."
-                .to_string()
-        );
-    }
-
     let identifier = identifier.map(|id| id.to_string()).unwrap_or_else(mint_uuid_v4);
-
-    // One write for every field. Creation used to be one write per field, so a failure on the
-    // second — a refusal then, any I/O fault after the refusals moved up front — left
-    // `[profile.<name>] identifier = "<uuid>"` on disk, and the retry was refused because the
-    // half-created profile "already exists".
-    let mut fields = vec![(PROFILE_FIELD_IDENTIFIER, identifier.as_str())];
-
-    if let Some(name) = name {
-        fields.push((PROFILE_FIELD_NAME, name));
-    }
 
     edit_locked(&get_config_path(ConfigScope::Global)?, |path| {
         let mut document = load_document(path)?.unwrap_or_default();
@@ -1081,15 +1012,12 @@ pub fn create_profile(profile: &str,
             return Err(format!("The profile \"{}\" already exists.", profile));
         }
 
-        set_profile_fields_in_document(&mut document, path, profile, &fields)?;
+        set_profile_identifier_in_document(&mut document, path, profile, &identifier)?;
 
         write_validated(path, &document)
     })?;
 
-    Ok(Operator {
-        name: name.unwrap_or(&identifier).to_string(),
-        identifier,
-    })
+    Ok(Operator { identifier })
 }
 
 /// Mint a random version-4 UUID (lowercase hyphenated form) — the default operator id,
@@ -1175,7 +1103,7 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
 /// Whether `value` is empty for configuration purposes — the one definition every door uses.
 ///
 /// Whitespace-only counts as empty: `identifier = "   "` is no more an identity than `""` is.
-/// The value is only *tested* trimmed, never stored trimmed — a token or a display name is the
+/// The value is only *tested* trimmed, never stored trimmed — a token or an operator id is the
 /// user's string.
 pub fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
@@ -1201,7 +1129,7 @@ pub fn is_blank(value: &str) -> bool {
 /// **This states the fact and nothing else.** It is reached from several commands, and no advice
 /// is true at all of them (an `--unset` needs the scope, fails for a key that is not set, and
 /// cannot be run for a profile field), so the refusal names the key and stops. The commands that
-/// take a value as an *option* — `profile create --id`/`--display-name`, `franchise --token` — refuse it
+/// take a value as an *option* — `profile create --id`, `franchise --token` — refuse it
 /// themselves first and say to omit the option, which is true wherever they print it.
 fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
     if is_blank(value) {
@@ -1221,7 +1149,7 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
 /// applying the same normalization forever. Normalizing once, here, means the stored value
 /// needs no normalization to be understood at all.
 ///
-/// Free-form keys pass through untouched: a token, a URL or a display name is the user's
+/// Free-form keys pass through untouched: a token, a URL or an operator id is the user's
 /// string, and folding its case would corrupt it.
 fn storable_value(key: &str, value: &str) -> String {
     match key {
@@ -1474,34 +1402,34 @@ mod tests {
     fn values_can_be_set_and_read_back() {
         let mut document = DocumentMut::default();
 
-        set_value_in_document(&mut document, "operator", "name", "Máté").unwrap();
+        set_value_in_document(&mut document, "operator", "identifier", "máté@example.com").unwrap();
 
         let config = parse_config(&document, Path::new("config.toml")).unwrap();
-        assert_eq!(config.get(KEY_OPERATOR_NAME), Some("Máté"));
-        assert_eq!(config.get(KEY_OPERATOR_IDENTIFIER), None);
+        assert_eq!(config.get(KEY_OPERATOR_IDENTIFIER), Some("máté@example.com"));
+        assert_eq!(config.get(KEY_OPERATOR_PROFILE), None);
     }
 
     #[test]
     fn setting_a_value_preserves_comments_and_other_entries() {
         // Only the overwritten value's own inline comment may be lost; everything else
         // (leading comments, comments on untouched lines) must survive the rewrite.
-        let original = "# A comment that must survive.\n[operator]\nname = \"Old Name\"\nidentifier = \"old@id\" # untouched comment\n";
+        let original = "# A comment that must survive.\n[operator]\nprofile = \"old\"\nidentifier = \"old@id\" # untouched comment\n";
         let mut document: DocumentMut = original.parse().unwrap();
 
-        set_value_in_document(&mut document, "operator", "name", "New Name").unwrap();
+        set_value_in_document(&mut document, "operator", "profile", "new").unwrap();
 
         let written = document.to_string();
         assert!(written.contains("# A comment that must survive."));
         assert!(written.contains("# untouched comment"));
 
         let config = parse_config(&document, Path::new("config.toml")).unwrap();
-        assert_eq!(config.get(KEY_OPERATOR_NAME), Some("New Name"));
+        assert_eq!(config.get(KEY_OPERATOR_PROFILE), Some("new"));
         assert_eq!(config.get(KEY_OPERATOR_IDENTIFIER), Some("old@id"));
     }
 
     #[test]
     fn removing_a_value_leaves_comments_and_other_entries() {
-        let original = "# Keep me.\n[operator]\nname = \"Name\"\nidentifier = \"id\"\n[remote]\ntoken = \"secret\"\n";
+        let original = "# Keep me.\n[operator]\nprofile = \"work\"\nidentifier = \"id\"\n[remote]\ntoken = \"secret\"\n";
         let mut document: DocumentMut = original.parse().unwrap();
 
         assert!(remove_value_from_document(&mut document, "remote", "token").unwrap());
@@ -1512,7 +1440,7 @@ mod tests {
         let written = document.to_string();
         assert!(written.contains("# Keep me."));
         assert!(!written.contains("secret"));
-        assert_eq!(config.get(KEY_OPERATOR_NAME), Some("Name"));
+        assert_eq!(config.get(KEY_OPERATOR_PROFILE), Some("work"));
 
         // Removing an absent field (or an absent section) reports "not present".
         assert!(!remove_value_from_document(&mut document, "remote", "token").unwrap());
@@ -1521,9 +1449,9 @@ mod tests {
 
     #[test]
     fn dotted_keys_written_by_hand_are_readable() {
-        // Users may write `operator.name = "..."` at the top level instead of using
+        // Users may write `operator.identifier = "..."` at the top level instead of using
         // an `[operator]` section; both spellings must be readable.
-        assert_eq!(parse("operator.name = \"Dotted\"\n").unwrap().get(KEY_OPERATOR_NAME), Some("Dotted"));
+        assert_eq!(parse("operator.identifier = \"Dotted\"\n").unwrap().get(KEY_OPERATOR_IDENTIFIER), Some("Dotted"));
     }
 
     /// Reachable again, and therefore user-visible: since `write_validated` moved the parse to
@@ -1534,7 +1462,7 @@ mod tests {
     fn setting_a_value_in_a_section_that_is_not_a_table_is_reported() {
         let mut document: DocumentMut = "operator = 1\n".parse().unwrap();
 
-        let error = set_value_in_document(&mut document, "operator", "name", "x").unwrap_err();
+        let error = set_value_in_document(&mut document, "operator", "identifier", "x").unwrap_err();
 
         assert!(error.contains("\"operator\" must be a table"), "unexpected error: {error}");
         assert!(error.contains("not integer"), "the error must name what is there: {error}");
@@ -1580,9 +1508,12 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let error = split_key("operator.unknown").unwrap_err();
         assert!(error.contains("Unknown configuration key"));
-        assert!(error.contains(KEY_OPERATOR_NAME));
+        assert!(error.contains(KEY_OPERATOR_IDENTIFIER));
 
-        assert_eq!(split_key(KEY_OPERATOR_NAME).unwrap(), ("operator", "name"));
+        assert_eq!(split_key(KEY_OPERATOR_IDENTIFIER).unwrap(), ("operator", "identifier"));
+
+        // There is no display-name key: forklift records no names, so one would do nothing.
+        assert!(split_key("operator.name").unwrap_err().contains("Unknown configuration key"));
     }
 
     #[test]
@@ -1702,9 +1633,7 @@ mod tests {
     /// Profile *names* are the user's to choose; only the fields inside them are constrained.
     #[test]
     fn profiles_parse_in_file_order_with_their_optional_fields() {
-        let config = parse(
-            "[profile.work]\nidentifier = \"op-1\"\nname = \"Work\"\n\n[profile.home]\nname = \"Home\"\n"
-        ).unwrap();
+        let config = parse("[profile.work]\nidentifier = \"op-1\"\n\n[profile.home]\n").unwrap();
 
         assert_eq!(
             config.profiles.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
@@ -1716,7 +1645,7 @@ mod tests {
 
         // An absent field becomes the empty string the identity resolver treats as "fill in".
         assert_eq!(config.profile("home").unwrap().to_operator().identifier, "");
-        assert_eq!(config.profile("work").unwrap().to_operator().name, "Work");
+        assert_eq!(config.profile("work").unwrap().to_operator().identifier, "op-1");
     }
 
     /// The privacy case type-strictness alone does not reach: `onn` is a perfectly good string,
@@ -1783,34 +1712,24 @@ mod tests {
 
         // The separation that makes the above mean something: a value that merely *contains*
         // whitespace is untouched, and a free-form value is never trimmed on its way in.
-        assert!(validate_value(KEY_OPERATOR_NAME, "  Ada  Lovelace  ").is_ok());
-        assert!(require_non_empty("profile.work.name", " A ").is_ok());
+        assert!(validate_value(KEY_OPERATOR_IDENTIFIER, "  Ada  Lovelace  ").is_ok());
+        assert!(require_non_empty("profile.work.identifier", " A ").is_ok());
     }
 
-    /// An unknown or repeated profile field is the caller's bug, refused as
-    /// such — not written (an unknown one would then be blamed on the user's file by the parse,
-    /// and a repeated one would be written twice with the last silently winning).
-    ///
-    /// Every value here is blank **on purpose**: these checks run before the emptiness check, so
-    /// each assertion distinguishes them by message — and if one is removed, the blank value is
-    /// refused next. The document is in memory, so no file is ever touched, and it must come
-    /// out of every refusal unchanged.
+    /// Both input checks of the profile setter refuse before the document is touched. The document
+    /// is in memory, so no file is ever touched, and it must come out of every refusal unchanged.
     #[test]
-    fn set_profile_fields_refuses_an_unknown_or_repeated_field_as_a_caller_error() {
+    fn set_profile_identifier_refuses_a_blank_name_or_identifier_without_touching_the_document() {
         let path = Path::new("config.toml");
         let mut document = DocumentMut::default();
 
-        let unknown = set_profile_fields_in_document(&mut document, path, "work", &[("bogus", "")]).unwrap_err();
-        assert!(unknown.contains("\"bogus\" is not a profile field"), "unexpected: {unknown}");
-
-        let repeated = set_profile_fields_in_document(
-            &mut document, path, "work", &[(PROFILE_FIELD_NAME, "x"), (PROFILE_FIELD_NAME, "")]
-        ).unwrap_err();
-        assert!(repeated.contains("more than once"), "unexpected: {repeated}");
-
         assert_eq!(
-            set_profile_fields_in_document(&mut document, path, " ", &[(PROFILE_FIELD_NAME, "")]).unwrap_err(),
+            set_profile_identifier_in_document(&mut document, path, " ", "op-1").unwrap_err(),
             EMPTY_PROFILE_NAME
+        );
+        assert_eq!(
+            set_profile_identifier_in_document(&mut document, path, "work", " ").unwrap_err(),
+            "\"profile.work.identifier\" cannot be empty."
         );
 
         assert_eq!(document.to_string(), "", "a refused edit must not touch the document");
@@ -1831,10 +1750,10 @@ mod tests {
         assert_eq!(storable_value(KEY_REMOTE_TOR, "Off"), "off");
         assert_eq!(storable_value(KEY_REMOTE_TOR, "on"), "on");
 
-        // A token, a URL and a display name are the user's strings: case and surrounding
+        // A token, a URL and an operator id are the user's strings: case and surrounding
         // whitespace are content, and folding them would corrupt the value.
         assert_eq!(storable_value(KEY_REMOTE_TOKEN, "  AbC-123  "), "  AbC-123  ");
-        assert_eq!(storable_value(KEY_OPERATOR_NAME, "Ada L."), "Ada L.");
+        assert_eq!(storable_value(KEY_OPERATOR_IDENTIFIER, "Ada L."), "Ada L.");
         assert_eq!(storable_value(KEY_REMOTE_URL, "HTTP://Example.COM"), "HTTP://Example.COM");
     }
 
@@ -1988,10 +1907,11 @@ mod tests {
             ("any other unknown section",
              &[("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section")]),
             ("an unknown key inside a known section",
-             &[("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key")]),
+             &[("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key"),
+               ("[operator]\nname = \"Ada\"\n",          "\"operator.name\" is not a known configuration key")]),
             ("an array-of-tables where a table is expected",
-             &[("[[operator]]\nname = \"ada\"\n",        "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
-               ("[[profile.work]]\nname = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables")]),
+             &[("[[operator]]\nidentifier = \"ada\"\n",  "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
+               ("[[profile.work]]\nidentifier = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables")]),
             ("a section that is not a table at all",
              &[("operator = 5\n",                        "\"operator\" must be a table (written \"[operator]\"), not integer")]),
             ("every value is a **string on disk**",
@@ -2004,8 +1924,9 @@ mod tests {
             ("`maintenance.auto` accepts only",
              &[("[maintenance]\nauto = \"flase\"\n",     "\"flase\" is not a valid value for maintenance.auto"),
                ("[maintenance]\nloose = \"10k\"\n",      "\"10k\" is not a valid value for maintenance.loose")]),
-            ("profiles hold `identifier` and `name`, nothing else",
-             &[("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field")]),
+            ("profiles hold only `identifier`",
+             &[("[profile.work]\nnickname = \"w\"\n",    "\"profile.work.nickname\" is not a known profile field"),
+               ("[profile.work]\nname = \"Work\"\n",     "\"profile.work.name\" is not a known profile field")]),
             ("there is no third state",
              &[("[operator]\nidentifier = \"\"\n",       "\"operator.identifier\" cannot be empty"),
                ("[profile.work]\nidentifier = \"   \"\n", "\"profile.work.identifier\" cannot be empty")]),
@@ -2042,7 +1963,7 @@ mod tests {
         let good = parse(
             "[operator]\nidentifier = \"ada\"\n\n[maintenance]\nloose = \"6700\"\n\n\
              [remote]\ntor = \"on\"\ntorProxy = \"socks5h://127.0.0.1:9050\"\n\n\
-             [profile.work]\nname = \"Work\"\n"
+             [profile.work]\nidentifier = \"op-1\"\n"
         ).unwrap();
 
         assert_eq!(good.get(KEY_MAINTENANCE_LOOSE), Some("6700"));

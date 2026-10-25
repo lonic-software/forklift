@@ -81,7 +81,6 @@ impl Warehouse {
 
     fn prepare(&self) {
         self.run_ok(&["prepare"]);
-        self.run_ok(&["config", "operator.name", "determinism@forklift"]);
         self.run_ok(&["config", "operator.identifier", "determinism@forklift"]);
     }
 

@@ -786,7 +786,7 @@ mod tests {
         let config = json("config");
         assert!(config.contains(concat!(
             r#""key-value":{"repeat":{"max":2,"secret":true},"description":"#,
-            r#""key: The configuration key (e.g. \"operator.name\"); omit it to list every key | "#,
+            r#""key: The configuration key (e.g. \"remote.url\"); omit it to list every key | "#,
             r#"value: The value to set the key to; omit it to print the current value"}"#,
         )), "{config}");
 

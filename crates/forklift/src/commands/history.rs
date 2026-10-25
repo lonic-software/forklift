@@ -324,11 +324,9 @@ impl HistoryEntry {
         let actions = parcel.actions.iter().map(|action| {
             let identifier = action.operator.identifier.clone();
 
-            // A resolved name (the resolution hook) wins; the parser's
-            // identifier-as-name fallback is not a real name and is dropped.
-            let name = names.get(&identifier).cloned().or_else(|| {
-                (action.operator.name != identifier).then(|| action.operator.name.clone())
-            });
+            // Names come only from the remote's directory (the resolution hook); an operator it
+            // does not name has none.
+            let name = names.get(&identifier).cloned();
 
             // The signed office record carries the class and supervisor (§7.1). A human
             // (the default, and the fallback for an operator not in the office) shows

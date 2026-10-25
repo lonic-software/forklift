@@ -3607,12 +3607,6 @@ A command not listed here either reports only the generic human-message shape `{
     "ProfileEntry": {
       "description": "One profile and how many local keys it holds.",
       "properties": {
-        "display_name": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "identifier": {
           "description": "The operator id (`null` for the default before any id is minted).",
           "type": [
