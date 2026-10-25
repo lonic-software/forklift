@@ -62,7 +62,9 @@ forklift import-git .
 
 One-way migration of a git repo's history into the warehouse: git commits become
 parcels, trees become trees, blobs become blobs, and each **local branch becomes a
-pallet** (git's author/committer split maps onto forklift's author/stack). A branch's pallet
+pallet** (git's author/committer split maps onto forklift's author/stack). An author or committer
+becomes the operator id of their git email; the git name is not kept, since forklift records no
+names (so `export-git` later writes that email as the author name). A branch's pallet
 name is its name lowercased, with every character a pallet name does not allow replaced by `-`,
 and any part that would then start with `-` prefixed with `branch` (`@wip` becomes `branch-wip`).
 Before anything is converted, the import refuses, naming the branches, when a mapped name is
@@ -126,8 +128,8 @@ the current pallet, and its working tree is checked out). The point is that tryi
 reversible — your code history is never trapped. Requires `git` on your PATH; the target path
 must be empty or new. **Lossy in this direction:** git has no home for the signed office, the
 `@manifest` (approvals/provenance) or per-parcel signatures, so those are dropped. Author
-identity round-trips as the on-chain **identifier** — forklift never stores display names
-on-chain (zero-PII by design), so the git author name is that identifier (or `forklift`, when
+identity round-trips as the on-chain **identifier** — forklift records no display names
+(zero-PII by design), so the git author name is that identifier (or `forklift`, when
 the identifier holds nothing git keeps in a name). The meta pallets (`@office`, `@manifest`)
 and tags are not exported. Dates are written in UTC (`+0000`), and git has no date before 1970,
 so a parcel stamped earlier exports as 1970-01-01.
@@ -2171,7 +2173,8 @@ Refused, in either file:
 | Written | Why |
 |---------|-----|
 | `[opperator]`, or any other unknown section | a mistyped section header hides every key inside it |
-| `identifer = "ada"`, `name = "Ada"` | an unknown key inside a known section — the typo that mints over your identity. There is no `name` key: Forklift records no names |
+| `identifer = "ada"` | an unknown key inside a known section — the typo that mints over your identity |
+| `name = "Ada"` in `[operator]` | Forklift records no names, so there is no such key — delete the line. Names come only from a remote's directory |
 | `[[operator]]`, `[[profile.work]]` | an array-of-tables where a table is expected |
 | `operator = 5` | a section that is not a table at all |
 | `loose = 6700`, `tor = true` | every value is a **string on disk**, including the numeric and boolean ones — write `"6700"` and `"on"` |

@@ -1903,12 +1903,13 @@ mod tests {
         // contain, not merely "it is refused" — a case that started failing for an *unrelated*
         // reason would otherwise keep this test green while the guide's explanation of it
         // quietly became wrong.
-        let rows: [(&str, &[(&str, &str)]); 10] = [
+        let rows: [(&str, &[(&str, &str)]); 11] = [
             ("any other unknown section",
              &[("[opperator]\nidentifier = \"ada\"\n",   "\"opperator\" is not a known configuration section")]),
             ("an unknown key inside a known section",
-             &[("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key"),
-               ("[operator]\nname = \"Ada\"\n",          "\"operator.name\" is not a known configuration key")]),
+             &[("[operator]\nidentifer = \"ada\"\n",     "\"operator.identifer\" is not a known configuration key")]),
+            ("Forklift records no names",
+             &[("[operator]\nname = \"Ada\"\n",          "\"operator.name\" is not a known configuration key")]),
             ("an array-of-tables where a table is expected",
              &[("[[operator]]\nidentifier = \"ada\"\n",  "\"operator\" must be a table (written \"[operator]\"), not array of tables"),
                ("[[profile.work]]\nidentifier = \"ada\"\n",    "\"profile.work\" must be a table (written \"[profile.work]\"), not array of tables")]),

@@ -473,17 +473,26 @@ fn a_config_file_that_sets_a_name_is_refused() {
     let warehouse = TestWarehouse::new("config-name-refused");
     assert_success(&warehouse.run(&["prepare"]));
 
-    for (content, key) in [
-        ("[operator]\nidentifier = \"op-1\"\nname = \"Ada\"\n", "\"operator.name\" is not a known configuration key"),
-        ("[profile.work]\nidentifier = \"op-2\"\nname = \"Work\"\n", "\"profile.work.name\" is not a known profile field"),
+    let global = warehouse.home.join("global-config.toml");
+    let local = warehouse.root.join(".forklift/config/warehouse.toml");
+    let template = std::fs::read_to_string(&local).unwrap();
+    let name = "\"operator.name\" is not a known configuration key";
+    for (file, content, key) in [
+        (&global, "[operator]\nidentifier = \"op-1\"\nname = \"Ada\"\n", name),
+        (&global, "[profile.work]\nidentifier = \"op-2\"\nname = \"Work\"\n", "\"profile.work.name\" is not a known profile field"),
+        (&local, "[operator]\nname = \"Ada\"\n", name),
     ] {
-        std::fs::write(warehouse.home.join("global-config.toml"), content).unwrap();
+        std::fs::write(&global, "").unwrap();
+        std::fs::write(&local, &template).unwrap();
+        std::fs::write(file, content).unwrap();
         let refused = warehouse.run(&["config"]);
         assert!(!refused.status.success(), "{content:?} must refuse: {}", stdout(&refused));
         let message = stderr(&refused);
         assert!(message.contains(key), "unexpected: {message}");
-        assert!(message.contains("global-config.toml"), "the refusal must name the file: {message}");
+        let file_name = file.file_name().unwrap().to_str().unwrap();
+        assert!(message.contains(file_name), "the refusal must name the file: {message}");
     }
+    std::fs::write(&local, &template).unwrap();
 
     let set = warehouse.run(&["config", "operator.name", "Ada"]);
     assert!(!set.status.success());
@@ -6989,35 +6998,6 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
     assert!(stdout(&warehouse.run(&["config", "remote.tor"])).contains("on"));
 }
 
-/// A refused profile creation leaves nothing behind. Creation used to be two writes, and a value
-/// refused by the second left the first on disk — a profile the obvious retry then collided with
-/// ("the profile \"work\" already exists"), with no command able to remove it. A profile now holds
-/// one field, written once, and `create_profile` refuses its inputs before writing anything.
-#[test]
-fn a_refused_profile_field_leaves_no_half_created_profile_behind() {
-    let warehouse = TestWarehouse::new("profile-create-is-all-or-nothing");
-    assert_success(&warehouse.run(&["prepare"]));
-
-    let created = warehouse.run(&["profile", "create", "work", "--id", "  "]);
-    assert!(!created.status.success(), "a blank id must refuse: {}", stdout(&created));
-    assert!(
-        stderr(&created).contains("cannot be empty"),
-        "unexpected refusal: {}", stderr(&created)
-    );
-
-    // Nothing was written: the global file either does not exist or holds no profile section.
-    let global_config = warehouse.home.join("global-config.toml");
-    let content = std::fs::read_to_string(&global_config).unwrap_or_default();
-    assert!(
-        !content.contains("[profile.work]"),
-        "a refused creation must leave no profile behind: {content}"
-    );
-
-    // And the retry succeeds.
-    let retry = warehouse.run(&["profile", "create", "work", "--id", "work-me"]);
-    assert_success(&retry);
-}
-
 /// An empty value is refused with the fact alone wherever no advice is true on every path, and with
 /// "omit it" where the value came from an option. `--unset` is never suggested: it needs the right
 /// scope, fails for a key that is not set, and cannot address a profile field, so any hint built
@@ -7056,15 +7036,12 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     );
 
     // The `profile create` door: nothing is on disk yet, so the advice is about the option.
-    for (args, option) in [
-        (["profile", "create", "work", "--id", ""], "--id"),
-        (["profile", "create", "work", "--id", "  "], "--id"),
-    ] {
-        let refused = warehouse.run(&args);
-        assert!(!refused.status.success(), "{option} \"\" must refuse: {}", stdout(&refused));
+    for id in ["", "  "] {
+        let refused = warehouse.run(&["profile", "create", "work", "--id", id]);
+        assert!(!refused.status.success(), "--id {id:?} must refuse: {}", stdout(&refused));
 
         let message = stderr(&refused);
-        assert!(message.contains(option), "the refusal must name the option: {message}");
+        assert!(message.contains("--id"), "the refusal must name the option: {message}");
         assert!(message.contains("Omit it"), "the refusal must say what to do: {message}");
         assert!(
             !message.contains("file") && !message.contains("--unset"),

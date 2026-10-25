@@ -320,8 +320,8 @@ verifying history.
 a name or email. See
 [Profiles and pseudonymity](trust-and-identity.md#11-profiles-and-pseudonymity).
 
-**Display name** (git: `user.name`). Your name as shown on your own machine. It is never sent
-anywhere.
+**Display name** (git: `user.name`). The name a remote's directory gives an operator id, shown in
+place of the id where the remote supplies one. Forklift keeps no names of its own.
 
 **Profile.** A named identity, so one machine can act as different operators.
 

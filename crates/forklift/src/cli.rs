@@ -676,8 +676,8 @@ pub enum Command {
 
     /// Manage identity profiles (named operator ids) and select one per warehouse
     #[command(
-        long_about = "Manage identity profiles: named identity bundles (an operator id and a \
-                      display name) stored in the global configuration. A warehouse selects one \
+        long_about = "Manage identity profiles: named operator ids stored in the global \
+                      configuration. A warehouse selects one \
                       with \"profile use\", so one machine can act as different operators in \
                       different warehouses — e.g. a personal identity and one per organization. \
                       Without a subcommand, the profiles are listed."
