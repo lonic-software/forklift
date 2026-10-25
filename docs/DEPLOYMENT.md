@@ -310,7 +310,8 @@ table; DynamoDB is schemaless beyond the key.
 ### The CAS
 
 `compare_and_set_head` is a real conditional write, not a read-then-write — the atomicity that
-lets this head scale horizontally where `forklift-server` needs an in-process mutex. As of
+lets this head scale horizontally where `forklift-server`'s rests on a file lock on one machine's
+filesystem. As of
 FORK-95 it is a `TransactWriteItems` of up to three actions rather than a single-item
 `UpdateItem`: an `Update` on the target pallet's own item (`ConditionExpression` encoding the
 caller's expected head, exactly the prior single-item shape), a `ConditionCheck` on the office

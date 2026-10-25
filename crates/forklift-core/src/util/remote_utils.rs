@@ -954,11 +954,6 @@ pub(crate) const PRESENCE_ALLOWANCE_MS_PER_OP: f64 = 5.0;
 /// **Named residuals — a bounded list of the ones this fix found, not a claim that no others
 /// exist:**
 ///
-/// - `put_trust` holds `warehouse.writes` for the whole of its handler — the same mutex the
-///   ref-update handler holds across closure verification, ancestry and the office-chain verify,
-///   work this module elsewhere documents can legitimately run minutes. A first-contact `put_trust`
-///   racing another client's long first lift on the same warehouse exceeds this budget regardless
-///   of its size; see [`RemoteClient::put_trust`]'s own doc for why that is accepted.
 /// - `upload_signature`'s handler (on `forklift-server`) reaches `office_utils::read_office_state`,
 ///   which loads one object per user record and one per key record — O(roster), not O(constant),
 ///   so a large roster shifts it without bound.
@@ -1380,8 +1375,7 @@ mod clients {
         /// against `forklift-server`: single-write endpoints whose server side runs a fixed number
         /// of individually-capped hooks after the body is already in hand — not O(constant) file
         /// I/O overall, since `upload_signature`'s handler also reaches an O(roster) office-state
-        /// read and `put_trust` can hold the warehouse write lock for as long as a concurrent
-        /// ref-update runs — so a total deadline is honest as a price on the hook sequence, not as
+        /// read — so a total deadline is honest as a price on the hook sequence, not as
         /// a ceiling on the whole handler; see [`super::SINGLE_WRITE_ALLOWANCE`]'s own doc for the
         /// arithmetic and the residuals it does not price, including the second head that runs no
         /// hooks at all. But the mutation invariant still applies: neither
@@ -4107,18 +4101,9 @@ impl RemoteClient {
     /// Rides [`Posture::TotalDeadlineNoRedirect`], sized by [`Self::single_write_budget`] — same
     /// reasoning as [`Self::upload_signature`]'s doc: a mutation on this client never
     /// auto-follows any redirect, unconditionally, and before FORK-89 this call had no such
-    /// guard at all.
-    ///
-    /// **Accepted residual:** the server holds `warehouse.writes` — the same mutex the ref-update
-    /// handler holds across closure verification, ancestry and the office-chain verify, work this
-    /// module elsewhere documents can legitimately run minutes — for the whole of this call's
-    /// handler, including its own read/write of the trust anchor. A first-contact `put_trust`
-    /// racing another client's long first lift on the same warehouse can therefore exceed
-    /// [`Self::single_write_budget`], however generous. Not absorbed by inflating the budget:
-    /// minutes cannot be absorbed by a flat bound sized for O(constant) work. Accepted because it
-    /// is rare (`put_trust` fires on first contact or re-genesis, not per lift), the failure is
-    /// loud and correctly worded (the standard mutation-uncertainty message, not a hang), and a
-    /// retry converges once the racing lift releases the lock.
+    /// guard at all. On `forklift-server` the handler does not wait for a concurrent lift's
+    /// verification, however long it runs; what it can still wait on unpriced is that server's
+    /// shared `spawn_blocking` pool (see [`SINGLE_WRITE_ALLOWANCE`]'s residuals).
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
         let action = "uploading the trust anchor";
         let outcome = self.send_on(

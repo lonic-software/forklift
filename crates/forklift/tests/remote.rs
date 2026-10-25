@@ -3007,11 +3007,10 @@ fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
     let server = Server::start(&area, None);
     let root_str = area.path("server-root").to_str().unwrap().to_string();
 
-    // A second server on the same root is refused up front (it would silently break the first
-    // server's in-process ref-update CAS). The acquire happens before the serve loop, so this
-    // fails fast rather than blocking. --open: this is a raw `Command`, not `Server::spawn`, so
-    // it needs its own explicit opt-out of authentication to reach the serve-lock refusal this
-    // test is actually about, rather than the auth-config refusal (checked even earlier).
+    // A second server on the same root is refused up front (one serving process per root). The
+    // acquire happens before the serve loop, so this fails fast rather than blocking. --open:
+    // this is a raw `Command`, not `Server::spawn`, so it needs its own explicit opt-out of
+    // authentication to reach the serve-lock refusal this test is actually about, rather than the auth-config refusal (checked even earlier).
     let second = server_command()
         .args(["serve", "--root", &root_str, "--addr", "127.0.0.1:0", "--open"])
         .output()

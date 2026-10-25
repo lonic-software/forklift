@@ -266,8 +266,9 @@ Body: the trust anchor `{"genesis": …, "enabled_at": …, "boundary": […]}` 
 `prior_genesis` and `adopts` on a re-genesis anchor). Establishing trust on a remote is
 the same one-way door it is locally: accepted only when the remote has no anchor yet
 (`201`), idempotent when the anchor is identical (`200`), and `409` otherwise. The
-server serializes trust establishment with ref updates: two concurrent first contacts
-can never both plant their anchor — exactly one wins, the other gets the `409`. The
+install is a compare-and-set on the anchor the server read: two concurrent first contacts
+can never both plant their anchor — exactly one wins, the other gets the `409` (or the
+`200`, when its anchor is the identical one that won). The
 anchor comes first and the office pallet ref (with its objects) follows in the same sync:
 no head lifts `@office` while it holds no anchor (`422`), and the anchor without the chain
 verifies nothing. A remote that holds `@office` but no anchor has lost its anchor, and

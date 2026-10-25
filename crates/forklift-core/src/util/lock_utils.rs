@@ -127,8 +127,7 @@ fn serve_lock_path() -> PathBuf {
 /// root: neither can sweep a live server's in-flight objects (a lift slower than the grace period —
 /// or any lift, for a repack — would otherwise lose its staged objects and then fail its ref
 /// update), and a second server accidentally started on the
-/// same root is refused up front instead of silently breaking the first server's in-process
-/// ref-update CAS. `bundle` deliberately does *not* take it — it never deletes an object,
+/// same root is refused up front, keeping one serving process per root. `bundle` deliberately does *not* take it — it never deletes an object,
 /// writes atomically, and a stale bundle is self-healing, so it is safe against a live server.
 ///
 /// Distinct from [`StoreLock`], which serializes destructive store *maintenance* against itself
