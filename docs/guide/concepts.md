@@ -256,7 +256,8 @@ There are two server **heads** behind one protocol:
 - **The AWS head** (`forklift-aws-lambda`): API Gateway and two Lambda functions in front of S3
   and DynamoDB. Uploads and downloads of objects go directly between the client and S3 on
   presigned URLs instead of through the API; the functions read an upload only to check its
-  hash. Signatures, which are small, come through the API. See [the deployment reference](../DEPLOYMENT.md).
+  hash. Signatures, which are small, come through the API. See
+  [the deployment reference](../DEPLOYMENT.md).
 
 Reference: [Working with remotes](cli.md#6-working-with-remotes) and the
 [remote protocol](../format/REMOTE_PROTOCOL.md).
@@ -278,9 +279,9 @@ $ forklift heal
 Nothing to heal — no durability taint is standing.
 ```
 
-Locks are the exception. Like git's `index.lock`, Forklift's locks are files, and a command that is
-killed hard leaves its lock behind. The next command refuses and names the process that held it,
-and you remove the lock once that process is gone. A hard-killed `forklift-server` leaves its serve
+Locks are the exception. Like git's `index.lock`, most of Forklift's locks are files, and a
+command that is killed hard leaves its lock behind. The next command refuses, usually naming the
+process that held it, and you remove the lock once that process is gone. A hard-killed `forklift-server` leaves its serve
 lock the same way; see [Running a server](../SERVER.md).
 
 Reference: [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation) and

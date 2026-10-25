@@ -13,9 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// The targets of the inline links `[text](target)` on a page, with their line numbers, outside
-/// code. Code spans are found per paragraph, as CommonMark finds them: a run of backticks opens one
-/// only if a run of the same length follows in the paragraph, even on a later line, and an
-/// unmatched run is a literal backtick.
+/// code. Code spans are found per block, as CommonMark finds them: a run of backticks opens one
+/// only if a run of the same length follows in the block, even on a later line, and an unmatched
+/// run is a literal backtick. A block ends at a blank line, after a heading, and before a line
+/// that starts a new one (a heading, list item, quote or table row).
 fn link_targets(page: &str) -> Vec<(usize, String)> {
     let lines = prose_lines(page);
     let mut targets = Vec::new();
@@ -26,7 +27,11 @@ fn link_targets(page: &str) -> Vec<(usize, String)> {
             continue;
         }
         let mut last = first;
-        while last + 1 < lines.len() && !lines[last + 1].trim().is_empty() {
+        while last + 1 < lines.len()
+            && !lines[last + 1].trim().is_empty()
+            && !starts_block(lines[last])
+            && !starts_block(lines[last + 1])
+        {
             last += 1;
         }
         let paragraph = lines[first..=last].join("\n");
@@ -43,6 +48,19 @@ fn link_targets(page: &str) -> Vec<(usize, String)> {
         first = last + 1;
     }
     targets
+}
+
+/// Whether `line` starts a block of its own, which ends the one before it. A heading is a whole
+/// block, so it ends at its own line too; list items, quotes and table rows are treated the same,
+/// which only ever splits more finely than CommonMark does.
+fn starts_block(line: &str) -> bool {
+    let line = line.trim_start();
+    let numbered = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    line.starts_with('#')
+        || line.starts_with('>')
+        || line.starts_with('|')
+        || ["- ", "* ", "+ "].iter().any(|marker| line.starts_with(marker))
+        || (numbered.len() < line.len() && (numbered.starts_with(". ") || numbered.starts_with(") ")))
 }
 
 /// `paragraph` with every code span replaced by one space. Line breaks inside a span are kept, so
@@ -205,6 +223,11 @@ fn links_are_read_outside_code_only() {
     // A span closes only on a run of its own length, and never across a blank line.
     assert!(targets("``a ` b\n[not](a link) c``").is_empty());
     assert_eq!(targets("`open\n\n[a](x.md)` text"), ["x.md"]);
+    // Nor across list items, table rows, quotes or a heading and its text.
+    assert_eq!(targets("- a stray ` tick\n- see [a](x.md), another ` tick"), ["x.md"]);
+    assert_eq!(targets("| ` | x |\n| [a](x.md) | ` |"), ["x.md"]);
+    assert_eq!(targets("## A ` heading\n[a](x.md) then `"), ["x.md"]);
+    assert_eq!(targets("1. a ` tick\n2) [a](x.md) `"), ["x.md"]);
     // A target wrapped onto the next line is read as empty, which is reported, not skipped.
     assert_eq!(targets("[a](\nx.md)"), [""]);
 }
