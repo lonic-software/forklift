@@ -34,6 +34,7 @@ use forklift_core::model::remote::{
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
+use forklift_core::util::authority_utils::{self, Denied, Principal};
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{
     AnchorPrecondition, BoundaryScope, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError,
@@ -335,20 +336,6 @@ struct AppState {
     /// construction below), so in a server built through `serve` this field being `false`
     /// guarantees at least one of those three is `Some`/non-empty.
     open: bool,
-}
-
-/// Who a request is: the transport-level identity. Content-level authorization (roles,
-/// pallet grants) is decided against the warehouse's office state.
-#[derive(Clone, PartialEq, Eq)]
-enum Principal {
-    /// No authentication is configured on this server: full access.
-    Open,
-
-    /// The static token: full access (the operator of the server itself).
-    Static,
-
-    /// A per-operator token, bound to this office identifier.
-    Operator(String),
 }
 
 /// A handler error: a status code and the message for the JSON error body.
@@ -973,7 +960,7 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
         // unified the rule the token check above used to lack); what still differs between them
         // is normalization, not presence — a token's real, non-blank value is compared byte-exact
         // and never trimmed (above), and an identity's real, non-blank value is *also* never
-        // trimmed: `office_user_of` matches it by exact equality against the tracked office
+        // trimmed: `authority_utils::office_user_of` matches it by exact equality against the tracked office
         // roster, so trimming a legitimately whitespace-padded identifier here would be the
         // reason it can never match again (see
         // `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed` below).
@@ -1421,13 +1408,13 @@ fn emit_event(state: &Arc<AppState>, event: HookEvent) {
 /// `remote_utils::test_retrieval_delay` — what a test needs to pin here is not a
 /// duration but an ordering (a revocation landing after the authorization answer is
 /// fixed and before the write), and a duration long enough to be safe against scheduling jitter would also
-/// be long enough to slow every other test that happens to call `office_user_of`
-/// while it runs. Keyed by identifier, not a bare on/off flag: several other tests in
-/// this file exercise `office_user_of` concurrently (different threads, same
-/// process), and an unkeyed seam would occasionally rendezvous with one of *their*
-/// calls instead of the armed test's own, hanging it. `Mutex`, not thread-local:
-/// `office_user_of` runs on whichever `spawn_blocking` thread tokio schedules the
-/// request onto, which is never the thread a test arms this from.
+/// be long enough to slow every other test that happens to reach the ref update's move
+/// gate while it runs. Keyed by identifier, not a bare on/off flag: several other tests
+/// in this file exercise that gate concurrently (different threads, same process), and
+/// an unkeyed seam would occasionally rendezvous with one of *their* requests instead of
+/// the armed test's own, hanging it. `Mutex`, not thread-local: the gate runs on
+/// whichever `spawn_blocking` thread tokio schedules the request onto, which is never
+/// the thread a test arms this from.
 /// The armed seam: the identifier to rendezvous on, the channel the checkpoint
 /// signals it has been reached, and the gate it then waits on.
 #[cfg(test)]
@@ -1523,67 +1510,25 @@ fn office_state_at(office_head: &Option<String>) -> Result<office_utils::OfficeS
     }
 }
 
-/// Look up an operator's user record in this warehouse's office, against the trust
-/// anchor and office state a caller's own audit consumed — never re-read here. A
-/// caller with no audit of its own to agree with (`require_uploader`) reads both for
-/// itself and passes them through; a caller whose commit an audit guards (the ref
-/// update) must pass the very values that audit will check, not a second, independent
-/// read of them, or the two could disagree about what the office currently says.
-/// `None` when the warehouse has no trust yet — no office means no roles, and the
-/// transport token is the whole gate.
-fn office_user_of(identifier: &str,
-                  anchor: &Option<office_utils::TrustAnchor>,
-                  office_state: &office_utils::OfficeState) -> Result<Option<office_utils::UserRecord>, HandlerError> {
-    if anchor.is_none() {
-        return Ok(None);
-    }
-
-    // The bootstrap window: the anchor is set but the office itself has not been
-    // lifted yet (a lift PUTs trust before it uploads the office chain). With no
-    // roster there are no roles to enforce — the token stays the gate, and the
-    // office ref update still verifies the chain against the anchor, so only the
-    // enrolling operator's office can land.
-    if office_state.users.is_empty() {
-        return Ok(None);
-    }
-
-    let user = office_state.users.iter()
-        .find(|user| user.identifier == identifier)
-        .cloned()
-        .ok_or((
-            StatusCode::FORBIDDEN,
-            format!("\"{}\" is not enrolled in this warehouse's office.", identifier)
-        ))?;
-
-    // No-op outside a test that has armed the seam for this identifier (see
-    // `office_lookup_test_checkpoint`'s doc): a falsifier's rendezvous point, right
-    // where this decision is fixed and about to be handed back.
-    office_lookup_test_checkpoint(identifier);
-
-    Ok(Some(user))
+/// An office authority rule's refusal, as the `403` it is.
+fn forbidden(Denied(message): Denied) -> HandlerError {
+    (StatusCode::FORBIDDEN, message)
 }
 
 /// Authorize an upload (objects, signatures) — runs under the warehouse's storage-root
-/// scope. Uploads are not pallet-scoped, so any non-reader may upload; the ref update
-/// is where pallet grants bite. Unlike the ref update, this commits nothing and guards
-/// no audit, so it has no consumed values to agree with — it reads the anchor and
-/// office state for itself, deliberately, rather than threading them through from a
-/// caller that has none to give it.
+/// scope. Unlike the ref update, this commits nothing and guards no audit, so it has no
+/// consumed values to agree with — it reads the anchor and office state for itself,
+/// deliberately, rather than threading them through from a caller that has none to give
+/// it. Only an operator is judged against the office, so only an operator pays the reads.
 fn require_uploader(principal: &Principal) -> Result<(), HandlerError> {
-    let Principal::Operator(identifier) = principal else {
+    if !matches!(principal, Principal::Operator(_)) {
         return Ok(());
-    };
+    }
 
     let anchor = office_utils::read_trust_anchor().map_err(internal)?;
     let office_state = office_utils::read_office_state().map_err(internal)?;
 
-    match office_user_of(identifier, &anchor, &office_state)? {
-        Some(user) if user.role == office_utils::Role::Reader => Err((
-            StatusCode::FORBIDDEN,
-            format!("\"{}\" is a reader; readers cannot upload.", identifier)
-        )),
-        _ => Ok(()),
-    }
+    authority_utils::may_upload(principal, &anchor, &office_state).map_err(forbidden)
 }
 
 /// Get a path parameter of the matched route.
@@ -2423,15 +2368,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     return Err(trust_one_way_door());
                 }
 
-                if !matches!(principal, Principal::Static | Principal::Open) {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        "A trust reset (re-genesis) must be sanctioned by the server \
-                        operator: only the static token may replace the anchor. \
-                        Per-operator tokens derive their authority from the chain \
-                        being replaced.".to_string()
-                    ));
-                }
+                authority_utils::may_regenesis(&principal).map_err(forbidden)?;
 
                 let office_head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)
                     .map_err(internal)?;
@@ -2624,29 +2561,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // and never leaks whether some other precondition also happened to fail.
             if let Principal::Operator(identifier) = &principal {
                 let office_state = office_state_at(&office_head)?;
-                if let Some(user) = office_user_of(identifier, &anchor, &office_state)? {
-                    let allowed = if is_meta {
-                        // Anyone but a reader may transport a meta pallet's history. Content
-                        // authorization below differs by meta pallet, not a uniform "signer's
-                        // role" check: @office's parcels are checked, per parcel, against the
-                        // signer's role (`verify_office_chain`); a meta pallet's against
-                        // its own rules (`verify_meta_content`), which for @tags include an
-                        // admin rule. No meta pallet gets a pallet grant check.
-                        user.role != office_utils::Role::Reader
-                    } else {
-                        user.may_write_pallet(&bare)
-                    };
+                authority_utils::may_move(&principal, &anchor, &office_state, &pallet_ref).map_err(forbidden)?;
 
-                    if !allowed {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            format!(
-                                "\"{}\" ({}) may not move pallet \"{}\".",
-                                identifier, user.role.as_str(), name
-                            )
-                        ));
-                    }
-                }
+                // No-op outside a test that has armed the seam for this identifier (see
+                // `office_lookup_test_checkpoint`'s doc): a falsifier's rendezvous point, right
+                // where this decision is fixed and before the write it authorizes.
+                office_lookup_test_checkpoint(identifier);
             }
 
             // An early refusal, before the audit below spends anything on a request that cannot
@@ -3776,7 +3696,7 @@ mod tests {
 
     /// The check must reject only *all-whitespace* identifiers, not merely trim and accept —
     /// an identifier with incidental leading/trailing whitespace around real content is still a
-    /// real identity and must authenticate, verbatim (untrimmed): `office_user_of` matches an
+    /// real identity and must authenticate, verbatim (untrimmed): the office lookup matches an
     /// operator's identifier by exact equality against the tracked office roster, so silently
     /// trimming it here would make this check the reason a legitimately-enrolled " bob " never
     /// matches.
@@ -4067,7 +3987,7 @@ mod tests {
 
     /// F4 of PR #124 round 2: `"tok-a" = ""` used to parse fine — only the token (key) side was
     /// checked for emptiness, never the identifier (value). An empty identifier is not merely
-    /// unenrolled (which `office_user_of` already 403s): it flows into admission/event payloads
+    /// unenrolled (which the office lookup already 403s): it flows into admission/event payloads
     /// and `post_resolve`'s `caller` as a legitimate-looking actor.
     #[test]
     fn rejects_a_token_mapped_to_a_blank_identifier() {
@@ -4103,7 +4023,7 @@ mod tests {
     /// (`a_hook_answer_with_incidental_whitespace_around_a_real_identifier_still_authenticates`),
     /// missing here until now. Without it, a future edit changing `identifier.to_string()` to
     /// `identifier.trim().to_string()` above would silently break exact-equality matching against
-    /// the tracked office roster (`office_user_of`) for every legitimately whitespace-padded
+    /// the tracked office roster (the office lookup) for every legitimately whitespace-padded
     /// identifier, with no test in this file catching it: the two rejection tests above only
     /// exercise *entirely*-blank identifiers, never one with real content plus incidental
     /// surrounding whitespace.
@@ -5011,7 +4931,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------
-    // office_user_of / require_uploader (transport authorization)
+    // the office lookup / require_uploader (transport authorization)
     // ---------------------------------------------------------------------------------
 
     /// Serializes every test that touches key generation/signing: `sign_utils` resolves
@@ -5026,7 +4946,7 @@ mod tests {
     /// identity root, exactly like `office enroll`), with trust established. Building it
     /// through the same `office_utils`/`sign_utils` calls the CLI uses means the chain
     /// this produces is exactly as verifiable as a real one — not a shortcut that only
-    /// happens to satisfy `office_user_of`.
+    /// happens to satisfy the office lookup.
     struct OfficeFixture {
         root: PathBuf,
         _scope: StorageRootScope,
@@ -5218,14 +5138,14 @@ mod tests {
         }
     }
 
-    /// `office_user_of` no longer reads the anchor and office state for itself — its
+    /// The office lookup does not read the anchor and office state for itself — its
     /// production callers pass in the values their own audit consumed. These tests
     /// have no audit of their own to agree with, so they read fresh, exactly as
     /// `require_uploader` now does, and pass the result straight through.
     fn office_user_of_now(identifier: &str) -> Result<Option<office_utils::UserRecord>, HandlerError> {
         let anchor = office_utils::read_trust_anchor().map_err(internal)?;
         let office_state = office_utils::read_office_state().map_err(internal)?;
-        office_user_of(identifier, &anchor, &office_state)
+        authority_utils::office_user_of(identifier, &anchor, &office_state).map_err(forbidden)
     }
 
     #[test]
@@ -5266,7 +5186,7 @@ mod tests {
 
     #[test]
     fn require_uploader_bypasses_the_office_for_static_and_open_principals() {
-        // No storage scope at all: neither variant ever reaches `office_user_of`.
+        // No storage scope at all: neither variant ever reaches the office.
         assert!(require_uploader(&Principal::Static).is_ok());
         assert!(require_uploader(&Principal::Open).is_ok());
     }
@@ -5308,6 +5228,42 @@ mod tests {
 
         assert!(require_uploader(&Principal::Operator("carol".to_string())).is_ok());
         assert!(require_uploader(&Principal::Operator(fixture.admin.identifier.clone())).is_ok());
+    }
+
+    /// An operator whose token authenticates but whom the office does not enroll may not upload:
+    /// the office lookup's refusal is the upload's refusal, before any byte is stored. The same
+    /// object then lands for an enrolled writer, so the 403 is the gate and not the object.
+    // Revert: `require_uploader` swallows the lookup's refusal (`Err(_) => Ok(())`) → 201 → red.
+    #[tokio::test]
+    async fn an_unenrolled_operator_may_not_upload_an_object() {
+        let fixture = OfficeFixture::genesis("put-object-unenrolled");
+        fixture.admit("carol", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None);
+
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-mallory".to_string(), "mallory".to_string());
+        operator_tokens.insert("tok-carol".to_string(), "carol".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        let bytes = b"an object an unenrolled operator tries to upload";
+        let hash = object_utils::hash_object_bytes(bytes);
+        let mut params = PathParams::new();
+        params.insert("hash".to_string(), hash.clone());
+
+        let response = put_object(
+            State(Arc::clone(&state)), headers_with_bearer("tok-mallory"), Path(params.clone()),
+            Bytes::from_static(bytes)
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_text(response).await;
+        assert!(body.contains("is not enrolled in this warehouse's office."), "{}", body);
+        assert!(!file_utils::does_object_exist(&hash).unwrap(), "a refused upload must store nothing");
+
+        let response = put_object(
+            State(state), headers_with_bearer("tok-carol"), Path(params), Bytes::from_static(bytes)
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     // ---------------------------------------------------------------------------------
@@ -5505,7 +5461,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------
-    // FORK-95 slice 1 falsifiers: `office_user_of` consumes the audit's own values
+    // FORK-95 slice 1 falsifiers: the move gate consumes the audit's own values
     // instead of reading a second, independent copy of its own.
     // ---------------------------------------------------------------------------------
 
@@ -5610,7 +5566,7 @@ mod tests {
         }
     }
 
-    /// Arm the checkpoint in `office_user_of` for one identifier, returning a disarm
+    /// Arm the move gate's checkpoint for one identifier, returning a disarm
     /// guard plus the "reached" receiver and "proceed" sender the test drives the
     /// rendezvous with. Keyed by identifier so an unrelated concurrent lookup cannot
     /// consume the arm — but the key is only sound while no other test pushes as the
@@ -5629,7 +5585,7 @@ mod tests {
     /// Falsifier: a push whose grant is revoked while it is audited is refused, as a request
     /// arriving after the revocation would be, rather than committed on the office it read.
     ///
-    /// Not a wall-clock race: the revocation is driven into the checkpoint `office_user_of` reaches
+    /// Not a wall-clock race: the revocation is driven into the checkpoint the move gate reaches
     /// right after fixing its authorization answer, a real admin-signed office parcel moving the
     /// office ref while quinn's push holds a decision that still grants her "main". Her write then
     /// finds the office moved, and the update decides again against the office that stands now,
@@ -5669,7 +5625,7 @@ mod tests {
         ));
 
         reached.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("office_user_of must reach its test checkpoint");
+            .expect("the move gate must reach its test checkpoint");
 
         let mut office_state = office_utils::read_office_state().unwrap();
         office_state.users.iter_mut()
