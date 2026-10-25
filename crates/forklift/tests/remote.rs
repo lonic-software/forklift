@@ -2097,6 +2097,32 @@ fn a_bundle_in_another_version_is_refused_and_franchise_falls_back_to_the_walk()
     }
 }
 
+/// An upgraded forklift-server still holding a latest bundle built before the upgrade answers it
+/// `404`, and the franchise completes through its verified walk without it.
+///
+/// Revert: treat a `404` for the bundle as a failed download in `franchise` → the clone fails → red.
+#[test]
+fn a_server_holding_a_previous_version_bundle_still_franchises() {
+    let area = TestArea::new("bundle-server-previous-version");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/one.txt", "one\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "walked"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    server.rebuild_bundle(&area);
+    std::fs::write(area.path("server-root/.forklift/bundles/latest"),
+                   "forklift-bundle 2026-07-13\nbuilt before the upgrade").unwrap();
+
+    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    assert_success(&franchised);
+    assert!(!stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
+    assert_eq!(area.read_file("b/one.txt"), "one\n");
+    assert!(!area.path("b/.forklift/bundles/latest").exists());
+}
+
 #[test]
 fn a_token_protected_remote_requires_the_token() {
     let area = TestArea::new("token");
@@ -7069,8 +7095,9 @@ fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() 
 
     server.rebuild_bundle(&area);
 
-    // A recognized header (so it is not gracefully skipped as an unsupported future version)
-    // over a garbage payload (so importing it is a hard failure, not "nothing to import").
+    // A recognized header (so it is not gracefully skipped as an unsupported version) over a
+    // garbage payload with no digest (so import refuses it outright: a hard failure, not
+    // "nothing to import").
     let bundle_path = area.path("server-root/.forklift/bundles/latest");
     std::fs::write(&bundle_path, format!(
         "{}\nthis is not a valid pack section table",

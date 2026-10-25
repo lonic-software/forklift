@@ -1126,9 +1126,15 @@ fn verify_bundle_digest<R: Read + std::io::Seek>(reader: &mut R) -> Result<u64, 
     let mut hasher = blake3::Hasher::new();
     let mut digested_part = reader.by_ref().take(digested);
     hasher.update_reader(&mut digested_part).map_err(seek_error)?;
+    let shrank = || format!("{}: it shrank while it was being read.", BUNDLE_DIGEST_PREFIX);
+    if digested_part.limit() != 0 {
+        return Err(shrank());
+    }
     let mut recorded = [0u8; BUNDLE_DIGEST_BYTES];
-    if digested_part.limit() != 0 || reader.read_exact(&mut recorded).is_err() {
-        return Err(format!("{}: it shrank while it was being read.", BUNDLE_DIGEST_PREFIX));
+    match reader.read_exact(&mut recorded) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(shrank()),
+        Err(e) => return Err(seek_error(e)),
     }
 
     if hasher.finalize().as_bytes() != &recorded {

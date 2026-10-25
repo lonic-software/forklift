@@ -140,8 +140,9 @@ including all reachable parcels, trees, blobs, and parcel signature sidecars. It
 native packs in a temporary directory, writes the envelope and its digest to a sibling temporary
 file, syncs it, then atomically renames it to `.forklift/bundles/latest`. The server exposes that
 file at `GET /v1/bundles/latest`, and answers `404` while the file there is in another version than
-it writes (one built before an upgrade), logging a warning that names the rebuild. The next
-`forklift-server bundle`, or the automatic rebuild after enough lifts, replaces it.
+it writes (one built before an upgrade) or too short to carry a header, logging a warning that
+names the rebuild. The next `forklift-server bundle` replaces it, as does the automatic rebuild
+after enough lifts on a server started with `--rebuild-after-lifts`.
 
 Chunked-file transport has not shipped. A reachable chunked file therefore refuses a whole bundle
 instead of producing an incomplete artifact. Likewise, a grandfathered object above the 64 MiB

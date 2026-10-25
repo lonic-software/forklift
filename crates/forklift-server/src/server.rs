@@ -3015,8 +3015,9 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         Ok(false) => {
             tracing::warn!(
                 root = %warehouse.root.display(),
-                "the bundle was built in a format this server no longer serves; answering 404 until \
-                it is rebuilt with `forklift-server bundle --root <root>` (or the next automatic rebuild)"
+                "the bundle is not in the format this server writes (built before an upgrade, or cut \
+                short); answering 404 until it is rebuilt with `forklift-server bundle --root <root>` \
+                (or the next automatic rebuild, when --rebuild-after-lifts is set)"
             );
             return error_response((
                 StatusCode::NOT_FOUND, "No bundle in the current format has been built.".to_string()
