@@ -966,6 +966,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The result of a git export.",
   "properties": {
     "blobs": {
+      "description": "The git blobs written. A file unchanged from its parcel's first parent is reused, not\nwritten again.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -993,6 +994,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "trees": {
+      "description": "The git trees written. A tree unchanged from its parcel's first parent is reused, not\nwritten again.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"

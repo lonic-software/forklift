@@ -127,8 +127,14 @@ reversible — your code history is never trapped. Requires `git` on your PATH; 
 must be empty or new. **Lossy in this direction:** git has no home for the signed office, the
 `@manifest` (approvals/provenance) or per-parcel signatures, so those are dropped. Author
 identity round-trips as the on-chain **identifier** — forklift never stores display names
-on-chain (zero-PII by design), so the git author name is that identifier. The meta pallets
-(`@office`, `@manifest`) are not exported.
+on-chain (zero-PII by design), so the git author name is that identifier (or `forklift`, when
+the identifier holds nothing git keeps in a name). The meta pallets (`@office`, `@manifest`)
+and tags are not exported.
+
+The export is deterministic: the same history exports to the same commit hashes on any
+machine, whatever your own git configuration says (it is shut out of every object write).
+Each commit message ends in a `Forklift-Parcel: <parcel> export/<N>` line naming the parcel
+it came from and the export format it was written in.
 
 ### `config` — who you are, and settings
 

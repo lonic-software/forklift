@@ -672,7 +672,9 @@ mod tests {
     /// The fixture holds a chunked file, an executable, a symlink, an empty file and nested
     /// folders; a parcel dated 1970-01-02, which git refuses in the bare date form (test 19); an
     /// author who is not the stacker; an operator whose name git would strip to nothing; an empty
-    /// description; and a merge whose parent list repeats a parent.
+    /// description; and a merge whose parent list repeats a parent. Git itself drops a repeated
+    /// -p, so removing the dedup alone leaves this green; what the pin holds is which occurrence
+    /// is kept, and so the parent order.
     #[test]
     fn a_fixed_history_exports_to_a_fixed_tip() {
         let warehouse = Warehouse::storage_only("export-layout-pin");
