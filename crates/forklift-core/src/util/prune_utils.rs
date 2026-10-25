@@ -89,7 +89,7 @@ pub struct PrunePlan {
 
     /// Candidates kept because the git mirror's roots hold history the remote is not known to
     /// hold, where no pallet or haul reaches it. The mirror only exports what the remote held, so
-    /// this is normally zero; deleting the mirror's roots record lets a later prune free them.
+    /// this is normally zero; a later prune frees them once the remote holds that history again.
     pub kept_for_mirror: usize,
 
     /// Candidates kept because lifting the unlifted history of a pallet deleted here, which

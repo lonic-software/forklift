@@ -288,8 +288,8 @@ pub(crate) struct PruneReport {
     kept_for_hauls: usize,
 
     /// Candidates kept because the git mirror's roots hold history the remote is not known to
-    /// hold, where no pallet or haul reaches it. Normally zero; deleting the mirror's roots record
-    /// lets a later prune free them.
+    /// hold, where no pallet or haul reaches it. Normally zero, since the mirror exports only what
+    /// the remote held; a later prune frees them once the remote holds that history again.
     kept_for_mirror: usize,
 
     /// Candidates kept because lifting the unlifted history of a pallet deleted here reads them,
@@ -393,10 +393,9 @@ impl CommandOutput for PruneReport {
         if self.kept_for_mirror > 0 {
             println!(
                 "{} object(s) were kept because the git mirror's roots record holds history the \
-                remote is not known to hold, and no pallet or haul does; delete \"{}\" to let a \
-                later prune free them.",
-                self.kept_for_mirror,
-                forklift_core::util::mirror_utils::mirror_roots_path().display()
+                remote is not known to hold, and no pallet or haul does; some may be the only copy. \
+                A later prune frees them once the remote holds that history again.",
+                self.kept_for_mirror
             );
         }
 
