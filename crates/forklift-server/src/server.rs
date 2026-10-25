@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -2979,6 +2979,11 @@ impl tokio::io::AsyncRead for PinnedFile {
 /// streamed, never read into memory: bundles grow with the warehouse. The open handle
 /// keeps serving the old file even if a rebuild replaces it mid-transfer.
 ///
+/// A cut-off download resumes with `Range: bytes=N-`: the answer is a `206` with the bytes from
+/// `N` on, under the strong tag of the file the handle opened, or `416` when `N` is at or past the
+/// end. An `If-Range` naming any other tag gets the whole current bundle as a `200` instead (see
+/// [`requested_range`]). Every answer states its length.
+///
 /// A file in another version than this build writes — one built before an upgrade — is answered
 /// `404`, as if none were built, with a warning naming the rebuild: a client would only download it
 /// to refuse it, then fall back to fetching objects anyway.
@@ -3009,6 +3014,8 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         Err(e) => return error_response(internal(format!("Error while opening the bundle: {}", e))),
     };
 
+    bundle_open_test_checkpoint(&warehouse.root);
+
     // The header is read from the handle that streams, so the version judged is the file sent.
     match bundle_is_current(&mut file).await {
         Ok(true) => {}
@@ -3026,18 +3033,147 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         Err(e) => return error_response(internal(format!("Error while reading the bundle: {}", e))),
     }
 
-    // The download holds the handle until its last byte, so the warehouse is never let go while
-    // it streams.
-    let stream = tokio_util::io::ReaderStream::new(PinnedFile { file, _warehouse: warehouse });
+    // The validator and the length come from the handle that streams, never from the path: a
+    // rebuild renamed over the path after the open must not lend this response its tag.
+    let metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
+        Err(e) => return error_response(internal(format!("Error while reading the bundle: {}", e))),
+    };
+    let length = metadata.len();
+    let etag = bundle_etag(&metadata);
+    let range = requested_range(&headers, etag.as_deref(), length);
+    let offset = match range {
+        BundleRange::Whole => 0,
+        BundleRange::From(start) => start,
+        BundleRange::Unsatisfiable => length,
+    };
 
-    (
-        [
-            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
-            // Its packs are already compressed; the compression layer must not re-wrap them.
-            (axum::http::header::CONTENT_ENCODING, "identity"),
-        ],
-        Body::from_stream(stream),
-    ).into_response()
+    if offset > 0 && offset < length {
+        use tokio::io::AsyncSeekExt;
+
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+            return error_response(internal(format!("Error while reading the bundle: {}", e)));
+        }
+    }
+
+    // The download holds the handle until its last byte, so the warehouse is never let go while
+    // it streams. It never sends more than the length it announced.
+    let body = tokio::io::AsyncReadExt::take(PinnedFile { file, _warehouse: warehouse }, length - offset);
+    let mut response = Body::from_stream(tokio_util::io::ReaderStream::new(body)).into_response();
+    let response_headers = response.headers_mut();
+
+    response_headers.insert(axum::http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/octet-stream"));
+    // Its packs are already compressed; the compression layer must not re-wrap them.
+    response_headers.insert(axum::http::header::CONTENT_ENCODING, HeaderValue::from_static("identity"));
+    response_headers.insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from(length - offset));
+    response_headers.insert(axum::http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    if let Some(etag) = etag {
+        response_headers.insert(axum::http::header::ETAG,
+                                HeaderValue::from_str(&etag).expect("a quoted run of hex digits"));
+    }
+
+    let content_range = match range {
+        BundleRange::Whole => None,
+        BundleRange::Unsatisfiable => {
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            Some(format!("bytes */{}", length))
+        }
+        BundleRange::From(start) => {
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            Some(format!("bytes {}-{}/{}", start, length - 1, length))
+        }
+    };
+
+    if let Some(content_range) = content_range {
+        response.headers_mut().insert(axum::http::header::CONTENT_RANGE,
+                                      HeaderValue::from_str(&content_range).expect("digits and punctuation"));
+    }
+
+    response
+}
+
+/// The strong validator of the bundle `metadata` describes, as an opaque hash of its length, its
+/// modification time at full precision and, on Unix, its inode: the tag names one built file
+/// without showing a reader the store's inode numbers or build times. A rebuild publishes a newly
+/// created file by rename and never rewrites the served one, so a rebuilt bundle gets a new tag
+/// unless a reused inode meets an equal length and mtime; that costs a client one restart through
+/// the bundle's digest, never a misread. `None` when the platform reports no modification time: no
+/// tag is better than one a rebuild of equal length would share.
+fn bundle_etag(metadata: &std::fs::Metadata) -> Option<String> {
+    let modified = match metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => format!("{}", since.as_nanos()),
+        Err(before) => format!("-{}", before.duration().as_nanos()),
+    };
+
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata.ino().to_string()
+    };
+    #[cfg(not(unix))]
+    let inode = String::new();
+
+    let named = format!("{} {} {}", metadata.len(), modified, inode);
+    let hex = blake3::hash(named.as_bytes()).to_hex();
+
+    Some(format!("\"{}\"", &hex[..32]))
+}
+
+/// What part of the bundle a request is answered with.
+#[derive(Debug, PartialEq)]
+enum BundleRange {
+    /// `200`, the whole file.
+    Whole,
+    /// `206`, the bytes from this offset on, which is inside the file.
+    From(u64),
+    /// `416`: the offset is at or past the end.
+    Unsatisfiable,
+}
+
+/// The part of a bundle of `length` bytes, tagged `etag`, that a request asks for, by RFC 9110
+/// §14.2 and §13.1.5. Only one range form is served: a single `Range: bytes=N-` (the unit in any
+/// case, whitespace around the value ignored). It is honoured when there is no `If-Range`, or when
+/// the one `If-Range` is exactly `etag`, the current strong tag. Anything else is `Whole`: a stale
+/// or weak tag, a date, an `If-Range` with no tag to compare it with, another range form, or a
+/// repeated `Range` or `If-Range` line.
+fn requested_range(headers: &HeaderMap, etag: Option<&str>, length: u64) -> BundleRange {
+    let mut ranges = headers.get_all(axum::http::header::RANGE).iter();
+    let (Some(range), None) = (ranges.next(), ranges.next()) else {
+        return BundleRange::Whole;
+    };
+
+    let mut conditions = headers.get_all(axum::http::header::IF_RANGE).iter();
+    match (conditions.next(), conditions.next(), etag) {
+        (None, _, _) => {}
+        (Some(condition), None, Some(etag)) if condition.as_bytes() == etag.as_bytes() => {}
+        _ => return BundleRange::Whole,
+    }
+
+    let Some(start) = range.to_str().ok().and_then(open_ended_range_start) else {
+        return BundleRange::Whole;
+    };
+
+    if start < length { BundleRange::From(start) } else { BundleRange::Unsatisfiable }
+}
+
+/// `N` of a `bytes=N-` range value; `None` for any other value.
+fn open_ended_range_start(value: &str) -> Option<u64> {
+    let (unit, set) = value.trim().split_once('=')?;
+
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+
+    let digits = set.trim().strip_suffix('-')?;
+
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    digits.parse().ok()
 }
 
 /// Whether the bundle `file` opens is in the version this build writes, leaving the handle back at
@@ -3055,6 +3191,25 @@ async fn bundle_is_current(file: &mut tokio::fs::File) -> std::io::Result<bool> 
     file.seek(std::io::SeekFrom::Start(0)).await?;
     Ok(current)
 }
+
+/// Test seam: a `GET /v1/bundles/latest` on the armed warehouse root runs the armed closure once,
+/// right after it opened the bundle, so a test can rename a rebuilt bundle over the path in exactly
+/// that window. Keyed by root so tests serving bundles concurrently never meet.
+#[cfg(test)]
+static BUNDLE_OPEN_TEST_SEAMS: Mutex<BTreeMap<PathBuf, Box<dyn FnOnce() + Send>>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn bundle_open_test_checkpoint(root: &std::path::Path) {
+    let armed = BUNDLE_OPEN_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).remove(root);
+
+    if let Some(run) = armed {
+        run();
+    }
+}
+
+#[cfg(not(test))]
+fn bundle_open_test_checkpoint(_root: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -4459,6 +4614,231 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], current.as_bytes(), "the whole file is served from its first byte");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One bundle warehouse `w1` under `base`, and the path its bundle is served from.
+    fn bundle_state(base: &std::path::Path) -> (Arc<AppState>, PathBuf) {
+        let state = Arc::new(capped_state(base, 2, &["w1"]));
+        let path = {
+            let _scope = StorageRootScope::enter(&base.join("w1"));
+            bundle_utils::get_latest_bundle_path()
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        (state, path)
+    }
+
+    /// Publishes `bytes` as the bundle the way a rebuild does: a new file renamed over the path.
+    fn publish_bundle(path: &std::path::Path, bytes: &[u8]) {
+        let temp = path.with_extension("rebuild");
+        std::fs::write(&temp, bytes).unwrap();
+        file_utils::rename(&temp, path).unwrap();
+    }
+
+    /// `GET /v1/bundles/latest` with `headers` (name, value), answered: status, headers and body.
+    async fn get_bundle_with(state: &Arc<AppState>,
+                             headers: &[(&'static str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut request = HeaderMap::new();
+        for (name, value) in headers {
+            request.append(*name, HeaderValue::from_str(value).unwrap());
+        }
+
+        let response = get_bundle(State(Arc::clone(state)), request, Path(warehouse_params("w1"))).await;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, headers, body.to_vec())
+    }
+
+    fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).map(|value| value.to_str().unwrap())
+    }
+
+    /// A whole bundle carries a strong tag, its length and `Accept-Ranges`; a `Range: bytes=N-`
+    /// under that tag, or under no `If-Range` at all, gets a `206` with exactly bytes `N..` of the
+    /// file, `Content-Range` and the length of what is left.
+    ///
+    /// Revert: ignore `Range` → the resumed request answers `200` with the whole file → red.
+    #[tokio::test]
+    async fn a_ranged_bundle_request_under_the_current_tag_gets_the_rest() {
+        let base = scratch_dir("bundle-range");
+        let (state, path) = bundle_state(&base);
+        let bundle = format!("{}\nthe rest of the bundle", bundle_utils::BUNDLE_HEADER).into_bytes();
+        let length = bundle.len();
+        publish_bundle(&path, &bundle);
+
+        let (status, headers, body) = get_bundle_with(&state, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, bundle);
+        assert_eq!(header(&headers, "content-length"), Some(length.to_string().as_str()));
+        assert_eq!(header(&headers, "accept-ranges"), Some("bytes"));
+        assert_eq!(header(&headers, "content-range"), None);
+        let etag = header(&headers, "etag").expect("a whole bundle carries a tag").to_string();
+        assert!(etag.len() == 34 && etag.starts_with('"') && etag.ends_with('"')
+                    && etag[1..33].bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "a strong tag of 32 hex digits: {}", etag);
+
+        let start = 7;
+        let range = format!("bytes={}-", start);
+        let (status, headers, body) =
+            get_bundle_with(&state, &[("range", &range), ("if-range", &etag)]).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, &bundle[start..], "exactly the bytes from the offset asked for");
+        assert_eq!(header(&headers, "content-range"),
+                   Some(format!("bytes {}-{}/{}", start, length - 1, length).as_str()));
+        assert_eq!(header(&headers, "content-length"), Some((length - start).to_string().as_str()));
+        assert_eq!(header(&headers, "etag"), Some(etag.as_str()));
+
+        // The last byte alone is still a range, and so is the whole file asked for from byte 0; so
+        // is one asked for with no `If-Range`, and one spelled with another case and spaces.
+        let last = format!("bytes={}-", length - 1);
+        let spelled = format!(" Bytes = {}- ", start);
+        let unconditional: [(&str, &[(&'static str, &str)], usize); 4] = [
+            ("the last byte", &[("range", &last), ("if-range", &etag)], length - 1),
+            ("the first byte on", &[("range", "bytes=0-"), ("if-range", &etag)], 0),
+            ("no If-Range", &[("range", "bytes=5-")], 5),
+            ("another spelling", &[("range", &spelled), ("if-range", &etag)], start),
+        ];
+
+        for (case, request, from) in unconditional {
+            let (status, headers, body) = get_bundle_with(&state, request).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{}", case);
+            assert_eq!(body, &bundle[from..], "{}", case);
+            assert_eq!(header(&headers, "content-range"),
+                       Some(format!("bytes {}-{}/{}", from, length - 1, length).as_str()), "{}", case);
+        }
+
+        // An offset at or past the end, under the current tag or none, is not satisfiable.
+        let at_end = format!("bytes={}-", length);
+        let past_end = format!("bytes={}-", length + 5);
+        for request in [&[("range", at_end.as_str()), ("if-range", etag.as_str())][..],
+                        &[("range", past_end.as_str())][..]] {
+            let (status, headers, body) = get_bundle_with(&state, request).await;
+            assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{:?}", request);
+            assert!(body.is_empty(), "{:?}", request);
+            assert_eq!(header(&headers, "content-range"), Some(format!("bytes */{}", length).as_str()));
+            assert_eq!(header(&headers, "content-length"), Some("0"));
+            assert_eq!(header(&headers, "etag"), Some(etag.as_str()));
+        }
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An `If-Range` must name the current tag: after a rebuild, under a stale or weak tag, past
+    /// the end under a stale tag, in another range form, or with a repeated `Range` or `If-Range`
+    /// line, the answer is `200` with the whole current bundle and its own tag.
+    ///
+    /// Revert: honour `Range` without comparing `If-Range` → the stale-tag request answers `206`
+    /// → red.
+    #[tokio::test]
+    async fn a_ranged_bundle_request_under_another_tag_gets_the_whole_current_bundle() {
+        let base = scratch_dir("bundle-stale-range");
+        let (state, path) = bundle_state(&base);
+        let first = format!("{}\nthe first build", bundle_utils::BUNDLE_HEADER).into_bytes();
+        publish_bundle(&path, &first);
+        let (_, headers, _) = get_bundle_with(&state, &[]).await;
+        let first_tag = header(&headers, "etag").unwrap().to_string();
+
+        let rebuilt = format!("{}\nthe rebuilt bundle, longer", bundle_utils::BUNDLE_HEADER).into_bytes();
+        publish_bundle(&path, &rebuilt);
+
+        let weak = format!("W/{}", first_tag);
+        let (_, headers, _) = get_bundle_with(&state, &[]).await;
+        let current_tag = header(&headers, "etag").unwrap().to_string();
+        assert_ne!(current_tag, first_tag, "a rebuild gets a new tag");
+        let weak_current = format!("W/{}", current_tag);
+        let past_end = format!("bytes={}-", rebuilt.len());
+        let cases: [(&str, &[(&'static str, &str)]); 10] = [
+            ("the tag before the rebuild", &[("range", "bytes=5-"), ("if-range", &first_tag)]),
+            ("a tag never served", &[("range", "bytes=5-"), ("if-range", "\"stale\"")]),
+            ("a weak tag", &[("range", "bytes=5-"), ("if-range", &weak)]),
+            ("the current tag, weak", &[("range", "bytes=5-"), ("if-range", &weak_current)]),
+            ("a date", &[("range", "bytes=5-"), ("if-range", "Sun, 25 Oct 2026 08:53:01 GMT")]),
+            ("past the end under a stale tag", &[("range", &past_end), ("if-range", &first_tag)]),
+            ("a closed range", &[("range", "bytes=5-9"), ("if-range", &current_tag)]),
+            ("two ranges", &[("range", "bytes=5-,7-"), ("if-range", &current_tag)]),
+            ("a repeated Range", &[("range", "bytes=5-"), ("range", "bytes=7-")]),
+            ("a repeated If-Range", &[("range", "bytes=5-"), ("if-range", &current_tag),
+                                      ("if-range", &current_tag)]),
+        ];
+
+        for (case, request) in cases {
+            let (status, headers, body) = get_bundle_with(&state, request).await;
+            assert_eq!(status, StatusCode::OK, "{}", case);
+            assert_eq!(body, rebuilt, "{}: the whole current bundle", case);
+            assert_eq!(header(&headers, "etag"), Some(current_tag.as_str()), "{}", case);
+            assert_eq!(header(&headers, "content-length"), Some(rebuilt.len().to_string().as_str()), "{}", case);
+            assert_eq!(header(&headers, "content-range"), None, "{}", case);
+        }
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// With no tag to compare an `If-Range` with, a conditional range is never honoured; an
+    /// unconditional one still is.
+    ///
+    /// Revert: skip the `If-Range` check when there is no tag → the conditional range is honoured
+    /// → red.
+    #[test]
+    fn a_conditional_range_without_a_tag_gets_the_whole_bundle() {
+        let mut headers = HeaderMap::new();
+        headers.insert("range", HeaderValue::from_static("bytes=4-"));
+        assert_eq!(requested_range(&headers, None, 10), BundleRange::From(4));
+
+        headers.insert("if-range", HeaderValue::from_static("\"any\""));
+        assert_eq!(requested_range(&headers, None, 10), BundleRange::Whole);
+        assert_eq!(requested_range(&headers, Some("\"any\""), 10), BundleRange::From(4));
+    }
+
+    /// When a rebuild of equal length is renamed over the path after `get_bundle` opened the old
+    /// file, the response streams the old file under the old file's tag, which differs from the
+    /// rebuild's. On Unix the two files share their modification time as well, so only the inode
+    /// tells them apart.
+    ///
+    /// Reverts: take the tag from the path's metadata → the response carries the rebuild's tag →
+    /// red. Take it from the length alone → the two tags are equal → red. Drop the inode (Unix) →
+    /// equal length and mtime give equal tags → red.
+    #[tokio::test]
+    async fn a_bundle_rebuilt_while_its_request_is_served_keeps_the_tag_of_the_bytes_sent() {
+        let base = scratch_dir("bundle-swap");
+        let (state, path) = bundle_state(&base);
+        let old = format!("{}\nthe old build", bundle_utils::BUNDLE_HEADER).into_bytes();
+        let new = format!("{}\nthe new build", bundle_utils::BUNDLE_HEADER).into_bytes();
+        assert_eq!(old.len(), new.len());
+        publish_bundle(&path, &old);
+        let (_, headers, _) = get_bundle_with(&state, &[]).await;
+        let old_tag = header(&headers, "etag").unwrap().to_string();
+
+        let root = resolve_warehouse(&state, &warehouse_params("w1")).unwrap().root.clone();
+        let swap_path = path.clone();
+        let swap = move || {
+            let old_modified = std::fs::metadata(&swap_path).unwrap().modified().unwrap();
+            let temp = swap_path.with_extension("rebuild");
+            std::fs::write(&temp, &new).unwrap();
+            // Unix: the same mtime, so only the inode separates the files. Elsewhere there is no
+            // inode term, so the rebuild is a second later, as any real rebuild is.
+            let modified = if cfg!(unix) {
+                old_modified
+            } else {
+                old_modified + std::time::Duration::from_secs(1)
+            };
+            std::fs::File::options().write(true).open(&temp).unwrap().set_modified(modified).unwrap();
+            file_utils::rename(&temp, &swap_path).unwrap();
+        };
+        BUNDLE_OPEN_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).insert(root, Box::new(swap));
+
+        let (status, headers, body) = get_bundle_with(&state, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, old, "the open handle streams the old file");
+        assert_eq!(header(&headers, "etag"), Some(old_tag.as_str()), "under the old file's tag");
+
+        let (_, headers, body) = get_bundle_with(&state, &[]).await;
+        assert_eq!(body, format!("{}\nthe new build", bundle_utils::BUNDLE_HEADER).into_bytes());
+        assert_ne!(header(&headers, "etag"), Some(old_tag.as_str()), "the rebuild has a tag of its own");
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base);

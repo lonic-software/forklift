@@ -1267,6 +1267,7 @@ name = "forklift-server"
 version = "0.3.1"
 dependencies = [
  "axum",
+ "blake3",
  "chrono",
  "clap",
  "forklift-core",
