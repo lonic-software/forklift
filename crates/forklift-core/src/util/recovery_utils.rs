@@ -241,8 +241,8 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    audit_utils, bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, object_utils, office_utils,
-    pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
+    audit_utils, bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
+    office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
     taint_utils,
 };
 use crate::util::progress_utils::Progress;
@@ -1428,6 +1428,10 @@ struct WalkRoots {
     /// either: `haul merge` says so when it needs the head. Like a `Gap` pin, this cannot tell a
     /// head never fetched from one held here and then lost to damage: both read as absent.
     haul_heads: Vec<String>,
+    /// The parcels the git mirror's roots record names ([`GcRootSources::mirror_roots`]), walked
+    /// like [`Self::haul_heads`]: the record keeps history the remote can serve again, so a parcel
+    /// it names that is absent here is a gap, never a dangling reference.
+    mirror_roots: Vec<String>,
     /// Object hashes a staged inventory shard (of any bay) references directly (never through a
     /// parcel), with the entry's type (so a chunked file's recipe is still descended into for its
     /// chunks).
@@ -1453,6 +1457,11 @@ pub(crate) struct GcRootSources {
     /// apart from [`Self::parcels`] because a haul opened elsewhere *declares* its head, which
     /// this warehouse may never have fetched: its absence is a gap, never lost data.
     pub haul_heads: Vec<String>,
+    /// Every parcel the git mirror's roots record names ([`mirror_utils::read_mirror_roots`]):
+    /// where each mirrored pallet's next export starts. Kept apart from [`Self::parcels`] for the
+    /// reason [`Self::haul_heads`] is: the remote holds that history, so its absence here is a
+    /// gap, never lost data.
+    pub mirror_roots: Vec<String>,
     /// Every trust-pin root this call could establish, each paired with its own
     /// [`office_utils::PinAbsencePolicy`] — see [`gc_root_sources`]'s own doc comment for why the
     /// policy tag rides along instead of being stripped here.
@@ -1463,9 +1472,9 @@ pub(crate) struct GcRootSources {
     /// without these leaves would let gc or a repack delete a user's loaded-but-unstacked work
     /// (FORK-156).
     pub shard_leaves: Vec<(String, DirEntryType)>,
-    /// One plain-language note per haul, bay or office-record read this call had to skip rather
-    /// than abort on: a haul or bay note only under `bay_policy`'s `Tolerate`, an office-record
-    /// note only under `pin_policy`'s.
+    /// One plain-language note per haul, bay, mirror roots record or office-record read this call
+    /// had to skip rather than abort on: a haul, bay or mirror note only under `bay_policy`'s
+    /// `Tolerate`, an office-record note only under `pin_policy`'s.
     pub degraded: Vec<String>,
 }
 
@@ -1492,7 +1501,11 @@ pub(crate) struct GcRootSources {
 /// (gc's and prune's `FailClosed`/`FailClosed`, heal's `Tolerate`/`Tolerate`). They govern the
 /// bay-scoped parcels and the office record only, and `bay_policy` the hauls' proposed heads too
 /// ([`haul_utils::unmerged_haul_heads`]): a haul names its head in a meta cell, not a ref, so a
-/// source pallet moved or deleted off that head leaves the haul its only holder. The staged
+/// source pallet moved or deleted off that head leaves the haul its only holder. `bay_policy` also
+/// governs the git mirror's roots record ([`mirror_utils::read_mirror_roots`]): gc and prune refuse
+/// on an unreadable one, and heal, where every refused command is sent, reads past it with a note.
+/// Both name the same way out, deleting the record, which drops only history the remote can serve
+/// again. The staged
 /// shards are always read fail-closed: a shard that exists but cannot be read or parsed may name
 /// the only copy of staged work. A shard or folder that vanishes mid-walk is no reference at all
 /// and is skipped.
@@ -1508,12 +1521,13 @@ pub(crate) struct GcRootSources {
 ///                  `distrust_boundary` pins.
 ///
 /// # Returns
-/// * `Ok(GcRootSources)` - Every pallet head, every haul's proposed head not yet merged, every
-///                         readable bay's parked-parcel/consolidation roots, every trust-pin root this call could establish, and every staged
+/// * `Ok(GcRootSources)` - Every pallet head, every haul's proposed head not yet merged, the git
+///                         mirror's roots, every readable bay's parked-parcel/consolidation roots, every trust-pin root this call could establish, and every staged
 ///                         shard leaf of every bay.
 /// * `Err(String)`        - Under either policy's fail-closed branch, if the trust file itself
 ///                         could not be read (always fail-closed regardless of `pin_policy` — see
-///                         [`office_utils::TrustPinReadPolicy`]), or if a staged shard could not be
+///                         [`office_utils::TrustPinReadPolicy`]), if the git mirror's roots record
+///                         could not be read under `bay_policy`'s `FailClosed`, or if a staged shard could not be
 ///                         read or parsed (regardless of either policy).
 pub(crate) fn gc_root_sources(
     bay_dirs: &[PathBuf],
@@ -1546,6 +1560,21 @@ pub(crate) fn gc_root_sources(
         },
     };
 
+    let mirror_roots = match mirror_utils::read_mirror_roots() {
+        Ok(roots) => roots.into_values().collect(),
+        Err(e) => match bay_policy {
+            bay_utils::BayReadPolicy::FailClosed => return Err(e),
+            bay_utils::BayReadPolicy::Tolerate => {
+                degraded.push(format!(
+                    "{} Until then, its parcels were treated as held by nothing rather than \
+                    blocking this command.",
+                    e
+                ));
+                Vec::new()
+            }
+        },
+    };
+
     let bay_scope = bay_utils::collect_bay_scoped_parcel_roots(bay_dirs, bay_policy)?;
     parcels.extend(bay_scope.roots);
     degraded.extend(bay_scope.degraded);
@@ -1563,7 +1592,7 @@ pub(crate) fn gc_root_sources(
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_leaves)?;
     }
 
-    Ok(GcRootSources { parcels, haul_heads, pin_parcels: trust_pins.roots, shard_leaves, degraded })
+    Ok(GcRootSources { parcels, haul_heads, mirror_roots, pin_parcels: trust_pins.roots, shard_leaves, degraded })
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -1582,7 +1611,8 @@ pub(crate) fn gc_root_sources(
 /// this walk's roots must stay a *superset* of gc's live-set roots (every pallet head, every
 /// head a haul not yet merged proposes, every bay's parked parcels, every parcel a bay's in-progress consolidation or cherry-pick records,
 /// and every trust-pin root — the shared trust-anchor `adopts`, its `boundary` snapshot, and every key's revocation
-/// `distrust_boundary`, FORK-81 — and every bay's staged inventory shard leaves, FORK-156). If
+/// `distrust_boundary`, FORK-81 — every bay's staged inventory shard leaves, FORK-156, and every
+/// parcel the git mirror's roots record names, FORK-143). If
 /// gc ever treats an object as live, this walk must never call the same object safe to drop —
 /// otherwise `forklift heal` could clear a taint over an object `forklift gc` would refuse to
 /// delete. Both this function and `collect_live_set` call the shared [`gc_root_sources`] for
@@ -1643,6 +1673,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         tags_unread,
         pin_parcels: sources.pin_parcels,
         haul_heads: sources.haul_heads,
+        mirror_roots: sources.mirror_roots,
         shard_referenced: sources.shard_leaves,
         degraded_sources: sources.degraded,
     })
@@ -2081,7 +2112,7 @@ fn walk_closure_for(
         .cloned()
         .map(|hash| (hash, AbsencePolicy::Report))
         .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
-        .chain(roots.haul_heads.iter().map(|hash| (hash.clone(), AbsencePolicy::Gap)))
+        .chain(roots.haul_heads.iter().chain(&roots.mirror_roots).map(|hash| (hash.clone(), AbsencePolicy::Gap)))
         .collect();
 
     drain_parcel_queue(
@@ -3446,6 +3477,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: vec![(pinned.hash.clone(), office_utils::PinAbsencePolicy::Gap)],
             haul_heads: Vec::new(),
+            mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
         };
@@ -3488,6 +3520,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: vec![(adopted.hash.clone(), office_utils::PinAbsencePolicy::Loss)],
             haul_heads: Vec::new(),
+            mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
         };
@@ -4815,6 +4848,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: Vec::new(),
             haul_heads: vec![never_fetched.clone(), proposed.hash.clone()],
+            mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
         };
@@ -4876,6 +4910,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: Vec::new(),
             haul_heads: Vec::new(),
+            mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
         };
@@ -6496,6 +6531,61 @@ mod tests {
         let state = taint_utils::read_taints(&forklift).unwrap();
         assert!(state.recorded.contains(&vanished_path),
             "the object must still be named in the remainder after this run: {:?}", state.recorded);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable git mirror roots record follows the caller's policy, like a bay: gc and prune
+    /// refuse naming the record and the step that clears it, heal reads past it as a degraded
+    /// source (so it keeps the taint it cannot prove, with the same step in its note), and once the
+    /// record is deleted heal clears the taint. Revert the record's arm in `gc_root_sources` to
+    /// `unwrap_or_default` and the gc/prune half reddens; make it fail closed for heal too and the
+    /// heal half does.
+    #[test]
+    fn an_unreadable_mirror_record_blocks_gc_and_prune_while_heal_reads_past_it() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-unreadable-mirror-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+        let forklift = forklift_root();
+
+        let record = mirror_utils::mirror_roots_path();
+        std::fs::create_dir_all(&forklift).unwrap();
+        crate::util::pallet_utils::write_position_in(&forklift, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        std::fs::write(&record, b"forklift mirror roots 99\n").unwrap();
+        let record_name = record.display().to_string();
+
+        let vanished_hash = "9".repeat(64);
+        let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
+        plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
+
+        let gc_error = crate::util::gc_utils::collect_garbage(0).err()
+            .expect("gc must fail closed on an unreadable mirror roots record");
+        assert!(gc_error.contains(&record_name) && gc_error.contains("delete it"), "{}", gc_error);
+
+        // Prune reads its roots through the same call under the same policy.
+        let bay_dirs = bay_utils::all_bay_state_dirs().unwrap();
+        let prune_error = gc_root_sources(
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        ).err().expect("prune's root read must fail closed on an unreadable mirror roots record");
+        assert!(prune_error.contains(&record_name) && prune_error.contains("delete it"), "{}", prune_error);
+
+        let error = run_heal().expect_err(
+            "a degraded mirror record must never authorize clearing a taint, since its parcels \
+            may be the only reference to the object"
+        );
+        assert_durability_taint(&error, &[vanished_hash.as_str(), record_name.as_str(), "delete it"]);
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.contains(&vanished_path));
+
+        std::fs::remove_file(&record).unwrap();
+        run_heal().expect("with the record deleted, nothing references the object and heal clears the taint");
+        assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.contains(&vanished_path));
 
         std::fs::remove_dir_all(&dir).ok();
     }

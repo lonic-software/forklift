@@ -520,6 +520,9 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
     let known: HashSet<&String> = user_parcels.iter().chain(meta_parcels).collect();
     let mut roots: Vec<String> = sources.parcels.into_iter().filter(|p| !known.contains(p)).collect();
     roots.extend(sources.pin_parcels.into_iter().map(|(p, _)| p).filter(|p| !known.contains(p)));
+    // The git mirror's roots are left out: the remote holds all of that history, so a prune may
+    // seal it like any lifted history. Reading them still refuses a prune whose record is
+    // unreadable ([`root_sources`]).
 
     let parcels: Vec<String> = gc_utils::collect_reachable_for_sweep(&roots)?
         .into_iter()
