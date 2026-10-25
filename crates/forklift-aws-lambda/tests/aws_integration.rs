@@ -33,6 +33,7 @@ use aws_smithy_http_client::tls;
 
 use http::{Request, Response};
 
+use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
@@ -55,6 +56,11 @@ use forklift_core::util::{file_utils, object_utils, sign_utils};
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
 /// The endpoint to run against, or `None` — in which case every test is a clean skip.
+/// An invocation deadline no test reaches: the commit's re-issue loop keeps its attempt cap.
+fn far_deadline() -> std::time::SystemTime {
+    std::time::SystemTime::now() + Duration::from_secs(600)
+}
+
 fn endpoint() -> Option<String> {
     std::env::var("FORKLIFT_AWS_TEST_ENDPOINT").ok().filter(|value| !value.is_empty())
 }
@@ -481,14 +487,14 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // being unborn" mode — see `OfficePrecondition`'s docs), while the anchor
         // `ConditionCheck` is always built and resolves to its "absent" mode.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, OfficePrecondition::NotConsumed, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, OfficePrecondition::NotConsumed, None, &request_token())
                 .expect("cas against a genuinely missing item"),
             CasOutcome::Conflict { current: None }
         );
 
         // Create with expected None.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", None, &one, OfficePrecondition::NotConsumed, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", None, &one, OfficePrecondition::NotConsumed, None, &request_token())
                 .expect("create"),
             CasOutcome::Committed
         );
@@ -499,21 +505,21 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
 
         // A replay with expected None now conflicts, reporting the current head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", None, &two, OfficePrecondition::NotConsumed, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", None, &two, OfficePrecondition::NotConsumed, None, &request_token())
                 .expect("replay"),
             CasOutcome::Conflict { current: Some(one.clone()) }
         );
 
         // A fast-forward from the right expected commits.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, OfficePrecondition::NotConsumed, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &two, OfficePrecondition::NotConsumed, None, &request_token())
                 .expect("ff"),
             CasOutcome::Committed
         );
 
         // A stale expected conflicts, again reporting the actual head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &one, OfficePrecondition::NotConsumed, None)
+            refs.compare_and_set_head(PalletNamespace::User, "main", Some(&one), &one, OfficePrecondition::NotConsumed, None, &request_token())
                 .expect("stale"),
             CasOutcome::Conflict { current: Some(two.clone()) }
         );
@@ -523,7 +529,7 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // `ConditionCheck` is built regardless of what `office_head` names (the FORK-95 design
         // memo: "no two actions may target the same item").
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::Meta, "office", None, &one, OfficePrecondition::NotConsumed, None)
+            refs.compare_and_set_head(PalletNamespace::Meta, "office", None, &one, OfficePrecondition::NotConsumed, None, &request_token())
                 .expect("office"),
             CasOutcome::Committed
         );
@@ -586,7 +592,7 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
             .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
             .expect("read the office head");
         assert_eq!(
-            refs.replace_trust(&different, &read_bytes, office_head.as_deref())
+            refs.replace_trust(&different, &read_bytes, office_head.as_deref(), &request_token())
                 .expect("replace"),
             TrustWriteOutcome::Replaced
         );
@@ -643,6 +649,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &office_o1,
                 OfficePrecondition::NotConsumed,
                 None,
+                &request_token(),
             )
             .expect("plant the office"),
             CasOutcome::Committed
@@ -672,6 +679,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m1,
                 OfficePrecondition::At(&office_o1),
                 Some(&bytes_a1),
+                &request_token(),
             )
             .expect("create main under matching preconditions"),
             CasOutcome::Committed
@@ -697,6 +705,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &office_o2,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes_a1),
+                &request_token(),
             )
             .expect("move the office"),
             CasOutcome::Committed
@@ -710,6 +719,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m2,
                 OfficePrecondition::At(&office_o1), // stale: the office moved to office_o2 just above
                 Some(&bytes_a1),
+                &request_token(),
             )
             .expect("stale office precondition"),
             CasOutcome::OfficeMoved { current: Some(office_o2.clone()) }
@@ -736,7 +746,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
             .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
             .expect("read the office head");
         assert_eq!(
-            refs.replace_trust(&anchor_v2, &bytes_a1, office_now.as_deref())
+            refs.replace_trust(&anchor_v2, &bytes_a1, office_now.as_deref(), &request_token())
                 .expect("replace trust"),
             TrustWriteOutcome::Replaced
         );
@@ -751,6 +761,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m2,
                 OfficePrecondition::At(&office_o2), // current: matches
                 Some(&bytes_a1),  // stale: the anchor was replaced just above
+                &request_token(),
             )
             .expect("stale anchor precondition"),
             CasOutcome::AnchorMoved
@@ -772,6 +783,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &side_s1,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &request_token(),
             )
             .expect("create side"),
             CasOutcome::Committed
@@ -784,6 +796,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &side_s2,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &request_token(),
             )
             .expect("move side"),
             CasOutcome::Committed
@@ -796,6 +809,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m2,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &request_token(),
             )
             .expect("main commits under matching preconditions despite side's concurrent moves"),
             CasOutcome::Committed
@@ -813,6 +827,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m2,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &request_token(),
             )
             .expect("stale pallet-head precondition, office and anchor both current"),
             CasOutcome::Conflict { current: Some(main_m2.clone()) }
@@ -881,6 +896,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 &office_o1,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes_a1),
+                &request_token(),
             )
             .expect("lift office to o1"),
             CasOutcome::Committed
@@ -905,6 +921,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 &re_genesis(&genesis_g2, &office_o1),
                 &"0".repeat(64), // never the stored bytes
                 Some(&office_o1),
+                &request_token(),
             )
             .expect("stale anchor precondition"),
             TrustWriteOutcome::AnchorMoved {
@@ -922,6 +939,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 &re_genesis(&genesis_g2, &office_o2),
                 &bytes_a1,
                 Some(&office_o2), // stale: the office is still at o1
+                &request_token(),
             )
             .expect("stale office precondition"),
             TrustWriteOutcome::OfficeMoved {
@@ -935,7 +953,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
         // 3. Both preconditions current: the re-genesis lands. Without this the two refusals
         // above are also satisfied by a store that refuses everything.
         assert_eq!(
-            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1))
+            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1), &request_token())
                 .expect("both preconditions current"),
             TrustWriteOutcome::Replaced
         );
@@ -949,7 +967,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
         // DynamoDB because the comparison is on the bytes DynamoDB actually stored and returned
         // through `ALL_OLD`, which no fake can establish.
         assert_eq!(
-            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1))
+            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1), &request_token())
                 .expect("re-issue of an already-planted anchor"),
             TrustWriteOutcome::AlreadyIdentical
         );
@@ -964,12 +982,13 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 &"6".repeat(64),
                 OfficePrecondition::At(&office_o1),
                 Some(&bytes_a2),
+                &request_token(),
             )
             .expect("lift an unrelated pallet"),
             CasOutcome::Committed
         );
         assert_eq!(
-            refs.replace_trust(&re_genesis(&genesis_g3, &office_o1), &bytes_a2, Some(&office_o1))
+            refs.replace_trust(&re_genesis(&genesis_g3, &office_o1), &bytes_a2, Some(&office_o1), &request_token())
                 .expect("an unrelated pallet's move must not refuse the anchor write"),
             TrustWriteOutcome::Replaced
         );
@@ -1041,7 +1060,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
         // 1. Unborn office, conditioned on unborn: `attribute_not_exists` holds against an item
         // that is not there, and the re-genesis commits.
         assert_eq!(
-            refs.replace_trust(&adopting_nothing, &bytes_a1, None)
+            refs.replace_trust(&adopting_nothing, &bytes_a1, None, &request_token())
                 .expect("re-genesis against an unborn office"),
             TrustWriteOutcome::Replaced
         );
@@ -1058,6 +1077,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
                 &office_o1,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes_a2),
+                &request_token(),
             )
             .expect("lift office"),
             CasOutcome::Committed
@@ -1073,7 +1093,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
         .to_anchor();
 
         assert_eq!(
-            refs.replace_trust(&still_adopting_nothing, &bytes_a2, None)
+            refs.replace_trust(&still_adopting_nothing, &bytes_a2, None, &request_token())
                 .expect("the office is no longer unborn"),
             TrustWriteOutcome::OfficeMoved { current: Some(office_o1.clone()) }
         );
@@ -1193,7 +1213,7 @@ async fn edge(
                     bridge,
                 );
 
-                Ok(Head::pooled(objects, refs, warehouse_id.to_string()))
+                Ok(Head::pooled(objects, refs, warehouse_id.to_string(), far_deadline()))
             },
             request,
         )
@@ -1618,7 +1638,7 @@ async fn shim_handler(
                     config.default_pallet.clone(),
                     bridge,
                 );
-                Ok(Head::pooled(objects, refs, warehouse_id.to_string()))
+                Ok(Head::pooled(objects, refs, warehouse_id.to_string(), far_deadline()))
             },
             request,
         )

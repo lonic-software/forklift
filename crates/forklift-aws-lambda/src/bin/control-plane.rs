@@ -15,7 +15,9 @@ use forklift_aws_lambda::{
     auth_from_env, config_from_env, handle, AsyncBridge, AuthConfig, AwsConfig, DynamoRefStore,
     Head, Routing, S3ObjectStore,
 };
-use lambda_http::{run, service_fn, Body, Error, Request, Response};
+use std::time::SystemTime;
+
+use lambda_http::{run, service_fn, Body, Error, Request, RequestExt, Response};
 use tokio::sync::OnceCell;
 
 /// Built once per cold start, reused by every warm invocation. The SDK clients are cheap to
@@ -35,7 +37,14 @@ impl Context {
     /// Assemble the [`Head`] for one request's warehouse — the fixed id in single mode, the
     /// path's `{id}` in multi mode. Cheap: only the clients (cloned) and the resolved
     /// warehouse id, which the ref store and the scratch pool must share (stage-1 review).
-    fn build_head(&self, warehouse_id: &str) -> Result<Head<S3ObjectStore, DynamoRefStore>, String> {
+    ///
+    /// `deadline` is this invocation's, from the runtime context: the head re-issues a
+    /// transiently refused transaction only while the time left covers another attempt.
+    fn build_head(
+        &self,
+        warehouse_id: &str,
+        deadline: SystemTime,
+    ) -> Result<Head<S3ObjectStore, DynamoRefStore>, String> {
         let objects =
             S3ObjectStore::new(self.s3.clone(), self.config.bucket.clone(), self.bridge.clone());
         let refs = DynamoRefStore::new(
@@ -46,7 +55,7 @@ impl Context {
             self.bridge.clone(),
         );
 
-        Ok(Head::pooled(objects, refs, warehouse_id.to_string()))
+        Ok(Head::pooled(objects, refs, warehouse_id.to_string(), deadline))
     }
 }
 
@@ -74,12 +83,20 @@ async fn context() -> Result<&'static Context, Error> {
 async fn handler(event: Request) -> Result<Response<Body>, Error> {
     let ctx = context().await?;
 
+    // Read before the request is taken apart: the deadline lives in the request's extensions.
+    // A runtime that supplies no context is not one this function was built for, and a head
+    // that guessed a deadline could re-issue past the real one, so it fails loudly instead.
+    let deadline = event
+        .lambda_context_ref()
+        .map(|context| context.deadline())
+        .ok_or_else(|| Error::from("The Lambda runtime supplied no invocation context."))?;
+
     // The runtime has already buffered the whole body, so the router can be fully synchronous.
     let (parts, body) = event.into_parts();
     let request = http::Request::from_parts(parts, body_to_vec(body));
 
     let response = tokio::task::spawn_blocking(move || {
-        handle(&ctx.routing, &ctx.auth, |warehouse_id| ctx.build_head(warehouse_id), request)
+        handle(&ctx.routing, &ctx.auth, |warehouse_id| ctx.build_head(warehouse_id, deadline), request)
     })
     .await
     .map_err(|e| Error::from(format!("The request handler panicked: {}", e)))?;

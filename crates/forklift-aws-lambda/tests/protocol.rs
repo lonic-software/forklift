@@ -15,13 +15,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::error::Status;
 use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult};
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
-    SignatureOutcome, TrustOutcome, TrustWriteOutcome,
+    SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
 
@@ -787,6 +788,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
             &by_worker,
             OfficePrecondition::NotConsumed,
             trust.as_ref().map(|(_, raw)| raw.as_str()),
+            &request_token(),
         ),
         Ok(CasOutcome::Committed)
     ));
@@ -867,6 +869,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
             &office_head,
             OfficePrecondition::NotConsumed,
             None,
+            &request_token(),
         ),
         Ok(CasOutcome::Committed)
     ));
@@ -1385,7 +1388,12 @@ fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
     let new_head = latest.head_of("main").expect("main head");
 
     // A warehouse id unique to this test, so the process-global pool stays isolated.
-    let head = Head::pooled(MemoryObjectStore::new(), MemoryRefStore::new(), &warehouse);
+    let head = Head::pooled(
+        MemoryObjectStore::new(),
+        MemoryRefStore::new(),
+        &warehouse,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(600),
+    );
     upload_all(&head, &latest);
 
     head.objects.reset_reads();
@@ -1779,9 +1787,10 @@ impl RefStore for AsyncRefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
         self.bridge.block_on(suspending(|| {
-            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
         }))
     }
 
@@ -1806,8 +1815,9 @@ impl RefStore for AsyncRefStore {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor, expected_anchor, office_head)))
+        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)))
     }
 }
 
@@ -1894,8 +1904,9 @@ impl RefStore for SharedMemoryRefs {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
@@ -1919,8 +1930,9 @@ impl RefStore for SharedMemoryRefs {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.0.replace_trust(anchor, expected_anchor, office_head)
+        self.0.replace_trust(anchor, expected_anchor, office_head, request_token)
     }
 }
 
@@ -1968,6 +1980,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
                         &self.move_to,
                         OfficePrecondition::NotConsumed,
                         anchor_bytes.as_deref(),
+                        &request_token(),
                     )
                     .expect("inject the concurrent office move");
                 assert_eq!(
@@ -1989,8 +2002,9 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
@@ -2014,8 +2028,9 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.inner.replace_trust(anchor, expected_anchor, office_head)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
     }
 }
 
@@ -2045,8 +2060,9 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
@@ -2079,7 +2095,7 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
 
             assert_eq!(
                 self.inner
-                    .replace_trust(&self.move_to, &expected, office_head.as_deref())
+                    .replace_trust(&self.move_to, &expected, office_head.as_deref(), &request_token())
                     .expect("inject the concurrent re-genesis"),
                 TrustWriteOutcome::Replaced,
                 "the injected re-genesis must actually land, or the test it feeds proves \
@@ -2099,22 +2115,57 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.inner.replace_trust(anchor, expected_anchor, office_head)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
     }
 }
 
-/// A [`RefStore`] that forwards everything except `compare_and_set_head`, which always
-/// answers [`CasOutcome::Transient`] regardless of its arguments. `MemoryRefStore` itself
-/// never produces this variant (see its own docs), so it is otherwise unreachable through
-/// `Head::ref_update` in this crate's test suite — only a fake built to return it can prove
-/// `transient_contention()` and the `Status::ServiceUnavailable -> 503` mapping actually fire,
-/// rather than that variant silently falling through to a default match arm.
-struct AlwaysTransientOnCommit {
+/// A [`RefStore`] that forwards everything except `compare_and_set_head`, whose first
+/// `refusals` attempts answer [`CasOutcome::Transient`] regardless of their arguments, after
+/// which it forwards that too. Every attempt's request token is recorded, so a test can count the
+/// head's attempts and see which token each carried.
+///
+/// `MemoryRefStore` itself never produces `Transient` (see its own docs), so it is otherwise
+/// unreachable through `Head::ref_update` in this crate's test suite — only a fake built to
+/// return it can prove the head's re-issue loop, `transient_contention()` and the
+/// `Status::ServiceUnavailable -> 503` mapping actually fire, rather than that variant silently
+/// falling through to a default match arm.
+struct TransientOnCommit {
     inner: MemoryRefStore,
+    refusals: usize,
+    refusal: CasOutcome,
+    tokens: std::sync::Mutex<Vec<String>>,
 }
 
-impl RefStore for AlwaysTransientOnCommit {
+impl TransientOnCommit {
+    fn always() -> TransientOnCommit {
+        TransientOnCommit::times(usize::MAX)
+    }
+
+    fn times(refusals: usize) -> TransientOnCommit {
+        TransientOnCommit {
+            inner: MemoryRefStore::new(),
+            refusals,
+            refusal: CasOutcome::Transient(TransientCause::Contended),
+            tokens: Default::default(),
+        }
+    }
+
+    /// Every attempt answers that the pallet moved — the refusal the loop must not re-issue.
+    fn always_moved() -> TransientOnCommit {
+        TransientOnCommit {
+            refusal: CasOutcome::Conflict { current: Some("f".repeat(64)) },
+            ..TransientOnCommit::always()
+        }
+    }
+
+    fn tokens(&self) -> Vec<String> {
+        self.tokens.lock().unwrap().clone()
+    }
+}
+
+impl RefStore for TransientOnCommit {
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -2125,14 +2176,25 @@ impl RefStore for AlwaysTransientOnCommit {
 
     fn compare_and_set_head(
         &self,
-        _namespace: pallet_utils::PalletNamespace,
-        _name: &str,
-        _expected: Option<&str>,
-        _new: &str,
-        _office_head: OfficePrecondition<'_>,
-        _anchor: Option<&str>,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
-        Ok(CasOutcome::Transient)
+        let attempt = {
+            let mut tokens = self.tokens.lock().unwrap();
+            tokens.push(request_token.to_string());
+            tokens.len()
+        };
+
+        if attempt <= self.refusals {
+            return Ok(self.refusal.clone());
+        }
+
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
@@ -2156,19 +2218,15 @@ impl RefStore for AlwaysTransientOnCommit {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.inner.replace_trust(anchor, expected_anchor, office_head)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
     }
 }
 
-/// PR #116 review, finding 2: `CasOutcome::Transient` reaches `head.rs::transient_contention`
-/// and `Status::ServiceUnavailable`'s `503` only through this test — an edit remapping the
-/// `Transient` arm in `ref_update`'s match to `self.moved(...)` or `HeadError::internal(...)`
-/// would otherwise pass the entire suite, since nothing else in this crate ever observes that
-/// arm running.
-#[test]
-fn a_transient_cas_outcome_maps_to_a_503_through_ref_update() {
-    let area = Area::new("transient-cas-outcome");
+/// A pushed history ready to commit to `main` of an untrusted warehouse, uploaded into `head`.
+fn uploaded_first_push<R: RefStore>(area_name: &str, refs: R) -> (Area, Head<MemoryObjectStore, R>, String) {
+    let area = Area::new(area_name);
     prepare(&area, "wh");
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
@@ -2177,16 +2235,91 @@ fn a_transient_cas_outcome_maps_to_a_503_through_ref_update() {
     let harvested = harvest(&area.path("wh"));
     let main_head = harvested.head_of("main").expect("main head");
 
-    let head =
-        Head::new(MemoryObjectStore::new(), AlwaysTransientOnCommit { inner: MemoryRefStore::new() });
+    let head = Head::new(MemoryObjectStore::new(), refs);
     upload_all(&head, &harvested);
 
+    (area, head, main_head)
+}
+
+/// `CasOutcome::Transient` reaches `head.rs::transient_contention` and
+/// `Status::ServiceUnavailable`'s `503` only through these tests — an edit remapping the
+/// `Transient` arm in `ref_update`'s match to `self.moved(...)` or `HeadError::internal(...)`
+/// would otherwise pass the entire suite, since nothing else in this crate ever observes that arm
+/// running.
+///
+/// A commit that stays transient is re-issued until the budget is spent — four attempts, all
+/// under one request token — and only then answered `503`. A second request gets a token of its
+/// own: a token per process or per head would make DynamoDB replay one request's outcome for
+/// another.
+#[test]
+fn a_commit_that_stays_transient_is_attempted_four_times_under_one_token_then_answers_503() {
+    let (_area, head, main_head) =
+        uploaded_first_push("transient-cas-outcome", TransientOnCommit::always());
+
     let err = head
-        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head.clone() })
         .expect_err("a Transient CasOutcome must refuse the commit, not accept it");
 
     assert_eq!(err.status, Status::ServiceUnavailable);
     assert_eq!(err.status.as_u16(), 503);
+
+    let first = head.refs.tokens();
+    assert_eq!(first.len(), 4, "one budget is four attempts");
+    assert!(first.iter().all(|token| *token == first[0]), "one token per request: {first:?}");
+
+    let _ = head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head });
+    let both = head.refs.tokens();
+    assert_eq!(both.len(), 8);
+    assert!(both[4..].iter().all(|token| *token == both[4]));
+    assert_ne!(both[0], both[4], "each request mints its own token");
+}
+
+/// The point of the loop: a commit refused once for contention, with nothing having moved,
+/// succeeds on its re-issue instead of reaching the client as a `503`.
+#[test]
+fn a_commit_refused_transiently_once_is_reissued_and_lands() {
+    let (_area, head, main_head) =
+        uploaded_first_push("transient-cas-once", TransientOnCommit::times(1));
+
+    head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head.clone() })
+        .expect("the re-issue lands");
+
+    assert_eq!(head.refs.tokens().len(), 2);
+    assert_eq!(
+        head.refs.inner.get_head(pallet_utils::PalletNamespace::User, "main").unwrap(),
+        Some(main_head)
+    );
+}
+
+/// A refusal naming a moved input is never re-issued: it is the client's to act on, and the
+/// same transaction would only be refused again.
+#[test]
+fn a_moved_pallet_head_is_answered_on_the_first_attempt() {
+    let (_area, head, main_head) =
+        uploaded_first_push("moved-cas-not-reissued", TransientOnCommit::always_moved());
+
+    let err = head
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .expect_err("the commit reports the pallet moved");
+
+    assert_eq!(err.status, Status::Conflict);
+    assert_eq!(head.refs.tokens().len(), 1);
+}
+
+/// With too little of the invocation left to cover a wait and another attempt, the head answers
+/// `503` after the first attempt rather than re-issuing into a window it cannot finish in.
+#[test]
+fn a_commit_near_its_deadline_is_not_reissued() {
+    let (_area, head, main_head) =
+        uploaded_first_push("transient-cas-deadline", TransientOnCommit::always());
+    let head = head.with_deadline(std::time::SystemTime::now() + std::time::Duration::from_millis(500));
+
+    let err = head
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .expect_err("transient");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert_eq!(head.refs.tokens().len(), 1);
 }
 
 /// Falsifier 1a (office): the ref update must be refused, and refused as a **moved office**,
@@ -2311,6 +2444,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
             &office_head,
             OfficePrecondition::NotConsumed,
             None,
+            &request_token(),
         ),
         Ok(CasOutcome::Committed)
     ));
@@ -2483,6 +2617,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
                 &"a".repeat(64),
                 OfficePrecondition::At(&office_head),
                 Some(&anchor_bytes),
+                &request_token(),
             )
             .expect("plant an unrelated pallet"),
         CasOutcome::Committed
@@ -2541,6 +2676,7 @@ fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, Stri
                 office_head,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes),
+                &request_token(),
             )
             .expect("lift the office pallet"),
         CasOutcome::Committed
@@ -2722,6 +2858,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
                 &"e".repeat(64),
                 OfficePrecondition::NotConsumed,
                 Some(&bytes),
+                &request_token(),
             )
             .expect("lift an unrelated pallet"),
         CasOutcome::Committed
@@ -2741,14 +2878,27 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
 ///
 /// `MemoryRefStore` cannot produce that outcome itself (its single mutex makes every write either
 /// succeed or lose to a real, attributable mismatch), so the status it maps to has no other way
-/// to be pinned. Separate from `AlwaysTransientOnCommit` rather than folded into it: that fake
-/// pins the *commit's* transient path, and one fake answering both would let either test pass on
-/// the other's code path.
-struct AlwaysTransientOnAnchorWrite {
+/// to be pinned. Separate from `TransientOnCommit` rather than folded into it: that fake pins the
+/// *commit's* transient path, and one fake answering both would let either test pass on the
+/// other's code path. Like it, the first `refusals` attempts are transient and later ones are
+/// forwarded, and every attempt's token is recorded.
+struct TransientOnAnchorWrite {
     inner: Arc<MemoryRefStore>,
+    refusals: usize,
+    tokens: std::sync::Mutex<Vec<String>>,
 }
 
-impl RefStore for AlwaysTransientOnAnchorWrite {
+impl TransientOnAnchorWrite {
+    fn new(inner: Arc<MemoryRefStore>, refusals: usize) -> TransientOnAnchorWrite {
+        TransientOnAnchorWrite { inner, refusals, tokens: Default::default() }
+    }
+
+    fn tokens(&self) -> Vec<String> {
+        self.tokens.lock().unwrap().clone()
+    }
+}
+
+impl RefStore for TransientOnAnchorWrite {
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -2765,8 +2915,9 @@ impl RefStore for AlwaysTransientOnAnchorWrite {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
@@ -2790,11 +2941,22 @@ impl RefStore for AlwaysTransientOnAnchorWrite {
 
     fn replace_trust(
         &self,
-        _anchor: &office_utils::TrustAnchor,
-        _expected_anchor: &str,
-        _office_head: Option<&str>,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        Ok(TrustWriteOutcome::Transient)
+        let attempt = {
+            let mut tokens = self.tokens.lock().unwrap();
+            tokens.push(request_token.to_string());
+            tokens.len()
+        };
+
+        if attempt <= self.refusals {
+            return Ok(TrustWriteOutcome::Transient(TransientCause::Contended));
+        }
+
+        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
     }
 }
 
@@ -2828,8 +2990,9 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
     fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
@@ -2856,6 +3019,7 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         _anchor: &office_utils::TrustAnchor,
         _expected_anchor: &str,
         _office_head: Option<&str>,
+        _request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         Ok(TrustWriteOutcome::AnchorMoved { current: self.current.clone() })
     }
@@ -2950,21 +3114,57 @@ fn an_undecodable_incumbent_is_not_told_to_re_run() {
     );
 }
 
-/// A transient refusal of the anchor write is a `503`, not the `500` every refusal on this path
+/// An anchor write that stays transient is a `503`, not the `500` every refusal on this path
 /// used to be. It establishes nothing about whether either input moved, so it must not wear a
-/// `409` or a `422` either — both of those tell a client something specific and false.
+/// `409` or a `422` either — both of those tell a client something specific and false. It is
+/// answered only once the same budget the commit has is spent: four attempts, one token.
 #[test]
-fn a_transient_refusal_of_the_anchor_write_is_a_503() {
+fn an_anchor_write_that_stays_transient_is_attempted_four_times_then_answers_503() {
     let office_head = "0".repeat(64);
     let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
 
     let mine = re_genesis(&anchor_v1, &office_head, 'c');
-    let head =
-        Head::new(MemoryObjectStore::new(), AlwaysTransientOnAnchorWrite { inner: store });
+    let head = Head::new(MemoryObjectStore::new(), TransientOnAnchorWrite::new(store, usize::MAX));
 
     let err = head.put_trust(&mine).expect_err("transient contention");
 
     assert_eq!(err.status, Status::ServiceUnavailable);
+
+    let tokens = head.refs.tokens();
+    assert_eq!(tokens.len(), 4);
+    assert!(tokens.iter().all(|token| *token == tokens[0]), "one token per request: {tokens:?}");
+}
+
+/// The anchor write has the commit's recovery, not a lesser one: refused once for contention, it
+/// is re-issued and the re-genesis lands.
+#[test]
+fn an_anchor_write_refused_transiently_once_is_reissued_and_lands() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(MemoryObjectStore::new(), TransientOnAnchorWrite::new(store.clone(), 1));
+
+    assert_eq!(head.put_trust(&mine).expect("the re-issue lands"), TrustResult::Established);
+    assert_eq!(head.refs.tokens().len(), 2);
+    let (planted, _) = store.get_trust().unwrap().expect("an anchor");
+    assert!(TrustAnchorDto::from(&planted) == mine, "the re-genesis anchor is the one planted");
+}
+
+/// The window check guards the anchor write as it does the commit.
+#[test]
+fn an_anchor_write_near_its_deadline_is_not_reissued() {
+    let office_head = "0".repeat(64);
+    let (store, anchor_v1, _bytes) = seeded_trust(&office_head);
+
+    let mine = re_genesis(&anchor_v1, &office_head, 'c');
+    let head = Head::new(MemoryObjectStore::new(), TransientOnAnchorWrite::new(store, usize::MAX))
+        .with_deadline(std::time::SystemTime::now() + std::time::Duration::from_millis(500));
+
+    let err = head.put_trust(&mine).expect_err("transient contention");
+
+    assert_eq!(err.status, Status::ServiceUnavailable);
+    assert_eq!(head.refs.tokens().len(), 1);
 }
 
 /// FORK-114: a first anchor arrives over an unborn office, so its `adopts` is tied to nothing

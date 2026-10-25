@@ -157,10 +157,13 @@ pub enum CasOutcome {
     /// three inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
     /// concurrently touching one of this commit's items, the shared office item principally).
     /// A retry may succeed with nothing having changed, unlike the three variants above, each
-    /// of which asserts a specific value differs from what was consumed. `MemoryRefStore`
-    /// never produces this: its single mutex makes every commit either succeed or lose to a
-    /// real, attributable mismatch, never a transaction-level conflict with no value to blame.
-    Transient,
+    /// of which asserts a specific value differs from what was consumed. The head re-issues the
+    /// identical transaction under the same request token, within one bounded budget per
+    /// request, and answers `503` only once that budget is spent (FORK-95 design memo, claim
+    /// C14, arm two). `MemoryRefStore` never produces this: its single mutex makes every commit
+    /// either succeed or lose to a real, attributable mismatch, never a transaction-level
+    /// conflict with no value to blame.
+    Transient(TransientCause),
 }
 
 /// The outcome of the trust anchor's own conditional write — [`RefStore::replace_trust`].
@@ -208,17 +211,42 @@ pub enum TrustWriteOutcome {
     /// Carries the office pallet's actual current head.
     OfficeMoved { current: Option<String> },
     /// Refused for a reason establishing nothing about whether either input moved — on DynamoDB,
-    /// `TransactionConflict`. Note this write condition-checks the *same* shared office item
-    /// every trusted lift now touches, so a re-genesis merely running alongside an ordinary push
-    /// can land here having raced nothing that matters.
+    /// `TransactionConflict` principally. Note this write condition-checks the *same* shared
+    /// office item every trusted lift now touches, so a re-genesis merely running alongside an
+    /// ordinary push can land here having raced nothing that matters.
     ///
-    /// As at the ref-update commit, this slice answers it immediately rather than retrying:
-    /// FORK-95's retry arm owns the bounded budget that would make it recoverable, and both
-    /// transaction call sites now carry that identical debt rather than one having a budget the
-    /// other lacks. `MemoryRefStore` never produces this, for the reason
-    /// [`CasOutcome::Transient`] gives.
-    Transient,
+    /// The head answers it exactly as it answers [`CasOutcome::Transient`] — the same re-issue
+    /// loop, the same budget, the same token rule — so neither transaction site has a recovery
+    /// the other lacks. `MemoryRefStore` never produces this, for the reason that variant gives.
+    Transient(TransientCause),
 }
+
+/// Why a transaction was refused without any input being shown to have moved — which decides
+/// only how long the head waits before re-issuing it, never *whether* it does (FORK-95 design
+/// memo, claim C14, arm two: one budget per request, whatever mix of causes spends it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransientCause {
+    /// Contention or throttling: another transaction touched one of this one's items
+    /// (`TransactionConflict`), or the table or account is over its throughput. Waited out on
+    /// a short jittered schedule.
+    Contended,
+    /// An earlier attempt carrying the same request token is still running
+    /// (`TransactionInProgressException`). Waited out on the longer schedule DynamoDB's own
+    /// model recommends for it.
+    InProgress,
+    /// The attempt may or may not have been applied: it timed out, its response was lost or
+    /// unparseable, or DynamoDB reported an internal error. A re-issue under the same request
+    /// token is safe precisely because of that token — it is idempotent if the attempt landed,
+    /// and the first attempt if it did not.
+    FateUnknown,
+}
+
+/// The longest a single transaction attempt may run before it is abandoned as
+/// [`TransientCause::FateUnknown`]. It is what the head's remaining-window check budgets for
+/// "one more transaction", so the store's per-attempt timeout and that check must read the same
+/// value — which is why it lives here rather than in either. One second is the request timeout
+/// DynamoDB's model recommends for `TransactWriteItems` alongside its four-attempt timeline.
+pub const TRANSACTION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The outcome of establishing the trust anchor (a one-way door, §4.4 / §8.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +402,12 @@ pub trait RefStore {
     /// [`CasOutcome`] — the caller cannot tell a moved pallet head from a moved office head
     /// or a moved anchor without that distinction, and the client-facing refusal differs
     /// per case.
+    ///
+    /// `request_token` identifies the client request this commit belongs to, and is the same
+    /// on every re-issue of it: a store whose write is not atomic in one call (DynamoDB) makes
+    /// it the transaction's idempotency token, so a re-issue of an attempt that did land is
+    /// recognised rather than applied twice and misreported as the pallet having moved.
+    #[allow(clippy::too_many_arguments)]
     fn compare_and_set_head(
         &self,
         namespace: PalletNamespace,
@@ -382,6 +416,7 @@ pub trait RefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        request_token: &str,
     ) -> Result<CasOutcome, String>;
 
     /// Every pallet with something stacked, across both namespaces. Explicit because
@@ -423,10 +458,12 @@ pub trait RefStore {
     ///   "consumed as unborn": `put_trust` reads the office head *unconditionally* on this
     ///   path, so there is no "never consumed" state to confuse it with, and an anchor that
     ///   adopts nothing is one whose validation depended on the office still being unborn.
+    /// * `request_token` — as for [`compare_and_set_head`](RefStore::compare_and_set_head).
     fn replace_trust(
         &self,
         anchor: &TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        request_token: &str,
     ) -> Result<TrustWriteOutcome, String>;
 }

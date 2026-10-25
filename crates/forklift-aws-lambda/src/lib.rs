@@ -49,6 +49,7 @@ pub mod store;
 pub mod memory;
 pub mod scratch;
 pub mod head;
+pub mod reissue;
 
 pub use aws::{AwsConfig, DynamoRefStore, S3ObjectStore};
 pub use blocking::AsyncBridge;
@@ -57,5 +58,5 @@ pub use error::{HeadError, HeadResult, Status};
 pub use head::{BatchResult, Head};
 pub use store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
-    SignatureOutcome, TrustOutcome,
+    SignatureOutcome, TransientCause, TrustOutcome,
 };
