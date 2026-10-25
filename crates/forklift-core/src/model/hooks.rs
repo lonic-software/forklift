@@ -13,8 +13,8 @@
 //! a fixed hook count, and must not price a specific head's own per-hook timeout at all: that
 //! timeout is that head's business, not a wire-contract constant this protocol defines. Each head
 //! owns and names its own; none of them is reachable from here, which is the enforcement. See
-//! [`crate::util::remote_utils`]'s `SINGLE_WRITE_ALLOWANCE` doc for the defect that shipped when a
-//! client budget once did exactly that.
+//! [`crate::util::remote_utils`]'s `RETRYABLE_HEAD_PATIENCE` doc for the defect that shipped when
+//! a client budget once did exactly that.
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};

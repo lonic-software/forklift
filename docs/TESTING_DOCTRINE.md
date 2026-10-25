@@ -198,8 +198,8 @@ an exhaustive list of every such constant in the file — and confirms 7 matches
 them individually. But it does not stop there: it notices that `2 + 5` also sums to 7, a
 genuine coincidence, and does not treat "distinct from every value" as license to skip
 past it. It argues the coincidence away instead: the mutation under test is a
-`connect_timeout` substitution, and nothing in the module ever adds `POST_SEND_VERIFY_BASE`
-(the constant behind the 2) to a connect timeout, so that sum names no rival this test
+`connect_timeout` substitution, and nothing in the module then added `POST_SEND_VERIFY_BASE`
+(the constant behind the 2, since retired) to a connect timeout, so that sum names no rival this test
 could ever actually collide with. It then checks a *different* thing — the full
 pairwise-sum set over those five values — against the test's asserted **output**, 17s
 (`7 + ERROR_BODY_READ_TIMEOUT`), and finds no match there either. A collision turning up
