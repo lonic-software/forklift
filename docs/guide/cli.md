@@ -1467,7 +1467,14 @@ URL is refused before anything is contacted. The `retry` field of the error's `d
 whether running the same command again can help (`same`, `unknown`) or whether it fails the same
 way (`change`), and `next_step` spells out the command. To give up instead, delete the directory.
 Until the franchise finishes the directory belongs to it: a resume deletes everything in it but the
-fetched objects (and a finished bundle download), files added there since the failure included.
+fetched objects and the bundle download, files added there since the failure included.
+
+A download of the remote's bundle cut off partway is kept too: what had arrived is synced and
+recorded as it lands, and the resume asks the remote only for the rest. A remote whose bundle has
+been rebuilt since sends the new one whole, and a remote that cannot resume a download (no tag or
+no length on its answer) has the bundle downloaded in full each time. A resumed bundle is checked
+against its digest before any of it is stored; one that does not check out is downloaded once more
+in full.
 
 Any *parent* directories needed for a nested target path (e.g. `some/new/path`) are created the
 ordinary way and left standing. Claiming the target directory is exclusive: franchise builds
