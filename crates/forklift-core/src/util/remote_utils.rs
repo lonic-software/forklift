@@ -7271,7 +7271,7 @@ mod tests {
                 office: Some(&self.local_head),
                 new_office: Some(&self.remote_head),
                 pallets: pallet_utils::PalletsPrecondition::NotConsumed,
-            })
+            }).map(|_| ())
         }
 
         /// Assert neither the anchor nor the office moved from where the fixture put them.
