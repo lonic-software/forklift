@@ -2979,6 +2979,11 @@ impl tokio::io::AsyncRead for PinnedFile {
 /// streamed, never read into memory: bundles grow with the warehouse. The open handle
 /// keeps serving the old file even if a rebuild replaces it mid-transfer.
 ///
+/// A cut-off download resumes with `Range: bytes=N-`: the answer is a `206` with the bytes from
+/// `N` on, under the strong tag of the file the handle opened, or `416` when `N` is at or past the
+/// end. An `If-Range` naming any other tag gets the whole current bundle as a `200` instead (see
+/// [`requested_range`]). Every answer states its length.
+///
 /// A file in another version than this build writes — one built before an upgrade — is answered
 /// `404`, as if none were built, with a warning naming the rebuild: a client would only download it
 /// to refuse it, then fall back to fetching objects anyway.
@@ -3036,19 +3041,22 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
     };
     let length = metadata.len();
     let etag = bundle_etag(&metadata);
-    let start = etag.as_deref().and_then(|etag| requested_resume_offset(&headers, etag, length));
+    let offset = match requested_range(&headers, etag.as_deref(), length) {
+        BundleRange::Whole => 0,
+        BundleRange::From(start) => start,
+        BundleRange::Unsatisfiable => length,
+    };
 
-    if let Some(start) = start {
+    if offset > 0 && offset < length {
         use tokio::io::AsyncSeekExt;
 
-        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
             return error_response(internal(format!("Error while reading the bundle: {}", e)));
         }
     }
 
     // The download holds the handle until its last byte, so the warehouse is never let go while
     // it streams. It never sends more than the length it announced.
-    let offset = start.unwrap_or(0);
     let body = tokio::io::AsyncReadExt::take(PinnedFile { file, _warehouse: warehouse }, length - offset);
     let mut response = Body::from_stream(tokio_util::io::ReaderStream::new(body)).into_response();
     let response_headers = response.headers_mut();
@@ -3058,67 +3066,113 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
     // Its packs are already compressed; the compression layer must not re-wrap them.
     response_headers.insert(axum::http::header::CONTENT_ENCODING, HeaderValue::from_static("identity"));
     response_headers.insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from(length - offset));
+    response_headers.insert(axum::http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
     if let Some(etag) = etag {
         response_headers.insert(axum::http::header::ETAG,
-                                HeaderValue::from_str(&etag).expect("a quoted run of hex and dashes"));
-        response_headers.insert(axum::http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                                HeaderValue::from_str(&etag).expect("a quoted run of hex digits"));
     }
 
-    if let Some(start) = start {
-        let range = format!("bytes {}-{}/{}", start, length - 1, length);
+    let content_range = match offset {
+        0 => None,
+        _ if offset == length => {
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            Some(format!("bytes */{}", length))
+        }
+        _ => {
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            Some(format!("bytes {}-{}/{}", offset, length - 1, length))
+        }
+    };
 
-        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+    if let Some(content_range) = content_range {
         response.headers_mut().insert(axum::http::header::CONTENT_RANGE,
-                                      HeaderValue::from_str(&range).expect("digits, a dash and a slash"));
+                                      HeaderValue::from_str(&content_range).expect("digits and punctuation"));
     }
 
     response
 }
 
-/// The strong validator of the bundle `metadata` describes: its length, its modification time at
-/// full precision and, on Unix, its inode. A rebuild publishes a newly created file by rename and
-/// never rewrites the served one, so a rebuilt bundle gets a new tag unless a reused inode meets
-/// an equal length and mtime; that costs a client one restart through the bundle's digest, never a
-/// misread. `None` when the platform reports no modification time: no tag is better than one a
-/// rebuild of equal length would share.
+/// The strong validator of the bundle `metadata` describes, as an opaque hash of its length, its
+/// modification time at full precision and, on Unix, its inode: the tag names one built file
+/// without showing a reader the store's inode numbers or build times. A rebuild publishes a newly
+/// created file by rename and never rewrites the served one, so a rebuilt bundle gets a new tag
+/// unless a reused inode meets an equal length and mtime; that costs a client one restart through
+/// the bundle's digest, never a misread. `None` when the platform reports no modification time: no
+/// tag is better than one a rebuild of equal length would share.
 fn bundle_etag(metadata: &std::fs::Metadata) -> Option<String> {
     let modified = match metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH) {
-        Ok(since) => format!("{:x}", since.as_nanos()),
-        Err(before) => format!("n{:x}", before.duration().as_nanos()),
+        Ok(since) => format!("{}", since.as_nanos()),
+        Err(before) => format!("-{}", before.duration().as_nanos()),
     };
 
     #[cfg(unix)]
     let inode = {
         use std::os::unix::fs::MetadataExt;
 
-        format!("-{:x}", metadata.ino())
+        metadata.ino().to_string()
     };
     #[cfg(not(unix))]
     let inode = String::new();
 
-    Some(format!("\"{:x}-{}{}\"", metadata.len(), modified, inode))
+    let named = format!("{} {} {}", metadata.len(), modified, inode);
+    let hex = blake3::hash(named.as_bytes()).to_hex();
+
+    Some(format!("\"{}\"", &hex[..32]))
 }
 
-/// The offset a request asks the bundle to resume from: only `Range: bytes=N-` under an `If-Range`
-/// naming exactly `etag`, the current strong tag, with `N` inside the file. Anything else — no
-/// `If-Range`, a stale or weak tag, a date, another range form, an offset at or past the end — is
-/// `None`, and the whole current bundle is served under its own tag (RFC 9110 §13.1.5).
-fn requested_resume_offset(headers: &HeaderMap, etag: &str, length: u64) -> Option<u64> {
-    let if_range = headers.get(axum::http::header::IF_RANGE)?;
+/// What part of the bundle a request is answered with.
+#[derive(Debug, PartialEq)]
+enum BundleRange {
+    /// `200`, the whole file.
+    Whole,
+    /// `206`, the bytes from this offset on, which is inside the file.
+    From(u64),
+    /// `416`: the offset is at or past the end.
+    Unsatisfiable,
+}
 
-    if if_range.as_bytes() != etag.as_bytes() {
+/// The part of a bundle of `length` bytes, tagged `etag`, that a request asks for, by RFC 9110
+/// §14.2 and §13.1.5. Only one range form is served: a single `Range: bytes=N-` (the unit in any
+/// case, whitespace around the value ignored). It is honoured when there is no `If-Range`, or when
+/// the one `If-Range` is exactly `etag`, the current strong tag. Anything else is `Whole`: a stale
+/// or weak tag, a date, an `If-Range` with no tag to compare it with, another range form, or a
+/// repeated `Range` or `If-Range` line.
+fn requested_range(headers: &HeaderMap, etag: Option<&str>, length: u64) -> BundleRange {
+    let mut ranges = headers.get_all(axum::http::header::RANGE).iter();
+    let (Some(range), None) = (ranges.next(), ranges.next()) else {
+        return BundleRange::Whole;
+    };
+
+    let mut conditions = headers.get_all(axum::http::header::IF_RANGE).iter();
+    match (conditions.next(), conditions.next(), etag) {
+        (None, _, _) => {}
+        (Some(condition), None, Some(etag)) if condition.as_bytes() == etag.as_bytes() => {}
+        _ => return BundleRange::Whole,
+    }
+
+    let Some(start) = range.to_str().ok().and_then(open_ended_range_start) else {
+        return BundleRange::Whole;
+    };
+
+    if start < length { BundleRange::From(start) } else { BundleRange::Unsatisfiable }
+}
+
+/// `N` of a `bytes=N-` range value; `None` for any other value.
+fn open_ended_range_start(value: &str) -> Option<u64> {
+    let (unit, set) = value.trim().split_once('=')?;
+
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
         return None;
     }
 
-    let range = headers.get(axum::http::header::RANGE)?.to_str().ok()?;
-    let digits = range.strip_prefix("bytes=")?.strip_suffix('-')?;
+    let digits = set.trim().strip_suffix('-')?;
 
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
 
-    digits.parse::<u64>().ok().filter(|&start| start < length)
+    digits.parse().ok()
 }
 
 /// Whether the bundle `file` opens is in the version this build writes, leaving the handle back at
@@ -4587,7 +4641,7 @@ mod tests {
                              headers: &[(&'static str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
         let mut request = HeaderMap::new();
         for (name, value) in headers {
-            request.insert(*name, HeaderValue::from_str(value).unwrap());
+            request.append(*name, HeaderValue::from_str(value).unwrap());
         }
 
         let response = get_bundle(State(Arc::clone(state)), request, Path(warehouse_params("w1"))).await;
@@ -4602,8 +4656,8 @@ mod tests {
     }
 
     /// A whole bundle carries a strong tag, its length and `Accept-Ranges`; a `Range: bytes=N-`
-    /// under that tag gets a `206` with exactly bytes `N..` of the file, `Content-Range` and the
-    /// length of what is left.
+    /// under that tag, or under no `If-Range` at all, gets a `206` with exactly bytes `N..` of the
+    /// file, `Content-Range` and the length of what is left.
     ///
     /// Revert: ignore `Range` → the resumed request answers `200` with the whole file → red.
     #[tokio::test]
@@ -4621,7 +4675,9 @@ mod tests {
         assert_eq!(header(&headers, "accept-ranges"), Some("bytes"));
         assert_eq!(header(&headers, "content-range"), None);
         let etag = header(&headers, "etag").expect("a whole bundle carries a tag").to_string();
-        assert!(etag.starts_with('"') && etag.ends_with('"') && etag.len() > 2, "a strong tag: {}", etag);
+        assert!(etag.len() == 34 && etag.starts_with('"') && etag.ends_with('"')
+                    && etag[1..33].bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "a strong tag of 32 hex digits: {}", etag);
 
         let start = 7;
         let range = format!("bytes={}-", start);
@@ -4634,19 +4690,44 @@ mod tests {
         assert_eq!(header(&headers, "content-length"), Some((length - start).to_string().as_str()));
         assert_eq!(header(&headers, "etag"), Some(etag.as_str()));
 
-        // The last byte alone is still a range.
-        let range = format!("bytes={}-", length - 1);
-        let (status, _, body) = get_bundle_with(&state, &[("range", &range), ("if-range", &etag)]).await;
-        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
-        assert_eq!(body, &bundle[length - 1..]);
+        // The last byte alone is still a range; so is one asked for with no `If-Range`, and one
+        // spelled with another case and spaces.
+        let last = format!("bytes={}-", length - 1);
+        let spelled = format!(" Bytes = {}- ", start);
+        let unconditional: [(&str, &[(&'static str, &str)], usize); 3] = [
+            ("the last byte", &[("range", &last), ("if-range", &etag)], length - 1),
+            ("no If-Range", &[("range", "bytes=5-")], 5),
+            ("another spelling", &[("range", &spelled), ("if-range", &etag)], start),
+        ];
+
+        for (case, request, from) in unconditional {
+            let (status, headers, body) = get_bundle_with(&state, request).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{}", case);
+            assert_eq!(body, &bundle[from..], "{}", case);
+            assert_eq!(header(&headers, "content-range"),
+                       Some(format!("bytes {}-{}/{}", from, length - 1, length).as_str()), "{}", case);
+        }
+
+        // An offset at or past the end, under the current tag or none, is not satisfiable.
+        let at_end = format!("bytes={}-", length);
+        let past_end = format!("bytes={}-", length + 5);
+        for request in [&[("range", at_end.as_str()), ("if-range", etag.as_str())][..],
+                        &[("range", past_end.as_str())][..]] {
+            let (status, headers, body) = get_bundle_with(&state, request).await;
+            assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{:?}", request);
+            assert!(body.is_empty(), "{:?}", request);
+            assert_eq!(header(&headers, "content-range"), Some(format!("bytes */{}", length).as_str()));
+            assert_eq!(header(&headers, "content-length"), Some("0"));
+            assert_eq!(header(&headers, "etag"), Some(etag.as_str()));
+        }
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A range is served only under the current tag: after a rebuild, under a stale or weak tag,
-    /// with no `If-Range` at all, past the end, or in another range form, the answer is `200` with
-    /// the whole current bundle and its own tag.
+    /// An `If-Range` must name the current tag: after a rebuild, under a stale or weak tag, past
+    /// the end under a stale tag, in another range form, or with a repeated `Range` or `If-Range`
+    /// line, the answer is `200` with the whole current bundle and its own tag.
     ///
     /// Revert: honour `Range` without comparing `If-Range` → the stale-tag request answers `206`
     /// → red.
@@ -4668,14 +4749,18 @@ mod tests {
         assert_ne!(current_tag, first_tag, "a rebuild gets a new tag");
         let weak_current = format!("W/{}", current_tag);
         let past_end = format!("bytes={}-", rebuilt.len());
-        let cases: [(&str, &[(&'static str, &str)]); 7] = [
+        let cases: [(&str, &[(&'static str, &str)]); 10] = [
             ("the tag before the rebuild", &[("range", "bytes=5-"), ("if-range", &first_tag)]),
             ("a tag never served", &[("range", "bytes=5-"), ("if-range", "\"stale\"")]),
             ("a weak tag", &[("range", "bytes=5-"), ("if-range", &weak)]),
             ("the current tag, weak", &[("range", "bytes=5-"), ("if-range", &weak_current)]),
-            ("no If-Range", &[("range", "bytes=5-")]),
-            ("an offset at the end", &[("range", &past_end), ("if-range", &current_tag)]),
+            ("a date", &[("range", "bytes=5-"), ("if-range", "Sun, 25 Oct 2026 08:53:01 GMT")]),
+            ("past the end under a stale tag", &[("range", &past_end), ("if-range", &first_tag)]),
             ("a closed range", &[("range", "bytes=5-9"), ("if-range", &current_tag)]),
+            ("two ranges", &[("range", "bytes=5-,7-"), ("if-range", &current_tag)]),
+            ("a repeated Range", &[("range", "bytes=5-"), ("range", "bytes=7-")]),
+            ("a repeated If-Range", &[("range", "bytes=5-"), ("if-range", &current_tag),
+                                      ("if-range", &current_tag)]),
         ];
 
         for (case, request) in cases {
@@ -4689,6 +4774,22 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// With no tag to compare an `If-Range` with, a conditional range is never honoured; an
+    /// unconditional one still is.
+    ///
+    /// Revert: skip the `If-Range` check when there is no tag → the conditional range is honoured
+    /// → red.
+    #[test]
+    fn a_conditional_range_without_a_tag_gets_the_whole_bundle() {
+        let mut headers = HeaderMap::new();
+        headers.insert("range", HeaderValue::from_static("bytes=4-"));
+        assert_eq!(requested_range(&headers, None, 10), BundleRange::From(4));
+
+        headers.insert("if-range", HeaderValue::from_static("\"any\""));
+        assert_eq!(requested_range(&headers, None, 10), BundleRange::Whole);
+        assert_eq!(requested_range(&headers, Some("\"any\""), 10), BundleRange::From(4));
     }
 
     /// When a rebuild of equal length is renamed over the path after `get_bundle` opened the old
