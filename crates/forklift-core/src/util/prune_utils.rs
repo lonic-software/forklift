@@ -77,8 +77,8 @@ pub struct PrunePlan {
     /// stacked here and never lifted, or lifted to a remote head this warehouse has not lowered
     /// since. Some may be the only copy; the rest are the base trees that lift compares against.
     /// A later prune of the same path frees them once the remote's heads reach that history.
-    /// Excludes what only a haul's or a deleted pallet's history reads, counted in
-    /// `kept_for_hauls` and `kept_for_deleted`.
+    /// Excludes what only a haul's, the git mirror's or a deleted pallet's history reads, counted
+    /// in `kept_for_hauls`, `kept_for_mirror` and `kept_for_deleted`.
     pub kept_unlifted: usize,
 
     /// Candidates kept because lifting the unlifted history a haul not yet merged proposes reads
@@ -86,6 +86,11 @@ pub struct PrunePlan {
     /// puts that history on its target, and a prune after the target is lifted frees them. A
     /// closed haul keeps them, since reopening it proposes the same head.
     pub kept_for_hauls: usize,
+
+    /// Candidates kept because the git mirror's roots hold history the remote is not known to
+    /// hold, where no pallet or haul reaches it. The mirror only exports what the remote held, so
+    /// this is normally zero; deleting the mirror's roots record lets a later prune free them.
+    pub kept_for_mirror: usize,
 
     /// Candidates kept because lifting the unlifted history of a pallet deleted here, which
     /// `undo` can still put back, reads them. Lifting cannot free these; a later prune does once
@@ -147,7 +152,10 @@ fn plan_from(
     // recorded head, which no ref need still reach.
     let proposed = gc_utils::collect_reachable_for_sweep(&sources.haul_heads)?;
     let removed = gc_utils::collect_reachable_for_sweep(removed_heads)?;
-    let user_parcels = with_held(&live_parcels, proposed.iter().chain(&removed));
+    // The git mirror's roots are held the same way: the mirror exports only what the remote held,
+    // but a remote reset since would leave the only copy here.
+    let mirrored = gc_utils::collect_reachable_for_sweep(&sources.mirror_roots)?;
+    let user_parcels = with_held(&live_parcels, proposed.iter().chain(&mirrored).chain(&removed));
     let local = local_roots(&user_parcels, &meta_parcels, sources)?;
 
     let mut retained = collect_retained(&user_parcels, &meta_parcels, post_prune)?;
@@ -155,19 +163,23 @@ fn plan_from(
 
     let unlifted = unlifted_parcels(&user_parcels, remote_heads)?;
 
-    // The live pallets' unlifted history, a haul's and a deleted pallet's are judged apart, each
-    // once: the report counts the last two apart because lifting cannot free them. A parcel both
-    // a haul and a delete hold counts for the haul. retain_unlifted judges one parcel at a time,
+    // The live pallets' unlifted history, a haul's, the mirror's and a deleted pallet's are judged
+    // apart, each once: the report counts the last three apart because lifting cannot free them.
+    // A parcel several hold counts for the first of haul, mirror, delete. retain_unlifted judges one parcel at a time,
     // so the keeps together are exactly the keep of the whole.
     let live: HashSet<&String> = live_parcels.iter().collect();
     let (live_unlifted, held_unlifted): (HashSet<String>, HashSet<String>) =
         unlifted.iter().cloned().partition(|parcel| live.contains(parcel));
-    let (haul_unlifted, deleted_unlifted): (HashSet<String>, HashSet<String>) =
+    let (haul_unlifted, rest_unlifted): (HashSet<String>, HashSet<String>) =
         held_unlifted.into_iter().partition(|parcel| proposed.contains(parcel));
+    let (mirror_unlifted, deleted_unlifted): (HashSet<String>, HashSet<String>) =
+        rest_unlifted.into_iter().partition(|parcel| mirrored.contains(parcel));
     let (kept_for_live, mut touching) = retain_unlifted(&live_unlifted, pruned_prefixes)?;
     let (kept_for_proposed, touching_proposed) = retain_unlifted(&haul_unlifted, pruned_prefixes)?;
+    let (kept_for_mirrored, touching_mirrored) = retain_unlifted(&mirror_unlifted, pruned_prefixes)?;
     let (kept_for_removed, touching_removed) = retain_unlifted(&deleted_unlifted, pruned_prefixes)?;
     touching.extend(touching_proposed);
+    touching.extend(touching_mirrored);
     touching.extend(touching_removed);
 
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
@@ -180,6 +192,7 @@ fn plan_from(
     let mut retained_shared = 0usize;
     let mut kept_unlifted = 0usize;
     let mut kept_for_hauls = 0usize;
+    let mut kept_for_mirror = 0usize;
     let mut kept_for_deleted = 0usize;
 
     for hash in &targets {
@@ -204,6 +217,11 @@ fn plan_from(
 
         if kept_for_proposed.contains(hash) {
             kept_for_hauls += 1;
+            continue;
+        }
+
+        if kept_for_mirrored.contains(hash) {
+            kept_for_mirror += 1;
             continue;
         }
 
@@ -232,7 +250,7 @@ fn plan_from(
         }
     }
 
-    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_deleted, unlifted_pallets })
+    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_mirror, kept_for_deleted, unlifted_pallets })
 }
 
 /// `live_parcels`, then every `held` parcel they do not reach, once: the user history a prune
@@ -520,9 +538,6 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
     let known: HashSet<&String> = user_parcels.iter().chain(meta_parcels).collect();
     let mut roots: Vec<String> = sources.parcels.into_iter().filter(|p| !known.contains(p)).collect();
     roots.extend(sources.pin_parcels.into_iter().map(|(p, _)| p).filter(|p| !known.contains(p)));
-    // The git mirror's roots are left out: the remote holds all of that history, so a prune may
-    // seal it like any lifted history. Reading them still refuses a prune whose record is
-    // unreadable ([`root_sources`]).
 
     let parcels: Vec<String> = gc_utils::collect_reachable_for_sweep(&roots)?
         .into_iter()
@@ -1269,6 +1284,21 @@ mod tests {
         assert_eq!((plan.kept_for_hauls, plan.kept_for_deleted, plan.kept_unlifted), (3, 0, 0));
         let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], proposing(&deleted)).unwrap();
         assert_eq!((plan.kept_for_hauls, plan.kept_for_deleted), (3, 0));
+
+        // The git mirror's roots hold it the same way, counted apart; behind a haul in precedence.
+        // Mutation: leave the mirror roots out of the held heads → the parent's web tree is freed.
+        let mirroring = |head: &String| {
+            let mut sources = root_sources().unwrap();
+            sources.mirror_roots = vec![head.clone()];
+            sources
+        };
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], mirroring(&deleted)).unwrap();
+        assert_eq!(plan.to_free, vec![f.web_blob.clone()], "the mirror's history is kept like a deleted pallet's");
+        assert_eq!((plan.kept_for_mirror, plan.kept_for_deleted, plan.kept_unlifted), (3, 0, 0));
+        let mut both = proposing(&deleted);
+        both.mirror_roots = vec![deleted.clone()];
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], both).unwrap();
+        assert_eq!((plan.kept_for_hauls, plan.kept_for_mirror), (3, 0));
 
         // A live pallet sharing the unlifted history counts it as its own.
         pallet_utils::update_pallet_head("feature", None, &deleted, &pallet_utils::RefPreconditions::NONE).unwrap();

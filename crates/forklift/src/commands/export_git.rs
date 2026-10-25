@@ -130,7 +130,9 @@ impl GitRepo {
     /// rewrites what Forklift hands git: on macOS `git init` turns core.precomposeunicode on, which
     /// rewrites an NFD name.
     pub(crate) fn create(path: &Path) -> Result<GitRepo, String> {
-        let repo = GitRepo { path: path.to_path_buf() };
+        let path = std::path::absolute(path)
+            .map_err(|e| format!("Error while resolving \"{}\": {}", path.display(), e))?;
+        let repo = GitRepo { path };
         repo.run(&["init", "-q", "--object-format=sha1"], None)?;
         repo.run(&["config", "core.precomposeunicode", "false"], None)?;
 
@@ -149,8 +151,11 @@ impl GitRepo {
     fn run_isolated(&self, args: &[&str], env: &[(&str, &str)], input: Option<&[u8]>) -> Result<String, String> {
         let mut command = self.command(|key| key.starts_with("GIT_"));
         // A missing global config file also reads as empty, so this holds on a git that does not
-        // map /dev/null.
-        command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null");
+        // map /dev/null. A git before 2.32 ignores GIT_CONFIG_GLOBAL and reads the global config
+        // from the home folder, so that points at a folder that does not exist.
+        let no_home = self.path.join(".git").join("forklift-no-home");
+        command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", &no_home).env("XDG_CONFIG_HOME", &no_home);
         for (key, value) in env {
             command.env(key, value);
         }
@@ -185,25 +190,37 @@ impl GitRepo {
 }
 
 /// One parcel's exported commit, with the trees a child converts against (D4).
+#[derive(Clone)]
 struct ExportedCommit {
     commit: String,
     git_tree: String,
     forklift_tree: String,
 }
 
-/// Writes forklift parcels into a git repository as commits. A parcel's tree is converted against
-/// its first parent's: whatever is unchanged takes its git hash from the parent's exported tree, so
-/// a parcel costs git processes in proportion to its changed paths, not to its tree's size.
+/// Writes forklift parcels into a git repository as commits. Each object is written once per run:
+/// whatever this run already converted, at any path, is reused by its forklift hash. Beyond that,
+/// a parcel's tree is converted against its first parent's, whose git hashes are read back from
+/// the repository, so a parcel built on a commit an earlier run wrote also costs git processes in
+/// proportion to its changed paths, not to its tree's size.
 pub(crate) struct Exporter<'a> {
     repo: &'a GitRepo,
     exported: HashMap<String, ExportedCommit>,
+    blobs: HashMap<String, String>,
+    trees: HashMap<String, String>,
     trees_written: usize,
     blobs_written: usize,
 }
 
 impl<'a> Exporter<'a> {
     pub(crate) fn new(repo: &'a GitRepo) -> Exporter<'a> {
-        Exporter { repo, exported: HashMap::new(), trees_written: 0, blobs_written: 0 }
+        Exporter {
+            repo,
+            exported: HashMap::new(),
+            blobs: HashMap::new(),
+            trees: HashMap::new(),
+            trees_written: 0,
+            blobs_written: 0,
+        }
     }
 
     /// Write one parcel as a git commit (its parents must already be written).
@@ -221,13 +238,14 @@ impl<'a> Exporter<'a> {
             parents.push(self.exported.get(parent)
                 .ok_or("a parent commit was not exported before its child".to_string())?);
         }
+        let parent_commits: Vec<String> = parents.iter().map(|parent| parent.commit.clone()).collect();
         let base = parents.first().map(|parent| (parent.forklift_tree.clone(), parent.git_tree.clone()));
-        let mut args: Vec<String> = parents.iter()
-            .flat_map(|parent| ["-p".to_string(), parent.commit.clone()])
-            .collect();
 
         let tree = self.convert_tree(&parcel.tree_hash, base.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
-        args.splice(0..0, ["commit-tree".to_string(), tree.clone()]);
+        let mut args = vec!["commit-tree".to_string(), tree.clone()];
+        for commit in parent_commits {
+            args.extend(["-p".to_string(), commit]);
+        }
 
         // Git's author/committer come from the environment; map them from the parcel's
         // Author and Stack actions so authorship and dates survive.
@@ -257,29 +275,28 @@ impl<'a> Exporter<'a> {
     }
 
     /// Write one forklift tree as a git tree (recursively), against `base`: the forklift tree at the
-    /// same path in the first parent, with the git tree it was exported as. An entry whose forklift
-    /// hash matches the base's entry of the same name and kind reuses that entry's git hash. Only
-    /// the hash: the mode is always recomputed from the entry's own type.
+    /// same path in the first parent, with the git tree it was exported as. An entry this run has
+    /// not converted yet, whose forklift hash matches the base's entry of the same name and kind,
+    /// reuses that entry's git hash. Only the hash: the mode is always recomputed from the entry's
+    /// own type.
     fn convert_tree(&mut self, forklift_hash: &str, base: Option<(&str, &str)>) -> Result<String, String> {
+        if let Some(hash) = self.trees.get(forklift_hash) {
+            return Ok(hash.clone());
+        }
         if let Some((base_forklift, base_git)) = base {
             if base_forklift == forklift_hash {
+                self.trees.insert(forklift_hash.to_string(), base_git.to_string());
                 return Ok(base_git.to_string());
             }
         }
 
         let tree = object_utils::load_tree(forklift_hash)?;
-        let (base_tree, base_entries) = match base {
-            Some((base_forklift, base_git)) => (Some(object_utils::load_tree(base_forklift)?), self.list_tree(base_git)?),
-            None => (None, HashMap::new()),
+        let base = match base {
+            Some((base_forklift, base_git)) => Some((object_utils::load_tree(base_forklift)?, base_git)),
+            None => None,
         };
-        // The git hash of the base's file `name`, when its forklift hash is `hash`.
-        let reusable_blob = |name: &str, hash: &str| -> Option<String> {
-            base_tree.as_ref().and_then(|base| base.get_file(name))
-                .filter(|base_item| base_item.hash == hash)
-                .and_then(|_| base_entries.get(name))
-                .filter(|(kind, _)| kind == "blob")
-                .map(|(_, git_hash)| git_hash.clone())
-        };
+        // The base's git entries, listed only once an entry needs one.
+        let mut base_entries: Option<HashMap<String, (String, String)>> = None;
 
         let mut entries = String::new();
 
@@ -289,24 +306,35 @@ impl<'a> Exporter<'a> {
                 DirEntryType::SymbolicLink => "120000",
                 _ => "100644",
             };
-            let blob = match reusable_blob(name, &item.hash) {
+
+            let mut blob = self.blobs.get(&item.hash).cloned();
+            if let Some((base_tree, base_git)) = &base {
+                if blob.is_none() && base_tree.get_file(name).is_some_and(|base_item| base_item.hash == item.hash) {
+                    blob = self.base_entry(&mut base_entries, base_git, name, "blob")?;
+                }
+            }
+            let blob = match blob {
                 Some(blob) => blob,
                 // A chunked file's hash is a recipe: stream-assemble it into the git blob rather
                 // than loading it as a blob (which would fail) or reading it whole into memory.
                 None if item.item_type.is_chunked() => self.convert_chunked_blob(&item.hash)?,
                 None => self.convert_blob(&item.hash)?,
             };
+            self.blobs.insert(item.hash.clone(), blob.clone());
             entries.push_str(&format!("{} blob {}\t{}\0", mode, blob, name));
         }
 
         for (name, item) in tree.get_subtrees() {
             // Converted against the base's subtree of the same name, which returns its git hash
             // outright when the two are equal.
-            let base_subtree = base_tree.as_ref().and_then(|base| base.get_subtree(name))
-                .and_then(|base_item| base_entries.get(name)
-                    .filter(|(kind, _)| kind == "tree")
-                    .map(|(_, git_hash)| (base_item.hash.as_str(), git_hash.as_str())));
-            let subtree = self.convert_tree(&item.hash, base_subtree)?;
+            let mut base_subtree = None;
+            if let Some((base_tree, base_git)) = &base {
+                if let Some(base_item) = base_tree.get_subtree(name).filter(|_| !self.trees.contains_key(&item.hash)) {
+                    base_subtree = self.base_entry(&mut base_entries, base_git, name, "tree")?
+                        .map(|git_hash| (base_item.hash.clone(), git_hash));
+                }
+            }
+            let subtree = self.convert_tree(&item.hash, base_subtree.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
             entries.push_str(&format!("040000 tree {}\t{}\0", subtree, name));
         }
 
@@ -315,8 +343,22 @@ impl<'a> Exporter<'a> {
         // A name never holds NUL (the tree parser refuses one), so NUL frames every entry.
         let git_hash = self.repo.run(&["mktree", "-z"], Some(entries.as_bytes()))?.trim().to_string();
         self.trees_written += 1;
+        self.trees.insert(forklift_hash.to_string(), git_hash.clone());
 
         Ok(git_hash)
+    }
+
+    /// The git hash of the entry `name` of git kind `kind` in the git tree `base_git`, listing that
+    /// tree into `entries` on first use.
+    fn base_entry(&self, entries: &mut Option<HashMap<String, (String, String)>>, base_git: &str, name: &str, kind: &str)
+        -> Result<Option<String>, String> {
+        if entries.is_none() {
+            *entries = Some(self.list_tree(base_git)?);
+        }
+
+        Ok(entries.as_ref().and_then(|entries| entries.get(name))
+            .filter(|(entry_kind, _)| entry_kind == kind)
+            .map(|(_, git_hash)| git_hash.clone()))
     }
 
     /// The entries of the git tree `git_hash`: name to (kind, hash). Read with `-z`, since plain
@@ -429,9 +471,10 @@ fn without_crud(value: &str) -> String {
 }
 
 /// A git date for unix time `seconds`. The `@` form, since git reads a bare number before March
-/// 1973 as something other than a unix time and refuses it.
+/// 1973 as something other than a unix time and refuses it. Git has no date before 1970, so an
+/// earlier one is written as the epoch.
 fn git_date(seconds: i64) -> String {
-    format!("@{} +0000", seconds)
+    format!("@{} +0000", seconds.max(0))
 }
 
 /// The last line of every exported commit's message: the parcel it was exported from, and the
@@ -731,14 +774,15 @@ mod tests {
         assert_eq!(tip, "66677f9fc675b41891d4f168fb280606e0aac682", "the export layout's pinned tip moved");
     }
 
-    /// Test 15 (reuse): a parcel changing one file deep in a large tree writes only that file's blob
-    /// and the trees on its path.
+    /// Test 15 (reuse): a parcel changing one file deep in a large tree, exported on a commit an
+    /// earlier run wrote, writes only that file's blob and the trees on its path. Within one run, a
+    /// subtree that moved is written again only where its own path changed.
     #[test]
     fn a_one_file_change_writes_only_its_path() {
         let warehouse = Warehouse::storage_only("export-reuse");
 
         let names: Vec<String> = (0..40).map(|n| format!("file-{}", n)).collect();
-        let tree = |changed: &[u8]| {
+        let tree = |changed: &[u8], right_name: &str| {
             let files = |dir: &str| -> Vec<(String, Vec<u8>)> {
                 names.iter().map(|name| (name.clone(), format!("{}/{}\n", dir, name).into_bytes())).collect()
             };
@@ -746,21 +790,27 @@ mod tests {
             let mut left_entries: Vec<Entry> = left.iter().map(|(name, content)| Entry::File(name, DirEntryType::Normal, content)).collect();
             left_entries.push(Entry::File("changed", DirEntryType::Normal, changed));
             let right_entries: Vec<Entry> = right.iter().map(|(name, content)| Entry::File(name, DirEntryType::Normal, content)).collect();
-            store_tree(&[Entry::Dir("left", vec![Entry::Dir("inner", left_entries)]), Entry::Dir("right", right_entries)])
+            store_tree(&[Entry::Dir("left", vec![Entry::Dir("inner", left_entries)]), Entry::Dir(right_name, right_entries)])
         };
 
-        let first = store_parcel(&tree(b"one\n"), &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some("one"));
-        let second = store_parcel(&tree(b"two\n"), &[&first], vec![action(ParcelActionType::Stack, "op", 2_000)], Some("two"));
+        let first = store_parcel(&tree(b"one\n", "right"), &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some("one"));
+        let second = store_parcel(&tree(b"two\n", "right"), &[&first], vec![action(ParcelActionType::Stack, "op", 2_000)], Some("two"));
+        let moved = store_parcel(&tree(b"two\n", "moved"), &[&second], vec![action(ParcelActionType::Stack, "op", 3_000)], Some("moved"));
 
         let repo = create_repo(&warehouse);
-        let mut exporter = Exporter::new(&repo);
-        export(&mut exporter, &first);
-        let (trees, blobs) = (exporter.trees_written, exporter.blobs_written);
-        assert_eq!((trees, blobs), (4, 81));
+        let mut earlier = Exporter::new(&repo);
+        export(&mut earlier, &first);
+        assert_eq!((earlier.trees_written, earlier.blobs_written), (4, 81));
 
-        export(&mut exporter, &second);
-        assert_eq!((exporter.trees_written - trees, exporter.blobs_written - blobs), (3, 1),
+        // A later run knows only the commit it builds on, as the mirror does.
+        let mut later = Exporter::new(&repo);
+        later.exported.insert(first.clone(), earlier.exported[&first].clone());
+        export(&mut later, &second);
+        assert_eq!((later.trees_written, later.blobs_written), (3, 1),
             "the changed blob and the root, left and left/inner trees");
+
+        export(&mut later, &moved);
+        assert_eq!((later.trees_written, later.blobs_written), (4, 1), "a rename writes only the root again");
     }
 
     /// Test 1's filter half: a chunked file is hashed byte for byte even in a repository whose own
@@ -808,6 +858,12 @@ mod tests {
         assert_eq!(without_crud(" <;> "), "");
         assert_eq!(without_crud("..."), "...");
         assert_eq!(without_crud("a\nb"), "ab");
+    }
+
+    #[test]
+    fn a_date_before_1970_is_written_as_the_epoch() {
+        assert_eq!(git_date(-5), "@0 +0000");
+        assert_eq!(git_date(86_400), "@86400 +0000");
     }
 
     /// A killed earlier process with this one's id can leave its temp file at the very name the
