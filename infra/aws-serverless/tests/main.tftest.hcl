@@ -225,6 +225,7 @@ run "c5_operator_tokens_alone_are_a_credential" {
   command = apply
 
   variables {
+    warehouse_id           = "wh"
     auth_token             = null
     operator_token_digests = { (sha256("an-operator-token")) = "ada@example" }
   }
@@ -281,6 +282,19 @@ run "c5_empty_strings_digest_rejected" {
 
   variables {
     operator_token_digests = { (sha256("")) = "ada@example" }
+  }
+
+  expect_failures = [
+    var.operator_token_digests,
+  ]
+}
+
+run "c5_operator_tokens_alone_rejected_for_multi_warehouse" {
+  command = plan
+
+  variables {
+    auth_token             = null
+    operator_token_digests = { (sha256("an-operator-token")) = "ada@example" }
   }
 
   expect_failures = [

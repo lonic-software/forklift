@@ -283,6 +283,20 @@ pub fn auth_from_env() -> Result<AuthConfig, String> {
     auth_from(|name| std::env::var(name).ok())
 }
 
+/// Refuse credentials the routing can never use: in [`Routing::Multi`] only the shared bearer
+/// (or an open head) sets a warehouse up (see [`handle`]), so operator tokens alone would leave
+/// every warehouse id read-only for good. Checked at cold start, beside the two readers.
+pub fn check_auth_fits_routing(auth: &AuthConfig, routing: &Routing) -> Result<(), String> {
+    match (auth, routing) {
+        (AuthConfig::Credentials(credentials), Routing::Multi) if credentials.static_token.is_none() => Err(
+            "Multi-warehouse routing (no FORKLIFT_WAREHOUSE_ID) needs FORKLIFT_TOKEN_SHA256: only the \
+            shared bearer sets a warehouse up, so operator tokens alone could never write anywhere."
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// The pure decision behind [`auth_from_env`], over any variable source.
 fn auth_from(var: impl Fn(&str) -> Option<String>) -> Result<AuthConfig, String> {
     if var("FORKLIFT_TOKEN").is_some() {
@@ -1200,6 +1214,24 @@ mod tests {
             ],
             "one digest bound as the shared bearer and as an operator",
         );
+    }
+
+    /// Operator tokens alone suit one warehouse, never many: in multi routing nobody could set a
+    /// warehouse up. The shared bearer, or open access, suits either.
+    #[test]
+    fn operator_tokens_alone_are_refused_for_multi_warehouse_routing() {
+        let operators_only = auth_from(vars(&[(
+            "FORKLIFT_OPERATOR_TOKENS",
+            &format!(r#"{{"{}":"ada@example"}}"#, hex_digest("ada-token")),
+        )]))
+        .unwrap();
+        let with_bearer = auth_from(vars(&[("FORKLIFT_TOKEN_SHA256", &hex_digest("shared-secret"))])).unwrap();
+        let single = Routing::Single("wh".to_string());
+
+        assert!(check_auth_fits_routing(&operators_only, &Routing::Multi).unwrap_err().contains("FORKLIFT_TOKEN_SHA256"));
+        assert_eq!(check_auth_fits_routing(&operators_only, &single), Ok(()));
+        assert_eq!(check_auth_fits_routing(&with_bearer, &Routing::Multi), Ok(()));
+        assert_eq!(check_auth_fits_routing(&AuthConfig::Open, &Routing::Multi), Ok(()));
     }
 
     /// An identifier is bound exactly as configured: the office matches identifiers by exact

@@ -69,6 +69,13 @@ variable "operator_token_digests" {
     error_message = "Set auth_token, operator_token_digests, or both: a control plane with no credential would refuse every request."
   }
 
+  # Multi-warehouse mode: only the shared bearer sets a warehouse id up, so operator tokens alone
+  # could never write anywhere. The function refuses this too, at cold start.
+  validation {
+    condition     = var.warehouse_id != null || var.auth_token != null || length(var.operator_token_digests) == 0
+    error_message = "Multi-warehouse mode (warehouse_id = null) needs auth_token: only the shared bearer sets a warehouse up."
+  }
+
   # The function refuses this too, at cold start: its shared-bearer match is tried first, so the
   # operator binding would be dead and its holder an administrator.
   validation {
@@ -126,8 +133,8 @@ variable "warehouse_id" {
     Null (the default) deploys in multi-warehouse mode (`FORKLIFT_WAREHOUSE_ID` unset) — routes
     live under `/warehouses/{id}/v1/...`. A non-null value deploys single-warehouse mode, serving
     fixed `/v1/...` routes. There is no invented default id: this mirrors `config_from_env`
-    exactly. Note: the auth token is single-tenant regardless of this setting — one token rules
-    every warehouse id in multi-warehouse mode (F8).
+    exactly. In multi-warehouse mode one credential set is accepted for every warehouse id, and
+    `auth_token` is required: only the shared bearer sets a warehouse id up (F8).
   EOT
   type        = string
   default     = null

@@ -109,8 +109,9 @@ Build the two zips with `cargo lambda build --release --arm64` (see
 **Not closed by construction — still worth knowing:**
 
 - **`auth_token` lives in Terraform/OpenTofu state.** The Lambda console holds only its digest,
-  but the state holds the variable itself; use an encrypted state backend, or leave `auth_token`
-  null and configure only `operator_token_digests`. Rotation is change-variable-and-apply. This
+  but the state holds the variable itself; use an encrypted state backend, or — for a single
+  warehouse (`warehouse_id` set) — leave `auth_token` null and configure only
+  `operator_token_digests`. Rotation is change-variable-and-apply. This
   module deliberately does not add a Secrets Manager integration — the code reads an environment
   variable and nothing else, so that would imply security it cannot deliver.
 - **The shared bearer is the administrator credential.** Whoever holds `auth_token` may move any
@@ -153,7 +154,7 @@ The full, semver-governed contract is in [`variables.tf`](variables.tf) and
 once published; renames and removals are breaking changes. A summary:
 
 **Required:** `control_plane_package`, `verifier_package`, and at least one of `auth_token`
-(sensitive) or `operator_token_digests`.
+(sensitive) or `operator_token_digests` — `auth_token` whenever `warehouse_id` is null.
 
 **Optional, most consequential first:** `kms_key_arn`, `warehouse_id`, `force_destroy`,
 `deletion_protection`, `enable_pitr`, `staging_expiry_days`, `responses_expiry_days`,

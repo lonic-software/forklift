@@ -658,7 +658,8 @@ the same type `forklift-server` resolves its callers to:
   `{"<64-hex digest>": "mate@lonic.net"}`. A client presenting one is
   `Principal::Operator(id)`, and the office's roles and per-pallet grants apply to it (below).
   Identifiers are matched exactly against the office roster, never trimmed. Either variable alone
-  is a complete configuration; both together are fine.
+  is a complete configuration for a single warehouse, and both together are fine; multi-warehouse
+  mode needs `FORKLIFT_TOKEN_SHA256` (below), and the function refuses to start without it.
 * **A misconfiguration fails the cold start**, so the function never serves on a credential set
   it half understood: a digest that is not 64 lowercase hex characters; the digest of the empty
   string; a blank identifier; one digest bound twice, or bound both as the shared bearer and as an
@@ -702,12 +703,13 @@ carries exactly its office identity's authority**, judged by the same office rul
 | ref update, meta pallet (`@office`, `@manifest`, `@haul`, `@tags`, `@kv`) | the operator is not enrolled, or is a `reader`; the pallet grant list is not consulted for a meta pallet |
 | trust (re-genesis) | always — a re-genesis's authority comes from the very chain it replaces, so only the shared bearer (or an open head) may perform one |
 
-Until the warehouse is trusted, or while its office has no roster yet (the bootstrap window
-before the office is first lifted), no operator is judged against the office and every
-authenticated caller passes these rules. In multi-warehouse mode (no `FORKLIFT_WAREHOUSE_ID`),
+On a single-warehouse head, until the warehouse is trusted, or while its office has no roster
+yet (the bootstrap window before the office is first lifted), no operator is judged against the
+office and every authenticated caller passes these rules. In multi-warehouse mode (no `FORKLIFT_WAREHOUSE_ID`),
 where every well-formed id answers, an untrusted id is one nobody has set up: an operator token
 is refused (`403`) every write to it, establishing its trust included, so only the shared bearer
-sets a warehouse up — as only the static token creates one on `forklift-server`. The window is not a hole: a trusted warehouse refuses a
+sets a warehouse up — as only the static token creates one on `forklift-server`. Once it is
+trusted, the bootstrap window applies there too. The window is not a hole: a trusted warehouse refuses a
 working or meta pallet outright until its office is lifted, and the office's own first lift is
 pinned by its own compare-and-set.
 
