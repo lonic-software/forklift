@@ -10,14 +10,18 @@ are designed but **not yet implemented** are deliberately kept out of the main
 comparison and collected in [§8](#8-forklift-features-not-yet-implemented-future-work)
 so the present-day picture stays honest.
 
+This page compares; it does not specify. Where it names a Forklift behaviour, it links to the
+page that documents it, and that page is the authority. For what Forklift does that git leaves
+to a host or to you, with runnable examples, see [Why Forklift](guide/concepts.md).
+
 > **Reading note.** Forklift's terminology is warehouse-themed. The mapping to
 > git words (warehouse = repo, parcel = commit, pallet = branch, load = add,
 > stack = commit, consolidate = merge, lift/lower = push/pull, franchise = clone,
-> haul = pull request) is in the [README](../README.md) and
-> [CLI guide](guide/cli.md). This document uses Forklift's words for Forklift and
+> haul = pull request) is in the [README](../README.md) and the
+> [glossary](guide/glossary.md). This document uses Forklift's words for Forklift and
 > each other tool's own words for that tool.
 
-**Status of the systems compared (as of 2026-07):**
+**Status of the systems compared** (Forklift as of 2026-10, the others as of mid-2026):
 
 | System | Since | Author | Language | Data model | Maturity |
 |--------|-------|--------|----------|------------|----------|
@@ -25,7 +29,7 @@ so the present-day picture stays honest.
 | **Jujutsu (jj)** | 2020 | Martin von Zweigbergk / Google | Rust | Snapshots + first-class conflicts (Git-compatible backend) | Young, fast-moving, widely admired |
 | **Sapling (sl)** | 2022 (open-sourced) | Meta | Rust + Python | Snapshots (Mercurial lineage), monorepo-scale | Production at Meta scale; OSS server story thin |
 | **Pijul** | 2015 | Pierre-Étienne Meunier | Rust | **Patches** (sound patch algebra) | Niche, theoretically distinctive |
-| **Forklift** | 2026 | Máté Kolonics / lonic-software | Rust | Content-addressed snapshots | **v0.1.x — brand new, tiny user base** |
+| **Forklift** | 2026 | Máté Kolonics / lonic-software | Rust | Content-addressed snapshots | **v0.3.x — brand new, tiny user base** |
 
 Forklift is by far the youngest and least proven system here. That is the single most
 important honest caveat, and it colors everything below: Git, jj, Sapling, and Pijul
@@ -44,8 +48,8 @@ useful lens.
   a full copy. It won so completely that its assumptions ("a repo is a `.git` directory",
   "the server runs a process to negotiate packs") now feel like laws of nature rather
   than design choices. Git optimizes for **distributed, offline, snapshot-based
-  history**, and treats identity, collaboration metadata, and hosting as *someone else's
-  problem* (yours, or GitHub's).
+  history**, and leaves identity and collaboration metadata largely to hosting services
+  (GitHub, GitLab) and to configuration each user assembles.
 
 - **Jujutsu** — *"What if the working copy were just a commit, and you never feared
   rewriting history?"* jj keeps Git's object model (it uses Git as a storage backend)
@@ -73,7 +77,7 @@ useful lens.
   server. On top of that it builds **cryptographic identity and tamper-evident history**
   *into the repository* (signed parcels, a genesis trust anchor, an in-repo user
   registry), makes **collaboration metadata a signed in-repo object** (reviews, pull
-  requests, provenance), and treats **AI agents as enrolled, signed, supervised
+  requests, tags, provenance), and treats **AI agents as enrolled, signed, supervised
   operators**. Forklift optimizes for **serverless hosting economics + verifiable
   authorship in an AI-authored world**.
 
@@ -87,37 +91,41 @@ Sapling conquered *scale*; Pijul made *merging sound*; Forklift is going after
 
 Git has, by a vast margin, the most users, so it gets a dedicated head-to-head. Forklift
 is deliberately close to Git in *shape* — a snapshot store, a staging area, cheap
-branches, push/pull — so a Git user is productive quickly (Forklift even ships Git
-command names as hidden aliases: `add`, `commit`, `status`, `log`, `branch`,
-`checkout`, `merge`, `clone`, `push`, `pull`, `stash`). The differences are where it
-counts.
+branches, push/pull — so a Git user is productive quickly. Forklift accepts Git's names for
+its everyday commands as hidden aliases (`add`, `commit`, `status`, `log`, `branch`,
+`checkout`, `merge`, `clone`, `push`, `pull`, `stash` and more), and keeps `diff`, `restore`,
+`tag`, `show` and `cherry-pick` under their Git names outright; see
+[Coming from git?](guide/cli.md#coming-from-git). The differences are where it counts.
 
 ### 2.1 Data model & object store
 
 | | Git | Forklift |
 |---|-----|----------|
-| Objects | blob / tree / commit / tag | blob / tree / **compact parcel** (commit); no tag object yet |
+| Objects | blob / tree / commit / tag | blob / tree / **compact parcel** (commit); tags are signed records on the `@tags` meta pallet, not a fourth object type |
 | Addressing | SHA-1 (SHA-256 opt-in, migration ongoing) | **Blake3** (fast, parallel, keyed-hashing capable) |
-| Content model | Snapshots (trees), delta-compressed in packs | Snapshots (trees), zstd full/delta records in native packs |
-| On-disk compression | zlib; delta chains in packfiles | zstd; bounded delta chains in native packs and whole-clone bundles |
+| Content model | Snapshots (trees), delta-compressed in packs | Snapshots (trees), delta-compressed in packs |
+| On-disk compression | zlib; delta chains in packfiles | zstd; bounded delta chains in native packs |
 | Staging area | The index (single file) | **Sharded per-directory inventory** ("the dock") |
-| Hashing large files | Single-threaded | **Parallel — Blake3 parallelizes one big file across cores** |
+| Large files | Whole objects, or the Git LFS add-on | **Native content-defined chunking** from 8 MiB |
 
 Both are snapshot systems: identical content yields an identical hash and is stored
 once (dedup). The meaningful divergences:
 
-- **Blake3 vs SHA-1.** Forklift chose Blake3 for speed, parallelism, and the option of
-  *keyed hashing* (relevant to the future hidden-files feature). Git's SHA-1 is a known
-  weakness it is still migrating away from.
-- **Sharded staging.** Git's index is one file the whole repo shares — the source of
-  `git worktree`'s sharp edges. Forklift shards the staging area per directory, which is
-  what lets commands touch only the directories they need (**bounded memory** is an
-  explicit design principle) and is the foundation of Forklift's parallel walks and its
-  per-working-directory "bays".
-- **Delta compression.** Both systems delta-compress packed history. Git uses its pack delta
-  machinery; Forklift uses zstd dictionary frames against similar objects, with bounded chains.
-  Whole-clone bundles now carry Forklift's native pack/index pairs directly, while newly authored
-  objects remain loose until automatic or explicit compaction.
+- **Blake3 vs SHA-1.** Forklift chose Blake3 for speed, parallelism (one large file hashes
+  across cores), and the option of *keyed hashing* (relevant to the future hidden-files
+  feature). Git's SHA-1 is a known weakness it is still migrating away from.
+- **Sharded staging.** Git's index is one file per working tree. Forklift shards the staging
+  area per directory, which lets commands touch only the directories they need (**bounded
+  memory** is an explicit design principle) and underlies its parallel walks and its
+  per-working-directory [bays](guide/cli.md#bay--parallel-working-directories).
+- **Delta compression.** Both systems delta-compress packed history, and Forklift finds delta
+  bases the way Git does, by walking history to pair each version of a file with the one
+  before it. New objects stay loose until automatic or explicit
+  [`compact`](guide/cli.md#compact--pack-the-object-store); the measured result on git.git is
+  in [the benchmark guide](BENCHMARK.md).
+- **Large files.** Forklift chunks large files natively, with no pointer files and no second
+  tool: an edit re-stores only the chunks it touched. See
+  [Large files](guide/cli.md#large-files) for how they travel and their limits.
 
 ### 2.2 The staging area
 
@@ -125,126 +133,150 @@ Both keep a staging step (Git's index, Forklift's inventory/dock) — a delibera
 similarity, and a deliberate *difference* from jj and Sapling, which drop it. Forklift's
 `load` = `git add`, `stack` = `git commit`. The behavioral wrinkle: Forklift's `commit`
 alias runs `stack`, which commits what you've `load`ed — it does **not** stage-and-commit
-in one step. If you value `git add -p`-style hunk staging, note Forklift stages at file
-granularity today (no interactive hunk staging). **[Forklift lacks `add -p` hunk staging.]**
+in one step. Forklift stages whole files: there is no interactive hunk staging.
+**[Forklift lacks `add -p` hunk staging.]**
 
 ### 2.3 Branching, merging, history editing
 
 - **Branches.** Equivalent: Forklift pallets are mutable pointers to head parcels, cheap
-  and atomic, exactly like Git branches.
-- **Merging.** Forklift `consolidate` is a real three-way merge (common-ancestor BFS,
-  exact whitespace-preserving LCS diff3, clean fast-forward when possible, diff3 conflict
-  markers when not). On par with Git merge for the common cases.
-- **History editing — the big Git-side gap in Forklift.** Git has `rebase` (including
-  interactive), `cherry-pick`, `commit --amend`, `bisect`, `blame`, `reflog`, and tags.
-  Forklift has:
-  - `undo` — a **journaled, universal undo** that reverses the last `stack`,
-    `consolidate` (merges included), or `shift`. Cleaner than Git's five kinds of reset
-    for the last operation, but shallower than Git's reflog for arbitrary recovery.
-  - `deliver` — squash a draft pallet's checkpoint trail into one clean signed parcel
-    *while keeping the trail* as signed evidence. This is nicer than `git rebase -i`
-    squash (which destroys the trail), but narrower in scope.
-  - **No `rebase`, no `cherry-pick`, no `bisect`, no `blame`/annotate, no tags, no
-    interactive history rewriting.** **[Forklift lacks all of these.]** For anyone whose
-    Git workflow is rebase-heavy, this is the most noticeable absence.
+  and atomic, like Git branches.
+- **Merging.** [`consolidate`](guide/cli.md#consolidate--merge-con) is a three-way merge:
+  already-up-to-date, fast-forward, or a merge against the common ancestor with diff3 conflict
+  markers when the sides overlap. On par with Git merge for the common cases.
+- **History tools Forklift has:**
+  - [`cherry-pick`](guide/cli.md#cherry-pick--apply-one-parcels-change-onto-the-current-pallet-cp)
+    — apply one parcel's change onto the current pallet as a new parcel. The original authors
+    are preserved and the pick is freshly signed.
+  - [`blame`](guide/cli.md#blame--who-wrote-each-line-bl-annotate) — attribute each line to
+    the parcel that last changed it, along the first-parent chain (Git's
+    `blame --first-parent`). Because authorship is signed, each line also carries the author's
+    identity class, so blame can say whether an agent wrote it.
+  - [`tag`](guide/cli.md#tag--signed-tags--releases) — admin-signed, immutable release tags.
+    Git has signed tags too; Forklift's differ in that the signer is checked against the
+    in-repo office (§2.4) rather than a keyring each reader assembles.
+  - [`undo`](guide/cli.md#undo--reverse-the-last-operation) — a journaled undo that walks
+    back `stack`, `consolidate`, `cherry-pick`, `shift` and pallet deletes one at a time.
+    Simpler than choosing among Git's kinds of reset, but shallower than Git's reflog for
+    arbitrary recovery.
+  - [`deliver`](guide/cli.md#deliver--squash-a-draft-onto-a-target-keeping-the-trail-dv) —
+    squash a draft pallet's checkpoint trail into one clean signed parcel *while keeping the
+    trail* as signed evidence. Unlike `git rebase -i` squash, the trail is not destroyed;
+    but it is narrower in scope.
+- **What Git has and Forklift does not:** `rebase` (including interactive), `commit --amend`,
+  `bisect`, and a reflog. **[Forklift lacks these.]** Rebase is declined on purpose: it
+  rewrites signed history and needs a force-push, and Forklift's remotes accept fast-forwards
+  only. `cherry-pick` plus `consolidate` cover moving changes between pallets. For anyone whose
+  Git workflow is rebase-heavy, this is the most noticeable absence.
 
 ### 2.4 Identity, signing & trust — Forklift's clearest win over Git
 
-This is where Forklift is *structurally* ahead, not just differently-shaped.
+This is where Forklift is *structurally* ahead, not just differently-shaped. The full model is
+in [Trust and identity](guide/trust-and-identity.md).
 
 | | Git | Forklift |
 |---|-----|----------|
-| Author identity | Freetext `name <email>`, trivially forgeable | Signed by an **enrolled key**; the operator id is on-chain |
-| Commit signing | Optional GPG/SSH; almost nobody configures it | **Mandatory once you enroll** — a one-way door, no unsigned escape hatch |
-| Who can contribute | Anyone who can write to the repo | On a trusted warehouse, **only holders of admitted keys** |
-| User registry | None (GitHub bolts one on outside the repo) | **In-repo `office`** — users, roles, keys, all signed |
-| Offline verification | `git verify-commit` if signed, no registry to check against | `audit` — verifies the whole chain from a **genesis trust anchor** offline |
-| Key management | Out of band | `office keygen` / `admit` / `rotate` / `retire` / `authorize`, with rotation continuity proofs and revocation records |
-| Privacy | Name + email baked into immutable history forever | **Pseudonymous by default, zero PII on-chain**; GDPR-style name erasure is possible |
+| Author identity | Freetext `name <email>`, trivially forgeable | Signed by an **enrolled key**; the history records an opaque operator id |
+| Commit signing | Optional per author (GPG, SSH or X.509) | **Mandatory once you enroll** — a one-way door, no unsigned escape hatch |
+| Who can contribute | Whoever the host lets push | On a trusted warehouse, **only holders of admitted keys** |
+| User registry | None (hosts keep one outside the repo) | **In-repo `office`** — users, roles, keys, all signed |
+| Offline verification | `git verify-commit` against a keyring you supply | [`audit`](guide/cli.md#audit--verify-signed-history-offline-a) — verifies the chain from a **genesis trust anchor** offline |
+| Key management | Out of band | `office keygen` / `admit` / `authorize` / `rotate` / `retire`, with revocation decided by ancestry |
+| Privacy | Name + email baked into immutable history forever | **Pseudonymous: no names or emails in history** at all |
 
-Git's trust model is "trust the server's account system." Forklift's trust model lives
-*in the repository* and is verifiable by any clone with no server and no network. This is
-the feature Git structurally cannot retrofit, because it has no identity registry to
-verify signatures against.
+Git can sign, but which keys count is decided outside the repository, so a clone cannot tell
+from the repository alone who was allowed to write. Forklift's trust model lives *in the
+repository* and is verifiable by any clone with no server and no network. That is the part Git
+cannot retrofit without an identity registry to verify signatures against. Forklift keeps no
+names of its own: a hosting provider may map operator ids to names behind its own policy (see
+[Profiles and pseudonymity](guide/trust-and-identity.md#11-profiles-and-pseudonymity)).
 
 ### 2.5 Collaboration metadata in the repo
 
-In Git, pull requests, reviews, and approvals live in **GitHub's/GitLab's database** —
-not in the repo, not portable, not signed, lost if you change hosts. Forklift puts them
-*in the warehouse* as signed objects on dedicated meta-pallets:
+Git has signed tags and `git notes`, but pull requests, reviews and approvals live in
+**GitHub's or GitLab's database**: not in the repo, not portable, not signed, and left behind
+if you change hosts. Forklift puts them *in the warehouse* as signed records on meta pallets:
 
-- `manifest` — signed post-metadata attached to parcels (notes, approvals, **provenance**),
-  one signed cell per entry.
-- `haul` — pull requests as signed cells (the proposal, its head, its status, one review
-  per reviewer, comments), where **every review is signed** and names the head it
-  reviewed, so an approval is forge-proof, never silently carries over to new work, and
-  even carries the reviewer's identity class (human vs. agent).
+- [`manifest`](guide/cli.md#manifest--signed-post-metadata-on-parcels-mf) — signed
+  notes, approvals and **AI provenance** attached to parcels.
+- [`kv`](guide/cli.md#kv--custom-metadata-on-parcels) — your own signed keys and values on
+  any parcel (CI status, for example).
+- [`tag`](guide/cli.md#tag--signed-tags--releases) — releases.
+- [`haul`](guide/cli.md#haul--pull-requests-reviewable-merge-proposals) — pull requests,
+  where **every review is signed** and names the head it reviewed, so an approval is
+  forge-proof, never silently carries over to new work, and carries the reviewer's identity
+  class (human vs. agent). Reviews are recorded but do not yet gate a merge (§8).
 
-These sync across remotes like any other object and survive moving hosts. Git has
-nothing equivalent in-repo; the closest is under-used `git notes`.
+These sync with `lift`, `lower` and `franchise` like any other pallet and survive moving
+hosts.
 
 ### 2.6 Remote & hosting architecture — Forklift's founding bet
 
 Git's wire protocol needs a **stateful server process** to negotiate packs (compute what
-to send by walking history and building a delta-compressed packfile on the fly). That is
-precisely what makes serverless Git hosting awkward.
+to send by walking history and building a packfile on the fly). That is what makes
+serverless Git hosting awkward.
 
 Forklift's protocol is designed so the remote is **untrusted object storage + thin
-verifier functions**:
+verifier functions** (the [remote protocol](format/REMOTE_PROTOCOL.md) is the reference):
 
-- The control plane exchanges hash lists and (in the hosted design) presigned URLs;
-  **object bytes move directly between client and storage**, never through a compute layer.
-- Refs update via **compare-and-swap** (fast-forward only, no force-push) — the single
-  point of mutable consistency.
-- Everything a client downloads is **verifiable offline** (content addressing +
-  signatures); everything it uploads is **unverified until the server re-hashes it**.
-- A self-hostable server head (`forklift-server`, shipped) already implements all of
-  this — hash verification before an object is fetchable, CAS refs, full signature audit
-  on trusted warehouses, multi-warehouse serving, GC, a Docker image.
+- The remote checks every object it accepts against its hash; the client checks everything
+  it downloads by hash, and by signature in a warehouse with an office.
+- Pallet refs move by **compare-and-swap**, fast-forward only — there is no force-push.
+- Two server **heads** implement it, and both ship:
+  - **`forklift-server`** — a single self-hostable binary with multi-warehouse serving,
+    per-operator tokens with pallet grants, GC and a Docker image. See
+    [Running a server](SERVER.md).
+  - **The AWS head** (`forklift-aws-lambda`) — API Gateway and two Lambda functions in front
+    of S3 and DynamoDB. Object uploads and downloads go directly between the client and S3
+    on presigned URLs instead of through the API; the functions read an upload only to
+    check its hash. You deploy it into your own AWS account; see
+    [the deployment reference](DEPLOYMENT.md). It cannot yet authorize per pallet: every
+    caller holding its token has the same privileges
+    ([what the token controls](DEPLOYMENT.md#what-the-bearer-token-does--and-does-not--control)).
 
-The AWS-serverless head (Lambda + S3 + DynamoDB) that motivated the whole project is
-**designed but not yet built** ([§8](#8-forklift-features-not-yet-implemented-future-work)).
-So today Forklift can be self-hosted, but the marquee "runs on S3 with no server"
-deployment does not exist yet. **[Forklift's serverless hosting is designed, not shipped.]**
+There is no managed Forklift hosting service. **[Forklift has no hosted offering; you run the
+server or deploy the AWS head yourself.]**
 
 Against Git's ecosystem, this is lopsided the other way: GitHub, GitLab, Gitea, Bitbucket,
-CI everywhere, IDE integration everywhere, `git-lfs`, an ocean of Stack Overflow answers.
-Forklift has none of that yet. **[Forklift's ecosystem is essentially nonexistent by
+CI everywhere, IDE integration everywhere, an ocean of Stack Overflow answers. Forklift has
+none of that yet. The bridge it offers is
+[`mirror`](guide/cli.md#mirror--keep-a-git-remote-in-step), which keeps a Git remote in step
+with a Forklift remote, one way. **[Forklift's ecosystem is essentially nonexistent by
 comparison — this is the honest, dominant practical gap.]**
 
 ### 2.7 Performance & concurrency
 
-- **Parallelism.** Git is largely single-threaded in its core paths. Forklift is
-  **parallel by default** — per-directory scans, per-file hashing, and compression fan
-  out over a shared worker pool sized to core count, and Blake3 parallelizes even a
-  single large file. On many-core machines with large working trees this is a real edge.
+- **Parallelism.** Git parallelizes some operations by default, such as packing, and others,
+  such as checkout, only behind a setting. Forklift is designed to use every core by default
+  and spreads work across them wherever measurement shows it pays; some operations were
+  measured and kept serial. [The parallelization plan](PARALLELIZATION_PLAN.md) lists each
+  operation and its status.
 - **Bounded memory.** Forklift makes "no operation needs RAM proportional to repo size"
   a design principle (streaming shards). Git is generally fine here too, but Forklift
   designs for it explicitly.
-- **Caveat.** Git has 20 years of profiling and pathological-case hardening. Forklift's
-  performance claims are architecturally sound but not yet proven on huge real-world
-  repos at scale.
+- **Caveat.** Git has 20 years of profiling and pathological-case hardening. Forklift has been
+  measured against Git on git.git, where it is level on some operations and slower on others
+  ([the benchmark guide](BENCHMARK.md)), but not at monorepo scale.
 
 ### 2.8 AI-agent orientation
 
-Git treats machine consumers as an afterthought (scrape porcelain, parse `--porcelain`
-output, freetext authors). Forklift is built for them: global `--json` with a versioned
-envelope, stable error + exit codes, structured `conflicts` output (base/ours/theirs as
-content addresses), a built-in `forklift mcp` MCP server, agent identity classes with
-supervisors, machine-authorship provenance, `deliver` for squash-with-evidence, `bay`s
-for fleet-on-one-box, and optimistic lift so a fleet stacking to one pallet stops
-serializing. This is covered in [§7](#7-the-ai-agent-dimension). Git has no answer here
-that isn't a retrofit.
+Git has stable machine formats for some commands (`--porcelain`, `--format`, `-z`), each its
+own, and freetext authors. Forklift is built for machine consumers: global `--json` with one
+versioned envelope, stable error and exit codes, structured `conflicts` output (base/ours/theirs
+as content addresses), a built-in `forklift mcp` MCP server, agent identity classes with
+supervisors, machine-authorship provenance, `deliver` for squash-with-evidence, `bay`s for
+fleet-on-one-box, and optimistic lift so a fleet stacking to one pallet stops serializing.
+This is covered in [§7](#7-the-ai-agent-dimension) and in
+[the machine and agent interface](MACHINE_INTERFACE.md).
 
 ### 2.9 Git vs. Forklift — bottom line
 
 Forklift is a bet that *identity, collaboration metadata, and hosting economics* belong
 **inside** the VCS, and that AI authorship makes that urgent. Where it wins over Git today
-is signed/verifiable in-repo trust, in-repo portable collaboration data, parallelism, and
-machine-first ergonomics. Where Git wins — and will for years — is **maturity, ecosystem,
-tooling, delta compression, and the rich history-editing toolbox** (rebase, cherry-pick,
-bisect, blame, tags). If you need those, or you need it to work everywhere with everyone
-today, use Git.
+is signed/verifiable in-repo trust, in-repo portable collaboration data, a storage-centric
+remote protocol, and machine-first ergonomics. Where Git wins — and will for years — is
+**maturity, ecosystem, tooling, proven scale, and the rest of the history-editing toolbox**
+(rebase, amend, bisect, reflog, hunk staging). If you need those, or you need it to work
+everywhere with everyone today, use Git.
 
 ---
 
@@ -260,25 +292,27 @@ jj is the most direct "modern VCS" comparison, and in several areas jj is ahead.
   first-class conflicts.]**
 - **The operation log.** jj records *every* operation and can undo/redo any of them
   (`jj op undo`), including restoring the repo to any past operation state. Forklift's
-  journaled `undo` covers `stack`/`consolidate`/`shift` only, one step at a time.
-  jj's model is more general. **[Forklift's undo is narrower.]**
+  journaled `undo` covers `stack`, `consolidate`, `cherry-pick`, `shift` and pallet deletes,
+  one step at a time, with no redo. jj's model is more general. **[Forklift's undo is
+  narrower.]**
 - **No staging area friction & the working-copy-as-commit model** make history editing
   effortless in jj; automatic rebase of descendant commits when you edit an ancestor is a
-  standout. Forklift has no rebase at all. **[Forklift lacks this.]**
+  standout. Forklift has no rebase. **[Forklift lacks this.]**
 - **Stable change IDs + revsets.** jj gives every change a stable ID that survives
-  rewrites, plus a powerful `revset` query language. Forklift identifies parcels by hash
-  (which changes on rewrite) and has no query language. **[Forklift lacks stable change
-  IDs and revsets.]**
+  rewrites, plus a `revset` query language. Forklift identifies parcels by hash, and its
+  [`query`](guide/cli.md#query--filter-history-on-signed-identity-q) filters history by
+  signed identity, provenance, tags and paths, but is not a revset algebra. **[Forklift lacks
+  stable change IDs and revsets.]**
 
 **Where Forklift is ahead of jj:**
 
 - **Identity, signing & trust.** jj inherits Git's model — freetext authors, optional
   signing, no in-repo user registry. Forklift's signed office, genesis anchor, and offline
   `audit` have no jj equivalent.
-- **Serverless-native protocol & self-hostable server.** jj relies on Git remotes and Git
-  hosting (its default backend *is* Git); it has no independent hosting story. Forklift has
-  its own storage-centric protocol and a self-hostable server head.
-- **In-repo collaboration metadata** (haul/manifest) and **AI-agent primitives**
+- **Its own storage-centric protocol and server heads.** jj relies on Git remotes and Git
+  hosting (its default backend *is* Git). Forklift has its own protocol, a self-hostable
+  server and an AWS serverless head.
+- **In-repo collaboration metadata** (haul/manifest/tags) and **AI-agent primitives**
   (identity classes, provenance, MCP, bays). jj has none of these as first-class features.
 - **Zero-PII pseudonymous history** by design.
 
@@ -297,14 +331,15 @@ where Forklift is least proven.
 **Where Sapling is ahead of Forklift:**
 
 - **Monorepo scale, proven.** Sapling runs on repos with tens of millions of files at
-  Meta. Forklift's scale claims are design-stage; **it has not been benchmarked on a large
-  real repo** (its own design doc flags this as an open task). **[Forklift is unproven at
-  scale.]**
+  Meta. Forklift has been benchmarked on git.git, not on anything of that size.
+  **[Forklift is unproven at scale.]**
 - **Virtual filesystem / lazy fetch (EdenFS).** Sapling fetches file content on demand,
-  so you can work in a giant repo without materializing it. Forklift materializes the
-  working tree; its task-scoped sparse workspaces are **future work**
-  ([§8](#8-forklift-features-not-yet-implemented-future-work)). **[Forklift lacks lazy/
-  partial checkout today.]**
+  so you can work in a giant repo without materializing it. Forklift has
+  [sparse warehouses](guide/concepts.md#4-sparse-warehouses): a `franchise --only` fetches
+  and materializes only the paths you ask for, and `expand` widens that later. But there is
+  no virtual filesystem, and fetching history lazily, so a clone's cost is bounded by the tip
+  rather than by history length, is still future work (§8). **[Forklift lacks a virtual
+  filesystem.]**
 - **Smartlog & stacked-diff workflow polish.** Sapling's `smartlog`, `absorb`, and
   stacked-PR review (ReviewStack) are mature and loved. Forklift's `deliver` is in the
   same spirit but far less developed. **[Forklift lacks smartlog/absorb-grade tooling.]**
@@ -317,7 +352,7 @@ where Forklift is least proven.
   in-repo cryptographic user registry or genesis-anchored offline audit.
 - **Serverless-native hosting design.** Sapling's scale server (Mononoke) is a heavy
   stateful service; its open-source self-hosting story is thin. Forklift's remote is
-  storage + thin verifiers, self-hostable today.
+  storage + thin verifiers, self-hostable or deployable on AWS today.
 - **In-repo collaboration metadata and AI-agent primitives.**
 - **A single self-contained binary** with no Python runtime; Sapling's client mixes
   Rust and Python.
@@ -341,9 +376,10 @@ mostly about data model.
   changes are applied. Snapshot systems — Git, jj, Sapling, **and Forklift** — cannot
   offer this; merge results can depend on order and ancestry. **[Forklift, being
   snapshot-based, structurally lacks patch commutativity.]**
-- **Clean cherry-picking & change reordering** with no duplicate-commit / rebase-hell
-  problems, a direct consequence of the patch model. Forklift has no cherry-pick at all.
-  **[Forklift lacks this.]**
+- **Clean cherry-picking & change reordering**, a direct consequence of the patch model.
+  Forklift has `cherry-pick`, but as in Git a pick is a new parcel with its own hash, so the
+  same change then exists twice in history; Pijul applies the same patch. **[Forklift lacks
+  patch identity across picks.]**
 - **First-class stored conflicts**, like jj. Forklift blocks on conflicts. **[Forklift
   lacks this.]**
 
@@ -355,11 +391,13 @@ mostly about data model.
 - **Identity, signing & trust as a first-class subsystem.** Pijul signs patches and has
   keys, but nothing like Forklift's genesis anchor, in-repo office/role registry, agent
   identity classes, and offline chain audit.
-- **Serverless-native hosting design + self-hostable server.** Pijul has The Nest for
-  hosting, but not Forklift's storage-centric, presigned-byte-plane architecture.
-- **In-repo collaboration metadata (haul/manifest) and the whole AI-agent track.**
-- **Git interoperability** — Forklift ships bidirectional `import-git` / `export-git`.
-  Pijul's Git interop is more limited.
+- **Serverless-native hosting design.** Pijul has The Nest for hosting, but not Forklift's
+  storage-centric architecture with object bytes on presigned URLs.
+- **In-repo collaboration metadata (haul/manifest/tags) and the whole AI-agent track.**
+- **Git interoperability** — Forklift ships
+  [`import-git`](guide/cli.md#import-git--migrate-a-git-repository),
+  [`export-git`](guide/cli.md#export-git--migrate-back-to-git) and `mirror`. Pijul's Git
+  interop is more limited.
 
 **Shared ground:** both are Rust, both make conflicts and signing serious concerns, both
 challenge Git's assumptions. The summary: **Pijul is the tool if *merge correctness and
@@ -380,41 +418,42 @@ Legend: ✅ present · ⚠️ partial / weaker · ❌ absent · 🔭 **designed 
 | Staging area | ✅ | ❌ | ❌ | ⚠️ | ✅ (sharded) |
 | Cheap branches | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Three-way merge | ✅ | ✅ | ✅ | ✅ | ✅ |
-| First-class / committable conflicts | ❌ | ✅ | ⚠️ | ✅ | ❌ |
-| Rebase | ✅ | ✅ (auto) | ✅ | n/a | ❌ |
-| Cherry-pick | ✅ | ✅ | ✅ | ✅ | ❌ |
+| First-class / committable conflicts | ❌ | ✅ | ⚠️ | ✅ | 🔭 (parked) |
+| Rebase | ✅ | ✅ (auto) | ✅ | n/a | ❌ (declined) |
+| Cherry-pick | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Interactive history editing | ✅ | ✅ | ✅ | ⚠️ | ⚠️ (`deliver`) |
 | Universal undo / operation log | ⚠️ (reflog) | ✅ | ✅ | ⚠️ | ⚠️ (journaled `undo`) |
-| Stable change IDs / revsets | ❌ | ✅ | ⚠️ | ⚠️ | ❌ |
-| Bisect | ✅ | ⚠️ | ✅ | ❌ | ❌ |
-| Blame / annotate | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Tags | ✅ | ✅ | ✅ | ⚠️ | ❌ |
-| Hunk-level staging (`add -p`) | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Parallel core ops | ❌ | ⚠️ | ✅ | ⚠️ | ✅ |
-| Lazy / virtual filesystem checkout | ❌ | ❌ | ✅ | ⚠️ | 🔭 |
-| Partial / sparse workspace | ⚠️ (painful) | ⚠️ | ✅ | ✅ | 🔭 |
-| Large-file handling | ⚠️ (LFS add-on) | ⚠️ | ✅ | ⚠️ | ⚠️ |
-| Delta compression | ✅ | ✅ | ✅ | ✅ | 🔭 |
-| Parallel working dirs (worktrees) | ⚠️ (bolt-on) | ✅ | ✅ | ⚠️ | ✅ (bays) |
+| Stable change IDs / revsets | ❌ | ✅ | ⚠️ | ⚠️ | ⚠️ (`query`, no change IDs) |
+| Bisect | ✅ | ⚠️ | ✅ | ❌ | 🔭 |
+| Blame / annotate | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Tags | ✅ | ✅ | ✅ | ⚠️ | ✅ (signed) |
+| Hunk-level staging (`add -p`) | ✅ | ✅ | ✅ | ✅ | 🔭 |
+| Parallel core ops | ⚠️ | ⚠️ | ✅ | ⚠️ | ✅ |
+| Lazy / virtual filesystem checkout | ❌ | ❌ | ✅ | ⚠️ | ❌ |
+| Partial / sparse workspace | ⚠️ (two features) | ⚠️ | ✅ | ✅ | ✅ |
+| Large-file handling | ⚠️ (LFS add-on) | ⚠️ | ✅ | ⚠️ | ✅ (native chunking) |
+| Delta compression | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Parallel working dirs (worktrees) | ✅ | ✅ | ✅ | ⚠️ | ✅ (bays) |
 | Mandatory signed history | ❌ | ❌ | ❌ | ⚠️ | ✅ |
 | In-repo user/key registry | ❌ | ❌ | ❌ | ⚠️ | ✅ |
 | Genesis trust anchor + offline audit | ❌ | ❌ | ❌ | ⚠️ | ✅ |
 | Pseudonymous / zero-PII history | ❌ | ❌ | ❌ | ⚠️ | ✅ |
-| In-repo collaboration metadata (PRs/reviews) | ❌ | ❌ | ❌ | ⚠️ | ✅ |
+| In-repo collaboration metadata (PRs/reviews) | ⚠️ (notes) | ❌ | ❌ | ⚠️ | ✅ |
 | AI-agent identity classes + provenance | ❌ | ❌ | ❌ | ❌ | ✅ |
 | Machine-first CLI (`--json`, stable errors) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ✅ |
 | Built-in MCP server | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Serverless-native remote protocol | ❌ | ❌ | ❌ | ❌ | ✅ (self-host today) |
-| Managed hosting / serverless deployment | ✅ (huge) | via Git | ⚠️ (Mononoke) | ✅ (The Nest) | 🔭 (AWS head planned) |
-| Git interop (import & export) | n/a | ✅ (native) | ✅ | ⚠️ | ✅ (bidirectional) |
+| Serverless-native remote protocol | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Serverless deployment | ❌ | via Git | ❌ | ❌ | ✅ (AWS head, self-deployed) |
+| Managed hosting | ✅ (huge) | via Git | ⚠️ (Mononoke) | ✅ (The Nest) | ❌ |
+| Git interop (import & export) | n/a | ✅ (native) | ✅ | ⚠️ | ✅ (import, export, mirror) |
 | Ecosystem / IDE / CI integration | ✅✅✅ | ⚠️ (growing) | ⚠️ | ❌ | ❌ |
 | Proven at massive scale | ✅ | ⚠️ | ✅ | ❌ | ❌ |
 | Years in production | ~20 | ~4 | production @ Meta | ~10 (niche) | **<1** |
 
 The matrix is intentionally unflattering where it should be: Forklift's ✅ column is real
-and distinctive (trust, in-repo collaboration, AI agents, serverless protocol,
-parallelism), but its ❌ and 🔭 columns are long, and its **ecosystem and scale rows are
-its weakest** — the things that take *time and users*, not code, to earn.
+and distinctive (trust, in-repo collaboration, AI agents, serverless protocol), but its
+❌ and 🔭 rows are real too, and its **ecosystem and scale rows are its weakest** — the
+things that take *time and users*, not code, to earn.
 
 ---
 
@@ -427,16 +466,17 @@ becoming primary consumers of version control, which changes five things:
 1. **Authorship becomes a compliance question** — *what* wrote this, under *whose*
    authority. Forklift answers it cryptographically: agents are enrolled operators with an
    **identity class** (human / agent / bot / service) and a **supervisor**, every parcel
-   is signed by the agent's own key, and `query --class agent` filters "which parcels
-   did agents write, under whose supervision" — forge-proof and offline. Passphrase-
-   protected human keys mean an unattended agent **fails closed** rather than signing as a
-   human.
+   is signed by the agent's own key, and `query --class agent` answers "which parcels
+   did agents write, under whose supervision" from the verified signer, offline.
+   [Passphrase-protected](guide/trust-and-identity.md#6-passphrase-protected-keys) human keys
+   mean an unattended agent with no terminal cannot sign as a human.
 2. **The CLI's consumer is a program on a token budget** — Forklift has global `--json`,
    stable error/exit codes, token-cheap summaries, and a built-in `forklift mcp` MCP
    server so agents call typed tools instead of scraping output.
 3. **Concurrency goes fleet-size** — `bay`s give N agents parallel working directories on
-   one machine sharing one object store; **optimistic lift** auto-merges disjoint
-   concurrent pushes so a fleet stacking to one pallet stops serializing through a human.
+   one machine sharing one object store; [optimistic lift](guide/cli.md#lift--push-li)
+   auto-merges concurrent pushes that merge cleanly, so a fleet stacking to one pallet stops
+   serializing through a human.
 4. **History splits into a noisy trail and a clean story** — `deliver` squashes an agent's
    checkpoint trail into one clean signed parcel *while keeping the trail as signed
    evidence*.
@@ -452,75 +492,60 @@ honest that it is also a **bet on a future** that has not fully arrived.
 
 ## 8. Forklift features **not yet implemented** (future work)
 
-> Everything in this section is **designed but not shipped** as of 2026-07. It is listed
-> separately, on purpose, so the rest of this document reflects only what Forklift can
-> actually do today. These are being actively worked on; several are what would close the
-> most-cited gaps above. Status labels mirror Forklift's own roadmap
-> ([`docs/DESIGN.html`](DESIGN.html)).
+> Everything in this section is **designed or planned but not shipped** as of 2026-10. It is
+> listed separately, on purpose, so the rest of this document reflects only what Forklift can
+> actually do today. [The design document](DESIGN.html) is the roadmap and holds each item's
+> current status; this list is a summary of it and loses to it where they differ.
 
-**Hosting & scale (the founding vision, partly unbuilt):**
+**Hosting & scale:**
 
-- 🔭 **AWS serverless head** (`forklift-aws-lambda`) — the Lambda + S3 + DynamoDB control
-  plane that motivated the whole project. *Planned.* Today Forklift can be **self-hosted**
-  (`forklift-server`) but the "runs on S3 with no server" deployment is not built.
-- 🔭 **Generational/ranged bundle delivery** — native indexes are shipped; range negotiation and
-  incremental bundle rebuilds remain planned.
-- 🔭 **A managed hosting service** (repo registry, web UI, auth, billing) — Forklift's
-  GitHub/GitLab equivalent. *Planned as a separate product*, built on the AWS head.
-- 🔭 **Server metrics/observability, bundle auto-rebuild policy, native TLS listener** —
-  production-hardening items. *Planned* (logs + health checks already shipped).
+- 🔭 **Lazy history** — fetch parcels and trees on demand, so clone cost is bounded by the tip
+  rather than by history length. *Planned*, after the warehouse becomes a bounded cache over
+  its remote, whose design is closed and partly built.
+- 🔭 **Per-pallet authorization on the AWS head**, which today has no per-caller identity.
+  `forklift-server` already has per-operator tokens with pallet grants.
+- 🔭 **Server metrics** (bytes and objects transferred, CAS conflicts, audit failures) and a
+  **bundle auto-rebuild policy**. *Planned* (logs and a health check have shipped).
 
-**Working-copy scale (the Sapling-shaped gap):**
+**Working-copy & history tools:**
 
-- 🔭 **Task-scoped sparse workspaces** (`franchise --only <subtree>`, scoped bays) — fetch
-  and materialize only the subtree a task needs; the per-directory tree/shard model makes
-  this natural. *Needs design.* This is Forklift's answer to sparse-checkout / lazy
-  fetch, and it is **not built** — so Forklift has no partial-checkout story today.
-- 🔭 **Per-file privileges / hidden files** (FORK-10) — files some users can't even see,
-  enforced by the remote (keyed-hash or encrypted blobs). Flagged as the hardest feature
-  in the backlog. *Needs design.*
+- 🔭 **First-class, committable conflicts** — a conflicting merge stacked as a signed parcel
+  and resolved later, as jj does. *Designed, parked until there is demand.*
+- 🔭 **`bisect`** and **hunk-level partial staging**. *Planned.*
+- 🔭 **Per-file privileges / hidden files** — files some users cannot even see, enforced by the
+  remote. The hardest feature in the backlog. *Needs design.*
+- 🔭 **Per-parent conflict stages** for merges with more than two parents. *Needs design.*
 
 **Collaboration & identity (provider layer):**
 
-- 🔭 **Org-tier chains & delegation hierarchy** — per-org signed chains above the
-  warehouse office, for scaling identity across an organization. *In progress* (pseudonymous
-  chains, sigchain endorsements, PoP + admin-authorized keys, re-genesis, revocation
-  records, and the hook protocol have **shipped**; org-tier chains and embedded-key
-  offline audit / org-chain bundling remain).
-- 🔭 **Per-org pseudonymous operator ids** — true cross-org unlinkability. *Future*
-  (global id shipped; per-org is a provider-layer upgrade).
+- 🔭 **Org-tier chains & delegation hierarchy** — per-org signed chains above the warehouse
+  office. *In progress*: pseudonymous chains, sigchain endorsements, proof-of-possession and
+  admin-authorized keys, re-genesis, revocation records and the hook protocol have shipped;
+  org-tier chains and embedded-key offline audit remain.
 - 🔭 **Web-UI signing** — producing signed content from a browser "merge" button without
-  the provider being able to forge. *Future* (part of the provider layer).
-- 🔭 **Cross-warehouse forks & approval-gated merges for `haul`** — the pull-request MVP
-  is intra-warehouse and records reviews without gating merges on them. *Future.*
+  the provider being able to forge. *Future.*
+- 🔭 **Cross-warehouse forks & approval-gated merges for `haul`** — hauls merge within one
+  warehouse today, and reviews are recorded without gating the merge. *Future.*
 
 **Agent track remainders:**
 
 - 🔭 **`events --follow` event stream** — so fleet members react to each other's stacks
-  instead of polling. *Deferred* pending the internal event-stream refactor.
-- 🔭 **Auto-checkpoint mode** for draft pallets (checkpoint every `load`/`stack`), and
-  **bundling a delivery's trail closure** so it travels with the delivery. *Future.*
+  instead of polling. *Deferred* pending an internal event-stream refactor.
+- 🔭 **Auto-checkpoint mode** for draft pallets. *Planned.*
 - 🔭 **Full transcript stored as a blob-in-tree** for provenance (regulated shops).
-  *Future* (hash-only provenance shipped).
+  *Future* (a transcript hash already ships).
 
-**UX & smaller items:**
-
-- 🔭 **"Did you mean …" command suggestions** and **per-command usage guides**. *Planned.*
-- 🔭 **Per-parent conflict stages** for three-parent merges. *Needs design.*
-- 🔭 Cosmetic: rename "inventory" → "dock" for terminology consistency. *Needs design.*
-
-**Not on the roadmap at all** (worth stating so the picture is complete): `rebase`,
-`cherry-pick`, `bisect`, `blame`/annotate, tags, hunk-level staging, and first-class
-committable conflicts are **not currently planned** features — they are genuine gaps
-versus the alternatives, not scheduled work.
+**Declined:** `rebase` and interactive history rewriting are not planned. They rewrite signed
+history and need a force-push; `cherry-pick` and `consolidate` cover moving changes between
+pallets instead.
 
 ---
 
 ## 9. Summary — when to reach for which
 
 - **Use Git** if you need it to work everywhere, with everyone, today — mature tooling,
-  vast ecosystem, and a full history-editing toolbox (rebase, cherry-pick, bisect,
-  blame, tags). The safe default for almost everyone.
+  vast ecosystem, and a full history-editing toolbox (rebase, amend, bisect, reflog).
+  The safe default for almost everyone.
 - **Use Jujutsu** if you want the best *local workflow and history-editing* experience —
   first-class conflicts, universal undo, effortless rewriting — while staying
   Git-compatible.
@@ -531,20 +556,18 @@ versus the alternatives, not scheduled work.
 - **Use Forklift** if you care about **verifiable, signed, in-repo identity and
   collaboration data**, a **serverless-native hosting model**, and **first-class AI-agent
   authorship** — and you can accept that it is **brand new, unproven at scale, lacks a
-  large ecosystem, has no managed hosting yet, and is missing common history-editing
-  tools**. Forklift is the most opinionated bet in this list, aimed at where version
-  control might be going rather than where it has been.
+  large ecosystem, has no managed hosting, and has no rebase**. Forklift is the most
+  opinionated bet in this list, aimed at where version control might be going rather than
+  where it has been.
 
 The honest one-sentence verdict: **Forklift has a genuinely distinctive and coherent
-position — trust, serverless hosting, and AI authorship built into the VCS — but it is
-years behind Git, jj, Sapling, and Pijul on maturity, ecosystem, scale-proof, and the
-everyday history-editing toolbox, and several of its headline differentiators (serverless
-hosting at scale, sparse workspaces, delta compression) are still on the roadmap rather
-than in the binary.**
+position — trust, serverless hosting, and AI authorship built into the VCS, all shipped — but
+it is years behind Git, jj, Sapling, and Pijul on maturity, ecosystem and proof at scale, and
+it deliberately leaves out the history-rewriting half of Git's toolbox.**
 
 ---
 
-*This comparison reflects Forklift at v0.1.x (2026-07). For the authoritative, dated
+*This comparison reflects Forklift at v0.3.x (2026-10). For the authoritative, dated
 status of every Forklift feature, see [`docs/DESIGN.html`](DESIGN.html). Descriptions of
 Git, Jujutsu, Sapling, and Pijul reflect those projects as of mid-2026 and are necessarily
 a snapshot of fast-moving software — corrections welcome.*
