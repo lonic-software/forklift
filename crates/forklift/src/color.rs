@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 /// When to colour human output (`--color`). The variants' doc comments are help text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ColorChoice {
-    /// Color on a terminal, unless NO_COLOR is non-empty or TERM is unset or `dumb`.
+    /// Color on a terminal, unless NO_COLOR is non-empty or TERM is `dumb` (or unset, outside Windows).
     Auto,
     /// Always color, even into a pipe or a file.
     Always,

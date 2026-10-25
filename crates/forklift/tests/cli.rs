@@ -3887,8 +3887,8 @@ fn piped_output_is_plain_unless_colour_is_forced() {
     assert!(forced.contains("\x1b[31m") && forced.contains("\x1b[32m"), "{:?}", forced);
 }
 
-/// clap's own help and usage errors follow `--color` too, `forklift help` included, and the flag's value is never read as the
-/// command a failed parse names.
+/// clap's own help and usage errors follow `--color` too, `forklift help` included, and the
+/// flag's value is never read as the command a failed parse names.
 #[test]
 fn usage_errors_follow_color_and_its_value_is_not_the_command() {
     let warehouse = TestWarehouse::new("color-usage");
