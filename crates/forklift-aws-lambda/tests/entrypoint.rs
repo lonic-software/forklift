@@ -25,7 +25,7 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
-use forklift_aws_lambda::{handle, AuthConfig, BearerToken, Head, Routing};
+use forklift_aws_lambda::{handle, AuthConfig, Credentials, Head, Routing, TokenDigest};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{
@@ -654,36 +654,31 @@ fn a_trusted_lift_runs_the_audit_through_http() {
     assert!(info.trust.is_some());
 }
 
-/// **Pins the documented current posture** (`entrypoint::authenticate`'s doc comment,
-/// `docs/DEPLOYMENT.md`'s "What the bearer token does — and does not — control"): this head has
-/// no per-pallet authorization. Every request in this test carries nothing but the shared
-/// bearer token — no operator identity is ever presented, because this head has no mechanism to
-/// present one (no `Principal`, no per-operator token file, no authentication hook) — and that
-/// single secret is sufficient to move the office pallet itself, the most privileged pallet a
-/// warehouse has, exactly as it is sufficient to move an ordinary one. The content-level audit
-/// (closure presence, fast-forward, the signed office chain) still runs and still passes,
-/// because the pushed history really is validly signed; what this test isolates is that nothing
-/// *in addition* to that content check ever asks who transported the bytes.
+/// **Pins the shared bearer's authority** (`docs/DEPLOYMENT.md`'s "What the bearer tokens do —
+/// and do not — control"): the shared bearer (`FORKLIFT_TOKEN_SHA256`) resolves to
+/// `Principal::Static`, the deployment's own administrator credential, which every office
+/// authority rule admits — exactly as `forklift-server`'s static token. Every request in this
+/// test carries nothing but that bearer, and it is sufficient to move the office pallet itself,
+/// the most privileged pallet a warehouse has, as it is sufficient to move an ordinary one. The
+/// content-level audit (closure presence, fast-forward, the signed office chain) still runs and
+/// still passes, because the pushed history really is validly signed; what this test isolates
+/// is that the authority rules add nothing on top of it for this credential. Per-operator tokens
+/// are where roles and grants bite (see the `an_operator_*` tests below); a deployment that wants
+/// every caller judged by the office hands out operator tokens and keeps the shared bearer for
+/// its administrator, or configures none.
+///
+/// This is deliberate, not a gap waiting to be closed: do not invert it. A head that refused its
+/// own administrator credential would leave a re-genesis — which no operator may sanction —
+/// with no one able to make it.
 ///
 /// The two pushes run against **two independent fixtures**, not one shared warehouse. On a
 /// trusted warehouse, the non-office `ref_update` arm refuses with a 422 ("the office pallet is
-/// missing") whenever the ref store has no office head yet (that check lives inside
-/// `if let Some(anchor) = &anchor`, so an untrusted warehouse never reaches it) — so a single
-/// shared fixture would make the `main` assertion
-/// causally dependent on the `@office` HTTP push above it having already landed — a future gate
-/// that refused the office push with `403` would flip the `main` assertion to `422` for an
-/// unrelated reason (a missing office head), not the `403` that would actually signal a
-/// per-pallet gate. To keep the two assertions independent, `main_fixture`'s office head is
-/// seeded directly through `RefStore::compare_and_set_head`, never through the office HTTP
-/// endpoint, so it exists regardless of what that endpoint would do.
-///
-/// **Invert this when operator identity lands:** the day this head grows a caller-identity
-/// mechanism and calls the shared transport rule `forklift_core`'s `authority_utils::may_move`
-/// (as `forklift-server`'s `Principal::Operator` path does), a request carrying only the shared
-/// bearer — resolving to no operator identity — should be refused for at least one pallet class,
-/// and that assertion's `200` must become a `403`. Each assertion below flips independently: the office push flipping
-/// says nothing about whether the main push would too, and vice versa, which is the point of
-/// keeping them on separate fixtures.
+/// missing") whenever the ref store has no office head yet, so a single shared fixture would
+/// make the `main` assertion causally dependent on the `@office` HTTP push above it having
+/// already landed: a regression refusing the office push with `403` would flip the `main`
+/// assertion to `422` for an unrelated reason. To keep the two assertions independent,
+/// `main_fixture`'s office head is seeded directly through `RefStore::compare_and_set_head`,
+/// never through the office HTTP endpoint, so it exists regardless of what that endpoint does.
 #[test]
 fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
     let area = Area::new("shared-bearer-full-access");
@@ -718,7 +713,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
             objects: Arc::new(MemoryObjectStore::new()),
             refs: Arc::new(MemoryRefStore::new()),
             routing: Routing::Single("wh".to_string()),
-            auth: AuthConfig::Token(BearerToken::new("shared-secret".to_string()).unwrap()),
+            auth: credentials(Some("shared-secret"), &[]),
         };
         for (hash, bytes) in &harvest.objects {
             fixture.objects.put_verified(hash, bytes).expect("seed object");
@@ -746,7 +741,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
             serde_json::to_vec(&office).unwrap()
         ))),
         200,
-        "the office pallet moved on the shared bearer alone — no caller-role check ran"
+        "the office pallet moved on the shared bearer alone: the administrator credential"
     );
 
     // --- Assertion 2: an ordinary pallet moves on the identical bearer too. The office head is
@@ -898,6 +893,15 @@ fn an_internal_error_is_redacted_at_the_edge_not_forwarded_verbatim() {
 // seam every other test in this file bypasses via `Fixture`'s `AuthConfig::Open` default.
 // -------------------------------------------------------------------------------------------
 
+/// Credentials of an optional shared bearer and one operator token per `(token, identifier)`,
+/// configured as a deployment configures them: by digest.
+fn credentials(static_token: Option<&str>, operators: &[(&str, &str)]) -> AuthConfig {
+    let digest = |token: &str| TokenDigest::of_token(token).expect("a non-blank token");
+    let operators = operators.iter().map(|(token, identifier)| (digest(token), identifier.to_string())).collect();
+
+    AuthConfig::Credentials(Credentials::new(static_token.map(digest), operators).expect("valid credentials"))
+}
+
 /// Route one request through `handle` with an explicit `AuthConfig`, over a fresh empty store.
 /// Every case here is decided by `authenticate` before the route even resolves, so which store
 /// backs it is irrelevant.
@@ -944,7 +948,7 @@ fn the_open_opt_out_passes_every_request() {
 /// equal-length near-miss all refuse identically.
 #[test]
 fn a_configured_token_gates_every_request() {
-    let auth = AuthConfig::Token(BearerToken::new("secret".to_string()).unwrap());
+    let auth = credentials(Some("secret"), &[]);
 
     assert_eq!(
         status(&call_with_auth(&auth, get("/v1/warehouse"))),

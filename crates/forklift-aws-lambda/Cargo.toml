@@ -19,6 +19,11 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 subtle = { workspace = true }
 
+# SHA-256 for bearer tokens: the function holds only token digests (`FORKLIFT_TOKEN_SHA256`,
+# `FORKLIFT_OPERATOR_TOKENS`), the format `shasum -a 256` and terraform's `sha256()` produce.
+# Pinned to the version already in the lockfile (via the AWS SDK), so nothing new is pulled in.
+sha2 = "0.10.9"
+
 # The HTTP edge speaks the lightweight `http` crate (already in the tree via the AWS SDK), not
 # `lambda_http`, so the pure router `entrypoint::handle` is testable without any Lambda runtime
 # and the runtime crates stay out of the library entirely (see the `lambda` feature below).

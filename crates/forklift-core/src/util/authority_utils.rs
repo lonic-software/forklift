@@ -12,7 +12,7 @@ use crate::util::pallet_utils::{PalletNamespace, PalletRef};
 
 /// Who a request is: the transport-level identity a head resolved from its credential. What the
 /// identity may do (roles, pallet grants) is decided against the warehouse's office state.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Principal {
     /// No authentication is configured on this head: full access.
     Open,
