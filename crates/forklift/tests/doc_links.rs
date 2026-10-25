@@ -51,12 +51,15 @@ fn link_targets(page: &str) -> Vec<(usize, String)> {
 }
 
 /// Whether `line` starts a block of its own, which ends the one before it. A heading is a whole
-/// block, so it ends at its own line too; list items, quotes and table rows are treated the same,
-/// which only ever splits more finely than CommonMark does.
+/// block, so it ends at its own line too; list items, quotes and table rows are treated the same.
+/// This is close to CommonMark, not exact: a `|` line inside a paragraph, or a wrapped line that
+/// starts like a numbered item, splits a block CommonMark keeps whole, so backticks paired across
+/// that line are read differently.
 fn starts_block(line: &str) -> bool {
     let line = line.trim_start();
     let numbered = line.trim_start_matches(|c: char| c.is_ascii_digit());
-    line.starts_with('#')
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    ((1..=6).contains(&hashes) && line[hashes..].starts_with(' '))
         || line.starts_with('>')
         || line.starts_with('|')
         || ["- ", "* ", "+ "].iter().any(|marker| line.starts_with(marker))
@@ -228,6 +231,8 @@ fn links_are_read_outside_code_only() {
     assert_eq!(targets("| ` | x |\n| [a](x.md) | ` |"), ["x.md"]);
     assert_eq!(targets("## A ` heading\n[a](x.md) then `"), ["x.md"]);
     assert_eq!(targets("1. a ` tick\n2) [a](x.md) `"), ["x.md"]);
+    // A line starting "#123" wraps the paragraph; it is not a heading.
+    assert!(targets("see `a\n#123 [x](y.md) b`").is_empty());
     // A target wrapped onto the next line is read as empty, which is reported, not skipped.
     assert_eq!(targets("[a](\nx.md)"), [""]);
 }

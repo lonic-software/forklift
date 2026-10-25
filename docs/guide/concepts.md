@@ -281,8 +281,8 @@ Nothing to heal — no durability taint is standing.
 
 Locks are the exception. Like git's `index.lock`, most of Forklift's locks are files, and a
 command that is killed hard leaves its lock behind. The next command refuses, usually naming the
-process that held it, and you remove the lock once that process is gone. A hard-killed `forklift-server` leaves its serve
-lock the same way; see [Running a server](../SERVER.md).
+process that held it, and you remove the lock once that process is gone. A hard-killed
+`forklift-server` leaves its serve lock the same way; see [Running a server](../SERVER.md).
 
 Reference: [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation) and
 [Interrupted operations](cli.md#interrupted-operations).
