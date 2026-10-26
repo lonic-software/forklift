@@ -2,7 +2,8 @@ use serde::Serialize;
 use crate::commands::shift;
 use crate::output::{self, CommandOutput};
 use forklift_core::error;
-use forklift_core::util::{bay_utils, file_utils, haul_utils, journal_utils, merge_utils};
+use forklift_core::util::{bay_utils, file_utils, haul_utils, journal_utils, merge_utils, take_utils};
+use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::haul_utils::HaulStatus;
 use forklift_core::util::pallet_utils::{self, PalletNamespace, PalletRef, PalletsPrecondition, RefPreconditions, RefUpdateError};
 use forklift_core::util::remote_utils::{self, RemoteClient};
@@ -80,7 +81,12 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
         Some(revision) => {
             let parcel_hash = pallet_utils::resolve_revision(revision)?;
 
-            pallet_utils::update_pallet_head(name, None, &parcel_hash, &pallet_utils::RefPreconditions::NONE)?;
+            // A hash can name history a lower fetched and refused, so it is verified like any
+            // take: every local pallet head must be one this warehouse's anchor vouches for. A
+            // pallet name resolves to a head that already is.
+            let preconditions = take_utils::verify_take(None, &TakeTrust::local()?, &parcel_hash, name, FetchAt::Warehouse).await?;
+
+            pallet_utils::update_pallet_head(name, None, &parcel_hash, &preconditions)?;
 
             let head = shift::shift_to(name).await?;
 

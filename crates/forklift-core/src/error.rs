@@ -242,6 +242,12 @@ refusal_codes! {
     /// failed or busy. The others went through. The refusal's details carry the run's report
     /// (`{url, pallets}`), each pallet's message naming its own step.
     MirrorIncomplete => "mirror_incomplete",
+
+    /// History a remote served does not verify against the trust anchor this warehouse holds (or,
+    /// at first contact, the one the remote serves): a parcel is unsigned or signed by an unknown
+    /// key after the trust boundary, signed by a revoked key outside its distrust boundary, or sits
+    /// behind a boundary neither this warehouse nor the remote can resolve. Nothing was adopted.
+    HistoryUnverified => "history_unverified",
 }
 
 impl RefusalCode {

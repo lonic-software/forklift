@@ -5,8 +5,9 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
 use forklift_core::util::{
     config_utils, file_utils, merge_utils, object_utils, pallet_utils,
-    remote_utils, scope_utils,
+    remote_utils, scope_utils, take_utils,
 };
+use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower::{self, MetaPalletFailure};
 use crate::commands::mirror::{self, PalletMirror};
@@ -259,6 +260,10 @@ async fn try_auto_merge(client: &RemoteClient,
             pallet, base, Some(head), "lifted: the remote diverged, and only a bay at its pallet's head can merge it in",
         ).into());
     }
+
+    // Their work becomes a parent of the merge parcel, so it is verified before anything is
+    // merged. The merge's own write is conditioned by `stack`, which judges it again.
+    take_utils::verify_take(Some(client), &TakeTrust::local()?, remote_head, pallet, FetchAt::Warehouse).await?;
 
     // Merging materializes into the working directory, so only a clean warehouse qualifies.
     let our_tree = object_utils::load_parcel(head)?.tree_hash;

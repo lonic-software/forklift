@@ -922,9 +922,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         &request.new_head,
                         anchor,
                         &office_state,
-                        request.old_head.as_deref(),
+                        request.old_head.as_deref().as_slice(),
                     )
-                    .map_err(HeadError::unprocessable)?;
+                    .map_err(|refusal| HeadError::unprocessable(String::from(refusal)))?;
                 }
             }
 

@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CoreError, RefusalCode};
-use crate::util::pallet_utils::{self, BayPosition};
+use crate::util::pallet_utils::{self, AnchorPrecondition, BayPosition, OfficePrecondition, RefPreconditions};
 use crate::util::shift_utils::{self, FileOp, TreeProvenance};
 use crate::util::{cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, park_utils, record_utils};
 
@@ -36,7 +36,7 @@ const FILE_NAME_OPERATION: &str = "operation";
 
 /// The [`record_utils`] kind and version of the marker file.
 const OPERATION_RECORD: &str = "operation";
-const OPERATION_VERSION: u32 = 1;
+const OPERATION_VERSION: u32 = 2;
 
 /// The operations that raise the marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +123,11 @@ pub struct Operation {
     /// Merge and cherry-pick: the other side's tree. Every path the merge can have written differs
     /// between it and `source_tree`, which bounds what a rollback puts back.
     pub their_tree: Option<String>,
+
+    /// Lower: the office and anchor its take was verified against, which its write — and heal's
+    /// roll-forward of it — is conditioned on, so a change to either since rolls the take back.
+    pub office: OfficePrecondition,
+    pub anchor: AnchorPrecondition,
 }
 
 impl Operation {
@@ -139,7 +144,14 @@ impl Operation {
             expected: None,
             parked: None,
             their_tree: None,
+            office: OfficePrecondition::NotConsumed,
+            anchor: AnchorPrecondition::NotConsumed,
         }
+    }
+
+    /// The preconditions of the operation's ref write: the office and anchor it recorded.
+    pub fn preconditions(&self) -> RefPreconditions {
+        RefPreconditions { office: self.office.clone(), anchor: self.anchor.clone(), ..RefPreconditions::NONE }
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -157,14 +169,24 @@ impl Operation {
             or_empty(&self.expected),
             or_empty(&self.parked),
             or_empty(&self.their_tree),
+            match &self.office {
+                OfficePrecondition::NotConsumed => String::new(),
+                OfficePrecondition::At(None) => "unborn".to_string(),
+                OfficePrecondition::At(Some(head)) => head.clone(),
+            },
+            match &self.anchor {
+                AnchorPrecondition::NotConsumed => String::new(),
+                AnchorPrecondition::Absent => "absent".to_string(),
+                AnchorPrecondition::Bytes(bytes) => format!("bytes {}", crate::util::sign_utils::to_hex(bytes)),
+            },
         ])
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Operation, String> {
         let entries = record_utils::from_bytes(bytes, OPERATION_RECORD, OPERATION_VERSION).map_err(|e| e.describe())?;
 
-        let [kind, phase, source_pallet, source_base, source_tree, target_pallet, target_base, target_tree, expected, parked, their_tree] =
-            <[String; 11]>::try_from(entries).map_err(|_| "is malformed.".to_string())?;
+        let [kind, phase, source_pallet, source_base, source_tree, target_pallet, target_base, target_tree, expected, parked, their_tree, office, anchor] =
+            <[String; 13]>::try_from(entries).map_err(|_| "is malformed.".to_string())?;
 
         let kind = OperationKind::parse(&kind).ok_or(format!("names an operation this version of Forklift does not know (\"{}\").", kind.escape_debug()))?;
 
@@ -196,6 +218,19 @@ impl Operation {
             expected: hash(expected)?,
             parked: hash(parked)?,
             their_tree: hash(their_tree)?,
+            office: match office.as_str() {
+                "" => OfficePrecondition::NotConsumed,
+                "unborn" => OfficePrecondition::At(None),
+                _ => OfficePrecondition::At(Some(hash(office)?.ok_or("is malformed.".to_string())?)),
+            },
+            anchor: match anchor.as_str() {
+                "" => AnchorPrecondition::NotConsumed,
+                "absent" => AnchorPrecondition::Absent,
+                _ => match anchor.strip_prefix("bytes ").map(crate::util::sign_utils::from_hex) {
+                    Some(Ok(bytes)) => AnchorPrecondition::Bytes(bytes),
+                    _ => return Err("is malformed.".to_string()),
+                },
+            },
         })
     }
 }
@@ -531,8 +566,10 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
                 None => false,
             };
 
+            // Under the preconditions the operation recorded: a lower's take lands only while the
+            // office and anchor it was verified against stand, and is rolled back otherwise.
             let landed = landed || (head == operation.expected && pallet_utils::update_pallet_head(
-                &operation.target.pallet, operation.expected.as_deref(), new, &pallet_utils::RefPreconditions::NONE
+                &operation.target.pallet, operation.expected.as_deref(), new, &operation.preconditions()
             ).is_ok());
 
             if landed {

@@ -65,7 +65,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
             return Err(pallet_utils::pallet_not_found_refusal(&pallet_ref).into());
         };
 
-        let (verified, legacy) = audit_utils::verify_pallet_history(&head, &anchor, &office_state, None)?;
+        let (verified, legacy) = audit_utils::verify_pallet_history(&head, &anchor, &office_state, &[]).map_err(String::from)?;
 
         report.pallet_verified = true;
         report.verified_parcels = verified;

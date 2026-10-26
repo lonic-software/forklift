@@ -494,6 +494,10 @@ error_codes! {
     /// A mirror run left at least one pallet out of step with git. `error.details` carries the
     /// run's report, `{url, pallets}`.
     MirrorIncomplete,
+
+    /// History a remote served does not verify against the trust anchor this warehouse holds;
+    /// nothing was adopted.
+    HistoryUnverified,
 }
 
 impl ErrorCode {
@@ -532,6 +536,7 @@ impl ErrorCode {
             ErrorCode::OnlyPrefixNotFound => RefusalCode::OnlyPrefixNotFound.as_str(),
             ErrorCode::StagedUploadDiscarded => RefusalCode::StagedUploadDiscarded.as_str(),
             ErrorCode::MirrorIncomplete => RefusalCode::MirrorIncomplete.as_str(),
+            ErrorCode::HistoryUnverified => RefusalCode::HistoryUnverified.as_str(),
         }
     }
 
@@ -573,6 +578,7 @@ impl ErrorCode {
             ErrorCode::OnlyPrefixNotFound => 31,
             ErrorCode::StagedUploadDiscarded => 32,
             ErrorCode::MirrorIncomplete => 33,
+            ErrorCode::HistoryUnverified => 34,
         }
     }
 
@@ -659,6 +665,9 @@ impl ErrorCode {
             ErrorCode::MirrorIncomplete =>
                 "A mirror run left at least one pallet out of step with git; the others went \
                  through, and each failed pallet's message names its step",
+            ErrorCode::HistoryUnverified =>
+                "History the remote served does not verify against the trust anchor this \
+                 warehouse holds; nothing was adopted",
         }
     }
 
@@ -696,6 +705,7 @@ impl ErrorCode {
             RefusalCode::OnlyPrefixNotFound => ErrorCode::OnlyPrefixNotFound,
             RefusalCode::StagedUploadDiscarded => ErrorCode::StagedUploadDiscarded,
             RefusalCode::MirrorIncomplete => ErrorCode::MirrorIncomplete,
+            RefusalCode::HistoryUnverified => ErrorCode::HistoryUnverified,
         }
     }
 }
@@ -1131,6 +1141,7 @@ mod tests {
             (RefusalCode::OnlyPrefixNotFound, "only_prefix_not_found", 31),
             (RefusalCode::StagedUploadDiscarded, "staged_upload_discarded", 32),
             (RefusalCode::MirrorIncomplete, "mirror_incomplete", 33),
+            (RefusalCode::HistoryUnverified, "history_unverified", 34),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

@@ -456,16 +456,17 @@ fn chains_to_identity_root(key: &crate::util::office_utils::KeyRecord,
 /// * `head`           - The pallet head to verify from.
 /// * `anchor`         - The trust anchor (its boundary separates the legacy history).
 /// * `office_state`   - The verified office state (the key registry).
-/// * `known_verified` - A head that already passed this verification (`None` walks
-///                      everything — the offline `audit`).
+/// * `known_verified` - Heads that already passed this verification, or were signed here
+///                      (empty walks everything — the offline `audit`, a franchise).
 ///
 /// # Returns
-/// * `Ok((usize, usize))` - The number of verified and legacy (pre-trust) parcels.
-/// * `Err(String)`        - If any parcel fails verification.
+/// * `Ok((usize, usize))`    - The number of verified and legacy (pre-trust) parcels.
+/// * `Err(HistoryRefusal)`   - If any parcel fails verification; its `gap` names the boundary
+///                             parcel this store lacks when that, not the parcel, is why.
 pub fn verify_pallet_history(head: &str,
                              anchor: &TrustAnchor,
                              office_state: &OfficeState,
-                             known_verified: Option<&str>) -> Result<(usize, usize), String> {
+                             known_verified: &[&str]) -> Result<(usize, usize), HistoryRefusal> {
     // Phase 1 — discover the parcels to verify: everything reachable from `head` and not
     // from `known_verified`, whose ancestry was verified when it was committed. The walk is
     // bounded by the gap between the two heads, including across a merge (see
@@ -475,7 +476,7 @@ pub fn verify_pallet_history(head: &str,
     // the discovery set is always complete, and on a graph-warm warehouse it is found
     // without decoding a single parcel body. The bodies are proven present in phase 2
     // instead, in parallel.
-    let parcels = new_parcels(head, known_verified)?;
+    let parcels = new_parcels_with_edges(head, (!known_verified.is_empty()).then_some(known_verified))?.0;
 
     // Phase 2 — verify every parcel's signature. Each check is independent: it runs
     // against the immutable `office_state` key registry, not against any neighbour, so the
@@ -571,7 +572,7 @@ pub fn verify_pallet_history(head: &str,
                     // one entry and only the first is ever named here, so an interior
                     // ancestor further back may be missing too — supplying this one object
                     // can simply uncover the next gap on a rerun.
-                    return Err(format!(
+                    return Err(HistoryRefusal::gap(BoundaryGap::Trust { missing: missing.clone() }, format!(
                         "Parcel {} {}, and this store cannot resolve the trust boundary \
                         (boundary parcel {} is not present locally), so it cannot tell \
                         whether this parcel predates trust or was stacked after it. Verify \
@@ -586,9 +587,9 @@ pub fn verify_pallet_history(head: &str,
                             ),
                         },
                         missing
-                    ));
+                    )));
                 } else {
-                    return Err(match reason {
+                    return Err(HistoryRefusal::from(match reason {
                         TrustBoundaryReason::Unsigned => format!(
                             "Parcel {} was stacked after trust was established but carries no \
                             signature. The warehouse may have been tampered with.",
@@ -599,7 +600,7 @@ pub fn verify_pallet_history(head: &str,
                             office. The warehouse may have been tampered with.",
                             hash, key_id
                         ),
-                    });
+                    }));
                 }
             }
 
@@ -629,17 +630,19 @@ pub fn verify_pallet_history(head: &str,
                 // pays for a second pass.
                 if !vouched {
                     if let Some(missing) = distrust_boundaries.unresolved_head(key)? {
-                        return Err(format!(
+                        let gap = BoundaryGap::Distrust { key_id: key_id.clone(), missing: missing.clone() };
+
+                        return Err(HistoryRefusal::gap(gap, format!(
                             "Parcel {} is signed with revoked key {}: this store cannot \
                             resolve the revocation's distrust boundary (boundary parcel {} is \
                             not present locally), so it cannot tell whether this parcel \
                             predates the revocation or the key kept signing after it. Verify \
                             against a store with the full history.",
                             hash, key_id, missing
-                        ));
+                        )));
                     }
 
-                    return Err(format!(
+                    return Err(HistoryRefusal::from(format!(
                         "Parcel {} is signed with key {}, which is revoked \
                         ({}), and the parcel is outside the revocation's \
                         distrust boundary. The warehouse may have been tampered \
@@ -650,7 +653,7 @@ pub fn verify_pallet_history(head: &str,
                         key.revocation_reason
                             .map(|reason| reason.as_str())
                             .unwrap_or("no recorded reason")
-                    ));
+                    )));
                 }
 
                 verified += 1;
@@ -659,6 +662,47 @@ pub fn verify_pallet_history(head: &str,
     }
 
     Ok((verified, legacy))
+}
+
+/// Why [`verify_pallet_history`] refused: the message it always gave, and — when what this store
+/// lacks, not the parcel itself, is the reason — the boundary it could not resolve, so a take can
+/// fetch that boundary and judge once more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryRefusal {
+    /// The refusal, as `audit` prints it.
+    pub message: String,
+
+    /// The boundary this store could not resolve, if that is why.
+    pub gap: Option<BoundaryGap>,
+}
+
+/// A boundary [`verify_pallet_history`] could not resolve, because its walk crossed a parcel this
+/// store does not hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundaryGap {
+    /// The trust anchor's boundary; `missing` is the first absent parcel its walk met.
+    Trust { missing: String },
+
+    /// The distrust boundary of the revoked key `key_id`; `missing` as above.
+    Distrust { key_id: String, missing: String },
+}
+
+impl HistoryRefusal {
+    fn gap(gap: BoundaryGap, message: String) -> HistoryRefusal {
+        HistoryRefusal { message, gap: Some(gap) }
+    }
+}
+
+impl From<String> for HistoryRefusal {
+    fn from(message: String) -> HistoryRefusal {
+        HistoryRefusal { message, gap: None }
+    }
+}
+
+impl From<HistoryRefusal> for String {
+    fn from(refusal: HistoryRefusal) -> String {
+        refusal.message
+    }
 }
 
 /// The verdict [`verify_signatures`] reaches for one parcel — the independent, parallel
@@ -936,21 +980,32 @@ impl std::ops::Deref for VerifiedOffice {
 /// This warehouse's office, verified against its trust anchor. A meta pallet's writes
 /// are judged against the verified office, never the unverified local read.
 pub fn verified_local_office() -> Result<VerifiedOffice, String> {
-    let (anchor, anchor_bytes) = office_utils::read_trust_anchor_with_bytes()?
-        .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?;
+    Ok(verified_local_trust()?
+        .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?
+        .1)
+}
+
+/// This warehouse's trust anchor and its office verified against it, read together so the office
+/// is judged against exactly the anchor returned — or `None` when no anchor is held.
+pub fn verified_local_trust() -> Result<Option<(TrustAnchor, VerifiedOffice)>, String> {
+    let Some((anchor, anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
+        return Ok(None);
+    };
     let head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
         .ok_or("The office pallet is unborn; use \"office enroll\" first.".to_string())?;
 
     let state = verify_office_chain_memoized(&anchor, &head)?;
 
-    Ok(VerifiedOffice {
+    let office = VerifiedOffice {
         state,
         preconditions: RefPreconditions {
             office: OfficePrecondition::At(Some(head)),
             anchor: AnchorPrecondition::Bytes(anchor_bytes),
             pallets: PalletsPrecondition::NotConsumed,
         },
-    })
+    };
+
+    Ok(Some((anchor, office)))
 }
 
 /// [`verify_office_chain`], remembered for the life of the process.
@@ -3147,8 +3202,11 @@ mod tests {
             adopts: None,
         };
 
-        let error = verify_pallet_history(&target, &anchor, &office_state, None).unwrap_err();
+        let refusal = verify_pallet_history(&target, &anchor, &office_state, &[]).unwrap_err();
+        let error = refusal.message;
 
+        assert_eq!(refusal.gap, Some(BoundaryGap::Distrust { key_id: agent_id.clone(), missing: never_fetched.clone() }),
+                   "the gap is typed, so a take can fetch the boundary and judge again");
         assert!(error.contains(&target), "names the parcel under question: {}", error);
         assert!(error.contains(&agent_id), "names the revoked key: {}", error);
         assert!(
@@ -3220,8 +3278,11 @@ mod tests {
             adopts: None,
         };
 
-        let error = verify_pallet_history(&target, &anchor, &office_state, None).unwrap_err();
+        let refusal = verify_pallet_history(&target, &anchor, &office_state, &[]).unwrap_err();
+        let error = refusal.message;
 
+        assert_eq!(refusal.gap, Some(BoundaryGap::Distrust { key_id: agent_id.clone(), missing: missing_ancestor.clone() }),
+                   "the gap is typed and names the interior parcel");
         assert!(error.contains(&target), "names the parcel under question: {}", error);
         assert!(
             error.contains(&missing_ancestor),
