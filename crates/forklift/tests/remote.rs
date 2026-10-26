@@ -8543,6 +8543,99 @@ fn heal_finishes_an_interrupted_lower_only_under_the_office_it_was_verified_agai
     }
 }
 
+/// "a", an admin, holding a worker's lifted `feat` and the worker's open haul of it, with main
+/// diverged so merging `feat` conflicts. Returns the server, the haul id and the worker's head.
+fn worker_feat(area: &TestArea) -> (Server, String, String) {
+    area.write_file("tokens.toml", concat!(
+        "[operators]\n",
+        "\"w-token\" = \"worker@forklift\"\n",
+    ));
+    let server = Server::start_with_tokens(area, Some("root"), "tokens.toml");
+
+    prepare_warehouse(area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    stack_file(area, "a", "code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    let worker = keygen_admit_args(area, "worker@forklift");
+    assert_success(&area.forklift("a", &["office", "admit", &worker[0], &worker[1], &worker[2]]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
+    assert_success(&area.forklift("b", &["palletize", "feat"]));
+    stack_file(area, "b", "code.txt", "worker\n");
+    assert_success(&area.forklift("b", &["lift"]));
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    let id = open_haul(area, "b", "Worker");
+    assert_success(&area.forklift("b", &["lift"]));
+    let worked = pallet_head(area, "b", "feat");
+
+    // a takes both while the worker's key is trusted.
+    assert_success(&area.forklift("a", &["lower", "feat"]));
+    assert_success(&area.forklift("a", &["lower"]));
+    stack_file(area, "a", "code.txt", "admin\n");
+
+    (server, id, worked)
+}
+
+/// Retire the worker's key as compromised in "a", once a holds no head at the worker's parcel —
+/// the haul, closed meanwhile, would keep `feat` — so the distrust boundary does not hold it.
+fn retire_worker_beyond_feat(area: &TestArea, id: &str) {
+    assert_success(&area.forklift("a", &["haul", "close", id]));
+    assert_success(&area.forklift("a", &["palletize", "--delete", "feat"]));
+
+    let list = stdout(&area.forklift("a", &["office", "list"]));
+    let worker_key_id = list.lines().rev()
+        .find(|line| line.trim_start().starts_with("key "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("office list shows the worker's key")
+        .to_string();
+    assert_success(&area.forklift("a", &["office", "retire", &worker_key_id, "--compromised", "--offline"]));
+}
+
+/// A merge signed here makes the merged history this warehouse's, so the stack completing a
+/// conflicted consolidation judges the merged head under the office it signs under, not the one
+/// the consolidation began under: a worker's parcel, vouched for then, refuses once the worker's
+/// key is retired with a boundary that does not hold it. Revert: drop the stack's re-verify, and
+/// the stack signs the merge.
+#[test]
+fn a_conflicted_consolidation_is_judged_under_the_office_its_stack_signs_under() {
+    let area = TestArea::new("take-compromised-stack");
+    let (_server, id, worked) = worker_feat(&area);
+    let main = pallet_head(&area, "a", "main");
+
+    let consolidated = area.forklift("a", &["consolidate", "feat"]);
+    assert_success(&consolidated);
+    assert!(stdout(&consolidated).contains("conflict: code.txt"), "{}", stdout(&consolidated));
+    retire_worker_beyond_feat(&area, &id);
+
+    area.write_file("a/code.txt", "resolved\n");
+    assert_success(&area.forklift("a", &["load", "code.txt"]));
+    let stacked = area.forklift("a", &["--json", "stack", "resolved"]);
+    let message = history_unverified_message(&stacked);
+    assert!(message.contains(&worked), "{}", message);
+    assert!(message.contains("Nothing was stacked."), "{}", message);
+    assert_eq!(pallet_head(&area, "a", "main"), main);
+}
+
+/// A haul merge judges the proposed head before merging anything: the worker's parcel refuses
+/// once the worker's key is retired with a boundary that does not hold it. Revert: drop haul
+/// merge's verify, and the merge goes ahead.
+#[test]
+fn a_haul_merge_refuses_a_head_its_office_does_not_vouch_for() {
+    let area = TestArea::new("take-compromised-haul");
+    let (_server, id, worked) = worker_feat(&area);
+    let main = pallet_head(&area, "a", "main");
+
+    retire_worker_beyond_feat(&area, &id);
+    assert_success(&area.forklift("a", &["haul", "reopen", &id]));
+    let merged = area.forklift("a", &["--json", "haul", "merge", &id]);
+    let message = history_unverified_message(&merged);
+    assert!(message.contains(&worked), "{}", message);
+    assert_eq!(pallet_head(&area, "a", "main"), main);
+    assert_eq!(area.read_file("a/code.txt"), "admin\n");
+}
+
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
