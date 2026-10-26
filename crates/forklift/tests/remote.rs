@@ -4560,8 +4560,8 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
 ///
 /// Resolution: lifting `side` (bringing A1, and so A0's presence via A1's own ancestry, fully
 /// onto the server) and retrying the identical `tmp` lift succeeds. A clone franchised scoped
-/// to "tmp" alone still reads A0 as `unresolved` (it never fetches `side`'s A1 either — a
-/// franchise fetches only the resolved pallet's own ancestry); fetching A1's history directly
+/// to "tmp" alone fetches A1 as the boundary its take's verdict needs; with A1 removed again it
+/// reads A0 as `unresolved`, and fetching A1's history directly
 /// into that same clone (`remote_utils::fetch_history`, the in-process idiom used elsewhere in
 /// this file) flips the SAME query's answer to `vouched` — the resolved, definitive read.
 #[test]
@@ -4666,11 +4666,14 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
         stderr(&second_lift)
     );
 
-    // A clone scoped to "tmp" alone still never fetches `side`'s A1 (franchise fetches only
-    // the resolved pallet's own ancestry) — so the SAME unresolved read reproduces here too,
-    // pinning that this is genuinely about A1's absence, not some artifact of the origin.
+    // A clone scoped to "tmp" alone fetches A1 even so: verifying the take of A0 needs the
+    // distrust boundary, and the take fetches what its verdict lacks. Removing A1 from the clone
+    // reproduces the SAME unresolved read, pinning that it is genuinely about A1's absence, not
+    // some artifact of the origin.
     let franchised = area.forklift(".", &["franchise", &server.url, "tmp-clone", "--pallet", "tmp"]);
     assert_success(&franchised);
+    assert!(object_present(&area, "tmp-clone", &a1), "the franchise fetches the distrust boundary A1");
+    std::fs::remove_file(object_store_path(&area, "tmp-clone", &a1)).unwrap();
 
     let query_before = area.forklift("tmp-clone", &["--json", "query", "tmp"]);
     assert_success(&query_before);
