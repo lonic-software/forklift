@@ -1291,7 +1291,8 @@ refuses rather than turn it into a warehouse.
 
 A command in a bay opens the warehouse its redirect names and nothing further: when that is not
 a warehouse, the command refuses with `not_a_warehouse` before writing anything. A warehouse
-that is gone is to be restored, or the bay's `.forklift` deleted. A redirect that names another
+that is gone is to be restored, or the bay's `.forklift` deleted. One with no marker is
+re-created, and the bay then added to it again. A redirect that names another
 bay (which `bay add` run inside a bay used to write) is refused with the way out: `bay remove`
 the bay in its warehouse, delete its `.forklift`, and `bay add` it again under a new name. `bay
 add` run inside a bay now adds a bay of the warehouse, so it no longer writes such a redirect.
