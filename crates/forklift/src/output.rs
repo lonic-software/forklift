@@ -666,8 +666,9 @@ impl ErrorCode {
                 "A mirror run left at least one pallet out of step with git; the others went \
                  through, and each failed pallet's message names its step",
             ErrorCode::HistoryUnverified =>
-                "History the remote served does not verify against the trust anchor this \
-                 warehouse holds; nothing was adopted",
+                "History about to be adopted as a pallet's does not verify against the trust \
+                 anchor it was judged against (the one held here, or at first contact the one the \
+                 remote serves); nothing was adopted",
         }
     }
 
