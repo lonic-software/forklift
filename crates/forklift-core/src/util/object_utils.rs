@@ -563,6 +563,28 @@ pub fn parse_tree_bytes(hash: &str, bytes: &[u8]) -> Result<TreeItem, String> {
     }
 }
 
+/// Parse a parcel from raw object bytes the caller already holds, enforcing the whole-object
+/// ceiling first: [`parse_tree_bytes`]'s counterpart, for a head that walks parcel history
+/// straight from object storage.
+///
+/// # Arguments
+/// * `hash`  - The hash the bytes are addressed by (for the error message; not re-verified here).
+/// * `bytes` - The full (uncompressed) parcel object bytes.
+///
+/// # Returns
+/// * `Ok(Parcel)`  - The parsed parcel.
+/// * `Err(String)` - If the bytes exceed the ceiling, or are not a parcel.
+pub fn parse_parcel_bytes(hash: &str, bytes: &[u8]) -> Result<Parcel, String> {
+    enforce_object_ceiling(bytes)?;
+
+    match parser::object::loose_object_parser::parse(bytes)
+        .map_err(|e| format!("Parcel {} could not be read: {}", hash, e))?
+    {
+        ParsedObject::Parcel(parcel) => Ok(parcel),
+        other => Err(format!("Object {} is a {}, not a parcel.", hash, other.get_type())),
+    }
+}
+
 /// Load and parse the chunk object with the given hash from the object store. The per-chunk
 /// ceiling is enforced on read by the parser.
 ///

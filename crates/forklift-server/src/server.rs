@@ -29,9 +29,9 @@ use forklift_core::model::hooks::{
     EVENT_WAREHOUSE_CREATED,
 };
 use forklift_core::model::remote::{
-    ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
+    ErrorResponse, HoldsRequest, HoldsResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
-    WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
+    WarehouseInfo, MAX_HOLDS_CANDIDATES, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
 use forklift_core::util::authority_utils::{self, Denied, Principal};
@@ -789,6 +789,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .route("/signatures/{hash}", get(get_signature).put(put_signature))
         .route("/trust", put(put_trust))
         .route("/pallets/{name}", post(post_ref_update))
+        .route("/pallets/{name}/holds", post(post_holds))
         .route("/resolve", post(post_resolve))
         .route("/bundles/latest", get(get_bundle));
 
@@ -1987,6 +1988,59 @@ async fn post_missing(State(state): State<Arc<AppState>>,
         }
 
         Ok(MissingObjectsResponse { missing })
+    }).await;
+
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+/// `POST /v1/pallets/{name}/holds` — which of these parcels does the pallet still hold, its head
+/// or one of the head's ancestors? A bounded walk ([`merge_utils::holds_from`]): a candidate it
+/// could not settle is answered `unknown`, never `not_held`. Reading history is what fetching
+/// already allows, so nothing past authentication is asked.
+async fn post_holds(State(state): State<Arc<AppState>>,
+                    headers: HeaderMap,
+                    Path(params): Path<PathParams>,
+                    Json(request): Json<HoldsRequest>) -> Response {
+    if let Err(error) = check_auth(&state, &headers).await {
+        return error_response(error);
+    }
+
+    let warehouse = match resolve_warehouse(&state, &params) {
+        Ok(warehouse) => warehouse,
+        Err(error) => return error_response(error),
+    };
+
+    let name = match param(&params, "name") {
+        Ok(name) => name,
+        Err(error) => return error_response(error),
+    };
+
+    if request.candidates.len() > MAX_HOLDS_CANDIDATES {
+        return error_response(unprocessable(format!(
+            "At most {} candidates per request.",
+            MAX_HOLDS_CANDIDATES
+        )));
+    }
+
+    if let Err(error) = require_object_hashes(&request.candidates) {
+        return error_response(error);
+    }
+
+    let result = blocking(warehouse, move || {
+        let pallet_ref = pallet_utils::PalletRef::parse(&name).map_err(unprocessable)?;
+        let head = pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)?;
+        let deadline = std::time::Instant::now() + merge_utils::MAX_HOLDS_WALK_TIME;
+
+        let holds = merge_utils::holds_from(head.as_deref(),
+                                            &request.candidates,
+                                            merge_utils::MAX_HOLDS_WALK,
+                                            || std::time::Instant::now() >= deadline,
+                                            |hash| object_utils::load_parcel(hash).map(|parcel| parcel.parents));
+
+        Ok(HoldsResponse { holds })
     }).await;
 
     match result {

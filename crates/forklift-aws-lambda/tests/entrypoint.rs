@@ -29,6 +29,7 @@ use forklift_aws_lambda::{handle, AuthConfig, Credentials, Head, Routing, TokenD
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{
+    HoldAnswer, HoldsRequest, HoldsResponse,
     CommitLiftRequest, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse, WarehouseInfo,
     LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_MISSING_BATCH,
@@ -300,6 +301,54 @@ fn the_untrusted_lift_walk_maps_every_status() {
     assert_eq!(status(&response), 409);
     let error: serde_json::Value = body_json(&response);
     assert!(error.get("error").and_then(|value| value.as_str()).is_some(), "a JSON error body");
+}
+
+/// The holds walk reads parcels straight from the object store: the head and its ancestor are
+/// held, a parcel outside the history is not, a pallet the warehouse lacks holds nothing, and a
+/// request past the cap or naming no valid pallet is a 422.
+#[test]
+fn the_holds_endpoint_walks_the_stored_history() {
+    let area = Area::new("holds");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    area.write_file("wh/readme.txt", "hello again\n");
+    area.forklift("wh", &["load", "readme.txt"]);
+    area.forklift("wh", &["stack", "second"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main has a head");
+    let first = object_utils::parse_parcel_bytes(&main_head, &harvest.objects[&main_head])
+        .expect("the head is a parcel")
+        .parents
+        .remove(0);
+
+    let fixture = Fixture::direct();
+    for (hash, bytes) in &harvest.objects {
+        assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
+    }
+    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/main", &commit))), 200);
+
+    let stranger = "0".repeat(64);
+    let request = HoldsRequest { candidates: vec![main_head.clone(), first.clone(), stranger.clone()] };
+
+    let response = fixture.call(post_json("/v1/pallets/main/holds", &request));
+    assert_eq!(status(&response), 200);
+    let holds: HoldsResponse = body_json(&response);
+    assert_eq!(holds.holds[&main_head], HoldAnswer::Held, "the head itself");
+    assert_eq!(holds.holds[&first], HoldAnswer::Held, "an ancestor read from the store");
+    assert_eq!(holds.holds[&stranger], HoldAnswer::NotHeld, "the whole history was read");
+
+    let holds: HoldsResponse = body_json(&fixture.call(post_json("/v1/pallets/elsewhere/holds", &request)));
+    assert_eq!(holds.holds[&main_head], HoldAnswer::NotHeld, "a pallet the warehouse lacks holds nothing");
+
+    let over_cap = HoldsRequest { candidates: (0..17).map(|n| format!("{:064x}", n)).collect() };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/main/holds", &over_cap))), 422);
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/Main/holds", &request))), 422);
+    let uppercase = HoldsRequest { candidates: vec![main_head.to_ascii_uppercase()] };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/main/holds", &uppercase))), 422);
 }
 
 /// FORK-77: a ref update naming a pallet outside the portable grammar is a 422 naming it, and

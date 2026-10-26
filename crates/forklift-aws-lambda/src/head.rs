@@ -41,7 +41,8 @@ use std::time::SystemTime;
 
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::remote::{
-    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
+    HoldAnswer, RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_HOLDS_CANDIDATES,
+    MAX_MISSING_BATCH,
     PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::tree_item::TreeItem;
@@ -289,6 +290,36 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             self.objects.objects_missing(hashes).map_err(HeadError::internal)?.into_iter().collect();
 
         Ok(hashes.iter().filter(|hash| absent.contains(hash.as_str())).cloned().collect())
+    }
+
+    /// `POST /v1/pallets/{name}/holds` — which of `candidates` the pallet still holds, its head or
+    /// one of the head's ancestors. The walk ([`merge_utils::holds_from`]) reads parcels straight
+    /// from the object store, with no scratch mirror, and stops at the same step and time bounds
+    /// as on the direct head; a candidate it could not settle is `unknown`, never `not_held`.
+    pub fn holds(&self, name: &str, candidates: &[String]) -> HeadResult<BTreeMap<String, HoldAnswer>> {
+        if candidates.len() > MAX_HOLDS_CANDIDATES {
+            return Err(HeadError::unprocessable(format!(
+                "At most {} candidates per request.",
+                MAX_HOLDS_CANDIDATES
+            )));
+        }
+
+        candidates.iter().try_for_each(|hash| require_object_hash(hash))?;
+
+        let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
+        let head = self.refs.get_head(pallet_ref.namespace, &pallet_ref.name).map_err(HeadError::internal)?;
+        let deadline = std::time::Instant::now() + merge_utils::MAX_HOLDS_WALK_TIME;
+
+        Ok(merge_utils::holds_from(head.as_deref(),
+                                   candidates,
+                                   merge_utils::MAX_HOLDS_WALK,
+                                   || std::time::Instant::now() >= deadline,
+                                   |hash| {
+                                       let bytes = self.objects.get(hash)?
+                                           .ok_or_else(|| format!("Parcel {} is missing.", hash))?;
+
+                                       object_utils::parse_parcel_bytes(hash, &bytes).map(|parcel| parcel.parents)
+                                   }))
     }
 
     /// `POST /v1/objects/upload-targets` — the body-less upload negotiation (additive).

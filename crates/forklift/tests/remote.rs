@@ -1044,6 +1044,8 @@ fn every_hash_taking_endpoint_refuses_an_uppercase_spelling_as_client_error() {
         ("missing", http_post_json(&server.url, "/v1/objects/missing", &batch)),
         ("upload-targets", http_post_json(&server.url, "/v1/objects/upload-targets", &targets)),
         ("batch", http_post_json(&server.url, "/v1/objects/batch", &batch)),
+        ("holds", http_post_json(&server.url, "/v1/pallets/main/holds",
+                                 &format!("{{\"candidates\":[\"{}\"]}}", upper))),
         ("object", http_get(&server.url, &format!("/v1/objects/{}", upper))),
         ("signature", http_get(&server.url, &format!("/v1/signatures/{}", upper))),
         ("object put", http_send_json(&server.url, "PUT", &format!("/v1/objects/{}", upper), "{}")),
@@ -1055,6 +1057,52 @@ fn every_hash_taking_endpoint_refuses_an_uppercase_spelling_as_client_error() {
         assert!(body.contains("not an object hash"), "{}: {}", endpoint, body);
         assert!(!body.contains(&upper), "{}: the client's value is not repeated: {}", endpoint, body);
     }
+}
+
+#[test]
+fn the_holds_endpoint_answers_held_for_lifted_history_and_not_held_for_the_rest() {
+    let area = TestArea::new("holds-endpoint");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    let mut parcels = Vec::new();
+    for (round, content) in ["one\n", "two\n"].iter().enumerate() {
+        area.write_file("a/doc.txt", content);
+        assert_success(&area.forklift("a", &["load", "."]));
+        let stacked = area.forklift("a", &["stack", &format!("round {}", round)]);
+        assert_success(&stacked);
+        parcels.push(stdout(&stacked)
+            .split_whitespace()
+            .find(|word| word.len() == 64)
+            .expect("the stack output carries the parcel hash")
+            .to_string());
+    }
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let stranger = "0".repeat(64);
+    let request = format!("{{\"candidates\":[\"{}\",\"{}\",\"{}\"]}}", parcels[0], parcels[1], stranger);
+
+    let (status, body) = http_post_json(&server.url, "/v1/pallets/main/holds", &request);
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+    let holds: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(holds["holds"][&parcels[0]], "held", "an ancestor of the head: {}", body);
+    assert_eq!(holds["holds"][&parcels[1]], "held", "the head itself: {}", body);
+    assert_eq!(holds["holds"][&stranger], "not_held", "the whole history was read: {}", body);
+
+    // A pallet the warehouse does not have holds nothing.
+    let (status, body) = http_post_json(&server.url, "/v1/pallets/elsewhere/holds", &request);
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+    let holds: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(holds["holds"][&parcels[1]], "not_held", "{}", body);
+
+    // One candidate past the cap, and a name no pallet can carry, are refused.
+    let over_cap: Vec<String> = (0..17).map(|n| format!("\"{:064x}\"", n)).collect();
+    let (status, body) = http_post_json(&server.url, "/v1/pallets/main/holds",
+        &format!("{{\"candidates\":[{}]}}", over_cap.join(",")));
+    assert!(status.starts_with("HTTP/1.1 422"), "{} / {}", status, body);
+
+    let (status, body) = http_post_json(&server.url, "/v1/pallets/..%2Fmain/holds", &request);
+    assert!(status.starts_with("HTTP/1.1 422"), "{} / {}", status, body);
 }
 
 #[test]

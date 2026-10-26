@@ -387,6 +387,25 @@ longer fails at ref-update time. It never failed on a lost tree or blob behind i
 that ancestry is trusted, by the same induction. The `audit` command is what re-proves a
 whole history.
 
+### `POST /v1/pallets/{name}/holds` (additive)
+
+Body: `{"candidates": ["<parcel hash>", …]}` (at most 16 per request).
+Response: `{"holds": {"<parcel hash>": "held" | "not_held" | "unknown", …}}` — one answer per
+distinct candidate: whether the pallet still holds that parcel as its head or one of the head's
+ancestors.
+
+- `held` — the walk from the pallet's head reached the parcel.
+- `not_held` — the walk read the pallet's whole history without reaching it, or the warehouse has
+  no such pallet.
+- `unknown` — the walk stopped before it could tell: it read its step bound of parcels, ran past
+  its time bound, or could not read a parcel. Both bounds are fixed on every head.
+
+A client may let a remote's `held` stand in for keeping that history itself; it must read
+`unknown`, any answer it does not recognise, and a head without this endpoint (`404`) as
+"not confirmed", which keeps everything. A candidate that is not an object hash, more than 16 of
+them, or a name no pallet can carry is a `422`. Reading history is what fetching already allows,
+so no permission beyond authentication is asked.
+
 ### `POST /lift/{session}/commit` (additive; serverless head)
 
 The **session-commit** step, for a head where object bytes bypass the control plane —
