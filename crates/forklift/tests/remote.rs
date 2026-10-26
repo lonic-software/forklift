@@ -8479,6 +8479,70 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
     assert!(!area.path("c/.forklift/pallets/y").exists());
 }
 
+/// Stand an interrupted lower of b's main from `from` to `to` — interrupted after it wrote the
+/// files and before it wrote the ref, so b holds `to`'s files with the ref and position at `from` —
+/// recording the office its take was verified against: the one b holds, or another.
+fn interrupt_lower(area: &TestArea, from: &str, to: &str, office_moved: bool) {
+    use forklift_core::util::{audit_utils, object_utils, operation_utils, pallet_utils};
+    use forklift_core::util::operation_utils::{Operation, OperationKind};
+    use forklift_core::util::pallet_utils::{BayPosition, OfficePrecondition, RefPreconditions};
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("b"));
+    let (_, office) = audit_utils::verified_local_trust().unwrap().expect("b holds an anchor");
+    pallet_utils::update_pallet_head("main", Some(to), from, &RefPreconditions::NONE).unwrap();
+    pallet_utils::write_position(&BayPosition::new("main", Some(from.to_string()))).unwrap();
+
+    let mut operation = Operation::new(
+        OperationKind::Lower,
+        BayPosition::new("main", Some(from.to_string())),
+        Some(object_utils::load_parcel(from).unwrap().tree_hash),
+        BayPosition::new("main", Some(to.to_string())),
+    );
+    operation.target_tree = Some(object_utils::load_parcel(to).unwrap().tree_hash);
+    operation.expected = Some(from.to_string());
+    let preconditions = office.preconditions();
+    operation.office = match office_moved {
+        true => OfficePrecondition::At(Some("0".repeat(64))),
+        false => preconditions.office,
+    };
+    operation.anchor = preconditions.anchor;
+    operation_utils::raise(&operation).unwrap();
+    operation_utils::forget_raised_for_tests();
+}
+
+/// Heal rolls an interrupted lower forward only under the office and anchor its take was verified
+/// against: with the office it recorded still standing it finishes the take, and with the office
+/// moved since it undoes it. Revert: let heal's roll-forward write with no preconditions, and the
+/// moved office is rolled forward too.
+#[test]
+fn heal_finishes_an_interrupted_lower_only_under_the_office_it_was_verified_against() {
+    let area = TestArea::new("take-heal");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    stack_file(&area, "a", "code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    let from = pallet_head(&area, "b", "main");
+
+    stack_file(&area, "a", "code.txt", "v2\n");
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+    let to = pallet_head(&area, "b", "main");
+
+    for (office_moved, head, content) in [(false, &to, "v2\n"), (true, &from, "v1\n")] {
+        assert_success(&area.forklift("b", &["shift", "main"]));
+        interrupt_lower(&area, &from, &to, office_moved);
+        assert!(operation_standing(&area, "b"));
+
+        let healed = area.forklift("b", &["heal"]);
+        assert_success(&healed);
+        assert!(!operation_standing(&area, "b"));
+        assert_eq!(&pallet_head(&area, "b", "main"), head, "office moved: {}; {}", office_moved, stdout(&healed));
+        assert_eq!(area.read_file("b/code.txt"), content, "office moved: {}", office_moved);
+    }
+}
+
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
