@@ -4147,7 +4147,7 @@ mod tests {
     #[test]
     fn multi_mode_caches_the_handle_across_requests() {
         let base = scratch_dir("resolve-multi-cache");
-        std::fs::create_dir_all(base.join("wh1").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        mark_warehouse(&base.join("wh1"));
         let state = base_state(ServeMode::Multi { base: base.clone() });
 
         let mut params = PathParams::new();
@@ -4163,8 +4163,8 @@ mod tests {
     #[test]
     fn multi_mode_keeps_tenants_isolated() {
         let base = scratch_dir("resolve-multi-tenants");
-        std::fs::create_dir_all(base.join("wh1").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
-        std::fs::create_dir_all(base.join("wh2").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        mark_warehouse(&base.join("wh1"));
+        mark_warehouse(&base.join("wh2"));
         let state = base_state(ServeMode::Multi { base: base.clone() });
 
         let mut params1 = PathParams::new();
@@ -4186,11 +4186,18 @@ mod tests {
     // The live-warehouse cap: letting idle warehouses go
     // ---------------------------------------------------------------------------------
 
+    /// Makes `root` a bare warehouse: its `.forklift` folder, holding only the marker.
+    fn mark_warehouse(root: &std::path::Path) {
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+        std::fs::write(forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 1\n").unwrap();
+    }
+
     /// A multi-mode state over `base` that keeps at most `cap` warehouses live while any is idle,
     /// with each of `ids` present as a (bare) warehouse.
     fn capped_state(base: &std::path::Path, cap: usize, ids: &[&str]) -> AppState {
         for id in ids {
-            std::fs::create_dir_all(base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            mark_warehouse(&base.join(id));
         }
         let state = base_state(ServeMode::Multi { base: base.to_path_buf() });
         *state.warehouses.lock().unwrap() = WarehouseRegistry::new(cap);
@@ -4316,11 +4323,11 @@ mod tests {
         let base = scratch_dir("sparse-single");
 
         let full = base.join("full");
-        std::fs::create_dir_all(full.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        mark_warehouse(&full);
         drop(WarehouseHandle::serving(full.clone()).expect("a full root is served"));
 
         let sparse = base.join("sparse");
-        std::fs::create_dir_all(sparse.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        mark_warehouse(&sparse);
         make_sparse(&sparse);
         let refused = WarehouseHandle::serving(sparse.clone()).err().expect("a sparse root is refused");
         assert!(matches!(refused, ServingRefusal::Sparse), "{:?}", refused);
@@ -4328,7 +4335,7 @@ mod tests {
         assert!(message.starts_with("\"/srv/wh\" is a sparse warehouse"), "{}", message);
 
         let garbled = base.join("garbled");
-        std::fs::create_dir_all(garbled.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        mark_warehouse(&garbled);
         make_sparse(&garbled);
         {
             let _scope = StorageRootScope::enter(&garbled);
@@ -4926,7 +4933,7 @@ mod tests {
         let base = scratch_dir("create-sweep");
         std::fs::create_dir_all(base.join(format!("{}w-1-0", CREATING_PREFIX)).join(FOLDER_NAME_FORKLIFT_ROOT))
             .unwrap();
-        std::fs::create_dir_all(base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        mark_warehouse(&base.join("w"));
         std::fs::write(base.join(format!("{}stray", CREATING_PREFIX)), b"").unwrap();
         std::fs::write(base.join(lock_utils::FILE_NAME_BASE_SERVE_LOCK), b"").unwrap();
 

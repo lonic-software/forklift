@@ -25,8 +25,13 @@ impl Area {
         let _ = std::fs::remove_dir_all(&base);
         let home = base.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        // Canonical, so paths compare with the ones forklift reports (macOS's /var is /private/var).
+        // Canonical, so paths compare with the ones forklift reports (macOS's /var is /private/var),
+        // without Windows' verbatim prefix, which a working directory never carries.
         let base = std::fs::canonicalize(&base).unwrap();
+        let base = match base.to_str().and_then(|shown| shown.strip_prefix(r"\\?\")) {
+            Some(plain) => PathBuf::from(plain),
+            None => base,
+        };
         let home = base.join("home");
 
         Area { base, home }
