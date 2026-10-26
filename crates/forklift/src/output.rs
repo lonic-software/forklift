@@ -676,8 +676,8 @@ impl ErrorCode {
     /// where the core taxonomy meets the head's exit-code table (§7.4/§7.8): the `match` is total
     /// over `RefusalCode`, so adding a refusal code in `forklift-core` without wiring its exit code
     /// here is a *compile error* — which is the entire point of the type. The two enums are kept
-    /// distinct because `ErrorCode` also classifies head-only conditions core can never raise
-    /// (`NotAWarehouse`, `WarehouseLocked`, …).
+    /// distinct because `ErrorCode` also classifies head-only conditions core never raises
+    /// (`WarehouseLocked`, …).
     fn from_refusal(code: RefusalCode) -> ErrorCode {
         match code {
             RefusalCode::OutOfScope => ErrorCode::OutOfScope,
@@ -707,6 +707,7 @@ impl ErrorCode {
             RefusalCode::StagedUploadDiscarded => ErrorCode::StagedUploadDiscarded,
             RefusalCode::MirrorIncomplete => ErrorCode::MirrorIncomplete,
             RefusalCode::HistoryUnverified => ErrorCode::HistoryUnverified,
+            RefusalCode::NotAWarehouse => ErrorCode::NotAWarehouse,
         }
     }
 }
@@ -1176,6 +1177,7 @@ mod tests {
             (RefusalCode::StagedUploadDiscarded, "staged_upload_discarded", 32),
             (RefusalCode::MirrorIncomplete, "mirror_incomplete", 33),
             (RefusalCode::HistoryUnverified, "history_unverified", 34),
+            (RefusalCode::NotAWarehouse, "not_a_warehouse", 3),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

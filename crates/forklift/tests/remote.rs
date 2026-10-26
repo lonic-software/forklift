@@ -7250,6 +7250,26 @@ fn every_other_command_refuses_inside_an_unfinished_franchise() {
     assert_eq!(nested.status.code(), Some(30), "{}{}", stdout(&nested), stderr(&nested));
 }
 
+/// A franchise stopped before its warehouse marker was written is still an unfinished franchise,
+/// never a folder that is not a warehouse: the franchise check comes before the marker's.
+#[test]
+fn an_unfinished_franchise_without_a_warehouse_marker_is_still_franchise_incomplete() {
+    let area = TestArea::new("franchise-incomplete-unmarked");
+    let server = Server::start(&area, None);
+    remote_with_two_subtrees(&area, &server);
+
+    let failed = area.forklift(".", &["franchise", &server.url, "half", "--only", "src/ap"]);
+    assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    let _ = std::fs::remove_file(area.path("half/.forklift/warehouse"));
+    assert!(!area.path("half/.forklift/warehouse").exists() && area.path("half/.forklift/franchise").is_file());
+
+    for args in [&["--json", "status"][..], &["--json", "prepare"]] {
+        let refused = area.forklift("half", args);
+        let value = json_of(&refused);
+        assert_eq!(value["error"]["code"], "franchise_incomplete", "{:?}: {}", args, value);
+    }
+}
+
 #[test]
 fn a_resume_of_another_remote_is_refused_before_it_connects() {
     let area = TestArea::new("franchise-resume-other-remote");

@@ -51,9 +51,14 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
         return Err(format!("A bay named \"{}\" already exists.", name));
     }
 
-    // The warehouse root: the CLI entered it, so it is the current directory.
-    let warehouse_root = std::env::current_dir()
-        .map_err(|e| format!("Error while getting the warehouse root: {}", e))?;
+    // The working tree the CLI entered (the current directory) is the warehouse's, or a bay's when
+    // run inside one; the new bay belongs to the warehouse either way, never to the bay.
+    let working_root = std::env::current_dir()
+        .map_err(|e| format!("Error while getting the working tree root: {}", e))?;
+    let warehouse_root = match globals::forklift_root().parent() {
+        Some(shared) if globals::active_bay().is_some() => shared.to_path_buf(),
+        _ => working_root.clone(),
+    };
 
     // A bay branches off the parcel this bay's files stand on (the current pallet's head, unless
     // another bay moved it since), so there must be one.
@@ -70,7 +75,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // silently empty bay. Resolved while still at the warehouse root, before the cwd changes.
     let scope = resolve_scope(&scope_paths, &tree)?;
 
-    let bay_dir = resolve_bay_dir(name, path, &warehouse_root)?;
+    let bay_dir = resolve_bay_dir(name, path, &working_root, &warehouse_root)?;
 
     if bay_dir.exists() && bay_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
         return Err(format!(
@@ -208,8 +213,11 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
 }
 
 /// Resolve where the bay's working directory should live: the given path (relative to the
-/// directory the user invoked forklift from), or a default sibling of the warehouse.
-fn resolve_bay_dir(name: &str, path: Option<String>, warehouse_root: &std::path::Path) -> Result<PathBuf, String> {
+/// directory the user invoked forklift from, below `working_root`), or a default sibling of the
+/// warehouse.
+fn resolve_bay_dir(
+    name: &str, path: Option<String>, working_root: &std::path::Path, warehouse_root: &std::path::Path
+) -> Result<PathBuf, String> {
     match path {
         Some(path) => {
             let given = PathBuf::from(path);
@@ -217,9 +225,9 @@ fn resolve_bay_dir(name: &str, path: Option<String>, warehouse_root: &std::path:
             if given.is_absolute() {
                 Ok(given)
             } else {
-                // The CLI changed into the warehouse root; resolve relative to where the
-                // user actually was.
-                Ok(warehouse_root.join(warehouse_utils::cwd_relative_to_root()).join(given))
+                // The CLI changed into the root of the working tree it was run in (the bay's,
+                // inside a bay); resolve relative to where the user actually was.
+                Ok(working_root.join(warehouse_utils::cwd_relative_to_root()).join(given))
             }
         }
         None => {

@@ -248,6 +248,11 @@ refusal_codes! {
     /// key after the trust boundary, signed by a revoked key outside its distrust boundary, or sits
     /// behind a boundary neither this warehouse nor the remote can resolve. Nothing was adopted.
     HistoryUnverified => "history_unverified",
+
+    /// A directory a command was to use as a warehouse is not one: its `.forklift` folder holds no
+    /// warehouse marker, it is a bay's, it is missing, or a bay's redirect names something that is
+    /// not a warehouse. Refused before any lock is taken; the next step names the root it refused.
+    NotAWarehouse => "not_a_warehouse",
 }
 
 impl RefusalCode {
