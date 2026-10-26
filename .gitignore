@@ -20,3 +20,6 @@ backend_override.tf
 
 # Cross-compiled Lambda build output (cargo target dir used by the Linux container build).
 target-lambda-docker/
+
+# Trace build output (cargo target dir used for tracing builds).
+/target-trace/
