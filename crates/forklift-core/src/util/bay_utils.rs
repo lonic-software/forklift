@@ -64,8 +64,13 @@ pub struct BayRedirect {
 /// What a directory's `.forklift` entry is (see [`classify_forklift`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkliftKind {
-    /// A folder without a redirect: a warehouse's own forklift root.
+    /// A folder without a redirect, holding a warehouse marker: a warehouse's own forklift root.
     Warehouse,
+
+    /// A folder with neither a redirect nor a warehouse marker: made by hand, by a prepare that
+    /// never finished, by a Forklift that did not mark warehouses yet, or a bay's folder whose
+    /// redirect was lost. Never entered as a warehouse.
+    Unprepared,
 
     /// A folder holding a [`FILE_NAME_BAY_REDIRECT`] regular file: a bay's working metadata.
     Bay,
@@ -122,9 +127,9 @@ pub fn classify_forklift(forklift_path: &Path) -> Result<ForkliftKind, String> {
             "\"{}\" is a link to nothing, so \"{}\" is neither a warehouse nor a valid bay.",
             redirect.to_string_lossy(), forklift_path.to_string_lossy()
         )),
-        // A marker that cannot be read is an error, never a warehouse. Refusing a folder without
-        // one waits on the decision whether unmarked warehouses are adopted or re-created.
-        Err(e) if absent(&e) => warehouse_utils::has_warehouse_marker(forklift_path).map(|_| ForkliftKind::Warehouse),
+        // A marker that cannot be read is an error, never a warehouse and never an unprepared folder.
+        Err(e) if absent(&e) => warehouse_utils::has_warehouse_marker(forklift_path)
+            .map(|marked| if marked { ForkliftKind::Warehouse } else { ForkliftKind::Unprepared }),
         Err(e) => Err(format!("Error while checking \"{}\": {}", redirect.to_string_lossy(), e)),
     }
 }
@@ -320,7 +325,7 @@ fn ownership(forklift: &Path, shared_forklift: &Path, name: &str) -> Ownership {
     let record = match classify_forklift(forklift) {
         Ok(ForkliftKind::Bay) => forklift.join(FILE_NAME_BAY_REDIRECT),
         Ok(ForkliftKind::OldFormatBay) => forklift.to_path_buf(),
-        Ok(ForkliftKind::Warehouse) => return Ownership::NotOurs("it holds no bay redirect".to_string()),
+        Ok(ForkliftKind::Warehouse | ForkliftKind::Unprepared) => return Ownership::NotOurs("it holds no bay redirect".to_string()),
         Ok(ForkliftKind::Absent) => return Ownership::NotOurs("it is a link to nothing".to_string()),
         Err(e) => return Ownership::Unknown(e),
     };
@@ -1020,7 +1025,8 @@ mod tests {
     }
 
     /// Each shape of `.forklift` is classified as what it is: a folder holding a `redirect` file is a
-    /// bay, never a warehouse, and a `redirect` that is not a file is refused rather than guessed.
+    /// bay, never a warehouse, a folder is a warehouse only with a marker, and a `redirect` that is
+    /// not a file is refused rather than guessed.
     #[test]
     fn a_forklift_entry_is_classified_by_its_shape() {
         let dir = std::env::temp_dir().join(format!("forklift-bay-utils-classify-{}", std::process::id()));
@@ -1036,7 +1042,11 @@ mod tests {
         std::fs::remove_file(&forklift).unwrap();
 
         std::fs::create_dir(&forklift).unwrap();
+        assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::Unprepared, "a folder with no marker is no warehouse");
+        let marker = forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER);
+        std::fs::write(&marker, "/forklift-warehouse 1\n").unwrap();
         assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::Warehouse);
+        std::fs::remove_file(&marker).unwrap();
 
         std::fs::create_dir(forklift.join(FILE_NAME_BAY_REDIRECT)).unwrap();
         let error = classify_forklift(&forklift).unwrap_err();

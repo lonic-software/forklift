@@ -45,8 +45,14 @@ running it in an existing warehouse only creates what's missing. `-v` lists each
 piece created.
 
 The last thing `prepare` writes is `.forklift/warehouse`, a marker saying the folder
-is a complete warehouse; running `prepare` in a warehouse that has no marker yet adds
-one. A new `.forklift/` (or one that is there but empty) is built under the name
+is a complete warehouse. Every command needs it: a `.forklift/` without it is no
+warehouse, and commands run there refuse with `not_a_warehouse` (exit 3) and a next
+step that names the folder. An empty `.forklift/` is one `prepare` can take; when it
+sits inside another warehouse, the next step says to remove it first, so the folder
+uses that warehouse. `prepare` refuses a `.forklift/` with something in it but no
+marker, such as one made by a Forklift that did not mark warehouses yet: move it
+aside, run `prepare`, then import the history again (`import-git`) or franchise it
+again. It refuses a bay's folder too. A new `.forklift/` (or one that is there but empty) is built under the name
 `.forklift.tmp~<pid>-<n>` and renamed into place when it is complete, so an interrupted
 `prepare` leaves no half-built warehouse, only that folder. It is never tracked, and
 the next `prepare` in the same directory removes it; one it cannot tell is abandoned
@@ -1282,6 +1288,13 @@ lives under the warehouse's `.forklift/bays/<name>/`. That folder sits on the ba
 so the probes that learn how a volume stamps file times and keeps the executable bit measure
 the bay's volume even when the warehouse lives on another one. `prepare` in a bay's directory
 refuses rather than turn it into a warehouse.
+
+A command in a bay opens the warehouse its redirect names and nothing further: when that is not
+a warehouse, the command refuses with `not_a_warehouse` before writing anything. A warehouse
+that is gone is to be restored, or the bay's `.forklift` deleted. A redirect that names another
+bay (which `bay add` run inside a bay used to write) is refused with the way out: `bay remove`
+the bay in its warehouse, delete its `.forklift`, and `bay add` it again under a new name. `bay
+add` run inside a bay now adds a bay of the warehouse, so it no longer writes such a redirect.
 
 A bay made by an older version of Forklift has a `.forklift` *file* instead, which is refused,
 naming the conversion: create a new folder (the error names one nothing in the directory

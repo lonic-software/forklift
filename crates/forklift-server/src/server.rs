@@ -679,6 +679,11 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
             match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT))? {
                 bay_utils::ForkliftKind::Warehouse => (),
+                // Refused with the remedy for what the folder holds (or as a franchise that has not
+                // finished, which may not have marked it yet).
+                bay_utils::ForkliftKind::Unprepared => {
+                    warehouse_utils::open_warehouse_root(&root).map_err(String::from)?;
+                }
                 bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => return Err(format!(
                     "\"{}\" is a bay's working directory, not a forklift warehouse. Serve the warehouse \
                     the bay belongs to instead.",

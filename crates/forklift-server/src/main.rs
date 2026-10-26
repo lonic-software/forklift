@@ -573,6 +573,8 @@ fn resolve_root(root: &str, create: bool) -> Result<std::path::PathBuf, String> 
 /// simply never uses the working-directory parts (the inventory).
 fn prepare(root: &str) -> Result<(), String> {
     let resolved = resolve_root(root, true)?;
+    // A bay's folder, or one with something in it but no warehouse marker, is not prepare's to take.
+    forklift_core::util::warehouse_utils::check_preparable(&resolved)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
 
     let created = forklift_core::util::warehouse_utils::prepare_warehouse()?;

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
 use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, pallet_utils, record_utils};
 
@@ -67,10 +68,14 @@ pub fn is_working_tree_root(dir: &Path) -> Result<bool, String> {
 /// the root), and switch the working directory to the root, so that all warehouse paths
 /// (e.g. the object store) resolve correctly regardless of where forklift was invoked.
 ///
+/// The root found is opened through [`open_warehouse_root`]; inside a bay, the warehouse its
+/// redirect names is opened that way instead, once, with no further redirect followed.
+///
 /// # Returns
 /// * `Ok(())`      - If the warehouse was entered successfully.
-/// * `Err(String)` - If no warehouse was found, it holds a franchise that has not finished (a
-///                   framed `franchise_incomplete` refusal), or the directory switch failed.
+/// * `Err(String)` - If no warehouse was found, the root is no warehouse (a framed `not_a_warehouse`
+///                   refusal) or holds a franchise that has not finished (a framed
+///                   `franchise_incomplete` refusal), or the directory switch failed.
 pub fn enter_warehouse() -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
@@ -83,13 +88,12 @@ pub fn enter_warehouse() -> Result<(), String> {
     match bay_utils::classify_forklift(&forklift)? {
         bay_utils::ForkliftKind::Bay => {
             let redirect = bay_utils::read_bay_redirect(&forklift)?;
-            globals::set_bay_context(redirect.warehouse_root.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
+            let shared = open_bay_warehouse(&root, &redirect).map_err(String::from)?;
+            globals::set_bay_context(shared.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
         }
-        bay_utils::ForkliftKind::OldFormatBay => return Err(bay_utils::old_format_bay_error(&root)),
-        // A franchise that has not finished refuses every command, before any lock is taken: only
-        // running `franchise` again finishes it.
-        bay_utils::ForkliftKind::Warehouse => franchise_utils::gate(&root).map_err(String::from)?,
-        bay_utils::ForkliftKind::Absent => (),
+        _ => {
+            open_warehouse_root(&root).map_err(String::from)?;
+        }
     }
 
     let relative = cwd.strip_prefix(&root).unwrap_or(Path::new(""));
@@ -97,6 +101,183 @@ pub fn enter_warehouse() -> Result<(), String> {
 
     std::env::set_current_dir(&root)
         .map_err(|e| format!("Error while switching to the working tree root \"{}\": {}", root.to_string_lossy(), e))
+}
+
+/// Open the warehouse whose root is `root`, the one way every head decides that a directory is a
+/// warehouse. Only the `.forklift` at `root` is judged ([`bay_utils::classify_forklift`]); a bay's
+/// redirect is never followed, so a bay's folder is refused here like any other non-warehouse. A
+/// franchise that has not finished is refused before the marker is asked for, since it may not
+/// have written one yet.
+///
+/// # Returns
+/// * `Ok(PathBuf)`     - `root`: its `.forklift` holds a warehouse marker this build reads.
+/// * `Err(CoreError)`  - A `not_a_warehouse` refusal naming the absolute root, a
+///                       `franchise_incomplete` refusal, the older bay format's refusal, or the
+///                       `.forklift` could not be judged.
+pub fn open_warehouse_root(root: &Path) -> Result<PathBuf, CoreError> {
+    let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+    match bay_utils::classify_forklift(&forklift)? {
+        bay_utils::ForkliftKind::Warehouse => {
+            franchise_utils::gate(root)?;
+            Ok(root.to_path_buf())
+        }
+        bay_utils::ForkliftKind::Unprepared => {
+            franchise_utils::gate(root)?;
+            Err(unprepared_refusal(root)?)
+        }
+        bay_utils::ForkliftKind::Bay => {
+            let shown = shown_root(root);
+            Err(CoreError::refusal(
+                RefusalCode::NotAWarehouse,
+                format!("\"{}\" is a bay's working directory, not a warehouse.", shown.to_string_lossy()),
+                format!(
+                    "Use the warehouse the bay belongs to, or run the command inside the bay \"{}\".",
+                    shown.to_string_lossy()
+                ),
+            ))
+        }
+        bay_utils::ForkliftKind::OldFormatBay => Err(CoreError::from(bay_utils::old_format_bay_error(root))),
+        bay_utils::ForkliftKind::Absent => {
+            let shown = shown_root(root);
+            Err(CoreError::refusal(
+                RefusalCode::NotAWarehouse,
+                format!("\"{}\" holds no \"{}\" folder, so it is not a warehouse.", shown.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT),
+                format!("Run \"forklift prepare\" in \"{}\" to create a warehouse there.", shown.to_string_lossy()),
+            ))
+        }
+    }
+}
+
+/// Open the warehouse a bay at `bay_root` redirects to: one [`open_warehouse_root`] of the
+/// redirect's warehouse root, never a chain of redirects. A redirect to another bay (which `bay add`
+/// run inside a bay once wrote) and a redirect to a warehouse that is gone get refusals saying how
+/// to get a working bay back.
+///
+/// # Returns
+/// * `Ok(PathBuf)`    - The warehouse root the redirect names.
+/// * `Err(CoreError)` - As [`open_warehouse_root`], naming the warehouse the redirect names.
+fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Result<PathBuf, CoreError> {
+    let target = &redirect.warehouse_root;
+    let target_forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
+    let bay = shown_root(bay_root);
+
+    match bay_utils::classify_forklift(&target_forklift)? {
+        bay_utils::ForkliftKind::Bay => {
+            // The bay was registered in the warehouse the redirect's bay belongs to.
+            let warehouse = bay_utils::read_bay_redirect(&target_forklift)
+                .map(|other| format!("\"{}\"", other.warehouse_root.to_string_lossy()))
+                .unwrap_or_else(|_| format!("the warehouse the bay \"{}\" belongs to", target.to_string_lossy()));
+
+            Err(CoreError::refusal(
+                RefusalCode::NotAWarehouse,
+                format!(
+                    "The bay \"{}\" redirects to \"{}\", which is another bay, not a warehouse.",
+                    bay.to_string_lossy(), target.to_string_lossy()
+                ),
+                format!(
+                    "Run \"forklift bay remove {}\" in {}, delete \"{}\", then run \"forklift bay add\" there \
+                    under a new name into an empty folder.",
+                    redirect.name, warehouse, bay.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
+                ),
+            ))
+        }
+        bay_utils::ForkliftKind::Absent => Err(CoreError::refusal(
+            RefusalCode::NotAWarehouse,
+            format!(
+                "The bay \"{}\" belongs to the warehouse \"{}\", which holds no \"{}\" folder.",
+                bay.to_string_lossy(), target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT
+            ),
+            format!(
+                "Restore the warehouse at \"{}\", or delete \"{}\".",
+                target.to_string_lossy(), bay.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
+            ),
+        )),
+        _ => open_warehouse_root(target),
+    }
+}
+
+/// Refuse a directory `forklift prepare` (or `forklift-server prepare`) is asked to make a
+/// warehouse of, when what stands there is not for prepare to take: an unfinished franchise, a
+/// bay's folder, or a `.forklift` with something in it but no warehouse marker. A missing or empty
+/// `.forklift` is prepared, and so is a warehouse, which prepare completes.
+///
+/// [`prepare_warehouse`] itself does not ask this: franchise, the server's create and the Lambda
+/// scratch fill folders they made or claimed themselves.
+///
+/// # Returns
+/// * `Ok(())`         - Prepare may run at `root`.
+/// * `Err(CoreError)` - A `franchise_incomplete` or `not_a_warehouse` refusal, or the `.forklift`
+///                      could not be judged.
+pub fn check_preparable(root: &Path) -> Result<(), CoreError> {
+    franchise_utils::gate(root)?;
+
+    let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+    match bay_utils::classify_forklift(&forklift)? {
+        bay_utils::ForkliftKind::Absent | bay_utils::ForkliftKind::Warehouse => Ok(()),
+        bay_utils::ForkliftKind::Unprepared if is_empty_folder(&forklift)? => Ok(()),
+        bay_utils::ForkliftKind::Unprepared => Err(unprepared_refusal(root)?),
+        bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => Err(CoreError::refusal(
+            RefusalCode::NotAWarehouse,
+            format!(
+                "\"{}\" belongs to a bay, so a warehouse cannot be prepared there.",
+                forklift.to_string_lossy()
+            ),
+            "Remove the bay from its warehouse first (\"forklift bay remove <name>\" in the warehouse).",
+        )),
+    }
+}
+
+/// The refusal for a `.forklift` at `root` with no warehouse marker (and no redirect). An empty one
+/// may sit inside a warehouse, where the user most likely meant that one: then removing it comes
+/// first, so the next step never builds a nested warehouse the outer one would refuse. One with
+/// anything in it is from before warehouses were marked, or not a warehouse; prepare refuses it,
+/// so it is moved aside and the warehouse made again.
+fn unprepared_refusal(root: &Path) -> Result<CoreError, CoreError> {
+    let shown = shown_root(root);
+    let forklift = shown.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+    if !is_empty_folder(&forklift)? {
+        return Ok(CoreError::refusal(
+            RefusalCode::NotAWarehouse,
+            format!(
+                "\"{}\" holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.",
+                forklift.to_string_lossy()
+            ),
+            format!(
+                "Move \"{}\" aside, run \"forklift prepare\" in \"{}\", then import the history again \
+                (\"forklift import-git\") or franchise it again; or, if it was a bay's, restore its redirect.",
+                forklift.to_string_lossy(), shown.to_string_lossy()
+            ),
+        ));
+    }
+
+    let message = format!("\"{}\" is empty, so it is not a warehouse.", forklift.to_string_lossy());
+    // The working tree the user would be in without the empty folder, found as discovery finds one.
+    let outer = shown.ancestors().skip(1).find(|dir| dir.join(FOLDER_NAME_FORKLIFT_ROOT).exists());
+
+    let next_step = match outer {
+        Some(outer) => format!(
+            "Remove the empty \"{}\" to use the warehouse at \"{}\", or run \"forklift prepare\" in \"{}\".",
+            forklift.to_string_lossy(), outer.to_string_lossy(), shown.to_string_lossy()
+        ),
+        None => format!("Run \"forklift prepare\" in \"{}\".", shown.to_string_lossy()),
+    };
+
+    Ok(CoreError::refusal(RefusalCode::NotAWarehouse, message, next_step))
+}
+
+/// `root` as an absolute path, for the refusals that name it.
+fn shown_root(root: &Path) -> PathBuf {
+    std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// Whether the folder `path` (followed, as classification follows it) holds nothing.
+fn is_empty_folder(path: &Path) -> Result<bool, CoreError> {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .map_err(|e| CoreError::from(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)))
 }
 
 /// Respell each component of `relative`, a directory below `root`, as its parent lists it.
@@ -287,7 +468,9 @@ fn refuse_bay(forklift: &Path) -> Result<(), String> {
             "\"{}\" belongs to a bay, so a warehouse cannot be prepared there. Remove the bay from its \
             warehouse first.", forklift.to_string_lossy()
         )),
-        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Absent => Ok(()),
+        // A folder with no marker is one its caller made or claimed: prepare's commands refuse
+        // anything else first (`check_preparable`).
+        bay_utils::ForkliftKind::Warehouse | bay_utils::ForkliftKind::Unprepared | bay_utils::ForkliftKind::Absent => Ok(()),
     }
 }
 
@@ -744,15 +927,15 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A `.forklift` with anything in it is filled in place, marker last: an existing warehouse
-    /// from before the marker gets one, and a folder with no marker still reads as a warehouse.
+    /// A `.forklift` with anything in it is filled in place, marker last (a franchise's claim is
+    /// one); until marked, it is no warehouse.
     #[test]
     fn an_existing_forklift_folder_is_filled_in_place_and_marked() {
         let root = fresh_dir("in-place");
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(forklift.join("objects")).unwrap();
         std::fs::write(forklift.join("keep"), "mine").unwrap();
-        assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
+        assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Unprepared));
 
         let notes = prepare_at(&root).unwrap();
 
