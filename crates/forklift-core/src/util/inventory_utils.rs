@@ -3561,7 +3561,10 @@ mod tests {
         }).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let between = std::time::SystemTime::now();
+        // Linux stamps a file from its coarse clock, which can trail `now()` by a tick, so a
+        // write that lands just after this instant may read as just before it. The margin stays
+        // well inside the sleep, so a shard published at its first change still reads early.
+        let between = std::time::SystemTime::now() - std::time::Duration::from_millis(20);
 
         batch.update("a/b", |inventory| {
             inventory.add_item(item("second.txt", 2, InventoryItemState::Normal));
