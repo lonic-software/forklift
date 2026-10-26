@@ -41,8 +41,7 @@ use std::time::SystemTime;
 
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::remote::{
-    HoldAnswer, RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_HOLDS_CANDIDATES,
-    MAX_MISSING_BATCH,
+    HoldAnswer, RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
     PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
 use forklift_core::model::tree_item::TreeItem;
@@ -130,6 +129,10 @@ static OFFICE_STATES: OnceLock<Mutex<HashMap<String, OfficeState>>> = OnceLock::
 
 /// How many office states [`OFFICE_STATES`] keeps; past it, one is dropped to make room.
 const MAX_CACHED_OFFICE_STATES: usize = 32;
+
+/// How long before the invocation deadline a holds walk stops, leaving the time to answer and one
+/// read round already in flight to finish.
+const HOLDS_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
@@ -293,33 +296,31 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// `POST /v1/pallets/{name}/holds` — which of `candidates` the pallet still holds, its head or
-    /// one of the head's ancestors. The walk ([`merge_utils::holds_from`]) reads parcels straight
-    /// from the object store, with no scratch mirror, and stops at the same step and time bounds
-    /// as on the direct head; a candidate it could not settle is `unknown`, never `not_held`.
+    /// one of the head's ancestors ([`merge_utils::holds`], the bounds both heads share). The walk
+    /// reads each round of parcels straight from the object store in one concurrent batch, with no
+    /// scratch mirror. It stops [`HOLDS_ANSWER_RESERVE`] before this invocation's deadline when
+    /// that comes sooner than the walk's own time bound, so a short configured timeout still gets
+    /// an answer; a candidate it could not settle is `unknown`, never `not_held`.
     pub fn holds(&self, name: &str, candidates: &[String]) -> HeadResult<BTreeMap<String, HoldAnswer>> {
-        if candidates.len() > MAX_HOLDS_CANDIDATES {
-            return Err(HeadError::unprocessable(format!(
-                "At most {} candidates per request.",
-                MAX_HOLDS_CANDIDATES
-            )));
-        }
-
+        merge_utils::check_holds_candidates(candidates).map_err(HeadError::unprocessable)?;
         candidates.iter().try_for_each(|hash| require_object_hash(hash))?;
 
         let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
         let head = self.refs.get_head(pallet_ref.namespace, &pallet_ref.name).map_err(HeadError::internal)?;
-        let deadline = std::time::Instant::now() + merge_utils::MAX_HOLDS_WALK_TIME;
 
-        Ok(merge_utils::holds_from(head.as_deref(),
-                                   candidates,
-                                   merge_utils::MAX_HOLDS_WALK,
-                                   || std::time::Instant::now() >= deadline,
-                                   |hash| {
-                                       let bytes = self.objects.get(hash)?
-                                           .ok_or_else(|| format!("Parcel {} is missing.", hash))?;
+        let deadline = self.deadline.map(|deadline| {
+            let left = deadline.duration_since(SystemTime::now()).unwrap_or_default();
 
-                                       object_utils::parse_parcel_bytes(hash, &bytes).map(|parcel| parcel.parents)
-                                   }))
+            std::time::Instant::now() + left.saturating_sub(HOLDS_ANSWER_RESERVE)
+        });
+
+        merge_utils::holds(head.as_deref(), candidates, deadline, |round| {
+            self.objects.get_many(round).into_iter().zip(round).map(|(bytes, hash)| {
+                let bytes = bytes?.ok_or_else(|| format!("Parcel {} is missing.", hash))?;
+
+                object_utils::parse_parcel_bytes(hash, &bytes).map(|parcel| parcel.parents)
+            }).collect()
+        }).map_err(HeadError::unprocessable)
     }
 
     /// `POST /v1/objects/upload-targets` — the body-less upload negotiation (additive).

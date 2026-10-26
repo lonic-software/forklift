@@ -548,6 +548,21 @@ impl ObjectStore for S3ObjectStore {
         self.bridge.block_on(self.key_bytes(&object_key(hash)))
     }
 
+    /// A bounded-concurrency batch of `GetObject`s, [`objects_missing`](ObjectStore::objects_missing)'s
+    /// shape: `buffered` keeps the results in the order of `hashes`, and one failed read fails only
+    /// its own entry.
+    fn get_many(&self, hashes: &[String]) -> Vec<Result<Option<Vec<u8>>, String>> {
+        use futures::stream::{self, StreamExt};
+
+        self.bridge.block_on(async {
+            stream::iter(hashes.iter())
+                .map(|hash| async move { self.key_bytes(&object_key(hash)).await })
+                .buffered(MISSING_PROBE_CONCURRENCY)
+                .collect()
+                .await
+        })
+    }
+
     fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {
         // Verify before the network call: nothing unverified is ever handed to the canonical
         // namespace, and the message matches the fake so the head's `422` reads identically.

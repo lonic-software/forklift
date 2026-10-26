@@ -1167,6 +1167,15 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
         // The lift commits, and a stale replay conflicts.
         let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
         head.ref_update(&Principal::Static, "main", &request).expect("lift main");
+
+        // The holds walk reads its rounds through S3's concurrent `get_many`, whose results keep
+        // the order asked for, an absent object included.
+        let stranger = "0".repeat(64);
+        let read = head.objects.get_many(&[stranger.clone(), main_head.clone()]);
+        assert!(matches!(read[0], Ok(None)) && matches!(read[1], Ok(Some(_))), "in order");
+        let holds = head.holds("main", &[main_head.clone(), stranger.clone()]).expect("holds");
+        assert_eq!(holds[&main_head], forklift_core::model::remote::HoldAnswer::Held);
+        assert_eq!(holds[&stranger], forklift_core::model::remote::HoldAnswer::NotHeld);
         assert_eq!(
             head.ref_update(&Principal::Static, "main", &request).expect_err("stale replay").status,
             forklift_aws_lambda::Status::Conflict
