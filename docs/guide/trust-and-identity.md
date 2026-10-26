@@ -162,6 +162,7 @@ in the store, unreferenced. Run `audit` where the history came from.
   install judges each one first. One the anchor does not vouch for (work stacked
   here before the remote enrolled) stays as it is, and `audit` reports it, but no
   later take counts its history, or anything built on it, as already verified.
+  The command names each such pallet in a `pallets_unvouched` warning.
 - A merge signed here makes the merged history this warehouse's, so the `stack`
   that completes a conflicted merge judges the merged head again under the
   office it signs under: a key revoked since the merge began refuses it.

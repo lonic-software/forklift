@@ -310,7 +310,9 @@ fn local_user_heads() -> Result<Vec<(String, String)>, String> {
 /// a head an anchor installed from a remote was recorded not to vouch for, and any head built on
 /// one — a parcel signed on top of history the anchor does not vouch for is no better than it.
 fn vouched_local_heads(anchor: &TrustAnchor) -> Result<Vec<String>, String> {
-    let unvouched = read_unvouched(&anchor.genesis)?;
+    // A parcel no longer in the store is in no local head's history, which is always present.
+    let mut unvouched = read_unvouched(&anchor.genesis)?;
+    unvouched.retain(|head| file_utils::does_object_exist(head).unwrap_or(true));
     let mut heads = Vec::new();
 
     for (_, head) in local_user_heads()? {
@@ -350,30 +352,39 @@ fn vouched_local_heads(anchor: &TrustAnchor) -> Result<Vec<String>, String> {
 /// * `verified`     - Heads already verified against both (the pallet the command takes).
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - Every head judged: the install must be conditioned on the user pallets
-///                       still holding only these, or a head moved meanwhile goes unjudged.
-/// * `Err(String)`     - A head's history could not be read, or the record could not be written.
+/// * `Ok(LocalJudgement)` - Every head judged, and the pallets the anchor does not vouch for.
+/// * `Err(String)`        - The record could not be read or written.
 pub async fn record_unvouched_heads(client: &RemoteClient,
                                     anchor: &TrustAnchor,
                                     office_head: &str,
                                     office_state: &OfficeState,
-                                    verified: &[&str]) -> Result<Vec<String>, String> {
-    let mut judged = Vec::new();
+                                    verified: &[&str]) -> Result<LocalJudgement, String> {
+    let mut known: Vec<String> = verified.iter().map(|head| head.to_string()).collect();
+    let mut judgement = LocalJudgement { judged: Vec::new(), unvouched: Vec::new() };
     let mut unvouched = Vec::new();
 
     for (pallet, head) in local_user_heads()? {
-        let judgement = judge(Some(client), anchor, Some(office_head), office_state, verified, &head, &pallet, FetchAt::Warehouse).await?;
+        let bound: Vec<&str> = known.iter().map(String::as_str).collect();
 
-        if let Judgement::Refused { .. } = judgement {
-            unvouched.push(head.clone());
+        // A head whose history cannot be read is not one the anchor was seen to vouch for: left
+        // out of later known sets like a refused one, rather than keeping the anchor out.
+        match judge(Some(client), anchor, Some(office_head), office_state, &bound, &head, &pallet, FetchAt::Warehouse).await {
+            Ok(Judgement::Vouched) => known.push(head.clone()),
+            Ok(Judgement::Refused { .. }) | Err(_) => {
+                unvouched.push(head.clone());
+                judgement.unvouched.push(pallet);
+            }
         }
 
-        judged.push(head);
+        judgement.judged.push(head);
     }
 
     if !unvouched.is_empty() {
         let lock = RefLock::acquire()?;
         let mut entries = read_unvouched_entries()?;
+
+        // An entry whose parcel left the store can bound nothing any more.
+        entries.retain(|(_, head)| file_utils::does_object_exist(head).unwrap_or(true));
 
         for head in unvouched {
             let entry = (anchor.genesis.clone(), head);
@@ -385,7 +396,17 @@ pub async fn record_unvouched_heads(client: &RemoteClient,
         write_unvouched_entries(&lock, &entries)?;
     }
 
-    Ok(judged)
+    Ok(judgement)
+}
+
+/// What [`record_unvouched_heads`] found.
+pub struct LocalJudgement {
+    /// Every head judged: the install must be conditioned on the user pallets still holding only
+    /// these, or a head moved meanwhile goes unjudged.
+    pub judged: Vec<String>,
+
+    /// The pallets whose heads the anchor does not vouch for, for the command to name.
+    pub unvouched: Vec<String>,
 }
 
 /// The record of heads an installed anchor does not vouch for, in the shared forklift root: a

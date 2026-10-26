@@ -83,6 +83,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     // before that anchor is installed, so a refusal leaves this warehouse holding none. Where it is
     // taken it is judged against the installed anchor, which by then remembers this verdict. The
     // local pallets are judged too, so a later take skips only history the anchor vouches for.
+    let mut unvouched = Vec::new();
     if let Some(first_contact) = trust.take_trust() {
         let target = named.as_deref().unwrap_or(&current);
         let mut verified = Vec::new();
@@ -93,7 +94,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
             verified.push(remote_head.as_str());
         }
 
-        trust.judge_local_heads(&client, &verified).await?;
+        unvouched = trust.judge_local_heads(&client, &verified).await?;
     }
 
     let trust = trust.commit()?;
@@ -102,6 +103,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     // later refusal (a dirty warehouse, a missing pallet) would otherwise leave it unsaid.
     if let Some(genesis) = &trust.adopted_genesis {
         output::warn_trust_adopted(&trust_utils::first_contact(client.url(), genesis));
+        output::warn_pallets_unvouched(&unvouched);
     }
 
     // Meta pallets (the manifest, …) sync alongside trust — fast-forwarded, never

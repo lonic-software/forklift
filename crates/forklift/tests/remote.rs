@@ -8511,6 +8511,10 @@ fn an_anchor_taken_from_a_remote_does_not_vouch_for_local_work_it_never_saw() {
     assert_success(&lowered);
     assert!(stderr(&lowered).contains("Adopted the remote's trust anchor") || stdout(&lowered).contains("Adopted the remote's trust anchor"),
             "{}{}", stdout(&lowered), stderr(&lowered));
+    // The command says which pallet it could not vouch for, and only that one.
+    let warning = stderr(&lowered);
+    assert!(warning.contains("pallet(s) \"feature\""), "{}", warning);
+    assert!(!warning.contains("\"main\""), "{}", warning);
     let recorded = area.read_file("w/.forklift/unvouched-heads");
     assert!(recorded.contains(&local), "{}", recorded);
     assert!(!recorded.contains(&base), "{}", recorded);

@@ -926,6 +926,38 @@ fn held_head_unrecorded_warning_text(mode: OutputMode, error: &str) -> String {
     }
 }
 
+/// The warning code of [`warn_pallets_unvouched`].
+pub const CODE_PALLETS_UNVOUCHED: &str = "pallets_unvouched";
+
+/// Name the local pallets a trust anchor just taken from a remote does not vouch for (`lower` at
+/// first contact, `office accept-regenesis`), on the stderr side-channel the other warnings use:
+/// the command succeeded, and the exit code stays its own.
+pub fn warn_pallets_unvouched(pallets: &[String]) {
+    if !pallets.is_empty() {
+        eprintln!("{}", pallets_unvouched_warning_text(mode(), pallets));
+    }
+}
+
+/// The pure half of [`warn_pallets_unvouched`], asserted in both modes without capturing stderr.
+fn pallets_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> String {
+    let names: Vec<String> = pallets.iter().map(|pallet| format!("\"{}\"", forklift_core::error::sanitize(pallet))).collect();
+    let message = format!(
+        "The trust anchor this warehouse now holds does not vouch for the history of pallet(s) {}: \
+        it was stacked here outside the anchor. Each stays as it is, but taking its history into \
+        another pallet is refused, and \"forklift audit\" names why.",
+        names.join(", ")
+    );
+    let next_step = "As an enrolled signer, re-stack the work onto a pallet the anchor vouches for \
+        (\"forklift cherry-pick\"), or delete the pallet (\"forklift palletize --delete <name>\").";
+
+    match mode {
+        OutputMode::Human => format!("Warning: {} {}", message, next_step),
+        OutputMode::Json => warning_envelope(
+            CODE_PALLETS_UNVOUCHED, &message, next_step, Some(&serde_json::json!({ "pallets": pallets })),
+        ),
+    }
+}
+
 /// Announce a trust anchor adopted on first contact (`lower`, `franchise`). Adoption is never
 /// silent: this names the adopted value, so a reader can check it out of band, and under `--json`
 /// it is a warning document on stderr whose `details` carry the value — the command's own result
@@ -1304,5 +1336,23 @@ mod tests {
         assert_eq!(parsed["details"], serde_json::json!({
             "subject": "http://remote", "current": "abc123", "what_changed": "first_contact",
         }));
+    }
+
+    #[test]
+    fn the_pallets_unvouched_warning_names_every_pallet_in_both_modes() {
+        let pallets = vec!["feature".to_string(), "spike\u{1b}]0;x\u{7}".to_string()];
+
+        let human = pallets_unvouched_warning_text(OutputMode::Human, &pallets);
+        assert!(human.starts_with("Warning: "), "{}", human);
+        assert!(human.contains("\"feature\""), "{}", human);
+        assert!(!human.chars().any(char::is_control), "a pallet name reached the terminal raw: {:?}", human);
+
+        let json = pallets_unvouched_warning_text(OutputMode::Json, &pallets);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut fields: Vec<&str> = parsed.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["details", "lonic_json", "message", "next_step", "tool", "warning"], "{json}");
+        assert_eq!(parsed["warning"], "pallets_unvouched");
+        assert_eq!(parsed["details"], serde_json::json!({ "pallets": pallets }));
     }
 }

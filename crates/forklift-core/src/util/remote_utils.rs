@@ -6990,11 +6990,11 @@ impl PreparedTrust {
     /// * `verified` - Heads this command already verified against the served anchor.
     ///
     /// # Returns
-    /// * `Ok(())`      - The heads are judged.
-    /// * `Err(String)` - A head's history could not be read, or the record could not be written.
-    pub async fn judge_local_heads(&mut self, client: &RemoteClient, verified: &[&str]) -> Result<(), String> {
+    /// * `Ok(Vec<String>)` - The pallets the anchor does not vouch for, which the command names.
+    /// * `Err(String)`     - The record could not be read or written.
+    pub async fn judge_local_heads(&mut self, client: &RemoteClient, verified: &[&str]) -> Result<Vec<String>, String> {
         if self.adopting.is_none() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let anchor = self.anchor.as_ref().expect("first contact verified an anchor");
@@ -7002,9 +7002,10 @@ impl PreparedTrust {
             .expect("first contact verified an office");
         let office_state = self.office_state.as_ref().expect("first contact verified an office");
 
-        self.judged_heads = Some(take_utils::record_unvouched_heads(client, anchor, office_head, office_state, verified).await?);
+        let judgement = take_utils::record_unvouched_heads(client, anchor, office_head, office_state, verified).await?;
+        self.judged_heads = Some(judgement.judged);
 
-        Ok(())
+        Ok(judgement.unvouched)
     }
 
     /// Write the prepared trust: on first contact install the anchor with the office it governs;
@@ -7157,7 +7158,8 @@ pub async fn pending_regenesis(client: &RemoteClient) -> Result<RegenesisState, 
 /// * `confirmed` - The new genesis being accepted.
 ///
 /// # Returns
-/// * `Ok(Some((TrustAnchor, TrustAnchor)))` - The replaced and the adopted anchor.
+/// * `Ok(Some((TrustAnchor, TrustAnchor, Vec<String>)))` - The replaced and the adopted anchor,
+///                                            and the pallets the adopted one does not vouch for.
 /// * `Ok(None)`                             - The remote's anchor is already the held one and
 ///                                            `confirmed` names it: already accepted.
 /// * `Err(String)`                          - If either side holds no anchor, the custody chain
@@ -7166,7 +7168,7 @@ pub async fn pending_regenesis(client: &RemoteClient) -> Result<RegenesisState, 
 ///                                            transfer failed.
 pub async fn accept_regenesis(client: &RemoteClient,
                               confirmed: &str)
-    -> Result<Option<(office_utils::TrustAnchor, office_utils::TrustAnchor)>, String> {
+    -> Result<Option<(office_utils::TrustAnchor, office_utils::TrustAnchor, Vec<String>)>, String> {
     let (local, local_bytes, remote_trust, info) = match pending_regenesis(client).await? {
         RegenesisState::Pending { local, local_bytes, remote, info } => (local, local_bytes, remote, info),
         // Nothing is pending. That is success only if the confirmed value is the one held;
@@ -7205,7 +7207,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
 
     // The local heads were vouched for by the anchor being replaced; the one replacing it judges
     // them afresh, as at first contact.
-    let judged = take_utils::record_unvouched_heads(client, &new_anchor, remote_office_head, &new_office_state, &[]).await?;
+    let judgement = take_utils::record_unvouched_heads(client, &new_anchor, remote_office_head, &new_office_state, &[]).await?;
 
     // The anchor and the office move together, only while both are as this acceptance read them
     // and the user pallets hold only the heads judged above. Another bay that accepted the same re-genesis meanwhile installed exactly this, and the
@@ -7215,10 +7217,10 @@ pub async fn accept_regenesis(client: &RemoteClient,
         replaces: Some(&local_bytes),
         office: local_office_head.as_deref(),
         new_office: Some(remote_office_head),
-        pallets: pallet_utils::PalletsPrecondition::WithinBoundary { boundary: judged, scope: pallet_utils::BoundaryScope::UserPallets },
+        pallets: pallet_utils::PalletsPrecondition::WithinBoundary { boundary: judgement.judged, scope: pallet_utils::BoundaryScope::UserPallets },
     })?;
 
-    Ok(Some((local, new_anchor)))
+    Ok(Some((local, new_anchor, judgement.unvouched)))
 }
 
 /// Push the local trust state (lift direction): establish the anchor on the remote when
