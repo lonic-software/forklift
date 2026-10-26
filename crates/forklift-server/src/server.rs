@@ -1048,10 +1048,16 @@ fn holds_warehouse(root: &std::path::Path) -> bool {
 }
 
 /// Whether nothing stands at `root`, or only an empty folder: what a creation would take.
-fn is_missing_or_empty_folder(root: &std::path::Path) -> bool {
+///
+/// # Returns
+/// * `Ok(bool)`              - Whether a creation would take `root`.
+/// * `Err(std::io::Error)`   - `root` could not be checked.
+fn is_missing_or_empty_folder(root: &std::path::Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(root) {
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        Ok(meta) => meta.is_dir() && std::fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+        Ok(meta) if meta.is_dir() => Ok(std::fs::read_dir(root)?.next().is_none()),
+        Ok(_) => Ok(false),
     }
 }
 
@@ -1607,10 +1613,21 @@ fn resolve_warehouse(state: &AppState,
     // refuse the create a 404 points at, so it is answered as unusable instead. One that cannot
     // be judged is a server fault, with no remedy offered. An unfinished franchise, which may not
     // have marked its folder yet, goes on to `serving` and its 503.
-    match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)) {
-        Ok(bay_utils::ForkliftKind::Warehouse) => (),
-        Ok(bay_utils::ForkliftKind::Unprepared) if franchise_utils::gate(&root).is_err() => (),
-        Ok(bay_utils::ForkliftKind::Absent) if is_missing_or_empty_folder(&root) => return Err((
+    // The cause of a check that failed is logged, never sent: it names this server's paths.
+    let unchecked = |error: String| {
+        tracing::error!(warehouse = %id, %error, "whether the warehouse is one could not be checked");
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Whether \"{}\" on this server is a warehouse could not be checked.", id))
+    };
+    let missing = match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)) {
+        Ok(bay_utils::ForkliftKind::Warehouse) => None,
+        Ok(bay_utils::ForkliftKind::Unprepared) if franchise_utils::gate(&root).is_err() => None,
+        Ok(bay_utils::ForkliftKind::Absent) => Some(is_missing_or_empty_folder(&root).map_err(|e| unchecked(e.to_string()))?),
+        Err(error) => return Err(unchecked(error)),
+        Ok(_) => Some(false),
+    };
+    match missing {
+        None => (),
+        Some(true) => return Err((
             StatusCode::NOT_FOUND,
             format!(
                 "No warehouse \"{}\" exists on this server. Create it first: \
@@ -1618,11 +1635,7 @@ fn resolve_warehouse(state: &AppState,
                 id, id
             )
         )),
-        Err(_) => return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Whether \"{}\" on this server is a warehouse could not be checked.", id)
-        )),
-        _ => return Err((
+        Some(false) => return Err((
             StatusCode::CONFLICT,
             format!(
                 "\"{}\" exists on this server but is not a usable warehouse. The server's operator must \
@@ -4138,6 +4151,30 @@ mod tests {
 
         let error = resolve_warehouse(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A name whose folder cannot be listed is not judged empty or full: the lookup answers it as
+    /// a check that failed, never with a remedy.
+    ///
+    /// Revert: an unreadable folder reads as not empty → 409 → red.
+    #[cfg(unix)]
+    #[test]
+    fn multi_mode_500s_for_a_folder_it_cannot_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch_dir("resolve-multi-unlistable");
+        let shut = base.join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let listable = std::fs::read_dir(&shut).is_ok();
+        let error = resolve_warehouse(&state, &warehouse_params("shut")).err().unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !listable {
+            assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
