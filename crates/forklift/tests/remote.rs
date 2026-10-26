@@ -307,6 +307,7 @@ fn http_send_json(server_url: &str, method: &str, path: &str, body: &str) -> (St
     (status, body)
 }
 
+#[track_caller]
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
