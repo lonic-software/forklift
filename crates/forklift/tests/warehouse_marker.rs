@@ -233,11 +233,79 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
 
     for args in [&["load", "."][..], &["config", "operator.identifier", "x@y"], &["profile", "use", "work"]] {
         let refusal = area.refused(&bay, args);
-        assert!(refusal.message.contains(&quoted(&root.join(FOLDER_NAME_FORKLIFT_ROOT))), "{:?}: {}", args, refusal.message);
-        assert!(refusal.next_step.contains(&format!("run \"forklift prepare\" in {}", quoted(&root))), "{:?}: {}", args, refusal.next_step);
+        assert_eq!(
+            refusal.message,
+            format!("The bay {} belongs to {}, whose \".forklift\" holds no warehouse marker.", quoted(&bay), quoted(&root)),
+            "{:?}", args
+        );
+        // Prepare's remedy alone would leave a warehouse that does not know the bay.
+        assert_eq!(
+            refusal.next_step,
+            format!(
+                "Re-create the warehouse at {} (move its \".forklift\" aside, run \"forklift prepare\" there, then \
+                import the history again with \"forklift import-git\" or franchise it again), then delete {} and add \
+                the bay again with \"forklift bay add\" in {}.",
+                quoted(&root), quoted(&bay.join(FOLDER_NAME_FORKLIFT_ROOT)), quoted(&root)
+            ),
+            "{:?}", args
+        );
     }
     assert_eq!(listing(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), shared, "the warehouse was written");
     assert_eq!(listing(&bay.join(FOLDER_NAME_FORKLIFT_ROOT)), own, "the bay was written");
+}
+
+/// An empty `.forklift` inside a bay is never sent to the bay as if it were the warehouse: the
+/// outer working tree is named only when it is a warehouse.
+#[test]
+fn an_empty_forklift_folder_inside_a_bay_names_no_outer_warehouse() {
+    let area = Area::new("nested-bay");
+    let root = area.warehouse("w");
+    let bay = area.path("bay");
+    area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
+    let sub = bay.join("sub");
+    std::fs::create_dir_all(sub.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+
+    let refusal = area.refused(&sub, &["stocktake"]);
+    assert_eq!(refusal.next_step, format!("Run \"forklift prepare\" in {}.", quoted(&sub)));
+}
+
+/// A marker this build cannot read is said to be one, never answered as "no warehouse here" with
+/// a prepare that would refuse the same marker.
+#[test]
+fn an_unreadable_marker_is_not_answered_with_prepare() {
+    let area = Area::new("unreadable");
+    let root = area.warehouse("w");
+    std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse"), "/forklift-warehouse 2\n").unwrap();
+
+    let output = area.run(&root, &["--json", "stocktake"]);
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(value["error"]["code"], "not_a_warehouse", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().starts_with("The warehouse marker \""), "{}", value);
+    assert!(!value["error"]["next_step"].as_str().unwrap_or("").contains("prepare"), "{}", value);
+}
+
+/// `forklift-server prepare` prints a refusal as its message and next step, never the frame
+/// core carries it in.
+#[test]
+fn the_server_prints_a_refusal_without_its_frame() {
+    let area = Area::new("server-prepare");
+    let old = area.dir("old");
+    std::fs::create_dir_all(old.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
+
+    let output = std::process::Command::new(common::server_binary())
+        .args(["prepare", "--root", old.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = text(&output.stderr);
+    let message = format!(
+        "{} holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.\n",
+        quoted(&old.join(FOLDER_NAME_FORKLIFT_ROOT))
+    );
+    assert!(stderr.starts_with(&message), "{:?}", stderr);
+    assert!(stderr[message.len()..].starts_with("Move "), "{:?}", stderr);
+    assert!(!stderr.contains('\u{1f}') && !stderr.contains("not_a_warehouse"), "{:?}", stderr);
 }
 
 /// A bay whose warehouse is gone is told to restore it or delete the bay's folder.

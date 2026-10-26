@@ -225,8 +225,8 @@ fn resolve_bay_dir(
             if given.is_absolute() {
                 Ok(given)
             } else {
-                // The CLI changed into the warehouse root; resolve relative to where the
-                // user actually was.
+                // The CLI changed into the root of the working tree it was run in (the bay's,
+                // inside a bay); resolve relative to where the user actually was.
                 Ok(working_root.join(warehouse_utils::cwd_relative_to_root()).join(given))
             }
         }

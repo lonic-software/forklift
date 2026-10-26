@@ -126,7 +126,14 @@ async fn async_main() {
     };
 
     if let Err(e) = result {
-        eprintln!("{}", e);
+        // A core refusal arrives framed: print its message and next step, never the frame.
+        match forklift_core::error::CoreError::from(e) {
+            forklift_core::error::CoreError::Refusal { message, next_step, .. } => {
+                eprintln!("{}", message);
+                eprintln!("{}", next_step);
+            }
+            other => eprintln!("{}", other),
+        }
         std::process::exit(1);
     }
 }

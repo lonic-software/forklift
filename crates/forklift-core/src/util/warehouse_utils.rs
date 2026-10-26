@@ -13,7 +13,8 @@ static CWD_RELATIVE_TO_ROOT: OnceLock<PathBuf> = OnceLock::new();
 ///
 /// # Returns
 /// * `Ok(PathBuf)`  - The path of the warehouse root.
-/// * `Err(String)`  - If the current directory is not inside a warehouse.
+/// * `Err(String)`  - A framed `not_a_warehouse` refusal if the current directory is not inside a
+///                    working tree, or the current directory could not be read.
 pub fn find_warehouse_root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
@@ -29,11 +30,14 @@ pub fn find_warehouse_root() -> Result<PathBuf, String> {
 
         match dir.parent() {
             Some(parent) => dir = parent,
-            None => return Err(format!(
-                "Not a forklift warehouse (no \"{}\" found in this directory or any of \
-                its parents). Use the \"prepare\" command to create a warehouse.",
-                FOLDER_NAME_FORKLIFT_ROOT
-            )),
+            None => return Err(String::from(CoreError::refusal(
+                RefusalCode::NotAWarehouse,
+                format!(
+                    "Not a forklift warehouse (no \"{}\" found in this directory or any of its parents).",
+                    FOLDER_NAME_FORKLIFT_ROOT
+                ),
+                "Run \"forklift prepare\" to create a warehouse here, or change into one.",
+            ))),
         }
     }
 }
@@ -193,6 +197,24 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
                 target.to_string_lossy(), bay.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
             ),
         )),
+        bay_utils::ForkliftKind::Unprepared => {
+            franchise_utils::gate(target)?;
+            // Prepare's own remedy would build a warehouse that does not know this bay.
+            Err(CoreError::refusal(
+                RefusalCode::NotAWarehouse,
+                format!(
+                    "The bay \"{}\" belongs to \"{}\", whose \"{}\" holds no warehouse marker.",
+                    bay.to_string_lossy(), target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT
+                ),
+                format!(
+                    "Re-create the warehouse at \"{}\" (move its \"{}\" aside, run \"forklift prepare\" there, \
+                    then import the history again with \"forklift import-git\" or franchise it again), then delete \
+                    \"{}\" and add the bay again with \"forklift bay add\" in \"{}\".",
+                    target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT,
+                    bay.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy(), target.to_string_lossy()
+                ),
+            ))
+        }
         _ => open_warehouse_root(target),
     }
 }
@@ -254,8 +276,10 @@ fn unprepared_refusal(root: &Path) -> Result<CoreError, CoreError> {
     }
 
     let message = format!("\"{}\" is empty, so it is not a warehouse.", forklift.to_string_lossy());
-    // The working tree the user would be in without the empty folder, found as discovery finds one.
-    let outer = shown.ancestors().skip(1).find(|dir| dir.join(FOLDER_NAME_FORKLIFT_ROOT).exists());
+    // The working tree the user would be in without the empty folder, found as discovery finds one,
+    // and named only when it is a warehouse: a bay or another unmarked folder is no place to send them.
+    let outer = shown.ancestors().skip(1).find(|dir| dir.join(FOLDER_NAME_FORKLIFT_ROOT).exists())
+        .filter(|dir| bay_utils::classify_forklift(&dir.join(FOLDER_NAME_FORKLIFT_ROOT)) == Ok(bay_utils::ForkliftKind::Warehouse));
 
     let next_step = match outer {
         Some(outer) => format!(

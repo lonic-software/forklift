@@ -284,16 +284,9 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     }
 
     if cli.command.requires_warehouse() {
-        // A coded refusal (an unfinished franchise) keeps its own code; anything else means there
-        // is no warehouse to enter.
-        warehouse_utils::enter_warehouse().map_err(|message| match CoreError::from(message) {
-            refusal @ CoreError::Refusal { .. } => ForkliftError::from(refusal),
-            other => ForkliftError::new(
-                ErrorCode::NotAWarehouse,
-                String::from(other),
-                "Run \"forklift prepare\" to create a warehouse here, or change into one."
-            ),
-        })?;
+        // Every way of not being in a warehouse is a coded refusal with its own next step; anything
+        // else (an unreadable marker or redirect) is a failure no prepare would cure.
+        warehouse_utils::enter_warehouse().map_err(ForkliftError::from)?;
 
         // Mutating commands hold the warehouse lock for their whole runtime, so two forklift
         // processes can never interleave writes to the staging area or the pallet refs — and

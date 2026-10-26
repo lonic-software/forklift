@@ -1594,15 +1594,28 @@ fn resolve_warehouse(state: &AppState,
 
     let root = base.join(&id);
 
-    if !holds_warehouse(&root) {
-        return Err((
+    // A folder with no warehouse marker exists, so the create a 404 would point at is refused: it
+    // is answered as unusable instead. An unfinished franchise, which may not have marked its
+    // folder yet, goes on to `serving` and its 503.
+    match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)) {
+        Ok(bay_utils::ForkliftKind::Warehouse) => (),
+        Ok(bay_utils::ForkliftKind::Unprepared) if franchise_utils::gate(&root).is_err() => (),
+        Ok(bay_utils::ForkliftKind::Unprepared) => return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Warehouse \"{}\" exists on this server but is not a usable warehouse: it was made before \
+                warehouses were marked. The server's operator must re-create it.",
+                id
+            )
+        )),
+        _ => return Err((
             StatusCode::NOT_FOUND,
             format!(
                 "No warehouse \"{}\" exists on this server. Create it first: \
                 PUT /warehouses/{}.",
                 id, id
             )
-        ));
+        )),
     }
 
     // Acquire this warehouse's serve lock as it is served, and hold it in the registry's handle
@@ -4111,6 +4124,25 @@ mod tests {
 
         let error = resolve_warehouse(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A tenant folder without a warehouse marker exists, so it is answered 409, never the 404
+    /// whose "create it first" the create would then refuse; nothing about it is served.
+    ///
+    /// Revert: the lookup stops answering an unmarked folder → it falls to the 404 → red.
+    #[test]
+    fn multi_mode_409s_for_an_unmarked_warehouse() {
+        let base = scratch_dir("resolve-multi-unmarked");
+        std::fs::create_dir_all(base.join("old").join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let error = resolve_warehouse(&state, &warehouse_params("old")).err().unwrap();
+        assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
+        assert!(error.1.starts_with("Warehouse \"old\" exists on this server but is not a usable warehouse"), "{}", error.1);
+        assert!(!error.1.contains(&*base.to_string_lossy()), "no server path reaches the client: {}", error.1);
+        assert!(!serve_lock_exists(&base, "old"));
 
         let _ = std::fs::remove_dir_all(&base);
     }
