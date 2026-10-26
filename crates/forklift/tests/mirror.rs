@@ -1214,3 +1214,58 @@ fn a_damaged_export_refuses_only_its_own_pallet() {
         assert_eq!(last_line(&fixture.git, &tip(&fixture.git, "main").unwrap()), parcel_line(&head));
     }
 }
+
+/// Every file under a directory, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() { files.extend(files_under(&path)); } else { files.push(path); }
+    }
+    files
+}
+
+/// A head the anchor does not vouch for never reaches git: the remote serves the anchor this
+/// warehouse holds over a main moved to an unsigned parcel (by a client that found the anchor and
+/// office stripped), and the mirror refuses main without exporting it.
+///
+/// Revert: let the mirror skip `verify_take`, and git's main moves to the unsigned parcel.
+#[test]
+fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
+    let fixture = Fixture::new("unverified");
+    let area = &fixture.area;
+    area.forklift_ok("a", &["office", "enroll"]);
+    area.stack("a", "code.txt", "v2\n", "signed");
+    area.lift("a");
+
+    fixture.franchise("b");
+    area.forklift_ok("b", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
+    area.forklift_ok("b", &["mirror"]);
+    let mirrored = tip(&fixture.git, "main").unwrap();
+
+    let trust = area.path("server-root/.forklift/trust");
+    let office = files_under(&area.path("server-root/.forklift")).into_iter()
+        .find(|entry| entry.file_name().is_some_and(|name| name == "office"))
+        .unwrap();
+    let stripped: Vec<(PathBuf, Vec<u8>)> = [trust, office].into_iter()
+        .map(|path| { let bytes = std::fs::read(&path).unwrap(); std::fs::remove_file(&path).unwrap(); (path, bytes) })
+        .collect();
+
+    fixture.franchise("c");
+    area.stack("c", "code.txt", "forged\n", "forged");
+    let forged = area.lift("c")["head"].as_str().unwrap().to_string();
+    for (path, bytes) in &stripped {
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    let run = area.forklift("b", &["--json", "mirror"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    assert_eq!(report["error"]["code"], "mirror_incomplete", "{}", report);
+    let main = outcome(&report["error"]["details"], "main");
+    assert_eq!(main["status"], "failed", "{}", report);
+    let message = main["message"].as_str().unwrap();
+    assert!(message.contains("does not verify against the trust anchor this warehouse holds"), "{}", message);
+    assert!(message.contains(&forged), "{}", message);
+    assert!(message.contains("Run \"forklift audit\""), "the pallet names its step: {}", message);
+    assert_eq!(tip(&fixture.git, "main").unwrap(), mirrored);
+}

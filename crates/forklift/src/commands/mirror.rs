@@ -562,9 +562,13 @@ impl<'a> Run<'a> {
             return Err(problem);
         }
 
-        // Before anything reaches git: a head the anchor does not vouch for is not exported.
+        // Before anything reaches git: a head the anchor does not vouch for is not exported. The
+        // pallet's message carries the refusal's step, which the run's next step points at.
         take_utils::verify_take(Some(self.client), &self.trust, head, pallet, FetchAt::Warehouse).await
-            .map_err(|refusal| Problem::Failed(CoreError::from(refusal).to_string()))?;
+            .map_err(|refusal| Problem::Failed(match CoreError::from(refusal) {
+                CoreError::Refusal { message, next_step, .. } => format!("{} {}", message, next_step),
+                other => other.to_string(),
+            }))?;
 
         let mut git = self.fetch_branch(pallet)?;
 
