@@ -1018,12 +1018,17 @@ fn anchor_moved() -> HandlerError {
     (StatusCode::CONFLICT, "The trust anchor changed during the audit; re-read the warehouse and retry.".to_string())
 }
 
+/// Resolve a root the command line names to an absolute path, for entering it as a storage-root
+/// scope. It judges nothing: [`open_root`] does, and prepare asks core's own check.
+pub(crate) fn canonical_root(root: &str) -> Result<PathBuf, String> {
+    std::fs::canonicalize(root).map_err(|e| format!("Error while resolving \"{}\": {}", root, e))
+}
+
 /// Open the warehouse at `root`, the one way `serve --root`, `bundle` and `gc` take their root:
 /// resolved to an absolute path, then judged by core's gate before anything in it is read, written
 /// or locked, so anything there but a warehouse is refused with a next step for this server.
 pub(crate) fn open_root(root: &str) -> Result<PathBuf, String> {
-    let resolved = std::fs::canonicalize(root)
-        .map_err(|e| format!("Error while resolving \"{}\": {}", root, e))?;
+    let resolved = canonical_root(root)?;
     Ok(warehouse_utils::open_warehouse_root(&resolved, warehouse_utils::Head::Server)?)
 }
 

@@ -190,19 +190,7 @@ pub fn open_warehouse_root(root: &Path, head: Head) -> Result<PathBuf, CoreError
         }
         bay_utils::ForkliftKind::OldFormatBay => match head {
             Head::Client => Err(bay_utils::old_format_bay_refusal(root)),
-            // The server serves no bay, so converting one is no way out; and a file there may be
-            // anything, so it is not named a bay.
-            Head::Server => {
-                let shown = shown_root(root);
-                Err(CoreError::refusal(
-                    RefusalCode::NotAWarehouse,
-                    format!(
-                        "\"{}\" is a file, not a warehouse's folder.",
-                        shown.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
-                    ),
-                    format!("Move it aside and run {}, or use the warehouse it belongs to.", head.prepare_command(&shown)),
-                ))
-            }
+            Head::Server => Err(forklift_file_refusal(root, head)),
         },
         bay_utils::ForkliftKind::Bay => {
             let shown = shown_root(root);
@@ -317,6 +305,7 @@ pub fn check_preparable(root: &Path, head: Head) -> Result<(), CoreError> {
         bay_utils::ForkliftKind::Absent | bay_utils::ForkliftKind::Warehouse => Ok(()),
         bay_utils::ForkliftKind::Unprepared if is_empty_folder(&forklift)? => Ok(()),
         bay_utils::ForkliftKind::Unprepared => Err(unprepared_refusal(root, head)?),
+        bay_utils::ForkliftKind::OldFormatBay if head == Head::Server => Err(forklift_file_refusal(root, head)),
         bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => Err(CoreError::refusal(
             RefusalCode::NotAWarehouse,
             format!(
@@ -326,6 +315,20 @@ pub fn check_preparable(root: &Path, head: Head) -> Result<(), CoreError> {
             "Remove the bay from its warehouse first (\"forklift bay remove <name>\" in the warehouse).",
         )),
     }
+}
+
+/// The server's refusal for a `.forklift` at `root` that is a file. The server serves no bay, so
+/// converting one is no way out; and a file there may be anything, so it is not named a bay.
+fn forklift_file_refusal(root: &Path, head: Head) -> CoreError {
+    let shown = shown_root(root);
+    CoreError::refusal(
+        RefusalCode::NotAWarehouse,
+        format!(
+            "\"{}\" is a file, not a warehouse's folder.",
+            shown.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
+        ),
+        format!("Move it aside and run {}.", head.prepare_command(&shown)),
+    )
 }
 
 /// The refusal for a `.forklift` at `root` with no warehouse marker (and no redirect). An empty one

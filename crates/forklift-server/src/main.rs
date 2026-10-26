@@ -561,16 +561,11 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
     })
 }
 
-/// Resolve a warehouse root to an absolute path, for entering it as a storage-root scope.
-fn canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
-    std::fs::canonicalize(root).map_err(|e| format!("Error while resolving \"{}\": {}", root, e))
-}
-
 /// Prepare a bare warehouse: the same layout `forklift prepare` creates — the server
 /// simply never uses the working-directory parts (the inventory).
 fn prepare(root: &str) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| format!("Error while creating \"{}\": {}", root, e))?;
-    let resolved = canonical_root(root)?;
+    let resolved = server::canonical_root(root)?;
     // An unfinished franchise, a bay's folder, or one with something in it but no warehouse marker,
     // is not prepare's to take.
     forklift_core::util::warehouse_utils::check_preparable(&resolved, forklift_core::util::warehouse_utils::Head::Server)?;
@@ -1340,7 +1335,7 @@ mod tests {
     /// not a warehouse before it touches anything, and names this server's prepare where that is
     /// the remedy.
     ///
-    /// Revert: `bundle` or `gc` opening with `canonical_root` alone → a root is written to, or the
+    /// Revert: `bundle` or `gc` opening with `server::canonical_root` alone → a root is written to, or the
     /// refusal is not `not_a_warehouse` → red.
     #[test]
     fn bundle_and_gc_refuse_a_root_that_is_not_a_warehouse() {
@@ -1386,10 +1381,11 @@ mod tests {
 
     /// Each next step the server gives for a root that is not a warehouse works when followed:
     /// prepare takes an empty `.forklift`, the warehouse above an empty nested one is the root to
-    /// pass, and an unmarked folder moved aside leaves a root prepare takes.
+    /// pass, and an unmarked folder or a `.forklift` file moved aside leaves a root prepare takes.
     ///
     /// Revert: the server's step for an empty nested `.forklift` sending the operator to remove it
-    /// (the CLI's) → the root to pass is not named → red.
+    /// (the CLI's) → the root to pass is not named → red. Prepare calling a `.forklift` file a bay's
+    /// (the CLI's wording), or its step offering the warehouse the file "belongs to" → red.
     #[test]
     fn the_server_next_steps_work_when_followed() {
         let forklift_name = forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT;
@@ -1418,7 +1414,18 @@ mod tests {
         prepare(old.to_str().unwrap()).unwrap();
         bundle(old.to_str().unwrap()).unwrap();
 
-        for root in [empty, warehouse, old] {
+        // A `.forklift` file: bundle and prepare give the same step, neither names a bay, and it works.
+        let file = scratch_root("follow-file");
+        std::fs::write(file.join(forklift_name), "anything").unwrap();
+        for (command, next_step) in [("bundle", next_step_of(&file)), ("prepare", refusal(prepare(file.to_str().unwrap()).unwrap_err()).1)] {
+            assert!(next_step.starts_with("Move it aside and run \"forklift-server prepare\" with --root"), "{}: {}", command, next_step);
+            assert!(!next_step.contains("bay") && !next_step.contains("belongs"), "{}: {}", command, next_step);
+        }
+        std::fs::rename(file.join(forklift_name), file.join("aside")).unwrap();
+        prepare(file.to_str().unwrap()).unwrap();
+        bundle(file.to_str().unwrap()).unwrap();
+
+        for root in [empty, warehouse, old, file] {
             let _ = std::fs::remove_dir_all(&root);
         }
     }
