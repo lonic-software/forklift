@@ -759,13 +759,36 @@ mod tests {
     }
 
     #[test]
+    fn a_lower_record_reads_back_its_preconditions() {
+        let mut operation = operation();
+        operation.kind = OperationKind::Lower;
+
+        for (office, anchor) in [
+            (OfficePrecondition::At(Some("e".repeat(64))), AnchorPrecondition::Bytes(b"anchor\nbytes".to_vec())),
+            (OfficePrecondition::At(None), AnchorPrecondition::Absent),
+            (OfficePrecondition::NotConsumed, AnchorPrecondition::NotConsumed),
+        ] {
+            operation.office = office;
+            operation.anchor = anchor;
+            assert_eq!(Operation::from_bytes(&operation.to_bytes()), Ok(operation.clone()));
+        }
+
+        let text = String::from_utf8(operation.to_bytes()).unwrap();
+        let unknown = format!("{}bytes zz\n", text.trim_end_matches('\n').rsplit_once('\n').unwrap().0.to_string() + "\n");
+        assert_eq!(Operation::from_bytes(unknown.as_bytes()), Err("is malformed.".to_string()));
+    }
+
+    #[test]
     fn a_record_of_an_unknown_operation_or_another_version_refuses() {
         let text = String::from_utf8(operation().to_bytes()).unwrap();
 
         let unknown = text.replace("\nmerge\n", "\nrebase\n");
         assert!(Operation::from_bytes(unknown.as_bytes()).unwrap_err().contains("does not know (\"rebase\")"));
 
-        let newer = text.replace("/forklift-operation 1", "/forklift-operation 2");
+        let newer = text.replace(
+            &format!("/forklift-operation {}", OPERATION_VERSION), &format!("/forklift-operation {}", OPERATION_VERSION + 1)
+        );
+        assert_ne!(newer, text);
         assert!(Operation::from_bytes(newer.as_bytes()).unwrap_err().contains("does not know"));
 
         let short = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0.to_string() + "\n";

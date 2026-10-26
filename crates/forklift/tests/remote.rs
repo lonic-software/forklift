@@ -8261,81 +8261,194 @@ fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
     assert!(area.path("b/.forklift/pallets/feat").exists());
 }
 
-/// SPIKE (FORK-126): a remote stripped of both its anchor and its office serves unsigned history,
-/// and a warehouse holding an anchor lowers it unverified. Asserts today's defect.
-#[test]
-fn spike_fork126_lower_takes_unsigned_history_from_a_stripped_remote() {
-    let area = TestArea::new("spike-126");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "a", &server.url);
-    area.write_file("a/code.txt", "v1\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
-    assert_success(&area.forklift("a", &["office", "enroll"]));
-    area.write_file("a/code.txt", "v2\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "signed"]));
-    assert_success(&area.forklift("a", &["lift"]));
-
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
-    assert!(area.path("b/.forklift/trust").is_file());
-
-    // Strip both the anchor and the office ref from the server's storage.
-    std::fs::remove_file(area.path("server-root/.forklift/trust")).unwrap();
-    let mut office = Vec::new();
-    for entry in walk(&area.path("server-root/.forklift")) {
-        if entry.file_name().map(|n| n == "office").unwrap_or(false) && entry.is_file() {
-            office.push(entry);
-        }
-    }
-    println!("office refs: {:?}", office);
-    assert_eq!(office.len(), 1, "{:?}", office);
-    std::fs::remove_file(&office[0]).unwrap();
-
-    // A client with no anchor lifts an unsigned parcel; the anchorless server takes it.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "c"]));
-    assert!(!area.path("c/.forklift/trust").exists());
-    area.write_file("c/code.txt", "forged\n");
-    assert_success(&area.forklift("c", &["load", "."]));
-    assert_success(&area.forklift("c", &["stack", "forged"]));
-    assert_success(&area.forklift("c", &["lift"]));
-
-    // DEFECT: b, holding the anchor, fast-forwards to the unsigned parcel.
-    let lowered = area.forklift("b", &["lower"]);
-    println!("lower: {}{}", stdout(&lowered), stderr(&lowered));
-    assert_success(&lowered);
-    assert_eq!(std::fs::read_to_string(area.path("b/code.txt")).unwrap(), "forged\n");
-
-    // Only an audit notices.
-    let audited = area.forklift("b", &["audit"]);
-    println!("audit: {}{}", stdout(&audited), stderr(&audited));
-    assert!(!audited.status.success());
-    assert!(stderr(&audited).contains("carries no signature") || stdout(&audited).contains("carries no signature"));
+/// The message of a `history_unverified` refusal under `--json`: exit 34, the error document on
+/// stdout.
+fn history_unverified_message(output: &Output) -> String {
+    assert_eq!(output.status.code(), Some(34), "{}{}", stdout(output), stderr(output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+    assert_eq!(value["error"]["code"], "history_unverified", "{}", value);
+    value["error"]["message"].as_str().unwrap().to_string()
 }
 
-/// SPIKE (FORK-126): a partial client that lowers a post-enrollment pallet whose unsigned
-/// pre-enrollment ancestry is bounded only by another pallet's boundary head cannot resolve the
-/// trust boundary, though the remote is honest.
+/// The message of a refused franchise whose cause is `history_unverified`: a franchise reports
+/// any failure as `franchise_incomplete` (exit 30), keeping what it fetched for a resume.
+fn franchise_history_unverified_message(output: &Output) -> String {
+    assert_eq!(output.status.code(), Some(30), "{}{}", stdout(output), stderr(output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+    assert_eq!(value["error"]["details"]["cause_code"], "history_unverified", "{}", value);
+    value["error"]["message"].as_str().unwrap().to_string()
+}
+
+/// A remote whose main was signed under an anchor, then stripped of both its anchor and its
+/// office, and moved by an anchorless client "c" to an unsigned parcel. "b" franchised while it
+/// was whole, so it holds the anchor and stands at the signed head.
+struct StrippedRemote {
+    server: Server,
+    /// The signed head "b" stands at.
+    signed: String,
+    /// The unsigned head the remote now serves for main.
+    forged: String,
+    /// The stripped files and what they held, to put the anchor and office back.
+    stripped: Vec<(PathBuf, Vec<u8>)>,
+}
+
+impl StrippedRemote {
+    fn new(area: &TestArea) -> StrippedRemote {
+        let server = Server::start(area, None);
+
+        prepare_warehouse(area, "a", &server.url);
+        stack_file(area, "a", "code.txt", "v1\n");
+        assert_success(&area.forklift("a", &["office", "enroll"]));
+        stack_file(area, "a", "code.txt", "v2\n");
+        assert_success(&area.forklift("a", &["lift"]));
+
+        assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+        assert!(area.path("b/.forklift/trust").is_file());
+        let signed = pallet_head(area, "b", "main");
+
+        let trust = area.path("server-root/.forklift/trust");
+        let office: Vec<PathBuf> = walk(&area.path("server-root/.forklift")).into_iter()
+            .filter(|entry| entry.file_name().is_some_and(|name| name == "office"))
+            .collect();
+        assert_eq!(office.len(), 1, "{:?}", office);
+
+        let mut stripped = Vec::new();
+        for path in [trust, office[0].clone()] {
+            stripped.push((path.clone(), std::fs::read(&path).unwrap()));
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        // An anchorless client lifts an unsigned parcel, and the anchorless server takes it.
+        assert_success(&area.forklift(".", &["franchise", &server.url, "c"]));
+        assert!(!area.path("c/.forklift/trust").exists());
+        stack_file(area, "c", "code.txt", "forged\n");
+        assert_success(&area.forklift("c", &["lift"]));
+        let forged = pallet_head(area, "c", "main");
+        assert_eq!(remote_pallet_head(&server, "main"), Some(forged.clone()));
+
+        StrippedRemote { server, signed, forged, stripped }
+    }
+
+    /// Put the stripped anchor and office back: the remote serves its anchor again, over a main
+    /// that does not verify against it.
+    fn restore(&self) {
+        for (path, bytes) in &self.stripped {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
+/// Whether an interrupted operation's marker stands in a warehouse under the area.
+fn operation_standing(area: &TestArea, dir: &str) -> bool {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(dir));
+    forklift_core::util::operation_utils::read().unwrap().is_some()
+}
+
+/// A warehouse holding an anchor takes nothing a stripped remote serves past it: a lower of the
+/// working pallet refuses before its first durable record, leaving the ref, the working files and
+/// no operation marker behind, and so does a lower of a pallet by name. Revert: let `verify_take`
+/// return the preconditions before judging, and the lower fast-forwards b to the forged parcel.
 #[test]
-fn spike_fork126_partial_client_hits_the_boundary_gap() {
-    let area = TestArea::new("spike-126-gap");
+fn a_lower_refuses_history_a_stripped_remote_serves_and_takes_nothing() {
+    let area = TestArea::new("take-stripped-lower");
+    let remote = StrippedRemote::new(&area);
+
+    let refused = area.forklift("b", &["--json", "lower"]);
+    let message = history_unverified_message(&refused);
+    assert!(message.contains("carries no signature"), "{}", message);
+    assert!(message.contains(&remote.forged), "{}", message);
+    assert!(message.contains("Nothing was taken."), "{}", message);
+    assert_eq!(pallet_head(&area, "b", "main"), remote.signed);
+    assert_eq!(area.read_file("b/code.txt"), "v2\n");
+    assert!(!operation_standing(&area, "b"), "a refused take raises no operation");
+
+    assert_success(&area.forklift("b", &["palletize", "side"]));
+    let named = area.forklift("b", &["--json", "lower", "main"]);
+    history_unverified_message(&named);
+    assert_eq!(pallet_head(&area, "b", "main"), remote.signed);
+    assert_eq!(area.read_file("b/code.txt"), "v2\n");
+
+    // Nor does a warehouse that never held an anchor stop taking from one that never had one.
+    assert_success(&area.forklift(".", &["franchise", &remote.server.url, "d"]));
+    assert_eq!(pallet_head(&area, "d", "main"), remote.forged);
+    assert_success(&area.forklift("c", &["lower"]));
+}
+
+/// What a refused lower fetched is in the store, but adopting it by hash refuses the same way:
+/// a pallet created at it, and a lift whose auto-merge would take it. Revert: the same mutation
+/// of `verify_take`, and the palletize creates the pallet at the forged parcel.
+#[test]
+fn a_take_by_hash_or_by_auto_merge_refuses_unverified_history() {
+    let area = TestArea::new("take-stripped-hash");
+    let remote = StrippedRemote::new(&area);
+
+    history_unverified_message(&area.forklift("b", &["--json", "lower"]));
+    assert!(object_present(&area, "b", &remote.forged), "the refused lower fetched the forged parcel");
+
+    let created = area.forklift("b", &["--json", "palletize", "forged", &remote.forged]);
+    let message = history_unverified_message(&created);
+    assert!(message.contains("was not moved to it"), "{}", message);
+    assert!(!area.path("b/.forklift/pallets/forged").exists());
+
+    // With the anchor back, the lift finds the remote ahead under the same anchor and office.
+    remote.restore();
+    stack_file(&area, "b", "other.txt", "local\n");
+    let local = pallet_head(&area, "b", "main");
+    let lifted = area.forklift("b", &["--json", "lift"]);
+    history_unverified_message(&lifted);
+    assert_eq!(pallet_head(&area, "b", "main"), local);
+    assert_eq!(area.read_file("b/code.txt"), "v2\n");
+    assert_eq!(remote_pallet_head(&remote.server, "main"), Some(remote.forged.clone()));
+}
+
+/// At first contact the anchor a remote serves is checked against what it serves before anything
+/// is installed: a franchise, a sparse one, and a lower in a warehouse holding no anchor refuse,
+/// and leave no anchor, office or pallet behind. Revert: the same mutation of `verify_take`, and
+/// the franchise installs the anchor over the forged main.
+#[test]
+fn first_contact_refuses_history_that_does_not_verify_against_the_served_anchor() {
+    let area = TestArea::new("take-first-contact");
+    let remote = StrippedRemote::new(&area);
+    assert_success(&area.forklift(".", &["franchise", &remote.server.url, "e"]));
+    remote.restore();
+
+    let franchised = area.forklift(".", &["--json", "franchise", &remote.server.url, "d"]);
+    let message = franchise_history_unverified_message(&franchised);
+    assert!(message.contains("the trust anchor the remote serves"), "{}", message);
+    assert!(!area.path("d/.forklift/trust").exists(), "no anchor installed");
+    assert!(!area.path("d/.forklift/pallets/main").exists(), "no pallet adopted");
+
+    let sparse = area.forklift(".", &["--json", "franchise", &remote.server.url, "s", "--only", "code.txt"]);
+    franchise_history_unverified_message(&sparse);
+    assert!(!area.path("s/.forklift/trust").exists(), "no anchor installed");
+
+    // "e" franchised the stripped remote, so it holds no anchor and stands at the forged head;
+    // the restored anchor does not vouch for it, and a lower installs nothing.
+    let lowered = area.forklift("e", &["--json", "lower"]);
+    history_unverified_message(&lowered);
+    assert!(!area.path("e/.forklift/trust").exists(), "no anchor installed");
+    assert!(!walk(&area.path("e/.forklift")).iter().any(|entry| entry.file_name().is_some_and(|name| name == "office")),
+            "no office installed");
+}
+
+/// A partial client lowering a post-enrollment pallet whose unsigned pre-enrollment ancestry is
+/// bounded only by another pallet's boundary head fetches that boundary and takes it; the take
+/// then audits clean and leaves nothing for heal. A remote that cannot serve the boundary refuses,
+/// naming it. Revert: let `verify_take` refuse a gap without fetching, and `lower y` refuses.
+#[test]
+fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
+    let area = TestArea::new("take-boundary-gap");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "a", &server.url);
-    area.write_file("a/code.txt", "v1\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    stack_file(&area, "a", "code.txt", "v1\n");
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift("a", &["palletize", "side"]));
-    area.write_file("a/code.txt", "s1\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "s1"]));
-    let s1 = std::fs::read_to_string(area.path("a/.forklift/pallets/side")).unwrap().trim().to_string();
-    area.write_file("a/code.txt", "s2\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "s2"]));
+    stack_file(&area, "a", "code.txt", "s1\n");
+    let s1 = pallet_head(&area, "a", "side");
+    stack_file(&area, "a", "code.txt", "s2\n");
+    let s2 = pallet_head(&area, "a", "side");
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift("a", &["shift", "main"]));
@@ -8343,23 +8456,24 @@ fn spike_fork126_partial_client_hits_the_boundary_gap() {
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift("a", &["palletize", "y", &s1]));
-    area.write_file("a/code.txt", "y\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "signed"]));
-    let lifted = area.forklift("a", &["lift"]);
-    println!("lift y: {}{}", stdout(&lifted), stderr(&lifted));
-    assert_success(&lifted);
+    stack_file(&area, "a", "code.txt", "y\n");
+    assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
-    let lowered = area.forklift("b", &["lower", "y"]);
-    println!("lower y: {}{}", stdout(&lowered), stderr(&lowered));
-    assert_success(&lowered);
+    assert!(!object_present(&area, "b", &s2), "the franchise did not fetch side");
+    assert_success(&area.forklift("b", &["lower", "y"]));
+    assert_success(&area.forklift("b", &["audit", "y"]));
+    let healed = area.forklift("b", &["heal"]);
+    assert_success(&healed);
+    assert!(stdout(&healed).contains("Nothing to heal"), "{}", stdout(&healed));
 
-    let audited = area.forklift("b", &["audit", "y"]);
-    println!("audit: {}{}", stdout(&audited), stderr(&audited));
-    assert!(!audited.status.success());
-    let text = format!("{}{}", stdout(&audited), stderr(&audited));
-    assert!(text.contains("cannot resolve the trust boundary"), "{}", text);
+    // A remote that no longer holds the boundary head cannot vouch for y.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "c"]));
+    std::fs::remove_file(object_store_path(&area, "server-root", &s2)).unwrap();
+    let refused = area.forklift("c", &["--json", "lower", "y"]);
+    let message = history_unverified_message(&refused);
+    assert!(message.contains(&s2), "{}", message);
+    assert!(!area.path("c/.forklift/pallets/y").exists());
 }
 
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
