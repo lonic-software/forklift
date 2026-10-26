@@ -299,12 +299,13 @@ fn the_server_prints_a_refusal_without_its_frame() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = text(&output.stderr);
-    let message = format!(
-        "{} holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.\n",
-        quoted(&old.join(FOLDER_NAME_FORKLIFT_ROOT))
-    );
-    assert!(stderr.starts_with(&message), "{:?}", stderr);
-    assert!(stderr[message.len()..].starts_with("Move "), "{:?}", stderr);
+    // The root as the server resolved it (canonical: on Windows, with the verbatim prefix).
+    let (message, next_step) = stderr.split_once('\n').expect("a message line");
+    assert!(message.starts_with('"') && message.ends_with(&format!(
+        "{}\" holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.",
+        std::path::MAIN_SEPARATOR_STR.to_string() + FOLDER_NAME_FORKLIFT_ROOT
+    )), "{:?}", stderr);
+    assert!(next_step.starts_with("Move "), "{:?}", stderr);
     assert!(!stderr.contains('\u{1f}') && !stderr.contains("not_a_warehouse"), "{:?}", stderr);
 }
 
