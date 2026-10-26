@@ -48,8 +48,9 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use forklift_core::model::remote::{
-    CommitLiftRequest, ErrorResponse, HoldsRequest, HoldsResponse, MissingObjectsRequest, MissingObjectsResponse,
-    RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
+    CommitLiftRequest, ErrorResponse, HoldsRequest, HoldsResponse, MissingObjectsRequest,
+    MissingObjectsResponse, RefUpdateRequest,
+    ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
 use forklift_core::util::authority_utils::Principal;

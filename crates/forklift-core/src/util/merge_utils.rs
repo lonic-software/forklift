@@ -574,7 +574,8 @@ pub fn holds_from(head: Option<&str>,
             break false;
         }
 
-        let round: Vec<String> = queue.drain(..queue.len().min(HOLDS_READ_ROUND).min(max_steps - steps)).collect();
+        let size = queue.len().min(HOLDS_READ_ROUND).min(max_steps - steps);
+        let round: Vec<String> = queue.drain(..size).collect();
         steps += round.len();
 
         let read = parents_of(&round);
@@ -1411,7 +1412,9 @@ mod tests {
         let mut reads = 0;
         let answers = holds_from(head, &candidates, max_steps, || false, |round| {
             reads += round.len();
-            round.iter().map(|hash| parents.get(hash.as_str()).cloned().ok_or_else(|| format!("no parcel {}", hash))).collect()
+            round.iter()
+                .map(|hash| parents.get(hash.as_str()).cloned().ok_or_else(|| format!("no parcel {}", hash)))
+                .collect()
         });
 
         (answers, reads)
@@ -1492,7 +1495,8 @@ mod tests {
     #[test]
     fn holds_refuses_more_candidates_than_one_request_may_name() {
         let candidates: Vec<String> = (0..=MAX_HOLDS_CANDIDATES).map(|n| format!("{:064x}", n)).collect();
-        let error = holds(Some("h"), &candidates, None, |_| panic!("no walk for a refused request")).unwrap_err();
+        let error = holds(Some("h"), &candidates, None, |_| panic!("no walk for a refused request"))
+            .unwrap_err();
         assert!(error.contains(&MAX_HOLDS_CANDIDATES.to_string()), "{}", error);
 
         assert!(holds(None, &candidates[..MAX_HOLDS_CANDIDATES], None, |_| Vec::new()).is_ok());

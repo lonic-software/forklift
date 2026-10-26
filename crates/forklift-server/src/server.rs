@@ -29,7 +29,8 @@ use forklift_core::model::hooks::{
     EVENT_WAREHOUSE_CREATED,
 };
 use forklift_core::model::remote::{
-    ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
+    ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest,
+    MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,

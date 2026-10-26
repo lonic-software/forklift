@@ -227,14 +227,14 @@ attempts with backoff, before the event is dropped or sent to a configured on-fa
 covers transient failures — worth pairing with a dead-letter queue/on-failure destination on the
 verifier for visibility into anything that exhausts its retries.
 
-`POST /v1/pallets/{name}/holds` needs no headroom of its own. Its ancestry walk reads each depth
-of history from S3 as one concurrent round, so a straight chain of parcels still costs one
-round trip per parcel (a parent cannot be asked for before its child is read) and covers a few
-hundred parcels where the direct head covers thousands. It stops at whichever comes first: 10 s, or 3 s before this
-invocation's deadline, so it keeps clear of a `control_plane_timeout_s` set below 10 s as well.
-Whatever it had not settled by then it answers `unknown`, an answer that only makes a client keep
-more. A single S3 read that stalls in its SDK retries for longer than the reserve can still carry
-the walk past the deadline.
+`POST /v1/pallets/{name}/holds` needs no headroom of its own. Its ancestry walk reads parcels
+from S3 in concurrent rounds of up to 64, taken from the front of the walk. A straight chain of
+parcels still costs one round trip per parcel, since a parent cannot be asked for before its
+child is read, so there it covers a few hundred parcels where the direct head covers thousands.
+It stops at whichever comes first: 10 s, or 3 s before this invocation's deadline, so it keeps
+clear of a `control_plane_timeout_s` set below 10 s as well. Whatever it had not settled by then
+it answers `unknown`, an answer that only makes a client keep more. A single S3 read that stalls
+in its SDK retries for longer than the reserve can still carry the walk past the deadline.
 
 ## The S3 bucket
 

@@ -298,9 +298,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// `POST /v1/pallets/{name}/holds` — which of `candidates` the pallet still holds, its head or
     /// one of the head's ancestors ([`merge_utils::holds`], the bounds both heads share). The walk
     /// reads each round of parcels straight from the object store in one concurrent batch, with no
-    /// scratch mirror; a straight chain's rounds hold one parcel each, so there it reads serially. It stops [`HOLDS_ANSWER_RESERVE`] before this invocation's deadline when
-    /// that comes sooner than the walk's own time bound, so a short configured timeout still gets
-    /// an answer; a candidate it could not settle is `unknown`, never `not_held`.
+    /// scratch mirror; a straight chain's rounds hold one parcel each, so there it reads serially.
+    /// It stops [`HOLDS_ANSWER_RESERVE`] before this invocation's deadline when that comes sooner
+    /// than the walk's own time bound, so a short configured timeout still gets an answer; a
+    /// candidate it could not settle is `unknown`, never `not_held`.
     pub fn holds(&self, name: &str, candidates: &[String]) -> HeadResult<BTreeMap<String, HoldAnswer>> {
         merge_utils::check_holds_candidates(candidates).map_err(HeadError::unprocessable)?;
         candidates.iter().try_for_each(|hash| require_object_hash(hash))?;
