@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
-use forklift_core::error::CoreError;
 use forklift_core::util::{lock_utils, warehouse_utils};
 use forklift_core::util::fanout_utils::block_on_worker_stack;
 use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};

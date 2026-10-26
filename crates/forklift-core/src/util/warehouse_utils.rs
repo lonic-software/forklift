@@ -98,7 +98,7 @@ pub fn enter_warehouse() -> Result<(), String> {
             globals::set_bay_context(shared.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
         }
         _ => {
-            open_warehouse_root(&root).map_err(String::from)?;
+            open_warehouse_root(&root, Head::Client).map_err(String::from)?;
         }
     }
 
@@ -109,18 +109,74 @@ pub fn enter_warehouse() -> Result<(), String> {
         .map_err(|e| format!("Error while switching to the working tree root \"{}\": {}", root.to_string_lossy(), e))
 }
 
+/// The head a refusal's next step is written for. The command that prepares a warehouse differs
+/// between them, and so does what fills a re-created one with its history again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Head {
+    /// The `forklift` CLI.
+    Client,
+
+    /// `forklift-server`, which serves the warehouse it opens.
+    Server,
+}
+
+impl Head {
+    /// The command that prepares a warehouse at `root` (absolute), quoted for a next step.
+    fn prepare_command(self, root: &Path) -> String {
+        match self {
+            Head::Client => format!("\"forklift prepare\" in \"{}\"", root.to_string_lossy()),
+            Head::Server => format!("\"forklift-server prepare\" with --root \"{}\"", root.to_string_lossy()),
+        }
+    }
+
+    /// The way out for a `.forklift` at `root` (absolute) that has content but no marker: making
+    /// the warehouse again, and for the CLI, restoring a bay's lost redirect.
+    fn recreate_step(self, forklift: &Path, root: &Path) -> String {
+        match self {
+            Head::Client => format!(
+                "Move \"{}\" aside, run {}, then import the history again (\"forklift import-git\") or \
+                franchise it again; or, if it was a bay's, restore its redirect.",
+                forklift.to_string_lossy(), self.prepare_command(root)
+            ),
+            // A bay is never served, so its redirect is no way out here; and the old folder is refused
+            // by every head, so the new warehouse holds only what clients lift into it.
+            Head::Server => format!(
+                "Move \"{}\" aside and run {}; the new warehouse starts empty, and clients lift their \
+                pallets into it again (\"forklift lift\").",
+                forklift.to_string_lossy(), self.prepare_command(root)
+            ),
+        }
+    }
+
+    /// The way to the warehouse at `outer` (absolute) for a user whose root holds an empty
+    /// `.forklift` inside it, or to prepare `root` instead.
+    fn outer_step(self, forklift: &Path, outer: &Path, root: &Path) -> String {
+        match self {
+            Head::Client => format!(
+                "Remove the empty \"{}\" to use the warehouse at \"{}\", or run {}.",
+                forklift.to_string_lossy(), outer.to_string_lossy(), self.prepare_command(root)
+            ),
+            // The server opens only the root it is given, never one above it.
+            Head::Server => format!(
+                "Pass --root \"{}\" to use the warehouse there, or run {}.",
+                outer.to_string_lossy(), self.prepare_command(root)
+            ),
+        }
+    }
+}
+
 /// Open the warehouse whose root is `root`, the one way every head decides that a directory is a
 /// warehouse. Only the `.forklift` at `root` is judged ([`bay_utils::classify_forklift`]); a bay's
 /// redirect is never followed, so a bay's folder is refused here like any other non-warehouse. A
 /// franchise that has not finished is refused before the marker is asked for, since it may not
-/// have written one yet.
+/// have written one yet. Next steps are written for `head`.
 ///
 /// # Returns
 /// * `Ok(PathBuf)`     - `root`: its `.forklift` holds a warehouse marker this build reads.
 /// * `Err(CoreError)`  - A `not_a_warehouse` refusal naming the absolute root, a
 ///                       `franchise_incomplete` refusal, the older bay format's refusal, or the
 ///                       `.forklift` could not be judged.
-pub fn open_warehouse_root(root: &Path) -> Result<PathBuf, CoreError> {
+pub fn open_warehouse_root(root: &Path, head: Head) -> Result<PathBuf, CoreError> {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
 
     match bay_utils::classify_forklift(&forklift)? {
@@ -130,26 +186,33 @@ pub fn open_warehouse_root(root: &Path) -> Result<PathBuf, CoreError> {
         }
         bay_utils::ForkliftKind::Unprepared => {
             franchise_utils::gate(root)?;
-            Err(unprepared_refusal(root)?)
+            Err(unprepared_refusal(root, head)?)
         }
+        bay_utils::ForkliftKind::OldFormatBay => match head {
+            Head::Client => Err(bay_utils::old_format_bay_refusal(root)),
+            Head::Server => Err(forklift_file_refusal(root, head)),
+        },
         bay_utils::ForkliftKind::Bay => {
             let shown = shown_root(root);
-            Err(CoreError::refusal(
-                RefusalCode::NotAWarehouse,
-                format!("\"{}\" is a bay's working directory, not a warehouse.", shown.to_string_lossy()),
-                format!(
+            let next_step = match head {
+                Head::Client => format!(
                     "Use the warehouse the bay belongs to, or run the command inside the bay \"{}\".",
                     shown.to_string_lossy()
                 ),
+                Head::Server => "Use the warehouse the bay belongs to instead.".to_string(),
+            };
+            Err(CoreError::refusal(
+                RefusalCode::NotAWarehouse,
+                format!("\"{}\" is a bay's working directory, not a warehouse.", shown.to_string_lossy()),
+                next_step,
             ))
         }
-        bay_utils::ForkliftKind::OldFormatBay => Err(bay_utils::old_format_bay_refusal(root)),
         bay_utils::ForkliftKind::Absent => {
             let shown = shown_root(root);
             Err(CoreError::refusal(
                 RefusalCode::NotAWarehouse,
                 format!("\"{}\" holds no \"{}\" folder, so it is not a warehouse.", shown.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT),
-                format!("Run \"forklift prepare\" in \"{}\" to create a warehouse there.", shown.to_string_lossy()),
+                format!("Run {} to create a warehouse there.", head.prepare_command(&shown)),
             ))
         }
     }
@@ -217,7 +280,7 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
                 ),
             ))
         }
-        _ => open_warehouse_root(target),
+        _ => open_warehouse_root(target, Head::Client),
     }
 }
 
@@ -233,7 +296,7 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
 /// * `Ok(())`         - Prepare may run at `root`.
 /// * `Err(CoreError)` - A `franchise_incomplete` or `not_a_warehouse` refusal, or the `.forklift`
 ///                      could not be judged.
-pub fn check_preparable(root: &Path) -> Result<(), CoreError> {
+pub fn check_preparable(root: &Path, head: Head) -> Result<(), CoreError> {
     franchise_utils::gate(root)?;
 
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
@@ -241,7 +304,8 @@ pub fn check_preparable(root: &Path) -> Result<(), CoreError> {
     match bay_utils::classify_forklift(&forklift)? {
         bay_utils::ForkliftKind::Absent | bay_utils::ForkliftKind::Warehouse => Ok(()),
         bay_utils::ForkliftKind::Unprepared if is_empty_folder(&forklift)? => Ok(()),
-        bay_utils::ForkliftKind::Unprepared => Err(unprepared_refusal(root)?),
+        bay_utils::ForkliftKind::Unprepared => Err(unprepared_refusal(root, head)?),
+        bay_utils::ForkliftKind::OldFormatBay if head == Head::Server => Err(forklift_file_refusal(root, head)),
         bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => Err(CoreError::refusal(
             RefusalCode::NotAWarehouse,
             format!(
@@ -253,12 +317,26 @@ pub fn check_preparable(root: &Path) -> Result<(), CoreError> {
     }
 }
 
+/// The server's refusal for a `.forklift` at `root` that is a file. The server serves no bay, so
+/// converting one is no way out; and a file there may be anything, so it is not named a bay.
+fn forklift_file_refusal(root: &Path, head: Head) -> CoreError {
+    let shown = shown_root(root);
+    CoreError::refusal(
+        RefusalCode::NotAWarehouse,
+        format!(
+            "\"{}\" is a file, not a warehouse's folder.",
+            shown.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy()
+        ),
+        format!("Move it aside and run {}.", head.prepare_command(&shown)),
+    )
+}
+
 /// The refusal for a `.forklift` at `root` with no warehouse marker (and no redirect). An empty one
 /// may sit inside a warehouse, where the user most likely meant that one: then removing it comes
 /// first, so the next step never builds a nested warehouse the outer one would refuse. One with
 /// anything in it is from before warehouses were marked, or not a warehouse; prepare refuses it,
 /// so it is moved aside and the warehouse made again.
-fn unprepared_refusal(root: &Path) -> Result<CoreError, CoreError> {
+fn unprepared_refusal(root: &Path, head: Head) -> Result<CoreError, CoreError> {
     let shown = shown_root(root);
     let forklift = shown.join(FOLDER_NAME_FORKLIFT_ROOT);
 
@@ -269,11 +347,7 @@ fn unprepared_refusal(root: &Path) -> Result<CoreError, CoreError> {
                 "\"{}\" holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.",
                 forklift.to_string_lossy()
             ),
-            format!(
-                "Move \"{}\" aside, run \"forklift prepare\" in \"{}\", then import the history again \
-                (\"forklift import-git\") or franchise it again; or, if it was a bay's, restore its redirect.",
-                forklift.to_string_lossy(), shown.to_string_lossy()
-            ),
+            head.recreate_step(&forklift, &shown),
         ));
     }
 
@@ -284,11 +358,8 @@ fn unprepared_refusal(root: &Path) -> Result<CoreError, CoreError> {
         .filter(|dir| bay_utils::classify_forklift(&dir.join(FOLDER_NAME_FORKLIFT_ROOT)) == Ok(bay_utils::ForkliftKind::Warehouse));
 
     let next_step = match outer {
-        Some(outer) => format!(
-            "Remove the empty \"{}\" to use the warehouse at \"{}\", or run \"forklift prepare\" in \"{}\".",
-            forklift.to_string_lossy(), outer.to_string_lossy(), shown.to_string_lossy()
-        ),
-        None => format!("Run \"forklift prepare\" in \"{}\".", shown.to_string_lossy()),
+        Some(outer) => head.outer_step(&forklift, outer, &shown),
+        None => format!("Run {}.", head.prepare_command(&shown)),
     };
 
     Ok(CoreError::refusal(RefusalCode::NotAWarehouse, message, next_step))
