@@ -48,8 +48,9 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use forklift_core::model::remote::{
-    CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
-    RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
+    CommitLiftRequest, ErrorResponse, HoldsRequest, HoldsResponse, MissingObjectsRequest,
+    MissingObjectsResponse, RefUpdateRequest,
+    ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
 use forklift_core::util::authority_utils::Principal;
@@ -536,6 +537,7 @@ enum Route {
     SignaturePut(String),
     PutTrust,
     RefUpdate(String),
+    Holds(String),
     Resolve,
     BundleLatest,
     CommitLift(String),
@@ -604,6 +606,7 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> Op
         (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut((*hash).to_string())),
         (&Method::PUT, ["trust"]) => Some(Route::PutTrust),
         (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate((*name).to_string())),
+        (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds((*name).to_string())),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
         _ => None,
@@ -729,6 +732,12 @@ where
             let request: RefUpdateRequest = parse_json(&body)?;
             head.ref_update(caller, &name, &request)?;
             Ok(empty(StatusCode::OK))
+        }
+
+        Route::Holds(name) => {
+            let request: HoldsRequest = parse_json(&body)?;
+            let holds = head.holds(&name, &request.candidates)?;
+            Ok(json_response(StatusCode::OK, &HoldsResponse { holds }))
         }
 
         // Resolution is a display-only, server-mediated directory lookup (DESIGN.html §8.12).

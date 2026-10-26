@@ -160,6 +160,40 @@ pub struct MissingObjectsResponse {
     pub missing: Vec<String>,
 }
 
+/// The most candidates one `POST /v1/pallets/{name}/holds` request may ask about. Both heads
+/// refuse a longer list with a `422`, since a client's own cap does not bind a hostile client.
+/// It matches the held-heads record's per-pallet cap, so one request covers a pallet's record.
+pub const MAX_HOLDS_CANDIDATES: usize = 16;
+
+/// The body of `POST /v1/pallets/{name}/holds`: parcel hashes the client once saw this pallet
+/// hold, asking whether the pallet's current head still reaches each one.
+#[derive(Serialize, Deserialize)]
+pub struct HoldsRequest {
+    pub candidates: Vec<String>,
+}
+
+/// One candidate's answer in a [`HoldsResponse`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldAnswer {
+    /// The pallet's current head reaches the candidate, so the remote holds its history.
+    Held,
+    /// The walk from the current head ended without reaching the candidate (or the pallet does
+    /// not exist).
+    NotHeld,
+    /// The head could not decide within its bounds, or could not read a parcel on the way. An
+    /// answer this build does not know reads as this one too: it is the answer that frees
+    /// nothing.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The response of `POST /v1/pallets/{name}/holds`: one answer per distinct candidate asked.
+#[derive(Serialize, Deserialize)]
+pub struct HoldsResponse {
+    pub holds: BTreeMap<String, HoldAnswer>,
+}
+
 /// The body of `POST /v1/objects/upload-targets` (additive; a head whose byte plane is
 /// object storage). Asks, without sending a single object body, where each of these
 /// objects should be uploaded for lift `session`.

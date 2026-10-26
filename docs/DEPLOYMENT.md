@@ -227,6 +227,15 @@ attempts with backoff, before the event is dropped or sent to a configured on-fa
 covers transient failures — worth pairing with a dead-letter queue/on-failure destination on the
 verifier for visibility into anything that exhausts its retries.
 
+`POST /v1/pallets/{name}/holds` needs no headroom of its own. Its ancestry walk reads parcels
+from S3 in concurrent rounds of up to 64, taken from the front of the walk. A straight chain of
+parcels still costs one round trip per parcel, since a parent cannot be asked for before its
+child is read, so there it covers a few hundred parcels where the direct head covers thousands.
+It stops at whichever comes first: 10 s, or 3 s before this invocation's deadline, so it keeps
+clear of a `control_plane_timeout_s` set below 10 s as well. Whatever it had not settled by then
+it answers `unknown`, an answer that only makes a client keep more. A single S3 read that stalls
+in its SDK retries for longer than the reserve can still carry the walk past the deadline.
+
 ## The S3 bucket
 
 ### Key layout
@@ -460,6 +469,7 @@ directly). In multi-warehouse mode every path below is additionally prefixed wit
 | `PUT` | `/v1/signatures/{hash}` | Store a signature sidecar |
 | `PUT` | `/v1/trust` | Establish or re-genesis the trust anchor |
 | `POST` | `/v1/pallets/{name}` | The ref-update CAS |
+| `POST` | `/v1/pallets/{name}/holds` | Which of up to 16 parcels the pallet still holds (a bounded walk; `unknown` past its step or time bound) |
 | `POST` | `/v1/resolve` | Operator id → display name (always an empty map on this head — no resolution hook) |
 | `GET` | `/v1/bundles/latest` | Latest whole-warehouse bundle (always `404` today — no bundle builder exists for this head yet) |
 | `POST` | `/lift/{session}/commit` or `/v1/lift/{session}/commit` | Verify-and-promote a lift session's staged uploads (both path forms are accepted — a documented spec/implementation mismatch the router tolerates rather than picks a side on) |

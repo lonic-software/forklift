@@ -29,7 +29,7 @@ use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::authority_utils::Principal;
-use forklift_core::model::remote::{RefUpdateRequest, TrustAnchorDto};
+use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, TrustAnchorDto};
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils;
 use forklift_core::util::{file_utils, object_utils, sign_utils};
@@ -314,6 +314,43 @@ fn untrusted_lift_and_the_cas_guards() {
         head.ref_update(&Principal::Static, "main", &stale).expect_err("stale old_head").status,
         Status::Conflict
     );
+}
+
+/// A holds walk on an invocation with less time left than the answer reserve reads nothing and
+/// answers `unknown` for what the head alone does not settle, rather than run into the gateway.
+#[test]
+fn a_holds_walk_stops_short_of_the_invocation_deadline() {
+    let area = Area::new("holds-deadline");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    area.write_file("wh/readme.txt", "hello again\n");
+    area.forklift("wh", &["load", "readme.txt"]);
+    area.forklift("wh", &["stack", "second"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main has a head");
+    let first = object_utils::parse_parcel_bytes(&main_head, &harvest.objects[&main_head])
+        .expect("the head is a parcel")
+        .parents
+        .remove(0);
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest);
+    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    head.ref_update(&Principal::Static, "main", &request).expect("lift main");
+    let candidates = [main_head.clone(), first.clone()];
+
+    let holds = head.holds("main", &candidates).expect("holds");
+    assert_eq!(holds[&first], HoldAnswer::Held, "the control: with time left, the walk reaches it");
+
+    let head = head.with_deadline(std::time::SystemTime::now() + std::time::Duration::from_secs(1));
+    head.objects.reset_reads();
+    let holds = head.holds("main", &candidates).expect("holds");
+    assert_eq!(holds[&main_head], HoldAnswer::Held, "the head needs no read");
+    assert_eq!(holds[&first], HoldAnswer::Unknown, "no time was left to read toward it");
+    assert_eq!(head.objects.reads(), 0);
 }
 
 /// A ref update whose closure is not fully uploaded is refused (`422`).

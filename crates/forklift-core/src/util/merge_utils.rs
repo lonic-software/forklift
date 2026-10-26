@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use crate::enums::dir_entry_type::DirEntryType;
+use crate::model::remote::{HoldAnswer, MAX_HOLDS_CANDIDATES};
 use crate::globals::bay_root;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils};
@@ -446,6 +448,167 @@ fn is_ancestor_via_walk(ancestor: &str, descendant: &str) -> Result<bool, String
     }
 
     Ok(false)
+}
+
+/// The most parcels one [`holds`] walk reads. Fixed rather than configurable: passing it answers
+/// [`HoldAnswer::Unknown`], which only keeps more on the client, so a wrong value costs disk and
+/// never data.
+pub const MAX_HOLDS_WALK: usize = 10_000;
+
+/// The longest one [`holds`] walk runs before answering, on every head: well inside the shortest
+/// gateway timeout a hosted head sits behind, so a slow store answers [`HoldAnswer::Unknown`]
+/// rather than no answer at all. A head whose invocation ends sooner passes its own deadline too.
+pub const MAX_HOLDS_WALK_TIME: Duration = Duration::from_secs(10);
+
+/// The most parcels one round of a [`holds_from`] walk asks its reader for at once. A store that
+/// reads a round concurrently (the object-storage head) gains up to this much; the time bound is
+/// checked between rounds, so it is also how far one round can carry a walk past its deadline.
+pub const HOLDS_READ_ROUND: usize = 64;
+
+/// Which of `candidates` a pallet whose head is `head` still holds, under the bounds every head
+/// shares: the candidate cap ([`check_holds_candidates`]), [`MAX_HOLDS_WALK`] parcels, and the
+/// earlier of [`MAX_HOLDS_WALK_TIME`] from now and `deadline`. The one entry point both heads
+/// answer `POST /v1/pallets/{name}/holds` through.
+///
+/// # Arguments
+/// * `head`       - The pallet's current head, or `None` when there is no such pallet.
+/// * `candidates` - The parcel hashes to answer for.
+/// * `deadline`   - A head's own outer deadline, when it has one.
+/// * `parents_of` - Reads a round of parcels' parents (see [`holds_from`]).
+///
+/// # Returns
+/// * `Ok(BTreeMap)` - One answer per distinct candidate.
+/// * `Err(String)`  - If there are more candidates than one request may name.
+pub fn holds(head: Option<&str>,
+             candidates: &[String],
+             deadline: Option<Instant>,
+             parents_of: impl FnMut(&[String]) -> Vec<Result<Vec<String>, String>>)
+             -> Result<BTreeMap<String, HoldAnswer>, String> {
+    check_holds_candidates(candidates)?;
+
+    let own = Instant::now() + MAX_HOLDS_WALK_TIME;
+    let deadline = deadline.map_or(own, |deadline| deadline.min(own));
+
+    Ok(holds_from(head, candidates, MAX_HOLDS_WALK, || Instant::now() >= deadline, parents_of))
+}
+
+/// Refuse a holds request naming more than [`MAX_HOLDS_CANDIDATES`] candidates.
+pub fn check_holds_candidates(candidates: &[String]) -> Result<(), String> {
+    if candidates.len() > MAX_HOLDS_CANDIDATES {
+        return Err(format!("At most {} candidates per request.", MAX_HOLDS_CANDIDATES));
+    }
+
+    Ok(())
+}
+
+/// Which of `candidates` a pallet whose head is `head` still holds: a bounded ancestry check
+/// with an answer for "could not tell", unlike [`is_ancestor`].
+///
+/// One breadth-first walk from `head` serves every candidate. A candidate the walk reaches is
+/// [`HoldAnswer::Held`]. When the walk runs out of history without reaching one, it is
+/// [`HoldAnswer::NotHeld`]; with no `head` (the pallet does not exist) every candidate is. A walk
+/// that has read `max_steps` parcels, sees `out_of_time` answer true, or fails to read a parcel
+/// stops, and every candidate it had not reached is [`HoldAnswer::Unknown`]: it cannot say
+/// whether history it never read leads there.
+///
+/// The walk reads in rounds of up to [`HOLDS_READ_ROUND`] parcels, so a reader can fetch a round
+/// concurrently; `out_of_time` is asked before each round. A round is the breadth of history at
+/// that depth, so a straight chain of parcels reads one at a time: no parent can be asked for
+/// before its child is read. A reader answering for fewer parcels than a round holds stops the
+/// walk as an unreadable parcel does.
+///
+/// No commit-graph is consulted. Building a missing generation walks a parcel's whole ancestry
+/// and writes the result, and neither is bounded.
+///
+/// # Arguments
+/// * `head`        - The pallet's current head, or `None` when there is no such pallet.
+/// * `candidates`  - The parcel hashes to answer for.
+/// * `max_steps`   - The most parcels to read.
+/// * `out_of_time` - Asked before each round; `true` stops the walk.
+/// * `parents_of`  - Reads a round of parcels: one result per hash, in the order given.
+///
+/// # Returns
+/// One answer per distinct candidate.
+pub fn holds_from(head: Option<&str>,
+                  candidates: &[String],
+                  max_steps: usize,
+                  out_of_time: impl Fn() -> bool,
+                  mut parents_of: impl FnMut(&[String]) -> Vec<Result<Vec<String>, String>>)
+                  -> BTreeMap<String, HoldAnswer> {
+    let mut answers: BTreeMap<String, HoldAnswer> =
+        candidates.iter().map(|candidate| (candidate.clone(), HoldAnswer::Unknown)).collect();
+    let mut pending: HashSet<String> = answers.keys().cloned().collect();
+
+    let Some(head) = head else {
+        answers.values_mut().for_each(|answer| *answer = HoldAnswer::NotHeld);
+        return answers;
+    };
+
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut steps = 0;
+
+    // A parcel is reached, and so settles a candidate, when it is first queued.
+    let mut reach = |hash: String, queue: &mut VecDeque<String>, answers: &mut BTreeMap<String, HoldAnswer>| {
+        if visited.insert(hash.clone()) {
+            if pending.remove(&hash) {
+                answers.insert(hash.clone(), HoldAnswer::Held);
+            }
+
+            queue.push_back(hash);
+        }
+
+        pending.is_empty()
+    };
+
+    if reach(head.to_string(), &mut queue, &mut answers) {
+        return answers;
+    }
+
+    let exhausted = loop {
+        if queue.is_empty() {
+            break true;
+        }
+
+        if steps == max_steps || out_of_time() {
+            break false;
+        }
+
+        let size = queue.len().min(HOLDS_READ_ROUND).min(max_steps - steps);
+        let round: Vec<String> = queue.drain(..size).collect();
+        steps += round.len();
+
+        let read = parents_of(&round);
+
+        // A reader answering for fewer parcels than it was asked leaves history unread, and a
+        // walk that went on would take it for exhausted.
+        let mut unreadable = read.len() != round.len();
+
+        for parents in read {
+            match parents {
+                Ok(parents) => {
+                    for parent in parents {
+                        if reach(parent, &mut queue, &mut answers) {
+                            return answers;
+                        }
+                    }
+                }
+                Err(_) => unreadable = true,
+            }
+        }
+
+        if unreadable {
+            break false;
+        }
+    };
+
+    if exhausted {
+        for candidate in pending {
+            answers.insert(candidate, HoldAnswer::NotHeld);
+        }
+    }
+
+    answers
 }
 
 /// Find a merge base of two parcels: a best (highest-generation) common ancestor.
@@ -1234,6 +1397,124 @@ mod tests {
                 "a chunked base compares by its on-disk kind");
         assert!(merged_plain_kind(None, Normal, Executable) == Executable, "an add/add keeps the bit");
         assert!(merged_plain_kind(Some(SymbolicLink), Normal, Normal) == Normal);
+    }
+
+    /// `holds_from` over an in-memory history: each entry is a parcel and its parents.
+    fn holds_over(history: &[(&str, &[&str])],
+                  head: Option<&str>,
+                  candidates: &[&str],
+                  max_steps: usize)
+                  -> (BTreeMap<String, HoldAnswer>, usize) {
+        let parents: std::collections::HashMap<&str, Vec<String>> = history.iter()
+            .map(|(hash, parents)| (*hash, parents.iter().map(|parent| parent.to_string()).collect()))
+            .collect();
+        let candidates: Vec<String> = candidates.iter().map(|candidate| candidate.to_string()).collect();
+        let mut reads = 0;
+        let answers = holds_from(head, &candidates, max_steps, || false, |round| {
+            reads += round.len();
+            round.iter()
+                .map(|hash| parents.get(hash.as_str()).cloned().ok_or_else(|| format!("no parcel {}", hash)))
+                .collect()
+        });
+
+        (answers, reads)
+    }
+
+    #[test]
+    fn holds_answers_held_for_the_head_and_its_ancestors_and_not_held_past_the_root() {
+        // a <- b <- c (head); x is unrelated.
+        let history: &[(&str, &[&str])] = &[("a", &[]), ("b", &["a"]), ("c", &["b"]), ("x", &[])];
+        let (answers, _) = holds_over(history, Some("c"), &["c", "a", "x"], MAX_HOLDS_WALK);
+
+        assert_eq!(answers["c"], HoldAnswer::Held, "the head itself is held");
+        assert_eq!(answers["a"], HoldAnswer::Held, "the root ancestor is held");
+        assert_eq!(answers["x"], HoldAnswer::NotHeld, "the whole history was read without reaching x");
+    }
+
+    #[test]
+    fn holds_answers_not_held_for_every_candidate_of_a_missing_pallet() {
+        let (answers, reads) = holds_over(&[], None, &["a", "b"], MAX_HOLDS_WALK);
+
+        assert!(answers.values().all(|answer| *answer == HoldAnswer::NotHeld), "{:?}", answers);
+        assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn holds_reads_a_shared_ancestor_once_and_stops_when_every_candidate_is_found() {
+        // r <- l, r <- m, (l, m) <- h: the diamond's root is reachable twice.
+        let history: &[(&str, &[&str])] = &[("r", &[]), ("l", &["r"]), ("m", &["r"]), ("h", &["l", "m"])];
+        let (answers, reads) = holds_over(history, Some("h"), &["r"], MAX_HOLDS_WALK);
+
+        assert_eq!(answers["r"], HoldAnswer::Held);
+        assert_eq!(reads, 3, "h, l and m are read; r is found without reading its parents");
+    }
+
+    #[test]
+    fn holds_answers_unknown_when_the_walk_bound_is_reached() {
+        // a <- b <- c <- d (head): reaching a needs three reads.
+        let history: &[(&str, &[&str])] = &[("a", &[]), ("b", &["a"]), ("c", &["b"]), ("d", &["c"])];
+
+        let (answers, reads) = holds_over(history, Some("d"), &["a", "c", "x"], 2);
+        assert_eq!(answers["c"], HoldAnswer::Held, "found inside the bound");
+        assert_eq!(answers["a"], HoldAnswer::Unknown, "beyond the bound");
+        assert_eq!(answers["x"], HoldAnswer::Unknown, "history was left unread, so x is not ruled out");
+        assert_eq!(reads, 2);
+
+        let (answers, _) = holds_over(history, Some("d"), &["a", "x"], 3);
+        assert_eq!(answers["a"], HoldAnswer::Held, "three reads reach a");
+        assert_eq!(answers["x"], HoldAnswer::Unknown, "a's own parents are still unread");
+
+        let (answers, _) = holds_over(history, Some("d"), &["x"], 4);
+        assert_eq!(answers["x"], HoldAnswer::NotHeld, "four reads exhaust the history");
+    }
+
+    #[test]
+    fn holds_reads_a_wide_history_in_rounds_no_larger_than_the_round_cap() {
+        // h merges 100 roots at once.
+        let roots: Vec<String> = (0..100).map(|n| format!("p{}", n)).collect();
+        let mut rounds: Vec<usize> = Vec::new();
+        let answers = holds_from(Some("h"), &["x".to_string()], MAX_HOLDS_WALK, || false, |round| {
+            rounds.push(round.len());
+            round.iter().map(|hash| Ok(if hash == "h" { roots.clone() } else { Vec::new() })).collect()
+        });
+
+        assert_eq!(answers["x"], HoldAnswer::NotHeld);
+        assert_eq!(rounds, vec![1, HOLDS_READ_ROUND, 100 - HOLDS_READ_ROUND]);
+    }
+
+    #[test]
+    fn holds_answers_unknown_when_the_reader_answers_for_fewer_parcels_than_asked() {
+        // h's parent p is "read" by a reader that drops it: its history is not exhausted.
+        let answers = holds_from(Some("h"), &["x".to_string()], MAX_HOLDS_WALK, || false, |round| {
+            if round == ["h"] { vec![Ok(vec!["p".to_string()])] } else { Vec::new() }
+        });
+
+        assert_eq!(answers["x"], HoldAnswer::Unknown);
+    }
+
+    #[test]
+    fn holds_refuses_more_candidates_than_one_request_may_name() {
+        let candidates: Vec<String> = (0..=MAX_HOLDS_CANDIDATES).map(|n| format!("{:064x}", n)).collect();
+        let error = holds(Some("h"), &candidates, None, |_| panic!("no walk for a refused request"))
+            .unwrap_err();
+        assert!(error.contains(&MAX_HOLDS_CANDIDATES.to_string()), "{}", error);
+
+        assert!(holds(None, &candidates[..MAX_HOLDS_CANDIDATES], None, |_| Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn holds_answers_unknown_when_a_parcel_cannot_be_read_or_time_runs_out() {
+        // b's parent a is missing from the store.
+        let history: &[(&str, &[&str])] = &[("b", &["a"]), ("c", &["b"])];
+        let (answers, _) = holds_over(history, Some("c"), &["b", "x"], MAX_HOLDS_WALK);
+        assert_eq!(answers["b"], HoldAnswer::Held);
+        assert_eq!(answers["x"], HoldAnswer::Unknown, "an unreadable parcel may lead to x");
+
+        let candidates = vec!["c".to_string(), "x".to_string()];
+        let answers = holds_from(Some("c"), &candidates, MAX_HOLDS_WALK, || true,
+                                 |round| round.iter().map(|_| Ok(Vec::new())).collect());
+        assert_eq!(answers["c"], HoldAnswer::Held, "the head needs no read");
+        assert_eq!(answers["x"], HoldAnswer::Unknown);
     }
 
     /// A micro-benchmark (not run by default) contrasting the generation-number fast path with

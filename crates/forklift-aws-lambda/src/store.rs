@@ -307,6 +307,15 @@ pub trait ObjectStore {
     /// The uncompressed object bytes, or `None` if absent.
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String>;
 
+    /// [`get`](ObjectStore::get) for several objects: one result per hash, in the order given. The
+    /// holds walk reads a round of parcels through it. The default reads serially, which is right
+    /// for a store whose read is cheap; the S3 backend overrides it with a bounded-concurrency
+    /// batch, so a round as wide as a merge-heavy history costs one round trip rather than one per
+    /// parcel.
+    fn get_many(&self, hashes: &[String]) -> Vec<Result<Option<Vec<u8>>, String>> {
+        hashes.iter().map(|hash| self.get(hash)).collect()
+    }
+
     /// Verify `Blake3(bytes) == hash` and store the object; nothing unverified may ever
     /// become fetchable (invariant 1). Storing an already-present hash is a no-op.
     fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String>;

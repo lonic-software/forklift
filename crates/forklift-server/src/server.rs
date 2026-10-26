@@ -29,7 +29,8 @@ use forklift_core::model::hooks::{
     EVENT_WAREHOUSE_CREATED,
 };
 use forklift_core::model::remote::{
-    ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
+    ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest,
+    MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
@@ -789,6 +790,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .route("/signatures/{hash}", get(get_signature).put(put_signature))
         .route("/trust", put(put_trust))
         .route("/pallets/{name}", post(post_ref_update))
+        .route("/pallets/{name}/holds", post(post_holds))
         .route("/resolve", post(post_resolve))
         .route("/bundles/latest", get(get_bundle));
 
@@ -1987,6 +1989,72 @@ async fn post_missing(State(state): State<Arc<AppState>>,
         }
 
         Ok(MissingObjectsResponse { missing })
+    }).await;
+
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+/// The most holds walks this server runs at once (see [`post_holds`]).
+const MAX_CONCURRENT_HOLDS_WALKS: usize = 4;
+
+static HOLDS_WALKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_HOLDS_WALKS);
+
+/// `POST /v1/pallets/{name}/holds` — which of these parcels does the pallet still hold, its head
+/// or one of the head's ancestors? A bounded walk ([`merge_utils::holds`]): a candidate it
+/// could not settle is answered `unknown`, never `not_held`. Reading history is what fetching
+/// already allows, so nothing past authentication is asked.
+async fn post_holds(State(state): State<Arc<AppState>>,
+                    headers: HeaderMap,
+                    Path(params): Path<PathParams>,
+                    Json(request): Json<HoldsRequest>) -> Response {
+    if let Err(error) = check_auth(&state, &headers).await {
+        return error_response(error);
+    }
+
+    let warehouse = match resolve_warehouse(&state, &params) {
+        Ok(warehouse) => warehouse,
+        Err(error) => return error_response(error),
+    };
+
+    let name = match param(&params, "name") {
+        Ok(name) => name,
+        Err(error) => return error_response(error),
+    };
+
+    if let Err(error) = merge_utils::check_holds_candidates(&request.candidates).map_err(unprocessable) {
+        return error_response(error);
+    }
+
+    if let Err(error) = require_object_hashes(&request.candidates) {
+        return error_response(error);
+    }
+
+    // Refused before the cap is consulted, so whether a name is a `422` never depends on load.
+    let pallet_ref = match pallet_utils::PalletRef::parse(&name).map_err(unprocessable) {
+        Ok(pallet_ref) => pallet_ref,
+        Err(error) => return error_response(error),
+    };
+
+    // A walk holds a blocking thread for up to its time bound, and the pool serves every other
+    // request too. Past the cap the answer is `unknown` at once: correct, and only keeps more. The
+    // permit moves into the walk, so a client that hangs up does not free it while the walk runs.
+    let Ok(permit) = HOLDS_WALKS.try_acquire() else {
+        let holds = request.candidates.into_iter().map(|candidate| (candidate, HoldAnswer::Unknown)).collect();
+        return Json(HoldsResponse { holds }).into_response();
+    };
+
+    let result = blocking(warehouse, move || {
+        let _permit = permit;
+        let head = pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)?;
+
+        let holds = merge_utils::holds(head.as_deref(), &request.candidates, None, |round| {
+            round.iter().map(|hash| object_utils::load_parcel(hash).map(|parcel| parcel.parents)).collect()
+        }).map_err(unprocessable)?;
+
+        Ok(HoldsResponse { holds })
     }).await;
 
     match result {
