@@ -462,7 +462,8 @@ fn chains_to_identity_root(key: &crate::util::office_utils::KeyRecord,
 /// # Returns
 /// * `Ok((usize, usize))`    - The number of verified and legacy (pre-trust) parcels.
 /// * `Err(HistoryRefusal)`   - If any parcel fails verification; its `gap` names the boundary
-///                             parcel this store lacks when that, not the parcel, is why.
+///                             parcel this store lacks when that, not the parcel, is why. A walk
+///                             that could not read what it needed is marked `read_failure`.
 pub fn verify_pallet_history(head: &str,
                              anchor: &TrustAnchor,
                              office_state: &OfficeState,

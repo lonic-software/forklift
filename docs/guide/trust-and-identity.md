@@ -157,6 +157,11 @@ in the store, unreferenced. Run `audit` where the history came from.
   franchise, or a lower of a pallet whose pre-trust history is bounded by
   another pallet's head — fetches that boundary from the remote and judges
   again. A remote that cannot serve it is refused, naming the parcel.
+- The pallets this warehouse held before it took a remote's anchor — at first
+  contact, or when accepting a re-genesis — were never judged against it, so the
+  install judges each one first. One the anchor does not vouch for (work stacked
+  here before the remote enrolled) stays as it is, and `audit` reports it, but no
+  later take counts its history, or anything built on it, as already verified.
 - A merge signed here makes the merged history this warehouse's, so the `stack`
   that completes a conflicted merge judges the merged head again under the
   office it signs under: a key revoked since the merge began refuses it.

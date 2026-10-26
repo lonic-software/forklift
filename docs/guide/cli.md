@@ -185,7 +185,12 @@ A pallet whose name git does not accept as a branch name (`feature.lock`, `a..b`
 as is one in `mirror.pallets` the remote does not have; neither is a failure. `mirror` fails
 with `mirror_incomplete` (exit 33) when any pallet is refused or its push fails, after the
 others went through; under `--json` the error's `details` carry the whole run's report. Tags, the
-signed office, the `@manifest` and signatures are not mirrored: git has no equivalent. Refuses
+signed office, the `@manifest` and signatures are not mirrored: git has no equivalent. A head
+is exported only once its history verifies against the trust anchor: with one held, against it
+and the office, which first catches up with the remote's as a `lower` takes it; with none held,
+against the anchor the remote serves, which a mirror never installs. A head that does not
+verify is that pallet's failure (`history_unverified`), and a changed, stripped or diverged
+trust refuses the run as it would a `lower`. Refuses
 in a scoped bay or a sparse franchise, which hold only part of each tree. Two runs never share
 the mirror: a run that finds another in progress reports it busy and stops.
 
