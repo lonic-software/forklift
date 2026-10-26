@@ -426,7 +426,7 @@ fn the_server_serves_no_unmarked_root() {
     let old = area.dir("old");
     std::fs::create_dir_all(old.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
 
-    for (root, expected) in [(&empty, "Run \"forklift-server prepare --root "), (&old, "Move ")] {
+    for (root, expected) in [(&empty, "Run \"forklift-server prepare\" with --root "), (&old, "Move ")] {
         let before = listing(root);
         // Waited on with a deadline: a server that took the folder for a warehouse would serve it forever.
         let mut serving = std::process::Command::new(common::server_binary())

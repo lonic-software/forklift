@@ -566,14 +566,6 @@ fn canonical_root(root: &str) -> Result<std::path::PathBuf, String> {
     std::fs::canonicalize(root).map_err(|e| format!("Error while resolving \"{}\": {}", root, e))
 }
 
-/// Open the warehouse at `root` through core's one gate, before anything in it is read or written:
-/// a folder with no `.forklift`, one without a warehouse marker, a bay's and an unfinished
-/// franchise are each refused, with a next step for this server.
-fn open_root(root: &str) -> Result<std::path::PathBuf, String> {
-    let resolved = canonical_root(root)?;
-    Ok(forklift_core::util::warehouse_utils::open_warehouse_root(&resolved, forklift_core::util::warehouse_utils::Head::Server)?)
-}
-
 /// Prepare a bare warehouse: the same layout `forklift prepare` creates — the server
 /// simply never uses the working-directory parts (the inventory).
 fn prepare(root: &str) -> Result<(), String> {
@@ -597,7 +589,7 @@ fn prepare(root: &str) -> Result<(), String> {
 
 /// Build the bundle served at `/v1/bundles/latest`.
 fn bundle(root: &str) -> Result<(), String> {
-    let resolved = open_root(root)?;
+    let resolved = server::open_root(root)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
 
     // Unlike `gc`, `bundle` is safe to run against a live server and is deliberately *not*
@@ -621,7 +613,7 @@ fn bundle(root: &str) -> Result<(), String> {
 
 /// Collect unreferenced objects.
 fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
-    let resolved = open_root(root)?;
+    let resolved = server::open_root(root)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
 
     // Refuse while a server is serving this root: gc would sweep the server's in-flight
@@ -1322,7 +1314,7 @@ mod tests {
     /// `bundle` and `gc` open their root through core's gate: an unfinished franchise is no
     /// warehouse to work on yet, and neither is a folder whose `.forklift` holds no marker.
     ///
-    /// Revert: `open_root` without the gate (canonicalize only) → the empty `.forklift` opens → red.
+    /// Revert: `server::open_root` without the gate (canonicalize only) → the empty `.forklift` opens → red.
     #[test]
     fn a_root_holding_an_unfinished_franchise_is_refused() {
         let root = scratch_root("franchise");
@@ -1330,16 +1322,16 @@ mod tests {
         std::fs::create_dir_all(&forklift).unwrap();
         std::fs::write(forklift_core::util::franchise_utils::record_path(&forklift), b"").unwrap();
 
-        let refused = open_root(root.to_str().unwrap()).unwrap_err();
+        let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::FranchiseIncomplete);
 
         // Without the franchise, the folder holds no marker: still no warehouse.
         std::fs::remove_file(forklift_core::util::franchise_utils::record_path(&forklift)).unwrap();
-        let refused = open_root(root.to_str().unwrap()).unwrap_err();
+        let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::NotAWarehouse);
 
         std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 1\n").unwrap();
-        assert_eq!(open_root(root.to_str().unwrap()).unwrap(), std::fs::canonicalize(&root).unwrap());
+        assert_eq!(server::open_root(root.to_str().unwrap()).unwrap(), std::fs::canonicalize(&root).unwrap());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1353,7 +1345,7 @@ mod tests {
     #[test]
     fn bundle_and_gc_refuse_a_root_that_is_not_a_warehouse() {
         let forklift_name = forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT;
-        let cases: [(&str, fn(&std::path::Path), bool); 4] = [
+        let cases: [(&str, fn(&std::path::Path), bool); 5] = [
             ("none", |_| (), true),
             ("empty", |root| std::fs::create_dir_all(root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap(), true),
             ("unmarked", |root| std::fs::create_dir_all(root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap(), true),
@@ -1362,6 +1354,8 @@ mod tests {
                 std::fs::create_dir_all(&forklift).unwrap();
                 std::fs::write(forklift.join(forklift_core::util::bay_utils::FILE_NAME_BAY_REDIRECT), b"x").unwrap();
             }, false),
+            // A file in the folder's place: the older bay format, or anything else.
+            ("file", |root| std::fs::write(root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT), b"x").unwrap(), true),
         ];
 
         for (name, make, prepare_is_the_remedy) in cases {
@@ -1377,15 +1371,54 @@ mod tests {
                 let (code, next_step) = refusal(error);
                 assert_eq!(code, forklift_core::error::RefusalCode::NotAWarehouse, "{} {}", command, name);
                 assert_eq!(
-                    next_step.contains(&format!("\"forklift-server prepare --root {}\"", shown.to_string_lossy())),
+                    next_step.contains(&format!("\"forklift-server prepare\" with --root \"{}\"", shown.to_string_lossy())),
                     prepare_is_the_remedy,
                     "{} {}: {}", command, name, next_step
                 );
                 assert!(!next_step.contains("\"forklift prepare\"") && !next_step.contains("import-git"), "{} {}: {}", command, name, next_step);
             }
             assert_eq!(listing(&root), before, "{}: nothing written", name);
-            assert!(name == "none" || root.join(forklift_name).is_dir());
+            assert!(name == "none" || root.join(forklift_name).exists());
 
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Each next step the server gives for a root that is not a warehouse works when followed:
+    /// prepare takes an empty `.forklift`, the warehouse above an empty nested one is the root to
+    /// pass, and an unmarked folder moved aside leaves a root prepare takes.
+    ///
+    /// Revert: the server's step for an empty nested `.forklift` sending the operator to remove it
+    /// (the CLI's) → the root to pass is not named → red.
+    #[test]
+    fn the_server_next_steps_work_when_followed() {
+        let forklift_name = forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT;
+        let next_step_of = |root: &std::path::Path| refusal(bundle(root.to_str().unwrap()).unwrap_err()).1;
+
+        let empty = scratch_root("follow-empty");
+        std::fs::create_dir_all(empty.join(forklift_name)).unwrap();
+        assert!(next_step_of(&empty).starts_with("Run \"forklift-server prepare\" with --root"));
+        prepare(empty.to_str().unwrap()).unwrap();
+        bundle(empty.to_str().unwrap()).unwrap();
+
+        let warehouse = scratch_root("follow-nested");
+        prepare(warehouse.to_str().unwrap()).unwrap();
+        let sub = warehouse.join("sub");
+        std::fs::create_dir_all(sub.join(forklift_name)).unwrap();
+        let next_step = next_step_of(&sub);
+        let shown = std::fs::canonicalize(&warehouse).unwrap();
+        assert!(next_step.starts_with(&format!("Pass --root \"{}\" to use the warehouse there", shown.to_string_lossy())), "{}", next_step);
+        bundle(shown.to_str().unwrap()).unwrap();
+
+        let old = scratch_root("follow-unmarked");
+        std::fs::create_dir_all(old.join(forklift_name).join("objects")).unwrap();
+        let next_step = next_step_of(&old);
+        assert!(next_step.starts_with("Move ") && !next_step.contains("redirect"), "{}", next_step);
+        std::fs::rename(old.join(forklift_name), old.join("aside")).unwrap();
+        prepare(old.to_str().unwrap()).unwrap();
+        bundle(old.to_str().unwrap()).unwrap();
+
+        for root in [empty, warehouse, old] {
             let _ = std::fs::remove_dir_all(&root);
         }
     }
