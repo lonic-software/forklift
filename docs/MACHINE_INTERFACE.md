@@ -790,7 +790,7 @@ Example session:
   since a failed franchise removes the warehouse it adopted into.
 * A `lower` that adopts a remote's trust anchor on first contact, or an `office accept-regenesis`,
   writes a `pallets_unvouched` warning to the same channel when the anchor does not vouch for the
-  history of a pallet this warehouse already held, with `details` `{ "pallets": ["<name>", …] }`.
+  history of a pallet this warehouse already held, or that history could not be read to judge it, with `details` `{ "pallets": ["<name>", …] }`.
   Those pallets stay as they are; a take of their history into another pallet is refused
   (`history_unverified`). The command's own result stands and its exit code is unchanged.
 * A `lift` or `lower` whose remote head could not be added to the warehouse's held-heads record

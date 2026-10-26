@@ -942,13 +942,14 @@ pub fn warn_pallets_unvouched(pallets: &[String]) {
 fn pallets_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> String {
     let names: Vec<String> = pallets.iter().map(|pallet| format!("\"{}\"", forklift_core::error::sanitize(pallet))).collect();
     let message = format!(
-        "The trust anchor this warehouse now holds does not vouch for the history of pallet(s) {}: \
-        it was stacked here outside the anchor. Each stays as it is, but taking its history into \
+        "The trust anchor this warehouse now holds does not vouch for the history of pallet(s) {}, \
+        or it could not be read to judge it. Each stays as it is, but taking its history into \
         another pallet is refused, and \"forklift audit\" names why.",
         names.join(", ")
     );
     let next_step = "As an enrolled signer, re-stack the work onto a pallet the anchor vouches for \
-        (\"forklift cherry-pick\"), or delete the pallet (\"forklift palletize --delete <name>\").";
+        (\"forklift cherry-pick\"), or delete the pallet: no other pallet holds that work, so the delete \
+        needs \"forklift palletize --delete --force <name>\".";
 
     match mode {
         OutputMode::Human => format!("Warning: {} {}", message, next_step),
