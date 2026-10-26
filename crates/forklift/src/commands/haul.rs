@@ -3,7 +3,8 @@ use forklift_core::error::sanitize;
 use forklift_core::util::haul_utils::{self, Haul, HaulStatus, ReviewVerdict, UnreadableCell};
 use forklift_core::util::meta_tree::MetaSigner;
 use forklift_core::util::office_utils::{self, OfficeState};
-use forklift_core::util::{config_utils, file_utils, merge_utils, object_utils, pallet_utils};
+use forklift_core::util::{config_utils, file_utils, merge_utils, object_utils, pallet_utils, take_utils};
+use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::cli::HaulAction;
 use crate::color;
 use crate::commands::consolidate::{self, MergeStatus};
@@ -260,6 +261,11 @@ async fn merge(id: &str) -> Result<(), String> {
         output::emit(&Merged { id: haul.id.clone(), merge_parcel: target_head, already: true });
         return Ok(());
     }
+
+    // The proposed head becomes a parent of the merge parcel, and nothing vouches for it yet: a
+    // haul can propose any parcel. Verified before anything is merged; `stack` judges it again
+    // when it finishes a conflicted merge.
+    take_utils::verify_take(None, &TakeTrust::local()?, &haul.head, &current, FetchAt::Warehouse).await?;
 
     // The merge is built on the tree this bay holds, and moves the pallet from there; the check
     // above only read the pallet's history.

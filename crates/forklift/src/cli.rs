@@ -572,7 +572,9 @@ pub enum Command {
                       is fetched, exported incrementally into .forklift/mirror.git, and pushed to the \
                       git branch of the same name, never by force: a git branch holding a commit the \
                       export does not is refused, and left as it is. Only lifted heads are mirrored. \
-                      Tags, the signed office, the @manifest and signatures are not mirrored. With \
+                      Tags, the signed office, the @manifest and signatures are not mirrored. A \
+                      head is exported only once its history verifies against the trust anchor \
+                      (the one held, or the one the remote serves). With \
                       mirror.auto on (the default), every lift mirrors the pallet it lifted. \
                       Requires git on PATH."
     )]

@@ -1528,14 +1528,16 @@ pub fn materialize_tree(from_tree: Option<&str>,
 /// Move `pallet` from `expected` (the bay's base) to `new` after `written_tree` (the tree of `new`)
 /// was already materialized, recording `new` as the bay's base once it stands, and putting the working tree and inventory back at `start_tree` (the tree of
 /// `expected`, or the empty tree for an unborn pallet) if the pallet did not end up at `new` (see
-/// [`settle_head_write`], which decides that).
+/// [`settle_head_write`], which decides that). The write carries `preconditions`, so a refused one
+/// rolls back too.
 pub fn write_head_or_roll_back(pallet: &str,
                                expected: Option<&str>,
                                new: &str,
+                               preconditions: &crate::util::pallet_utils::RefPreconditions,
                                written_tree: &str,
                                start_tree: Option<&str>,
                                anchor: file_utils::StatAnchor) -> Result<(), String> {
-    let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new, &crate::util::pallet_utils::RefPreconditions::NONE) else {
+    let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new, preconditions) else {
         crate::util::pallet_utils::record_landed(pallet, new)?;
         return crate::util::operation_utils::finish();
     };
@@ -1657,7 +1659,7 @@ mod tests {
         crate::util::pallet_utils::update_pallet_head("main", Some(&start), &new, &crate::util::pallet_utils::RefPreconditions::NONE).unwrap();
 
         // The trees name no stored objects: a rollback would fail loudly, so Ok proves none ran.
-        write_head_or_roll_back("main", Some(&start), &new, &"c".repeat(64), Some(&"d".repeat(64)),
+        write_head_or_roll_back("main", Some(&start), &new, &crate::util::pallet_utils::RefPreconditions::NONE, &"c".repeat(64), Some(&"d".repeat(64)),
                                 file_utils::StatAnchor::Unproven)
             .expect("a move another bay already made must stand");
         assert_eq!(crate::util::pallet_utils::get_pallet_head("main").unwrap(), Some(new));

@@ -2702,8 +2702,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     &request.new_head,
                     &anchor,
                     &office_state,
-                    request.old_head.as_deref()
-                ).map_err(unprocessable)?;
+                    request.old_head.as_deref().as_slice()
+                ).map_err(|refusal| unprocessable(refusal.into()))?;
             }
 
             ref_write_test_checkpoint(&name);

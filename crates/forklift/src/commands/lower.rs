@@ -8,8 +8,9 @@ use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, remote_utils, shift_utils, stocktake_utils, trust_utils,
+    operation_utils, pallet_utils, remote_utils, shift_utils, stocktake_utils, take_utils, trust_utils,
 };
+use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::office;
 use crate::events;
@@ -74,13 +75,35 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         }
     }
 
-    // Checks the pin (and a stripped anchor) against the handshake before anything is fetched.
-    let trust = remote_utils::adopt_remote_trust(&client, &info, expect.as_deref()).await?;
+    // Checks the pin (and a stripped anchor) against the handshake before anything is fetched,
+    // and verifies the remote's office against the anchor it will stand under.
+    let mut trust = remote_utils::prepare_remote_trust(&client, &info, expect.as_deref()).await?;
+
+    // First contact: the pallet this lower takes is verified against the anchor the remote serves
+    // before that anchor is installed, so a refusal leaves this warehouse holding none. Where it is
+    // taken it is judged against the installed anchor, which by then remembers this verdict. The
+    // local pallets are judged too, so a later take skips only history the anchor vouches for.
+    let mut unvouched = Vec::new();
+    if let Some(first_contact) = trust.take_trust() {
+        let target = named.as_deref().unwrap_or(&current);
+        let mut verified = Vec::new();
+
+        if let Some(remote_head) = info.pallets.get(target) {
+            remote_utils::fetch_history_scoped(&client, remote_head, target, &progress).await?;
+            take_utils::verify_take(Some(&client), &first_contact, remote_head, target, FetchAt::Warehouse).await?;
+            verified.push(remote_head.as_str());
+        }
+
+        unvouched = trust.judge_local_heads(&client, &verified).await?;
+    }
+
+    let trust = trust.commit()?;
 
     // Announced at once, not with the report: the adopted anchor is already on disk, and a
     // later refusal (a dirty warehouse, a missing pallet) would otherwise leave it unsaid.
     if let Some(genesis) = &trust.adopted_genesis {
         output::warn_trust_adopted(&trust_utils::first_contact(client.url(), genesis));
+        output::warn_pallets_unvouched(&unvouched);
     }
 
     // Meta pallets (the manifest, …) sync alongside trust — fast-forwarded, never
@@ -204,6 +227,11 @@ async fn lower_working_pallet(client: &RemoteClient,
         }
     }
 
+    // Before the marker: a refused take leaves nothing standing. The write — the first one, and
+    // heal's roll-forward of an interrupted one — carries the verdict's preconditions, so an office
+    // or anchor change since rolls the take back rather than landing it.
+    let preconditions = take_utils::verify_take(Some(client), &TakeTrust::local()?, remote_head, &pallet, FetchAt::Warehouse).await?;
+
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
 
     // Refused before the marker, so a refusal leaves nothing standing (`materialize_tree` checks
@@ -220,13 +248,15 @@ async fn lower_working_pallet(client: &RemoteClient,
     );
     operation.target_tree = Some(remote_tree.clone());
     operation.expected = local_head.clone();
+    operation.office = preconditions.office.clone();
+    operation.anchor = preconditions.anchor.clone();
     operation_utils::raise(&operation)?;
 
     shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress)?;
 
     // A compare-and-set against the head this lower started from; the working tree goes back to
     // where it was if the pallet did not move (another bay moved it first, or the write failed).
-    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &remote_tree, local_tree.as_deref(), anchor);
+    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &preconditions, &remote_tree, local_tree.as_deref(), anchor);
     // A write that reported an error can still have landed; the ref read back decides.
     if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(remote_head.as_str()) {
         record_served_head(&pallet, remote_head);
@@ -336,6 +366,9 @@ async fn lower_named_pallet(client: &RemoteClient,
         None => LowerOutcome::Created,
     };
 
+    // The write carries the verdict's preconditions, so an office or anchor change since fails it.
+    let preconditions = take_utils::verify_take(Some(client), &TakeTrust::local()?, remote_head, &pallet, FetchAt::Warehouse).await?;
+
     // A bay standing on the pallet while it is unborn has no base to catch up from: created
     // under it, the pallet would refuse that bay's stack as behind, and its catch-up would read
     // all of its files as changes to overwrite. Judged after the fetch, just before the write, so
@@ -344,7 +377,7 @@ async fn lower_named_pallet(client: &RemoteClient,
         refuse_a_bay_on_unborn(&pallet)?;
     }
 
-    let error = match pallet_utils::update_pallet_head(&pallet, local_head.as_deref(), remote_head, &pallet_utils::RefPreconditions::NONE) {
+    let error = match pallet_utils::update_pallet_head(&pallet, local_head.as_deref(), remote_head, &preconditions) {
         Ok(()) => {
             record_served_head(&pallet, remote_head);
             report.outcome = Some(moved);

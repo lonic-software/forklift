@@ -11,9 +11,10 @@ use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, Bundle
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
     bundle_utils, config_utils, file_utils, lock_utils, object_utils, operation_utils, pack_utils,
-    pallet_utils, remote_utils, scope_utils, shift_utils, trust_utils, warehouse_utils,
+    pallet_utils, remote_utils, scope_utils, shift_utils, take_utils, trust_utils, warehouse_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
+use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::output::{self, CommandOutput};
 
 /// Handle the franchise command (git's "clone"): open a local franchise of a remote
@@ -537,7 +538,29 @@ async fn franchise_into_prepared_target(
 
     // `None` because the pin was already checked against this same handshake by
     // `check_handshake_trust` in `handle_command`, before the download — not because there is none.
-    let trust = remote_utils::adopt_remote_trust(client, &info, None).await?;
+    let mut trust = remote_utils::prepare_remote_trust(client, &info, None).await?;
+    let take_trust = trust.take_trust().unwrap_or(TakeTrust::Untrusted);
+
+    let PalletResolution { pallet_name, remote_head } = resolution;
+
+    // The pallet's history is fetched and verified against the anchor the remote serves before
+    // that anchor, its office or a meta pallet is installed, so a refusal leaves no trust behind.
+    // At the scope this franchise asks for, which is not on disk yet.
+    let fetched = match &remote_head {
+        Some(remote_head) => {
+            let stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
+            take_utils::verify_take(Some(client), &take_trust, remote_head, &pallet_name, FetchAt::Scope(&fetch_scope)).await?;
+            Some(stats)
+        }
+        // Unborn on the remote: no history to judge.
+        None => None,
+    };
+
+    // A new warehouse holds no pallet head yet, so this judges nothing; a first-contact install
+    // still refuses without it.
+    trust.judge_local_heads(client, &remote_head.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+
+    let trust = trust.commit()?;
     report.adopted_genesis = trust.adopted_genesis;
 
     // Adopt the meta pallets too (the manifest, …), so a clone carries the post-metadata,
@@ -551,9 +574,7 @@ async fn franchise_into_prepared_target(
 
     report.meta_adopted = meta.adopted;
 
-    let PalletResolution { pallet_name, remote_head } = resolution;
-
-    let Some(remote_head) = remote_head else {
+    let (Some(remote_head), Some(stats)) = (remote_head, fetched) else {
         // Legitimately unborn: `resolve_pallet` already ruled out a typo before any of this
         // warehouse's mutation began, so reaching this branch means either the remote's own
         // default pallet has nothing stacked yet, or an explicitly named pallet does not exist
@@ -578,8 +599,6 @@ async fn franchise_into_prepared_target(
 
         return Ok(());
     };
-
-    let stats = remote_utils::fetch_history_at(client, &remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
 
     let tree_hash = object_utils::load_parcel(&remote_head)?.tree_hash;
 
@@ -614,8 +633,8 @@ async fn franchise_into_prepared_target(
     operation_utils::raise(&Operation::new(OperationKind::Franchise, position.clone(), None, position))?;
 
     // A franchise fills a fresh warehouse (a resume discarded every ref), so the pallet is unborn
-    // here.
-    pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &pallet_utils::RefPreconditions::NONE)?;
+    // here. The write stands only on the trust the history was verified against.
+    pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &take_utils::installed(&take_trust)?)?;
     pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
 
     // A failure here keeps everything fetched, like any other: a resume redoes the whole

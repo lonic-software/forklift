@@ -432,6 +432,18 @@ run returns as `data`: each entry's `status` says what happened to that pallet a
 `message` names the step. A failure before any pallet is tried (no `mirror.url`, a busy or
 damaged mirror) is not this code.
 
+### History the anchor does not vouch for: `history_unverified`
+
+A command that adopts a head another store served (`lower`, `franchise`, `lift`'s auto-merge,
+`mirror`) or one already in the store (`palletize <name> <hash>`, `haul merge`, the `stack` that
+completes a conflicted merge) refuses with `history_unverified` (exit 34) when the head's history
+does not verify against the trust anchor and office it is judged against: the ones this warehouse
+holds, or at first contact the ones the remote serves. Nothing was adopted: no ref moved, no
+working file changed, and no anchor, office or meta pallet was installed. The message names the
+pallet, the head and why; when a boundary parcel the verdict needed could not be fetched, it says
+so too. A `franchise` reports it as `franchise_incomplete` with `details.cause_code:
+"history_unverified"`; a `mirror` reports it as that pallet's `failed` entry.
+
 ### Catching up: `behind`, `remote_ahead`, `diverged`, `target_not_covered`
 
 Four codes name what has to be caught up with before an operation can go through. The code names
@@ -776,6 +788,11 @@ Example session:
   [Trust refusals](#trust-refusals-trust_changed). `lower` writes it as soon as the anchor is
   adopted, since the adoption stands even if the pull then fails; `franchise` only on success,
   since a failed franchise removes the warehouse it adopted into.
+* A `lower` that adopts a remote's trust anchor on first contact, or an `office accept-regenesis`,
+  writes a `pallets_unvouched` warning to the same channel when the anchor does not vouch for the
+  history of a pallet this warehouse already held, or that history could not be read to judge it, with `details` `{ "pallets": ["<name>", …] }`.
+  Those pallets stay as they are; a take of their history into another pallet is refused
+  (`history_unverified`). The command's own result stands and its exit code is unchanged.
 * A `lift` or `lower` whose remote head could not be added to the warehouse's held-heads record
   (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower, up to date or
   ahead included) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own

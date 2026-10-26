@@ -7,8 +7,9 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{
     config_utils, file_utils, graph_utils, merge_utils, mirror_utils, object_utils, pallet_utils,
-    scope_utils,
+    scope_utils, take_utils,
 };
+use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::export_git::{self, Exporter, GitRepo, EXPORT_LAYOUT};
 use crate::events;
 use crate::output::{self, CommandOutput};
@@ -69,7 +70,9 @@ pub async fn handle_command() -> Result<(), String> {
             .collect(),
     };
 
-    let mut run = Run::start(&repo, &client, url.clone(), false).map_err(Problem::into_message)?;
+    let trust = mirror_trust(&client, &info).await?;
+
+    let mut run = Run::start(&repo, &client, trust, url.clone(), false).map_err(Problem::into_message)?;
     let mut report = MirrorReport { url, pallets: Vec::new() };
 
     for pallet in &pallets {
@@ -158,13 +161,30 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
     let outcome = async {
         let repo = open_repository()?;
         let mut record = load_record(&repo)?;
-        let mut run = Run::start(&repo, client, url, true)?;
+        let mut run = Run::start(&repo, client, TakeTrust::local()?, url, true)?;
 
         Ok::<PalletMirror, Problem>(run.mirror(pallet, Some(head), &mut record).await)
     }.await;
     drop(lock);
 
     Some(outcome.unwrap_or_else(|problem| problem.into_outcome(pallet)))
+}
+
+/// What every mirrored head is verified against before it is exported: git receives only history
+/// the anchor vouches for. With an anchor held, the office first fast-forwards to the remote's
+/// (verified against it, as a lower would), so a head signed by a newly admitted key verifies. With
+/// none held, the remote's own anchor and office — verified, never installed: a mirror adopts no
+/// trust.
+async fn mirror_trust(client: &RemoteClient, info: &forklift_core::model::remote::WarehouseInfo) -> Result<TakeTrust, String> {
+    let prepared = remote_utils::prepare_remote_trust(client, info, None).await?;
+
+    if let Some(first_contact) = prepared.take_trust() {
+        return Ok(first_contact);
+    }
+
+    prepared.commit()?;
+
+    TakeTrust::local()
 }
 
 /// Refuse a view that holds only part of each tree: a scoped bay, or a warehouse whose fetch
@@ -411,6 +431,8 @@ struct Pending {
 struct Run<'a> {
     repo: &'a GitRepo,
     client: &'a RemoteClient,
+    /// What every head is verified against before it is exported.
+    trust: TakeTrust,
     url: String,
     /// Where git's network calls run, so a relative `url` is read from the warehouse's root
     /// (the folder holding the shared `.forklift`), from any bay.
@@ -441,7 +463,7 @@ impl<'a> Run<'a> {
     /// Start a run: every exported ref must end in this build's parcel line (D2), and those whose
     /// parcel is in the local store are the boundaries the export builds on. One that does not is
     /// set aside for its own pallet's outcome.
-    fn start(repo: &'a GitRepo, client: &'a RemoteClient, url: String, unattended: bool) -> Result<Run<'a>, Problem> {
+    fn start(repo: &'a GitRepo, client: &'a RemoteClient, trust: TakeTrust, url: String, unattended: bool) -> Result<Run<'a>, Problem> {
         let mut pending = Vec::new();
         let mut refused = BTreeMap::new();
         for (pallet, commit) in exported_refs(repo)? {
@@ -456,6 +478,7 @@ impl<'a> Run<'a> {
         let mut run = Run {
             repo,
             client,
+            trust,
             url,
             from: mirror_utils::warehouse_root(),
             unattended,
@@ -538,6 +561,14 @@ impl<'a> Run<'a> {
         if let Some(problem) = self.refused.remove(pallet) {
             return Err(problem);
         }
+
+        // Before anything reaches git: a head the anchor does not vouch for is not exported. The
+        // pallet's message carries the refusal's step, which the run's next step points at.
+        take_utils::verify_take(Some(self.client), &self.trust, head, pallet, FetchAt::Warehouse).await
+            .map_err(|refusal| Problem::Failed(match CoreError::from(refusal) {
+                CoreError::Refusal { message, next_step, .. } => format!("{} {}", message, next_step),
+                other => other.to_string(),
+            }))?;
 
         let mut git = self.fetch_branch(pallet)?;
 

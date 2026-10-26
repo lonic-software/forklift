@@ -46,4 +46,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `only_prefix_not_found` | 31 | A sparse franchise's --only path is not a directory in the pallet on the remote |
 | `staged_upload_discarded` | 32 | A lift's commit named an upload the remote no longer holds (discarded or never received); running the lift again uploads it afresh |
 | `mirror_incomplete` | 33 | A mirror run left at least one pallet out of step with git; the others went through, and each failed pallet's message names its step |
+| `history_unverified` | 34 | History about to be adopted as a pallet's does not verify against the trust anchor it was judged against (the one held here, or at first contact the one the remote serves); nothing was adopted |
 

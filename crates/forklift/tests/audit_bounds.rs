@@ -255,7 +255,7 @@ fn a_linear_lift_reads_nothing_behind_the_verified_head() {
         audit_utils::verify_parcel_closure(&new_head, Some(&old_head))
             .expect("the bounded closure check never reads behind the verified head");
 
-        audit_utils::verify_pallet_history(&new_head, &anchor, &state, Some(&old_head))
+        audit_utils::verify_pallet_history(&new_head, &anchor, &state, &[old_head.as_str()])
             .expect("the bounded signature audit never reads behind the verified head");
 
         // The control: the deletion was real, and an unbounded audit still catches it.
@@ -309,7 +309,7 @@ fn a_merge_lift_reads_nothing_below_the_fork_point() {
         audit_utils::verify_parcel_closure(&new_head, Some(&old_head))
             .expect("the bounded closure check stops at the merge base");
 
-        audit_utils::verify_pallet_history(&new_head, &anchor, &state, Some(&old_head))
+        audit_utils::verify_pallet_history(&new_head, &anchor, &state, &[old_head.as_str()])
             .expect("the bounded signature audit stops at the merge base");
 
         // The control.

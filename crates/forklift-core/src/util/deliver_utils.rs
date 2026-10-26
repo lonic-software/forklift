@@ -74,7 +74,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     // The delivery record is judged against the verified office the key is chosen from, and the
     // delivered head is written only while that office stands. A reader may write no pallet, so
     // is refused before anything is written.
-    let stack_utils::Signing::Signed { key_id: signing_key_id, office } = stack_utils::resolve_signing_key(&operator)? else {
+    let stack_utils::Signing::Signed { key_id: signing_key_id, office, .. } = stack_utils::resolve_signing_key(&operator)? else {
         return Err(
             "Deliver records the checkpoint trail as signed post-metadata, so it needs an \
             enrolled key. Establish trust with \"office enroll\" first.".to_string()

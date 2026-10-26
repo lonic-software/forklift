@@ -79,6 +79,8 @@ this warehouse must be signed** — this cannot be undone.
   trust: it names the specific boundary parcel it could not find and says
   plainly that it cannot tell whether the parcel predates trust or was stacked
   after it. Still fail-closed, still a non-zero exit, but not an accusation.
+  A sync does not stop there: what it takes fetches the boundary parcel it lacks
+  from the remote and is judged again (see *What a sync takes is verified*).
   The walk covers the whole boundary once per audit, not once per parcel, so
   the object it names is not a promise that it is the one a given parcel
   actually needed — supplying it does not guarantee resolution, since another
@@ -126,6 +128,47 @@ on, and is not refused, so pin it with `--expect` to require an anchor. Under
 the new anchor names the held one as its prior (see §9), `unrelated` when it
 does not (another warehouse, tampering, or a reset you never saw — nothing
 overrides it).
+
+### What a sync takes is verified
+
+A head another store serves becomes this warehouse's at the ref write that
+adopts it, so every such write is judged first, with the same check `audit` runs:
+`lower` (of the working pallet or one named), `franchise`, `lift`'s auto-merge
+of a remote that moved ahead, and `mirror` before it exports a head to git — and,
+for a parcel already in the store, `palletize <name> <hash>` and `haul merge`.
+With an anchor held, the head's history must verify against it and the office
+this warehouse holds; nothing the remote serves gets past them, including a
+remote stripped of both its anchor and its office. At first contact it must
+verify against the anchor the remote serves, and the office the remote serves
+must verify against that anchor too, before either is installed.
+
+A head that does not verify is refused with `history_unverified` (exit 34) before
+anything is recorded: no ref moves, no working file changes, and at first contact
+no anchor, office or meta pallet is installed (a franchise reports it as
+`franchise_incomplete` with `cause_code: "history_unverified"`, keeping what it
+fetched; a mirror reports it as that pallet's failure). The objects fetched stay
+in the store, unreferenced. Run `audit` where the history came from.
+
+- The write that adopts a verified head lands only while the anchor and office
+  it was judged against still stand, and an interrupted `lower` that `heal`
+  finishes is held to the same pair: an office change in between rolls the
+  lower back instead.
+- A store that lacks the boundary ancestry a verdict needs — a sparse
+  franchise, or a lower of a pallet whose pre-trust history is bounded by
+  another pallet's head — fetches that boundary from the remote and judges
+  again. A remote that cannot serve it is refused, naming the parcel.
+- The pallets this warehouse held before it took a remote's anchor — at first
+  contact, or when accepting a re-genesis — were never judged against it, so the
+  install judges each one first. One the anchor does not vouch for (work stacked
+  here before the remote enrolled), or whose history cannot be read to judge it,
+  stays as it is, and `audit` reports it, but no
+  later take counts its history, or anything built on it, as already verified.
+  The command names each such pallet in a `pallets_unvouched` warning.
+- A merge signed here makes the merged history this warehouse's, so the `stack`
+  that completes a conflicted merge judges the merged head again under the
+  office it signs under: a key revoked since the merge began refuses it.
+- A warehouse with no anchor, syncing with a remote that has none, has nothing
+  to verify against, and takes what it is served.
 
 ---
 
@@ -424,7 +467,9 @@ key; pre-trust "legacy" parcels tolerated only when reachable from the recorded
 boundary). Stripped or corrupted signatures, an unknown key, a parcel beyond its signer's
 role, or a chain that doesn't reach genesis fail with a non-zero exit. The server head runs the exact
 same checks before it accepts any ref update, so a remote can never be pushed
-into a state a local `audit` would reject.
+into a state a local `audit` would reject — and a client runs them again on
+everything it takes (§2), so history altered in a remote's storage behind its
+server is refused at the sync rather than found by a later `audit`.
 
 ---
 

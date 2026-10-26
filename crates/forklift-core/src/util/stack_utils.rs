@@ -10,6 +10,8 @@ use crate::util::{
     object_utils, office_utils, operation_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
 };
 use crate::util::audit_utils::{self, VerifiedOffice};
+use crate::util::office_utils::TrustAnchor;
+use crate::util::take_utils::{self, FetchAt, TakeTrust};
 use crate::util::pallet_utils::{AnchorPrecondition, RefPreconditions, RefUpdateError};
 
 /// Why [`stack_parcel`] failed: its head write did not go through (which a merge or pick
@@ -74,9 +76,11 @@ pub enum Signing {
     /// head is written.
     Unsigned,
 
-    /// The parcel is signed with `key_id`, the operator's active key in the verified `office`.
+    /// The parcel is signed with `key_id`, the operator's active key in the verified `office`,
+    /// verified against `anchor`.
     Signed {
         key_id: String,
+        anchor: TrustAnchor,
         office: VerifiedOffice,
     },
 }
@@ -126,7 +130,8 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
         return Ok(Signing::Unsigned);
     }
 
-    let office = audit_utils::verified_local_office()?;
+    let (anchor, office) = audit_utils::verified_local_trust()?
+        .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?;
 
     if office.find_user(&operator.identifier).is_none() {
         return Err(format!(
@@ -145,7 +150,7 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
             operator.identifier
         ))?;
 
-    Ok(Signing::Signed { key_id, office })
+    Ok(Signing::Signed { key_id, anchor, office })
 }
 
 /// Stack the inventory as a new parcel on the current pallet: build the tree objects,
@@ -427,6 +432,17 @@ pub async fn stack_parcel(description: Option<String>,
     // A consolidation adds the consolidated head as a second parent; a cherry-pick does
     // not — it re-applies a diff as a single-parent parcel (no merge, no rewrite).
     if let Some(state) = &consolidation {
+        // Nothing vouched for the consolidated head when the merge began unless its command
+        // verified it, and the office may have changed since: a merge parcel signed here makes
+        // that history this warehouse's, so it is judged against the office this stack signs
+        // under — whatever began the consolidation.
+        if let Signing::Signed { anchor, office, .. } = &signing {
+            let trust = TakeTrust::Held { anchor: anchor.clone(), office: office.clone() };
+
+            take_utils::verify_take(None, &trust, &state.their_head, &pallet, FetchAt::Warehouse).await
+                .map_err(|refusal| StackError::Other(crate::error::append_to_message(refusal, "Nothing was stacked.")))?;
+        }
+
         parents.push(state.their_head.clone());
     }
 

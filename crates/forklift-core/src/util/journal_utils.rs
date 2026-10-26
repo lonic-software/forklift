@@ -676,7 +676,7 @@ fn trust_preconditions(wire: &str, head: &str) -> Result<pallet_utils::RefPrecon
     );
 
     let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| untrusted(e.into()))?;
-    audit_utils::verify_pallet_history(head, &anchor, &office_state, None).map_err(untrusted)?;
+    audit_utils::verify_pallet_history(head, &anchor, &office_state, &[]).map_err(|e| untrusted(e.into()))?;
 
     Ok(RefPreconditions {
         office: OfficePrecondition::At(Some(office_head)),
