@@ -17,7 +17,7 @@ pub fn handle_command(verbose: bool) -> Result<(), String> {
     // `franchise` finishes it), and over an unmarked folder would vouch for whatever it holds.
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
-    warehouse_utils::check_preparable(&cwd)?;
+    warehouse_utils::check_preparable(&cwd, warehouse_utils::Head::Client)?;
 
     let created = warehouse_utils::prepare_warehouse()?;
 

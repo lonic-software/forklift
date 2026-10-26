@@ -677,28 +677,11 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
             let root = std::fs::canonicalize(&root)
                 .map_err(|e| format!("Error while resolving \"{}\": {}", root, e))?;
 
-            match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT))? {
-                bay_utils::ForkliftKind::Warehouse => (),
-                // Refused with the remedy for what the folder holds (or as a franchise that has not
-                // finished, which may not have marked it yet).
-                bay_utils::ForkliftKind::Unprepared => {
-                    warehouse_utils::open_warehouse_root(&root).map_err(String::from)?;
-                }
-                bay_utils::ForkliftKind::Bay | bay_utils::ForkliftKind::OldFormatBay => return Err(format!(
-                    "\"{}\" is a bay's working directory, not a forklift warehouse. Serve the warehouse \
-                    the bay belongs to instead.",
-                    root.to_string_lossy()
-                )),
-                bay_utils::ForkliftKind::Absent => return Err(format!(
-                    "\"{}\" is not a forklift warehouse. Prepare it first: \
-                    forklift-server prepare --root {}",
-                    root.to_string_lossy(), root.to_string_lossy()
-                )),
-            }
+            // Anything there but a warehouse is refused before any lock is taken.
+            warehouse_utils::open_warehouse_root(&root, warehouse_utils::Head::Server).map_err(String::from)?;
 
             // Hold the serve lock for the served root for the process lifetime: a second
-            // server on the same root is refused here rather than silently breaking the CAS. An
-            // unfinished franchise is refused here too.
+            // server on the same root is refused here rather than silently breaking the CAS.
             let handle = WarehouseHandle::serving(root.clone())
                 .map_err(|refusal| refusal.message(&format!("\"{}\"", root.to_string_lossy())))?;
             ServeMode::Single(Arc::new(handle))
@@ -4941,6 +4924,16 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
         assert_eq!(std::fs::read(base.join("busy").join("notes.txt")).unwrap(), b"keep me");
         assert!(!base.join("busy").join(FOLDER_NAME_FORKLIFT_ROOT).exists(), "never adopted");
+
+        // A `.forklift` without a warehouse marker, empty or not, is neither an existing warehouse
+        // nor marked into one. Revert: `holds_warehouse` taking an unmarked folder → `Existed` → red.
+        for (id, content) in [("hollow", None), ("old", Some("objects"))] {
+            let forklift = base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT);
+            std::fs::create_dir_all(content.map_or(forklift.clone(), |content| forklift.join(content))).unwrap();
+            let error = create_warehouse(&base, id).err().unwrap_or_else(|| panic!("{} must not read as a warehouse", id));
+            assert_eq!(error.0, StatusCode::CONFLICT, "{}: {}", id, error.1);
+            assert!(!forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER).exists(), "{}: never marked", id);
+        }
 
         std::fs::write(base.join("file"), b"not a folder").unwrap();
         assert_eq!(create_warehouse(&base, "file").err().expect("a file is refused").0, StatusCode::CONFLICT);

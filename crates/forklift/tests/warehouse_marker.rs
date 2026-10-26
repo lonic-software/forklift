@@ -414,3 +414,39 @@ fn a_bay_redirecting_to_a_bay_is_refused_and_its_steps_give_a_working_bay() {
     area.run_ok(&root, &["bay", "add", "renewed", fresh.to_str().unwrap()]);
     area.run_ok(&fresh, &["stocktake"]);
 }
+
+/// `forklift-server serve --root` refuses a root whose `.forklift` holds no marker, with this
+/// server's own remedy: its prepare for an empty folder, and making the warehouse again for one
+/// with something in it.
+#[test]
+fn the_server_serves_no_unmarked_root() {
+    let area = Area::new("server-serve-unmarked");
+    let empty = area.dir("empty");
+    std::fs::create_dir_all(empty.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+    let old = area.dir("old");
+    std::fs::create_dir_all(old.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
+
+    for (root, expected) in [(&empty, "Run \"forklift-server prepare --root "), (&old, "Move ")] {
+        let before = listing(root);
+        // Waited on with a deadline: a server that took the folder for a warehouse would serve it forever.
+        let mut serving = std::process::Command::new(common::server_binary())
+            .args(["serve", "--root", root.to_str().unwrap(), "--addr", "127.0.0.1:0", "--open"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while serving.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = serving.kill();
+                let _ = serving.wait();
+                panic!("forklift-server served {:?}, which holds no warehouse marker", root);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let served = serving.wait_with_output().unwrap();
+        assert!(!served.status.success());
+        let stderr = text(&served.stderr);
+        let (_, next_step) = stderr.trim_end().split_once('\n').expect("a message line");
+        assert!(next_step.starts_with(expected), "{:?}", stderr);
+        assert!(!stderr.contains("\"forklift prepare\"") && !stderr.contains("import-git"), "{:?}", stderr);
+        assert_eq!(listing(root), before, "refused before any lock is taken");
+    }
+}

@@ -56,6 +56,13 @@ copies on that basis, so a sparse root could lead a client to free content it ca
 To serve a franchised copy, franchise it without `--only`. A franchise that has not finished is
 not served either (`503` from a `--warehouses` server) until it is resumed or deleted.
 
+A root is a warehouse only once `prepare` has marked it: its `.forklift` folder holds the
+warehouse marker, written last. `serve --root`, `bundle` and `gc` refuse any other root before
+touching it (`not_a_warehouse`), and a `--warehouses` server answers `409` for such a folder.
+An empty `.forklift` is prepared with `forklift-server prepare --root …`. One with content but no
+marker dates from before warehouses were marked, or is not a warehouse: move it aside, prepare the
+root, then lift each pallet into it again (`forklift lift`) from a warehouse that holds them.
+
 ## Serving many warehouses
 
 ```sh
