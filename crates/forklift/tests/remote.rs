@@ -8420,6 +8420,8 @@ fn first_contact_refuses_history_that_does_not_verify_against_the_served_anchor(
     assert!(message.contains("the trust anchor the remote serves"), "{}", message);
     assert!(!area.path("d/.forklift/trust").exists(), "no anchor installed");
     assert!(!area.path("d/.forklift/pallets/main").exists(), "no pallet adopted");
+    assert!(!walk(&area.path("d/.forklift")).iter().any(|entry| entry.starts_with(area.path("d/.forklift/meta"))),
+            "no office or other meta pallet adopted");
 
     let sparse = area.forklift(".", &["--json", "franchise", &remote.server.url, "s", "--only", "code.txt"]);
     franchise_history_unverified_message(&sparse);
@@ -8634,6 +8636,54 @@ fn a_haul_merge_refuses_a_head_its_office_does_not_vouch_for() {
     assert!(message.contains(&worked), "{}", message);
     assert_eq!(pallet_head(&area, "a", "main"), main);
     assert_eq!(area.read_file("a/code.txt"), "admin\n");
+}
+
+/// At first contact the office a remote serves is verified against the anchor it serves before
+/// anything is installed: an anchor from another warehouse over this one's office refuses, and
+/// leaves no anchor or office behind. Revert: drop `prepare_remote_trust`'s office-chain check,
+/// and the franchise installs the foreign anchor.
+#[test]
+fn first_contact_refuses_an_office_its_served_anchor_does_not_root() {
+    let area = TestArea::new("take-foreign-anchor");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    stack_file(&area, "a", "code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // Another warehouse enrolls an office of its own; its anchor replaces the remote's.
+    prepare_warehouse(&area, "x", "http://127.0.0.1:1");
+    stack_file(&area, "x", "code.txt", "x\n");
+    assert_success(&area.forklift("x", &["office", "enroll", "--offline"]));
+    std::fs::copy(area.path("x/.forklift/trust"), area.path("server-root/.forklift/trust")).unwrap();
+
+    let franchised = area.forklift(".", &["--json", "franchise", &server.url, "d"]);
+    let message = franchise_history_unverified_message(&franchised);
+    assert!(message.contains("The office history"), "{}", message);
+    assert!(!area.path("d/.forklift/trust").exists(), "no anchor installed");
+    assert!(!walk(&area.path("d/.forklift")).iter().any(|entry| entry.starts_with(area.path("d/.forklift/meta"))),
+            "no office installed");
+}
+
+/// An anchored remote whose default pallet is unborn still franchises: there is no history to
+/// judge, so the anchor and office are installed and the pallet starts unborn.
+#[test]
+fn an_anchored_remote_with_an_unborn_default_pallet_franchises() {
+    let area = TestArea::new("take-unborn");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    stack_file(&area, "a", "code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    stack_file(&area, "a", "code.txt", "feature\n");
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_eq!(remote_pallet_head(&server, "main"), None);
+
+    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    assert_success(&franchised);
+    assert!(stdout(&franchised).contains("starts unborn"), "{}", stdout(&franchised));
+    assert!(area.path("b/.forklift/trust").is_file());
+    assert_success(&area.forklift("b", &["lower", "feature"]));
 }
 
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
