@@ -316,7 +316,6 @@ fn untrusted_lift_and_the_cas_guards() {
     );
 }
 
-/// A ref update whose closure is not fully uploaded is refused (`422`).
 /// A holds walk on an invocation with less time left than the answer reserve reads nothing and
 /// answers `unknown` for what the head alone does not settle, rather than run into the gateway.
 #[test]
@@ -354,6 +353,7 @@ fn a_holds_walk_stops_short_of_the_invocation_deadline() {
     assert_eq!(head.objects.reads(), 0);
 }
 
+/// A ref update whose closure is not fully uploaded is refused (`422`).
 #[test]
 fn a_ref_update_with_a_missing_blob_is_refused() {
     let area = Area::new("missing-blob");

@@ -2002,7 +2002,7 @@ const MAX_CONCURRENT_HOLDS_WALKS: usize = 4;
 static HOLDS_WALKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_HOLDS_WALKS);
 
 /// `POST /v1/pallets/{name}/holds` — which of these parcels does the pallet still hold, its head
-/// or one of the head's ancestors? A bounded walk ([`merge_utils::holds_from`]): a candidate it
+/// or one of the head's ancestors? A bounded walk ([`merge_utils::holds`]): a candidate it
 /// could not settle is answered `unknown`, never `not_held`. Reading history is what fetching
 /// already allows, so nothing past authentication is asked.
 async fn post_holds(State(state): State<Arc<AppState>>,
@@ -2031,15 +2031,22 @@ async fn post_holds(State(state): State<Arc<AppState>>,
         return error_response(error);
     }
 
+    // Refused before the cap is consulted, so whether a name is a `422` never depends on load.
+    let pallet_ref = match pallet_utils::PalletRef::parse(&name).map_err(unprocessable) {
+        Ok(pallet_ref) => pallet_ref,
+        Err(error) => return error_response(error),
+    };
+
     // A walk holds a blocking thread for up to its time bound, and the pool serves every other
-    // request too. Past the cap the answer is `unknown` at once: correct, and only keeps more.
-    let Ok(_permit) = HOLDS_WALKS.try_acquire() else {
+    // request too. Past the cap the answer is `unknown` at once: correct, and only keeps more. The
+    // permit moves into the walk, so a client that hangs up does not free it while the walk runs.
+    let Ok(permit) = HOLDS_WALKS.try_acquire() else {
         let holds = request.candidates.into_iter().map(|candidate| (candidate, HoldAnswer::Unknown)).collect();
         return Json(HoldsResponse { holds }).into_response();
     };
 
     let result = blocking(warehouse, move || {
-        let pallet_ref = pallet_utils::PalletRef::parse(&name).map_err(unprocessable)?;
+        let _permit = permit;
         let head = pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)?;
 
         let holds = merge_utils::holds(head.as_deref(), &request.candidates, None, |round| {

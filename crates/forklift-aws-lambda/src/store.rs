@@ -310,8 +310,8 @@ pub trait ObjectStore {
     /// [`get`](ObjectStore::get) for several objects: one result per hash, in the order given. The
     /// holds walk reads a round of parcels through it. The default reads serially, which is right
     /// for a store whose read is cheap; the S3 backend overrides it with a bounded-concurrency
-    /// batch, since a serial walk of network reads covers only a few hundred parcels in the walk's
-    /// time bound.
+    /// batch, so a round as wide as a merge-heavy history costs one round trip rather than one per
+    /// parcel.
     fn get_many(&self, hashes: &[String]) -> Vec<Result<Option<Vec<u8>>, String>> {
         hashes.iter().map(|hash| self.get(hash)).collect()
     }

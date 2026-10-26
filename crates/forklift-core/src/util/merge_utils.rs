@@ -512,7 +512,10 @@ pub fn check_holds_candidates(candidates: &[String]) -> Result<(), String> {
 /// whether history it never read leads there.
 ///
 /// The walk reads in rounds of up to [`HOLDS_READ_ROUND`] parcels, so a reader can fetch a round
-/// concurrently; `out_of_time` is asked before each round.
+/// concurrently; `out_of_time` is asked before each round. A round is the breadth of history at
+/// that depth, so a straight chain of parcels reads one at a time: no parent can be asked for
+/// before its child is read. A reader answering for fewer parcels than a round holds stops the
+/// walk as an unreadable parcel does.
 ///
 /// No commit-graph is consulted. Building a missing generation walks a parcel's whole ancestry
 /// and writes the result, and neither is bounded.
@@ -574,9 +577,13 @@ pub fn holds_from(head: Option<&str>,
         let round: Vec<String> = queue.drain(..queue.len().min(HOLDS_READ_ROUND).min(max_steps - steps)).collect();
         steps += round.len();
 
-        let mut unreadable = false;
+        let read = parents_of(&round);
 
-        for parents in parents_of(&round) {
+        // A reader answering for fewer parcels than it was asked leaves history unread, and a
+        // walk that went on would take it for exhausted.
+        let mut unreadable = read.len() != round.len();
+
+        for parents in read {
             match parents {
                 Ok(parents) => {
                     for parent in parents {
@@ -1470,6 +1477,16 @@ mod tests {
 
         assert_eq!(answers["x"], HoldAnswer::NotHeld);
         assert_eq!(rounds, vec![1, HOLDS_READ_ROUND, 100 - HOLDS_READ_ROUND]);
+    }
+
+    #[test]
+    fn holds_answers_unknown_when_the_reader_answers_for_fewer_parcels_than_asked() {
+        // h's parent p is "read" by a reader that drops it: its history is not exhausted.
+        let answers = holds_from(Some("h"), &["x".to_string()], MAX_HOLDS_WALK, || false, |round| {
+            if round == ["h"] { vec![Ok(vec!["p".to_string()])] } else { Vec::new() }
+        });
+
+        assert_eq!(answers["x"], HoldAnswer::Unknown);
     }
 
     #[test]
