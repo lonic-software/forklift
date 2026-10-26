@@ -6853,6 +6853,11 @@ pub struct PreparedTrust {
 
     /// The transfer stats of the office history fetch.
     fetch: FetchStats,
+
+    /// At first contact, every local user-pallet head judged against the anchor
+    /// ([`PreparedTrust::judge_local_heads`]); the install stands only while the user pallets
+    /// hold no other.
+    judged_heads: Option<Vec<String>>,
 }
 
 /// Judge, fetch and verify the remote's trust state for a lower or franchise, writing nothing.
@@ -6887,6 +6892,7 @@ pub async fn prepare_remote_trust(client: &RemoteClient,
         local_office_head: None,
         new_office: None,
         fetch: FetchStats::default(),
+        judged_heads: None,
     };
 
     let Some(remote_office_head) = judge_remote_trust(client.url(), info, local, expect)? else {
@@ -6930,7 +6936,7 @@ pub async fn prepare_remote_trust(client: &RemoteClient,
     };
     let office_head = new_office.as_deref().or(local_office_head.as_deref())
         .expect("an office the remote serves is either taken or already local");
-    let office_state = audit_utils::verify_office_chain(&anchor, office_head).map_err(|error| String::from(CoreError::refusal(
+    let office_state = audit_utils::verify_office_chain_memoized(&anchor, office_head).map_err(|error| String::from(CoreError::refusal(
         RefusalCode::HistoryUnverified,
         format!(
             "The office history {} of {} does not verify against {}: {} Nothing was taken.",
@@ -6975,6 +6981,32 @@ impl PreparedTrust {
         })
     }
 
+    /// At first contact, judge every local user-pallet head against the anchor about to be
+    /// installed, recording the ones it does not vouch for ([`take_utils::record_unvouched_heads`]).
+    /// A first-contact [`Self::commit`] refuses without it. Nothing to do with an anchor held.
+    ///
+    /// # Arguments
+    /// * `client`   - The remote the anchor comes from.
+    /// * `verified` - Heads this command already verified against the served anchor.
+    ///
+    /// # Returns
+    /// * `Ok(())`      - The heads are judged.
+    /// * `Err(String)` - A head's history could not be read, or the record could not be written.
+    pub async fn judge_local_heads(&mut self, client: &RemoteClient, verified: &[&str]) -> Result<(), String> {
+        if self.adopting.is_none() {
+            return Ok(());
+        }
+
+        let anchor = self.anchor.as_ref().expect("first contact verified an anchor");
+        let office_head = self.new_office.as_deref().or(self.local_office_head.as_deref())
+            .expect("first contact verified an office");
+        let office_state = self.office_state.as_ref().expect("first contact verified an office");
+
+        self.judged_heads = Some(take_utils::record_unvouched_heads(client, anchor, office_head, office_state, verified).await?);
+
+        Ok(())
+    }
+
     /// Write the prepared trust: on first contact install the anchor with the office it governs;
     /// with an anchor held, fast-forward the office while that anchor still stands.
     ///
@@ -6993,12 +7025,23 @@ impl PreparedTrust {
             // landed (a write can land and fail) is announced in its error for the same reason; one
             // that did not land holds nothing, and the next sync adopts and announces it.
             (Some(remote_trust), _) => {
+                // A pallet that moved since its head was judged would be taken as vouched for.
+                let Some(judged) = self.judged_heads.clone() else {
+                    return Err(
+                        "The local pallets were not judged against the remote's trust anchor, so \
+                        it was not installed.".to_string()
+                    );
+                };
+
                 let installed = office_utils::install_trust(&office_utils::TrustInstall {
                     anchor: self.anchor.as_ref().expect("first contact verified an anchor"),
                     replaces: None,
                     office: self.local_office_head.as_deref(),
                     new_office,
-                    pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+                    pallets: pallet_utils::PalletsPrecondition::WithinBoundary {
+                        boundary: judged,
+                        scope: pallet_utils::BoundaryScope::UserPallets,
+                    },
                 });
 
                 if let Err(error) = installed {
@@ -7158,17 +7201,21 @@ pub async fn accept_regenesis(client: &RemoteClient,
 
     // Never adopt an anchor whose chain does not even verify against itself.
     let new_anchor = remote_trust.to_anchor();
-    crate::util::audit_utils::verify_office_chain(&new_anchor, remote_office_head)?;
+    let new_office_state = crate::util::audit_utils::verify_office_chain(&new_anchor, remote_office_head)?;
 
-    // The anchor and the office move together, only while both are as this acceptance read them.
-    // Another bay that accepted the same re-genesis meanwhile installed exactly this, and the
+    // The local heads were vouched for by the anchor being replaced; the one replacing it judges
+    // them afresh, as at first contact.
+    let judged = take_utils::record_unvouched_heads(client, &new_anchor, remote_office_head, &new_office_state, &[]).await?;
+
+    // The anchor and the office move together, only while both are as this acceptance read them
+    // and the user pallets hold only the heads judged above. Another bay that accepted the same re-genesis meanwhile installed exactly this, and the
     // acceptance stands.
     office_utils::install_trust(&office_utils::TrustInstall {
         anchor: &new_anchor,
         replaces: Some(&local_bytes),
         office: local_office_head.as_deref(),
         new_office: Some(remote_office_head),
-        pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+        pallets: pallet_utils::PalletsPrecondition::WithinBoundary { boundary: judged, scope: pallet_utils::BoundaryScope::UserPallets },
     })?;
 
     Ok(Some((local, new_anchor)))

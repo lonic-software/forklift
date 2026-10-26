@@ -538,7 +538,7 @@ async fn franchise_into_prepared_target(
 
     // `None` because the pin was already checked against this same handshake by
     // `check_handshake_trust` in `handle_command`, before the download — not because there is none.
-    let trust = remote_utils::prepare_remote_trust(client, &info, None).await?;
+    let mut trust = remote_utils::prepare_remote_trust(client, &info, None).await?;
     let take_trust = trust.take_trust().unwrap_or(TakeTrust::Untrusted);
 
     let PalletResolution { pallet_name, remote_head } = resolution;
@@ -555,6 +555,10 @@ async fn franchise_into_prepared_target(
         // Unborn on the remote: no history to judge.
         None => None,
     };
+
+    // A new warehouse holds no pallet head yet, so this judges nothing; a first-contact install
+    // still refuses without it.
+    trust.judge_local_heads(client, &remote_head.iter().map(String::as_str).collect::<Vec<_>>()).await?;
 
     let trust = trust.commit()?;
     report.adopted_genesis = trust.adopted_genesis;

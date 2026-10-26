@@ -77,18 +77,23 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
 
     // Checks the pin (and a stripped anchor) against the handshake before anything is fetched,
     // and verifies the remote's office against the anchor it will stand under.
-    let trust = remote_utils::prepare_remote_trust(&client, &info, expect.as_deref()).await?;
+    let mut trust = remote_utils::prepare_remote_trust(&client, &info, expect.as_deref()).await?;
 
     // First contact: the pallet this lower takes is verified against the anchor the remote serves
-    // before that anchor is installed, so a refusal leaves this warehouse holding none. It is
-    // verified again, against the installed anchor, where it is taken.
+    // before that anchor is installed, so a refusal leaves this warehouse holding none. Where it is
+    // taken it is judged against the installed anchor, which by then remembers this verdict. The
+    // local pallets are judged too, so a later take skips only history the anchor vouches for.
     if let Some(first_contact) = trust.take_trust() {
         let target = named.as_deref().unwrap_or(&current);
+        let mut verified = Vec::new();
 
         if let Some(remote_head) = info.pallets.get(target) {
             remote_utils::fetch_history_scoped(&client, remote_head, target, &progress).await?;
             take_utils::verify_take(Some(&client), &first_contact, remote_head, target, FetchAt::Warehouse).await?;
+            verified.push(remote_head.as_str());
         }
+
+        trust.judge_local_heads(&client, &verified).await?;
     }
 
     let trust = trust.commit()?;

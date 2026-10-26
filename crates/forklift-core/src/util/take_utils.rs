@@ -17,7 +17,10 @@
 //! The known-verified set that keeps a held take incremental is every local user-pallet head.
 //! It is sound only while every writer of a user-pallet ref either signs the head it writes,
 //! copies an existing local head, verifies the head here, or refuses while an anchor is held; the
-//! writer-invariant test in `crates/forklift/tests/take_writers.rs` keeps that list.
+//! writer-invariant test in `crates/forklift/tests/take_writers.rs` keeps that list. Heads that
+//! were already here when an anchor arrived from a remote were written under none of those, so
+//! the install judges them first ([`record_unvouched_heads`]) and the set leaves out the ones the
+//! anchor does not vouch for, and everything built on them.
 //!
 //! A partial client — a sparse one, or one that never fetched some pallet — can lack the boundary
 //! ancestry a verdict needs. The verdict then names the boundary it could not resolve
@@ -25,8 +28,13 @@
 //! fetches a pallet, and judges again. A gap that persists refuses.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use crate::error::{CoreError, RefusalCode};
+use crate::globals;
 use crate::util::audit_utils::{self, BoundaryGap, VerifiedOffice};
+use crate::util::lock_utils::RefLock;
+use crate::util::{file_utils, merge_utils, object_utils, record_utils};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
 use crate::util::pallet_utils::{self, AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::progress_utils::Progress;
@@ -67,14 +75,6 @@ impl TakeTrust {
             Some((anchor, office)) => TakeTrust::Held { anchor, office },
             None => TakeTrust::Untrusted,
         })
-    }
-
-    fn judged(&self) -> Option<(&TrustAnchor, &OfficeState)> {
-        match self {
-            TakeTrust::Untrusted => None,
-            TakeTrust::Held { anchor, office } => Some((anchor, &office.state)),
-            TakeTrust::FirstContact { anchor, office_state, .. } => Some((anchor, office_state)),
-        }
     }
 
     /// The preconditions of the ref write that adopts a head judged against this trust: the
@@ -154,25 +154,84 @@ pub async fn verify_take(client: Option<&RemoteClient>,
                          head: &str,
                          pallet: &str,
                          at: FetchAt<'_>) -> Result<RefPreconditions, String> {
-    let Some((anchor, office_state)) = trust.judged() else {
-        return Ok(trust.preconditions());
+    let (anchor, office_head, office_state) = match trust {
+        TakeTrust::Untrusted => return Ok(trust.preconditions()),
+        TakeTrust::Held { anchor, office } => (anchor, office.head(), &office.state),
+        TakeTrust::FirstContact { anchor, office_head, office_state } => (anchor, Some(office_head.as_str()), office_state),
     };
 
-    // A held take is incremental: every local user-pallet head was signed here or passed this
-    // check, so its ancestry needs no second walk. A first-contact take holds nothing verified
-    // yet — the local heads predate any anchor — so it walks the whole history, as `audit` does.
+    // A held take is incremental: every local user-pallet head the anchor vouches for was signed
+    // here or passed this check, so its ancestry needs no second walk. A first-contact take holds
+    // nothing verified yet — the local heads predate any anchor — so it walks the whole history,
+    // as `audit` does.
     let known = match trust {
-        TakeTrust::Held { .. } => local_user_heads()?,
+        TakeTrust::Held { anchor, .. } => vouched_local_heads(anchor)?,
         _ => Vec::new(),
     };
     let known: Vec<&str> = known.iter().map(String::as_str).collect();
+
+    match judge(client, anchor, office_head, office_state, &known, head, pallet, at).await? {
+        Judgement::Vouched => Ok(trust.preconditions()),
+        Judgement::Refused { why, fetch_error } => {
+            Err(history_unverified(pallet, head, trust, client.is_some(), &why, fetch_error.as_deref()).into())
+        }
+    }
+}
+
+/// What [`judge`] found.
+enum Judgement {
+    /// The anchor vouches for the head.
+    Vouched,
+
+    /// It does not: why, and — when the refusal is a boundary the remote was asked for — why
+    /// fetching it failed.
+    Refused {
+        why: String,
+        fetch_error: Option<String>,
+    },
+}
+
+/// Heads that verified in this process, keyed by the warehouse, the anchor, the office head and
+/// the head: a verdict depends on nothing else, so a command that judges one head twice (a lift's
+/// auto-merge, then the stack that records it) walks it once.
+static VOUCHED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Judge `head` against `anchor` and `office_state` (verified at `office_head`), with `known`
+/// heads' ancestry taken as verified, fetching a missing boundary from `client` as
+/// [`verify_take`] describes.
+///
+/// # Returns
+/// * `Ok(Judgement)` - The verdict.
+/// * `Err(String)`   - The walk could not read what it needed: no verdict was reached.
+#[allow(clippy::too_many_arguments)]
+async fn judge(client: Option<&RemoteClient>,
+               anchor: &TrustAnchor,
+               office_head: Option<&str>,
+               office_state: &OfficeState,
+               known: &[&str],
+               head: &str,
+               pallet: &str,
+               at: FetchAt<'_>) -> Result<Judgement, String> {
+    let key = office_head.map(|office_head| format!("{}\u{1}{}", audit_utils::office_chain_key(anchor, office_head), head));
+    let vouched = VOUCHED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    if key.as_ref().is_some_and(|key| vouched.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(key)) {
+        return Ok(Judgement::Vouched);
+    }
 
     let mut fetched: HashSet<BoundaryGapKind> = HashSet::new();
     let mut fetch_error: Option<String> = None;
 
     loop {
-        let refusal = match audit_utils::verify_pallet_history(head, anchor, office_state, &known) {
-            Ok(_) => return Ok(trust.preconditions()),
+        let refusal = match audit_utils::verify_pallet_history(head, anchor, office_state, known) {
+            Ok(_) => {
+                if let Some(key) = key {
+                    vouched.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(key);
+                }
+
+                return Ok(Judgement::Vouched);
+            }
+            Err(refusal) if refusal.read_failure => return Err(refusal.message),
             Err(refusal) => refusal,
         };
 
@@ -182,7 +241,14 @@ pub async fn verify_take(client: Option<&RemoteClient>,
         };
 
         let Some((gap, client)) = refetch else {
-            return Err(history_unverified(pallet, head, trust, client.is_some(), &refusal.message, fetch_error.as_deref()).into());
+            // A fetch failure explains only a gap that is still open; a verdict reached past it
+            // is about the history, not the network.
+            let fetch_error = match refusal.gap {
+                Some(_) => fetch_error,
+                None => None,
+            };
+
+            return Ok(Judgement::Refused { why: refusal.message, fetch_error });
         };
 
         let mut heads: Vec<String> = match gap {
@@ -227,17 +293,147 @@ impl BoundaryGapKind {
     }
 }
 
-/// Every local user-pallet head.
-fn local_user_heads() -> Result<Vec<String>, String> {
+/// Every local user pallet with a head, as (name, head).
+fn local_user_heads() -> Result<Vec<(String, String)>, String> {
     let mut heads = Vec::new();
 
     for name in pallet_utils::list_pallets()? {
         if let Some(head) = pallet_utils::get_pallet_head(&name)? {
+            heads.push((name, head));
+        }
+    }
+
+    Ok(heads)
+}
+
+/// Every local user-pallet head whose ancestry a take under `anchor` may skip: all of them except
+/// a head an anchor installed from a remote was recorded not to vouch for, and any head built on
+/// one — a parcel signed on top of history the anchor does not vouch for is no better than it.
+fn vouched_local_heads(anchor: &TrustAnchor) -> Result<Vec<String>, String> {
+    let unvouched = read_unvouched(&anchor.genesis)?;
+    let mut heads = Vec::new();
+
+    for (_, head) in local_user_heads()? {
+        let mut vouched = true;
+
+        for unvouched in &unvouched {
+            if *unvouched == head || merge_utils::is_ancestor(unvouched, &head)? {
+                vouched = false;
+                break;
+            }
+        }
+
+        if vouched {
             heads.push(head);
         }
     }
 
     Ok(heads)
+}
+
+/// Judge every local user-pallet head against an anchor about to be installed from a remote, and
+/// record the ones it does not vouch for, before the install.
+///
+/// A take judged against a held anchor skips the history of every local user-pallet head. A head
+/// this warehouse held before the remote's anchor arrived was never checked against it: work
+/// stacked here before the remote enrolled, unsigned and outside the anchor's boundary, is one.
+/// Such a head stays where it is — `audit` reports it, and a lift of it is refused — but a take
+/// must walk it, so it is recorded under the anchor's genesis and left out of every later take's
+/// known set ([`vouched_local_heads`]). A head the remote can serve the boundary of is fetched and
+/// judged on what it serves, as a take is.
+///
+/// # Arguments
+/// * `client`       - The remote the anchor comes from.
+/// * `anchor`       - The anchor about to be installed.
+/// * `office_head`  - The office head it will be installed with.
+/// * `office_state` - The office state at `office_head`, verified against `anchor`.
+/// * `verified`     - Heads already verified against both (the pallet the command takes).
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - Every head judged: the install must be conditioned on the user pallets
+///                       still holding only these, or a head moved meanwhile goes unjudged.
+/// * `Err(String)`     - A head's history could not be read, or the record could not be written.
+pub async fn record_unvouched_heads(client: &RemoteClient,
+                                    anchor: &TrustAnchor,
+                                    office_head: &str,
+                                    office_state: &OfficeState,
+                                    verified: &[&str]) -> Result<Vec<String>, String> {
+    let mut judged = Vec::new();
+    let mut unvouched = Vec::new();
+
+    for (pallet, head) in local_user_heads()? {
+        let judgement = judge(Some(client), anchor, Some(office_head), office_state, verified, &head, &pallet, FetchAt::Warehouse).await?;
+
+        if let Judgement::Refused { .. } = judgement {
+            unvouched.push(head.clone());
+        }
+
+        judged.push(head);
+    }
+
+    if !unvouched.is_empty() {
+        let lock = RefLock::acquire()?;
+        let mut entries = read_unvouched_entries()?;
+
+        for head in unvouched {
+            let entry = (anchor.genesis.clone(), head);
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+
+        write_unvouched_entries(&lock, &entries)?;
+    }
+
+    Ok(judged)
+}
+
+/// The record of heads an installed anchor does not vouch for, in the shared forklift root: a
+/// [`record_utils`] file of one `<genesis> <head>` entry per line. A warehouse that never installed
+/// an anchor over such a head has no file.
+const FILE_NAME_UNVOUCHED: &str = "unvouched-heads";
+const UNVOUCHED_RECORD: &str = "unvouched-heads";
+const UNVOUCHED_VERSION: u32 = 1;
+
+fn unvouched_path() -> PathBuf {
+    globals::forklift_root().join(FILE_NAME_UNVOUCHED)
+}
+
+fn read_unvouched_entries() -> Result<Vec<(String, String)>, String> {
+    let path = unvouched_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
+    };
+
+    record_utils::from_bytes(&bytes, UNVOUCHED_RECORD, UNVOUCHED_VERSION)
+        .map_err(|e| format!("The file \"{}\" {}", path.to_string_lossy(), e.describe()))?
+        .into_iter()
+        .map(|line| match line.split_once(' ') {
+            Some((genesis, head)) if object_utils::is_object_hash(genesis) && object_utils::is_object_hash(head) => {
+                Ok((genesis.to_string(), head.to_string()))
+            }
+            _ => Err(format!(
+                "The file \"{}\" holds an entry that is not a genesis and a parcel hash: \"{}\".",
+                path.to_string_lossy(), line.escape_debug()
+            )),
+        })
+        .collect()
+}
+
+fn write_unvouched_entries(_lock: &RefLock, entries: &[(String, String)]) -> Result<(), String> {
+    let lines = entries.iter().map(|(genesis, head)| format!("{} {}", genesis, head));
+
+    file_utils::write_file_atomically(&unvouched_path(), &record_utils::to_bytes(UNVOUCHED_RECORD, UNVOUCHED_VERSION, lines))
+}
+
+/// The heads recorded as not vouched for by the anchor of `genesis`.
+fn read_unvouched(genesis: &str) -> Result<Vec<String>, String> {
+    Ok(read_unvouched_entries()?.into_iter()
+        .filter(|(recorded, _)| recorded == genesis)
+        .map(|(_, head)| head)
+        .collect())
 }
 
 /// The refusal of a take whose history did not verify.

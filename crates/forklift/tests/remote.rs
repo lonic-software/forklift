@@ -8484,6 +8484,45 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
     assert!(!area.path("c/.forklift/pallets/y").exists());
 }
 
+/// Work stacked here before the remote enrolled is not vouched for by the anchor a later lower
+/// installs: the install records it, and a take never skips its history as a known-verified head.
+/// A head the anchor does vouch for stays known. Revert: let a held take count every local head as
+/// known, and `palletize copy` adopts the unsigned head.
+#[test]
+fn an_anchor_taken_from_a_remote_does_not_vouch_for_local_work_it_never_saw() {
+    let area = TestArea::new("take-unvouched-local");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    stack_file(&area, "a", "code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["lift"]));
+    let base = pallet_head(&area, "a", "main");
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "w"]));
+    assert_success(&area.forklift("w", &["palletize", "feature"]));
+    stack_file(&area, "w", "code.txt", "local\n");
+    let local = pallet_head(&area, "w", "feature");
+    assert_success(&area.forklift("w", &["shift", "main"]));
+
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let lowered = area.forklift("w", &["lower"]);
+    assert_success(&lowered);
+    assert!(stderr(&lowered).contains("Adopted the remote's trust anchor") || stdout(&lowered).contains("Adopted the remote's trust anchor"),
+            "{}{}", stdout(&lowered), stderr(&lowered));
+    let recorded = area.read_file("w/.forklift/unvouched-heads");
+    assert!(recorded.contains(&local), "{}", recorded);
+    assert!(!recorded.contains(&base), "{}", recorded);
+
+    let refused = area.forklift("w", &["--json", "palletize", "copy", &local]);
+    let message = history_unverified_message(&refused);
+    assert!(message.contains(&local), "{}", message);
+    assert!(!area.path("w/.forklift/pallets/copy").exists());
+
+    assert_success(&area.forklift("w", &["palletize", "kept", &base]));
+}
+
 /// Stand an interrupted lower of b's main from `from` to `to` — interrupted after it wrote the
 /// files and before it wrote the ref, so b holds `to`'s files with the ref and position at `from` —
 /// recording the office its take was verified against: the one b holds, or another.

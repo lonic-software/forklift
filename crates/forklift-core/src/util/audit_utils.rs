@@ -532,7 +532,7 @@ pub fn verify_pallet_history(head: &str,
     for (index, verdict) in verdicts.into_iter().enumerate() {
         let hash = &parcels[index];
 
-        match verdict? {
+        match verdict.map_err(HistoryRefusal::verdict)? {
             Verdict::Verified => verified += 1,
 
             // No signature, or a signature by a key the office does not know: after a
@@ -589,7 +589,7 @@ pub fn verify_pallet_history(head: &str,
                         missing
                     )));
                 } else {
-                    return Err(HistoryRefusal::from(match reason {
+                    return Err(HistoryRefusal::verdict(match reason {
                         TrustBoundaryReason::Unsigned => format!(
                             "Parcel {} was stacked after trust was established but carries no \
                             signature. The warehouse may have been tampered with.",
@@ -642,7 +642,7 @@ pub fn verify_pallet_history(head: &str,
                         )));
                     }
 
-                    return Err(HistoryRefusal::from(format!(
+                    return Err(HistoryRefusal::verdict(format!(
                         "Parcel {} is signed with key {}, which is revoked \
                         ({}), and the parcel is outside the revocation's \
                         distrust boundary. The warehouse may have been tampered \
@@ -674,6 +674,10 @@ pub struct HistoryRefusal {
 
     /// The boundary this store could not resolve, if that is why.
     pub gap: Option<BoundaryGap>,
+
+    /// No verdict was reached: the walk could not read what it needed (the message says what).
+    /// A parcel whose signature or body does not check out is a verdict, not this.
+    pub read_failure: bool,
 }
 
 /// A boundary [`verify_pallet_history`] could not resolve, because its walk crossed a parcel this
@@ -689,13 +693,18 @@ pub enum BoundaryGap {
 
 impl HistoryRefusal {
     fn gap(gap: BoundaryGap, message: String) -> HistoryRefusal {
-        HistoryRefusal { message, gap: Some(gap) }
+        HistoryRefusal { message, gap: Some(gap), read_failure: false }
+    }
+
+    fn verdict(message: String) -> HistoryRefusal {
+        HistoryRefusal { message, gap: None, read_failure: false }
     }
 }
 
+/// A read the walk could not complete, raised through `?`.
 impl From<String> for HistoryRefusal {
     fn from(message: String) -> HistoryRefusal {
-        HistoryRefusal { message, gap: None }
+        HistoryRefusal { message, gap: None, read_failure: true }
     }
 }
 
@@ -961,6 +970,14 @@ impl VerifiedOffice {
         self.preconditions.clone()
     }
 
+    /// The office head this state was verified at (`None` for an office never read from disk).
+    pub fn head(&self) -> Option<&str> {
+        match &self.preconditions.office {
+            OfficePrecondition::At(Some(head)) => Some(head),
+            _ => None,
+        }
+    }
+
     /// An office state that was never read from disk, for tests that judge writes against an
     /// in-memory office: its writes condition on nothing.
     #[cfg(test)]
@@ -1105,7 +1122,7 @@ fn office_history_holds(head: &str, parcel: &str) -> bool {
 }
 
 /// The memo key: which warehouse, under which anchor, at which office head.
-fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
+pub(crate) fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
     format!(
         "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
         crate::globals::forklift_root().to_string_lossy(),
