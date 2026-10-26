@@ -170,7 +170,7 @@ fn an_unmarked_folder_is_refused_and_prepare_will_not_take_it() {
     }
 
     // The remedy: move it aside and prepare again.
-    std::fs::rename(&forklift, root.join(".forklift.old")).unwrap();
+    forklift_core::util::file_utils::rename(&forklift, root.join(".forklift.old")).unwrap();
     area.run_ok(&root, &["prepare"]);
     area.run_ok(&root, &["stocktake"]);
 }
@@ -195,7 +195,8 @@ fn prepare_takes_an_empty_forklift_folder() {
 fn an_empty_forklift_folder_inside_a_warehouse_points_at_the_warehouse() {
     let area = Area::new("nested");
     let root = area.warehouse("w");
-    let sub = area.dir("w/sub");
+    let sub = area.dir("w").join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
     std::fs::create_dir(sub.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
 
     let refusal = area.refused(&sub, &["stocktake"]);
@@ -246,7 +247,7 @@ fn a_bay_whose_warehouse_is_gone_is_told_to_restore_it() {
     let root = area.warehouse("w");
     let bay = area.path("bay");
     area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
-    std::fs::rename(&root, area.path("w-moved")).unwrap();
+    forklift_core::util::file_utils::rename(&root, area.path("w-moved")).unwrap();
 
     let refusal = area.refused(&bay, &["stocktake"]);
     assert_eq!(
