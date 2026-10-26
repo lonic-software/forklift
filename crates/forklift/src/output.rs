@@ -948,8 +948,8 @@ fn pallets_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> Strin
         names.join(", ")
     );
     let next_step = "As an enrolled signer, re-stack the work onto a pallet the anchor vouches for \
-        (\"forklift cherry-pick\"), or delete the pallet: no other pallet holds that work, so the delete \
-        needs \"forklift palletize --delete --force <name>\".";
+        (\"forklift cherry-pick\"), or delete the pallet (\"forklift palletize --delete <name>\", which \
+        needs --force when no other pallet holds that work).";
 
     match mode {
         OutputMode::Human => format!("Warning: {} {}", message, next_step),
