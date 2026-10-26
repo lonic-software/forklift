@@ -8263,6 +8263,7 @@ fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
 
 /// The message of a `history_unverified` refusal under `--json`: exit 34, the error document on
 /// stdout.
+#[track_caller]
 fn history_unverified_message(output: &Output) -> String {
     assert_eq!(output.status.code(), Some(34), "{}{}", stdout(output), stderr(output));
     let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
@@ -8272,6 +8273,7 @@ fn history_unverified_message(output: &Output) -> String {
 
 /// The message of a refused franchise whose cause is `history_unverified`: a franchise reports
 /// any failure as `franchise_incomplete` (exit 30), keeping what it fetched for a resume.
+#[track_caller]
 fn franchise_history_unverified_message(output: &Output) -> String {
     assert_eq!(output.status.code(), Some(30), "{}{}", stdout(output), stderr(output));
     let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
