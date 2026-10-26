@@ -130,7 +130,9 @@ async fn async_main() {
         match forklift_core::error::CoreError::from(e) {
             forklift_core::error::CoreError::Refusal { message, next_step, .. } => {
                 eprintln!("{}", message);
-                eprintln!("{}", next_step);
+                if !next_step.is_empty() {
+                    eprintln!("{}", next_step);
+                }
             }
             other => eprintln!("{}", other),
         }

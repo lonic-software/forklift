@@ -91,7 +91,17 @@ pub fn enter_warehouse() -> Result<(), String> {
     // inventory, the current pallet, the lock and the probes of this bay's volume stay here.
     match bay_utils::classify_forklift(&forklift)? {
         bay_utils::ForkliftKind::Bay => {
-            let redirect = bay_utils::read_bay_redirect(&forklift)?;
+            // A bay whose redirect cannot be read names no warehouse: refused as no warehouse, so
+            // the way out is the bay's own.
+            let redirect = bay_utils::read_bay_redirect(&forklift).map_err(|message| String::from(CoreError::refusal(
+                RefusalCode::NotAWarehouse,
+                message,
+                format!(
+                    "Restore the bay's redirect \"{}\", or delete \"{}\".",
+                    shown_root(&forklift).join(bay_utils::FILE_NAME_BAY_REDIRECT).to_string_lossy(),
+                    shown_root(&forklift).to_string_lossy()
+                ),
+            )))?;
             let shared = open_bay_warehouse(&root, &redirect).map_err(String::from)?;
             globals::set_bay_context(shared.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
         }
@@ -141,7 +151,7 @@ pub fn open_warehouse_root(root: &Path) -> Result<PathBuf, CoreError> {
                 ),
             ))
         }
-        bay_utils::ForkliftKind::OldFormatBay => Err(CoreError::from(bay_utils::old_format_bay_error(root))),
+        bay_utils::ForkliftKind::OldFormatBay => Err(bay_utils::old_format_bay_refusal(root)),
         bay_utils::ForkliftKind::Absent => {
             let shown = shown_root(root);
             Err(CoreError::refusal(
@@ -208,10 +218,10 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
                 ),
                 format!(
                     "Re-create the warehouse at \"{}\" (move its \"{}\" aside, run \"forklift prepare\" there, \
-                    then import the history again with \"forklift import-git\" or franchise it again), then delete \
-                    \"{}\" and add the bay again with \"forklift bay add\" in \"{}\".",
+                    then import the history again with \"forklift import-git\" or franchise it again), then move \
+                    \"{}\" aside and add the bay again with \"forklift bay add\" in \"{}\".",
                     target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT,
-                    bay.join(FOLDER_NAME_FORKLIFT_ROOT).to_string_lossy(), target.to_string_lossy()
+                    bay.to_string_lossy(), target.to_string_lossy()
                 ),
             ))
         }

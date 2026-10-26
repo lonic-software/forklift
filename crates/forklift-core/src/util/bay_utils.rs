@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_FORKLIFT_ROOT};
 use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, park_utils, record_utils, warehouse_utils};
+use crate::error::{CoreError, RefusalCode};
 use crate::util::record_utils::RecordError;
 
 /// The file inside a bay's `.forklift` folder that names its warehouse, and so makes that folder a
@@ -76,7 +77,7 @@ pub enum ForkliftKind {
     Bay,
 
     /// A regular file: a bay redirect in the format older versions wrote, which is refused rather
-    /// than read (see [`old_format_bay_error`]).
+    /// than read (see [`old_format_bay_refusal`]).
     OldFormatBay,
 
     /// No entry at all.
@@ -134,14 +135,14 @@ pub fn classify_forklift(forklift_path: &Path) -> Result<ForkliftKind, String> {
     }
 }
 
-/// The refusal for a bay whose `.forklift` is a redirect file in the older format, with the
+/// The `not_a_warehouse` refusal for a bay whose `.forklift` is a redirect file in the older format, with the
 /// conversion that makes it current. The remedy stages the conversion in a new folder whose name
 /// nothing in the directory holds when the refusal is written; the bay's tree may hold any name,
 /// so the remedy says to create that folder, which fails rather than reuse one taken since.
 ///
 /// # Arguments
 /// * `root` - The directory holding the old-format `.forklift` file.
-pub fn old_format_bay_error(root: &Path) -> String {
+pub fn old_format_bay_refusal(root: &Path) -> CoreError {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
     let intro = format!(
         "\"{}\" is a bay redirect file written by an older version of Forklift; a bay now keeps it \
@@ -164,24 +165,27 @@ pub fn old_format_bay_error(root: &Path) -> String {
         break;
     }
 
-    match staging {
+    let next_step = match staging {
         Some(staging) => format!(
-            "{} Convert it in place: create the new folder \"{}\" (stop if that name is taken), move \
+            "Convert it in place: create the new folder \"{}\" (stop if that name is taken), move \
             the file \"{}\" to \"{}\", then rename \"{}\" to \"{}\".",
-            intro, staging.to_string_lossy(), forklift.to_string_lossy(),
+            staging.to_string_lossy(), forklift.to_string_lossy(),
             staging.join(FILE_NAME_BAY_REDIRECT).to_string_lossy(), staging.to_string_lossy(),
             forklift.to_string_lossy()
         ),
         None => format!(
-            "{} Convert it in place: create a new folder in \"{}\" under a name nothing there holds, \
+            "Convert it in place: create a new folder in \"{}\" under a name nothing there holds, \
             move the file \"{}\" into it as \"{}\", then rename that folder to \"{}\".",
-            intro, root.to_string_lossy(), forklift.to_string_lossy(), FILE_NAME_BAY_REDIRECT,
+            root.to_string_lossy(), forklift.to_string_lossy(), FILE_NAME_BAY_REDIRECT,
             forklift.to_string_lossy()
         ),
-    }
+    };
+
+    // The conversion stays in the message too: a human reads only the message.
+    CoreError::refusal(RefusalCode::NotAWarehouse, format!("{} {}", intro, next_step), next_step)
 }
 
-/// The folder [`old_format_bay_error`]'s remedy stages the conversion in.
+/// The folder [`old_format_bay_refusal`]'s remedy stages the conversion in.
 const FOLDER_NAME_FORKLIFT_NEW: &str = ".forklift.new";
 
 /// Write a bay's `.forklift` folder, holding its redirect, into its working directory.

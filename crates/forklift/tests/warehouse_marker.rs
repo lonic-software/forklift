@@ -243,15 +243,49 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
             refusal.next_step,
             format!(
                 "Re-create the warehouse at {} (move its \".forklift\" aside, run \"forklift prepare\" there, then \
-                import the history again with \"forklift import-git\" or franchise it again), then delete {} and add \
+                import the history again with \"forklift import-git\" or franchise it again), then move {} aside and add \
                 the bay again with \"forklift bay add\" in {}.",
-                quoted(&root), quoted(&bay.join(FOLDER_NAME_FORKLIFT_ROOT)), quoted(&root)
+                quoted(&root), quoted(&bay), quoted(&root)
             ),
             "{:?}", args
         );
     }
     assert_eq!(listing(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), shared, "the warehouse was written");
     assert_eq!(listing(&bay.join(FOLDER_NAME_FORKLIFT_ROOT)), own, "the bay was written");
+
+    // The steps give a working bay (the history coming back as a fresh stack of the same files).
+    forklift_core::util::file_utils::rename(root.join(FOLDER_NAME_FORKLIFT_ROOT), root.join(".forklift.old")).unwrap();
+    area.run_ok(&root, &["prepare"]);
+    area.run_ok(&root, &["config", "operator.identifier", "marker@forklift"]);
+    area.run_ok(&root, &["load", "app.txt"]);
+    area.run_ok(&root, &["stack", "again"]);
+    forklift_core::util::file_utils::rename(&bay, area.path("bay.old")).unwrap();
+    area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
+    area.run_ok(&bay, &["stocktake"]);
+}
+
+/// A bay in the older format, and one whose redirect cannot be read, are refused as no
+/// warehouse with the bay's own way out, never as a failure no step cures.
+#[test]
+fn a_bay_that_names_no_warehouse_is_refused_with_its_own_way_out() {
+    let area = Area::new("bay-unreadable");
+    let root = area.warehouse("w");
+    let bay = area.path("bay");
+    area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
+    let forklift = bay.join(FOLDER_NAME_FORKLIFT_ROOT);
+
+    std::fs::write(forklift.join("redirect"), "not a redirect\n").unwrap();
+    let refusal = area.refused(&bay, &["stocktake"]);
+    assert_eq!(
+        refusal.next_step,
+        format!("Restore the bay's redirect {}, or delete {}.", quoted(&forklift.join("redirect")), quoted(&forklift))
+    );
+
+    std::fs::remove_dir_all(&forklift).unwrap();
+    std::fs::write(&forklift, format!("{}\n", root.to_string_lossy())).unwrap();
+    let refusal = area.refused(&bay, &["stocktake"]);
+    assert!(refusal.message.contains("written by an older version of Forklift"), "{}", refusal.message);
+    assert!(refusal.next_step.starts_with("Convert it in place: "), "{}", refusal.next_step);
 }
 
 /// An empty `.forklift` inside a bay is never sent to the bay as if it were the warehouse: the
