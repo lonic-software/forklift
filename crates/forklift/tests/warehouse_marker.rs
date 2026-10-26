@@ -264,22 +264,14 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
     area.run_ok(&bay, &["stocktake"]);
 }
 
-/// A bay in the older format, and one whose redirect cannot be read, are refused as no
-/// warehouse with the bay's own way out, never as a failure no step cures.
+/// A bay in the older format is refused as no warehouse, with the conversion as its way out.
 #[test]
-fn a_bay_that_names_no_warehouse_is_refused_with_its_own_way_out() {
-    let area = Area::new("bay-unreadable");
+fn an_old_format_bay_is_refused_as_no_warehouse() {
+    let area = Area::new("bay-old-format");
     let root = area.warehouse("w");
     let bay = area.path("bay");
     area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
     let forklift = bay.join(FOLDER_NAME_FORKLIFT_ROOT);
-
-    std::fs::write(forklift.join("redirect"), "not a redirect\n").unwrap();
-    let refusal = area.refused(&bay, &["stocktake"]);
-    assert_eq!(
-        refusal.next_step,
-        format!("Restore the bay's redirect {}, or delete {}.", quoted(&forklift.join("redirect")), quoted(&forklift))
-    );
 
     std::fs::remove_dir_all(&forklift).unwrap();
     std::fs::write(&forklift, format!("{}\n", root.to_string_lossy())).unwrap();

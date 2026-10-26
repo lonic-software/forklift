@@ -1047,6 +1047,14 @@ fn holds_warehouse(root: &std::path::Path) -> bool {
     matches!(bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), Ok(bay_utils::ForkliftKind::Warehouse))
 }
 
+/// Whether nothing stands at `root`, or only an empty folder: what a creation would take.
+fn is_missing_or_empty_folder(root: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(root) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(meta) => meta.is_dir() && std::fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none()),
+    }
+}
+
 /// Map a trust install that did not land to the answer a ref update gives for the same condition:
 /// a `409` when the office or the anchor it was judged against moved, or when a pallet head here
 /// stands outside the anchor's boundary (it wrote nothing), and a 500 when a write failed.
@@ -1594,20 +1602,25 @@ fn resolve_warehouse(state: &AppState,
 
     let root = base.join(&id);
 
-    // Only a name with no `.forklift` at all is missing. Anything else there (a folder with no
-    // warehouse marker, a bay's, one that cannot be judged) would refuse the create a 404 points
-    // at, so it is answered as unusable instead. An unfinished franchise, which may not have
-    // marked its folder yet, goes on to `serving` and its 503.
+    // Only a name the create would take (nothing there, or an empty folder) is missing. Anything
+    // else that is not a warehouse (a file, a folder with content but no marker, a bay's) would
+    // refuse the create a 404 points at, so it is answered as unusable instead. One that cannot
+    // be judged is a server fault, with no remedy offered. An unfinished franchise, which may not
+    // have marked its folder yet, goes on to `serving` and its 503.
     match bay_utils::classify_forklift(&root.join(FOLDER_NAME_FORKLIFT_ROOT)) {
         Ok(bay_utils::ForkliftKind::Warehouse) => (),
         Ok(bay_utils::ForkliftKind::Unprepared) if franchise_utils::gate(&root).is_err() => (),
-        Ok(bay_utils::ForkliftKind::Absent) => return Err((
+        Ok(bay_utils::ForkliftKind::Absent) if is_missing_or_empty_folder(&root) => return Err((
             StatusCode::NOT_FOUND,
             format!(
                 "No warehouse \"{}\" exists on this server. Create it first: \
                 PUT /warehouses/{}.",
                 id, id
             )
+        )),
+        Err(_) => return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Whether \"{}\" on this server is a warehouse could not be checked.", id)
         )),
         _ => return Err((
             StatusCode::CONFLICT,
@@ -4152,9 +4165,20 @@ mod tests {
         std::fs::write(bay.join(bay_utils::FILE_NAME_BAY_REDIRECT), b"x").unwrap();
         mark_warehouse(&base.join("newer"));
         std::fs::write(base.join("newer").join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 2\n").unwrap();
-        for id in ["bay", "newer"] {
+        let error = resolve_warehouse(&state, &warehouse_params("bay")).err().unwrap();
+        assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
+        // One that cannot be judged is offered no remedy that would destroy it.
+        let error = resolve_warehouse(&state, &warehouse_params("newer")).err().unwrap();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
+
+        // A file, or a folder with content, would refuse a creation too; an empty folder would not.
+        std::fs::write(base.join("file"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("full")).unwrap();
+        std::fs::write(base.join("full").join("data.txt"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("empty")).unwrap();
+        for (id, status) in [("file", StatusCode::CONFLICT), ("full", StatusCode::CONFLICT), ("empty", StatusCode::NOT_FOUND)] {
             let error = resolve_warehouse(&state, &warehouse_params(id)).err().unwrap();
-            assert_eq!(error.0, StatusCode::CONFLICT, "{}: {}", id, error.1);
+            assert_eq!(error.0, status, "{}: {}", id, error.1);
         }
 
         let _ = std::fs::remove_dir_all(&base);
@@ -4891,8 +4915,8 @@ mod tests {
     }
 
     /// A bay's working directory holds a `.forklift` folder too. The multi-mode lookup does not
-    /// serve it, and creation neither reports it as an existing warehouse nor adopts it. Both
-    /// answer 409: a lookup's 404 would send the client to a creation that refuses.
+    /// serve it, and creation neither reports it as an existing warehouse nor adopts it. Neither
+    /// answers 404: that would send the client to a creation that refuses.
     #[test]
     fn a_bay_under_the_base_is_neither_served_nor_taken_for_a_warehouse() {
         let base = scratch_dir("bay-under-base");
@@ -4909,11 +4933,11 @@ mod tests {
         assert_eq!(std::fs::read_dir(&forklift).unwrap().count(), 1, "the bay's folder is left as it was");
         assert!(creation_litter(&base).is_empty(), "nothing is left behind: {:?}", creation_litter(&base));
 
-        // A `.forklift` that is neither (a redirect that is a folder) is a name clash, not a server
-        // fault: taken, to a lookup and a creation alike.
+        // A `.forklift` that is neither (a redirect that is a folder) cannot be judged: a lookup
+        // answers it as a server fault with no remedy, and a creation finds the name taken.
         std::fs::create_dir_all(base.join("broken").join(FOLDER_NAME_FORKLIFT_ROOT).join(bay_utils::FILE_NAME_BAY_REDIRECT)).unwrap();
         let error = resolve_warehouse(&state, &warehouse_params("broken")).err().expect("a broken entry must not be served");
-        assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
         let error = create_warehouse(&base, "broken").err().expect("a broken entry must not read as a warehouse");
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
 
