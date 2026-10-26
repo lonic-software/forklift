@@ -1410,7 +1410,7 @@ mod tests {
         std::fs::create_dir_all(old.join(forklift_name).join("objects")).unwrap();
         let next_step = next_step_of(&old);
         assert!(next_step.starts_with("Move ") && !next_step.contains("redirect"), "{}", next_step);
-        std::fs::rename(old.join(forklift_name), old.join("aside")).unwrap();
+        forklift_core::util::file_utils::rename(old.join(forklift_name), old.join("aside")).unwrap();
         prepare(old.to_str().unwrap()).unwrap();
         bundle(old.to_str().unwrap()).unwrap();
 
@@ -1421,7 +1421,7 @@ mod tests {
             assert!(next_step.starts_with("Move it aside and run \"forklift-server prepare\" with --root"), "{}: {}", command, next_step);
             assert!(!next_step.contains("bay") && !next_step.contains("belongs"), "{}: {}", command, next_step);
         }
-        std::fs::rename(file.join(forklift_name), file.join("aside")).unwrap();
+        forklift_core::util::file_utils::rename(file.join(forklift_name), file.join("aside")).unwrap();
         prepare(file.to_str().unwrap()).unwrap();
         bundle(file.to_str().unwrap()).unwrap();
 
