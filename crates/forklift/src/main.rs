@@ -410,7 +410,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             }).await,
         Command::ImportGit { path, no_compact } => commands::import_git::handle_command(&path, no_compact),
         Command::ExportGit { path } => commands::export_git::handle_command(&path),
-        Command::Lift => commands::lift::handle_command().await,
+        Command::Lift { recreate } => commands::lift::handle_command(recreate).await,
         Command::Load { path } => commands::load::handle_command(&path).await,
         Command::Lower { pallet, expect, keep } => commands::lower::handle_command(pallet, expect, keep).await,
         Command::Manifest { action } => commands::manifest::handle_command(action),

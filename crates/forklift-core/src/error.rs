@@ -253,6 +253,12 @@ refusal_codes! {
     /// warehouse marker, it is a bay's, it is missing, or a bay's redirect names something that is
     /// not a warehouse. Refused before any lock is taken; the next step names the root it refused.
     NotAWarehouse => "not_a_warehouse",
+
+    /// The remote has the pallet only as a tombstone: it was deleted there, and the remote keeps
+    /// the name reserved for the history its tombstone holds. A lift re-creates it only by
+    /// acknowledging the deletion (`lift --recreate`) from work that descends from that head; the
+    /// next step otherwise brings the pallet back there (`palletize --restore <name> --remote`).
+    PalletDeletedOnRemote => "pallet_deleted_on_remote",
 }
 
 impl RefusalCode {

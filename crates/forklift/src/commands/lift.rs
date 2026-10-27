@@ -25,11 +25,15 @@ const MAX_AUTO_MERGES: usize = 5;
 /// first — the key registry must be on the remote before the signed parcels arrive,
 /// because the remote audits every ref update.
 ///
+/// # Arguments
+/// * `recreate` - Re-create a pallet the remote deleted, acknowledging its tombstone (refused
+///                unless the local head descends from the tombstone's).
+///
 /// # Returns
 /// * `Ok(())`      - If the lift completed (or there was nothing to lift).
 /// * `Err(String)` - If no remote is configured, the remote is ahead, or a transfer
 ///                   failed.
-pub async fn handle_command() -> Result<(), String> {
+pub async fn handle_command(recreate: bool) -> Result<(), String> {
     ensure_origin_remote()?;
 
     let progress = events::progress();
@@ -117,7 +121,14 @@ pub async fn handle_command() -> Result<(), String> {
             mirror: None,
         };
 
-        let lifted = remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await;
+        // Refused here, before anything is uploaded, unless it is acknowledged; the remote refuses
+        // an unacknowledged creation of a deleted pallet all the same.
+        let lifted = match remote_utils::acknowledged_tombstone(&info, &pallet, &head, recreate) {
+            Ok(tombstone) => remote_utils::lift_pallet(
+                &client, &pallet, &head, remote_head.as_deref(), tombstone.as_deref(), info.chunking, &progress
+            ).await,
+            Err(why) => Err(why),
+        };
 
         let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
         lift_haul(&client, &info, landed, &mut report.meta_pallets, &mut report.meta_failed).await;
