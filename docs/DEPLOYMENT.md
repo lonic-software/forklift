@@ -172,6 +172,13 @@ single-`PUT` maximum).
   peaking at 188 MB. The same requests at 1024 MB ran 20–30% faster at the same peak, so the
   larger size is not needed for memory, and the time it saves is far inside the 29 s limit.
 
+  The batch also stops when its invocation is within `BATCH_ANSWER_RESERVE` (10 s) of its
+  deadline, so it needs a `control_plane_timeout_s` well above 10 s to batch usefully. At 10 s or
+  less every batch answer stops after its first object, and just above that each carries only
+  what it reads in the few seconds left; either way the first cut answer sends clients to fetching
+  one object at a time for the rest of the command. The default of 29 s leaves about 19 s of
+  reads per answer.
+
   Recommended default: **512 MB**, which also buys proportionally more CPU (Lambda ties CPU
   allocation to configured memory) for the audit's own work. Bump to **1024 MB** if your
   warehouses routinely stack near-maximal (64 MiB) trees or recipes: a batch whose budget is

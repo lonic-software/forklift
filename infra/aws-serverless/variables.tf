@@ -189,6 +189,8 @@ variable "control_plane_timeout_s" {
     29-second integration timeout for a synchronous Lambda proxy integration (true of both REST
     and HTTP APIs — docs/DEPLOYMENT.md "Timeout guidance"); a value above that ceiling only burns
     compute after the client already has its 504, so this module rejects it at plan time (F9/C10).
+    Batch downloads stop 10 seconds before this timeout, so at 10 or less each answer carries one
+    object, and only a value well above 10 lets them batch (docs/DEPLOYMENT.md "Memory sizing").
   EOT
   type        = number
   default     = 29

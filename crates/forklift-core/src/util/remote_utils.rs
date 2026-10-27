@@ -3561,7 +3561,7 @@ impl RemoteClient {
     /// The redirect-follow `GET` below does not share that reasoning: an offloading store writes
     /// the bundle to its storage-backed response key and only *then* presigns and returns the
     /// `GET` URL (`crates/forklift-aws-lambda/src/aws/s3.rs`'s `offload_response`, called from
-    /// `head.rs`'s `batch` after `build_partial_bundle` already ran) — so by the time this station
+    /// `head.rs`'s `batch` once its bundle is finished) — so by the time this station
     /// is reached, the bytes it reads are already fully materialized at a known size, not still
     /// being assembled by whatever answers the request. That is the same shape
     /// [`Self::fetch_object`]'s own read is, not the size-unknown-in-advance one the `POST` above
