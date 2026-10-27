@@ -154,9 +154,9 @@ const HOLDS_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs
 pub const BATCH_BYTE_BUDGET: u64 = 32 * 1024 * 1024;
 
 /// How long before the invocation deadline a `batch` stops mirroring objects, leaving the time to
-/// finish the one object already in flight, offload the bundle and answer. Measured at about
-/// 70 ms per MiB on a 512 MB function, so this covers the byte budget plus one maximal object with
-/// room to spare.
+/// finish the one object already in flight, offload the bundle and answer. A 37.5 MiB answer took
+/// about 1.4 s cold on a 512 MB function (docs/DEPLOYMENT.md "Memory sizing"), so this covers the
+/// byte budget plus one maximal object several times over.
 pub const BATCH_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How many times a pallet delete decides afresh when its commit is refused because the office or
