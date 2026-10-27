@@ -6057,6 +6057,8 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
     let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
     assert_eq!(report["data"]["freed"], 0, "{}", stdout(&pruned));
     assert!(object_present(&area, "sparse", &docs_blob), "an unanswered holds check confirms nothing");
+    assert!(stderr(&pruned).contains("\"warning\":\"holds_unanswered\""), "the pallet left unconfirmed is named: {}",
+            stderr(&pruned));
 }
 
 /// The entries of warehouse `name`'s held-heads record, as `<head> <pallet>` lines (the header

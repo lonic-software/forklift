@@ -211,7 +211,7 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
 ///
 /// A recorded head counts only when the remote answers that it holds it, so the record never frees
 /// more than the current heads alone unless the remote affirms it; when the confirmation cannot be
-/// had, the prune frees what the current heads alone allow.
+/// had, the prune frees what the current heads alone allow and warns which pallet went unanswered.
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - The head of every pallet the remote holds, and the confirmed recorded
@@ -226,10 +226,13 @@ async fn remote_pallet_heads() -> Result<Vec<String>, String> {
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
     remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
 
-    let confirmed = held_heads::confirmed_heads(&client, &info.pallets).await
+    let confirmation = held_heads::confirmed_heads(&client, &info.pallets).await
         .map_err(|e| error::append_to_message(e, note))?;
+    for (pallet, why) in &confirmation.unanswered {
+        output::warn_holds_unanswered(pallet, why);
+    }
 
-    Ok(info.pallets.into_values().chain(confirmed).collect())
+    Ok(info.pallets.into_values().chain(confirmation.heads).collect())
 }
 
 /// Refuse the prune if the main tree or any bay still materializes a pruned path. Every

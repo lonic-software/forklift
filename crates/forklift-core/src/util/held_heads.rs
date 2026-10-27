@@ -1,11 +1,10 @@
 //! The held-heads record: remote heads of working pallets this warehouse lifted to, lowered or
 //! franchised from.
 //!
-//! `scope-prune` counts as held by the remote only history it reaches from the remote's current
-//! heads, so once another warehouse lifts past every head held here, this warehouse's history of
-//! that pallet looks unlifted and is kept until a `lower`. This record nominates the earlier heads
-//! the remote was seen to accept or serve, so a prune can ask the remote whether it still holds
-//! them. An entry is only a candidate: a remote head can move backward (an `undo` on the served
+//! The remote's current heads alone stop reaching this warehouse's history of a pallet once
+//! another warehouse lifts past every head held here, and `scope-prune` would keep that history
+//! until a `lower`. This record nominates the earlier heads the remote was seen to accept or
+//! serve, so a prune asks the remote whether it still holds them. An entry is only a candidate: a remote head can move backward (an `undo` on the served
 //! root) and a pallet deleted and re-created under its name starts a new lineage, so a head seen
 //! once is no proof that the remote still holds it, and nothing may be freed on an entry alone.
 //!
@@ -138,23 +137,36 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
 /// moved back past (an `undo` on the served root), one from a pallet deleted and re-created under
 /// its name, and one whose history the remote no longer has all count as not held. A pallet the
 /// remote no longer lists is not asked, and one whose call fails (a head too old to have the
-/// route answers `404`) confirms none of its candidates. A record that does not parse is the one
-/// error: the prune refuses rather than guess at it.
+/// route answers `404`) confirms none of its candidates and is named in
+/// [`Confirmation::unanswered`], so the caller can say why less was freed. A record that does not
+/// parse is the one error: the prune refuses rather than guess at it.
 ///
 /// # Arguments
 /// * `client`         - The remote, already trust-checked by the caller.
 /// * `remote_pallets` - The remote's current heads by pallet wire name, from that handshake.
-pub async fn confirmed_heads(client: &RemoteClient, remote_pallets: &BTreeMap<String, String>) -> Result<Vec<String>, String> {
-    let mut confirmed = Vec::new();
+pub async fn confirmed_heads(client: &RemoteClient, remote_pallets: &BTreeMap<String, String>) -> Result<Confirmation, String> {
+    let mut confirmation = Confirmation::default();
 
-    // One call after another: prune is not a hot path, and each pallet is a single request.
+    // One call after another: prune is not a hot path, and a server walks only a few holds
+    // checks at once, answering `unknown` past that, so asking in parallel would confirm less.
     for (pallet, candidates) in to_ask(&read_held_heads()?, remote_pallets) {
-        if let Ok(answers) = client.holds(&pallet, &candidates).await {
-            confirmed.extend(held(&candidates, &answers));
+        match client.holds(&pallet, &candidates).await {
+            Ok(answers) => confirmation.heads.extend(held(&candidates, &answers)),
+            Err(why) => confirmation.unanswered.push((pallet, why)),
         }
     }
 
-    Ok(confirmed)
+    Ok(confirmation)
+}
+
+/// What [`confirmed_heads`] found.
+#[derive(Debug, Default)]
+pub struct Confirmation {
+    /// The recorded heads the remote answered `held`.
+    pub heads: Vec<String>,
+
+    /// The pallets whose holds call failed, each with its error; none of their candidates count.
+    pub unanswered: Vec<(String, String)>,
 }
 
 /// The candidates to ask about, by pallet: the recorded heads of every pallet the remote lists,

@@ -927,6 +927,29 @@ fn held_head_unrecorded_warning_text(mode: OutputMode, error: &str) -> String {
     }
 }
 
+/// The `--json` warning code for a pallet whose recorded heads the remote did not answer about.
+pub const CODE_HOLDS_UNANSWERED: &str = "holds_unanswered";
+
+/// Name a pallet whose holds check failed, on the stderr side-channel the other warnings use: the
+/// prune freed only what the remote's current heads allow, and its exit code stays its own.
+pub fn warn_holds_unanswered(pallet: &str, error: &str) {
+    eprintln!("{}", holds_unanswered_warning_text(mode(), pallet, error));
+}
+
+/// The pure half of [`warn_holds_unanswered`], asserted in both modes without capturing stderr.
+fn holds_unanswered_warning_text(mode: OutputMode, pallet: &str, error: &str) -> String {
+    let next_step = "History only the earlier heads reach was kept. Run the prune again once the \
+        remote answers, or lower the pallet, to free it.";
+    match mode {
+        OutputMode::Human => format!(
+            "Warning: the remote did not say whether it still holds the earlier heads of pallet \"{}\". {} {}",
+            forklift_core::error::sanitize(pallet), forklift_core::error::sanitize_lines(error), next_step
+        ),
+        OutputMode::Json => warning_envelope(CODE_HOLDS_UNANSWERED, error, next_step,
+                                             Some(&serde_json::json!({ "pallet": pallet }))),
+    }
+}
+
 /// The warning code of [`warn_pallets_unvouched`].
 pub const CODE_PALLETS_UNVOUCHED: &str = "pallets_unvouched";
 
@@ -1230,6 +1253,20 @@ mod tests {
             value["next_step"].as_str().unwrap().contains("forklift heal"),
             "next_step: {}", value["next_step"]
         );
+    }
+
+    #[test]
+    fn the_holds_unanswered_warning_names_the_pallet_and_the_cause_in_both_modes() {
+        let error = "The remote answered 404 Not Found";
+
+        let human = holds_unanswered_warning_text(OutputMode::Human, "main", error);
+        assert!(human.contains(error) && human.contains("\"main\""), "human text: {}", human);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&holds_unanswered_warning_text(OutputMode::Json, "main", error)).unwrap();
+        assert_eq!(value["warning"], "holds_unanswered");
+        assert_eq!(value["message"], error);
+        assert_eq!(value["details"]["pallet"], "main");
     }
 
     #[test]
