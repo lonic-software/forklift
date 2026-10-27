@@ -35,6 +35,7 @@ const PRIMITIVES: &[&str] = &[
     "update_pallet_head_verified",
     "update_pallet_head_locked",
     "write_head_or_roll_back",
+    "recreate_pallet_head",
 ];
 
 /// Every production writer: the file, the function holding the call, and why it is sound. A
@@ -55,6 +56,8 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/shift_utils.rs", "write_head_or_roll_back", Class::Primitive),
     // Signed whenever an anchor is held; a consolidation's merged head is verified first.
     ("crates/forklift-core/src/util/stack_utils.rs", "write_head", Class::Signs),
+    // A restored tombstone's head is verified as the anchor and office stand now, as undo's is.
+    ("crates/forklift-core/src/util/tombstone_utils.rs", "restore_pallet", Class::Verifies),
     ("crates/forklift/src/commands/bay.rs", "add", Class::CopiesLocal),
     ("crates/forklift/src/commands/consolidate.rs", "fast_forward", Class::CopiesLocal),
     ("crates/forklift/src/commands/franchise.rs", "franchise_into_prepared_target", Class::Verifies),
