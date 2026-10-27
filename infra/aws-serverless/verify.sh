@@ -84,7 +84,7 @@
 #      promotion under real S3-event latency — LocalStack's event delivery latency is not
 #      representative of production's.
 #   4. Timing/cost of the throttling defaults and PITR billing under real, sustained scheduled use.
-#   5. Whether the signature-sidecar check (step 4/4) ever actually runs its 200 branch — see its
+#   5. Whether the signature-sidecar check (step 4/5) ever actually runs its 200 branch — see its
 #      own comment: on any stack that has never had trust established (true of examples/staging/
 #      today), it is a documented, standing can't-build, not something a real run has confirmed.
 #
@@ -101,12 +101,12 @@
 #     scheduled workflow permanently red after its first success — and indistinguishably from a
 #     real verifier-KMS failure, the worst possible false signal. Fixed by franchising the
 #     persistent stack FIRST, then stacking new fixture content on top of whatever it already
-#     holds, every run (step 2/4's comment has the full reasoning, including why this was chosen
+#     holds, every run (step 2/5's comment has the full reasoning, including why this was chosen
 #     over a per-run pallet).
 #   - Step 4/4 asserted `GET /v1/signatures/{parcel}` returns 200 unconditionally, but a stack
 #     with no trust anchor established never signs anything, so that parcel's signature can only
 #     ever 404. Fixed by making the assertion conditional on the handshake already having
-#     reported a trust anchor — see step 4/4's comment for why establishing one from inside this
+#     reported a trust anchor — see step 4/5's comment for why establishing one from inside this
 #     script was ruled out rather than attempted.
 
 set -euo pipefail
@@ -253,7 +253,7 @@ run_in() {
 # non_aggregate_keys entry. KeyCount is therefore dropped from the assembled result and --output
 # text prints the literal "None" for EVERY response, including a small non-truncated one. Both
 # readings were "None", and `(( None > None ))` is false — bash reads the bare word as an unset
-# parameter, i.e. 0 — so step 3/4 could not fail, and would not have reddened even if the
+# parameter, i.e. 0 — so step 3/5 could not fail, and would not have reddened even if the
 # commit_lift sweep it exists to pin were removed outright. length(Contents || `[]`) counts the
 # merged pages and is correct across pagination.
 #
@@ -293,7 +293,7 @@ staging_key_count() {
 # measure guaranteed to catch the growth regardless of which prefix it nominally sits under, and
 # it is also the number an operator actually pays for.
 #
-# Every run stages a fresh 9 MiB of /dev/urandom (step 2/4 below) and franchises the whole
+# Every run stages a fresh 9 MiB of /dev/urandom (step 2/5 below) and franchises the whole
 # store's history twice. Fresh urandom never deduplicates against anything already in objects/,
 # and nothing anywhere — this script, the module, or the crate — ever prunes a canonical object:
 # an S3 lifecycle rule on objects/ would make the NEXT franchise fail on a missing object (the
@@ -333,7 +333,7 @@ bucket_total_size_bytes() {
 # that names itself as retention, not a verifier or stack regression, so nobody has to debug
 # this as an application failure. Both are round numbers chosen for a comfortable multi-month
 # runway on a DAILY cron (.github/workflows/aws-serverless-verify.yml) at ~9 MiB genuinely new
-# bytes added per run (dd of urandom, step 2/4 below) — a tripwire, not a derived capacity plan:
+# bytes added per run (dd of urandom, step 2/5 below) — a tripwire, not a derived capacity plan:
 #   - SOFT = 1 GiB  -> roughly 110+ daily runs (~3-4 months) before it's even worth a look
 #   - HARD = 4 GiB  -> roughly 450+ daily runs (~15 months) before the run refuses to continue
 SOFT_BUCKET_SIZE_BYTES=$((1 * 1024 * 1024 * 1024)) # 1 GiB
@@ -341,7 +341,7 @@ HARD_BUCKET_SIZE_BYTES=$((4 * 1024 * 1024 * 1024)) # 4 GiB
 
 # ---------------------------------------------------------------------------------------------
 # staging/ baseline (PR #80 review, finding #7) — snapshotted before this run touches anything,
-# so step 3/4's post-lift check can be scoped to what THIS run added rather than the whole
+# so step 3/5's post-lift check can be scoped to what THIS run added rather than the whole
 # bucket. The CLI has no way to report the lift session id it minted (remote_utils.rs's
 # new_lift_session() is internal and never surfaces through LiftReport/--json), so a literal
 # "this run's session prefix" isn't obtainable from the outside — a before/after delta on the
@@ -357,12 +357,12 @@ staging_key_count_before="$(staging_key_count)"
 if [[ "$staging_key_count_before" != "0" ]]; then
   log "  NOTE — staging/ already holds $staging_key_count_before key(s) before this run starts \
 (most likely a previous aborted run's leftover, e.g. one killed by the job timeout) — harmless, \
-and left alone until its own lifecycle-rule expiry. This run's own check (step 3/4) only asserts \
+and left alone until its own lifecycle-rule expiry. This run's own check (step 3/5) only asserts \
 it does not ADD to that count."
 fi
 
 # ---------------------------------------------------------------------------------------------
-# Size tripwire (PR #80 review, finding #3) — deliberately run before any of the four checklist
+# Size tripwire (PR #80 review, finding #3) — deliberately run before any of the checklist
 # steps below, not after them, so it always executes and reports even when a later step fails
 # outright under `set -e` (a bad endpoint, a real verifier/KMS regression, anything). The
 # operator needs to know "this is retention, not a real failure" regardless of what else does or
@@ -391,10 +391,10 @@ README's \"Layer 3 retention & reset\" section."
 fi
 
 # ---------------------------------------------------------------------------------------------
-# Step 1/4 (checklist step 1) — handshake.
+# Step 1/5 (checklist step 1) — handshake.
 # ---------------------------------------------------------------------------------------------
 
-log "step 1/4 (checklist #1): handshake — GET ${ENDPOINT}${PREFIX}/v1/warehouse"
+log "step 1/5 (checklist #1): handshake — GET ${ENDPOINT}${PREFIX}/v1/warehouse"
 
 handshake_code="$(curl_to_file "${ENDPOINT}${PREFIX}/v1/warehouse" "$WORKDIR/handshake.json" \
   -H "Authorization: Bearer $TOKEN")" ||
@@ -410,7 +410,7 @@ chunking="$(jq -r '.chunking // empty' "$WORKDIR/handshake.json" 2>/dev/null || 
 log "  OK — 200, chunking: true"
 
 # ---------------------------------------------------------------------------------------------
-# Step 2/4 (checklist steps 2 and 3, combined into one lift) — a small round trip plus a chunked
+# Step 2/5 (checklist steps 2 and 3, combined into one lift) — a small round trip plus a chunked
 # (>= 8 MiB) round trip. Combined deliberately: both call the identical
 # ObjectStore::verify_and_promote (docs/DEPLOYMENT.md "Architecture overview"), one synchronously
 # from the control plane and one asynchronously via the verifier's S3-event trigger, so one lift
@@ -453,7 +453,7 @@ log "  OK — 200, chunking: true"
 # exercise of a long-lived warehouse than always-brand-new files were.
 # ---------------------------------------------------------------------------------------------
 
-log "step 2/4 (checklist #2, #3): small + chunked (>= 8 MiB) round trip"
+log "step 2/5 (checklist #2, #3): small + chunked (>= 8 MiB) round trip"
 
 SRC_DIR="$WORKDIR/src"
 FR_DIR="$WORKDIR/franchise"
@@ -499,14 +499,14 @@ done
 log "  OK — small files and big.bin round-tripped identically"
 
 # ---------------------------------------------------------------------------------------------
-# Step 3/4 (checklist step 4) — after a successful lift, staging/ must not have grown: commit_
+# Step 3/5 (checklist step 4) — after a successful lift, staging/ must not have grown: commit_
 # lift's final batch sweeps everything THIS run staged. See the "staging/ baseline" section
 # above (PR #80 review, finding #7) for why this is a before/after delta on the bucket-wide
 # count rather than an absolute zero: a leftover from an unrelated aborted run must not wedge
 # this or any later run, only a leftover THIS run itself created should.
 # ---------------------------------------------------------------------------------------------
 
-log "step 3/4 (checklist #4): staging/ has not grown since before this run's lift"
+log "step 3/5 (checklist #4): staging/ has not grown since before this run's lift"
 
 staging_key_count_after="$(staging_key_count)"
 
@@ -517,7 +517,7 @@ fi
 log "  OK — staging/ did not grow ($staging_key_count_before -> $staging_key_count_after key(s))"
 
 # ---------------------------------------------------------------------------------------------
-# Step 4/4 — signature-sidecar fetch (binary response path) and the explicit control-plane read
+# Step 4/5 — signature-sidecar fetch (binary response path) and the explicit control-plane read
 # (KMS, control-plane half — see the caveat below).
 #
 # GET /v1/signatures/{hash} is the one endpoint that returns raw bytes directly through the
@@ -568,7 +568,7 @@ log "  OK — staging/ did not grow ($staging_key_count_before -> $staging_key_c
 #     see this file's header), establishing trust for the first time could not be verified here
 #     even if it were built.
 #
-# So: read whether trust is already established from the SAME handshake response step 1/4
+# So: read whether trust is already established from the SAME handshake response step 1/5
 # already fetched (`.trust` is `null` until a trust anchor exists — WarehouseInfo, forklift-core/
 # src/model/remote.rs), and only assert the 200 when it is. When it is not, this is logged
 # loudly as a known, standing can't-build — never a silent pass, never a deletion of the check —
@@ -576,7 +576,7 @@ log "  OK — staging/ did not grow ($staging_key_count_before -> $staging_key_c
 # this exact check starts pinning the binary-response path with no further script change needed.
 # ---------------------------------------------------------------------------------------------
 
-log "step 4/4: signature-sidecar fetch + explicit control-plane read"
+log "step 4/5: signature-sidecar fetch + explicit control-plane read"
 
 history_json="$(run_in "$SRC_DIR" "$FORKLIFT_BIN" history -n 1 --json)" || fail "forklift history --json failed"
 parcel_hash="$(printf '%s' "$history_json" | jq -r '.data.entries[0].parcel // empty' 2>/dev/null)"
@@ -619,5 +619,44 @@ read_code="$(curl_to_file "${ENDPOINT}${PREFIX}/v1/objects/$parcel_hash" "$WORKD
 [[ -s "$WORKDIR/object.bin" ]] || fail "object read came back with an empty body"
 
 log "  OK — explicit control-plane read succeeded"
+
+# ---------------------------------------------------------------------------------------------
+# Step 5/5 (FORK-304): a pallet name with '/' reaches the Lambda through the gateway. The client
+# sends the name as literal path segments, last in the path; the gateway decodes %2F before the
+# Lambda sees the path, so a name sent as one encoded segment would arrive split, and only a run
+# through the real gateway shows that the literal form arrives whole. Each run lifts a pallet of
+# its own name and deletes it again, so no run diverges from another; the delete leaves a
+# tombstone per run in the handshake, which nothing prunes today.
+# ---------------------------------------------------------------------------------------------
+
+log "step 5/5: a pallet named with '/' lifts and deletes through the gateway"
+
+SLASH_PALLET="verify-slash/$(date -u +%Y%m%d%H%M%S)-$$"
+pallets_json="$(run_in "$SRC_DIR" "$FORKLIFT_BIN" --json palletize)" || fail "forklift palletize --json failed"
+home_pallet="$(printf '%s' "$pallets_json" | jq -r '.data.current // empty' 2>/dev/null)"
+[[ -n "$home_pallet" ]] || fail "could not read the current pallet from 'forklift --json palletize': $pallets_json"
+
+run_in "$SRC_DIR" "$FORKLIFT_BIN" palletize "$SLASH_PALLET" >/dev/null || fail "forklift palletize $SLASH_PALLET failed"
+run_in "$SRC_DIR" "$FORKLIFT_BIN" shift "$SLASH_PALLET" >/dev/null || fail "forklift shift $SLASH_PALLET failed"
+run_in "$SRC_DIR" "$FORKLIFT_BIN" lift ||
+  fail "lifting $SLASH_PALLET failed: a name with '/' does not reach the Lambda's ref-update route whole"
+
+slash_code="$(curl_to_file "${ENDPOINT}${PREFIX}/v1/warehouse" "$WORKDIR/handshake-slash.json" \
+  -H "Authorization: Bearer $TOKEN")" || fail "handshake after the slash-named lift did not complete"
+[[ "$slash_code" == "200" ]] || fail "handshake after the slash-named lift expected 200, got $slash_code"
+jq -e --arg name "$SLASH_PALLET" '.pallets[$name] != null' "$WORKDIR/handshake-slash.json" >/dev/null ||
+  fail "the handshake does not list $SLASH_PALLET after its lift"
+
+run_in "$SRC_DIR" "$FORKLIFT_BIN" shift "$home_pallet" >/dev/null || fail "forklift shift $home_pallet failed"
+run_in "$SRC_DIR" "$FORKLIFT_BIN" palletize --delete "$SLASH_PALLET" --remote ||
+  fail "deleting $SLASH_PALLET on the remote failed: a name with '/' does not reach the Lambda's delete route whole"
+
+slash_code="$(curl_to_file "${ENDPOINT}${PREFIX}/v1/warehouse" "$WORKDIR/handshake-slash.json" \
+  -H "Authorization: Bearer $TOKEN")" || fail "handshake after the slash-named delete did not complete"
+[[ "$slash_code" == "200" ]] || fail "handshake after the slash-named delete expected 200, got $slash_code"
+jq -e --arg name "$SLASH_PALLET" '.pallets[$name] == null' "$WORKDIR/handshake-slash.json" >/dev/null ||
+  fail "the handshake still lists $SLASH_PALLET after its delete"
+
+log "  OK — $SLASH_PALLET lifted and deleted"
 
 log "all checks passed"

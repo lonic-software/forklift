@@ -566,19 +566,21 @@ fn resolve_route<B>(
     let path = request.uri().path();
     let method = request.method();
 
-    // Split into non-empty segments; the leading/trailing slashes drop out.
-    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    // Split into segments after the leading slash, keeping empty ones: a trailing slash or a `//`
+    // matches no route, as on `forklift-server`, except inside a pallet name, whose parse refuses
+    // the empty component (see [`match_endpoint`]).
+    let segments: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
 
     let (warehouse_id, rest) = match routing {
         Routing::Single(id) => (id.clone(), segments.as_slice()),
         Routing::Multi => match segments.split_first() {
             Some((&"warehouses", tail)) => match tail.split_first() {
-                Some((&id, endpoint)) => {
+                Some((&id, endpoint)) if !id.is_empty() => {
                     let id = param(id)?;
                     validate_warehouse_id(&id)?;
                     (id, endpoint)
                 }
-                None => return Err(not_found(path)),
+                _ => return Err(not_found(path)),
             },
             _ => return Err(not_found(path)),
         },
@@ -593,6 +595,13 @@ fn resolve_route<B>(
 /// `None` for an unknown path/method pair, which the caller turns into a `404`; a captured
 /// segment or query value that does not percent-decode to UTF-8 is a `422`.
 fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> HeadResult<Option<Route>> {
+    // An empty segment matches no route, as on `forklift-server`, whose captures never match an
+    // empty segment. A pallet name is the exception: it is the rest of the path, so an empty
+    // component reaches the handler, which refuses it like any other invalid name.
+    if !matches!(segments, ["v1", "pallets" | "holds", ..]) && segments.contains(&"") {
+        return Ok(None);
+    }
+
     // The session-commit endpoint is the one the spec writes without a `/v1` prefix
     // (`POST /lift/{session}/commit`), while its Transport section says every endpoint lives
     // under `/v1`. The client posts the `/v1` form; the bare one is accepted as the spec writes it.
@@ -620,25 +629,38 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> He
         (&Method::GET, ["signatures", hash]) => Some(Route::SignatureGet(param(hash)?)),
         (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut(param(hash)?)),
         (&Method::PUT, ["trust"]) => Some(Route::PutTrust),
-        (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate(param(name)?)),
-        (&Method::DELETE, ["pallets", name]) => Some(Route::RefDelete {
-            name: param(name)?,
+        (&Method::POST, ["pallets", name @ ..]) if is_tail(name) => Some(Route::RefUpdate(pallet_name(name)?)),
+        (&Method::DELETE, ["pallets", name @ ..]) if is_tail(name) => Some(Route::RefDelete {
+            name: pallet_name(name)?,
             old_head: query_param(query, "old_head")?.ok_or_else(|| {
                 HeadError::unprocessable("A pallet delete names the head it deletes: ?old_head=<hash>.")
             })?,
         }),
-        (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds(param(name)?)),
+        (&Method::POST, ["holds", name @ ..]) if is_tail(name) => Some(Route::Holds(pallet_name(name)?)),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
         _ => None,
     })
 }
 
+/// Whether the rest of the path after `pallets` or `holds` names something: `/v1/pallets/` and
+/// `/v1/pallets` match no route, as on `forklift-server`, whose wildcard needs a non-empty tail.
+fn is_tail(segments: &[&str]) -> bool {
+    !matches!(segments, [] | [""])
+}
+
+/// A pallet name, the rest of the path after `pallets` or `holds`: the client sends a name such
+/// as `feature/x` as literal segments, last in the path, so each segment is decoded on its own
+/// and the decoded segments are joined with `/`. An empty segment stays an empty component, so
+/// `a//b` and `a/b/` are not `a/b`; every handler parses the name, refusing an empty component,
+/// `.`, `..` and anything outside the name alphabet.
+fn pallet_name(segments: &[&str]) -> HeadResult<String> {
+    Ok(segments.iter().map(|segment| param(segment)).collect::<HeadResult<Vec<_>>>()?.join("/"))
+}
+
 /// A captured path parameter, percent-decoded as `forklift-server`'s `Path` extractor decodes
-/// it. The path is split into segments first, so an encoded `/` stays inside its segment: a
-/// pallet named `feature/x` arrives as the one segment `feature%2Fx`. A segment that does not
-/// decode to UTF-8 is a `422`, this head's status for a request it cannot process
-/// (`forklift-server` answers it `400`).
+/// it. A segment that does not decode to UTF-8 is a `422`, this head's status for a request it
+/// cannot process (`forklift-server` answers it `400`).
 fn param(segment: &str) -> HeadResult<String> {
     percent_decode_str(segment).decode_utf8().map(|value| value.into_owned()).map_err(|_| {
         HeadError::unprocessable(format!(

@@ -188,12 +188,12 @@ pub struct MissingObjectsResponse {
     pub missing: Vec<String>,
 }
 
-/// The most candidates one `POST /v1/pallets/{name}/holds` request may ask about. Both heads
+/// The most candidates one `POST /v1/holds/{name}` request may ask about. Both heads
 /// refuse a longer list with a `422`, since a client's own cap does not bind a hostile client.
 /// It matches the held-heads record's per-pallet cap, so one request covers a pallet's record.
 pub const MAX_HOLDS_CANDIDATES: usize = 16;
 
-/// The body of `POST /v1/pallets/{name}/holds`: parcel hashes the client once saw this pallet
+/// The body of `POST /v1/holds/{name}`: parcel hashes the client once saw this pallet
 /// hold, asking whether the pallet's current head still reaches each one.
 #[derive(Serialize, Deserialize)]
 pub struct HoldsRequest {
@@ -216,7 +216,7 @@ pub enum HoldAnswer {
     Unknown,
 }
 
-/// The response of `POST /v1/pallets/{name}/holds`: one answer per distinct candidate asked.
+/// The response of `POST /v1/holds/{name}`: one answer per distinct candidate asked.
 #[derive(Serialize, Deserialize)]
 pub struct HoldsResponse {
     pub holds: BTreeMap<String, HoldAnswer>,

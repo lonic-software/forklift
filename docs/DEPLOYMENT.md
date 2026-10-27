@@ -227,7 +227,7 @@ attempts with backoff, before the event is dropped or sent to a configured on-fa
 covers transient failures — worth pairing with a dead-letter queue/on-failure destination on the
 verifier for visibility into anything that exhausts its retries.
 
-`POST /v1/pallets/{name}/holds` needs no headroom of its own. Its ancestry walk reads parcels
+`POST /v1/holds/{name}` needs no headroom of its own. Its ancestry walk reads parcels
 from S3 in concurrent rounds of up to 64, taken from the front of the walk. A straight chain of
 parcels still costs one round trip per parcel, since a parent cannot be asked for before its
 child is read, so there it covers a few hundred parcels where the direct head covers thousands.
@@ -478,7 +478,7 @@ directly). In multi-warehouse mode every path below is additionally prefixed wit
 | `PUT` | `/v1/trust` | Establish or re-genesis the trust anchor |
 | `POST` | `/v1/pallets/{name}` | The ref-update CAS |
 | `DELETE` | `/v1/pallets/{name}?old_head={hash}` | Delete a user pallet, leaving a tombstone at its head |
-| `POST` | `/v1/pallets/{name}/holds` | Which of up to 16 parcels the pallet still holds (a bounded walk; `unknown` past its step or time bound) |
+| `POST` | `/v1/holds/{name}` | Which of up to 16 parcels the pallet still holds (a bounded walk; `unknown` past its step or time bound) |
 | `POST` | `/v1/resolve` | Operator id → display name (always an empty map on this head — no resolution hook) |
 | `GET` | `/v1/bundles/latest` | Latest whole-warehouse bundle (always `404` today — no bundle builder exists for this head yet) |
 | `POST` | `/lift/{session}/commit` or `/v1/lift/{session}/commit` | Verify-and-promote a lift session's staged uploads (both path forms are accepted — a documented spec/implementation mismatch the router tolerates rather than picks a side on) |

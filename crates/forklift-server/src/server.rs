@@ -804,8 +804,8 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .route("/objects/{hash}", get(get_object).put(put_object))
         .route("/signatures/{hash}", get(get_signature).put(put_signature))
         .route("/trust", put(put_trust))
-        .route("/pallets/{name}", post(post_ref_update).delete(delete_ref))
-        .route("/pallets/{name}/holds", post(post_holds))
+        .route("/pallets/{*name}", post(post_ref_update).delete(delete_ref))
+        .route("/holds/{*name}", post(post_holds))
         .route("/resolve", post(post_resolve))
         .route("/bundles/latest", get(get_bundle));
 
@@ -2058,7 +2058,7 @@ const MAX_CONCURRENT_HOLDS_WALKS: usize = 4;
 
 static HOLDS_WALKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_HOLDS_WALKS);
 
-/// `POST /v1/pallets/{name}/holds` — which of these parcels does the pallet still hold, its head
+/// `POST /v1/holds/{name}` — which of these parcels does the pallet still hold, its head
 /// or one of the head's ancestors? A bounded walk ([`merge_utils::holds`]): a candidate it
 /// could not settle is answered `unknown`, never `not_held`. Reading history is what fetching
 /// already allows, so nothing past authentication is asked. A pallet deleted here is walked from
@@ -2671,6 +2671,12 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    // Parsed before the admission hook, so a hook only ever sees a valid reference.
+    let pallet_ref = match pallet_utils::PalletRef::parse(&name).map_err(unprocessable) {
+        Ok(pallet_ref) => pallet_ref,
+        Err(error) => return error_response(error),
+    };
+
     if let Err(error) = check_admission(&state, &params, &principal, "ref_update", Some(&name)).await {
         return error_response(error);
     }
@@ -2683,9 +2689,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     };
 
     let result = blocking(Arc::clone(&warehouse), move || {
-        // Parse the qualified reference: a meta pallet arrives as `@office`. The server
-        // routes by *namespace*, never by a hard-coded name (DESIGN.html §3.3).
-        let pallet_ref = pallet_utils::PalletRef::parse(&name).map_err(unprocessable)?;
+        // A meta pallet arrives as `@office`. The server routes by *namespace*, never by a
+        // hard-coded name (DESIGN.html §3.3).
         let namespace = pallet_ref.namespace;
         let bare = pallet_ref.name.clone();
         let is_meta = namespace == pallet_utils::PalletNamespace::Meta;
@@ -2978,6 +2983,12 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    // Parsed before the admission hook, as in [`post_ref_update`].
+    let pallet_ref = match pallet_utils::PalletRef::parse(&name).map_err(unprocessable) {
+        Ok(pallet_ref) => pallet_ref,
+        Err(error) => return error_response(error),
+    };
+
     if let Err(error) = check_admission(&state, &params, &principal, "ref_delete", Some(&name)).await {
         return error_response(error);
     }
@@ -2990,8 +3001,6 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     };
 
     let result = blocking(Arc::clone(&warehouse), move || {
-        let pallet_ref = pallet_utils::PalletRef::parse(&name).map_err(unprocessable)?;
-
         if pallet_ref.namespace == pallet_utils::PalletNamespace::Meta {
             return Err(unprocessable(format!(
                 "Meta pallet \"{}\" cannot be deleted: it is tracked metadata, not a line of work.",

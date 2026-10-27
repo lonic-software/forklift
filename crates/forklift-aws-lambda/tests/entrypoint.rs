@@ -395,28 +395,28 @@ fn the_holds_endpoint_walks_the_stored_history() {
     let stranger = "0".repeat(64);
     let request = HoldsRequest { candidates: vec![main_head.clone(), first.clone(), stranger.clone()] };
 
-    let response = fixture.call(post_json("/v1/pallets/main/holds", &request));
+    let response = fixture.call(post_json("/v1/holds/main", &request));
     assert_eq!(status(&response), 200);
     let holds: HoldsResponse = body_json(&response);
     assert_eq!(holds.holds[&main_head], HoldAnswer::Held, "the head itself");
     assert_eq!(holds.holds[&first], HoldAnswer::Held, "an ancestor read from the store");
     assert_eq!(holds.holds[&stranger], HoldAnswer::NotHeld, "the whole history was read");
 
-    let holds: HoldsResponse = body_json(&fixture.call(post_json("/v1/pallets/elsewhere/holds", &request)));
+    let holds: HoldsResponse = body_json(&fixture.call(post_json("/v1/holds/elsewhere", &request)));
     assert_eq!(holds.holds[&main_head], HoldAnswer::NotHeld, "a pallet the warehouse lacks holds nothing");
 
     let over_cap = HoldsRequest { candidates: (0..17).map(|n| format!("{:064x}", n)).collect() };
-    assert_eq!(status(&fixture.call(post_json("/v1/pallets/main/holds", &over_cap))), 422);
-    assert_eq!(status(&fixture.call(post_json("/v1/pallets/Main/holds", &request))), 422);
+    assert_eq!(status(&fixture.call(post_json("/v1/holds/main", &over_cap))), 422);
+    assert_eq!(status(&fixture.call(post_json("/v1/holds/Main", &request))), 422);
     let uppercase = HoldsRequest { candidates: vec![main_head.to_ascii_uppercase()] };
-    assert_eq!(status(&fixture.call(post_json("/v1/pallets/main/holds", &uppercase))), 422);
+    assert_eq!(status(&fixture.call(post_json("/v1/holds/main", &uppercase))), 422);
 }
 
-/// FORK-297: a pallet name with `/` travels as one percent-encoded segment, as the client sends
-/// it, and is decoded back to the name on both per-pallet routes. Unencoded, the name is two
-/// segments and no route.
+/// FORK-304: a pallet name with `/` arrives as literal segments, as the API gateway hands the
+/// Lambda a path (it decodes `%2F` before routing), and is the whole rest of the path on all three
+/// per-pallet routes. Nothing literal follows a name, so `main/holds` is a pallet, not a route.
 #[test]
-fn a_pallet_named_with_a_slash_routes_as_one_encoded_segment() {
+fn a_pallet_named_with_a_slash_routes_as_literal_segments() {
     let area = Area::new("slash-pallet");
     prepare(&area, "wh");
     area.write_file("wh/readme.txt", "hello\n");
@@ -432,20 +432,101 @@ fn a_pallet_named_with_a_slash_routes_as_one_encoded_segment() {
     }
 
     let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
-    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x", &commit))), 404);
-    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature%2Fx", &commit))), 200);
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x", &commit))), 200);
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/main/holds", &commit))), 200);
 
     let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
     assert_eq!(info.pallets.get("feature/x"), Some(&main_head));
+    assert_eq!(info.pallets.get("main/holds"), Some(&main_head), "a ref update of the pallet main/holds");
     assert_eq!(info.pallets.get("feature"), None);
+    assert_eq!(info.pallets.get("main"), None);
 
     let request = HoldsRequest { candidates: vec![main_head.clone()] };
-    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x/holds", &request))), 404);
-    let holds: HoldsResponse = body_json(&fixture.call(post_json("/v1/pallets/feature%2Fx/holds", &request)));
+    let holds: HoldsResponse = body_json(&fixture.call(post_json("/v1/holds/feature/x", &request)));
     assert_eq!(holds.holds[&main_head], HoldAnswer::Held, "the holds of feature/x, not of a prefix");
+
+    let response = fixture.call(delete(&format!("/v1/pallets/feature/x?old_head={}", main_head)));
+    assert_eq!(status(&response), 200);
+    let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
+    assert_eq!(info.pallets.get("feature/x"), None);
+    assert_eq!(info.tombstone("feature/x"), Some(&main_head));
+    assert_eq!(info.pallets.get("main/holds"), Some(&main_head), "only the named pallet");
 
     // A segment that decodes to no UTF-8 name is refused, not routed as some other name.
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/%FF", &commit))), 422);
+}
+
+/// A tail that is no valid pallet name is refused on every per-pallet route before the ref store
+/// is touched: a `.`, `..`, empty or uppercase component is a 422, and no tail at all matches no
+/// route. The heads are real and `feature/x` and `main` exist, so a tail read as one of them (a
+/// `//` or trailing `/` collapsed, a `..` resolved) would move or delete it.
+#[test]
+fn a_tail_naming_no_valid_pallet_is_refused_on_every_route() {
+    let area = Area::new("invalid-pallet-tail");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    let harvest = harvest(&area.path("wh"));
+    let head = harvest.head_of("main").expect("main has a head");
+
+    let fixture = Fixture::direct();
+    for (hash, bytes) in &harvest.objects {
+        assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
+    }
+    let create = RefUpdateRequest { old_head: None, new_head: head.clone(), tombstone: None };
+    for name in ["feature/x", "main"] {
+        assert_eq!(status(&fixture.call(post_json(&format!("/v1/pallets/{}", name), &create))), 200);
+    }
+
+    let request = HoldsRequest { candidates: vec![head.clone()] };
+    for tail in [
+        "feature/..", "../main", "..%2Fmain", "feature/./x", "feature/X", "feature//x", "feature/x/", "/main",
+    ] {
+        let update = fixture.call(post_json(&format!("/v1/pallets/{}", tail), &create));
+        assert_eq!(status(&update), 422, "update {}", tail);
+        let holds = fixture.call(post_json(&format!("/v1/holds/{}", tail), &request));
+        assert_eq!(status(&holds), 422, "holds {}", tail);
+        let removal = fixture.call(delete(&format!("/v1/pallets/{}?old_head={}", tail, head)));
+        assert_eq!(status(&removal), 422, "delete {}", tail);
+    }
+
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/", &create))), 404);
+    assert_eq!(status(&fixture.call(post_json("/v1/holds/", &request))), 404);
+    assert_eq!(status(&fixture.call(delete(&format!("/v1/pallets/?old_head={}", head)))), 404);
+
+    let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
+    assert_eq!(info.pallets.len(), 2, "no ref moved: {:?}", info.pallets);
+    assert_eq!(info.pallets.get("feature/x"), Some(&head));
+    assert_eq!(info.pallets.get("main"), Some(&head));
+    assert_eq!(info.tombstone("feature/x"), None);
+    assert_eq!(info.tombstone("main"), None);
+}
+
+/// An empty segment outside a pallet name matches no route, as on `forklift-server`: a trailing
+/// slash, an empty capture and an empty warehouse id are each a 404, never a 422 for an empty value.
+#[test]
+fn an_empty_segment_outside_a_pallet_name_matches_no_route() {
+    let fixture = Fixture::direct();
+    let hash = "b".repeat(64);
+    for request in [
+        get("/v1/warehouse/"),
+        get("/v1/objects/"),
+        put_bytes("/v1/objects/?session=s", Vec::new()),
+        get("/v1/signatures/"),
+        put_bytes("/v1/signatures/", Vec::new()),
+        post_json("/v1/lift//commit", &serde_json::json!({})),
+        post_json("/lift//commit", &serde_json::json!({})),
+        get(&format!("/v1//objects/{}", hash)),
+    ] {
+        let uri = request.uri().to_string();
+        assert_eq!(status(&fixture.call(request)), 404, "{}", uri);
+    }
+
+    let fixture = Fixture::multi();
+    for uri in ["/warehouses/", "/warehouses//v1/warehouse", "/warehouses/acme/", "/warehouses/acme/v1/warehouse/"] {
+        assert_eq!(status(&fixture.call(get(uri))), 404, "{}", uri);
+    }
 }
 
 /// Every captured segment is percent-decoded, not only the pallet name: an object hash sent
