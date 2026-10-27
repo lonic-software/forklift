@@ -131,10 +131,11 @@ pub enum OfficePrecondition<'a> {
     /// nothing office-related). No office precondition is built at all — not "expect unborn".
     NotConsumed,
     /// The caller's decision read the office pallet and found it unborn; the commit must
-    /// condition on it still being unborn. A pallet delete builds this in the trust-bootstrap
-    /// window (anchor planted, office not yet lifted), where its authority check admitted the
-    /// caller *because* no office head existed — an office lift landing before the commit could
-    /// deny them, so the commit must not outlive it. `ref_update` never builds it: an untrusted
+    /// condition on it still being unborn. A pallet delete builds this whenever the office is
+    /// unborn, with or without an anchor. Where it matters is the trust-bootstrap window (anchor
+    /// planted, office not yet lifted): there the authority check admitted the caller *because* no
+    /// office head existed, so an office lift landing before the commit could deny them, and the
+    /// commit must not outlive it. `ref_update` never builds it: an untrusted
     /// audit consumes no office head, and a trusted one refuses an unborn office first.
     Unborn,
     /// The caller's audit read this office head; the commit must condition on it unchanged.

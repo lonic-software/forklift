@@ -282,9 +282,10 @@ impl DynamoRefStore {
     /// The `None` arm is reached from two callers, each of which genuinely consumed "the office
     /// is unborn". `replace_trust`: `put_trust` reads the office head unconditionally to run its
     /// `adopts` check, so an anchor adopting nothing is one whose validation depended on the
-    /// office still being unborn. A pallet delete, through `OfficePrecondition::Unborn`: in the
-    /// trust-bootstrap window its authority check admits the caller because no office head
-    /// exists yet, so an office lift landing before the commit must refuse it. A ref update never
+    /// office still being unborn. A pallet delete, through `OfficePrecondition::Unborn`, on every
+    /// warehouse whose office is unborn: in the trust-bootstrap window its authority check admits
+    /// the caller because no office head exists yet, so an office lift landing before the commit
+    /// must refuse it. A ref update never
     /// reaches it — an audit that found the office pallet missing refuses before the commit
     /// (`head.rs::ref_update`) — and the distinction lives in the callers' parameter types, not
     /// in this method, which only builds what it is told.

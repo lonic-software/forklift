@@ -403,8 +403,8 @@ pub fn pallet_moved_refusal(current: Option<&str>, expected: Option<&str>) -> Co
     ))
 }
 
-/// The refusal for a ref update that expected user pallet `pallet` at a head and found it deleted
-/// on the remote at `head`: lowering cannot resolve it (a lift after a lower would be a creation,
+/// The refusal for a ref update or a delete that expected user pallet `pallet` at a head and found
+/// it deleted on the remote at `head`: lowering cannot resolve it (a lift after a lower would be a creation,
 /// which the tombstone binds), so it names the deletion and the way back. `offers_drop` is whether
 /// the remote's head has an operator command that drops a tombstone, which the message then names.
 pub fn pallet_deleted_refusal(pallet: &str, head: &str, offers_drop: bool) -> CoreError {

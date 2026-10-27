@@ -1067,11 +1067,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// pallet an open haul names (a read-time check, as on every head).
     ///
     /// The commit conditions on the pallet's head, on the office as the authority check read it
-    /// (unborn included: in the trust-bootstrap window the check admits every operator *because*
-    /// no office exists, so an office lifted before the commit must refuse it), and on the
-    /// anchor's stored bytes. A refusal because the office or the anchor moved decides again from
-    /// fresh reads, up to [`DELETE_ATTEMPTS`] times; a transient refusal is re-issued as a ref
-    /// update's is.
+    /// (unborn included, on every warehouse: in the trust-bootstrap window the check admits every
+    /// operator *because* no office exists, so an office lifted before the commit must refuse it),
+    /// and on the anchor's stored bytes. A refusal because the office or the anchor moved decides
+    /// again from fresh reads, up to [`DELETE_ATTEMPTS`] times; a transient refusal is re-issued as
+    /// a ref update's is.
     pub fn delete_pallet(&self, caller: &Principal, name: &str, old_head: &str) -> HeadResult<()> {
         let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
 
