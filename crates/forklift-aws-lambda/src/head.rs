@@ -581,7 +581,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 _ => None,
             },
         )
-        .map_err(HeadError::internal)?;
+        .or_else(|error| settled_as_transient(&uncertain, error, TrustWriteOutcome::Transient))?;
 
         match outcome {
             TrustWriteOutcome::Replaced => Ok(TrustResult::Established),
@@ -1042,7 +1042,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 _ => None,
             },
         )
-        .map_err(HeadError::internal)?;
+        .or_else(|error| settled_as_transient(&uncertain, error, CasOutcome::Transient))?;
 
         match outcome {
             CasOutcome::Committed => Ok(()),
@@ -1122,7 +1122,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             };
 
             let uncertain = Cell::new(false);
-            let outcome = match reissue(
+            let outcome = reissue(
                 self.deadline,
                 |token| {
                     self.refs.delete_head(
@@ -1138,13 +1138,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
                     _ => None,
                 },
-            ) {
-                Ok(outcome) => outcome,
-                // A fault after an attempt of unknown fate leaves that attempt to the ref, as a
-                // transient end does: it may have landed.
-                Err(_) if uncertain.get() => CasOutcome::Transient(TransientCause::FateUnknown),
-                Err(error) => return Err(HeadError::internal(error)),
-            };
+            )
+            .or_else(|error| settled_as_transient(&uncertain, error, CasOutcome::Transient))?;
 
             match outcome {
                 CasOutcome::Committed => return Ok(()),
@@ -1163,14 +1158,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // Under one token an earlier attempt may still have landed: the ref decides.
                     // A ref that left `old_head` some other way is answered as the commit's
                     // conflict would have been, not as contention that moved nothing.
-                    // A read that fails too leaves an attempt that may have landed
-                    // unconfirmed; with none in doubt, it is the read's own fault.
+                    // A read that fails too leaves the fate where the attempts left it.
                     return match self.refs.get_head(PalletNamespace::User, &bare) {
                         Ok(RefHead::Deleted(tombstone)) if tombstone == old_head => Ok(()),
                         Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(uncertain.get())),
                         Ok(current) => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
-                        Err(_) if uncertain.get() => Err(self.delete_contention(true)),
-                        Err(error) => Err(HeadError::internal(error)),
+                        Err(_) => Err(self.delete_contention(uncertain.get())),
                     };
                 }
             }
@@ -1434,8 +1427,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// The `503` for a delete whose fate this request could not settle: with `uncertain` false
-    /// every attempt was refused for a reason showing no input moved; with it true an attempt
-    /// may have landed, and neither the commit nor the ref read back confirmed it. Running the
+    /// every attempt was refused for a reason showing no input moved, so nothing did whatever the
+    /// ref read back says or whether it could be read; with it true an attempt may have landed,
+    /// and neither the attempts nor the ref read back confirmed it. Running the
     /// same delete again is safe whatever happened: one that landed meanwhile answers `200`.
     fn delete_contention(&self, uncertain: bool) -> HeadError {
         let what = match uncertain {
@@ -1592,10 +1586,26 @@ fn upload_discarded(message: String) -> HeadError {
     )))
 }
 
-/// Why an uncertain transaction's `503` cannot say what happened, shared by both of its messages.
+/// Why an uncertain transaction's `503` cannot say what happened, shared by the commit's, the
+/// anchor write's and the delete's.
 const UNCONFIRMED: &str = "an attempt timed out, failed inside the warehouse's storage, or was \
-    still being applied when this request ran out of attempts, so it may or may not have been \
+    still being applied when this request stopped trying, so it may or may not have been \
     applied.";
+
+/// A re-issue that faulted, answered as the transient end it would otherwise have had when an
+/// earlier attempt under its token was of unknown fate: that attempt may still have landed, so
+/// the fault says nothing about the write and must not answer `500` as if it did. With no attempt
+/// in doubt the fault is the answer.
+fn settled_as_transient<T>(
+    uncertain: &Cell<bool>,
+    error: String,
+    transient: fn(TransientCause) -> T,
+) -> Result<T, HeadError> {
+    match uncertain.get() {
+        true => Ok(transient(TransientCause::FateUnknown)),
+        false => Err(HeadError::internal(error)),
+    }
+}
 
 /// Pass `cause` through to the re-issue loop, first noting in `uncertain` whether this attempt
 /// may yet land. Only a refusal for contention shows the attempt did not: an unknown fate may

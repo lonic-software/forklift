@@ -435,7 +435,11 @@ every other ref write, conditioned on the office and anchor the authorization re
 moved meanwhile, the head decides again. It answers `200` with no body. The open-haul check is
 made when the request is read, so a haul opened just before the removal is not refused; it keeps
 its proposed head, and the tombstone keeps the target's. Both `forklift-server` and the
-serverless head serve this endpoint with these checks and answers.
+serverless head serve this endpoint with these checks and answers, and the serverless head one
+more: a `503` when its storage stayed busy through every attempt it could afford, or an attempt
+may have landed and could not be confirmed. Either claims nothing about the pallet, and sending
+the same request again is always safe: a delete that landed meanwhile answers `200`, from the
+tombstone it left.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 

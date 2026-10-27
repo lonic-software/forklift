@@ -2226,6 +2226,8 @@ struct TransientOnCommit {
     /// What the first attempt answers instead of `refusal`, when set: a request whose attempts
     /// disagree, as when an attempt of unknown fate is followed by contention.
     first: Option<CasOutcome>,
+    /// Fail every attempt after the first with a fault instead.
+    fault: bool,
     tokens: std::sync::Mutex<Vec<String>>,
 }
 
@@ -2240,6 +2242,7 @@ impl TransientOnCommit {
             refusals,
             refusal: CasOutcome::Transient(TransientCause::Contended),
             first: None,
+            fault: false,
             tokens: Default::default(),
         }
     }
@@ -2286,6 +2289,10 @@ impl RefStore for TransientOnCommit {
             if let Some(first) = &self.first {
                 return Ok(first.clone());
             }
+        }
+
+        if attempt > 1 && self.fault {
+            return Err("a fault".to_string());
         }
 
         if attempt <= self.refusals {
@@ -2417,6 +2424,23 @@ fn a_commit_of_unknown_fate_answers_503_without_claiming_nothing_moved() {
         assert!(err.message.contains("may or may not have been applied"), "{name}: {}", err.message);
         assert!(err.message.contains("Fetch the warehouse"), "{name}: {}", err.message);
         assert!(!err.message.contains("No input is known to have moved"), "{name}: {}", err.message);
+    }
+
+    // A fault on the re-issue is a `503` of unknown fate after an attempt of unknown fate, and the
+    // fault itself after contention.
+    for (name, first, status) in [
+        ("unknown-then-fault-cas", TransientCause::FateUnknown, Status::ServiceUnavailable),
+        ("contended-then-fault-cas", TransientCause::Contended, Status::Internal),
+    ] {
+        let (_area, head, main_head) = uploaded_first_push(
+            name,
+            TransientOnCommit { first: Some(CasOutcome::Transient(first)), fault: true, ..TransientOnCommit::always() },
+        );
+        let err = head
+            .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None })
+            .expect_err("a fault is a refusal");
+
+        assert_eq!(err.status, status, "{name}: {}", err.message);
     }
 
     let (_area, head, main_head) =
@@ -3161,6 +3185,8 @@ struct TransientOnAnchorWrite {
     refusal: TrustWriteOutcome,
     /// What the first attempt answers instead of `refusal`, when set.
     first: Option<TrustWriteOutcome>,
+    /// Fail every attempt after the first with a fault instead.
+    fault: bool,
     tokens: std::sync::Mutex<Vec<String>>,
 }
 
@@ -3171,6 +3197,7 @@ impl TransientOnAnchorWrite {
             refusals,
             refusal: TrustWriteOutcome::Transient(TransientCause::Contended),
             first: None,
+            fault: false,
             tokens: Default::default(),
         }
     }
@@ -3249,6 +3276,10 @@ impl RefStore for TransientOnAnchorWrite {
             if let Some(first) = &self.first {
                 return Ok(first.clone());
             }
+        }
+
+        if attempt > 1 && self.fault {
+            return Err("a fault".to_string());
         }
 
         if attempt <= self.refusals {
@@ -3474,6 +3505,22 @@ fn an_anchor_write_of_unknown_fate_answers_503_without_claiming_nothing_changed(
         assert_eq!(err.status, Status::ServiceUnavailable);
         assert!(err.message.contains("may or may not have been applied"), "{}", err.message);
         assert!(!err.message.contains("nothing was changed"), "{}", err.message);
+    }
+
+    for (first, status) in
+        [(TransientCause::FateUnknown, Status::ServiceUnavailable), (TransientCause::Contended, Status::Internal)]
+    {
+        let head = Head::new(
+            MemoryObjectStore::new(),
+            TransientOnAnchorWrite {
+                first: Some(TrustWriteOutcome::Transient(first)),
+                fault: true,
+                ..TransientOnAnchorWrite::new(store.clone(), usize::MAX)
+            },
+        );
+        let err = head.put_trust(&Principal::Static, &mine).expect_err("a fault is a refusal");
+
+        assert_eq!(err.status, status, "{}", err.message);
     }
 
     let head = Head::new(MemoryObjectStore::new(), TransientOnAnchorWrite::new(store, usize::MAX));
@@ -3776,11 +3823,12 @@ enum DeleteRace {
     Transient,
     /// Run this against the shared store before the first attempt, then answer as [`Self::Transient`].
     TransientAfter(RefCell<Option<RacingWrite>>),
-    /// Answer as [`Self::Transient`], and fail every ref read once the first attempt was made.
-    TransientThenUnreadable(Cell<bool>),
-    /// Forward the first attempt and answer it as transient of unknown fate, then fail every later
-    /// attempt with a fault.
-    LandsThenFault(Cell<bool>),
+    /// Answer every attempt as transient for this cause without forwarding it, and fail every ref
+    /// read once the first attempt was made.
+    TransientThenUnreadable(TransientCause, Cell<bool>),
+    /// Answer the first attempt as transient for this cause, forwarding it first when `lands`,
+    /// then fail every later attempt with a fault.
+    ThenFault { first: TransientCause, lands: bool, attempted: Cell<bool> },
 }
 
 /// Wraps a shared [`MemoryRefStore`], interfering with `delete_head` as its [`DeleteRace`]
@@ -3799,7 +3847,7 @@ impl DeleteRace {
 impl RefStore for RacesTheDelete {
     fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
         match &self.race {
-            DeleteRace::TransientThenUnreadable(attempted) if attempted.get() => Err("throttled".to_string()),
+            DeleteRace::TransientThenUnreadable(_, attempted) if attempted.get() => Err("throttled".to_string()),
             _ => self.inner.get_head(namespace, name),
         }
     }
@@ -3838,14 +3886,16 @@ impl RefStore for RacesTheDelete {
                 Ok(CasOutcome::Transient(TransientCause::FateUnknown))
             }
             DeleteRace::Transient => Ok(CasOutcome::Transient(TransientCause::FateUnknown)),
-            DeleteRace::LandsThenFault(attempted) if attempted.replace(true) => Err("a fault".to_string()),
-            DeleteRace::LandsThenFault(_) => {
-                self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)?;
-                Ok(CasOutcome::Transient(TransientCause::FateUnknown))
+            DeleteRace::ThenFault { attempted, .. } if attempted.replace(true) => Err("a fault".to_string()),
+            DeleteRace::ThenFault { first, lands, .. } => {
+                if *lands {
+                    self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)?;
+                }
+                Ok(CasOutcome::Transient(*first))
             }
-            DeleteRace::TransientThenUnreadable(attempted) => {
+            DeleteRace::TransientThenUnreadable(cause, attempted) => {
                 attempted.set(true);
-                Ok(CasOutcome::Transient(TransientCause::FateUnknown))
+                Ok(CasOutcome::Transient(*cause))
             }
             DeleteRace::TransientAfter(race) => {
                 if let Some(race) = race.borrow_mut().take() {
@@ -3962,16 +4012,33 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_v2));
 
-    let area = Area::new("delete-transient-unreadable");
-    let (_, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::TransientThenUnreadable(Cell::new(false)));
-    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the ref cannot be read");
+    // A ref that cannot be read leaves the fate where the attempts left it.
+    for (cause, says) in [(TransientCause::FateUnknown, "could not be confirmed"), (TransientCause::Contended, "could not complete")] {
+        let area = Area::new("delete-transient-unreadable");
+        let (_, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::TransientThenUnreadable(cause, Cell::new(false)));
+        let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the ref cannot be read");
+        assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+        assert!(err.message.contains(says), "{}", err.message);
+    }
+
+    // A fault on the re-issue does not hide an attempt of unknown fate before it: the ref decides
+    // whether it landed. After contention the fault is the answer.
+    let fault = |first, lands| move |_: String, _: String| DeleteRace::ThenFault { first, lands, attempted: Cell::new(false) };
+
+    let area = Area::new("delete-lands-then-fault");
+    let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::FateUnknown, true));
+    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("the first attempt landed");
+
+    let area = Area::new("delete-unknown-then-fault");
+    let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::FateUnknown, false));
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert!(err.message.contains("could not be confirmed"), "{}", err.message);
 
-    // A fault on the re-issue does not hide the attempt before it, which landed.
-    let area = Area::new("delete-lands-then-fault");
-    let (_, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::LandsThenFault(Cell::new(false)));
-    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("the first attempt landed");
+    let area = Area::new("delete-contended-then-fault");
+    let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::Contended, false));
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the fault");
+    assert_eq!(err.status, Status::Internal, "{}", err.message);
 
     let area = Area::new("delete-transient-moved");
     let (_, head, feature_v2, _) =
