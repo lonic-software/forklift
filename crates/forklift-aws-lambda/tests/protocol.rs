@@ -1627,7 +1627,9 @@ fn a_batch_always_carries_one_object_and_absent_ones_do_not_mark_it() {
     let mut hashes = absent.clone();
     hashes.extend(objects.iter().map(|(hash, _)| hash.clone()));
 
-    let head = seeded_head(MemoryObjectStore::new(), &objects).with_batch_limits(1, std::time::Duration::ZERO);
+    // A zero budget: every object is over it, and only the rule that an empty answer never
+    // stops lets one through.
+    let head = seeded_head(MemoryObjectStore::new(), &objects).with_batch_limits(0, std::time::Duration::ZERO);
     let answer = head.batch(&hashes).expect("batch");
     assert!(answer.truncated);
     assert_eq!(bundled(&area, "one", answer, &hashes), hashes[2..3], "the absent ones are skipped, then one object");
