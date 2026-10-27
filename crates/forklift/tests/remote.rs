@@ -8364,6 +8364,44 @@ fn a_stale_clone_restores_a_pallet_deleted_on_the_remote_rather_than_re_creating
     assert!(!named.status.success() && stderr(&named).contains("needs \"--delete\" or \"--restore\""), "{}", stderr(&named));
 }
 
+// Revert: drop the capability check → the delete is sent, and reaches the server behind the proxy.
+#[test]
+fn a_remote_whose_handshake_lists_no_tombstones_is_never_sent_a_delete() {
+    let area = TestArea::new("remote-delete-unsupported");
+    let server = Server::start(&area, None);
+    let feat = remote_with_a_side_pallet(&area, &server);
+    let main = pallet_head(&area, "a", "main");
+
+    // The handshake an older head, or the serverless one, sends: no "tombstones".
+    let handshake = serde_json::json!({
+        "protocol": forklift_core::model::remote::PROTOCOL_VERSION,
+        "default_pallet": "main",
+        "pallets": { "main": main, "feat": feat },
+        "trust": null,
+    }).to_string();
+    let deletes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&deletes);
+    let proxy = InterceptingProxy::start_seeing(&server.url, move |path, head| {
+        if head.starts_with("DELETE") {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        path.ends_with("/v1/warehouse").then(|| format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            handshake.len(), handshake
+        ).into_bytes())
+    });
+    assert_success(&area.forklift("a", &["config", "remote.url", &proxy.url]));
+
+    for verb in ["--delete", "--restore"] {
+        let refused = area.forklift("a", &["palletize", verb, "feat", "--remote"]);
+        assert!(!refused.status.success(), "{}", stdout(&refused));
+        assert!(stderr(&refused).contains("does not support deleting pallets"), "{}", stderr(&refused));
+    }
+    assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing was sent");
+    assert!(area.path("server-root/.forklift/pallets/feat").exists());
+}
+
 // Revert: walk only the handshake's live pallets in the delete's containment → the local delete
 // refuses work the remote still keeps under its tombstone.
 #[test]
