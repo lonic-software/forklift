@@ -1000,18 +1000,6 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
     .expect("the blocking assertions");
 }
 
-/// FORK-95 slice 4, PR #117 round 2 finding 5: the office `ConditionCheck`'s **unborn** arm,
-/// against real DynamoDB.
-///
-/// `office_condition_check`'s `None` arm builds `attribute_not_exists(#h)`, and `replace_trust`
-/// is its only reachable caller — a re-genesis whose anchor adopts nothing, against a warehouse
-/// whose office pallet has not been lifted yet. Every other integration case in this file runs
-/// with the office already lifted, so that arm was exercised only by `MemoryRefStore`, which
-/// evaluates it as an ordinary `Option` comparison and therefore establishes nothing about how
-/// DynamoDB evaluates a `ConditionCheck` against an item that **does not exist**.
-///
-/// Both directions, since an `attribute_not_exists` condition can fail in either: it must hold
-/// while the office is unborn, and it must stop holding the moment the office is lifted.
 #[path = "support/tombstones.rs"]
 mod tombstones;
 
@@ -1036,6 +1024,19 @@ async fn dynamo_ref_store_upholds_the_tombstone_contract() {
         .expect("the blocking assertions");
 }
 
+/// FORK-95 slice 4, PR #117 round 2 finding 5: the office `ConditionCheck`'s **unborn** arm,
+/// against real DynamoDB.
+///
+/// `office_condition_check`'s `None` arm builds `attribute_not_exists(#h)`. `replace_trust` reaches
+/// it with a re-genesis whose anchor adopts nothing, against a warehouse whose office pallet has
+/// not been lifted yet; a pallet delete reaches it through `OfficePrecondition::Unborn`, which
+/// the tombstone contract drives. Every other integration case in this file runs
+/// with the office already lifted, so that arm was exercised only by `MemoryRefStore`, which
+/// evaluates it as an ordinary `Option` comparison and therefore establishes nothing about how
+/// DynamoDB evaluates a `ConditionCheck` against an item that **does not exist**.
+///
+/// Both directions, since an `attribute_not_exists` condition can fail in either: it must hold
+/// while the office is unborn, and it must stop holding the moment the office is lifted.
 #[tokio::test(flavor = "multi_thread")]
 async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
     let Some(endpoint) = endpoint() else {

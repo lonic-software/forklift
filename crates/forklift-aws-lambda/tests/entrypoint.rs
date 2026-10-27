@@ -237,6 +237,10 @@ fn put_json<T: Serialize>(uri: &str, body: &T) -> Request<Vec<u8>> {
     Request::builder().method("PUT").uri(uri).body(serde_json::to_vec(body).unwrap()).unwrap()
 }
 
+fn delete(uri: &str) -> Request<Vec<u8>> {
+    Request::builder().method("DELETE").uri(uri).body(Vec::new()).unwrap()
+}
+
 fn status(response: &Response<Vec<u8>>) -> u16 {
     response.status().as_u16()
 }
@@ -313,6 +317,51 @@ fn the_untrusted_lift_walk_maps_every_status() {
     assert_eq!(status(&response), 409);
     let error: serde_json::Value = body_json(&response);
     assert!(error.get("error").and_then(|value| value.as_str()).is_some(), "a JSON error body");
+}
+
+/// A delete names the head it deletes in the query: without it the request is a `422`; with it the
+/// pallet is deleted, answered with an empty `200`, and the handshake carries its tombstone in place
+/// of its head. A retry at the tombstone is `200` again; a delete from a head the pallet is not at
+/// is a `409`.
+#[test]
+fn a_pallet_delete_answers_over_http() {
+    let area = Area::new("delete");
+    prepare(&area, "wh");
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["palletize", "feature"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main head");
+    let fixture = Fixture::direct();
+    for (hash, bytes) in &harvest.objects {
+        assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
+    }
+    for pallet in ["main", "feature"] {
+        let lift = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
+        assert_eq!(status(&fixture.call(post_json(&format!("/v1/pallets/{}", pallet), &lift))), 200, "{}", pallet);
+    }
+
+    let response = fixture.call(delete("/v1/pallets/feature"));
+    assert_eq!(status(&response), 422);
+    let body: serde_json::Value = body_json(&response);
+    assert!(body["error"].as_str().expect("an error message").contains("old_head"), "{}", body);
+
+    let stale = fixture.call(delete(&format!("/v1/pallets/feature?old_head={}", "0".repeat(64))));
+    assert_eq!(status(&stale), 409);
+
+    let uri = format!("/v1/pallets/feature?old_head={}", main_head);
+    let response = fixture.call(delete(&uri));
+    assert_eq!(status(&response), 200);
+    assert!(response.body().is_empty(), "an empty body");
+
+    let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
+    assert_eq!(info.pallets.get("feature"), None);
+    assert_eq!(info.tombstone("feature"), Some(&main_head));
+    assert_eq!(info.pallets.get("main"), Some(&main_head), "only the named pallet");
+
+    assert_eq!(status(&fixture.call(delete(&uri))), 200, "a retry at the tombstone");
 }
 
 /// The holds walk reads parcels straight from the object store: the head and its ancestor are
@@ -1151,6 +1200,12 @@ fn in_multi_warehouse_routing_an_operator_writes_only_where_the_administrator_se
             "{}",
             token
         );
+        assert_eq!(
+            status(&fixture.call(bearing(token, delete(&format!("/warehouses/new/v1/pallets/main?old_head={}", main_head))))),
+            403,
+            "{}",
+            token
+        );
         assert_eq!(status(&fixture.call(bearing(token, get("/warehouses/new/v1/warehouse")))), 200, "reads stay open");
     }
 
@@ -1162,9 +1217,10 @@ fn in_multi_warehouse_routing_an_operator_writes_only_where_the_administrator_se
 }
 
 /// Trust established, office not yet lifted: there is no roster, so the gate admits every
-/// operator (the office's own first lift must get through). Nothing else may land in that
-/// window, because the commit is not conditioned on the office: a working pallet is refused by
-/// the audit for the missing office, and so is a meta pallet, which exists only under one.
+/// operator (the office's own first lift must get through). No other move may land in that
+/// window, because a move's commit is not conditioned on the office: a working pallet is refused
+/// by the audit for the missing office, and so is a meta pallet, which exists only under one. (A
+/// delete's commit is conditioned on the office staying unborn; `protocol.rs` pins that window.)
 #[test]
 fn before_the_office_is_lifted_an_operator_moves_neither_a_working_nor_a_meta_pallet() {
     let area = Area::new("operator-bootstrap");

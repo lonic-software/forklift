@@ -133,6 +133,29 @@ async fn the_ref_update_commit_sends_one_request_per_call() {
     assert_eq!(count(&counts, "TransactWriteItems"), 1);
 }
 
+/// A pallet delete commits through the ref-update commit's transaction, override included: one
+/// request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pallet_delete_sends_one_request_per_call() {
+    let (refs, counts) = stub_store(Stub::InternalServerError).await;
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        refs.delete_head(
+            PalletNamespace::User,
+            "feature",
+            &"c".repeat(64),
+            OfficePrecondition::Unborn,
+            None,
+            &request_token(),
+        )
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, Ok(CasOutcome::Transient(TransientCause::FateUnknown)));
+    assert_eq!(count(&counts, "TransactWriteItems"), 1);
+}
+
 /// The anchor write is the second transaction site and carries the same override: one request.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_anchor_write_sends_one_request_per_call() {

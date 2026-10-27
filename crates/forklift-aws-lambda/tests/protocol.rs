@@ -8,7 +8,7 @@
 //! CAS, and the full offline audit reused via the scratch bridge) against abstracted
 //! storage, no S3 or DynamoDB required.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -3570,4 +3570,485 @@ fn a_first_anchor_adopting_history_the_head_does_not_hold_is_refused() {
 
     upload_all(&head, &harvest);
     head.put_trust(&Principal::Static, &anchor).expect("adopted history held");
+}
+
+// ---------------------------------------------------------------------------------------
+// Pallet deletes.
+// ---------------------------------------------------------------------------------------
+
+#[path = "support/tombstones.rs"]
+mod tombstones;
+
+/// The tombstone contract (`support/tombstones.rs`) against the in-memory store, so the fake the
+/// rest of this suite runs on keeps the item state the DynamoDB store writes.
+#[test]
+fn the_memory_store_upholds_the_tombstone_contract() {
+    tombstones::upholds_the_tombstone_contract(&MemoryRefStore::new());
+}
+
+/// An untrusted warehouse with `main` at one parcel and `feature` two parcels past it, every
+/// object harvested. Returns the harvest, main's head, and feature's first and second heads.
+fn feature_warehouse(area: &Area) -> (Harvest, String, String, String) {
+    prepare(area, "wh");
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["palletize", "feature"]);
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "second"]);
+    let feature_v2 = harvest(&area.path("wh")).head_of("feature").expect("feature v2");
+    area.write_file("wh/app.txt", "v3\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "third"]);
+
+    let harvested = harvest(&area.path("wh"));
+    let main_head = harvested.head_of("main").expect("main head");
+    let feature_v3 = harvested.head_of("feature").expect("feature v3");
+    (harvested, main_head, feature_v2, feature_v3)
+}
+
+/// A head over `refs` holding every harvested object, with `main` and `feature` at `feature_v2`
+/// lifted.
+fn lifted_feature<R: RefStore>(refs: R, harvest: &Harvest, main_head: &str, feature_v2: &str) -> Head<MemoryObjectStore, R> {
+    let head = Head::new(MemoryObjectStore::new(), refs);
+    upload_all(&head, harvest);
+    for (pallet, new_head) in [("main", main_head), ("feature", feature_v2)] {
+        let lift = RefUpdateRequest { old_head: None, new_head: new_head.to_string(), tombstone: None };
+        head.ref_update(&Principal::Static, pallet, &lift).expect("lift");
+    }
+    head
+}
+
+/// The refusal code and next step a head error carries on the wire.
+fn code_and_next_step(message: &str) -> (String, String) {
+    let (code, _, next_step) = forklift_core::error::deframe(message).expect("a classified refusal");
+    (code.to_string(), next_step.to_string())
+}
+
+/// A delete leaves a tombstone: the handshake names it in place of the head, holds walks from it,
+/// and a retry at it answers `200` with nothing written.
+#[test]
+fn a_delete_leaves_a_tombstone_the_handshake_and_holds_read() {
+    let area = Area::new("delete");
+    let (harvest, main_head, feature_v2, feature_v3) = feature_warehouse(&area);
+    let head = lifted_feature(MemoryRefStore::new(), &harvest, &main_head, &feature_v2);
+
+    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("delete feature");
+
+    let info = head.handshake().expect("handshake");
+    assert_eq!(info.pallets.get("feature"), None);
+    assert_eq!(info.tombstone("feature"), Some(&feature_v2));
+    assert_eq!(info.pallets.get("main"), Some(&main_head), "only the named pallet");
+
+    let holds = head.holds("feature", &[feature_v2.clone(), main_head.clone(), feature_v3.clone()]).expect("holds");
+    assert_eq!(holds[&feature_v2], HoldAnswer::Held);
+    assert_eq!(holds[&main_head], HoldAnswer::Held, "the tombstone's history");
+    assert_eq!(holds[&feature_v3], HoldAnswer::NotHeld);
+
+    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("a retry at the tombstone");
+    assert_eq!(head.handshake().expect("handshake").tombstone("feature"), Some(&feature_v2));
+}
+
+/// Each refusal of a delete, in the direct head's codes, and nothing deleted by any of them: a
+/// malformed head and a meta pallet are `422`; a stale head is `remote_ahead`; the default pallet
+/// is a `409`; a pallet deleted at another head names the deletion and the restore, and no
+/// tombstone drop, which this head does not have.
+#[test]
+fn a_delete_names_what_stands_in_its_way() {
+    let area = Area::new("delete-refusals");
+    let (harvest, main_head, feature_v2, feature_v3) = feature_warehouse(&area);
+    let head = lifted_feature(MemoryRefStore::new(), &harvest, &main_head, &feature_v2);
+
+    let err = head.delete_pallet(&Principal::Static, "feature", "not-a-hash").expect_err("malformed head");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+
+    let err = head.delete_pallet(&Principal::Static, "@kv", &feature_v2).expect_err("a meta pallet");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains("tracked metadata"), "{}", err.message);
+
+    let err = head.delete_pallet(&Principal::Static, "feature", &main_head).expect_err("stale head");
+    assert_eq!(err.status, Status::Conflict);
+    assert_eq!(code_and_next_step(&err.message).0, "remote_ahead", "{}", err.message);
+
+    let err = head.delete_pallet(&Principal::Static, "main", &main_head).expect_err("the default pallet");
+    assert_eq!(err.status, Status::Conflict);
+    assert!(err.message.contains("default pallet"), "{}", err.message);
+
+    let info = head.handshake().expect("handshake");
+    assert_eq!((info.pallets.get("main"), info.pallets.get("feature")), (Some(&main_head), Some(&feature_v2)));
+
+    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("delete feature");
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v3).expect_err("deleted at another head");
+    assert_eq!(err.status, Status::Conflict);
+    assert_eq!(
+        code_and_next_step(&err.message),
+        ("pallet_deleted_on_remote".to_string(), "forklift palletize --restore feature --remote".to_string())
+    );
+    assert!(err.message.contains(&feature_v2), "names the tombstone: {}", err.message);
+    assert!(!err.message.contains("tombstone drop"), "this head has no drop: {}", err.message);
+}
+
+/// A deleted pallet moves again only through an acknowledged creation from its own history: an
+/// update from the old head, a creation that does not acknowledge the tombstone or acknowledges
+/// another head, and an acknowledged creation from history that does not descend from it are all
+/// `pallet_deleted_on_remote`; the acknowledged descendant lands and clears the tombstone.
+#[test]
+fn a_deleted_pallet_is_re_created_only_from_its_history_with_acknowledgement() {
+    let area = Area::new("delete-recreate");
+    let (harvest, main_head, feature_v2, feature_v3) = feature_warehouse(&area);
+    let head = lifted_feature(MemoryRefStore::new(), &harvest, &main_head, &feature_v2);
+    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("delete feature");
+
+    let refused = [
+        ("an update from the old head", Some(feature_v2.clone()), feature_v3.clone(), None, "deleted on this remote"),
+        ("an unacknowledged creation", None, feature_v3.clone(), None, "acknowledge the deletion"),
+        ("another head acknowledged", None, feature_v3.clone(), Some(main_head.clone()), "acknowledge the deletion"),
+        ("a non-descendant", None, main_head.clone(), Some(feature_v2.clone()), "does not descend"),
+    ];
+    for (case, old_head, new_head, tombstone, says) in refused {
+        let err = head
+            .ref_update(&Principal::Static, "feature", &RefUpdateRequest { old_head, new_head, tombstone })
+            .expect_err(case);
+        assert_eq!(err.status, Status::Conflict, "{}: {}", case, err.message);
+        assert_eq!(code_and_next_step(&err.message).0, "pallet_deleted_on_remote", "{}: {}", case, err.message);
+        assert!(err.message.contains(says), "{}: {}", case, err.message);
+        assert!(!err.message.contains("tombstone drop"), "{}: {}", case, err.message);
+    }
+    assert_eq!(head.handshake().expect("handshake").tombstone("feature"), Some(&feature_v2), "nothing moved");
+
+    let recreate = RefUpdateRequest { old_head: None, new_head: feature_v3.clone(), tombstone: Some(feature_v2.clone()) };
+    head.ref_update(&Principal::Static, "feature", &recreate).expect("an acknowledged descendant");
+    let info = head.handshake().expect("handshake");
+    assert_eq!(info.pallets.get("feature"), Some(&feature_v3));
+    assert_eq!(info.tombstone("feature"), None);
+}
+
+/// An open haul naming the pallet refuses the delete, read from the `@haul` head the store holds.
+#[test]
+fn an_open_haul_refuses_the_delete() {
+    let area = Area::new("delete-haul");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["palletize", "feature"]);
+    area.write_file("wh/feature.txt", "x\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "feature"]);
+    area.forklift("wh", &["shift", "main"]);
+    area.forklift("wh", &["haul", "open", "--target", "main", "--source", "feature", "--title", "Feature"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let feature_head = harvest.head_of("feature").expect("feature head");
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest);
+    head.put_trust(&Principal::Static, &harvest.trust.clone().expect("trust")).expect("put trust");
+    for wire in [format!("@{}", OFFICE_PALLET_NAME), "main".to_string(), "feature".to_string(), "@haul".to_string()] {
+        let new_head = harvest.head_of(&wire).expect("a harvested head");
+        head.ref_update(&Principal::Static, &wire, &RefUpdateRequest { old_head: None, new_head, tombstone: None })
+            .expect("lift");
+    }
+
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_head).expect_err("an open haul names it");
+    assert_eq!(err.status, Status::Conflict, "{}", err.message);
+    assert!(err.message.contains("Open haul"), "{}", err.message);
+    assert_eq!(head.handshake().expect("handshake").pallets.get("feature"), Some(&feature_head));
+}
+
+/// What [`RacesTheDelete`] does when the head's delete reaches the store.
+enum DeleteRace {
+    /// Run this against the shared store before the first attempt, then forward every attempt.
+    Before(RefCell<Option<Box<dyn FnOnce(&MemoryRefStore)>>>),
+    /// Forward the delete, then answer it as transient of unknown fate, on every attempt.
+    LandsThenTransient,
+    /// Answer every attempt as transient of unknown fate without forwarding it.
+    Transient,
+}
+
+/// Wraps a shared [`MemoryRefStore`], interfering with `delete_head` as its [`DeleteRace`]
+/// says. Forwards every other call.
+struct RacesTheDelete {
+    inner: Arc<MemoryRefStore>,
+    race: DeleteRace,
+}
+
+impl DeleteRace {
+    fn before(race: impl FnOnce(&MemoryRefStore) + 'static) -> DeleteRace {
+        DeleteRace::Before(RefCell::new(Some(Box::new(race))))
+    }
+}
+
+impl RefStore for RacesTheDelete {
+    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: ExpectedHead<'_>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+    }
+
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        match &self.race {
+            DeleteRace::Before(race) => {
+                if let Some(race) = race.borrow_mut().take() {
+                    race(&self.inner);
+                }
+                self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+            }
+            DeleteRace::LandsThenTransient => {
+                self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)?;
+                Ok(CasOutcome::Transient(TransientCause::FateUnknown))
+            }
+            DeleteRace::Transient => Ok(CasOutcome::Transient(TransientCause::FateUnknown)),
+        }
+    }
+
+    fn list_refs(&self) -> Result<RefListing, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor)
+    }
+
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+        request_token: &str,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
+    }
+}
+
+/// `feature` lifted at `feature_v2` in a shared store, and a head over that store that races its
+/// delete as `race` says.
+fn racing_head(area: &Area, race: impl FnOnce(String, String) -> DeleteRace) -> (Arc<MemoryRefStore>, Head<MemoryObjectStore, RacesTheDelete>, String, String) {
+    let (harvest, main_head, feature_v2, feature_v3) = feature_warehouse(area);
+    let store = Arc::new(MemoryRefStore::new());
+    lifted_feature(SharedMemoryRefs(store.clone()), &harvest, &main_head, &feature_v2);
+
+    let head = Head::new(MemoryObjectStore::new(), RacesTheDelete { inner: store.clone(), race: race(feature_v2.clone(), feature_v3.clone()) });
+    upload_all(&head, &harvest);
+    (store, head, feature_v2, feature_v3)
+}
+
+/// A lift landing between the delete's read and its commit refuses the delete as moved, and the
+/// lift stands.
+#[test]
+fn a_lift_racing_the_delete_refuses_it_as_moved() {
+    let area = Area::new("delete-races-lift");
+    let (store, head, feature_v2, feature_v3) = racing_head(&area, |from, to| {
+        DeleteRace::before(move |store: &MemoryRefStore| {
+            let outcome = store
+                .compare_and_set_head(
+                    pallet_utils::PalletNamespace::User,
+                    "feature",
+                    ExpectedHead::At(&from),
+                    &to,
+                    OfficePrecondition::NotConsumed,
+                    None,
+                    &request_token(),
+                )
+                .expect("the racing lift");
+            assert_eq!(outcome, CasOutcome::Committed);
+        })
+    });
+
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the pallet moved");
+    assert_eq!(err.status, Status::Conflict);
+    assert_eq!(code_and_next_step(&err.message).0, "remote_ahead", "{}", err.message);
+    assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_v3));
+}
+
+/// Two deletes from one head: the one whose commit finds the other's tombstone answers `200`,
+/// since that tombstone is what it asked for.
+#[test]
+fn of_two_racing_deletes_the_loser_answers_200() {
+    let area = Area::new("delete-races-delete");
+    let (store, head, feature_v2, _) = racing_head(&area, |from, _| {
+        DeleteRace::before(move |store: &MemoryRefStore| {
+            let outcome = store
+                .delete_head(pallet_utils::PalletNamespace::User, "feature", &from, OfficePrecondition::Unborn, None, &request_token())
+                .expect("the racing delete");
+            assert_eq!(outcome, CasOutcome::Committed);
+        })
+    });
+
+    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("the loser");
+    assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Deleted(feature_v2));
+}
+
+/// A delete answered transient on every attempt asks the ref: it answers `200` when an attempt
+/// landed, and `503` when none did, with the pallet live.
+#[test]
+fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
+    let area = Area::new("delete-transient-landed");
+    let (store, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::LandsThenTransient);
+    head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("an attempt landed");
+    assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Deleted(feature_v2));
+
+    let area = Area::new("delete-transient-not-landed");
+    let (store, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::Transient);
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_v2));
+}
+
+/// Enroll `identifier` in `dir`'s office with `role_args` (`office role`'s arguments after the
+/// identifier), from a key generated under that identifier, then switch back to the admin.
+fn enroll(area: &Area, dir: &str, identifier: &str, role_args: &[&str]) {
+    area.forklift(dir, &["config", "operator.identifier", identifier]);
+    let keygen = area.forklift_stdout(dir, &["office", "keygen"]);
+    area.forklift(dir, &["config", "operator.identifier", "tester@forklift"]);
+
+    let admit: Vec<&str> = keygen.lines()
+        .find(|line| line.trim_start().starts_with("office admit "))
+        .expect("keygen prints the admit line")
+        .split_whitespace()
+        .collect();
+    area.forklift(dir, &admit);
+
+    let mut role = vec!["office", "role", identifier];
+    role.extend(role_args);
+    area.forklift(dir, &role);
+}
+
+/// A trusted warehouse whose office grants `wes@forklift` writing `feature` and makes
+/// `rea@forklift` a reader, with signed `main` and `feature`; then a second office that only
+/// admits another reader, changing neither's authority. Returns the harvest, both office heads
+/// and feature's head.
+fn rostered_feature_warehouse(area: &Area) -> (Harvest, String, String, String) {
+    prepare(area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    enroll(area, "wh", "wes@forklift", &["writer", "--pallet", "feature"]);
+    enroll(area, "wh", "rea@forklift", &["reader"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["palletize", "feature"]);
+    area.write_file("wh/app.txt", "v2\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "feature"]);
+    let office_wire = format!("@{}", OFFICE_PALLET_NAME);
+    let first_office = harvest(&area.path("wh")).head_of(&office_wire).expect("office head");
+
+    enroll(area, "wh", "kit@forklift", &["reader"]);
+    let harvested = harvest(&area.path("wh"));
+    let second_office = harvested.head_of(&office_wire).expect("office head");
+    let feature_head = harvested.head_of("feature").expect("feature head");
+    assert_ne!(first_office, second_office);
+    (harvested, first_office, second_office, feature_head)
+}
+
+/// An `@office` lift that leaves the caller's authority as it was, landing between the delete's
+/// read and its commit, refuses that commit; the delete decides again from a fresh read and
+/// answers `200`, as the direct head's does.
+#[test]
+fn an_office_lift_racing_the_delete_is_decided_again() {
+    let area = Area::new("delete-redecides");
+    let (harvest, first_office, second_office, feature_head) = rostered_feature_warehouse(&area);
+    let store = Arc::new(MemoryRefStore::new());
+    let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+    upload_all(&setup, &harvest);
+    setup.put_trust(&Principal::Static, &harvest.trust.clone().expect("trust")).expect("put trust");
+    for (wire, new_head) in [(format!("@{}", OFFICE_PALLET_NAME), &first_office), ("feature".to_string(), &feature_head)] {
+        setup
+            .ref_update(&Principal::Static, &wire, &RefUpdateRequest { old_head: None, new_head: new_head.clone(), tombstone: None })
+            .expect("lift");
+    }
+
+    let attack = Head::new(
+        MemoryObjectStore::new(),
+        OfficeMovesAfterTheSnapshot { inner: store.clone(), move_to: second_office.clone(), fired: Cell::new(false) },
+    );
+    upload_all(&attack, &harvest);
+
+    attack
+        .delete_pallet(&Principal::Operator("wes@forklift".to_string()), "feature", &feature_head)
+        .expect("decided again under the new office");
+    assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Deleted(feature_head));
+    assert_eq!(
+        store.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).expect("get"),
+        RefHead::Live(second_office),
+        "the office lift landed"
+    );
+}
+
+/// Trust established and no office lifted: there is no roster, so every operator may delete. An
+/// office lift that denies the caller, landing between the delete's read and its commit, refuses
+/// the commit, because the delete conditions on the office staying unborn; decided again under
+/// that office, the delete is a `403` and the pallet stays live.
+#[test]
+fn an_office_lift_in_the_bootstrap_window_refuses_a_delete_it_denies() {
+    let area = Area::new("delete-bootstrap");
+    let (harvest, first_office, _, feature_head) = rostered_feature_warehouse(&area);
+    let reader = Principal::Operator("rea@forklift".to_string());
+
+    // Trust, and `feature` written straight into the store: no head lifts a working pallet before
+    // the office, but a warehouse that was served untrusted before it established trust has them.
+    let bootstrapped = || {
+        let store = Arc::new(MemoryRefStore::new());
+        let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+        setup.put_trust(&Principal::Static, &harvest.trust.clone().expect("trust")).expect("put trust");
+        let anchor = store.get_trust().expect("read trust").map(|(_, bytes)| bytes);
+        let outcome = store
+            .compare_and_set_head(
+                pallet_utils::PalletNamespace::User,
+                "feature",
+                ExpectedHead::Unborn,
+                &feature_head,
+                OfficePrecondition::NotConsumed,
+                anchor.as_deref(),
+                &request_token(),
+            )
+            .expect("seed feature");
+        assert_eq!(outcome, CasOutcome::Committed);
+        store
+    };
+
+    // The control: in the window, the reader's delete lands.
+    let store = bootstrapped();
+    let head = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
+    upload_all(&head, &harvest);
+    head.delete_pallet(&reader, "feature", &feature_head).expect("no roster yet");
+
+    let store = bootstrapped();
+    let attack = Head::new(
+        MemoryObjectStore::new(),
+        OfficeMovesAfterTheSnapshot { inner: store.clone(), move_to: first_office.clone(), fired: Cell::new(false) },
+    );
+    upload_all(&attack, &harvest);
+
+    let err = attack.delete_pallet(&reader, "feature", &feature_head).expect_err("the office denies the reader");
+    assert_eq!(err.status, Status::Forbidden, "{}", err.message);
+    assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_head));
 }
