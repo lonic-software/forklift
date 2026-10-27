@@ -148,7 +148,11 @@ fn plan_from(
     sources: recovery_utils::GcRootSources,
 ) -> Result<PrunePlan, String> {
     let (live_parcels, meta_parcels) = reachable_parcels()?;
-    let sealed = sealed_utils::read_sealed()?;
+    let sealed = sealed_utils::read_sealed().map_err(|error| format!(
+        "{} Restore it from a good copy, or use the version of Forklift that wrote it, then run the \
+        prune again.",
+        error
+    ))?;
     // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
     // recorded head, which no ref need still reach.
     let proposed = gc_utils::collect_reachable_for_sweep(&sources.haul_heads)?;
@@ -784,8 +788,9 @@ fn retain_present_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String
 /// already retained by the caller; this descends it to reach the chunk hashes.
 ///
 /// The recipe is present by construction here — the caller only descends a file it has classified
-/// in-scope and has not found held by hash alone, and an in-scope object was fetched — so a missing
-/// one is genuine corruption and fails loudly (before `plan_prune` narrows or frees anything: durable-before-destructive is preserved),
+/// in-scope and has not found held by hash alone, and an in-scope object was fetched — so a
+/// missing one is genuine corruption and fails loudly (before `plan_prune` narrows or frees
+/// anything: durable-before-destructive is preserved),
 /// exactly as the surrounding `load_tree` calls do.
 ///
 /// # Arguments
@@ -2055,8 +2060,10 @@ mod tests {
 
         let post_prune = MaterializationScope::from_prefixes(["src/api"]);
         let remote = [f.parcel.clone()];
-        assert!(plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()).is_err(),
-            "an unrecorded absent tree fails the plan");
+        let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()) else {
+            panic!("an unrecorded absent tree fails the plan");
+        };
+        assert!(error.contains(&held_src[2..]), "the plan fails on the absent tree itself: {}", error);
 
         seal(&[&held_src]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()).unwrap();
@@ -2138,6 +2145,6 @@ mod tests {
         let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) else {
             panic!("an unreadable record must fail the plan");
         };
-        assert!(error.contains("sealed-object record"), "{}", error);
+        assert!(error.contains("sealed-object record") && error.contains("Restore it from a good copy"), "{}", error);
     }
 }

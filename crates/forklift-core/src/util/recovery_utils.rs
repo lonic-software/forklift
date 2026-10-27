@@ -2008,8 +2008,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     // as lost.
     let sealed = sealed_utils::read_sealed().unwrap_or_else(|error| {
         roots.degraded_sources.push(format!(
-            "the sealed-object record could not be read this run ({}), so objects held by hash \
-            alone could not be told apart from lost ones.",
+            "objects held by hash alone could not be told apart from lost ones this run: {}",
             error
         ));
         SealedSet::default()
@@ -2446,10 +2445,11 @@ fn walk_tree(
         // boundary in a sparse/shallow warehouse is legitimately absent, or already known corrupt
         // by the caller (`corrupt` — step 1's hash-verify found this exact hash present but
         // wrong) — either way, record it (if a sink is listening, and unless the sealed record
-        // holds the absent hash by hash alone; a corrupt one it never holds) and stop; nothing beneath it is
-        // trustworthy either way (the store invariant a warehouse never holds a child without its
-        // parent tree, mirrored from `gc_utils::collect_live_set`'s own tree descent, extends to
-        // "nor a child whose parent's own bytes cannot be trusted"). Unconditional in both modes —
+        // holds the absent hash by hash alone; a corrupt one it never holds) and stop; nothing
+        // beneath it is trustworthy either way (the store invariant a warehouse never holds a
+        // child without its parent tree, mirrored from `gc_utils::collect_live_set`'s own tree
+        // descent, extends to "nor a child whose parent's own bytes cannot be trusted").
+        // Unconditional in both modes —
         // a descent guard, not a sink-feeding-only stat. Without the corrupt half of this check, a
         // corrupt reachable tree would instead hit `load_tree`'s bare `?` below and abort the
         // whole rescan (I5) — see
@@ -2881,10 +2881,11 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix what is named above (a bay's state, the office record, the fetch scope, the \
-        sealed-object record, or a pack index: restore its pack files from a good copy, move an \
-        index that does not parse out of the pack folder only if it holds nothing this warehouse \
-        needs, or re-create the warehouse for one of another format version), then run \
+        "Fix what is named above (a bay's state, the office record, the fetch scope, or a pack \
+        index: restore its pack files from a good copy, move an index that does not parse out of \
+        the pack folder only if it holds nothing this warehouse needs, or re-create the warehouse \
+        for one of another format version; the sealed-object record: restore it from a good copy, \
+        or use the version of Forklift that wrote it), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )
@@ -3772,7 +3773,7 @@ mod tests {
         std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
-        assert!(walk.degraded_sources.iter().any(|note| note.contains("sealed-object record could not be read")),
+        assert!(walk.degraded_sources.iter().any(|note| note.contains("objects held by hash alone could not be told apart")),
             "{:?}", walk.degraded_sources);
         assert_eq!(walk.hashes, [held].into_iter().collect::<BTreeSet<String>>());
 

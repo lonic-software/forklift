@@ -1785,9 +1785,9 @@ the remote holds it again, a deleted pallet's once
 the delete leaves the undo journal. So you can park edits
 under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
 `expand` has brought the path back. If any of that state cannot be read, the prune refuses
-before changing anything. Nothing beneath an object the warehouse holds by hash alone (see
-`audit`) is read or freed, and a sealed-object record that cannot be read refuses the prune the
-same way. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
+before changing anything. The prune does not read beneath an object the warehouse holds by hash
+alone (see `audit`), so such an object never makes it refuse, and a sealed-object record that
+cannot be read refuses the prune the same way. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
 before you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
 repack is future work.) A prune, dry run included, is **refused while a mutating command runs in
 another bay**, since that writer could reuse an object the prune is about to free; run it again
