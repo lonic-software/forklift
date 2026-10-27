@@ -1784,8 +1784,9 @@ left, or reports there is nothing left to free.
 (`.forklift/held-heads`, at most 16 per pallet). A prune asks the remote whether it still holds
 each recorded head its current heads have moved past, and frees the history of the heads it
 confirms, so another warehouse lifting ahead does not keep your history pinned until you lower.
-A head the remote does not confirm frees nothing: one an `undo` on the server moved back past, or
-one of a pallet deleted and re-created there. When the remote cannot answer (a server too old to
+A head the remote does not confirm frees nothing: one of a pallet deleted and re-created there, or
+one the server moved back past (an `undo` there is refused once it has served, so only a server
+whose served mark was lost could). When the remote cannot answer (a server too old to
 know the check, or one too busy to finish it), the prune prints a `holds_unanswered` warning
 naming the pallet and frees only what the remote's current heads allow; a `lower` of that pallet
 lets a later prune free what the remote's current head reaches. A `lift`, `lower` or `franchise`

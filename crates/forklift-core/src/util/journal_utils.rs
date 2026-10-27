@@ -843,12 +843,18 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
         return Ok(());
     }
 
-    for wire in entry.before.heads.keys() {
+    // In `put_back_refs`' order, so the refusal names the current pallet when it is one.
+    let current = &entry.after.current_pallet;
+    let order = entry.before.heads.keys()
+        .filter(|wire| *wire == current)
+        .chain(entry.before.heads.keys().filter(|wire| *wire != current));
+
+    for wire in order {
         let (Some(pre_head), Some(Some(post_head))) = (entry.before.head(wire), entry.after.heads.get(wire)) else {
             continue;
         };
 
-        let Ok(reference) = PalletRef::parse(wire) else { continue };
+        let reference = PalletRef::parse(wire)?;
 
         if pre_head == post_head
             || reference.namespace != PalletNamespace::User
@@ -1944,11 +1950,11 @@ mod tests {
         assert!(refused.contains("\"other\" is current now") && !refused.contains("has been served"), "{}", refused);
     }
 
-    // Revert: count every changed user wire whatever its ref holds now → the refusal names
-    // "aside", a pallet whose put-back would move nothing back.
+    // Revert: judge pallets in the journal's order → the refusal names "aside", not the current
+    // pallet the undo is about.
     #[test]
-    fn a_pallet_moved_on_since_the_operation_is_not_what_refuses_the_undo_in_a_served_root() {
-        let _scratch = Scratch::new("gate-served-other");
+    fn the_served_refusal_names_the_current_pallet_first() {
+        let _scratch = Scratch::new("gate-served-order");
         let first = hash('2');
         let second = pallet_utils::tests::child_of(&first, "aside");
         let pre = hash('1');
@@ -1963,13 +1969,32 @@ mod tests {
         push_if_changed("consolidate", before).unwrap();
         let entry = peek().unwrap().unwrap();
         assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
-        assert!(check_undoable(&entry).unwrap_err().contains("\"aside\""), "the first changed pallet is named");
+
+        let refused = check_undoable(&entry).unwrap_err();
+
+        assert!(refused.contains("has been served") && refused.contains("\"main\""), "{}", refused);
+    }
+
+    // Revert: count every changed user wire whatever its ref holds now → the gate refuses an
+    // undo whose put-back would move nothing back.
+    #[test]
+    fn a_pallet_moved_on_since_the_operation_does_not_refuse_the_undo_in_a_served_root() {
+        let _scratch = Scratch::new("gate-served-other");
+        let (mut entry, _pre, post) = stacked_on_a_child();
+        let first = hash('2');
+        let second = pallet_utils::tests::child_of(&first, "aside");
+        advance("aside", None, &second).unwrap();
+
+        // An entry that moved only "aside", with the bay at the head it left.
+        entry.before.heads = BTreeMap::from([("main".to_string(), Some(post.clone())), ("aside".to_string(), Some(first))]);
+        entry.after.heads = BTreeMap::from([("main".to_string(), Some(post)), ("aside".to_string(), Some(second.clone()))]);
+        assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
+        assert!(check_undoable(&entry).unwrap_err().contains("\"aside\""));
 
         // Another writer moves "aside" on: the put-back would leave it alone.
         move_elsewhere("aside", &pallet_utils::tests::child_of(&second, "later"));
 
-        let refused = check_undoable(&entry).unwrap_err();
-        assert!(refused.contains("has been served") && refused.contains("\"main\""), "{}", refused);
+        check_undoable(&entry).unwrap();
     }
 
     // Revert: drop the ref core's served refusal → the put-back lands after the gate passed.

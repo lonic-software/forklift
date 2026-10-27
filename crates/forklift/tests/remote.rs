@@ -6080,7 +6080,7 @@ fn scope_prune_frees_nothing_on_a_forged_held_head() {
 #[test]
 fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     // A remote ref is not forward-only. The remote served `ahead` and this warehouse recorded it;
-    // then the served `main` moves back to `base` (an undo), and later to a head of another
+    // then the served `main` moves back to `base` (as an undo could where the served mark was lost), and later to a head of another
     // lineage (a pallet re-created under the name). Neither reaches `ahead`, so the remote
     // answers `not_held` and the history only `ahead` reaches is kept both times.
     let area = TestArea::new("scope-prune-remote-moved-back");
@@ -6106,7 +6106,7 @@ fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     let v2_blob = path_object_hash(&area, "sparse", &ahead, "docs/guide.md");
     assert_success(&area.forklift("sparse", &["narrow", "docs"]));
 
-    for (moved_to, why) in [(&base, "an undo"), (&side, "a re-created pallet")] {
+    for (moved_to, why) in [(&base, "a head moved back"), (&side, "a re-created pallet")] {
         move_served_main(&area, moved_to);
         let pruned = area.forklift("sparse", &["--json", "scope-prune", "--dry-run", "docs"]);
         assert_success(&pruned);
