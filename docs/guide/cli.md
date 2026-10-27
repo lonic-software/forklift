@@ -1168,15 +1168,22 @@ unrelated history (`forklift-server tombstone drop`).
 
 With `--remote`, `--delete <name>` deletes the remote's pallet instead, at the head the remote
 lists: the remote keeps that head under its tombstone, so nothing it held is lost, and no clone's
-own pallet changes — this one's included. Its owner deletes it with a plain `--delete`, which
-counts the remote's tombstone as holding its work. `--restore <name> --remote` brings the pallet
-back on the remote at its tombstone's head; it needs none of that history here. Neither takes
-`--force`, and a remote that cannot delete pallets (it lists no tombstones in its handshake) is
-refused before anything is sent. The server refuses its default pallet, a pallet a checkout of its
-own warehouse stands on, and one an open haul names, and authorizes either as a move of the
-pallet. With `--json` the delete reports `remote`, `pallet`, `head`, `local_head` and `already`,
-and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has already deleted
-(as a rerun after a lost answer finds it) reports it done with `already` set, and sends nothing.
+own pallet changes — this one's included. Its owner deletes it with a plain `--delete`, which counts
+the remote's tombstone as holding its work. `--restore <name> --remote` brings the pallet back on
+the remote at its tombstone's head; it needs none of that history here. Neither takes `--force`, and
+a remote that cannot delete pallets (it lists no tombstones in its handshake) is refused before
+anything is sent. The server refuses its default pallet, a pallet a checkout of its own warehouse
+stands on, and one an open haul names, and authorizes either as a move of the pallet. A serverless
+remote deletes and restores the same way, with the same refusals, except that it has no warehouse of
+its own to stand a checkout on. It has no tombstone drop either, so a name it deleted comes back
+only through a restore or a re-creation from its history. It runs no hooks, so its deletes emit no
+`pallet_deleted` event. With `--json` the delete reports `remote`, `pallet`, `head`, `local_head`
+and `already`, and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has
+already deleted (as a rerun after a lost answer finds it) reports it done with `already` set, and
+sends nothing. A rerun deletes the pallet at the head the remote then holds, so after a lost answer
+check that head first (`palletize --remote --json`): the pallet may have moved, or been deleted and
+created again, meanwhile. A serverless remote whose storage could not settle a delete answers with
+an error naming the head the delete was for, and sends you to that listing before deleting again.
 
 A pallet deleted on the remote is not lowered or lifted as if it had never existed.
 `lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming

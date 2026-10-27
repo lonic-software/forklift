@@ -501,15 +501,25 @@ where
     O: ObjectStore,
     R: RefStore,
 {
-    let writes = matches!(
-        route,
+    // Every route is named, so a new one must be classified here rather than fall through as a
+    // read.
+    let writes = match route {
         Route::UploadTargets
-            | Route::ObjectPut { .. }
-            | Route::SignaturePut(_)
-            | Route::PutTrust
-            | Route::RefUpdate(_)
-            | Route::CommitLift(_)
-    );
+        | Route::ObjectPut { .. }
+        | Route::SignaturePut(_)
+        | Route::PutTrust
+        | Route::RefUpdate(_)
+        | Route::RefDelete { .. }
+        | Route::CommitLift(_) => true,
+        Route::Handshake
+        | Route::Missing
+        | Route::Batch
+        | Route::ObjectGet(_)
+        | Route::SignatureGet(_)
+        | Route::Holds(_)
+        | Route::Resolve
+        | Route::BundleLatest => false,
+    };
 
     if !matches!(routing, Routing::Multi) || !writes || !matches!(caller, Principal::Operator(_)) {
         return Ok(());
@@ -538,6 +548,7 @@ enum Route {
     SignaturePut(String),
     PutTrust,
     RefUpdate(String),
+    RefDelete { name: String, old_head: String },
     Holds(String),
     Resolve,
     BundleLatest,
@@ -610,6 +621,12 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> He
         (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut(param(hash)?)),
         (&Method::PUT, ["trust"]) => Some(Route::PutTrust),
         (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate(param(name)?)),
+        (&Method::DELETE, ["pallets", name]) => Some(Route::RefDelete {
+            name: param(name)?,
+            old_head: query_param(query, "old_head")?.ok_or_else(|| {
+                HeadError::unprocessable("A pallet delete names the head it deletes: ?old_head=<hash>.")
+            })?,
+        }),
         (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds(param(name)?)),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
@@ -763,6 +780,11 @@ where
         Route::RefUpdate(name) => {
             let request: RefUpdateRequest = parse_json(&body)?;
             head.ref_update(caller, &name, &request)?;
+            Ok(empty(StatusCode::OK))
+        }
+
+        Route::RefDelete { name, old_head } => {
+            head.delete_pallet(caller, &name, &old_head)?;
             Ok(empty(StatusCode::OK))
         }
 

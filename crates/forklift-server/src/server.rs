@@ -1040,13 +1040,7 @@ fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
 
     match forklift_core::util::tombstone_utils::read_tombstones() {
         Ok(tombstones) => match tombstones.get(bare) {
-            Some(head) => (StatusCode::CONFLICT, deleted_refusal(format!(
-                "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-                history. \"forklift palletize --restore {} --remote\" brings it back; otherwise use \
-                another name for new work, or ask the remote's operator to drop the tombstone \
-                (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
-                bare, head, bare, bare
-            ), bare)),
+            Some(head) => (StatusCode::CONFLICT, pallet_utils::pallet_deleted_refusal(bare, head, true).into()),
             None => pallet_moved(current, expected),
         },
         Err(error) => internal(error),
@@ -1056,36 +1050,7 @@ fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
 /// The refusal for a creation of a pallet deleted on this head whose tombstone still stands: a `409`
 /// unless the writer acknowledged the tombstone and the new head descends from its head.
 fn pallet_deleted(pallet: &str, head: &str, acknowledged: bool) -> HandlerError {
-    let message = match acknowledged {
-        false => format!(
-            "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-            history: re-creating it must acknowledge the deletion (\"forklift lift --recreate\", for \
-            work that descends from it). \"forklift palletize --restore {} --remote\" brings it back \
-            instead; otherwise lift the work under another name, or ask the remote's operator to drop \
-            the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was \
-            written.",
-            pallet, head, pallet, pallet
-        ),
-        true => format!(
-            "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
-            it: the name stays reserved for that history. \"forklift palletize --restore {} --remote\" \
-            brings it back, to lower and consolidate into this work; otherwise lift the work under \
-            another name, or ask the remote's operator to drop the tombstone \
-            (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
-            pallet, head, pallet, pallet
-        ),
-    };
-
-    (StatusCode::CONFLICT, deleted_refusal(message, pallet))
-}
-
-/// The [`RefusalCode::PalletDeletedOnRemote`] refusal carrying `message`, for user pallet `bare`.
-fn deleted_refusal(message: String, bare: &str) -> String {
-    forklift_core::error::CoreError::refusal(
-        forklift_core::error::RefusalCode::PalletDeletedOnRemote,
-        message,
-        format!("forklift palletize --restore {} --remote", bare),
-    ).into()
+    (StatusCode::CONFLICT, pallet_utils::pallet_recreation_refusal(pallet, head, acknowledged, true).into())
 }
 
 /// The refusal for a ref update whose audit consumed an office head that moved before the write:

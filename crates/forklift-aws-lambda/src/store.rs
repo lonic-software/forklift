@@ -16,15 +16,16 @@
 //! can write arbitrary bytes to a hash key. The staging round trip is the whole reason
 //! `put_target` needs a session.
 //!
-//! [`RefStore`] is the single consistency point — pallet heads and the trust anchor. On
-//! AWS it is DynamoDB, and its one non-idempotent operation,
-//! [`RefStore::compare_and_set_head`], is a conditional write: exactly the CAS that lets the
-//! serverless head scale horizontally, where the server head's compare-and-set rests on a file
-//! lock on one machine's filesystem (§4.5, §4.6). It conditions on all three of a ref update's
-//! movable inputs at once — the pallet's own head, the office head, and the trust anchor — as one DynamoDB transaction,
-//! so nothing this store cannot see move can make a commit outlive the audit it followed
-//! (FORK-95 design memo, "The invariant" / claim C6). Unlike the filesystem, object storage
-//! has no directory walk, so ref enumeration is an explicit primitive
+//! [`RefStore`] is the single consistency point — pallet heads and the trust anchor. On AWS it is
+//! DynamoDB, and its pallet writes, [`RefStore::compare_and_set_head`] and
+//! [`RefStore::delete_head`], are conditional writes: exactly the CAS that lets the serverless head
+//! scale horizontally, where the server head's compare-and-set rests on a file lock on one
+//! machine's filesystem (§4.5, §4.6). Each conditions on the movable inputs its decision read —
+//! the pallet's own head, and, where the caller asks for them, the office head and the trust
+//! anchor — as one DynamoDB transaction, so nothing this store cannot see move can make a commit
+//! outlive the checks it followed: a ref update's audit, a delete's authority (FORK-95 design
+//! memo, "The invariant" / claim C6). Unlike the filesystem, object
+//! storage has no directory walk, so ref enumeration is an explicit primitive
 //! ([`RefStore::list_refs`]).
 //!
 //! Every method returns `Result<_, String>`: storage failures are opaque strings that the
@@ -105,7 +106,8 @@ pub enum PromoteOutcome {
     },
 }
 
-/// Whether a ref-update audit consumed the office head at all, and what it consumed if so.
+/// Whether a commit's decision (a ref update's audit, or a delete's authorization) consumed the
+/// office head at all, and what it consumed if so.
 ///
 /// Before this type existed, `compare_and_set_head` took a plain `office_head: Option<&str>`
 /// alongside `anchor: Option<&str>` — two adjacent parameters of the same type, but `None`
@@ -115,7 +117,8 @@ pub enum PromoteOutcome {
 /// unaudited, office head that this particular commit simply never consumed — an untrusted
 /// push, principally). A future caller reading `office_head: None` as "unborn" rather than
 /// "not consumed" would compile clean and fail only at runtime, refusing pushes it should not.
-/// This type makes that reading impossible to get backwards: there is no `None` to misread.
+/// This type makes the two readings separate variants — [`NotConsumed`](Self::NotConsumed)
+/// and [`Unborn`](Self::Unborn) — so neither can be mistaken for the other.
 ///
 /// `anchor` keeps its plain `Option<&str>` shape rather than getting the same treatment,
 /// because the asymmetry it would paper over is real: the office head is *conditionally*
@@ -128,8 +131,64 @@ pub enum OfficePrecondition<'a> {
     /// The caller's audit never read an office head (an untrusted warehouse's audit touches
     /// nothing office-related). No office precondition is built at all — not "expect unborn".
     NotConsumed,
+    /// The caller's decision read the office pallet and found it unborn; the commit must
+    /// condition on it still being unborn. A pallet delete builds this whenever the office is
+    /// unborn, with or without an anchor. Where it matters is the trust-bootstrap window (anchor
+    /// planted, office not yet lifted): there the authority check admitted the caller *because* no
+    /// office head existed, so an office lift landing before the commit could deny them, and the
+    /// commit must not outlive it. `ref_update` never builds it: an untrusted
+    /// audit consumes no office head, and a trusted one refuses an unborn office first.
+    Unborn,
     /// The caller's audit read this office head; the commit must condition on it unchanged.
     At(&'a str),
+}
+
+/// What a pallet's ref holds: a live head, a tombstone, or nothing at all.
+///
+/// A delete keeps the pallet's entry and turns it into a tombstone carrying the head it held
+/// (`deleted_head`), so a stale client's lift can be told "deleted on the remote" with a way back
+/// rather than recreating the pallet silently, and the handshake can list what was deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefHead {
+    /// The pallet is live at this head.
+    Live(String),
+    /// The pallet was deleted from this head; it is the head the pallet held when it was.
+    Deleted(String),
+    /// The pallet never existed here.
+    Absent,
+}
+
+impl RefHead {
+    /// The live head, or `None` for a tombstone or an absent pallet.
+    pub fn live(&self) -> Option<&str> {
+        match self {
+            RefHead::Live(head) => Some(head),
+            RefHead::Deleted(_) | RefHead::Absent => None,
+        }
+    }
+}
+
+/// What [`RefStore::compare_and_set_head`] expects the pallet's ref to hold — the three states
+/// of [`RefHead`], each a different condition on the stored entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedHead<'a> {
+    /// The pallet must have no entry at all — neither a head nor a tombstone. A creation that
+    /// finds a tombstone conflicts, so a pallet deleted since the caller read it is never
+    /// recreated by a request that did not acknowledge the delete.
+    Unborn,
+    /// The pallet must be a tombstone of exactly this head: an acknowledged re-creation.
+    Deleted(&'a str),
+    /// The pallet must be live at exactly this head.
+    At(&'a str),
+}
+
+/// Every pallet with an entry, across both namespaces: those live, and those deleted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefListing {
+    /// Each live pallet and its head.
+    pub live: Vec<(PalletRef, String)>,
+    /// Each deleted pallet and the head it held when it was deleted.
+    pub tombstones: Vec<(PalletRef, String)>,
 }
 
 /// The outcome of a commit that conditions on every movable input a ref-update audit
@@ -142,9 +201,10 @@ pub enum OfficePrecondition<'a> {
 pub enum CasOutcome {
     /// Every precondition held; the head moved from `expected` to the new value.
     Committed,
-    /// The pallet's own head was not `expected`; nothing moved. Carries the actual current
-    /// head so the client can report the divergence.
-    Conflict { current: Option<String> },
+    /// The pallet's own ref did not hold what was expected; nothing moved. Carries what it
+    /// actually holds, tombstone included, so the caller can tell a pallet that moved from one
+    /// that was deleted.
+    Conflict { current: RefHead },
     /// The office head the audit consumed has since moved (or the office pallet was born or
     /// retired underneath it). Carries the office pallet's actual current head.
     OfficeMoved { current: Option<String> },
@@ -384,14 +444,15 @@ pub trait ObjectStore {
 
 /// The consistency point: pallet heads and the trust anchor.
 pub trait RefStore {
-    /// The current head of a pallet, or `None` if it is unborn.
-    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<Option<String>, String>;
+    /// What a pallet's ref holds: its live head, its tombstone, or nothing.
+    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<RefHead, String>;
 
     /// Atomically move a pallet head from `expected` to `new`, conditioned on all three of
     /// the invariant's movable inputs still holding what a ref-update audit consumed (a
     /// DynamoDB `TransactWriteItems`; FORK-95 design memo, claim C13):
     ///
-    /// * `expected` — the pallet's own head. `None` means "the pallet must not exist yet".
+    /// * `expected` — what the pallet's own ref must hold; see [`ExpectedHead`]. Committing
+    ///   leaves the pallet live at `new` and clears any tombstone it was.
     /// * `office_head` — see [`OfficePrecondition`]. `NotConsumed` when the caller's own audit
     ///   never read an office head at all (an untrusted warehouse's audit touches nothing
     ///   office-related), never merely because the office pallet happens to be unborn — an
@@ -421,16 +482,31 @@ pub trait RefStore {
         &self,
         namespace: PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
         request_token: &str,
     ) -> Result<CasOutcome, String>;
 
-    /// Every pallet with something stacked, across both namespaces. Explicit because
+    /// Atomically turn a pallet live at `old` into a tombstone of `old`, under the same three
+    /// preconditions as [`compare_and_set_head`](RefStore::compare_and_set_head) and with the same
+    /// outcomes: the pallet's own head must still be `old`, the office must still hold what the
+    /// delete's authority check read (`OfficePrecondition::Unborn` when it read none), and the
+    /// anchor's stored bytes must be unchanged.
+    fn delete_head(
+        &self,
+        namespace: PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String>;
+
+    /// Every pallet with an entry, across both namespaces, live and deleted. Explicit because
     /// object storage has no directory walk (unlike `pallet_utils::all_pallet_refs`).
-    fn list_refs(&self) -> Result<Vec<(PalletRef, String)>, String>;
+    fn list_refs(&self) -> Result<RefListing, String>;
 
     /// The pallet a franchise checks out when the user does not choose (git's `HEAD`).
     fn default_pallet(&self) -> Result<String, String>;

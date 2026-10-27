@@ -8448,7 +8448,7 @@ fn a_remote_whose_handshake_lists_no_tombstones_is_never_sent_a_delete() {
     let feat = remote_with_a_side_pallet(&area, &server);
     let main = pallet_head(&area, "a", "main");
 
-    // The handshake an older head, or the serverless one, sends: no "tombstones".
+    // The handshake an older head sends: no "tombstones".
     let handshake = serde_json::json!({
         "protocol": forklift_core::model::remote::PROTOCOL_VERSION,
         "default_pallet": "main",

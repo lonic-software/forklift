@@ -10,6 +10,7 @@
 //! |---------------|------------------|--------------------|--------------------------------|
 //! | `<warehouse>` | `pallet#main`    | `head = <hash>`    | a user pallet head             |
 //! | `<warehouse>` | `pallet#@office` | `head = <hash>`    | a meta pallet head             |
+//! | `<warehouse>` | `pallet#old`     | `deleted_head = …` | a deleted pallet's tombstone   |
 //! | `<warehouse>` | `trust`          | `anchor = <json>`  | the trust anchor               |
 //!
 //! The pallet sort key is `pallet#{qualified-ref}` — the same wire form the fake keys on
@@ -18,21 +19,30 @@
 //! "pallet#")`) rather than a full-table `Scan` — the explicit ref enumeration the trait
 //! calls for, since object storage has no directory walk.
 //!
+//! A pallet item carries `head` while the pallet is live and `deleted_head` once it is deleted —
+//! never both. A delete keeps the item rather than removing it, so a creation conditioned on the
+//! item not existing (`attribute_not_exists(entity)`) refuses a deleted pallet exactly as it
+//! refuses a live one, and only an acknowledged re-creation, conditioned on the tombstone, lifts
+//! it back.
+//!
 //! The table's key schema must be `wh` (S, partition) and `entity` (S, sort); a deployment
 //! provisions it that way (the integration test creates exactly this table).
 //!
 //! # The CAS
 //!
-//! [`compare_and_set_head`](RefStore::compare_and_set_head) is a real DynamoDB conditional
+//! [`compare_and_set_head`](RefStore::compare_and_set_head) — and its sibling
+//! [`delete_head`](RefStore::delete_head), the same transaction with a different pallet action —
+//! is a real DynamoDB conditional
 //! write, never a read-then-write — and, as of FORK-95, never a single-item one either. It is
 //! a `TransactWriteItems` of up to three actions: an `Update` on the target pallet's own item
 //! whose `ConditionExpression` encodes the caller's `expected` (exactly the prior single-item
 //! shape), a `ConditionCheck` on the office pallet's item at the office head the caller's
-//! audit consumed, and a `ConditionCheck` on the trust item at the anchor's stored
-//! serialization. The office check is skipped for two independent reasons: the target pallet
-//! *is* the office pallet (the `Update` above already pins that item; DynamoDB refuses two
-//! actions on one item), or the caller's audit never read an office head at all (an untrusted
-//! warehouse's audit never touches it) — see `RefStore::compare_and_set_head`'s docs. DynamoDB
+//! audit consumed (or at its absence, for a delete whose authority check found the office
+//! unborn), and a `ConditionCheck` on the trust item at the anchor's stored serialization. The
+//! office check is skipped for two independent reasons: the target pallet *is* the office pallet
+//! (the `Update` above already pins that item; DynamoDB refuses two actions on one item), or the
+//! caller's audit never read an office head at all (an untrusted warehouse's audit never touches
+//! it) — see `RefStore::compare_and_set_head`'s docs. DynamoDB
 //! either applies the whole transaction with every condition holding or applies nothing; on a
 //! condition failure `ReturnValuesOnConditionCheckFailure=ALL_OLD` hands back the failed item,
 //! so the store reports which precondition moved without a second round trip.
@@ -79,16 +89,18 @@ use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
 use crate::store::{
-    CasOutcome, OfficePrecondition, RefStore, TransientCause, TrustOutcome, TrustWriteOutcome,
-    TRANSACTION_ATTEMPT_TIMEOUT,
+    CasOutcome, ExpectedHead, OfficePrecondition, RefHead, RefListing, RefStore, TransientCause,
+    TrustOutcome, TrustWriteOutcome, TRANSACTION_ATTEMPT_TIMEOUT,
 };
 
 /// The partition-key attribute: the warehouse id.
 const ATTR_WAREHOUSE: &str = "wh";
 /// The sort-key attribute: the item kind (`pallet#…` or `trust`).
 const ATTR_ENTITY: &str = "entity";
-/// A pallet item's head hash.
+/// A live pallet item's head hash.
 const ATTR_HEAD: &str = "head";
+/// A deleted pallet item's tombstone: the head the pallet held when it was deleted.
+const ATTR_DELETED_HEAD: &str = "deleted_head";
 /// A trust item's anchor, as a JSON string.
 const ATTR_ANCHOR: &str = "anchor";
 
@@ -112,6 +124,28 @@ fn s(value: impl Into<String>) -> AttributeValue {
 /// The `head` string of an item, if present.
 fn head_of(item: &HashMap<String, AttributeValue>) -> Option<String> {
     item.get(ATTR_HEAD).and_then(|value| value.as_s().ok()).cloned()
+}
+
+/// What a pallet item holds: live at its `head`, a tombstone of its `deleted_head`, or nothing.
+/// `head` wins if an item somehow carries both — nothing this store writes ever does, and a live
+/// head is the state a write conditioned on `head` would see.
+fn ref_head_of(item: &HashMap<String, AttributeValue>) -> RefHead {
+    if let Some(head) = head_of(item) {
+        return RefHead::Live(head);
+    }
+
+    match item.get(ATTR_DELETED_HEAD).and_then(|value| value.as_s().ok()) {
+        Some(deleted) => RefHead::Deleted(deleted.clone()),
+        None => RefHead::Absent,
+    }
+}
+
+/// What the action on the target pallet's own item writes.
+enum PalletWrite<'a> {
+    /// Leave the pallet live at this head, from whatever `ExpectedHead` names.
+    Set { expected: ExpectedHead<'a>, new: &'a str },
+    /// Turn the pallet live at this head into its tombstone.
+    Delete { old: &'a str },
 }
 
 /// The `anchor` string of an item — its *stored bytes*, not a decoded anchor — if present. Reads
@@ -190,29 +224,47 @@ impl DynamoRefStore {
         Ok(output.item)
     }
 
-    /// The `Update` action against the target pallet's own item: `SET head = :new`, guarded by
-    /// `expected` exactly as the pre-FORK-95 single-item `UpdateItem` was. Always position 0 of
-    /// the transaction `compare_and_set_head` builds.
-    fn pallet_update(&self, entity: &str, expected: Option<&str>, new: &str) -> TransactWriteItem {
-        let mut builder = Update::builder()
+    /// The `Update` action against the target pallet's own item, guarded by what the caller
+    /// expects it to hold. Always position 0 of the transaction [`Self::commit`] builds.
+    ///
+    /// DynamoDB refuses an expression attribute name or value the expressions never use, so each
+    /// arm names exactly the attributes its own two expressions mention.
+    fn pallet_update(&self, entity: &str, write: PalletWrite<'_>) -> TransactWriteItem {
+        let builder = Update::builder()
             .set_key(Some(self.key(entity)))
             .table_name(&self.table)
-            .update_expression("SET #h = :new")
             .expression_attribute_names("#h", ATTR_HEAD)
-            .expression_attribute_values(":new", s(new))
             .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
 
-        builder = match expected {
-            // The pallet must currently hold exactly `old`. A missing item fails this too
-            // (there is no `head` to equal `old`), reported as a conflict with no current
-            // head — the fake's `current (None) != expected (Some)` branch.
-            Some(old) => builder
+        let builder = match write {
+            // The pallet must currently be live at exactly `old`. A missing item or a tombstone
+            // fails this too (there is no `head` to equal `old`), reported as a conflict carrying
+            // what the item does hold.
+            PalletWrite::Set { expected: ExpectedHead::At(old), new } => builder
+                .update_expression("SET #h = :new")
                 .condition_expression("#h = :old")
+                .expression_attribute_values(":new", s(new))
                 .expression_attribute_values(":old", s(old)),
-            // The pallet must not exist yet.
-            None => builder
+            // The pallet must have no item at all: neither a head nor a tombstone.
+            PalletWrite::Set { expected: ExpectedHead::Unborn, new } => builder
+                .update_expression("SET #h = :new")
                 .condition_expression("attribute_not_exists(#e)")
-                .expression_attribute_names("#e", ATTR_ENTITY),
+                .expression_attribute_names("#e", ATTR_ENTITY)
+                .expression_attribute_values(":new", s(new)),
+            // The pallet must be a tombstone of exactly `tombstone`; lifting it back clears the
+            // tombstone in the same write.
+            PalletWrite::Set { expected: ExpectedHead::Deleted(tombstone), new } => builder
+                .update_expression("SET #h = :new REMOVE #d")
+                .condition_expression("attribute_not_exists(#h) AND #d = :t")
+                .expression_attribute_names("#d", ATTR_DELETED_HEAD)
+                .expression_attribute_values(":new", s(new))
+                .expression_attribute_values(":t", s(tombstone)),
+            // The pallet must be live at exactly `old`; it becomes a tombstone of `old`.
+            PalletWrite::Delete { old } => builder
+                .update_expression("SET #d = :old REMOVE #h")
+                .condition_expression("#h = :old")
+                .expression_attribute_names("#d", ATTR_DELETED_HEAD)
+                .expression_attribute_values(":old", s(old)),
         };
 
         TransactWriteItem::builder()
@@ -221,22 +273,22 @@ impl DynamoRefStore {
     }
 
     /// The `ConditionCheck` on the office pallet's item: its head must still equal
-    /// `office_head` exactly. Built only when the caller's audit actually consumed an office
-    /// head — see `compare_and_set_head`, which skips this action both when the target *is*
-    /// `@office` itself (the `Update` above already pins that exact item; AWS refuses two
-    /// actions on one item in the same transaction) and when the caller passed no office head
-    /// at all, meaning its audit never read one.
+    /// `office_head` exactly, `None` meaning "the office pallet must be unborn". Built only when
+    /// the caller actually consumed the office — see [`Self::commit`], which skips this action
+    /// both when the target *is* `@office` itself (the `Update` above already pins that exact
+    /// item; AWS refuses two actions on one item in the same transaction) and when the caller's
+    /// [`OfficePrecondition`] is `NotConsumed`, meaning it never read one.
     ///
-    /// The `None` arm builds "the office pallet must be unborn", and exactly one of this method's
-    /// two callers may use it. **Not `compare_and_set_head`**: an audit that found the office
-    /// pallet missing refuses before reaching the commit (`head.rs::ref_update`), so its caller
-    /// always holds a real head, and an `attribute_not_exists` condition there would test a state
-    /// no audit this store serves ever consumed — which is why that caller passes
-    /// [`OfficePrecondition`], a type with no `None` to reach this arm with. **`replace_trust`
-    /// may**, and legitimately: `put_trust` reads the office head unconditionally to run its
-    /// `adopts` check, so an anchor adopting nothing is one whose validation genuinely consumed
-    /// "the office is unborn" and must condition on it. The distinction lives in the two callers'
-    /// parameter types, not in this method, which only builds what it is told.
+    /// The `None` arm is reached from two callers, each of which genuinely consumed "the office
+    /// is unborn". `replace_trust`: `put_trust` reads the office head unconditionally to run its
+    /// `adopts` check, so an anchor adopting nothing is one whose validation depended on the
+    /// office still being unborn. A pallet delete, through `OfficePrecondition::Unborn`, on every
+    /// warehouse whose office is unborn: in the trust-bootstrap window its authority check admits
+    /// the caller because no office head exists yet, so an office lift landing before the commit
+    /// must refuse it. A ref update never
+    /// reaches it — an audit that found the office pallet missing refuses before the commit
+    /// (`head.rs::ref_update`) — and the distinction lives in the callers' parameter types, not
+    /// in this method, which only builds what it is told.
     fn office_condition_check(
         &self,
         office_entity: &str,
@@ -534,12 +586,77 @@ fn classify(layout: &[Precondition], reasons: &[CancellationReason]) -> Result<R
     ))
 }
 
+impl DynamoRefStore {
+    /// The one transaction behind both pallet writers — [`RefStore::compare_and_set_head`] and
+    /// [`RefStore::delete_head`]: the action on the pallet's own item, plus the office and
+    /// anchor `ConditionCheck`s.
+    async fn commit(
+        &self,
+        entity: &str,
+        write: PalletWrite<'_>,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        label: &str,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        let office_entity = pallet_entity(PalletNamespace::Meta, OFFICE_PALLET_NAME);
+        // The office `ConditionCheck` is built only when neither of two independent reasons to
+        // skip it holds. Structural: DynamoDB refuses a transaction where two actions target the
+        // same item ("you cannot both `ConditionCheck` and `Update` the same item" — AWS API
+        // Reference), and writing `@office` itself is that case — the office precondition IS the
+        // pallet precondition the `Update` action already encodes. Semantic:
+        // `OfficePrecondition::NotConsumed` means the caller never consumed an office head at all
+        // (an untrusted warehouse never reads one — see `RefStore::compare_and_set_head`'s docs),
+        // and conditioning on it anyway would refuse a commit over a state it never depended on.
+        // `Unborn` is consumed, and conditions on the office still having no head. The match
+        // names every variant, so a new one cannot silently fall into "not consumed".
+        let office_condition = if entity == office_entity {
+            None
+        } else {
+            match office_head {
+                OfficePrecondition::NotConsumed => None,
+                OfficePrecondition::Unborn => Some(None),
+                OfficePrecondition::At(head) => Some(Some(head)),
+            }
+        };
+
+        // Each action is pushed with the precondition it conditions on, so the layout `classify`
+        // later reads is built here rather than restated there — see `ConditionedTransaction`.
+        let mut transaction = ConditionedTransaction::new();
+
+        transaction.push(self.pallet_update(entity, write), Precondition::PalletHead);
+
+        if let Some(office_head) = office_condition {
+            transaction.push(
+                self.office_condition_check(&office_entity, office_head),
+                Precondition::OfficeHead,
+            );
+        }
+
+        transaction.push(self.anchor_condition_check(anchor), Precondition::Anchor);
+
+        let refusal = transaction.send(&self.client, label, request_token).await?;
+
+        Ok(match refusal {
+            None => CasOutcome::Committed,
+            Some(Refusal::Transient(cause)) => CasOutcome::Transient(cause),
+            Some(Refusal::Moved(Precondition::PalletHead, item)) => CasOutcome::Conflict {
+                current: item.as_ref().map(ref_head_of).unwrap_or(RefHead::Absent),
+            },
+            Some(Refusal::Moved(Precondition::OfficeHead, item)) => {
+                CasOutcome::OfficeMoved { current: item.as_ref().and_then(head_of) }
+            }
+            Some(Refusal::Moved(Precondition::Anchor, _)) => CasOutcome::AnchorMoved,
+        })
+    }
+}
+
 impl RefStore for DynamoRefStore {
-    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
+    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<RefHead, String> {
         let entity = pallet_entity(namespace, name);
 
         self.bridge.block_on(async {
-            Ok(self.get_item(&entity).await?.as_ref().and_then(head_of))
+            Ok(self.get_item(&entity).await?.as_ref().map(ref_head_of).unwrap_or(RefHead::Absent))
         })
     }
 
@@ -548,63 +665,40 @@ impl RefStore for DynamoRefStore {
         &self,
         namespace: PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         let entity = pallet_entity(namespace, name);
-        let office_entity = pallet_entity(PalletNamespace::Meta, OFFICE_PALLET_NAME);
-        // The office `ConditionCheck` is built for two independent reasons at once, both of
-        // which must hold. Structural: DynamoDB refuses a transaction where two actions target
-        // the same item ("you cannot both `ConditionCheck` and `Update` the same item" — AWS
-        // API Reference), and lifting `@office` itself is that case — the office precondition
-        // IS the pallet precondition the `Update` action already encodes. Semantic:
-        // `OfficePrecondition::NotConsumed` means the caller's own audit never consumed an
-        // office head at all (an untrusted warehouse never reads one — see
-        // `RefStore::compare_and_set_head`'s docs), and conditioning on it anyway would refuse
-        // a commit over a state the audit never depended on.
-        let office_head_value = match office_head {
-            OfficePrecondition::At(head) if entity != office_entity => Some(head),
-            _ => None,
-        };
-        self.bridge.block_on(async {
-            // Each action is pushed with the precondition it conditions on, so the layout
-            // `classify` later reads is built here rather than restated there — see
-            // `ConditionedTransaction`.
-            let mut transaction = ConditionedTransaction::new();
+        let write = PalletWrite::Set { expected, new };
 
-            transaction.push(self.pallet_update(&entity, expected, new), Precondition::PalletHead);
-
-            if let Some(office_head) = office_head_value {
-                transaction.push(
-                    self.office_condition_check(&office_entity, Some(office_head)),
-                    Precondition::OfficeHead,
-                );
-            }
-
-            transaction.push(self.anchor_condition_check(anchor), Precondition::Anchor);
-
-            let refusal = transaction.send(&self.client, "DynamoDB ref-update commit", request_token).await?;
-
-            Ok(match refusal {
-                None => CasOutcome::Committed,
-                Some(Refusal::Transient(cause)) => CasOutcome::Transient(cause),
-                Some(Refusal::Moved(Precondition::PalletHead, item)) => {
-                    CasOutcome::Conflict { current: item.as_ref().and_then(head_of) }
-                }
-                Some(Refusal::Moved(Precondition::OfficeHead, item)) => {
-                    CasOutcome::OfficeMoved { current: item.as_ref().and_then(head_of) }
-                }
-                Some(Refusal::Moved(Precondition::Anchor, _)) => CasOutcome::AnchorMoved,
-            })
-        })
+        self.bridge.block_on(
+            self.commit(&entity, write, office_head, anchor, "DynamoDB ref-update commit", request_token),
+        )
     }
 
-    fn list_refs(&self) -> Result<Vec<(PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        let entity = pallet_entity(namespace, name);
+        let write = PalletWrite::Delete { old };
+
+        self.bridge.block_on(
+            self.commit(&entity, write, office_head, anchor, "DynamoDB pallet delete", request_token),
+        )
+    }
+
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.bridge.block_on(async {
-            let mut refs = Vec::new();
+            let mut listing = RefListing::default();
             let mut start_key: Option<HashMap<String, AttributeValue>> = None;
 
             loop {
@@ -627,12 +721,17 @@ impl RefStore for DynamoRefStore {
 
                 for item in page.items() {
                     let entity = item.get(ATTR_ENTITY).and_then(|value| value.as_s().ok());
-                    let head = head_of(item);
+                    let Some(wire) = entity.and_then(|entity| entity.strip_prefix(ENTITY_PALLET_PREFIX))
+                    else {
+                        continue;
+                    };
 
-                    if let (Some(entity), Some(head)) = (entity, head) {
-                        if let Some(wire) = entity.strip_prefix(ENTITY_PALLET_PREFIX) {
-                            refs.push((PalletRef::parse(wire)?, head));
+                    match ref_head_of(item) {
+                        RefHead::Live(head) => listing.live.push((PalletRef::parse(wire)?, head)),
+                        RefHead::Deleted(head) => {
+                            listing.tombstones.push((PalletRef::parse(wire)?, head))
                         }
+                        RefHead::Absent => {}
                     }
                 }
 
@@ -642,7 +741,7 @@ impl RefStore for DynamoRefStore {
                 }
             }
 
-            Ok(refs)
+            Ok(listing)
         })
     }
 

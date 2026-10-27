@@ -121,9 +121,9 @@ so a client that freed history because this remote held it can still fetch it, a
 map, empty when nothing was deleted. A head that cannot delete pallets sends `null` or omits the
 field, and a client reads that as "this remote does not support deleting pallets" before sending
 a `DELETE`. A name keeps its tombstone until a creation that acknowledges it (below) or the
-server's operator drops it; nothing expires one. A ref update or `DELETE` whose `old_head` names
-a pallet that is gone because it was deleted is refused with `409` and `code`
-`pallet_deleted_on_remote`, not `remote_ahead`: lowering cannot resolve it.
+server's operator drops it (the serverless head has no drop); nothing expires one. A ref update
+or `DELETE` whose `old_head` names a pallet that is gone because it was deleted is refused with
+`409` and `code` `pallet_deleted_on_remote`, not `remote_ahead`: lowering cannot resolve it.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
 endpoint) are *qualified references*: a user pallet is bare (`main`), a **meta pallet** —
@@ -315,7 +315,8 @@ mismatch present from the start: the remedy is identical, and the client cannot 
 the two apart.
 A remote may also answer `503` when the write loses to unrelated concurrent traffic rather than
 to either value actually moving. The AWS serverless head has already re-issued the write itself,
-within a small bounded budget, before it answers `503`, so the answer means the write could not
+within a small bounded budget, before it answers `503` (or stopped early, when a re-issue failed
+after an attempt of unknown fate), so the answer means the write could not
 be confirmed within that budget — and since an attempt may have timed out or still been in
 progress, the anchor may already be the new one. A `503` therefore establishes nothing about the
 anchor either way: read the trust anchor before repeating the request (repeating it unread is
@@ -397,7 +398,8 @@ office pallet, rather than a value having moved). The head re-issues that transa
 itself before answering — the transaction alone, never the audit, under one idempotency token
 per request, at most four attempts in all and only while its invocation window can afford
 another — so a `503` reaches the client only when the transaction could not be completed within
-that budget. Unlike every other status in this section, `503` makes no claim about server or
+that budget, or a re-issue failed after an attempt whose fate is unknown. Unlike every other
+status in this section, `503` makes no claim about server or
 request state, including whether the update itself landed: an attempt that timed out or was
 still in progress when the budget ran out may commit, and a retry of the identical request
 would then be answered `409`, the pallet having moved to the client's own new head. So a client
@@ -427,14 +429,27 @@ defined meaning in HTTP, and a proxy may drop it. Checks, in order:
    that a pallet already deleted at `old_head` (its tombstone holds it) answers `200`, so a retry
    whose first try landed reads as done;
 4. the remote's `default_pallet`, which a franchise checks out, is refused with `409`, and so is
-   a pallet a checkout of the server's own warehouse stands on, one an open haul names, and any
-   pallet while a haul cannot be read.
+   a pallet a checkout of the server's own warehouse stands on (the serverless head has none), one
+   an open haul names, and any pallet while a haul cannot be read.
 
 A request that passes them removes the ref and writes the tombstone atomically with respect to
 every other ref write, conditioned on the office and anchor the authorization read; when either
 moved meanwhile, the head decides again. It answers `200` with no body. The open-haul check is
 made when the request is read, so a haul opened just before the removal is not refused; it keeps
-its proposed head, and the tombstone keeps the target's.
+its proposed head, and the tombstone keeps the target's. Both `forklift-server` and the
+serverless head serve this endpoint with these checks and answers, and the serverless head one
+more: a `503` when its storage stayed busy through every attempt it could afford, or an attempt
+may have landed and could not be confirmed. Either claims nothing about the pallet's state now,
+and nothing in the status or headers tells them apart, so a client treats both as possibly
+landed: it reads the pallet's state before deleting again rather than deleting whatever head it
+finds then. A tombstone at `old_head` shows that a delete at `old_head` landed, this one or
+another; the pallet live at `old_head` that none has, or that a restore undid one — and after the
+second kind of `503` an attempt of unknown fate may still land; anything else that the pallet
+moved since. The message names the
+pallet and `old_head` for a person, and says whether the head read the pallet back live there
+before answering; that read is already past, and changes none of the above. The identical
+request may be sent again; it is answered from the state at that time — `200` from a tombstone
+still at `old_head` once it passes checks 1 and 2.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 
