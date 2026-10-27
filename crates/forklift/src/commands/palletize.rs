@@ -378,17 +378,28 @@ async fn remote_for_deletes(name: &str, verb: &str) -> Result<(RemoteClient, for
 async fn delete_remote_pallet(name: &str) -> Result<(), String> {
     let (client, info) = remote_for_deletes(name, "delete").await?;
 
-    let Some(head) = info.pallets.get(name) else {
-        return Err(match info.tombstone(name) {
-            Some(head) => format!("The remote's pallet \"{}\" is already deleted (at {}).", name, head),
-            None => format!(
-                "The remote has no pallet \"{}\"; \"forklift palletize --remote\" lists them.", name
-            ),
-        });
-    };
-
     // Read before the delete, so a local read error cannot turn a delete that landed into a failure.
     let local_head = pallet_utils::get_pallet_head(name)?;
+
+    let Some(head) = info.pallets.get(name) else {
+        // Already deleted there: what a rerun of a delete whose answer was lost finds, so it is
+        // reported as done rather than refused.
+        let Some(head) = info.tombstone(name) else {
+            return Err(format!(
+                "The remote has no pallet \"{}\"; \"forklift palletize --remote\" lists them.", name
+            ));
+        };
+
+        output::emit(&RemoteDeleted {
+            remote: client.url().to_string(),
+            pallet: name.to_string(),
+            head: head.clone(),
+            local_head,
+            already: true,
+        });
+
+        return Ok(());
+    };
 
     client.delete_ref(name, head).await.map_err(|why| moved_since_read(why, name, RemoteAction::Delete))?;
 
@@ -397,6 +408,7 @@ async fn delete_remote_pallet(name: &str) -> Result<(), String> {
         pallet: name.to_string(),
         head: head.clone(),
         local_head,
+        already: false,
     });
 
     Ok(())
@@ -418,14 +430,24 @@ pub(crate) struct RemoteDeleted {
     /// The local pallet's head, untouched by the delete; `null` when there is no local pallet of
     /// that name.
     local_head: Option<String>,
+
+    /// Whether the remote had deleted it already (at `head`), as a rerun of a delete that landed
+    /// finds it: nothing was sent.
+    already: bool,
 }
 
 impl CommandOutput for RemoteDeleted {
     fn render_human(&self) {
-        println!(
-            "Deleted pallet \"{}\" on {} (it was at {}).",
-            self.pallet, forklift_core::error::sanitize(&self.remote), self.head
-        );
+        match self.already {
+            true => println!(
+                "Pallet \"{}\" is already deleted on {} (it was at {}); nothing was sent.",
+                self.pallet, forklift_core::error::sanitize(&self.remote), self.head
+            ),
+            false => println!(
+                "Deleted pallet \"{}\" on {} (it was at {}).",
+                self.pallet, forklift_core::error::sanitize(&self.remote), self.head
+            ),
+        }
         println!(
             "The remote keeps its history; \"forklift palletize --restore {} --remote\" brings it back.",
             self.pallet
@@ -498,9 +520,13 @@ async fn restore_remote_pallet(name: &str) -> Result<(), String> {
     let (client, info) = remote_for_deletes(name, "restore").await?;
 
     let Some(head) = info.tombstone(name) else {
-        return Err(match info.pallets.contains_key(name) {
-            true => format!("The remote's pallet \"{}\" is not deleted; there is nothing to restore.", name),
-            false => format!(
+        return Err(match info.pallets.get(name) {
+            Some(head) => format!(
+                "The remote's pallet \"{}\" is not deleted: it is at {}, as a restore that already \
+                landed leaves it. There is nothing to restore.",
+                name, head
+            ),
+            None => format!(
                 "The remote has no deleted pallet \"{}\"; \"forklift palletize --remote\" lists them.", name
             ),
         });

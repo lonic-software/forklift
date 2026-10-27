@@ -3203,6 +3203,10 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "A pallet deleted on the remote.",
   "properties": {
+    "already": {
+      "description": "Whether the remote had deleted it already (at `head`), as a rerun of a delete that landed\nfinds it: nothing was sent.",
+      "type": "boolean"
+    },
     "head": {
       "description": "The head it was deleted at, which the remote keeps under its tombstone.",
       "type": "string"
@@ -3227,7 +3231,8 @@ A command not listed here either reports only the generic human-message shape `{
     "remote",
     "pallet",
     "head",
-    "local_head"
+    "local_head",
+    "already"
   ],
   "title": "RemoteDeleted",
   "type": "object"

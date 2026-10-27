@@ -1164,8 +1164,9 @@ back on the remote at its tombstone's head; it needs none of that history here. 
 `--force`, and a remote that cannot delete pallets (it lists no tombstones in its handshake) is
 refused before anything is sent. The server refuses its default pallet, a pallet a checkout of its
 own warehouse stands on, and one an open haul names, and authorizes either as a move of the
-pallet. With `--json` the delete reports `remote`, `pallet`, `head` and `local_head`, and the
-restore `pallet`, `head` and `remote`.
+pallet. With `--json` the delete reports `remote`, `pallet`, `head`, `local_head` and `already`,
+and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has already deleted
+(as a rerun after a lost answer finds it) reports it done with `already` set, and sends nothing.
 
 A pallet deleted on the remote is not lowered or lifted as if it had never existed.
 `lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming

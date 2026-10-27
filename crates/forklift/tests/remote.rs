@@ -8373,6 +8373,14 @@ fn a_pallet_deleted_on_the_remote_is_listed_and_lifts_back_only_acknowledged() {
     assert_eq!(value["data"]["local_head"], feat.as_str(), "the local pallet is untouched: {}", value);
     assert!(!area.path("server-root/.forklift/pallets/feat").exists(), "the remote's ref is gone");
     assert_eq!(pallet_head(&area, "a", "feat"), feat, "and the local one stays");
+    assert_eq!(value["data"]["already"], false, "{}", value);
+
+    // A rerun, as after a delete whose answer was lost, finds it deleted and reports it done.
+    let again = area.forklift("a", &["--json", "palletize", "--delete", "feat", "--remote"]);
+    assert_success(&again);
+    let value = json_of(&again);
+    assert_eq!(value["data"]["already"], true, "{}", value);
+    assert_eq!(value["data"]["head"], feat.as_str(), "{}", value);
 
     let listed = json_of(&area.forklift("b", &["--json", "palletize", "--remote"]));
     assert!(listed["data"]["pallets"].as_array().unwrap().iter().all(|entry| entry["name"] != "feat"), "{}", listed);
