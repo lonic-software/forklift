@@ -9512,10 +9512,10 @@ mod tests {
         /// cuts its batch answers:
         /// * `Some(FakeCut::Deadline)` marks every batch redirect [`BATCH_CUT_DEADLINE`] and serves
         ///   `bundle`, as a head that ran short of time does;
-        /// * `Some(FakeCut::Other(value, k))` answers as `Budget(k)` does, but marks `value`.
         /// * `Some(FakeCut::Budget(k))` answers each batch with a bundle of the first `k` requested
         ///   objects it holds, built for that request, marked [`BATCH_CUT_BUDGET`] when it left any
-        ///   requested hash out — a head with a budget of `k` objects.
+        ///   requested hash out — a head with a budget of `k` objects;
+        /// * `Some(FakeCut::Other(value, k))` answers as `Budget(k)` does, but marks `value`.
         fn start_marking(
             redirect_status: u16,
             bundle: Vec<u8>,
@@ -9584,7 +9584,10 @@ mod tests {
     /// Point `bundle` at the first `carry` objects the batch request in `body` asks for and
     /// `objects` holds, as a head with a budget of `carry` objects answers; whether it left any
     /// requested object it holds out.
-    fn carried_prefix(body: &[u8], carry: usize, objects: &HashMap<String, Vec<u8>>, bundle: &Mutex<Vec<u8>>) -> bool {
+    fn carried_prefix(body: &[u8],
+                      carry: usize,
+                      objects: &HashMap<String, Vec<u8>>,
+                      bundle: &Mutex<Vec<u8>>) -> bool {
         let request: serde_json::Value = serde_json::from_slice(body).unwrap();
         let requested: Vec<String> = request["hashes"].as_array().unwrap().iter()
             .map(|hash| hash.as_str().unwrap().to_string())

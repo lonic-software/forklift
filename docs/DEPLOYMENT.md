@@ -178,8 +178,8 @@ single-`PUT` maximum).
   less every batch answer stops after looking for its first object, and just above that each
   carries only what it reads in the few seconds left; either way the first answer cut at the
   deadline sends clients to fetching one object at a time for the rest of the command. The
-  default of 29 s leaves about 19 s per answer for its store reads — each requested object, and its signature sidecar when the scratch
-  lacks one.
+  default of 29 s leaves about 19 s per answer for its store reads — each requested object, and
+  its signature sidecar when the scratch lacks one.
 
   Recommended default: **512 MB**, which also buys proportionally more CPU (Lambda ties CPU
   allocation to configured memory) for the audit's own work. Bump to **1024 MB** if your
