@@ -3186,6 +3186,57 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     assert!(audit.status.success(), "{}", stderr(&audit));
 }
 
+// Revert: build the boundary from the remote's live heads only → the restore is audited from
+// genesis and the worker's parcels fall outside it.
+#[test]
+fn a_revocation_vouches_for_work_the_remote_keeps_under_a_tombstone() {
+    let area = TestArea::new("revoke-tombstone");
+
+    area.write_file("tokens.toml", concat!(
+        "[operators]\n",
+        "\"w-token\" = \"worker@forklift\"\n",
+    ));
+
+    let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
+
+    prepare_warehouse(&area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+
+    let worker = keygen_admit_args(&area, "worker@forklift");
+    assert_success(&area.forklift("a", &["office", "admit", &worker[0], &worker[1], &worker[2]]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // The worker lifts a side pallet, which is then deleted on the remote: only its tombstone
+    // holds the worker's parcel there.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
+    assert_success(&area.forklift("b", &["palletize", "feat"]));
+    area.write_file("b/code.txt", "v2 by worker\n");
+    assert_success(&area.forklift("b", &["load", "code.txt"]));
+    assert_success(&area.forklift("b", &["stack", "side work"]));
+    assert_success(&area.forklift("b", &["lift"]));
+    assert_success(&area.forklift("a", &["palletize", "--delete", "feat", "--remote"]));
+
+    // The admin retires the worker's key: the boundary takes in the tombstone's head as well.
+    assert_success(&area.forklift("a", &["lower"]));
+    let list = stdout(&area.forklift("a", &["office", "list"]));
+    let worker_key_id = list.lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("key "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("office list shows the worker's key")
+        .to_string();
+    assert_success(&area.forklift("a", &["office", "retire", &worker_key_id]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let restored = area.forklift("a", &["palletize", "--restore", "feat", "--remote"]);
+    assert!(restored.status.success(), "the worker's work stays vouched for: {}", stderr(&restored));
+}
+
 /// Generate a keypair for the given operator id (on the area's shared key directory)
 /// and return the printed admit arguments: [id, public_key, proof_of_possession].
 /// The keygen runs under the target operator's id (warehouse-scope override), then
