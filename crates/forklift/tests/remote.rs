@@ -8298,7 +8298,7 @@ fn remote_meta_head(area: &TestArea, dir: &str, name: &str) -> Option<String> {
     let listed = json_of(&area.forklift(dir, &["--json", "palletize", "--remote", "--all"]));
     listed["data"]["meta"].as_array()?.iter()
         .find(|entry| entry["name"] == name)
-        .map(|entry| entry["head"].as_str().unwrap().to_string())
+        .map(|entry| entry["remote_head"].as_str().unwrap().to_string())
 }
 
 // Revert: drop the tombstone arm of `acknowledged_tombstone` → the remote refuses the lift after
