@@ -854,7 +854,7 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
         if pre_head == post_head
             || reference.namespace != PalletNamespace::User
             || pallet_utils::get_pallet_head(&reference.name)?.as_deref() != Some(post_head.as_str())
-            // Read last, so an undo that moves no pallet back never depends on the mark.
+            // Read last, so the gate reads the mark only for a pallet it would move back.
             || !crate::util::tombstone_utils::is_served()? {
             continue;
         }
@@ -1996,6 +1996,25 @@ mod tests {
         assert!(check_undoable(&entry).unwrap_err().contains("\"aside\""));
 
         // Another writer moves "aside" on: the put-back would leave it alone.
+        move_elsewhere("aside", &pallet_utils::tests::child_of(&second, "later"));
+
+        check_undoable(&entry).unwrap();
+    }
+
+    // Revert: read the served mark before judging any wire → an unreadable mark fails a gate
+    // that would move nothing back.
+    #[test]
+    fn the_gate_reads_no_mark_for_an_undo_that_moves_nothing_back() {
+        let _scratch = Scratch::new("gate-served-unread");
+        let (mut entry, _pre, post) = stacked_on_a_child();
+        let first = hash('2');
+        let second = pallet_utils::tests::child_of(&first, "aside");
+        advance("aside", None, &second).unwrap();
+        entry.before.heads = BTreeMap::from([("main".to_string(), Some(post.clone())), ("aside".to_string(), Some(first))]);
+        entry.after.heads = BTreeMap::from([("main".to_string(), Some(post)), ("aside".to_string(), Some(second.clone()))]);
+        std::fs::write(crate::globals::forklift_root().join("served"), b"something else\n").unwrap();
+        assert!(check_undoable(&entry).unwrap_err().contains("served"), "a wire it would move back reads the mark");
+
         move_elsewhere("aside", &pallet_utils::tests::child_of(&second, "later"));
 
         check_undoable(&entry).unwrap();

@@ -607,12 +607,15 @@ consolidation or cherry-pick was started or finished. It also refuses to undo th
 completed a cherry-pick once the picked parcel is gone from the warehouse (a `gc` can collect it
 when no pallet reaches it), since the pick it would put back could never complete. Continue forward instead.
 In a warehouse that `forklift-server` has served, it refuses to undo a `stack`, `consolidate` or
-`cherry-pick` that moved a pallet, keeping the entry: the remote's clones may already rely on the
-parcel it would take off, and with no ref holding it the server's `gc` could free their only copy
-(the wire is fast-forward-only for the same reason). Take a change out there by stacking a parcel
-that reverts it. An older entry stays out of `undo`'s reach behind it: a pallet deleted since
-the warehouse was served comes back with `forklift palletize --restore <name>`. Undoing a delete or a `shift` is
-unaffected. Working-tree
+`cherry-pick` that would move a pallet back off the head it left, keeping the entry: the remote's
+clones may already rely on the parcel it would take off, and with no ref holding it the server's
+`gc` could free their only copy (the wire is fast-forward-only for the same reason). A pallet
+another bay has moved on since is left alone, so it does not refuse the undo, and meta pallets are
+outside the rule. Take a change out there by stacking a parcel that reverts it. An older entry
+stays out of `undo`'s reach behind it: a pallet deleted since the warehouse was served comes back
+with `forklift palletize --restore <name>`, and one deleted before then with
+`forklift palletize <name> <head>`, the head its delete printed, while the warehouse still holds
+it. Undoing a delete or a `shift` is unaffected. Working-tree
 commands in between — `load`, `remove`, `park` — change none of that and do not block it:
 after a `park`, `undo` soft-resets beneath the parked work. `park pop` then re-applies it,
 unless the parked work touches a path the undone parcel changed — it refuses that until the
@@ -1786,9 +1789,8 @@ left, or reports there is nothing left to free.
 (`.forklift/held-heads`, at most 16 per pallet). A prune asks the remote whether it still holds
 each recorded head its current heads have moved past, and frees the history of the heads it
 confirms, so another warehouse lifting ahead does not keep your history pinned until you lower.
-A head the remote does not confirm frees nothing: one of a pallet deleted and re-created there, or
-one the server moved back past (an `undo` there is refused once it has served, so only a server
-whose served mark was lost could). When the remote cannot answer (a server too old to
+A head the remote does not confirm frees nothing, such as one the remote's ref has left (a pallet
+re-created there after `forklift-server tombstone drop`, or a ref edited on the server's disk). When the remote cannot answer (a server too old to
 know the check, or one too busy to finish it), the prune prints a `holds_unanswered` warning
 naming the pallet and frees only what the remote's current heads allow; a `lower` of that pallet
 lets a later prune free what the remote's current head reaches. A `lift`, `lower` or `franchise`
