@@ -5,9 +5,9 @@
 //! another warehouse lifts past every head held here, and `scope-prune` would keep that history
 //! until a `lower`. This record nominates the earlier heads the remote was seen to accept or
 //! serve, so a prune asks the remote whether it still holds them. An entry is only a candidate:
-//! a remote head can move backward (an `undo` on the served root) and a pallet deleted and
-//! re-created under its name starts a new lineage, so a head seen once is no proof that the
-//! remote still holds it, and nothing may be freed on an entry alone.
+//! a pallet deleted and re-created under its name starts a new lineage, and a remote whose served
+//! mark was lost or never written lets an `undo` move a head back, so a head seen once is no proof
+//! that the remote still holds it, and nothing may be freed on an entry alone.
 //!
 //! The file lives in the shared forklift root beside the fetched-heads ledger, so every bay records
 //! into one, and is a [`record_utils`] file of `<head> <pallet>` lines, oldest first. Per pallet it
@@ -137,9 +137,10 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
 /// (the remote walks a deleted pallet from its tombstone). These are
 /// what a prune may add to the remote's current heads as history the remote holds.
 ///
-/// It fails closed. A candidate counts only on a `held` answer, so a forged entry, one the remote
-/// moved back past (an `undo` on the served root), one from a pallet deleted and re-created under
-/// its name, and one whose history the remote no longer has all count as not held. A pallet the
+/// It fails closed. A candidate counts only on a `held` answer, so a forged entry, one from a
+/// pallet deleted and re-created under its name, one the remote moved back past (possible only
+/// where it was never marked served), and one whose history the remote no longer has all count as
+/// not held. A pallet the
 /// remote neither lists nor keeps a tombstone of is not asked. One whose call fails (a head too old to have the route
 /// answers `404`), or that the remote answers `unknown` about (it was busy or out of time),
 /// confirms none of those candidates and is named in [`Confirmation::unanswered`], so the caller
