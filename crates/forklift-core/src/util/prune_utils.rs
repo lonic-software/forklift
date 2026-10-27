@@ -148,8 +148,8 @@ fn plan_from(
     sources: recovery_utils::GcRootSources,
 ) -> Result<PrunePlan, String> {
     let sealed = sealed_utils::read_sealed().map_err(|error| format!(
-        "{}. Make it readable again, from a good copy or with the version of Forklift that wrote \
-        it, then run the prune again.",
+        "{}. Make it readable again, restoring it from a good copy or, if another version of \
+        Forklift wrote it, using that version; then run the prune again.",
         error.trim_end_matches('.')
     ))?;
     let (live_parcels, meta_parcels) = reachable_parcels()?;
