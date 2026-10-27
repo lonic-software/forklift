@@ -482,9 +482,7 @@ pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
             continue;
         }
 
-        // Read past the cache: each object is read once, into the bundle, so caching it would
-        // only hold a second copy of bytes the bundle already holds.
-        bundle.push(hash, &file_utils::retrieve_object_by_hash_uncached(hash)?)?;
+        bundle.push(hash, &file_utils::retrieve_object_by_hash(hash)?)?;
     }
 
     bundle.finish()
