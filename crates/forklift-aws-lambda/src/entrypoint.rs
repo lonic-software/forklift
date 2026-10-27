@@ -567,8 +567,9 @@ fn resolve_route<B>(
     let method = request.method();
 
     // Split into segments after the leading slash, keeping empty ones: a trailing slash or a `//`
-    // matches no route, as on `forklift-server`, except inside a pallet name, whose parse refuses
-    // the empty component (see [`match_endpoint`]).
+    // in the path as received matches no route, as on `forklift-server`, except inside a pallet
+    // name, whose parse refuses the empty component (see [`match_endpoint`]). Behind API Gateway a
+    // `//` has already been collapsed, and `lambda_http` has resolved `.` and `..` segments.
     let segments: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
 
     let (warehouse_id, rest) = match routing {
@@ -595,9 +596,10 @@ fn resolve_route<B>(
 /// `None` for an unknown path/method pair, which the caller turns into a `404`; a captured
 /// segment or query value that does not percent-decode to UTF-8 is a `422`.
 fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> HeadResult<Option<Route>> {
-    // An empty segment matches no route, as on `forklift-server`, whose captures never match an
-    // empty segment. A pallet name is the exception: it is the rest of the path, so an empty
-    // component reaches the handler, which refuses it like any other invalid name.
+    // An empty segment in the path as received matches no route, as on `forklift-server`, whose
+    // captures never match an empty segment. A pallet name is the exception: it is the rest of the
+    // path, so an empty component reaches the handler, which refuses it like any other invalid
+    // name.
     if !matches!(segments, ["v1", "pallets" | "holds", ..]) && segments.contains(&"") {
         return Ok(None);
     }
@@ -651,9 +653,12 @@ fn is_tail(segments: &[&str]) -> bool {
 
 /// A pallet name, the rest of the path after `pallets` or `holds`: the client sends a name such
 /// as `feature/x` as literal segments, last in the path, so each segment is decoded on its own
-/// and the decoded segments are joined with `/`. An empty segment stays an empty component, so
-/// `a//b` and `a/b/` are not `a/b`; every handler parses the name, refusing an empty component,
-/// `.`, `..` and anything outside the name alphabet.
+/// and the decoded segments are joined with `/`. An empty segment stays an empty component, so a
+/// received `a//b` or `a/b/` is not `a/b`; every handler parses the name, refusing an empty
+/// component, `.`, `..` and anything outside the name alphabet. That refusal covers only what
+/// arrives: API Gateway collapses `//` (it keeps a trailing `/`), and `lambda_http` resolves `.` and
+/// `..` segments, `%2e` spellings included, so the client never sends a name that is no valid
+/// reference.
 fn pallet_name(segments: &[&str]) -> HeadResult<String> {
     Ok(segments.iter().map(|segment| param(segment)).collect::<HeadResult<Vec<_>>>()?.join("/"))
 }

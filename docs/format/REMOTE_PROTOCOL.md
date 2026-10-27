@@ -344,11 +344,17 @@ pallet names are a fixed list — `office`, `manifest`, `haul`, `tags`, `kv` —
 `{name}` is the rest of the path, here and on every route that takes a pallet, and nothing
 follows it. A client sends the reference's `/` as literal separators and percent-encodes each
 component on its own, so `feature/x` travels as `feature/x` and `@office` as `%40office`, never
-`%2F` for a `/`. A server percent-decodes each segment and joins them with `/`, keeping an empty
-segment as an empty component, so `a//b` and `a/b/` name no valid reference and are refused, never
-read as `a/b`. A segment that does not decode to UTF-8 is refused with a `4xx`. A `/` sent as
-`%2F` is not dependable: an API gateway or reverse proxy may decode it before the request is
-routed, so a reference carried as one encoded segment would arrive split.
+`%2F` for a `/`. A server percent-decodes each segment of the path it receives and joins them
+with `/`, keeping an empty segment as an empty component, so a received `a//b` or `a/b/` names no
+valid reference and is refused, as are `.` and `..` components. A segment that does not decode to
+UTF-8 is refused with a `4xx`.
+
+What a server receives is not always what the client sent. An API gateway, reverse proxy or runtime
+may decode `%2F` before the request is routed (a reference carried as one encoded segment would
+arrive split), collapse `//` to `/` (API Gateway's HTTP API does), or resolve `.` and `..`
+segments, `%2e` spellings included (`lambda_http`, the Lambda head's HTTP adapter, does), so
+`x/../main` would arrive as `main`. A client therefore never relies on the server's refusal: it
+checks every reference before building the path and sends only valid ones.
 
 `old_head: null` means "the pallet must not exist yet". Checks, in order:
 
