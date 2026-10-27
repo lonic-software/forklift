@@ -3186,10 +3186,12 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     assert!(audit.status.success(), "{}", stderr(&audit));
 }
 
-// Revert: build the boundary from the remote's live heads only → the restore is audited from
-// genesis and the worker's parcels fall outside it.
+// A pallet deleted before the revocation is deliberately left outside the distrust boundary: a
+// deletion is how a compromised key's work is taken down, and vouching for what a tombstone holds
+// would let a restore bring it back past the audit. A restore of such work stays refused.
+// Revert: take the remote's tombstone heads into the boundary → the restore passes the audit.
 #[test]
-fn a_revocation_vouches_for_work_the_remote_keeps_under_a_tombstone() {
+fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     let area = TestArea::new("revoke-tombstone");
 
     area.write_file("tokens.toml", concat!(
@@ -3221,7 +3223,7 @@ fn a_revocation_vouches_for_work_the_remote_keeps_under_a_tombstone() {
     assert_success(&area.forklift("b", &["lift"]));
     assert_success(&area.forklift("a", &["palletize", "--delete", "feat", "--remote"]));
 
-    // The admin retires the worker's key: the boundary takes in the tombstone's head as well.
+    // The admin revokes the worker's key: the boundary is the remote's live heads, not the tombstone.
     assert_success(&area.forklift("a", &["lower"]));
     let list = stdout(&area.forklift("a", &["office", "list"]));
     let worker_key_id = list.lines()
@@ -3230,11 +3232,13 @@ fn a_revocation_vouches_for_work_the_remote_keeps_under_a_tombstone() {
         .and_then(|line| line.split_whitespace().nth(1))
         .expect("office list shows the worker's key")
         .to_string();
-    assert_success(&area.forklift("a", &["office", "retire", &worker_key_id]));
+    assert_success(&area.forklift("a", &["office", "retire", &worker_key_id, "--compromised"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     let restored = area.forklift("a", &["palletize", "--restore", "feat", "--remote"]);
-    assert!(restored.status.success(), "the worker's work stays vouched for: {}", stderr(&restored));
+    assert!(!restored.status.success(), "the deleted work is not vouched for: {}", stdout(&restored));
+    assert!(stderr(&restored).contains("distrust boundary"), "{}", stderr(&restored));
+    assert!(!area.path("server-root/.forklift/pallets/feat").exists(), "the pallet stays deleted");
 }
 
 /// Generate a keypair for the given operator id (on the area's shared key directory)
