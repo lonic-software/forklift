@@ -503,6 +503,32 @@ fn a_tail_naming_no_valid_pallet_is_refused_on_every_route() {
     assert_eq!(info.tombstone("main"), None);
 }
 
+/// An empty segment outside a pallet name matches no route, as on `forklift-server`: a trailing
+/// slash, an empty capture and an empty warehouse id are each a 404, never a 422 for an empty value.
+#[test]
+fn an_empty_segment_outside_a_pallet_name_matches_no_route() {
+    let fixture = Fixture::direct();
+    let hash = "b".repeat(64);
+    for request in [
+        get("/v1/warehouse/"),
+        get("/v1/objects/"),
+        put_bytes("/v1/objects/?session=s", Vec::new()),
+        get("/v1/signatures/"),
+        put_bytes("/v1/signatures/", Vec::new()),
+        post_json("/v1/lift//commit", &serde_json::json!({})),
+        post_json("/lift//commit", &serde_json::json!({})),
+        get(&format!("/v1//objects/{}", hash)),
+    ] {
+        let uri = request.uri().to_string();
+        assert_eq!(status(&fixture.call(request)), 404, "{}", uri);
+    }
+
+    let fixture = Fixture::multi();
+    for uri in ["/warehouses/", "/warehouses//v1/warehouse", "/warehouses/acme/", "/warehouses/acme/v1/warehouse/"] {
+        assert_eq!(status(&fixture.call(get(uri))), 404, "{}", uri);
+    }
+}
+
 /// Every captured segment is percent-decoded, not only the pallet name: an object hash sent
 /// encoded reads the object, and a lift session that decodes to a `/` is refused on both the
 /// commit route and the upload query, since it would place its staging keys under another

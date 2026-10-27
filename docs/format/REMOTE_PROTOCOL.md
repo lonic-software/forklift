@@ -346,9 +346,9 @@ follows it. A client sends the reference's `/` as literal separators and percent
 component on its own, so `feature/x` travels as `feature/x` and `@office` as `%40office`, never
 `%2F` for a `/`. A server percent-decodes each segment and joins them with `/`, keeping an empty
 segment as an empty component, so `a//b` and `a/b/` name no valid reference and are refused, never
-read as `a/b`. A segment that does not decode to UTF-8 is refused with a `4xx`. A `/` sent as `%2F` is not dependable: an API
-gateway or reverse proxy may decode it before the request is routed, so a reference carried as one
-encoded segment would arrive split.
+read as `a/b`. A segment that does not decode to UTF-8 is refused with a `4xx`. A `/` sent as
+`%2F` is not dependable: an API gateway or reverse proxy may decode it before the request is
+routed, so a reference carried as one encoded segment would arrive split.
 
 `old_head: null` means "the pallet must not exist yet". Checks, in order:
 

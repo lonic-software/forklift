@@ -566,21 +566,21 @@ fn resolve_route<B>(
     let path = request.uri().path();
     let method = request.method();
 
-    // Split into segments after the leading slash. Empty segments are kept, as `forklift-server`'s
-    // router keeps them: a trailing slash or a `//` matches no route, or reaches a pallet name
-    // whose parse refuses the empty component.
+    // Split into segments after the leading slash, keeping empty ones: a trailing slash or a `//`
+    // matches no route, as on `forklift-server`, except inside a pallet name, whose parse refuses
+    // the empty component (see [`match_endpoint`]).
     let segments: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
 
     let (warehouse_id, rest) = match routing {
         Routing::Single(id) => (id.clone(), segments.as_slice()),
         Routing::Multi => match segments.split_first() {
             Some((&"warehouses", tail)) => match tail.split_first() {
-                Some((&id, endpoint)) => {
+                Some((&id, endpoint)) if !id.is_empty() => {
                     let id = param(id)?;
                     validate_warehouse_id(&id)?;
                     (id, endpoint)
                 }
-                None => return Err(not_found(path)),
+                _ => return Err(not_found(path)),
             },
             _ => return Err(not_found(path)),
         },
@@ -595,6 +595,13 @@ fn resolve_route<B>(
 /// `None` for an unknown path/method pair, which the caller turns into a `404`; a captured
 /// segment or query value that does not percent-decode to UTF-8 is a `422`.
 fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> HeadResult<Option<Route>> {
+    // An empty segment matches no route, as on `forklift-server`, whose captures never match an
+    // empty segment. A pallet name is the exception: it is the rest of the path, so an empty
+    // component reaches the handler, which refuses it like any other invalid name.
+    if !matches!(segments, ["v1", "pallets" | "holds", ..]) && segments.contains(&"") {
+        return Ok(None);
+    }
+
     // The session-commit endpoint is the one the spec writes without a `/v1` prefix
     // (`POST /lift/{session}/commit`), while its Transport section says every endpoint lives
     // under `/v1`. The client posts the `/v1` form; the bare one is accepted as the spec writes it.
