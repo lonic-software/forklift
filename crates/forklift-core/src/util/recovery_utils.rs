@@ -2449,10 +2449,9 @@ fn walk_tree(
         // beneath it is trustworthy either way (the store invariant a warehouse never holds a
         // child without its parent tree, mirrored from `gc_utils::collect_live_set`'s own tree
         // descent, extends to "nor a child whose parent's own bytes cannot be trusted").
-        // Unconditional in both modes —
-        // a descent guard, not a sink-feeding-only stat. Without the corrupt half of this check, a
-        // corrupt reachable tree would instead hit `load_tree`'s bare `?` below and abort the
-        // whole rescan (I5) — see
+        // Unconditional in both modes — a descent guard, not a sink-feeding-only stat. Without
+        // the corrupt half of this check, a corrupt reachable tree would instead hit
+        // `load_tree`'s bare `?` below and abort the whole rescan (I5) — see
         // [`tests::a_corrupt_reachable_tree_is_a_recorded_boundary_not_a_walk_abort`].
         let descent = if corrupt.contains(&tree_hash) { Descent::Absent } else { descent_presence(&tree_hash)? };
         match descent {
@@ -2616,7 +2615,7 @@ fn check_leaf(
             // Enumerating-mode only (gated on the sink, not merely no-opped): the targeted walk
             // never needs a chunk's raw presence, only whether it is a target (handled above).
             if let Some(s) = reborrow_sink(&mut sink) {
-                if !file_utils::raw_object_present(&chunk)? && !sealed_utils::is_recorded(sealed, &chunk) {
+                if !sealed_utils::is_recorded(sealed, &chunk) && !file_utils::raw_object_present(&chunk)? {
                     s(&chunk);
                 }
             }
@@ -2624,7 +2623,7 @@ fn check_leaf(
     } else if let Some(s) = reborrow_sink(&mut sink) {
         // Enumerating-mode only, same reasoning: a plain leaf's bytes are never loaded by this
         // walk either way.
-        if !file_utils::raw_object_present(hash)? && !sealed_utils::is_recorded(sealed, hash) {
+        if !sealed_utils::is_recorded(sealed, hash) && !file_utils::raw_object_present(hash)? {
             s(hash);
         }
     }
@@ -2884,8 +2883,8 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
         "Fix what is named above (a bay's state, the office record, the fetch scope, or a pack \
         index: restore its pack files from a good copy, move an index that does not parse out of \
         the pack folder only if it holds nothing this warehouse needs, or re-create the warehouse \
-        for one of another format version; the sealed-object record: restore it from a good copy, \
-        or use the version of Forklift that wrote it), then run \
+        for one of another format version; the sealed-object record: make it readable again, from a \
+        good copy or with the version of Forklift that wrote it), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )

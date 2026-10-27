@@ -149,9 +149,9 @@ fn plan_from(
 ) -> Result<PrunePlan, String> {
     let (live_parcels, meta_parcels) = reachable_parcels()?;
     let sealed = sealed_utils::read_sealed().map_err(|error| format!(
-        "{} Restore it from a good copy, or use the version of Forklift that wrote it, then run the \
-        prune again.",
-        error
+        "{}. Make it readable again, from a good copy or with the version of Forklift that wrote \
+        it, then run the prune again.",
+        error.trim_end_matches('.')
     ))?;
     // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
     // recorded head, which no ref need still reach.
@@ -914,18 +914,17 @@ fn collect_prune_targets(
 
 /// The hash of the subtree at warehouse path `key` under `root_tree_hash`, as
 /// [`tree_utils::resolve_subtree_hash`] finds it, or `None` when the key names nothing there or
-/// a tree on the way to it is held by hash alone ([`held_by_hash`]): what lies beneath such a tree
-/// is not in this store to walk. Any other absent tree on the way fails, as it does there.
+/// a tree on the way to it, or the tree at it, is held by hash alone ([`held_by_hash`]): what
+/// lies beneath such a tree is not in this store to walk, and the remote holds all of it. Any other
+/// absent tree on the way fails, as it does there.
 ///
 /// [`tree_utils::resolve_subtree_hash`]: crate::util::tree_utils::resolve_subtree_hash
 fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &SealedSet) -> Result<Option<String>, String> {
-    if key.is_empty() {
-        return Ok(Some(root_tree_hash.to_string()));
-    }
-
     let mut current = root_tree_hash.to_string();
 
-    for component in key.split('/') {
+    // The empty key names the root itself, as it does there.
+    let components = if key.is_empty() { None } else { Some(key.split('/')) };
+    for component in components.into_iter().flatten() {
         if held_by_hash(sealed, &current)? {
             return Ok(None);
         }
@@ -938,6 +937,9 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &SealedSet)
         }
     }
 
+    if held_by_hash(sealed, &current)? {
+        return Ok(None);
+    }
     Ok(Some(current))
 }
 
@@ -2092,6 +2094,24 @@ mod tests {
         assert_eq!(plan.unlifted_pallets, vec!["other".to_string()]);
     }
 
+    /// FORK-133: a pruned path that names a tree held by hash alone keeps nothing for the unlifted
+    /// parcel over it, so its pallet is not named as needing a lift, while the pallet whose
+    /// unlifted change does keep something is. Mutation: drop the held check on the tree at the
+    /// key in `resolve_unsealed_subtree` → `other` is named → red.
+    #[test]
+    fn plan_prune_names_no_pallet_for_a_pruned_path_held_by_hash_alone() {
+        let _scratch = Scratch::new("sealed-at-key");
+        build_fixture();
+        let held_src = "6".repeat(64);
+        plant_other(&store_tree(&[("src", &held_src, DirEntryType::Tree)]), Vec::new());
+        seal(&[&held_src]);
+
+        let post_prune = MaterializationScope::from_prefixes(["README.md"]);
+        let plan = plan_prune(&["src".to_string()], &post_prune, &[], &[], &store_access()).unwrap();
+        assert!(plan.kept_unlifted > 0, "main's unlifted change keeps its path");
+        assert_eq!(plan.unlifted_pallets, vec!["main".to_string()]);
+    }
+
     /// FORK-133: an in-scope tree, an in-scope recipe under a present tree, and a spine-level
     /// in-scope recipe, each recorded and absent, are retained without being loaded. Mutations,
     /// each red: drop the full walk's held check, or the held check on either recipe descent.
@@ -2145,6 +2165,6 @@ mod tests {
         let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) else {
             panic!("an unreadable record must fail the plan");
         };
-        assert!(error.contains("sealed-object record") && error.contains("Restore it from a good copy"), "{}", error);
+        assert!(error.contains("sealed-object record") && error.contains(". Make it readable again"), "{}", error);
     }
 }
