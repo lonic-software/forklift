@@ -544,7 +544,7 @@ pub(crate) mod tests {
         });
         parcel.store().unwrap();
         let none = pallet_utils::RefPreconditions::NONE;
-        crate::util::tombstone_utils::mark_served().unwrap();
+        assert!(crate::util::tombstone_utils::mark_served().unwrap());
         pallet_utils::update_pallet_head("gone", None, &parcel.hash, &none).unwrap();
         pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "gone", &parcel.hash, &none, None).unwrap();
 

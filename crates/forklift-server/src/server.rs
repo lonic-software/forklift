@@ -129,7 +129,11 @@ impl WarehouseHandle {
             let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
             let store_access = StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?;
 
-            forklift_core::util::tombstone_utils::mark_served().map_err(ServingRefusal::Unreadable)?;
+            if !forklift_core::util::tombstone_utils::mark_served().map_err(ServingRefusal::Unreadable)? {
+                return Err(ServingRefusal::Busy(
+                    "A command in this warehouse is changing its pallets. Try again once it finishes.".to_string()
+                ));
+            }
 
             (serve_lock, store_access)
         };
@@ -2760,7 +2764,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     let acknowledged = request.tombstone.as_deref() == Some(head.as_str());
 
                     let descends = acknowledged
-                        && (head == request.new_head || merge_utils::is_ancestor(&head, &request.new_head).map_err(internal)?);
+                        && merge_utils::is_ancestor(&head, &request.new_head).map_err(internal)?;
 
                     if !acknowledged || !descends {
                         return Err(pallet_deleted(&bare, &head, acknowledged));
@@ -6398,7 +6402,7 @@ mod tests {
             pallet_utils::update_pallet_head("main", None, &main, &RefPreconditions::NONE).unwrap();
             pallet_utils::update_pallet_head("side", None, &side, &RefPreconditions::NONE).unwrap();
             pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
-            tombstone_utils::mark_served().unwrap();
+            assert!(tombstone_utils::mark_served().unwrap());
 
             (root, scope, side)
         }

@@ -70,19 +70,30 @@ pub fn is_served() -> Result<bool, String> {
 /// Mark the warehouse at the current storage root as served, durably, unless it is already. Under
 /// the [`RefLock`], so a ref removal in a bay reads the mark either before it is written (and the
 /// server then serves a root without that ref) or after it (and the removal leaves a tombstone).
-/// A root already marked is answered without the lock, so only a first serve can wait on a bay.
-pub fn mark_served() -> Result<(), String> {
+/// A root already marked is answered without the lock. The lock is tried, never waited for: the
+/// server calls this under its registry mutex, so a bay holding the lock makes the first serve
+/// retry rather than stall every other warehouse.
+///
+/// # Returns
+/// * `Ok(true)`    - The root is marked.
+/// * `Ok(false)`   - The root is unmarked and a bay holds the ref lock; nothing was written.
+/// * `Err(String)` - The mark could not be read or written.
+pub fn mark_served() -> Result<bool, String> {
     if is_served()? {
-        return Ok(());
+        return Ok(true);
     }
 
-    let _lock = RefLock::acquire()?;
+    let Some(_lock) = RefLock::try_acquire_in(&globals::forklift_root())? else {
+        return Ok(false);
+    };
 
     if is_served()? {
-        return Ok(());
+        return Ok(true);
     }
 
-    file_utils::write_file_atomically(&served_path(), &record_utils::to_bytes(SERVED_RECORD, SERVED_VERSION, Vec::<String>::new()))
+    file_utils::write_file_atomically(&served_path(), &record_utils::to_bytes(SERVED_RECORD, SERVED_VERSION, Vec::<String>::new()))?;
+
+    Ok(true)
 }
 
 /// The tombstones of the warehouse at the current storage root: each removed pallet's wire name,
@@ -229,13 +240,28 @@ mod tests {
         let _scratch = Scratch::new("mark");
 
         assert!(!is_served().unwrap(), "a root never served carries no mark");
-        mark_served().unwrap();
-        mark_served().unwrap();
+        assert!(mark_served().unwrap());
+        assert!(mark_served().unwrap());
         assert!(is_served().unwrap(), "the mark stands");
 
         std::fs::write(served_path(), b"something else\n").unwrap();
         let error = is_served().unwrap_err();
         assert!(error.contains(FILE_NAME_SERVED), "an unreadable mark is an error, never \"not served\": {}", error);
+    }
+
+    #[test]
+    fn a_first_mark_under_a_held_ref_lock_is_refused_not_waited_for() {
+        let _scratch = Scratch::new("busy");
+
+        let lock = RefLock::acquire().unwrap();
+        assert!(!mark_served().unwrap(), "a bay holds the ref lock, so the mark must not wait");
+        assert!(!is_served().unwrap(), "nothing is written while the lock is held");
+
+        drop(lock);
+        assert!(mark_served().unwrap());
+
+        let _lock = RefLock::acquire().unwrap();
+        assert!(mark_served().unwrap(), "a marked root is answered without the lock");
     }
 
     #[test]

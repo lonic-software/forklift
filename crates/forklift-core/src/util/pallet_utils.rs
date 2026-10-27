@@ -1123,15 +1123,16 @@ fn update_pallet_head_checked(
             }
         }
 
-        update_pallet_head_locked(&lock, namespace, name, expected, new, left)?;
+        let written = update_pallet_head_locked(&lock, namespace, name, expected, new, left);
 
-        // The ref has landed, so a tombstone that cannot be cleared fails nothing: beside a live ref
-        // it only over-roots, and the next removal or re-creation of the name replaces it.
-        if tombstone.is_some() {
+        // A write can land and still report a failure, so the ref is read back before the
+        // tombstone is kept. Once it has landed, a tombstone that cannot be cleared fails nothing:
+        // beside a live ref it only over-roots, and the next removal of the name replaces it.
+        if tombstone.is_some() && (written.is_ok() || get_pallet_head_in(namespace, name).ok().flatten().as_deref() == Some(new)) {
             let _ = clear_tombstone(&lock, name);
         }
 
-        return Ok(());
+        return written;
     }
 }
 
@@ -1150,7 +1151,7 @@ fn recreated_tombstone(namespace: PalletNamespace,
     // A creation that does not acknowledge the tombstone is refused whatever it descends from, so
     // its history is not walked.
     let descends = acknowledged == Some(head.as_str())
-        && (head == new || crate::util::merge_utils::is_ancestor(&head, new)?);
+        && crate::util::merge_utils::is_ancestor(&head, new)?;
 
     Ok(Some((head, descends)))
 }
@@ -2669,7 +2670,7 @@ pub(crate) mod tests {
             remove_pallet_head_in(PalletNamespace::User, "kept", &hash('a'), &RefPreconditions::NONE, Some(&deleting("kept", &hash('a')))).unwrap();
             assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "a root never served keeps no tombstones");
 
-            tombstone_utils::mark_served().unwrap();
+            assert!(tombstone_utils::mark_served().unwrap());
             remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, None).unwrap();
 
             assert_eq!(get_pallet_head("gone").unwrap(), None);
@@ -2693,7 +2694,7 @@ pub(crate) mod tests {
         fn a_refused_removal_leaves_the_tombstones_as_they_were() {
             let (root, _scope) = scratch("tombstone-refused");
             update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
-            tombstone_utils::mark_served().unwrap();
+            assert!(tombstone_utils::mark_served().unwrap());
 
             let refused = remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, None);
 
@@ -2706,10 +2707,23 @@ pub(crate) mod tests {
         fn deleted_in_a_served_root(name: &str) -> (PathBuf, StorageRootScope) {
             let (root, scope) = scratch(name);
             update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
-            tombstone_utils::mark_served().unwrap();
+            assert!(tombstone_utils::mark_served().unwrap());
             remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, None).unwrap();
 
             (root, scope)
+        }
+
+        #[test]
+        fn a_re_creation_whose_write_did_not_land_keeps_the_tombstone() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-unlanded");
+            let on_it = child_of(&hash('a'), "on it");
+            std::fs::create_dir_all(get_pallet_ref_path(PalletNamespace::User, "gone")).unwrap();
+
+            let refused = recreate_pallet_head("gone", &on_it, &RefPreconditions::NONE, &hash('a'));
+
+            assert!(matches!(&refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
+            assert_eq!(tombstone_utils::tombstone_heads().unwrap(), vec![hash('a')], "the tombstone stands");
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         #[test]

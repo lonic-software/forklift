@@ -497,13 +497,13 @@ impl RefLock {
     }
 
     /// Take the ref lock of the warehouse whose forklift root is `root` without waiting, for a
-    /// test that checks the lock is held.
+    /// caller that must not block on a bay (the server's first serve of a root) and for a test that
+    /// checks the lock is held.
     ///
     /// # Returns
     /// * `Ok(Some(RefLock))` - The lock was free, and is now held.
     /// * `Ok(None)`          - Another thread or process holds it.
     /// * `Err(String)`       - The sidecar could not be opened or locked.
-    #[cfg(test)]
     pub(crate) fn try_acquire_in(root: &Path) -> Result<Option<RefLock>, String> {
         let path = absolute(root.join(FILE_NAME_REF_LOCK));
         let file = open_lock_sidecar(&path)?;
