@@ -5924,6 +5924,32 @@ fn scope_prune_frees_history_the_remote_confirms_it_still_holds() {
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
 }
 
+// Revert: take the handshake's live pallets alone as the remote's heads → the deleted pallet's
+// lifted work reads as never lifted and is kept.
+#[test]
+fn scope_prune_frees_work_the_remote_keeps_under_a_tombstone() {
+    let area = TestArea::new("scope-prune-tombstone");
+    let _server = sparse_with_docs(&area);
+
+    assert_success(&area.forklift("sparse", &["palletize", "side"]));
+    std::fs::write(area.path("sparse/docs/guide.md"), "guide on side\n").unwrap();
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "side docs edit"]));
+    let side = pallet_head(&area, "sparse", "side");
+    let side_blob = path_object_hash(&area, "sparse", &side, "docs/guide.md");
+    assert_success(&area.forklift("sparse", &["lift"]));
+    assert_success(&area.forklift("sparse", &["shift", "main"]));
+
+    assert_success(&area.forklift("dev", &["palletize", "--delete", "side", "--remote"]));
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+
+    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&pruned);
+    let report = json_of(&pruned);
+    assert_eq!(report["data"]["kept_unlifted"], 0, "{}", report);
+    assert!(!object_present(&area, "sparse", &side_blob), "the remote keeps the deleted pallet's history");
+}
+
 #[test]
 fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     // FORK-297: a pallet name may carry `/`, and the per-pallet routes take it as one path
