@@ -1173,8 +1173,13 @@ A pallet deleted on the remote is not lowered or lifted as if it had never exist
 `pallet_deleted_on_remote` (exit 35) before uploading anything, naming the step that fits the
 work here: when it descends from the deleted head, `lift --recreate` re-creates the pallet with it,
 acknowledging the deletion; otherwise `palletize --restore <name> --remote`, then lower and
-consolidate the remote's history into the work before lifting. A plain `palletize --delete`
-drops the work here instead.
+consolidate the remote's history into the work before lifting. To drop the work here instead,
+shift to another pallet and `palletize --delete` it.
+
+A key revoked after a pallet was deleted on the remote does not vouch for what the tombstone
+holds: the distrust boundary takes the remote's live pallets only, since deleting a pallet is how
+a compromised key's work is taken down. A restore of work signed by that key outside the boundary
+is refused by the audit like any other.
 
 ### `shift` — switch pallets (`sh`)
 
