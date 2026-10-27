@@ -1084,7 +1084,7 @@ fn update_pallet_head_checked(
     // this walk first.
     let left = left_unreached(namespace, expected, new)?;
 
-    let mut tombstone = recreated_tombstone(namespace, name, expected, new)?;
+    let mut tombstone = recreated_tombstone(namespace, name, expected, new, acknowledged)?;
 
     loop {
         #[cfg(test)]
@@ -1100,7 +1100,7 @@ fn update_pallet_head_checked(
 
         if tombstone_of(namespace, name, expected)? != tombstone.as_ref().map(|(head, _)| head.clone()) {
             drop(lock);
-            tombstone = recreated_tombstone(namespace, name, expected, new)?;
+            tombstone = recreated_tombstone(namespace, name, expected, new, acknowledged)?;
             continue;
         }
 
@@ -1125,28 +1125,32 @@ fn update_pallet_head_checked(
 
         update_pallet_head_locked(&lock, namespace, name, expected, new, left)?;
 
+        // The ref has landed, so a tombstone that cannot be cleared fails nothing: beside a live ref
+        // it only over-roots, and the next removal or re-creation of the name replaces it.
         if tombstone.is_some() {
-            clear_tombstone(&lock, name).map_err(|e| RefUpdateError::Failed(format!(
-                "Pallet \"{}\" was re-created, but its tombstone could not be cleared: {}", name, e
-            )))?;
+            let _ = clear_tombstone(&lock, name);
         }
 
         return Ok(());
     }
 }
 
-/// The head of the tombstone a write of `new` over `expected` would re-create, and whether `new`
-/// descends from (or is) it: `None` unless the write creates a user pallet whose name has a
-/// tombstone (see [`tombstone_of`]).
+/// The head of the tombstone a write of `new` over `expected` would re-create, and whether the
+/// write may: `acknowledged` names that head and `new` descends from (or is) it. `None` unless the
+/// write creates a user pallet whose name has a tombstone (see [`tombstone_of`]).
 fn recreated_tombstone(namespace: PalletNamespace,
                        name: &str,
                        expected: Option<&str>,
-                       new: &str) -> Result<Option<(String, bool)>, String> {
+                       new: &str,
+                       acknowledged: Option<&str>) -> Result<Option<(String, bool)>, String> {
     let Some(head) = tombstone_of(namespace, name, expected)? else {
         return Ok(None);
     };
 
-    let descends = head == new || crate::util::merge_utils::is_ancestor(&head, new)?;
+    // A creation that does not acknowledge the tombstone is refused whatever it descends from, so
+    // its history is not walked.
+    let descends = acknowledged == Some(head.as_str())
+        && (head == new || crate::util::merge_utils::is_ancestor(&head, new)?);
 
     Ok(Some((head, descends)))
 }

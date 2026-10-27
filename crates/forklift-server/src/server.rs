@@ -2744,19 +2744,6 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 )));
             }
 
-            // An early refusal too: the ref write applies the same rule under its lock.
-            if request.old_head.is_none() && !is_meta {
-                if let Some(head) = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.remove(&bare) {
-                    let acknowledged = request.tombstone.as_deref() == Some(head.as_str());
-
-                    let descends = head == request.new_head || merge_utils::is_ancestor(&head, &request.new_head).map_err(internal)?;
-
-                    if !acknowledged || !descends {
-                        return Err(pallet_deleted(&bare, &head, acknowledged));
-                    }
-                }
-            }
-
             // A ref must never point at missing history. The write below takes this verification
             // rather than walking the history a second time, and a further attempt reuses it: it
             // covers the request's two heads, whose content no other writer can change.
@@ -2765,6 +2752,21 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
                     .map_err(unprocessable)?,
             };
+
+            // An early refusal too, after the closure check, so its walk of the new history reads
+            // only what is present: the ref write applies the same rule under its lock.
+            if request.old_head.is_none() && !is_meta {
+                if let Some(head) = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.remove(&bare) {
+                    let acknowledged = request.tombstone.as_deref() == Some(head.as_str());
+
+                    let descends = acknowledged
+                        && (head == request.new_head || merge_utils::is_ancestor(&head, &request.new_head).map_err(internal)?);
+
+                    if !acknowledged || !descends {
+                        return Err(pallet_deleted(&bare, &head, acknowledged));
+                    }
+                }
+            }
 
             if let Some(old_head) = &request.old_head {
                 // The one sanctioned non-fast-forward: the office lift right after a
@@ -6362,7 +6364,6 @@ mod tests {
         TrustAnchorDto { genesis: "0".repeat(64), enabled_at: 1, boundary, prior_genesis: None, adopts: None }
     }
 
-    /// A storage-only warehouse entered on this thread, for a test of `PUT /v1/trust`.
     /// A parcel on `parent`, so a head on it descends from `parent`.
     fn store_child_parcel(parent: &str, description: &str) -> String {
         use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -6500,6 +6501,26 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
+        /// A re-creation whose history is not all uploaded is refused as missing history (`422`),
+        /// before any walk of it.
+        ///
+        /// Revert: run the early tombstone check before the closure check → the walk fails on the
+        /// absent parent → `500` → red.
+        #[tokio::test]
+        async fn a_re_creation_with_missing_history_is_a_422() {
+            let (root, _scope, side) = served_with_side("delete-recreate-missing");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+            let absent = store_child_parcel(&side, "never uploaded");
+            let on_absent = store_child_parcel(&absent, "uploaded");
+            let (folder, file) = file_utils::get_path_for_object(&absent).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+
+            let response = create(&root, "side", &on_absent, Some(&side)).await;
+
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{}", body_text(response).await);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
         /// Revert: walk nothing for an absent ref in `post_holds` → the deleted head reads as not
         /// held → red.
         #[tokio::test]
@@ -6518,6 +6539,7 @@ mod tests {
         }
     }
 
+    /// A storage-only warehouse entered on this thread, for a test of `PUT /v1/trust`.
     fn trust_warehouse(name: &str) -> (PathBuf, StorageRootScope) {
         let root = scratch_dir(name);
         let scope = StorageRootScope::enter(&root);

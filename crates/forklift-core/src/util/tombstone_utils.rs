@@ -70,7 +70,12 @@ pub fn is_served() -> Result<bool, String> {
 /// Mark the warehouse at the current storage root as served, durably, unless it is already. Under
 /// the [`RefLock`], so a ref removal in a bay reads the mark either before it is written (and the
 /// server then serves a root without that ref) or after it (and the removal leaves a tombstone).
+/// A root already marked is answered without the lock, so only a first serve can wait on a bay.
 pub fn mark_served() -> Result<(), String> {
+    if is_served()? {
+        return Ok(());
+    }
+
     let _lock = RefLock::acquire()?;
 
     if is_served()? {
