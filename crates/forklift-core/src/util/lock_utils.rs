@@ -465,9 +465,10 @@ impl MirrorLock {
 ///
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
-/// ref compare-and-set, the trust install, `heal`'s restage of a ref or the anchor, the scoped
-/// fetch's record and re-check, `expand`'s commit and the held-heads write take it, and none of
-/// them calls another: work inside a hold uses the lock-free variants, which take the held lock as
+/// ref compare-and-set (which writes and clears tombstones in its hold), the trust install, `heal`'s
+/// restage of a ref or the anchor, the scoped fetch's record and re-check, `expand`'s commit, the
+/// held-heads write, the first served mark and a tombstone drop (taken inside its serve lock) take
+/// it, and none of them calls another: work inside a hold uses the lock-free variants, which take the held lock as
 /// an argument.
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.

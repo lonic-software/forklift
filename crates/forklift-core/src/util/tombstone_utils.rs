@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use crate::globals;
 use crate::util::lock_utils::{RefLock, ServeLock};
-use crate::util::{file_utils, object_utils, record_utils};
+use crate::util::{file_utils, object_utils, pallet_utils, record_utils};
 
 /// The mark's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_SERVED: &str = "served";
@@ -103,16 +103,22 @@ pub fn mark_served() -> Result<bool, String> {
 ///
 /// # Returns
 /// * `Ok(BTreeMap<String, String>)` - The tombstones.
-/// * `Err(String)`                  - The list exists but could not be read or holds an entry that
-///                                    is not a parcel hash and a pallet name.
+/// * `Err(String)`                  - The list exists but could not be read, holds an entry that is
+///                                    not a parcel hash and a pallet name, or names a pallet twice.
 pub fn read_tombstones() -> Result<BTreeMap<String, String>, String> {
     let path = tombstones_path();
     let mut tombstones = BTreeMap::new();
 
     for line in read_record(&path, TOMBSTONES_RECORD, TOMBSTONES_VERSION)?.unwrap_or_default() {
         match line.split_once(' ') {
-            Some((head, pallet)) if object_utils::is_object_hash(head) && !pallet.is_empty() => {
-                tombstones.insert(pallet.to_string(), head.to_string());
+            Some((head, pallet)) if object_utils::is_object_hash(head) && pallet_utils::validate_pallet_name(pallet).is_ok() => {
+                // Two tombstones of one name would leave one head unrooted, so neither is chosen.
+                if tombstones.insert(pallet.to_string(), head.to_string()).is_some() {
+                    return Err(format!(
+                        "The file \"{}\" holds two tombstones of pallet \"{}\".",
+                        path.to_string_lossy(), pallet
+                    ));
+                }
             }
             _ => return Err(format!(
                 "The file \"{}\" holds an entry that is not a parcel hash and a pallet name: \"{}\".",
@@ -310,11 +316,21 @@ mod tests {
         drop(lock);
 
         assert_eq!(read_tombstones().unwrap(), BTreeMap::from([("feature/x".to_string(), head.clone())]));
-        assert_eq!(tombstone_heads().unwrap(), vec![head]);
+        assert_eq!(tombstone_heads().unwrap(), vec![head.clone()]);
 
         std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, ["nothash main"])).unwrap();
         let error = read_tombstones().unwrap_err();
         assert!(error.contains("not a parcel hash"), "{}", error);
+
+        let bad_name = format!("{} bad name", head);
+        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, [bad_name.as_str()])).unwrap();
+        let error = read_tombstones().unwrap_err();
+        assert!(error.contains("not a parcel hash and a pallet name"), "{}", error);
+
+        let (first, second) = (format!("{} main", head), format!("{} main", "b".repeat(64)));
+        std::fs::write(tombstones_path(), record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, [first.as_str(), second.as_str()])).unwrap();
+        let error = read_tombstones().unwrap_err();
+        assert!(error.contains("two tombstones of pallet \"main\""), "a duplicate is refused, never collapsed: {}", error);
     }
 
     #[test]
