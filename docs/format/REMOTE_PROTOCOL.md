@@ -206,6 +206,34 @@ The bytes live under an **ephemeral, content-addressed response prefix**, never 
 namespace, so nothing there is reachable as an object at a hash key and invariant 1 is not in
 play — and the client hash-verifies every record on import regardless.
 
+A head may also **cut its answer short**: stop before it has looked for every requested object,
+to bound its memory or to answer inside its own time limit. It marks such an answer with the
+header `Forklift-Batch`, on the answer to the `POST` itself — the `200` carrying the bundle, or
+the `303` to it, so a client reads the mark before following the redirect. The mark says only
+that the head stopped looking; the objects it skipped may or may not be ones it holds. A cut
+answer is still a valid bundle and is imported. Its value says why the head stopped:
+
+- `budget` — the answer reached the head's size bound. It carries at least one object, and the
+  client asks again, in a new `POST`, for the requested objects it still lacks. The bound limits
+  one answer, not the remote, so the client keeps using the endpoint. An answer so marked that
+  carried nothing the client lacked is not asked again: the client fetches the rest of that
+  request with loose `GET`s and goes on using the endpoint for its other requests.
+- `deadline` — the head ran short of time, and the answer may be empty. The client fetches the
+  rest with loose `GET`s and does not ask this endpoint again for the rest of the command: a
+  store too slow to finish one batch in the head's time limit would spend that whole limit again
+  on every later request, and parallel loose `GET`s serve it better.
+
+A head whose answer meets both bounds marks it `deadline`. An answer that looked for every
+requested object carries no mark, even when it is short because the remote lacks some, and the
+client keeps using the endpoint. A value other than these two is no mark.
+
+The serverless head stops once its bundle holds 32 MiB of object data, or when its invocation is
+within 10 s of its deadline, so one answer carries at most 32 MiB plus one object. The byte
+budget never stops an answer that carries nothing, so an object larger than the budget is still
+sent, alone or after smaller ones that left room under it; the deadline stops even an empty
+answer once it has spent its time looking for objects it lacks. The self-hosted server answers
+every batch whole; the client's 512-hash chunks bound it.
+
 ### `GET /v1/parcels/{parcel}/subtree/{path}` (additive; the path-addressed fetch)
 
 The object closure of the subtree at `path` in `parcel` — the subtree root object and every

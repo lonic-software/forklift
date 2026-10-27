@@ -466,8 +466,7 @@ fn remove_stale_staging(parent: &Path) {
 /// writer-side refusal `build_bundle` gives, rather than silently omitting content the
 /// caller asked for by name.
 ///
-/// A hash repeated in `hashes` is written once, at its first occurrence: the importer admits each
-/// requested hash at most once (see [`StreamAdmission`]), so a repeat would fail the whole import.
+/// A hash repeated in `hashes` is written once, at its first occurrence (see [`BundleWriter`]).
 ///
 /// # Arguments
 /// * `hashes` - The objects to pack.
@@ -476,33 +475,78 @@ fn remove_stale_staging(parent: &Path) {
 /// * `Ok(Vec<u8>)` - The bundle bytes (header line + one zstd stream of records).
 /// * `Err(String)` - If a present object could not be read, or one is above the ceiling.
 pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
-    let mut bytes: Vec<u8> = Vec::new();
-
-    // Partial responses are the compact record stream: they are incremental additions to an
-    // existing store, not the whole-clone artifact whose native packs can be installed as a unit.
-    bytes.extend_from_slice(BUNDLE_HEADER_V3.as_bytes());
-    bytes.push(b'\n');
-
-    let mut encoder = zstd::stream::Encoder::new(&mut bytes, 0)
-        .map_err(|e| format!("Error while starting the bundle stream: {}", e))?;
-
-    let mut written: HashSet<&str> = HashSet::new();
+    let mut bundle = BundleWriter::new()?;
+    let mut looked: HashSet<&str> = HashSet::new();
 
     for hash in hashes {
-        if !written.insert(hash.as_str()) || !file_utils::does_object_exist(hash)? {
+        if !looked.insert(hash.as_str()) || !file_utils::does_object_exist(hash)? {
             continue;
         }
 
-        let object_bytes = file_utils::retrieve_object_by_hash(hash)?;
-        refuse_if_transporting_over_ceiling(&format!("object {}", hash), object_bytes.len())?;
-
-        write_record(&mut encoder, KIND_OBJECT, hash, &object_bytes)?;
+        bundle.push(hash, &file_utils::retrieve_object_by_hash(hash)?)?;
     }
 
-    encoder.finish()
-        .map_err(|e| format!("Error while finishing the bundle stream: {}", e))?;
+    bundle.finish()
+}
 
-    Ok(bytes)
+/// A partial bundle written one object at a time, for a caller that has each object's bytes in
+/// hand already and so need not read them back from the store: a serverless head mirroring a
+/// batch from its object store pushes each object as it arrives, and stops when its answer is
+/// big enough.
+pub struct BundleWriter {
+    encoder: zstd::stream::Encoder<'static, Vec<u8>>,
+    written: HashSet<String>,
+    object_bytes: u64,
+}
+
+impl BundleWriter {
+    /// An empty bundle: the header line and the start of the record stream.
+    pub fn new() -> Result<BundleWriter, String> {
+        // Partial responses are the compact record stream: they are incremental additions to an
+        // existing store, not the whole-clone artifact whose native packs can be installed as a unit.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(BUNDLE_HEADER_V3.as_bytes());
+        bytes.push(b'\n');
+
+        let encoder = zstd::stream::Encoder::new(bytes, 0)
+            .map_err(|e| format!("Error while starting the bundle stream: {}", e))?;
+
+        Ok(BundleWriter { encoder, written: HashSet::new(), object_bytes: 0 })
+    }
+
+    /// Whether no object has been pushed yet.
+    pub fn is_empty(&self) -> bool {
+        self.written.is_empty()
+    }
+
+    /// The object bytes pushed so far, before compression.
+    pub fn object_bytes(&self) -> u64 {
+        self.object_bytes
+    }
+
+    /// Append the object `hash` whose bytes are `object_bytes`, which the caller has verified
+    /// against the hash. A hash already in the bundle is not written again: the importer admits
+    /// each requested hash at most once (see [`StreamAdmission`]), so a repeat would fail the
+    /// whole import. An object above the whole-object ceiling is refused.
+    pub fn push(&mut self, hash: &str, object_bytes: &[u8]) -> Result<(), String> {
+        if self.written.contains(hash) {
+            return Ok(());
+        }
+
+        refuse_if_transporting_over_ceiling(&format!("object {}", hash), object_bytes.len())?;
+        write_record(&mut self.encoder, KIND_OBJECT, hash, object_bytes)?;
+
+        self.written.insert(hash.to_string());
+        self.object_bytes += object_bytes.len() as u64;
+
+        Ok(())
+    }
+
+    /// The finished bundle bytes.
+    pub fn finish(self) -> Result<Vec<u8>, String> {
+        self.encoder.finish()
+            .map_err(|e| format!("Error while finishing the bundle stream: {}", e))
+    }
 }
 
 /// An object hash in binary form: the plan holds one per record, so a whole-history plan costs

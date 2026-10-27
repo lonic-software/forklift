@@ -58,8 +58,8 @@ pub use entrypoint::{
     TokenDigest,
 };
 pub use error::{HeadError, HeadResult, Status};
-pub use head::{BatchResult, Head};
+pub use head::{BatchCut, BatchDelivery, BatchResult, Head, BATCH_ANSWER_RESERVE, BATCH_BYTE_BUDGET};
 pub use store::{
-    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
+    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, PromoteOutcome, PutOutcome, PutTarget, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome,
 };

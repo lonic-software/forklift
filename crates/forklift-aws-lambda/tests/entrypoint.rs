@@ -23,7 +23,7 @@ use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{
     ExpectedHead, RefHead, RefListing,
-    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{handle, AuthConfig, Credentials, Head, Routing, TokenDigest};
@@ -33,7 +33,7 @@ use forklift_core::model::remote::{
     HoldAnswer, HoldsRequest, HoldsResponse,
     CommitLiftRequest, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse, WarehouseInfo,
-    LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_MISSING_BATCH,
+    BATCH_CUT_BUDGET, BATCH_CUT_DEADLINE, BATCH_HEADER, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_MISSING_BATCH,
 };
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{self, PalletNamespace};
@@ -80,7 +80,7 @@ impl ObjectStore for SharedObjects {
     fn discard_session(&self, session: &str) -> Result<(), String> {
         self.0.discard_session(session)
     }
-    fn offload_response(&self, bytes: &[u8]) -> Result<Option<String>, String> {
+    fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
         self.0.offload_response(bytes)
     }
 }
@@ -866,6 +866,62 @@ fn batch_offloads_or_streams_by_store() {
     let url = location(&response);
     assert!(url.starts_with("https://s3.example/bucket/responses/"), "{}", url);
     assert!(!url.contains("/objects/"), "a response body is never an object");
+}
+
+/// A batch the head cut short says why in a `Forklift-Batch` header on the answer to the `POST`
+/// itself — the `200` with the bundle and the `303` to it alike, since a redirected client reads
+/// it before following: `budget` for a cut at the byte budget, `deadline` for one near the
+/// invocation deadline. A whole answer carries no such header.
+/// Revert: drop the header insert from the `Batch` route → every cut answer lacks it; swap the two
+/// values → each cut names the other.
+#[test]
+fn a_cut_batch_is_marked_with_why_on_both_answers() {
+    let objects: Vec<(String, Vec<u8>)> = (0..2)
+        .map(|i| {
+            let bytes = format!("truncated-batch-{i}").into_bytes();
+            (object_utils::hash_object_bytes(&bytes), bytes)
+        })
+        .collect();
+    let hashes: Vec<String> = objects.iter().map(|(hash, _)| hash.clone()).collect();
+
+    for fixture in [Fixture::direct(), Fixture::staging()] {
+        for (hash, bytes) in &objects {
+            fixture.objects.put_verified(hash, bytes).expect("seed");
+        }
+
+        let call = |byte_budget: u64, deadline: Option<std::time::SystemTime>| {
+            let (objects, refs) = (fixture.objects.clone(), fixture.refs.clone());
+            handle(
+                &fixture.routing,
+                &fixture.auth,
+                move |_warehouse| {
+                    let head = Head::new(SharedObjects(objects), SharedRefs(refs))
+                        .with_batch_limits(byte_budget, std::time::Duration::from_secs(60));
+                    Ok(match deadline {
+                        Some(deadline) => head.with_deadline(deadline),
+                        None => head,
+                    })
+                },
+                post_json("/v1/objects/batch", &MissingObjectsRequest { hashes: hashes.clone() }),
+            )
+        };
+
+        let mark = |response: &Response<Vec<u8>>| -> Option<String> {
+            response.headers().get(BATCH_HEADER).map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let cut = call(1, None);
+        assert!(matches!(status(&cut), 200 | 303), "{}", status(&cut));
+        assert_eq!(mark(&cut).as_deref(), Some(BATCH_CUT_BUDGET));
+
+        let late = call(u64::MAX, Some(std::time::SystemTime::now()));
+        assert_eq!(status(&late), status(&cut));
+        assert_eq!(mark(&late).as_deref(), Some(BATCH_CUT_DEADLINE));
+
+        let whole = call(u64::MAX, None);
+        assert_eq!(status(&whole), status(&cut), "the same store answers the same way");
+        assert!(whole.headers().get(BATCH_HEADER).is_none(), "a whole answer is unmarked");
+    }
 }
 
 // -------------------------------------------------------------------------------------------

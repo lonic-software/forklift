@@ -58,7 +58,7 @@ use crate::error::{HeadError, HeadResult};
 use crate::reissue::reissue;
 use crate::scratch::{materialize, materialize_state, Mirror, Scratch};
 use crate::store::{
-    CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
+    CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome, PutTarget,
     RefHead, RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
@@ -94,10 +94,29 @@ pub enum ObjectWriteResult {
     Redirect(String),
 }
 
-/// How the head answers a `batch` request: the bundle bytes, or a redirect to a presigned
-/// `GET` for them.
+/// How the head answers a `batch` request.
 #[derive(Debug)]
-pub enum BatchResult {
+pub struct BatchResult {
+    /// Where the bundle is.
+    pub delivery: BatchDelivery,
+    /// Why the head stopped before looking for every requested object, if it did. The router
+    /// marks the answer with it (`Forklift-Batch`).
+    pub cut: Option<BatchCut>,
+}
+
+/// Why a `batch` answer stopped before looking for every requested object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchCut {
+    /// The bundle reached [`BATCH_BYTE_BUDGET`]; the client asks again for the rest.
+    Budget,
+    /// The invocation deadline came within [`BATCH_ANSWER_RESERVE`]; the client fetches the rest
+    /// one object at a time.
+    Deadline,
+}
+
+/// Where a `batch` bundle is: the bytes themselves, or a presigned `GET` for them.
+#[derive(Debug)]
+pub enum BatchDelivery {
     /// The bundle-format stream (the head serves it itself).
     Bundle(Vec<u8>),
     /// Follow this presigned URL for the bundle. The router answers `303` (not `307`/`308`):
@@ -136,6 +155,19 @@ const MAX_CACHED_OFFICE_STATES: usize = 32;
 /// read round already in flight to finish.
 const HOLDS_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How many object bytes one `batch` answer carries before the head stops and answers with what
+/// it has, marked as cut at the budget. It bounds the function's memory: the bundle is held whole
+/// until it is offloaded, and it can overshoot this by the one object that crossed it (up to
+/// `MAX_OBJECT_BYTES`, 64 MiB). See docs/DEPLOYMENT.md "Memory sizing" for the measurement it is
+/// sized from.
+pub const BATCH_BYTE_BUDGET: u64 = 32 * 1024 * 1024;
+
+/// How long before the invocation deadline a `batch` stops mirroring objects, leaving the time to
+/// finish the one object already in flight, offload the bundle and answer. A 37.5 MiB answer took
+/// about 1.4 s cold on a 512 MB function (docs/DEPLOYMENT.md "Memory sizing"), so this covers the
+/// byte budget plus one maximal object several times over.
+pub const BATCH_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How many times a pallet delete decides afresh when its commit is refused because the office or
 /// the anchor moved underneath it — the direct head's bound for the same loop. Only the last
 /// attempt's refusal is answered.
@@ -150,6 +182,9 @@ pub struct Head<O: ObjectStore, R: RefStore> {
     /// re-issued only while what remains covers the wait and one more attempt (see
     /// `reissue.rs`); `None` keeps the attempt cap and skips that check.
     deadline: Option<SystemTime>,
+    /// When a `batch` answer stops: past this many object bytes, or this close to `deadline`.
+    batch_byte_budget: u64,
+    batch_answer_reserve: std::time::Duration,
 }
 
 impl<O: ObjectStore, R: RefStore> Head<O, R> {
@@ -158,7 +193,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// It has no invocation deadline, so a transient refusal is re-issued up to the attempt cap
     /// without a window check; [`with_deadline`](Self::with_deadline) adds one.
     pub fn new(objects: O, refs: R) -> Head<O, R> {
-        Head { objects, refs, scratch: ScratchSource::Ephemeral, deadline: None }
+        Head {
+            objects,
+            refs,
+            scratch: ScratchSource::Ephemeral,
+            deadline: None,
+            batch_byte_budget: BATCH_BYTE_BUDGET,
+            batch_answer_reserve: BATCH_ANSWER_RESERVE,
+        }
     }
 
     /// Assemble a head that reuses one scratch warehouse across warm invocations, so the
@@ -183,12 +225,21 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             refs,
             scratch: ScratchSource::Pooled(warehouse_id.into()),
             deadline: Some(deadline),
+            batch_byte_budget: BATCH_BYTE_BUDGET,
+            batch_answer_reserve: BATCH_ANSWER_RESERVE,
         }
     }
 
     /// The same head, bounded by an invocation deadline.
     pub fn with_deadline(self, deadline: SystemTime) -> Head<O, R> {
         Head { deadline: Some(deadline), ..self }
+    }
+
+    /// The same head, with its `batch` answers bounded by `byte_budget` object bytes and stopping
+    /// `answer_reserve` before the invocation deadline, in place of [`BATCH_BYTE_BUDGET`] and
+    /// [`BATCH_ANSWER_RESERVE`].
+    pub fn with_batch_limits(self, byte_budget: u64, answer_reserve: std::time::Duration) -> Head<O, R> {
+        Head { batch_byte_budget: byte_budget, batch_answer_reserve: answer_reserve, ..self }
     }
 
     /// The scratch warehouse this request mirrors into.
@@ -1195,33 +1246,62 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// `POST /v1/objects/batch` — many objects in one bundle-format stream (forklift's
     /// packfile moment). Objects the store lacks are simply absent; the client falls back
-    /// to loose fetches. Built by mirroring the requested objects into a scratch and
-    /// reusing `bundle_utils::build_partial_bundle`.
+    /// to loose fetches. Each object is mirrored into the scratch and written into the bundle as
+    /// it arrives, in request order.
+    ///
+    /// The answer stops early, with what it has, once the bundle holds [`BATCH_BYTE_BUDGET`]
+    /// object bytes or the invocation deadline is within [`BATCH_ANSWER_RESERVE`] — a request
+    /// may name 512 objects of up to 64 MiB each, and the function has neither the memory nor the
+    /// time for that. It always looks for the first requested object, and the byte budget never
+    /// stops an answer that carries nothing. An answer that stopped before looking for every
+    /// requested object is marked with why it stopped — whether or not the store holds the ones it
+    /// skipped, which it did not stop to find out. A budget cut sends the client back for the rest;
+    /// a deadline cut sends it to fetching the rest one object at a time.
     ///
     /// The bundle is the one *response* that has no small bound — it is as large as the
-    /// objects asked for — so a store that can offload it hands back a presigned `GET`
-    /// rather than squeezing megabytes back through the control plane. Same medicine as the
-    /// upload path, in the other direction — except the router answers `303`, not `307`, since
-    /// this request is a `POST` and the presigned target only ever accepts `GET`.
+    /// objects asked for, up to that budget — so a store that can offload it hands back a
+    /// presigned `GET` rather than squeezing megabytes back through the control plane. Same
+    /// medicine as the upload path, in the other direction — except the router answers `303`,
+    /// not `307`, since this request is a `POST` and the presigned target only ever accepts `GET`.
     pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
         self.reject_malformed_batch(hashes)?;
 
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
-        let bundle = scratch.scoped(|| -> HeadResult<Vec<u8>> {
-            let mut mirrored: HashSet<String> = HashSet::new();
+        let (bundle, cut) = scratch.scoped(|| -> HeadResult<(Vec<u8>, Option<BatchCut>)> {
+            let mut bundle = bundle_utils::BundleWriter::new().map_err(HeadError::internal)?;
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut cut = None;
 
             for hash in hashes {
-                if !mirrored.insert(hash.clone()) {
+                if !seen.insert(hash.as_str()) {
                     continue;
                 }
 
-                // A warm scratch may already hold it, mirrored from this same warehouse.
-                if !file_utils::does_object_exist(hash).map_err(HeadError::internal)? {
-                    if let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? {
-                        object_utils::store_object_bytes(hash, &bytes)
-                            .map_err(HeadError::internal)?;
+                cut = self.batch_answer_cut(&bundle, seen.len() > 1);
+                if cut.is_some() {
+                    break;
+                }
+
+                // A warm scratch may already hold it, mirrored from this same warehouse. Either way
+                // the bytes are verified against the hash before they enter the bundle: the scratch
+                // verified them when it stored them.
+                let object = if file_utils::does_object_exist(hash).map_err(HeadError::internal)? {
+                    Some(file_utils::retrieve_object_by_hash_uncached(hash).map_err(HeadError::internal)?)
+                } else {
+                    match self.objects.get(hash).map_err(HeadError::internal)? {
+                        Some(bytes) => {
+                            object_utils::store_object_bytes(hash, &bytes).map_err(HeadError::internal)?;
+                            Some(bytes)
+                        }
+                        // The store lacks it: it is simply not in the bundle — the documented
+                        // contract.
+                        None => None,
                     }
+                };
+
+                if let Some(object) = object {
+                    bundle.push(hash, &object).map_err(HeadError::internal)?;
                 }
 
                 if sign_utils::load_raw_parcel_signature(hash).map_err(HeadError::internal)?.is_none()
@@ -1235,14 +1315,34 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
             }
 
-            // `build_partial_bundle` skips whatever is absent from the scratch, so a hash the
-            // store lacks is simply not in the bundle — the documented contract.
-            bundle_utils::build_partial_bundle(hashes).map_err(HeadError::internal)
+            Ok((bundle.finish().map_err(HeadError::internal)?, cut))
         })?;
 
-        match self.objects.offload_response(&bundle).map_err(HeadError::internal)? {
-            Some(url) => Ok(BatchResult::Redirect(url)),
-            None => Ok(BatchResult::Bundle(bundle)),
+        let delivery = match self.objects.offload_response(bundle).map_err(HeadError::internal)? {
+            OffloadedResponse::Url(url) => BatchDelivery::Redirect(url),
+            OffloadedResponse::Inline(bundle) => BatchDelivery::Bundle(bundle),
+        };
+
+        Ok(BatchResult { delivery, cut })
+    }
+
+    /// Whether a `batch` answer holding `bundle` stops before looking for its next object, and
+    /// why: it has `looked` for an object already and the invocation deadline is within the answer
+    /// reserve, or it carries an object and is past the byte budget. The deadline counts lookups of
+    /// objects the store lacks too, since on a slow store those spend the time as surely as reads
+    /// do. It is judged first, so an answer that meets both rules says it ran short of time — the
+    /// cut that tells the client not to ask again.
+    fn batch_answer_cut(&self, bundle: &bundle_utils::BundleWriter, looked: bool) -> Option<BatchCut> {
+        let out_of_time = looked && self.deadline.is_some_and(|deadline| {
+            deadline.duration_since(SystemTime::now()).unwrap_or_default() < self.batch_answer_reserve
+        });
+
+        if out_of_time {
+            Some(BatchCut::Deadline)
+        } else if !bundle.is_empty() && bundle.object_bytes() >= self.batch_byte_budget {
+            Some(BatchCut::Budget)
+        } else {
+            None
         }
     }
 

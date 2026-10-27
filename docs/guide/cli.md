@@ -1676,7 +1676,10 @@ content and leaves out-of-scope changes sealed by hash, exactly as the franchise
 longer than about 45 seconds to start answering a batch does not fail the command: the rest of
 that command fetches one object at a time, which is slower but still finishes, and the command
 says so in one closing line (`batch_lane: "degraded"` under `--json`). A remote that serves no
-batch downloads gets the same line, worded for that (`batch_lane: "endpoint_absent"`). A remote
+batch downloads gets the same line, worded for that (`batch_lane: "endpoint_absent"`), and so
+does one that runs out of time partway through a batch (`batch_lane: "out_of_time"`): what it
+sent is kept. A remote that sends only part of a batch because the objects asked for are too
+large for one answer is simply asked again for the rest. A remote
 that rate-limits its fetches is waited out, for up to 30 seconds per request. The same holds
 for every command that fetches (`franchise`, `lower`, `expand`, and `lift` when it auto-merges);
 `office accept-regenesis` adds the line to its message instead of a `batch_lane` field. A fetch

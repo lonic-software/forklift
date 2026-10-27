@@ -37,7 +37,7 @@ use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
     ExpectedHead, RefHead,
-    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{
@@ -354,12 +354,12 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
         assert_eq!(objects.get_signature(&parcel).expect("get sig").as_deref(), Some(sig_a.as_slice()));
 
         // A response body offloads to a presigned GET outside the object namespace.
-        match objects.offload_response(b"a bundle").expect("offload") {
-            Some(url) => {
+        match objects.offload_response(b"a bundle".to_vec()).expect("offload") {
+            OffloadedResponse::Url(url) => {
                 assert!(url.contains("responses/"), "{}", url);
                 assert!(!url.contains("/objects/"), "a response is never an object");
             }
-            None => panic!("an offloading store hands out a URL"),
+            OffloadedResponse::Inline(_) => panic!("an offloading store hands out a URL"),
         }
 
         // discard_session sweeps staging; a promote after it is Missing (nothing staged, not

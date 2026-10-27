@@ -25,7 +25,7 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
-use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
+use forklift_aws_lambda::{AsyncBridge, BatchCut, BatchDelivery, BatchResult, Head};
 
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals::StorageRootScope;
@@ -33,7 +33,7 @@ use forklift_core::util::authority_utils::Principal;
 use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, TrustAnchorDto};
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils;
-use forklift_core::util::{file_utils, object_utils, sign_utils};
+use forklift_core::util::{bundle_utils, file_utils, object_utils, sign_utils};
 
 // ---------------------------------------------------------------------------------------
 // Harness: build a warehouse with the CLI, harvest it into the fakes.
@@ -1497,11 +1497,13 @@ fn batch_returns_a_bundle_stream() {
 
     let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
 
-    match head.batch(&hashes).expect("batch") {
-        BatchResult::Bundle(bundle) => {
+    let answer = head.batch(&hashes).expect("batch");
+    assert!(answer.cut.is_none(), "a small batch is answered whole");
+    match answer.delivery {
+        BatchDelivery::Bundle(bundle) => {
             assert!(!bundle.is_empty(), "the batch produced a non-empty bundle stream")
         }
-        BatchResult::Redirect(_) => panic!("a direct store serves the bundle inline"),
+        BatchDelivery::Redirect(_) => panic!("a direct store serves the bundle inline"),
     }
 
     // Nothing is missing after the upload.
@@ -1533,21 +1535,177 @@ fn batch_offloads_the_bundle_to_a_presigned_url() {
         staging.objects.put_verified(hash, bytes).expect("seed the staging store");
     }
 
-    let inline = match direct.batch(&hashes).expect("direct batch") {
-        BatchResult::Bundle(bundle) => bundle,
-        BatchResult::Redirect(_) => panic!("a direct store serves the bundle inline"),
+    let inline = match direct.batch(&hashes).expect("direct batch").delivery {
+        BatchDelivery::Bundle(bundle) => bundle,
+        BatchDelivery::Redirect(_) => panic!("a direct store serves the bundle inline"),
     };
 
-    match staging.batch(&hashes).expect("offloaded batch") {
-        BatchResult::Redirect(url) => {
+    match staging.batch(&hashes).expect("offloaded batch").delivery {
+        BatchDelivery::Redirect(url) => {
             assert!(url.starts_with("https://s3.example/bucket/responses/"));
             assert!(!url.contains("/objects/"), "a response body is never an object");
 
             let served = staging.objects.offloaded_response(&url).expect("the presigned bytes");
             assert_eq!(served, inline, "the offloaded bundle is the bundle");
         }
-        BatchResult::Bundle(_) => panic!("an offloading store hands out a presigned GET"),
+        BatchDelivery::Bundle(_) => panic!("an offloading store hands out a presigned GET"),
     }
+}
+
+/// `count` distinct objects of `size` bytes each, seeded by `seed`, with their hashes.
+fn sized_objects(count: usize, size: usize, seed: &str) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|i| {
+            let mut bytes = format!("{seed}-{i}-").into_bytes();
+            bytes.resize(size, b'x');
+            (object_utils::hash_object_bytes(&bytes), bytes)
+        })
+        .collect()
+}
+
+/// A direct head over a store seeded with `objects`.
+fn seeded_head(store: MemoryObjectStore, objects: &[(String, Vec<u8>)]) -> Head<MemoryObjectStore, MemoryRefStore> {
+    for (hash, bytes) in objects {
+        store.put_verified(hash, bytes).expect("seed");
+    }
+    Head::new(store, MemoryRefStore::new())
+}
+
+/// The requested objects an inline batch answer carries, read back by importing its bundle into a
+/// fresh warehouse `name`, in request order.
+fn bundled(area: &Area, name: &str, answer: BatchResult, requested: &[String]) -> Vec<String> {
+    let BatchDelivery::Bundle(bundle) = answer.delivery else {
+        panic!("a direct store serves the bundle inline");
+    };
+
+    prepare(area, name);
+    let _scope = StorageRootScope::enter(&area.path(name));
+    let admission = bundle_utils::StreamAdmission::Requested(requested.iter().cloned().collect());
+    bundle_utils::import_streamed_bundle(&bundle[..], admission).expect("the bundle imports");
+
+    requested.iter().filter(|hash| file_utils::does_object_exist(hash).expect("presence")).cloned().collect()
+}
+
+/// A batch past the byte budget stops at the object that crossed it, marked as cut at the
+/// budget: a strict prefix of what was asked, at least one object, and over the budget by less
+/// than one object.
+/// Revert: drop the byte rule from `batch_answer_cut` → every object comes back, unmarked.
+#[test]
+fn a_batch_past_its_byte_budget_answers_a_marked_prefix() {
+    const SIZE: usize = 100 * 1024;
+    let area = Area::new("batch-budget");
+    let objects = sized_objects(10, SIZE, "budget");
+    let hashes: Vec<String> = objects.iter().map(|(hash, _)| hash.clone()).collect();
+
+    let head = seeded_head(MemoryObjectStore::new(), &objects)
+        .with_batch_limits(250 * 1024, std::time::Duration::ZERO);
+    let answer = head.batch(&hashes).expect("batch");
+    assert!(answer.cut == Some(BatchCut::Budget), "an answer cut at the budget is marked so");
+
+    let carried = bundled(&area, "budget", answer, &hashes);
+    assert_eq!(carried, hashes[..3], "it stops at the object that crossed 250 KiB, in request order");
+    assert!(carried.len() * SIZE < 250 * 1024 + SIZE, "the overshoot is under one object");
+
+    // The control: the same batch inside its budget is whole and unmarked.
+    let head = seeded_head(MemoryObjectStore::new(), &objects)
+        .with_batch_limits(10 * SIZE as u64 + 1, std::time::Duration::ZERO);
+    let answer = head.batch(&hashes).expect("batch");
+    assert!(answer.cut.is_none(), "a whole answer is not marked");
+    assert_eq!(bundled(&area, "whole", answer, &hashes), hashes);
+}
+
+/// The byte budget never stops an answer that carries nothing: at a zero budget the first object
+/// held is still sent, and objects the store lacks count toward nothing. An answer short only
+/// of what the store lacks is not marked; one that stopped before looking for every requested
+/// object is, even when the store lacks the ones it skipped.
+/// Revert: let the byte rule in `batch_answer_cut` stop an empty answer → the first answer
+/// carries nothing.
+#[test]
+fn a_batch_always_carries_one_object_and_absent_ones_do_not_mark_it() {
+    let area = Area::new("batch-one");
+    let objects = sized_objects(3, 64 * 1024, "one");
+    let absent: Vec<String> = synthetic_objects(2, "never-stored").into_iter().map(|(hash, _)| hash).collect();
+    let mut hashes = absent.clone();
+    hashes.extend(objects.iter().map(|(hash, _)| hash.clone()));
+
+    // A zero budget: every object is over it, and only the rule that an empty answer never
+    // stops lets one through.
+    let head = seeded_head(MemoryObjectStore::new(), &objects).with_batch_limits(0, std::time::Duration::ZERO);
+    let answer = head.batch(&hashes).expect("batch");
+    assert_eq!(answer.cut, Some(BatchCut::Budget));
+    assert_eq!(bundled(&area, "one", answer, &hashes), hashes[2..3], "the absent ones are skipped, then one object");
+
+    // Only absent objects: nothing to carry, and nothing was cut.
+    let answer = head.batch(&hashes[..2]).expect("batch");
+    assert!(answer.cut.is_none(), "an answer short only of what the store lacks is not marked");
+
+    // Cut before objects the store lacks: the head did not look for them, so it cannot say the
+    // answer is short only of those, and marks it.
+    let cut = [hashes[2].clone(), absent[0].clone(), absent[1].clone()];
+    let answer = head.batch(&cut).expect("batch");
+    assert!(answer.cut == Some(BatchCut::Budget), "an answer that skipped looking for an object is marked");
+    assert_eq!(bundled(&area, "skipped", answer, &cut), cut[..1]);
+
+    // A deadline already past still looks for the first object, and carries it when it is held.
+    // The budget is spent too, and the deadline is the cut it names: the one that tells the client
+    // not to ask again.
+    let head = seeded_head(MemoryObjectStore::new(), &objects)
+        .with_batch_limits(0, std::time::Duration::from_secs(10))
+        .with_deadline(std::time::SystemTime::now());
+    let answer = head.batch(&hashes[2..]).expect("batch");
+    assert_eq!(answer.cut, Some(BatchCut::Deadline));
+    assert_eq!(bundled(&area, "late", answer, &hashes[2..]), hashes[2..3]);
+}
+
+/// The deadline counts lookups of objects the store lacks: a batch of them over a slow store
+/// stops when the deadline nears, marked, rather than running past it while it carries nothing.
+/// Revert: let the deadline rule in `batch_answer_cut` wait for a carried object → all twelve
+/// lookups run, past the deadline, and the answer is unmarked.
+#[test]
+fn a_batch_of_absent_objects_over_a_slow_store_answers_before_the_invocation_deadline() {
+    let hashes: Vec<String> = synthetic_objects(12, "slow-absent").into_iter().map(|(hash, _)| hash).collect();
+
+    let window = std::time::Duration::from_secs(3);
+    let started = std::time::SystemTime::now();
+    let head = seeded_head(MemoryObjectStore::new().with_read_delay(std::time::Duration::from_millis(300)), &[])
+        .with_batch_limits(u64::MAX, std::time::Duration::from_secs(2))
+        .with_deadline(started + window);
+
+    let answer = head.batch(&hashes).expect("batch");
+    let elapsed = started.elapsed().expect("a forward clock");
+
+    assert!(answer.cut == Some(BatchCut::Deadline), "an answer cut at the deadline is marked so, carried objects or not");
+    assert!(elapsed < window, "it answered before the deadline: {:?}", elapsed);
+}
+
+/// A batch over a slow store stops mirroring when the invocation deadline nears, and answers
+/// before the deadline with a marked, strict subset.
+/// Revert: drop the deadline rule from `batch_answer_cut` → all twelve reads run, past the
+/// deadline, and the answer is whole.
+#[test]
+fn a_batch_over_a_slow_store_answers_before_the_invocation_deadline() {
+    let area = Area::new("batch-deadline");
+    let objects = sized_objects(12, 1024, "slow");
+    let hashes: Vec<String> = objects.iter().map(|(hash, _)| hash.clone()).collect();
+
+    let window = std::time::Duration::from_secs(3);
+    let started = std::time::SystemTime::now();
+    let head = seeded_head(
+        MemoryObjectStore::new().with_read_delay(std::time::Duration::from_millis(300)),
+        &objects,
+    )
+    .with_batch_limits(u64::MAX, std::time::Duration::from_secs(2))
+    .with_deadline(started + window);
+
+    let answer = head.batch(&hashes).expect("batch");
+    let elapsed = started.elapsed().expect("a forward clock");
+
+    assert!(answer.cut == Some(BatchCut::Deadline), "an answer cut at the deadline is marked so");
+    assert!(elapsed < window, "it answered before the deadline: {:?}", elapsed);
+
+    let carried = bundled(&area, "deadline", answer, &hashes);
+    assert!(!carried.is_empty() && carried.len() < hashes.len(), "a strict, non-empty subset: {}", carried.len());
+    assert_eq!(carried, hashes[..carried.len()], "a prefix, in request order");
 }
 
 /// The body-less upload negotiation: one round trip sorts the hashes into already-present,

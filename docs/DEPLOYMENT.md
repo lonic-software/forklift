@@ -163,9 +163,28 @@ single-`PUT` maximum).
   walk is sequential), so the control plane's floor is "one 64 MiB buffer plus normal JSON/SDK
   overhead", not "one 8 MiB buffer".
 
+  The `batch` endpoint is the third sink, and the largest: the bundle it answers with is held
+  whole until it is offloaded. `Head::batch` stops adding objects once the bundle holds
+  `BATCH_BYTE_BUDGET` (32 MiB) of object data and marks the answer cut at its budget, so the
+  client asks again for the rest and a bundle is at most 32 MiB plus the one object that crossed
+  it. Without that budget a request for 180 MiB of blobs ran a 512 MB function out of memory;
+  measured on a 512 MB function with it, a request for 24 blobs of 7.5 MiB answered a cut
+  37.5 MiB bundle in about 1.4 s cold and 0.9 s warm,
+  peaking at 188 MB. The same requests at 1024 MB ran 20–30% faster at the same peak, so the
+  larger size is not needed for memory, and the time it saves is far inside the 29 s limit.
+
+  The batch also stops when its invocation is within `BATCH_ANSWER_RESERVE` (10 s) of its
+  deadline, so it needs a `control_plane_timeout_s` well above 10 s to batch usefully. At 10 s or
+  less every batch answer stops after looking for its first object, and just above that each
+  carries only what it reads in the few seconds left; either way the first answer cut at the
+  deadline sends clients to fetching one object at a time for the rest of the command. The
+  default of 29 s leaves about 19 s per answer for its store reads — each requested object, and
+  its signature sidecar when the scratch lacks one.
+
   Recommended default: **512 MB**, which also buys proportionally more CPU (Lambda ties CPU
   allocation to configured memory) for the audit's own work. Bump to **1024 MB** if your
-  warehouses routinely stack near-maximal (64 MiB) trees or recipes.
+  warehouses routinely stack near-maximal (64 MiB) trees or recipes: a batch whose budget is
+  crossed by one of those holds a bundle of nearly 100 MiB.
 
 **Ephemeral storage (`/tmp`).** `Head::pooled`'s shared scratch (`scratch::Scratch::shared`)
 persists on `/tmp`, keyed by warehouse, across warm invocations — so most invocations only add

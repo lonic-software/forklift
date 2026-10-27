@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 8,
+  "schema": 9,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 8,
+  "schema": 9,
   "command": "stocktake",
   "ok": false,
   "error": {
@@ -83,7 +83,14 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 7** (current): the `mirror` command exists; `lift` carries `mirror` when it
+**Schema 9** (current): `batch_lane` may also be `out_of_time`, when the remote ran out of time for
+a batch download and the rest of the command fetched one object at a time.
+
+**Schema 8**: the `pallet_deleted_on_remote` error code exists; `palletize --remote` lists the
+remote's deleted pallets as `deleted`, and `palletize` lists this served warehouse's own as
+`deleted`; `palletize --delete`/`--restore` with `--remote` report `remote`.
+
+**Schema 7**: the `mirror` command exists; `lift` carries `mirror` when it
 mirrored the pallet it lifted (or tried to, and says why it did not); and a mirror run that leaves
 a pallet out of step with git fails with `mirror_incomplete` (exit 33), whose `details` carry the
 run's report, the same `{url, pallets}` a successful run returns.

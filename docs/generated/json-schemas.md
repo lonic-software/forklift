@@ -1031,6 +1031,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
           "type": "string"
+        },
+        {
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
+          "type": "string"
         }
       ]
     }
@@ -1968,6 +1973,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
           "type": "string"
+        },
+        {
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
+          "type": "string"
         }
       ]
     },
@@ -2213,6 +2223,11 @@ A command not listed here either reports only the generic human-message shape `{
         {
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
+          "type": "string"
+        },
+        {
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
           "type": "string"
         }
       ]
@@ -4650,6 +4665,11 @@ A command not listed here either reports only the generic human-message shape `{
         {
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
+          "type": "string"
+        },
+        {
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
           "type": "string"
         }
       ]
