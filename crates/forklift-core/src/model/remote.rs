@@ -388,6 +388,22 @@ pub struct ErrorResponse {
 mod tests {
     use super::*;
 
+    /// Revert: skip the tombstones → "gone" has no head; let them override → "both" reads at its
+    /// tombstone.
+    #[test]
+    fn a_tombstone_stands_in_for_a_pallet_the_remote_no_longer_lists() {
+        let mut info: WarehouseInfo = serde_json::from_str(
+            r#"{"protocol": "1", "pallets": {"live": "l", "both": "b"}, "default_pallet": "live"}"#
+        ).unwrap();
+        assert_eq!(info.held_pallet_heads(), info.pallets, "a head that cannot delete adds nothing");
+
+        info.tombstones = Some(BTreeMap::from([("gone".to_string(), "g".to_string()), ("both".to_string(), "t".to_string())]));
+        let held = info.held_pallet_heads();
+        assert_eq!(held.get("gone").map(String::as_str), Some("g"));
+        assert_eq!(held.get("both").map(String::as_str), Some("b"), "a live ref is taken at its head");
+        assert_eq!(held.len(), 3);
+    }
+
     /// New client × **old** server: an old error body has no `code`/`next_step`, so a new client
     /// must read them as absent (`#[serde(default)]`) rather than fail to parse.
     #[test]
