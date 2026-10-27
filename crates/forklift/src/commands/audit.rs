@@ -164,8 +164,8 @@ pub(crate) struct AuditScope {
     held_by_hash: usize,
 
     /// How a chunked file's chunks were checked: `presence-checked` in a normal audit (bounded, no
-    /// bytes re-read), or, under `--full`, re-read and re-hashed with each file re-assembled to
-    /// verify its recipe's content hash.
+    /// bytes re-read), or, under `--full`, re-read and re-hashed with each fully-present file
+    /// re-assembled to verify its recipe's content hash.
     chunks: &'static str,
 
     /// Out-of-scope content: sealed by the hash a signed parcel commits (unforgeable), verified

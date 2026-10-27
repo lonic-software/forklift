@@ -118,7 +118,7 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "What a content audit checked, and (on a sparse warehouse) the boundary it sealed rather than\nverified. Emitted so a skimming reader or agent can never mistake a sparse pass — which verified\ncontent only within the fetch scope — for a full-clone pass, nor a presence-only pass for a\n`--full` re-read.",
       "properties": {
         "chunks": {
-          "description": "How a chunked file's chunks were checked: `presence-checked` in a normal audit (bounded, no\nbytes re-read), or, under `--full`, re-read and re-hashed with each file re-assembled to\nverify its recipe's content hash.",
+          "description": "How a chunked file's chunks were checked: `presence-checked` in a normal audit (bounded, no\nbytes re-read), or, under `--full`, re-read and re-hashed with each fully-present file\nre-assembled to verify its recipe's content hash.",
           "type": "string"
         },
         "enforcement": {
