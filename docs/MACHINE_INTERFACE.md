@@ -287,7 +287,9 @@ over all of history costs about what `audit` does.
 
 Every pallet in `pallets` carries its `head` parcel hash, `null` for an unborn one (the
 current pallet is included in `pallets` even when unborn, rather than only signaled
-through `current_unborn`).
+through `current_unborn`). In a warehouse a server has served, `deleted` lists the pallets
+deleted here whose tombstones still stand, each `{ "name", "head" }`; it is omitted when there are
+none, as in every warehouse never served.
 
 Token-cheap by default: `stocktake --summary` reports counts only (no per-path lists),
 and `diff --json` reports the changed-file set (path + kind) rather than every line —
@@ -473,6 +475,17 @@ a pallet the remote does not have refuses with the same code before writing anyt
 `forklift lift`.
 `forklift palletize --remote` lists what the remote holds, so an agent can tell the two apart
 before acting.
+A pallet the remote deleted is the exception: `lower <name>` still refuses with
+`pallet_not_found`, but says it was deleted and names `forklift palletize --restore <name> --remote`.
+
+### A pallet the remote deleted: `pallet_deleted_on_remote`
+
+A `lift` that would re-create a pallet the remote has only as a tombstone refuses with
+`pallet_deleted_on_remote` (exit 35) before uploading anything. `next_step` is
+`forklift lift --recreate` when the local head descends from the head the tombstone keeps, and
+`forklift palletize --restore <name> --remote` otherwise. The remote raises the same code, with
+the restore as `next_step`, when a creation of a deleted pallet does not acknowledge its tombstone
+or does not descend from it, and when a ref update or delete finds its pallet deleted.
 
 ### An unfinished franchise: `franchise_incomplete`
 
