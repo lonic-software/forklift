@@ -4,9 +4,10 @@
 //! The remote's current heads alone stop reaching this warehouse's history of a pallet once
 //! another warehouse lifts past every head held here, and `scope-prune` would keep that history
 //! until a `lower`. This record nominates the earlier heads the remote was seen to accept or
-//! serve, so a prune asks the remote whether it still holds them. An entry is only a candidate: a remote head can move backward (an `undo` on the served
-//! root) and a pallet deleted and re-created under its name starts a new lineage, so a head seen
-//! once is no proof that the remote still holds it, and nothing may be freed on an entry alone.
+//! serve, so a prune asks the remote whether it still holds them. An entry is only a candidate:
+//! a remote head can move backward (an `undo` on the served root) and a pallet deleted and
+//! re-created under its name starts a new lineage, so a head seen once is no proof that the
+//! remote still holds it, and nothing may be freed on an entry alone.
 //!
 //! The file lives in the shared forklift root beside the fetched-heads ledger, so every bay records
 //! into one, and is a [`record_utils`] file of `<head> <pallet>` lines, oldest first. Per pallet it
