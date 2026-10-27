@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -1040,12 +1040,12 @@ fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
 
     match forklift_core::util::tombstone_utils::read_tombstones() {
         Ok(tombstones) => match tombstones.get(bare) {
-            Some(head) => (StatusCode::CONFLICT, format!(
+            Some(head) => (StatusCode::CONFLICT, deleted_refusal(format!(
                 "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
                 history. Use another name for new work, or ask the remote's operator to drop the \
                 tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
                 bare, head, bare
-            )),
+            ), bare)),
             None => pallet_moved(current, expected),
         },
         Err(error) => internal(error),
@@ -1072,7 +1072,16 @@ fn pallet_deleted(pallet: &str, head: &str, acknowledged: bool) -> HandlerError 
         ),
     };
 
-    (StatusCode::CONFLICT, message)
+    (StatusCode::CONFLICT, deleted_refusal(message, pallet))
+}
+
+/// The [`RefusalCode::PalletDeletedOnRemote`] refusal carrying `message`, for user pallet `bare`.
+fn deleted_refusal(message: String, bare: &str) -> String {
+    forklift_core::error::CoreError::refusal(
+        forklift_core::error::RefusalCode::PalletDeletedOnRemote,
+        message,
+        format!("forklift palletize --restore {} --remote", bare),
+    ).into()
 }
 
 /// The refusal for a ref update whose audit consumed an office head that moved before the write:
@@ -2981,7 +2990,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 async fn delete_ref(State(state): State<Arc<AppState>>,
                     headers: HeaderMap,
                     Path(params): Path<PathParams>,
-                    Json(request): Json<RefDeleteRequest>) -> Response {
+                    Query(request): Query<RefDeleteRequest>) -> Response {
     let principal = match check_auth(&state, &headers).await {
         Ok(principal) => principal,
         Err(error) => return error_response(error),
@@ -6461,7 +6470,7 @@ mod tests {
         async fn delete(root: &std::path::Path, name: &str, old_head: &str) -> Response {
             delete_ref(
                 State(Arc::new(single_mode_state(root.to_path_buf()))), HeaderMap::new(), Path(ref_update_params(name)),
-                Json(RefDeleteRequest { old_head: old_head.to_string() }),
+                Query(RefDeleteRequest { old_head: old_head.to_string() }),
             ).await.into_response()
         }
 
@@ -6520,6 +6529,7 @@ mod tests {
             let body = body_text(response).await;
             assert!(body.contains("was deleted on this remote") && !body.contains("Lower and retry"), "{}", body);
             assert!(body.contains("tombstone drop --root <warehouse> side"), "{}", body);
+            assert!(body.contains(r#""code":"pallet_deleted_on_remote""#), "{}", body);
             let _ = std::fs::remove_dir_all(&root);
         }
 
@@ -6578,7 +6588,9 @@ mod tests {
 
             let unacknowledged = create(&root, "side", &on_it, None).await;
             assert_eq!(unacknowledged.status(), StatusCode::CONFLICT);
-            assert!(body_text(unacknowledged).await.contains("acknowledge the deletion"));
+            let body = body_text(unacknowledged).await;
+            assert!(body.contains("acknowledge the deletion"), "{}", body);
+            assert!(body.contains(r#""code":"pallet_deleted_on_remote""#), "a client branches on the code: {}", body);
 
             let unrelated = create(&root, "side", &unrelated, Some(&side)).await;
             assert_eq!(unrelated.status(), StatusCode::CONFLICT);

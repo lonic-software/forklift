@@ -78,6 +78,21 @@ pub struct WarehouseInfo {
     pub tombstones: Option<BTreeMap<String, String>>,
 }
 
+impl WarehouseInfo {
+    /// The head this remote holds history from for each pallet name: a listed pallet's head, else
+    /// the head of its tombstone, which the remote keeps rooted and serves until it is dropped. A
+    /// name listed with a tombstone too is taken at its live head, as the holds route walks it.
+    pub fn held_pallet_heads(&self) -> BTreeMap<String, String> {
+        let mut heads = self.pallets.clone();
+
+        for (name, head) in self.tombstones.iter().flatten() {
+            heads.entry(name.clone()).or_insert_with(|| head.clone());
+        }
+
+        heads
+    }
+}
+
 /// The trust anchor on the wire (the TOML file's fields as JSON). The re-genesis
 /// fields (§8.7) are absent for an original enrollment.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]

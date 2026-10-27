@@ -3171,8 +3171,10 @@ impl RemoteClient {
         // A head is written into a local ref as given, and only fetched (and so verified) when
         // it is missing. A non-canonical spelling of a held head — uppercase finds the same file
         // on a case-insensitive filesystem — would skip both and wedge the pallet. Neither the
-        // name nor the value is repeated: both came from the remote.
-        if info.pallets.values().any(|head| !object_utils::is_object_hash(head)) {
+        // name nor the value is repeated: both came from the remote. A tombstone's head is counted
+        // as held and sent back as a ref's head, so it is held to the same spelling.
+        let tombstone_heads = info.tombstones.iter().flat_map(|tombstones| tombstones.values());
+        if info.pallets.values().chain(tombstone_heads).any(|head| !object_utils::is_object_hash(head)) {
             return Err(CoreError::refusal(
                 RefusalCode::RemoteProtocolViolation,
                 format!(
@@ -4231,14 +4233,18 @@ impl RemoteClient {
     /// FORK-89 this call was additionally exposed to a silent-success `301`/`302`, on top of the
     /// `303` every mutation on the auto-following client shared. Moving off it closes all of it
     /// the same way, uniformly.
+    ///
+    /// `tombstone`, on a creation (`old_head` `None`) of a pallet the remote deleted, is the head
+    /// its tombstone holds: it acknowledges the deletion, which the remote requires.
     pub async fn update_ref(&self,
                             pallet: &str,
                             old_head: Option<&str>,
-                            new_head: &str) -> Result<(), String> {
+                            new_head: &str,
+                            tombstone: Option<&str>) -> Result<(), String> {
         let body = RefUpdateRequest {
             old_head: old_head.map(|hash| hash.to_string()),
             new_head: new_head.to_string(),
-            tombstone: None,
+            tombstone: tombstone.map(|hash| hash.to_string()),
         };
         let action = format!("moving the remote pallet \"{}\"", pallet);
 
@@ -4255,6 +4261,38 @@ impl RemoteClient {
 
         if !response.status().is_success() {
             return Err(self.error_of(response, &format!("moving pallet \"{}\"", pallet)).await);
+        }
+
+        Ok(())
+    }
+
+    /// Delete user pallet `pallet` on the remote, which expects it at `old_head` (a compare-and-set);
+    /// the remote keeps that head under a tombstone. `old_head` travels in the query, not a body,
+    /// since a proxy may drop a `DELETE`'s body. A retry whose first try landed answers as done.
+    ///
+    /// Rides [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::retryable_head_budget`], as
+    /// [`Self::put_trust`] does: the removal walks no history, and a mutation on this client never
+    /// follows a redirect. A head-wait expiry says the delete may have landed.
+    pub async fn delete_ref(&self, pallet: &str, old_head: &str) -> Result<(), String> {
+        let action = format!("deleting the remote pallet \"{}\"", pallet);
+
+        if !object_utils::is_object_hash(old_head) {
+            return Err(format!("Error while {}: {} is not a parcel hash.", action, old_head));
+        }
+
+        let outcome = self.send_on(
+            Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
+            reqwest::Method::DELETE, &pallet_route(pallet, &format!("?old_head={}", old_head)),
+            SendBody::Empty,
+        ).await;
+        let response = self.response_from_send_mutation(&action, outcome)?;
+
+        if response.status().is_redirection() {
+            return Err(Self::describe_mutation_redirect(&action, &response));
+        }
+
+        if !response.status().is_success() {
+            return Err(self.error_of(response, &format!("deleting pallet \"{}\"", pallet)).await);
         }
 
         Ok(())
@@ -5766,6 +5804,8 @@ async fn fetch_missing_signatures(client: &RemoteClient,
 /// * `pallet`      - The pallet name on the remote.
 /// * `local_head`  - The local head parcel of the pallet.
 /// * `remote_head` - The remote's current head of the pallet (from the handshake).
+/// * `tombstone`   - With no `remote_head`, the head of the remote's tombstone of the pallet, which
+///                   the creation acknowledges (see [`acknowledged_tombstone`]).
 /// * `progress`    - Where to report the lift's phases and how many objects have uploaded.
 ///
 /// # Returns
@@ -5775,9 +5815,61 @@ pub async fn lift_pallet(client: &RemoteClient,
                          pallet: &str,
                          local_head: &str,
                          remote_head: Option<&str>,
+                         tombstone: Option<&str>,
                          chunking_supported: bool,
                          progress: &Progress) -> Result<LiftResult, String> {
-    lift_pallet_inner(client, pallet, local_head, remote_head, false, chunking_supported, progress).await
+    lift_pallet_inner(client, pallet, local_head, remote_head, tombstone, false, chunking_supported, progress).await
+}
+
+/// The tombstone a lift of user pallet `pallet` from `local_head` acknowledges, when the remote
+/// (`info`) has the pallet only as a tombstone: its head, once `recreate` asks for the re-creation
+/// and the local work descends from that head. Otherwise the lift is refused before anything is
+/// uploaded, naming the step that fits the local work.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The tombstone head the creation acknowledges.
+/// * `Ok(None)`         - The remote lists the pallet, or has no tombstone of it.
+/// * `Err(String)`      - The [`RefusalCode::PalletDeletedOnRemote`] refusal, or why the local
+///                        history could not be read.
+pub fn acknowledged_tombstone(info: &WarehouseInfo,
+                              pallet: &str,
+                              local_head: &str,
+                              recreate: bool) -> Result<Option<String>, String> {
+    if info.pallets.contains_key(pallet) {
+        return Ok(None);
+    }
+
+    let Some(head) = info.tombstones.as_ref().and_then(|tombstones| tombstones.get(pallet)) else {
+        return Ok(None);
+    };
+
+    let descends = head == local_head
+        || (file_utils::does_object_exist(head)? && merge_utils::is_ancestor(head, local_head)?);
+
+    if descends && recreate {
+        return Ok(Some(head.clone()));
+    }
+
+    let drop = format!("\"forklift palletize --delete {}\" drops the local pallet instead.", pallet);
+    let (message, next_step) = match descends {
+        true => (format!(
+            "The remote's pallet \"{}\" was deleted at {}, and the name stays reserved for that \
+            history. This warehouse's work descends from it: \"forklift lift --recreate\" re-creates \
+            the pallet with it, acknowledging the deletion. {} Nothing was lifted.",
+            pallet, head, drop
+        ), "forklift lift --recreate".to_string()),
+        false => (format!(
+            "The remote's pallet \"{}\" was deleted at {}, and the name stays reserved for that \
+            history, which this warehouse's work does not descend from{}. \"forklift palletize \
+            --restore {} --remote\" brings the pallet back on the remote; lower it and consolidate \
+            it into this work, then lift. {} Nothing was lifted.",
+            pallet, head,
+            if recreate { ", so \"--recreate\" cannot re-create it" } else { "" },
+            pallet, drop
+        ), format!("forklift palletize --restore {} --remote", pallet)),
+    };
+
+    Err(CoreError::refusal(RefusalCode::PalletDeletedOnRemote, message, next_step).into())
 }
 
 /// `lift_pallet`, allowing one sanctioned non-descendant update: the office lift right
@@ -5788,6 +5880,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
                            pallet: &str,
                            local_head: &str,
                            remote_head: Option<&str>,
+                           tombstone: Option<&str>,
                            adopted_reset: bool,
                            chunking_supported: bool,
                            progress: &Progress) -> Result<LiftResult, String> {
@@ -5830,7 +5923,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
     let (new_parcels, uploaded_objects, uploaded_signatures) =
         upload_history(client, local_head, remote_head, chunking_supported, progress).await?;
 
-    client.update_ref(pallet, remote_head, local_head).await?;
+    client.update_ref(pallet, remote_head, local_head, tombstone).await?;
 
     // After the compare-and-set, so a refused or failed lift records nothing; best-effort, since
     // the remote has the head now and an error here would read as a lift that did not land.
@@ -7358,6 +7451,7 @@ pub async fn push_local_trust(client: &RemoteClient,
         &office_key,
         &office_head,
         remote_office_head,
+        None,
         adopted_reset,
         // The office pallet carries only structural, tracked-metadata objects — never a chunked
         // file — so the capability never actually gates it; threaded honestly all the same.
@@ -7421,7 +7515,7 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
         let remote_head = info.pallets.get(&wire).map(String::as_str);
 
         // Meta pallets never carry a chunked file; the capability is threaded for uniformity.
-        let result = lift_pallet(client, &wire, &local_head, remote_head, info.chunking, &Progress::NONE).await;
+        let result = lift_pallet(client, &wire, &local_head, remote_head, None, info.chunking, &Progress::NONE).await;
         lifts.push(MetaPalletLift { pallet: wire, result });
     }
 
@@ -7469,7 +7563,7 @@ pub async fn lift_haul_pallet(client: &RemoteClient,
                  lifts it (lowering it first when the remote's head is not held here), then lift again{}.",
                 haul_utils::describe_held(&held), drop))
         }
-        Ok(_) => lift_pallet(client, &wire, &local_head, remote_head, info.chunking, &Progress::NONE).await,
+        Ok(_) => lift_pallet(client, &wire, &local_head, remote_head, None, info.chunking, &Progress::NONE).await,
     };
 
     Some(MetaPalletLift { pallet: wire, result })
@@ -14804,7 +14898,7 @@ mod tests {
         let outcome = runtime.block_on(async {
             tokio::time::timeout(
                 outer_ceiling,
-                client.update_ref("main", None, &"a".repeat(64)),
+                client.update_ref("main", None, &"a".repeat(64), None),
             ).await
         });
 
@@ -14845,7 +14939,7 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(assert_still_running(
-            "update_ref", check_after, client.update_ref("main", None, &"a".repeat(64)),
+            "update_ref", check_after, client.update_ref("main", None, &"a".repeat(64), None),
         ));
     }
 
@@ -16032,7 +16126,7 @@ mod tests {
         let client = RemoteClient::new(&url, None).unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let error = runtime.block_on(client.update_ref("main", None, &"a".repeat(64)))
+        let error = runtime.block_on(client.update_ref("main", None, &"a".repeat(64), None))
             .expect_err("a 303 must not be silently followed to a 2xx landing");
 
         assert!(
@@ -16060,7 +16154,7 @@ mod tests {
         let client = RemoteClient::new(&url, None).unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let error = runtime.block_on(client.update_ref("main", None, &"a".repeat(64)))
+        let error = runtime.block_on(client.update_ref("main", None, &"a".repeat(64), None))
             .expect_err("a 302 must not be silently followed to a 2xx landing");
 
         assert!(

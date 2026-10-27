@@ -35,7 +35,10 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 7 (this one): the `mirror` command exists, `lift` carries `mirror` when it mirrored
+/// Version 8 (this one): the `pallet_deleted_on_remote` error code exists; `palletize --remote`
+/// lists the remote's deleted pallets as `deleted`, and `palletize` lists this served warehouse's
+/// own as `deleted`; `palletize --delete`/`--restore` with `--remote` report `remote`.
+/// Version 7: the `mirror` command exists, `lift` carries `mirror` when it mirrored
 /// (or tried to mirror) the pallet it lifted, and the `mirror_incomplete` error code exists (with
 /// the run's report as `details`).
 /// Version 6: `franchise`, `lower`, `expand` and `lift` carry `batch_lane`
@@ -54,7 +57,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -498,6 +501,9 @@ error_codes! {
     /// History a remote served does not verify against the trust anchor this warehouse holds;
     /// nothing was adopted.
     HistoryUnverified,
+
+    /// The remote has the pallet only as a tombstone: it was deleted there. Nothing was lifted.
+    PalletDeletedOnRemote,
 }
 
 impl ErrorCode {
@@ -537,6 +543,7 @@ impl ErrorCode {
             ErrorCode::StagedUploadDiscarded => RefusalCode::StagedUploadDiscarded.as_str(),
             ErrorCode::MirrorIncomplete => RefusalCode::MirrorIncomplete.as_str(),
             ErrorCode::HistoryUnverified => RefusalCode::HistoryUnverified.as_str(),
+            ErrorCode::PalletDeletedOnRemote => RefusalCode::PalletDeletedOnRemote.as_str(),
         }
     }
 
@@ -579,6 +586,7 @@ impl ErrorCode {
             ErrorCode::StagedUploadDiscarded => 32,
             ErrorCode::MirrorIncomplete => 33,
             ErrorCode::HistoryUnverified => 34,
+            ErrorCode::PalletDeletedOnRemote => 35,
         }
     }
 
@@ -669,6 +677,10 @@ impl ErrorCode {
                 "History about to be adopted as a pallet's does not verify against the trust \
                  anchor it was judged against (the one held here, or at first contact the one the \
                  remote serves); nothing was adopted",
+            ErrorCode::PalletDeletedOnRemote =>
+                "The remote has the pallet only as a tombstone: it was deleted there, and the name \
+                 stays reserved for that history; \"palletize --restore <name> --remote\" brings it \
+                 back, \"lift --recreate\" re-creates it from work that descends from it",
         }
     }
 
@@ -708,6 +720,7 @@ impl ErrorCode {
             RefusalCode::MirrorIncomplete => ErrorCode::MirrorIncomplete,
             RefusalCode::HistoryUnverified => ErrorCode::HistoryUnverified,
             RefusalCode::NotAWarehouse => ErrorCode::NotAWarehouse,
+            RefusalCode::PalletDeletedOnRemote => ErrorCode::PalletDeletedOnRemote,
         }
     }
 }
@@ -1202,6 +1215,7 @@ mod tests {
             (RefusalCode::MirrorIncomplete, "mirror_incomplete", 33),
             (RefusalCode::HistoryUnverified, "history_unverified", 34),
             (RefusalCode::NotAWarehouse, "not_a_warehouse", 3),
+            (RefusalCode::PalletDeletedOnRemote, "pallet_deleted_on_remote", 35),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

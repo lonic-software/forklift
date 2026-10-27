@@ -461,9 +461,15 @@ pub enum Command {
                       every signature before it accepts the update. A remote that is ahead or has \
                       diverged is never overwritten: lower first when it is ahead; when both \
                       sides moved and the changes do not auto-merge, the refusal names how to \
-                      merge the remote head in."
+                      merge the remote head in. A pallet deleted on the remote is re-created only \
+                      with \"--recreate\", from work that descends from the head it was deleted at."
     )]
-    Lift,
+    Lift {
+        /// Re-create the pallet on the remote where it was deleted, acknowledging the deletion:
+        /// refused unless the local work descends from the head the remote's tombstone holds
+        #[arg(long)]
+        recreate: bool,
+    },
 
     /// Take the current state of a file or directory into the inventory (stage)
     #[command(visible_alias = "l", alias = "add")]
@@ -602,7 +608,10 @@ pub enum Command {
                       are listed instead, each with how it relates to the local one. With \
                       \"--delete\", the named pallet is deleted instead: its ref goes, its parcels \
                       stay, and \"forklift undo\" brings it back. With \"--restore\", a pallet \
-                      deleted in a served warehouse comes back at the head its tombstone holds."
+                      deleted in a served warehouse comes back at the head its tombstone holds. \
+                      With \"--remote\" as well, either acts on the remote's pallet: a pallet \
+                      deleted there keeps its history on the remote, and no clone's own pallet \
+                      changes."
     )]
     Palletize {
         /// The name of the new pallet; omit it to list the pallets
@@ -618,26 +627,28 @@ pub enum Command {
         all: bool,
 
         /// List the remote's pallets instead: each with its remote head, the local head, and
-        /// whether the two are the same, the local one is ahead, or they differ (lower decides).
-        /// Downloads and writes nothing
-        #[arg(long, conflicts_with_all = ["name", "revision"])]
+        /// whether the two are the same, the local one is ahead, or they differ (lower decides),
+        /// and the pallets deleted there. Downloads and writes nothing. With "--delete" or
+        /// "--restore", delete or restore the named pallet on the remote instead
+        #[arg(long, conflicts_with = "revision")]
         remote: bool,
 
         /// Delete the named pallet: remove its ref, keeping its parcels. Refused for the pallet a
         /// bay stands on, one an open haul names, and — without "--force" — one whose work no
         /// other pallet here or on the remote holds. Undo it with "forklift undo"
-        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all", "remote"])]
+        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all"])]
         delete: bool,
 
         /// With "--delete": delete even when no other pallet holds the pallet's work. It stays
         /// recoverable by "forklift undo" while the delete is in this bay's undo journal, and in a
         /// warehouse a server has served by "--restore" while its tombstone stands
-        #[arg(long, requires = "delete")]
+        #[arg(long, requires = "delete", conflicts_with = "remote")]
         force: bool,
 
         /// Bring back the named pallet, deleted in this warehouse after it was served, at the head
-        /// its tombstone holds. Refused while a bay stands on the name at another head
-        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all", "remote", "delete"])]
+        /// its tombstone holds. Refused while a bay stands on the name at another head. With
+        /// "--remote", bring it back on the remote, which needs no history here
+        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all", "delete"])]
         restore: bool,
     },
 
@@ -1741,7 +1752,7 @@ impl Command {
                 | Command::Heal
                 | Command::History { .. }
                 | Command::ImportGit { .. }
-                | Command::Lift
+                | Command::Lift { .. }
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
@@ -1813,7 +1824,7 @@ impl Command {
                 | Command::Consolidate { .. }
                 | Command::Expand { .. }
                 | Command::ImportGit { .. }
-                | Command::Lift
+                | Command::Lift { .. }
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
@@ -1850,7 +1861,7 @@ impl Command {
                 | Command::Expand { .. }
                 | Command::Heal
                 | Command::ImportGit { .. }
-                | Command::Lift
+                | Command::Lift { .. }
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }

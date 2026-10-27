@@ -288,8 +288,22 @@ fn remote_pallet_head<'a>(info: &'a forklift_core::model::remote::WarehouseInfo,
 
 /// The [`RefusalCode::PalletNotFound`] refusal for a remote that has no user pallet `pallet`,
 /// naming the ones it has. `next_step` is the remedy at the site: `lift` publishes a current
-/// pallet with something stacked, `palletize --remote` lists what another name could be.
+/// pallet with something stacked, `palletize --remote` lists what another name could be. A pallet
+/// deleted on the remote is refused naming the deletion and its restore instead.
 fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, pallet: &str, next_step: &str) -> CoreError {
+    // A deleted pallet's history is still there, under its tombstone: restoring it is the way on.
+    if let Some(head) = info.tombstones.as_ref().and_then(|tombstones| tombstones.get(pallet)) {
+        return CoreError::refusal(
+            RefusalCode::PalletNotFound,
+            format!(
+                "The remote's pallet \"{}\" was deleted at {}; the remote still holds its history. \
+                \"forklift palletize --restore {} --remote\" brings it back there.",
+                pallet, head, pallet
+            ),
+            format!("forklift palletize --restore {} --remote", pallet),
+        );
+    }
+
     let user: Vec<&str> = info.pallets.keys()
         .map(String::as_str)
         .filter(|name| !name.starts_with(pallet_utils::META_QUALIFIER))
@@ -926,7 +940,7 @@ async fn replay(client: &RemoteClient,
         }
     }
 
-    remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), info.chunking, &Progress::NONE).await?;
+    remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), None, info.chunking, &Progress::NONE).await?;
     // Conditioned on the office the replay was signed and checked under, as every meta write is.
     // The remote already holds the replay, so a refusal says so rather than "nothing was written".
     match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &office.preconditions()) {
