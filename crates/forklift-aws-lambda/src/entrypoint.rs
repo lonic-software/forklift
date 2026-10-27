@@ -43,6 +43,7 @@
 use std::collections::HashMap;
 
 use http::{header, Method, Request, Response, StatusCode};
+use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -545,7 +546,8 @@ enum Route {
 
 /// Resolve the warehouse id and the endpoint of a request, stripping the `/warehouses/{id}`
 /// prefix in multi mode. A path that matches nothing is a `404`; an invalid warehouse id is a
-/// `422` (the same shape `forklift-server` gives).
+/// `422` (the same shape `forklift-server` gives). A captured segment that does not
+/// percent-decode to UTF-8 is also a `422`, where `forklift-server` answers `400` (see [`param`]).
 fn resolve_route<B>(
     routing: &Routing,
     request: &Request<B>,
@@ -561,8 +563,9 @@ fn resolve_route<B>(
         Routing::Multi => match segments.split_first() {
             Some((&"warehouses", tail)) => match tail.split_first() {
                 Some((&id, endpoint)) => {
-                    validate_warehouse_id(id)?;
-                    (id.to_string(), endpoint)
+                    let id = param(id)?;
+                    validate_warehouse_id(&id)?;
+                    (id, endpoint)
                 }
                 None => return Err(not_found(path)),
             },
@@ -570,46 +573,74 @@ fn resolve_route<B>(
         },
     };
 
-    let route = match_endpoint(method, rest, request.uri().query()).ok_or_else(|| not_found(path))?;
+    let route = match_endpoint(method, rest, request.uri().query())?.ok_or_else(|| not_found(path))?;
 
     Ok((warehouse_id, route))
 }
 
 /// Match the protocol endpoint (everything after the optional `/warehouses/{id}` prefix).
-/// `None` for an unknown path/method pair, which the caller turns into a `404`.
-fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> Option<Route> {
+/// `None` for an unknown path/method pair, which the caller turns into a `404`; a captured
+/// segment or query value that does not percent-decode to UTF-8 is a `422`.
+fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> HeadResult<Option<Route>> {
     // The session-commit endpoint is the one the spec writes without a `/v1` prefix
     // (`POST /lift/{session}/commit`), while its Transport section says every endpoint lives
-    // under `/v1`. The two disagree and no client speaks it yet, so accept both forms.
+    // under `/v1`. The client posts the `/v1` form; the bare one is accepted as the spec writes it.
     if method == Method::POST {
         if let ["lift", session, "commit"] | ["v1", "lift", session, "commit"] = segments {
-            return Some(Route::CommitLift((*session).to_string()));
+            return Ok(Some(Route::CommitLift(session_id(&param(session)?)?)));
         }
     }
 
     // Every other endpoint lives under `/v1`.
     let ["v1", rest @ ..] = segments else {
-        return None;
+        return Ok(None);
     };
 
-    match (method, rest) {
+    Ok(match (method, rest) {
         (&Method::GET, ["warehouse"]) => Some(Route::Handshake),
         (&Method::POST, ["objects", "missing"]) => Some(Route::Missing),
         (&Method::POST, ["objects", "upload-targets"]) => Some(Route::UploadTargets),
         (&Method::POST, ["objects", "batch"]) => Some(Route::Batch),
-        (&Method::GET, ["objects", hash]) => Some(Route::ObjectGet((*hash).to_string())),
+        (&Method::GET, ["objects", hash]) => Some(Route::ObjectGet(param(hash)?)),
         (&Method::PUT, ["objects", hash]) => Some(Route::ObjectPut {
-            hash: (*hash).to_string(),
-            session: query_param(query, "session"),
+            hash: param(hash)?,
+            session: query_param(query, "session")?.as_deref().map(session_id).transpose()?,
         }),
-        (&Method::GET, ["signatures", hash]) => Some(Route::SignatureGet((*hash).to_string())),
-        (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut((*hash).to_string())),
+        (&Method::GET, ["signatures", hash]) => Some(Route::SignatureGet(param(hash)?)),
+        (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut(param(hash)?)),
         (&Method::PUT, ["trust"]) => Some(Route::PutTrust),
-        (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate((*name).to_string())),
-        (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds((*name).to_string())),
+        (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate(param(name)?)),
+        (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds(param(name)?)),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
         _ => None,
+    })
+}
+
+/// A captured path parameter, percent-decoded as `forklift-server`'s `Path` extractor decodes
+/// it. The path is split into segments first, so an encoded `/` stays inside its segment: a
+/// pallet named `feature/x` arrives as the one segment `feature%2Fx`. A segment that does not
+/// decode to UTF-8 is a `422`, this head's status for a request it cannot process
+/// (`forklift-server` answers it `400`).
+fn param(segment: &str) -> HeadResult<String> {
+    percent_decode_str(segment).decode_utf8().map(|value| value.into_owned()).map_err(|_| {
+        HeadError::unprocessable(format!(
+            "The value {} is not UTF-8 once percent-decoded.", segment))
+    })
+}
+
+/// A lift session id, wherever the request names it (the commit path, the upload query, the
+/// `upload-targets` body): one or more ASCII alphanumerics and `-`, as the client's hyphenated
+/// UUIDs are. The id becomes the staging prefix `staging/{session}/`, so a `/` in one would place
+/// its staging keys under another session's sweep prefix; anything else is a `422`.
+fn session_id(session: &str) -> HeadResult<String> {
+    let valid = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-';
+    if !session.is_empty() && session.bytes().all(valid) {
+        Ok(session.to_string())
+    } else {
+        Err(HeadError::unprocessable(format!(
+            "The lift session {:?} is not a session id (ASCII letters, digits and '-').", session
+        )))
     }
 }
 
@@ -682,7 +713,8 @@ where
         Route::UploadTargets => {
             let request: UploadTargetsRequest = parse_json(&body)?;
             reject_oversized_upload_targets(request.hashes.len())?;
-            let response = head.upload_targets(caller, &request.session, &request.hashes)?;
+            let session = session_id(&request.session)?;
+            let response = head.upload_targets(caller, &session, &request.hashes)?;
             Ok(json_response(StatusCode::OK, &response))
         }
 
@@ -773,24 +805,28 @@ fn validate_warehouse_id(id: &str) -> HeadResult<()> {
     warehouse_utils::validate_warehouse_id(id).map_err(HeadError::unprocessable)
 }
 
-/// Pull one `key=value` out of a raw query string. Values are simple (a lift session id, a
-/// hex hash) so no percent-decoding is needed — the client never encodes them.
+/// Pull one `key=value` out of a raw query string, percent-decoded as a path parameter is (see
+/// [`param`]), so the session a staged upload names reads the same as the one its commit path
+/// names.
 ///
 /// An empty or whitespace-only value (`?session=`) is treated the same as the parameter being
 /// absent entirely, rather than as a real, empty session id: a blank session could never be
 /// committed against (`staging//{hash}` is not a key `commit_lift` can promote), so a client
 /// that sends one is routed to the same `422 SessionRequired` a missing parameter gets, instead
 /// of a `307` that stages the upload somewhere it can never be promoted from.
-fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    let value = query?.split('&').find_map(|pair| {
+fn query_param(query: Option<&str>, key: &str) -> HeadResult<Option<String>> {
+    let Some(value) = query.and_then(|query| query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
         (name == key).then_some(value)
-    })?;
+    })) else {
+        return Ok(None);
+    };
 
+    let value = param(value)?;
     if value.trim().is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(value.to_string())
+        Ok(Some(value))
     }
 }
 
@@ -1034,27 +1070,21 @@ mod tests {
         assert!(body.code.is_none());
     }
 
-    /// `query_param` treats a missing, empty, or whitespace-only value as absent — the fix for
-    /// the review finding that `?session=` presigned a `staging//{hash}` key nothing could ever
-    /// commit against. A non-empty value (including one with embedded whitespace) still round
-    /// trips untouched, and no percent-decoding happens (the client never encodes these values).
+    /// `query_param` treats a missing, empty, or whitespace-only value as absent, so `?session=`
+    /// never presigns a `staging//{hash}` key nothing could ever commit against. It decodes as a
+    /// path parameter does, so emptiness is judged on the decoded value.
     #[test]
     fn query_param_treats_empty_and_whitespace_values_as_absent() {
-        assert_eq!(query_param(Some("session=abc"), "session"), Some("abc".to_string()));
-        assert_eq!(query_param(Some("session="), "session"), None, "an empty value is absent");
-        assert_eq!(
-            query_param(Some("session=   "), "session"),
-            None,
-            "a whitespace-only value is absent"
-        );
-        assert_eq!(
-            query_param(Some("session=%20"), "session"),
-            Some("%20".to_string()),
-            "no percent-decoding: a literal three-character value is not empty"
-        );
-        assert_eq!(query_param(Some("other=abc"), "session"), None, "a different key");
-        assert_eq!(query_param(Some("session=abc&other=x"), "session"), Some("abc".to_string()));
-        assert_eq!(query_param(None, "session"), None, "no query string at all");
+        let read = |query: Option<&str>| query_param(query, "session").unwrap();
+        assert_eq!(read(Some("session=abc")), Some("abc".to_string()));
+        assert_eq!(read(Some("session=")), None, "an empty value is absent");
+        assert_eq!(read(Some("session=   ")), None, "a whitespace-only value is absent");
+        assert_eq!(read(Some("session=%20")), None, "decoded, an encoded space is whitespace too");
+        assert_eq!(read(Some("session=%61bc")), Some("abc".to_string()), "decoded as a path parameter");
+        assert!(query_param(Some("session=%FF"), "session").is_err(), "not UTF-8 once decoded");
+        assert_eq!(read(Some("other=abc")), None, "a different key");
+        assert_eq!(read(Some("session=abc&other=x")), Some("abc".to_string()));
+        assert_eq!(read(None), None, "no query string at all");
     }
 
     /// The status mapping stays a `409` for a conflicting signature even though `Head` never

@@ -351,6 +351,80 @@ fn the_holds_endpoint_walks_the_stored_history() {
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/main/holds", &uppercase))), 422);
 }
 
+/// FORK-297: a pallet name with `/` travels as one percent-encoded segment, as the client sends
+/// it, and is decoded back to the name on both per-pallet routes. Unencoded, the name is two
+/// segments and no route.
+#[test]
+fn a_pallet_named_with_a_slash_routes_as_one_encoded_segment() {
+    let area = Area::new("slash-pallet");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main has a head");
+
+    let fixture = Fixture::direct();
+    for (hash, bytes) in &harvest.objects {
+        assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
+    }
+
+    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x", &commit))), 404);
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature%2Fx", &commit))), 200);
+
+    let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
+    assert_eq!(info.pallets.get("feature/x"), Some(&main_head));
+    assert_eq!(info.pallets.get("feature"), None);
+
+    let request = HoldsRequest { candidates: vec![main_head.clone()] };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x/holds", &request))), 404);
+    let holds: HoldsResponse = body_json(&fixture.call(post_json("/v1/pallets/feature%2Fx/holds", &request)));
+    assert_eq!(holds.holds[&main_head], HoldAnswer::Held, "the holds of feature/x, not of a prefix");
+
+    // A segment that decodes to no UTF-8 name is refused, not routed as some other name.
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/%FF", &commit))), 422);
+}
+
+/// Every captured segment is percent-decoded, not only the pallet name: an object hash sent
+/// encoded reads the object, and a lift session that decodes to a `/` is refused on both the
+/// commit route and the upload query, since it would place its staging keys under another
+/// session's sweep prefix.
+#[test]
+fn captured_segments_and_the_session_query_are_percent_decoded() {
+    let fixture = Fixture::staging();
+
+    let bytes = b"an object".to_vec();
+    let hash = object_utils::hash_object_bytes(&bytes);
+    fixture.objects.put_verified(&hash, &bytes).expect("seed");
+    let encoded_hash = format!("%{:02X}{}", hash.as_bytes()[0], &hash[1..]);
+    assert_eq!(status(&fixture.call(get(&format!("/v1/objects/{}", encoded_hash)))), 307);
+
+    // An encoded session decodes to the staging key of the session it names.
+    let response =
+        fixture.call(put_bytes(&format!("/v1/objects/{}?session=lift%2D1", hash), b"ignored".to_vec()));
+    assert_eq!(status(&response), 307);
+    assert_eq!(location(&response), format!("https://s3.example/bucket/staging/lift-1/{}", hash));
+
+    let response =
+        fixture.call(put_bytes(&format!("/v1/objects/{}?session=lift-1%2Fx", hash), b"ignored".to_vec()));
+    assert_eq!(status(&response), 422, "a session decoding to a '/' is refused on upload");
+    let response =
+        fixture.call(put_bytes(&format!("/v1/objects/{}?session=%FF", hash), b"ignored".to_vec()));
+    assert_eq!(status(&response), 422, "a session decoding to no UTF-8 is refused on upload");
+
+    for session in ["lift-1/x", ""] {
+        let request = UploadTargetsRequest { session: session.to_string(), hashes: vec![hash.clone()] };
+        let response = fixture.call(post_json("/v1/objects/upload-targets", &request));
+        assert_eq!(status(&response), 422, "the upload-targets session {:?} is refused", session);
+    }
+
+    let commit = CommitLiftRequest { control_plane: vec![hash.clone()], blobs: vec![], more: false };
+    assert_eq!(status(&fixture.call(post_json("/v1/lift/lift-1%2Fx/commit", &commit))), 422);
+    assert_eq!(status(&fixture.call(post_json("/v1/lift/%FF/commit", &commit))), 422);
+}
+
 /// FORK-77: a ref update naming a pallet outside the portable grammar is a 422 naming it, and
 /// no ref moves — `Main` never becomes a second spelling of `main`.
 #[test]
@@ -1172,6 +1246,14 @@ fn multi_warehouse_routing_resolves_the_path_id() {
     assert_eq!(status(&fixture.call(get("/warehouses/.hidden/v1/warehouse"))), 422);
     // A mixed-case id would alias its lowercase spelling on a case-folding store: 422, unrouted.
     let (response, resolved) = fixture.call_capturing(get("/warehouses/Acme/v1/warehouse"));
+    assert_eq!(status(&response), 422);
+    assert!(resolved.is_none());
+
+    // The id is percent-decoded before it is judged: `%61cme` is `acme`, `%FF` is no id.
+    let (response, resolved) = fixture.call_capturing(get("/warehouses/%61cme/v1/warehouse"));
+    assert_eq!(status(&response), 200);
+    assert_eq!(resolved.as_deref(), Some("acme"));
+    let (response, resolved) = fixture.call_capturing(get("/warehouses/%FF/v1/warehouse"));
     assert_eq!(status(&response), 422);
     assert!(resolved.is_none());
 

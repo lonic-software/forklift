@@ -252,6 +252,11 @@ is **additive and head-specific** (the `forklift-server` head ignores it and ver
 body inline), but a staging head answers `422` without one, because bytes staged under no
 session could never be promoted.
 
+A session id is one or more ASCII letters, digits and `-` (the client sends a hyphenated UUID),
+wherever it appears: this query, the `upload-targets` body and the commit path. A head that reads
+the session (the serverless head, whatever its store) refuses any other id with `422`, since a
+`/` would place that session's staging keys under another session's prefix.
+
 ### `GET /v1/signatures/{hash}` · `PUT /v1/signatures/{hash}`
 
 The signature sidecar of a parcel (the binary format of
@@ -316,13 +321,20 @@ that pallet permanently un-liftable.
 
 The CAS ref update — the commit point of a `lift`. `{name}` is a qualified reference:
 a user pallet bare (`main`), a meta pallet with the `@` qualifier (`@office`), so the office
-lifts to `POST /v1/pallets/@office`. The meta pallet names are a fixed list — `office`,
-`manifest`, `haul`, `tags`, `kv` — and any other `@name` is refused with `422` before any other
-check.
+lifts to `POST /v1/pallets/%40office` (the reference `@office`, encoded as below). The meta
+pallet names are a fixed list — `office`, `manifest`, `haul`, `tags`, `kv` — and any other
+`@name` is refused with `422` before any other check.
 
 ```json
 { "old_head": "<hash-or-null>", "new_head": "<hash>" }
 ```
+
+`{name}` is one path segment, here and on every route that takes a pallet. A client
+percent-encodes the whole reference, `/` included, so `feature/x` travels as `feature%2Fx` and
+`@office` as `%40office`. A server percent-decodes the segment back to the reference, and refuses
+with a `4xx` a segment that does not decode to UTF-8. An unencoded `/` splits the name across
+segments, so the request matches no route or the wrong one (a raw `feature/holds` reads as the
+holds route of `feature`).
 
 `old_head: null` means "the pallet must not exist yet". Checks, in order:
 

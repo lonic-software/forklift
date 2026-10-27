@@ -5924,6 +5924,45 @@ fn scope_prune_frees_history_the_remote_confirms_it_still_holds() {
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
 }
 
+#[test]
+fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
+    // FORK-297: a pallet name may carry `/`, and the per-pallet routes take it as one path
+    // segment. The lift moves `feature/x` on the remote, and the prune's holds check of it is
+    // answered, so the history the remote confirms under that name is freed.
+    let area = TestArea::new("scope-prune-slash-pallet");
+    let server = sparse_with_docs(&area);
+
+    let base = pallet_head(&area, "sparse", "main");
+    let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
+
+    // Both remote heads move past anything the sparse warehouse holds.
+    area.write_file("dev/src/api/a.txt", "api v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("dev", &["palletize", "feature/x"]));
+    assert_success(&area.forklift("dev", &["shift", "feature/x"]));
+    area.write_file("dev/src/api/a.txt", "api v3\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "feature work"]));
+    let feature = pallet_head(&area, "dev", "feature/x");
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_eq!(remote_pallet_head(&server, "feature/x").as_deref(), Some(feature.as_str()));
+
+    // The only recorded head is under `feature/x`, so freeing the docs blob takes that pallet's
+    // holds answer.
+    let record = area.path("sparse/.forklift/held-heads");
+    let header = std::fs::read_to_string(&record).unwrap().lines().next().unwrap().to_string();
+    std::fs::write(&record, format!("{}\n{} feature/x\n", header, base)).unwrap();
+    assert_eq!(held_heads(&area, "sparse"), vec![format!("{} feature/x", base)]);
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+
+    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&pruned);
+    assert!(!stderr(&pruned).contains("holds_unanswered"), "the holds check was answered: {}", stderr(&pruned));
+    assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
+}
+
 /// Point the served root's `main` at `head`, as an `undo` on the server, or a pallet deleted there
 /// and re-created under its name, would.
 fn move_served_main(area: &TestArea, head: &str) {
