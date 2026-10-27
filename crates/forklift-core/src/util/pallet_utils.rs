@@ -2676,7 +2676,7 @@ pub(crate) mod tests {
             remove_pallet_head_in(PalletNamespace::User, "kept", &hash('a'), &RefPreconditions::NONE, Some(&deleting("kept", &hash('a')))).unwrap();
             assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "a root never served keeps no tombstones");
 
-            assert!(tombstone_utils::mark_served().unwrap());
+            assert!(tombstone_utils::mark_served(false).unwrap());
             remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, None).unwrap();
 
             assert_eq!(get_pallet_head("gone").unwrap(), None);
@@ -2700,7 +2700,7 @@ pub(crate) mod tests {
         fn a_refused_removal_leaves_the_tombstones_as_they_were() {
             let (root, _scope) = scratch("tombstone-refused");
             update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
-            assert!(tombstone_utils::mark_served().unwrap());
+            assert!(tombstone_utils::mark_served(false).unwrap());
 
             let refused = remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, None);
 
@@ -2713,7 +2713,7 @@ pub(crate) mod tests {
         fn deleted_in_a_served_root(name: &str) -> (PathBuf, StorageRootScope) {
             let (root, scope) = scratch(name);
             update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
-            assert!(tombstone_utils::mark_served().unwrap());
+            assert!(tombstone_utils::mark_served(false).unwrap());
             remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, None).unwrap();
 
             (root, scope)

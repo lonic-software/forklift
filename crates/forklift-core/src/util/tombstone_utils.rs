@@ -70,21 +70,26 @@ pub fn is_served() -> Result<bool, String> {
 /// Mark the warehouse at the current storage root as served, durably, unless it is already. Under
 /// the [`RefLock`], so a ref removal in a bay reads the mark either before it is written (and the
 /// server then serves a root without that ref) or after it (and the removal leaves a tombstone).
-/// A root already marked is answered without the lock. The lock is tried, never waited for: the
-/// server calls this under its registry mutex, so a bay holding the lock makes the first serve
-/// retry rather than stall every other warehouse.
+/// A root already marked is answered without the lock. Unless `wait`, the lock is tried, never
+/// waited for: the server's multi-root registry calls this under its mutex, so a bay holding the
+/// lock makes the first serve retry rather than stall every other warehouse.
 ///
 /// # Returns
 /// * `Ok(true)`    - The root is marked.
-/// * `Ok(false)`   - The root is unmarked and a bay holds the ref lock; nothing was written.
+/// * `Ok(false)`   - Not `wait`, the root is unmarked and a bay holds the ref lock; nothing was
+///                   written.
 /// * `Err(String)` - The mark could not be read or written.
-pub fn mark_served() -> Result<bool, String> {
+pub fn mark_served(wait: bool) -> Result<bool, String> {
     if is_served()? {
         return Ok(true);
     }
 
-    let Some(_lock) = RefLock::try_acquire_in(&globals::forklift_root())? else {
-        return Ok(false);
+    let _lock = match wait {
+        true => RefLock::acquire()?,
+        false => match RefLock::try_acquire_in(&globals::forklift_root())? {
+            Some(lock) => lock,
+            None => return Ok(false),
+        },
     };
 
     if is_served()? {
@@ -221,6 +226,11 @@ pub fn restore_pallet(wire: &str) -> Result<String, String> {
 /// * `Err(String)` - The refusal, naming the deleted head and the way out, or why the tombstones
 ///                   could not be read.
 pub fn refuse_a_tombstoned_name(wire: &str) -> Result<(), String> {
+    // Bound as a ref write is: only a served root's tombstones count.
+    if !is_served()? {
+        return Ok(());
+    }
+
     match read_tombstones()?.get(wire) {
         Some(head) => Err(format!(
             "Pallet \"{}\" was deleted in this served warehouse, at {}, and the name is kept for it. \
@@ -264,8 +274,8 @@ mod tests {
         let _scratch = Scratch::new("mark");
 
         assert!(!is_served().unwrap(), "a root never served carries no mark");
-        assert!(mark_served().unwrap());
-        assert!(mark_served().unwrap());
+        assert!(mark_served(false).unwrap());
+        assert!(mark_served(false).unwrap());
         assert!(is_served().unwrap(), "the mark stands");
 
         std::fs::write(served_path(), b"something else\n").unwrap();
@@ -278,18 +288,33 @@ mod tests {
         let _scratch = Scratch::new("busy");
 
         let lock = RefLock::acquire().unwrap();
-        assert!(!mark_served().unwrap(), "a bay holds the ref lock, so the mark must not wait");
+        assert!(!mark_served(false).unwrap(), "a bay holds the ref lock, so the mark must not wait");
         assert!(!is_served().unwrap(), "nothing is written while the lock is held");
 
         drop(lock);
-        assert!(mark_served().unwrap());
+        assert!(mark_served(false).unwrap());
 
         let _lock = RefLock::acquire().unwrap();
-        assert!(mark_served().unwrap(), "a marked root is answered without the lock");
+        assert!(mark_served(false).unwrap(), "a marked root is answered without the lock");
     }
 
     #[test]
-    fn a_tombstoned_name_is_refused_for_a_new_unborn_pallet() {
+    fn a_waiting_first_mark_waits_for_the_ref_lock() {
+        let _scratch = Scratch::new("wait");
+
+        let lock = RefLock::acquire().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(lock);
+        });
+
+        assert!(mark_served(true).unwrap(), "a waiting mark is written once the bay lets go");
+        assert!(is_served().unwrap());
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn a_tombstoned_name_is_refused_for_a_new_unborn_pallet_only_in_a_served_root() {
         let _scratch = Scratch::new("reserved");
         let head = "a".repeat(64);
 
@@ -298,7 +323,9 @@ mod tests {
         let lock = RefLock::acquire().unwrap();
         write_tombstones(&lock, &BTreeMap::from([("gone".to_string(), head.clone())])).unwrap();
         drop(lock);
+        refuse_a_tombstoned_name("gone").unwrap();
 
+        assert!(mark_served(false).unwrap());
         let refused = refuse_a_tombstoned_name("gone").unwrap_err();
         assert!(refused.contains(&head) && refused.contains("forklift palletize --restore gone"), "{}", refused);
         refuse_a_tombstoned_name("other").unwrap();

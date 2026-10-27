@@ -99,7 +99,9 @@ impl WarehouseHandle {
     /// runtime thread.
     ///
     /// The root is marked as served (`tombstone_utils::mark_served`) before the handle is
-    /// returned, durably, and a root whose mark cannot be written is refused: from then on every ref
+    /// returned, durably, and a root whose mark cannot be written is refused. A first mark waits for
+    /// a bay's ref lock only when `wait` (a single root, served once at startup, under no registry);
+    /// otherwise the root is refused as busy, and a later request serves it: from then on every ref
     /// removal there leaves a tombstone, which a client that freed its copy of a head this server
     /// listed relies on.
     ///
@@ -109,7 +111,7 @@ impl WarehouseHandle {
     /// cannot serve back. Checking once, here, is enough because a full root never turns sparse:
     /// of the fetch-scope writers, franchise sets it as it creates the warehouse, `expand` never
     /// widens one to full, and scope-prune only narrows one that is already sparse.
-    fn serving(root: PathBuf) -> Result<WarehouseHandle, ServingRefusal> {
+    fn serving(root: PathBuf, wait: bool) -> Result<WarehouseHandle, ServingRefusal> {
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
         // absolute path or an open file, so they stay valid once the scope drops).
@@ -129,7 +131,7 @@ impl WarehouseHandle {
             let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
             let store_access = StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?;
 
-            if !forklift_core::util::tombstone_utils::mark_served().map_err(ServingRefusal::Unreadable)? {
+            if !forklift_core::util::tombstone_utils::mark_served(wait).map_err(ServingRefusal::Unreadable)? {
                 return Err(ServingRefusal::Busy(
                     "A command in this warehouse is changing its pallets. Try again once it finishes.".to_string()
                 ));
@@ -693,7 +695,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
             // Hold the serve lock for the served root for the process lifetime: a second
             // server on the same root is refused here rather than silently breaking the CAS.
-            let handle = WarehouseHandle::serving(root.clone())
+            let handle = WarehouseHandle::serving(root.clone(), true)
                 .map_err(|refusal| refusal.message(&format!("\"{}\"", root.to_string_lossy())))?;
             ServeMode::Single(Arc::new(handle))
         }
@@ -1023,13 +1025,17 @@ fn pallet_deleted(pallet: &str, head: &str, acknowledged: bool) -> HandlerError 
     let message = match acknowledged {
         false => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-            history: re-creating it must acknowledge the deletion. Nothing was written.",
-            pallet, head
+            history: re-creating it must acknowledge the deletion. Lift the work under another name, \
+            or ask the remote's operator to drop the tombstone (\"forklift-server tombstone drop {}\"). \
+            Nothing was written.",
+            pallet, head, pallet
         ),
         true => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
-            it: the name stays reserved for that history. Nothing was written.",
-            pallet, head
+            it: the name stays reserved for that history. Lift the work under another name, or ask \
+            the remote's operator to drop the tombstone (\"forklift-server tombstone drop {}\"). \
+            Nothing was written.",
+            pallet, head, pallet
         ),
     };
 
@@ -1682,7 +1688,7 @@ fn resolve_warehouse(state: &AppState,
     // warehouse stays refused (409) until it is replaced, and an unfinished franchise (503) until
     // it is resumed or deleted.
     let handle = Arc::new(
-        WarehouseHandle::serving(root).map_err(|refusal| match refusal {
+        WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
             ServingRefusal::Busy(reason) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, reason),
@@ -4714,12 +4720,12 @@ mod tests {
 
         let full = base.join("full");
         mark_warehouse(&full);
-        drop(WarehouseHandle::serving(full.clone()).expect("a full root is served"));
+        drop(WarehouseHandle::serving(full.clone(), false).expect("a full root is served"));
 
         let sparse = base.join("sparse");
         mark_warehouse(&sparse);
         make_sparse(&sparse);
-        let refused = WarehouseHandle::serving(sparse.clone()).err().expect("a sparse root is refused");
+        let refused = WarehouseHandle::serving(sparse.clone(), false).err().expect("a sparse root is refused");
         assert!(matches!(refused, ServingRefusal::Sparse), "{:?}", refused);
         let message = refused.message("\"/srv/wh\"");
         assert!(message.starts_with("\"/srv/wh\" is a sparse warehouse"), "{}", message);
@@ -4731,7 +4737,7 @@ mod tests {
             let _scope = StorageRootScope::enter(&garbled);
             std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
         }
-        let refused = WarehouseHandle::serving(garbled).err().expect("an unreadable scope is refused");
+        let refused = WarehouseHandle::serving(garbled, false).err().expect("an unreadable scope is refused");
         assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
 
         let _ = std::fs::remove_dir_all(&base);
@@ -6410,7 +6416,7 @@ mod tests {
             pallet_utils::update_pallet_head("main", None, &main, &RefPreconditions::NONE).unwrap();
             pallet_utils::update_pallet_head("side", None, &side, &RefPreconditions::NONE).unwrap();
             pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
-            assert!(tombstone_utils::mark_served().unwrap());
+            assert!(tombstone_utils::mark_served(false).unwrap());
 
             (root, scope, side)
         }
@@ -6436,7 +6442,7 @@ mod tests {
             let root = scratch_dir("serving-marks");
             mark_warehouse(&root);
 
-            drop(WarehouseHandle::serving(root.clone()).expect("a full root is served"));
+            drop(WarehouseHandle::serving(root.clone(), false).expect("a full root is served"));
 
             let _scope = StorageRootScope::enter(&root);
             assert!(tombstone_utils::is_served().unwrap(), "a served root carries the mark");

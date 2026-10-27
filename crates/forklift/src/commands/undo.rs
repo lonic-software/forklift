@@ -309,7 +309,7 @@ mod tests {
     fn undo_of_a_delete_in_a_served_warehouse_clears_its_tombstone() {
         let _warehouse = Warehouse::storage_only("undo-delete-served");
         let none = pallet_utils::RefPreconditions::NONE;
-        assert!(forklift_core::util::tombstone_utils::mark_served().unwrap());
+        assert!(forklift_core::util::tombstone_utils::mark_served(false).unwrap());
 
         let tree = test_support::store_tree("a.txt", b"a\n");
         let main = test_support::store_parcel(&tree, &[]);
