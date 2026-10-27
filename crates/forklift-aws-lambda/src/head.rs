@@ -316,7 +316,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(hashes.iter().filter(|hash| absent.contains(hash.as_str())).cloned().collect())
     }
 
-    /// `POST /v1/pallets/{name}/holds` — which of `candidates` the pallet still holds, its head or
+    /// `POST /v1/holds/{name}` — which of `candidates` the pallet still holds, its head or
     /// one of the head's ancestors ([`merge_utils::holds`], the bounds both heads share). The walk
     /// reads each round of parcels straight from the object store in one concurrent batch, with no
     /// scratch mirror; a straight chain's rounds hold one parcel each, so there it reads serially.

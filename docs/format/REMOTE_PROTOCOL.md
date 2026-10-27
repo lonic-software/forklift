@@ -341,12 +341,13 @@ pallet names are a fixed list — `office`, `manifest`, `haul`, `tags`, `kv` —
 { "old_head": "<hash-or-null>", "new_head": "<hash>", "tombstone": "<hash, optional>" }
 ```
 
-`{name}` is one path segment, here and on every route that takes a pallet. A client
-percent-encodes the whole reference, `/` included, so `feature/x` travels as `feature%2Fx` and
-`@office` as `%40office`. A server percent-decodes the segment back to the reference, and refuses
-with a `4xx` a segment that does not decode to UTF-8. An unencoded `/` splits the name across
-segments, so the request matches no route or the wrong one (a raw `feature/holds` reads as the
-holds route of `feature`).
+`{name}` is the rest of the path, here and on every route that takes a pallet, and nothing
+follows it. A client sends the reference's `/` as literal separators and percent-encodes each
+component on its own, so `feature/x` travels as `feature/x` and `@office` as `%40office`, never
+`%2F` for a `/`. A server percent-decodes each segment and joins them with `/`, and refuses with a
+`4xx` a segment that does not decode to UTF-8. A `/` sent as `%2F` is not dependable: an API
+gateway or reverse proxy may decode it before the request is routed, so a reference carried as one
+encoded segment would arrive split.
 
 `old_head: null` means "the pallet must not exist yet". Checks, in order:
 
@@ -451,7 +452,7 @@ before answering; that read is already past, and changes none of the above. The 
 request may be sent again; it is answered from the state at that time — `200` from a tombstone
 still at `old_head` once it passes checks 1 and 2.
 
-### `POST /v1/pallets/{name}/holds` (additive)
+### `POST /v1/holds/{name}` (additive)
 
 Body: `{"candidates": ["<parcel hash>", …]}` (at most 16 per request).
 Response: `{"holds": {"<parcel hash>": "held" | "not_held" | "unknown", …}}` — one answer per

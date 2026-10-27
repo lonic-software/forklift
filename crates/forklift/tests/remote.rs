@@ -288,14 +288,23 @@ fn http_post_json(server_url: &str, path: &str, body: &str) -> (String, String) 
 
 /// Send a JSON body with `method` over raw HTTP and return `(status line, response body)`.
 fn http_send_json(server_url: &str, method: &str, path: &str, body: &str) -> (String, String) {
+    http_send_json_as(server_url, method, path, body, None)
+}
+
+/// [`http_send_json`], with `token` as the bearer credential when one is given.
+fn http_send_json_as(server_url: &str, method: &str, path: &str, body: &str, token: Option<&str>) -> (String, String) {
     let address = server_url.strip_prefix("http://").unwrap();
     let mut stream = std::net::TcpStream::connect(address).unwrap();
 
+    let auth = token
+        .map(|token| format!("Authorization: Bearer {}\r\n", token))
+        .unwrap_or_default();
+
     write!(
         stream,
-        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+        "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n\
         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        method, path, address, body.len(), body
+        method, path, address, auth, body.len(), body
     ).unwrap();
 
     let mut response = String::new();
@@ -733,6 +742,7 @@ struct InterceptingProxy {
 }
 
 type Intercept = dyn Fn(&str, &str) -> Option<Vec<u8>> + Send + Sync;
+type Rewrite = dyn Fn(&str) -> String + Send + Sync;
 
 impl InterceptingProxy {
     fn start(upstream: &str, intercept: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static) -> InterceptingProxy {
@@ -742,10 +752,19 @@ impl InterceptingProxy {
     /// As [`InterceptingProxy::start`], with `intercept` also given the request's head.
     fn start_seeing(upstream: &str,
                     intercept: impl Fn(&str, &str) -> Option<Vec<u8>> + Send + Sync + 'static) -> InterceptingProxy {
+        InterceptingProxy::launch(upstream, std::sync::Arc::new(intercept), std::sync::Arc::new(str::to_string))
+    }
+
+    /// A proxy that intercepts nothing and forwards each request with its path rewritten by
+    /// `rewrite`, as an intermediary that normalizes paths before routing does.
+    fn start_rewriting(upstream: &str, rewrite: impl Fn(&str) -> String + Send + Sync + 'static) -> InterceptingProxy {
+        InterceptingProxy::launch(upstream, std::sync::Arc::new(|_: &str, _: &str| None), std::sync::Arc::new(rewrite))
+    }
+
+    fn launch(upstream: &str, intercept: std::sync::Arc<Intercept>, rewrite: std::sync::Arc<Rewrite>) -> InterceptingProxy {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let upstream = upstream.trim_start_matches("http://").trim_end_matches('/').to_string();
-        let intercept: std::sync::Arc<Intercept> = std::sync::Arc::new(intercept);
 
         // The acceptor lives for the rest of the test process, like `HookServer`'s.
         std::thread::spawn(move || {
@@ -753,8 +772,9 @@ impl InterceptingProxy {
                 let Ok(downstream) = stream else { continue };
                 let upstream = upstream.clone();
                 let intercept = std::sync::Arc::clone(&intercept);
+                let rewrite = std::sync::Arc::clone(&rewrite);
 
-                std::thread::spawn(move || InterceptingProxy::serve(downstream, &upstream, &*intercept));
+                std::thread::spawn(move || InterceptingProxy::serve(downstream, &upstream, &*intercept, &*rewrite));
             }
         });
 
@@ -763,7 +783,8 @@ impl InterceptingProxy {
 
     fn serve(mut downstream: std::net::TcpStream,
              upstream: &str,
-             intercept: &Intercept) {
+             intercept: &Intercept,
+             rewrite: &Rewrite) {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 8192];
 
@@ -807,6 +828,7 @@ impl InterceptingProxy {
         }
 
         let Ok(mut server) = std::net::TcpStream::connect(upstream) else { return };
+        let request_line = request_line.replacen(path, &rewrite(path), 1);
         let mut forwarded = format!("{}\r\n{}\r\nConnection: close\r\n\r\n", request_line, headers.join("\r\n")).into_bytes();
         forwarded.extend_from_slice(&body);
 
@@ -1044,7 +1066,7 @@ fn every_hash_taking_endpoint_refuses_an_uppercase_spelling_as_client_error() {
         ("missing", http_post_json(&server.url, "/v1/objects/missing", &batch)),
         ("upload-targets", http_post_json(&server.url, "/v1/objects/upload-targets", &targets)),
         ("batch", http_post_json(&server.url, "/v1/objects/batch", &batch)),
-        ("holds", http_post_json(&server.url, "/v1/pallets/main/holds",
+        ("holds", http_post_json(&server.url, "/v1/holds/main",
                                  &format!("{{\"candidates\":[\"{}\"]}}", upper))),
         ("object", http_get(&server.url, &format!("/v1/objects/{}", upper))),
         ("signature", http_get(&server.url, &format!("/v1/signatures/{}", upper))),
@@ -1082,7 +1104,7 @@ fn the_holds_endpoint_answers_held_for_lifted_history_and_not_held_for_the_rest(
     let stranger = "0".repeat(64);
     let request = format!("{{\"candidates\":[\"{}\",\"{}\",\"{}\"]}}", parcels[0], parcels[1], stranger);
 
-    let (status, body) = http_post_json(&server.url, "/v1/pallets/main/holds", &request);
+    let (status, body) = http_post_json(&server.url, "/v1/holds/main", &request);
     assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
     let holds: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(holds["holds"][&parcels[0]], "held", "an ancestor of the head: {}", body);
@@ -1090,18 +1112,18 @@ fn the_holds_endpoint_answers_held_for_lifted_history_and_not_held_for_the_rest(
     assert_eq!(holds["holds"][&stranger], "not_held", "the whole history was read: {}", body);
 
     // A pallet the warehouse does not have holds nothing.
-    let (status, body) = http_post_json(&server.url, "/v1/pallets/elsewhere/holds", &request);
+    let (status, body) = http_post_json(&server.url, "/v1/holds/elsewhere", &request);
     assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
     let holds: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(holds["holds"][&parcels[1]], "not_held", "{}", body);
 
     // One candidate past the cap, and a name no pallet can carry, are refused.
     let over_cap: Vec<String> = (0..17).map(|n| format!("\"{:064x}\"", n)).collect();
-    let (status, body) = http_post_json(&server.url, "/v1/pallets/main/holds",
+    let (status, body) = http_post_json(&server.url, "/v1/holds/main",
         &format!("{{\"candidates\":[{}]}}", over_cap.join(",")));
     assert!(status.starts_with("HTTP/1.1 422"), "{} / {}", status, body);
 
-    let (status, body) = http_post_json(&server.url, "/v1/pallets/..%2Fmain/holds", &request);
+    let (status, body) = http_post_json(&server.url, "/v1/holds/../main", &request);
     assert!(status.starts_with("HTTP/1.1 422"), "{} / {}", status, body);
 }
 
@@ -3772,6 +3794,58 @@ fn hooks_authenticate_admit_and_notify() {
     assert!(stderr(&denied).contains("quota is exhausted"), "{}", stderr(&denied));
 }
 
+/// FORK-304: a pallet name is the rest of the path, so a tail that is no valid name is refused
+/// with a 422 before the admission hook is asked, on the ref update and the delete alike; a valid
+/// slash-named tail does reach the hook, whole.
+#[test]
+fn a_tail_naming_no_valid_pallet_never_reaches_the_admission_hook() {
+    let area = TestArea::new("hooks-bad-tail");
+    let hooks = HookServer::start();
+    let server = start_hooked_server(&area, &hooks, "a shared hook secret");
+    let token = Some("hook-token");
+    let hash = "b".repeat(64);
+    let update = format!("{{\"old_head\":null,\"new_head\":\"{}\"}}", hash);
+
+    let admitted = |action: &str| -> Vec<String> {
+        hooks.recorded().into_iter()
+            .filter(|request| request.path == "/admission")
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .filter(|body| body.contains(&format!("\"action\":\"{}\"", action)))
+            .collect()
+    };
+
+    // The control: a valid name reaches the hook on both routes, so the silence below is the
+    // parse's doing, not a hook that is never asked.
+    let (status, body) = http_send_json_as(&server.url, "POST", "/v1/pallets/feature/x", &update, token);
+    assert!(!status.starts_with("HTTP/1.1 404"), "{} / {}", status, body);
+    let status = http_status(&server.url, "DELETE", &format!("/v1/pallets/feature/x?old_head={}", hash), token);
+    assert!(!status.starts_with("HTTP/1.1 404"), "{}", status);
+    let updates = admitted("ref_update");
+    assert!(updates.len() == 1 && updates[0].contains("\"pallet\":\"feature/x\""), "{:?}", updates);
+    let deletes = admitted("ref_delete");
+    assert!(deletes.len() == 1 && deletes[0].contains("\"pallet\":\"feature/x\""), "{:?}", deletes);
+
+    for tail in ["feature/..", "..%2Fmain", "feature/./x", "feature/X", "feature//x"] {
+        let (status, body) =
+            http_send_json_as(&server.url, "POST", &format!("/v1/pallets/{}", tail), &update, token);
+        assert!(status.starts_with("HTTP/1.1 422"), "update {}: {} / {}", tail, status, body);
+        let status = http_status(&server.url, "DELETE", &format!("/v1/pallets/{}?old_head={}", tail, hash), token);
+        assert!(status.starts_with("HTTP/1.1 422"), "delete {}: {}", tail, status);
+        let (status, body) = http_send_json_as(&server.url, "POST", &format!("/v1/holds/{}", tail),
+            &format!("{{\"candidates\":[\"{}\"]}}", hash), token);
+        assert!(status.starts_with("HTTP/1.1 422"), "holds {}: {} / {}", tail, status, body);
+    }
+    assert_eq!(admitted("ref_update").len(), 1, "a refused name was put to the hook: {:?}", admitted("ref_update"));
+    assert_eq!(admitted("ref_delete").len(), 1, "a refused name was put to the hook: {:?}", admitted("ref_delete"));
+
+    for (method, path) in [("POST", "/v1/pallets/"), ("POST", "/v1/holds/")] {
+        let (status, body) = http_send_json_as(&server.url, method, path, &update, token);
+        assert!(status.starts_with("HTTP/1.1 404"), "{} {}: {} / {}", method, path, status, body);
+    }
+    let status = http_status(&server.url, "DELETE", &format!("/v1/pallets/?old_head={}", hash), token);
+    assert!(status.starts_with("HTTP/1.1 404"), "{}", status);
+}
+
 #[test]
 fn an_unreachable_authentication_hook_fails_closed() {
     let area = TestArea::new("hooks-closed");
@@ -6007,8 +6081,7 @@ fn scope_prune_frees_work_the_remote_keeps_under_a_tombstone() {
 
 #[test]
 fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
-    // FORK-297: a pallet name may carry `/`, and the per-pallet routes take it as one path
-    // segment. The lift moves `feature/x` on the remote, and the prune's holds check of it is
+    // FORK-297: a pallet name may carry `/`, and the per-pallet routes take it whole. The lift moves `feature/x` on the remote, and the prune's holds check of it is
     // answered, so the history the remote confirms under that name is freed.
     let area = TestArea::new("scope-prune-slash-pallet");
     let server = sparse_with_docs(&area);
@@ -6042,6 +6115,82 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     assert_success(&pruned);
     assert!(!stderr(&pruned).contains("holds_unanswered"), "the holds check was answered: {}", stderr(&pruned));
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
+}
+
+/// What stands between the client and forklift-server in [`a_slash_named_pallet_crosses`].
+enum SlashProxy {
+    /// Decodes `%2F` to `/` before forwarding, as the serverless head's API gateway does.
+    Decoding,
+    /// Refuses any request whose path holds `%2F`, as a proxy with encoded slashes disallowed does.
+    Refusing,
+}
+
+/// FORK-304: lift `feature/x`, have the remote answer its holds check, and delete it, all through
+/// `proxy`. forklift-server alone is no witness: it decodes `%2F` inside one segment, so a name
+/// sent as `feature%2Fx` reaches it whole either way.
+fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
+    let area = TestArea::new(name);
+    let server = Server::start(&area, None);
+    let proxy = match proxy {
+        SlashProxy::Decoding => InterceptingProxy::start_rewriting(&server.url, |path| {
+            path.replace("%2F", "/").replace("%2f", "/")
+        }),
+        SlashProxy::Refusing => InterceptingProxy::start(&server.url, |path| {
+            path.to_ascii_uppercase().contains("%2F").then(|| {
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            })
+        }),
+    };
+
+    prepare_warehouse(&area, "dev", &proxy.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &proxy.url, "sparse", "--only", "src/api", "--only", "docs"]));
+    let base = pallet_head(&area, "sparse", "main");
+    let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
+
+    // The lift moves `feature/x` on the remote, not some prefix of it.
+    area.write_file("dev/src/api/a.txt", "api v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("dev", &["palletize", "feature/x"]));
+    assert_success(&area.forklift("dev", &["shift", "feature/x"]));
+    area.write_file("dev/src/api/a.txt", "api v3\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "feature work"]));
+    let feature = pallet_head(&area, "dev", "feature/x");
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_eq!(remote_pallet_head(&server, "feature/x").as_deref(), Some(feature.as_str()));
+
+    // The only recorded head is under `feature/x`, so freeing the docs blob takes that pallet's
+    // holds answer.
+    let record = area.path("sparse/.forklift/held-heads");
+    let header = std::fs::read_to_string(&record).unwrap().lines().next().unwrap().to_string();
+    std::fs::write(&record, format!("{}\n{} feature/x\n", header, base)).unwrap();
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&pruned);
+    assert!(!stderr(&pruned).contains("holds_unanswered"), "the holds check was answered: {}", stderr(&pruned));
+    assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
+
+    assert_success(&area.forklift("dev", &["shift", "main"]));
+    assert_success(&area.forklift("dev", &["palletize", "--delete", "feature/x", "--remote"]));
+    assert_eq!(remote_pallet_head(&server, "feature/x"), None, "the delete removed feature/x");
+    assert_eq!(remote_pallet_head(&server, "main").as_deref(), Some(pallet_head(&area, "dev", "main").as_str()));
+}
+
+#[test]
+fn a_slash_named_pallet_crosses_a_proxy_that_decodes_encoded_slashes() {
+    a_slash_named_pallet_crosses(SlashProxy::Decoding, "slash-pallet-decoding-proxy");
+}
+
+#[test]
+fn a_slash_named_pallet_crosses_a_proxy_that_refuses_encoded_slashes() {
+    a_slash_named_pallet_crosses(SlashProxy::Refusing, "slash-pallet-refusing-proxy");
 }
 
 /// Point the served root's `main` at `head`, as an edit on the server's disk would, or a pallet
@@ -6156,7 +6305,7 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
     let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = std::sync::Arc::clone(&asked);
     let proxy = InterceptingProxy::start(&server.url, move |path| {
-        path.ends_with("/holds").then(|| {
+        path.contains("/v1/holds/").then(|| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         })

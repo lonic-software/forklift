@@ -153,17 +153,24 @@ fn encode_path_segments(path: &str) -> String {
         .join("/")
 }
 
-/// Percent-encode a value as ONE URL path segment against [`PATH_SEGMENT`], `/` included: a
-/// pallet name such as `feature/x` is one route parameter, which an unencoded `/` would split
-/// into two segments that no route matches.
+/// Percent-encode a value as ONE URL path segment against [`PATH_SEGMENT`], `/` included.
 fn encode_path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT).to_string()
 }
 
-/// The path of a per-pallet route, `/v1/pallets/{pallet}` followed by `tail`: every route that
-/// takes a pallet builds its path here, so none can put the name in raw.
-fn pallet_route(pallet: &str, tail: &str) -> String {
-    format!("/v1/pallets/{}{}", encode_path_segment(pallet), tail)
+/// The path of the ref-update and delete routes of `pallet`, `/v1/pallets/{pallet}`. The name
+/// travels as literal segments (`feature/x`, never `feature%2Fx`) and always last in the path:
+/// an API gateway or reverse proxy that decodes `%2F` before routing would split a name sent as
+/// one encoded segment, while literal segments arrive as they were sent, and with nothing after
+/// the name no literal can be mistaken for one of its components.
+fn pallet_route(pallet: &str) -> String {
+    format!("/v1/pallets/{}", encode_path_segments(pallet))
+}
+
+/// The path of the holds route of `pallet`, `/v1/holds/{pallet}`, the name carried as in
+/// [`pallet_route`].
+fn holds_route(pallet: &str) -> String {
+    format!("/v1/holds/{}", encode_path_segments(pallet))
 }
 
 /// How many objects one batch-fetch request asks for: bounds the response the server
@@ -3274,7 +3281,7 @@ impl RemoteClient {
             let posture = Posture::HeadDeadline { head: self.retryable_head_budget() };
             let outcome = self.send_waiting_out_throttle(
                 posture,
-                reqwest::Method::POST, &pallet_route(pallet, "/holds"),
+                reqwest::Method::POST, &holds_route(pallet),
                 SendBody::json(&HoldsRequest { candidates: batch.to_vec() })?,
                 "the holds check",
             ).await?;
@@ -4250,7 +4257,7 @@ impl RemoteClient {
 
         let outcome = self.send_on(
             Posture::UnboundedNoRedirect(UnboundedTicket::Fork94),
-            reqwest::Method::POST, &pallet_route(pallet, ""),
+            reqwest::Method::POST, &pallet_route(pallet),
             SendBody::json(&body)?,
         ).await;
         let response = self.response_from_send_mutation(&action, outcome)?;
@@ -4282,7 +4289,7 @@ impl RemoteClient {
 
         let outcome = self.send_on(
             Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
-            reqwest::Method::DELETE, &pallet_route(pallet, &format!("?old_head={}", old_head)),
+            reqwest::Method::DELETE, &format!("{}?old_head={}", pallet_route(pallet), old_head),
             SendBody::Empty,
         ).await;
         let response = self.response_from_send_mutation(&action, outcome)?;
@@ -8210,11 +8217,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_path_segment_encodes_a_slash_into_the_one_segment() {
-        assert_eq!(encode_path_segment("feature/x"), "feature%2Fx");
-        assert_eq!(encode_path_segment("@haul"), "%40haul");
-        assert_eq!(encode_path_segment("main"), "main");
-        assert_eq!(pallet_route("feature/x", "/holds"), "/v1/pallets/feature%2Fx/holds");
+    fn a_pallet_route_carries_the_name_as_literal_segments() {
+        // A gateway that decodes `%2F` before routing would split `feature%2Fx`; the name goes
+        // out as the literal segments it already has, each still encoded on its own.
+        assert_eq!(pallet_route("feature/x"), "/v1/pallets/feature/x");
+        assert_eq!(holds_route("feature/x"), "/v1/holds/feature/x");
+        assert_eq!(pallet_route("@office"), "/v1/pallets/%40office");
+        assert_eq!(holds_route("main"), "/v1/holds/main");
     }
 
     #[test]

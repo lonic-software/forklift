@@ -620,25 +620,32 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> He
         (&Method::GET, ["signatures", hash]) => Some(Route::SignatureGet(param(hash)?)),
         (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut(param(hash)?)),
         (&Method::PUT, ["trust"]) => Some(Route::PutTrust),
-        (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate(param(name)?)),
-        (&Method::DELETE, ["pallets", name]) => Some(Route::RefDelete {
-            name: param(name)?,
+        (&Method::POST, ["pallets", name @ ..]) if !name.is_empty() => Some(Route::RefUpdate(pallet_name(name)?)),
+        (&Method::DELETE, ["pallets", name @ ..]) if !name.is_empty() => Some(Route::RefDelete {
+            name: pallet_name(name)?,
             old_head: query_param(query, "old_head")?.ok_or_else(|| {
                 HeadError::unprocessable("A pallet delete names the head it deletes: ?old_head=<hash>.")
             })?,
         }),
-        (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds(param(name)?)),
+        (&Method::POST, ["holds", name @ ..]) if !name.is_empty() => Some(Route::Holds(pallet_name(name)?)),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
         _ => None,
     })
 }
 
+/// A pallet name, the rest of the path after `pallets` or `holds`: the client sends a name such
+/// as `feature/x` as literal segments, last in the path, so each segment is decoded on its own
+/// and the decoded segments are joined with `/`. Empty segments were dropped by the split, so
+/// `a//b` reads as `a/b`; no valid name has an empty component, and every handler still parses
+/// the name, refusing `.`, `..` and anything outside the name alphabet.
+fn pallet_name(segments: &[&str]) -> HeadResult<String> {
+    Ok(segments.iter().map(|segment| param(segment)).collect::<HeadResult<Vec<_>>>()?.join("/"))
+}
+
 /// A captured path parameter, percent-decoded as `forklift-server`'s `Path` extractor decodes
-/// it. The path is split into segments first, so an encoded `/` stays inside its segment: a
-/// pallet named `feature/x` arrives as the one segment `feature%2Fx`. A segment that does not
-/// decode to UTF-8 is a `422`, this head's status for a request it cannot process
-/// (`forklift-server` answers it `400`).
+/// it. A segment that does not decode to UTF-8 is a `422`, this head's status for a request it
+/// cannot process (`forklift-server` answers it `400`).
 fn param(segment: &str) -> HeadResult<String> {
     percent_decode_str(segment).decode_utf8().map(|value| value.into_owned()).map_err(|_| {
         HeadError::unprocessable(format!(

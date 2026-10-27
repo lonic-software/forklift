@@ -468,7 +468,7 @@ pub const HOLDS_READ_ROUND: usize = 64;
 /// Which of `candidates` a pallet whose head is `head` still holds, under the bounds every head
 /// shares: the candidate cap ([`check_holds_candidates`]), [`MAX_HOLDS_WALK`] parcels, and the
 /// earlier of [`MAX_HOLDS_WALK_TIME`] from now and `deadline`. The one entry point both heads
-/// answer `POST /v1/pallets/{name}/holds` through.
+/// answer `POST /v1/holds/{name}` through.
 ///
 /// # Arguments
 /// * `head`       - The pallet's current head, or `None` when there is no such pallet.
