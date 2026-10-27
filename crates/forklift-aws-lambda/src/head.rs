@@ -1162,9 +1162,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // A read that fails too leaves the fate where the attempts left it.
                     return match self.refs.get_head(PalletNamespace::User, &bare) {
                         Ok(RefHead::Deleted(tombstone)) if tombstone == old_head => Ok(()),
-                        Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(uncertain.get(), None)),
+                        Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(old_head, uncertain.get(), None)),
                         Ok(current) => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
-                        Err(error) => Err(self.delete_contention(uncertain.get(), Some(&error))),
+                        Err(error) => Err(self.delete_contention(old_head, uncertain.get(), Some(&error))),
                     };
                 }
             }
@@ -1431,10 +1431,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// every attempt was refused for a reason showing no input moved, so nothing did whatever the
     /// ref read back says or whether it could be read; with it true an attempt may have landed,
     /// and neither the attempts nor the ref read back confirmed it. `read_fault` is why the ref
-    /// could not be read back, when it could not. Both send the caller to check the pallet's
-    /// remote head before deleting again, since a client cannot tell them apart and in either
-    /// case the pallet may have moved, or been deleted and created again, since it was read.
-    fn delete_contention(&self, uncertain: bool, read_fault: Option<&str>) -> HeadError {
+    /// could not be read back, when it could not. Both name `old_head`, the head the delete was
+    /// for, and send the caller to check that the pallet is still there before deleting again: a
+    /// client cannot tell the two apart, and a delete at whatever head it then finds would remove
+    /// work pushed meanwhile.
+    fn delete_contention(&self, old_head: &str, uncertain: bool, read_fault: Option<&str>) -> HeadError {
         let what = match uncertain {
             true => format!("The delete could not be confirmed: {}", UNCONFIRMED),
             false => "The delete could not complete: the warehouse's storage stayed busy through \
@@ -1442,9 +1443,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 pallet at the same time. Nothing is known to have moved."
                 .to_string(),
         };
-        let next = "Check the pallet's remote head (\"forklift palletize --remote --json\") before \
-            deleting it again: it may have moved, or been deleted and created again, since this \
-            request read it.";
+        let next = format!(
+            "Before deleting it again, check that the pallet's remote head is still {} (\"forklift \
+            palletize --remote --json\"): a delete at another head would remove work pushed since.",
+            old_head
+        );
 
         let fault = read_fault.map(|fault| fault.split_whitespace().collect::<Vec<_>>().join(" "));
         let read = match fault.as_deref().map(|fault| fault.strip_suffix('.').unwrap_or(fault)) {
