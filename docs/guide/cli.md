@@ -1787,8 +1787,8 @@ under the path, narrow and prune; the parked edits survive, and `park pop` re-ap
 `expand` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything; so does a sealed-object record that cannot be read. The prune reads
 nothing beneath an object the warehouse holds by hash alone (see `audit`). A full (non-sparse)
-warehouse has nothing to prune. Use `--dry-run` before you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
-repack is future work.) A prune, dry run included, is **refused while a mutating command runs in
+warehouse has nothing to prune. Use `--dry-run` before you leap. (Objects already inside a pack
+are reported but not reclaimed yet — a scope-aware repack is future work.) A prune, dry run included, is **refused while a mutating command runs in
 another bay**, since that writer could reuse an object the prune is about to free; run it again
 once the other command finishes. (A `forklift-server` never serves a sparse warehouse, so no
 server is in the way.)

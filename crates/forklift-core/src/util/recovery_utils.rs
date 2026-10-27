@@ -99,7 +99,8 @@
 //! terminal-leaf presence check never runs at all, so the targeted walk pays no per-leaf/per-chunk
 //! stat it has no use for. `Some(collector)` for the targetless enumerator
 //! ([`enumerate_absent_reachable`]) — every absence found, at every level including terminal
-//! leaves and chunks, is recorded. Both share [`walk_closure_for`]'s exact descent (one code path,
+//! leaves and chunks, is recorded, except a tree, recipe, chunk or leaf the sealed-object record
+//! holds by hash alone (never a parcel, a staged object or a corrupt boundary). Both share [`walk_closure_for`]'s exact descent (one code path,
 //! two modes, so they can never drift apart); [`enumerate_absent_reachable`] additionally passes an
 //! **empty target set**, so every node's targets-check is vacuous and every node's descent-guard is
 //! actually reached.
@@ -1976,6 +1977,11 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// objects as vanished would refuse every torn heal there. A fetch scope that cannot be read is a
 /// degraded source, and the walk then runs in full.
 ///
+/// Likewise an absent tree, recipe, chunk or leaf that the sealed-object record holds is held by
+/// hash alone (the remote holds it and its closure) and is neither recorded nor descended into. A
+/// parcel, a staged object and a corrupt boundary are never held. A sealed-object record that
+/// cannot be read is a degraded source, and the walk then holds nothing.
+///
 /// `corrupt` is the §8.3 corrupt-boundary carve-out: a hash in this set that the walk reaches is
 /// treated exactly like a raw-absent one — recorded via the sink, not descended into — even
 /// though [`file_utils::raw_object_present`] would say it *is* present. Without this, a reachable
@@ -1985,8 +1991,9 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// no other caller yet, but the parameter is real, not vestigial — see `rescan_torn_taint`).
 ///
 /// # Returns
-/// * `Ok(ClosureWalkResult)` - Every raw-absent (or corrupt-boundary) hash the walk reached,
-///                            recorded once each, plus any degraded-source notes.
+/// * `Ok(ClosureWalkResult)` - Every raw-absent (or corrupt-boundary) hash the walk reached and
+///                            does not hold by hash alone, recorded once each, plus any
+///                            degraded-source notes.
 /// * `Err(String)`          - A ref source could not be read, or a *present*, non-corrupt-boundary
 ///                            object could not be loaded (corrupt/unreadable) — the walk still
 ///                            fails loud on that, exactly as before the carve-out existed (I5: an
@@ -2008,7 +2015,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     // as lost.
     let sealed = sealed_utils::read_sealed().unwrap_or_else(|error| {
         roots.degraded_sources.push(format!(
-            "objects held by hash alone could not be told apart from lost ones this run: {}.",
+            "objects held by hash alone could not be told apart from lost ones this run. {}.",
             error.trim_end_matches('.')
         ));
         SealedSet::default()
@@ -2561,7 +2568,8 @@ impl TreeVisits {
 ///
 /// Presence-tolerant (I3): a **chunked** leaf's recipe can itself be raw-absent (sparse/shallow) —
 /// its chunks are then locally absent too (mirrors `gc_utils::mark_recipe_chunks_live`), so an
-/// absent recipe is recorded (if a sink is listening) and its chunk list is never fetched. This
+/// absent recipe is recorded (if a sink is listening, and unless `sealed` holds it by hash alone)
+/// and its chunk list is never fetched. This
 /// recipe-presence guard is a real descent guard (skips the `recipe_chunk_hashes` load) and runs
 /// **unconditionally in both modes**, exactly like the parcel/subtree guards.
 ///
@@ -2615,7 +2623,7 @@ fn check_leaf(
             // Enumerating-mode only (gated on the sink, not merely no-opped): the targeted walk
             // never needs a chunk's raw presence, only whether it is a target (handled above).
             if let Some(s) = reborrow_sink(&mut sink) {
-                if !sealed_utils::is_recorded(sealed, &chunk) && !file_utils::raw_object_present(&chunk)? {
+                if !held_by_hash(sealed, corrupt, &chunk) && !file_utils::raw_object_present(&chunk)? {
                     s(&chunk);
                 }
             }
@@ -2623,7 +2631,7 @@ fn check_leaf(
     } else if let Some(s) = reborrow_sink(&mut sink) {
         // Enumerating-mode only, same reasoning: a plain leaf's bytes are never loaded by this
         // walk either way.
-        if !sealed_utils::is_recorded(sealed, hash) && !file_utils::raw_object_present(hash)? {
+        if !held_by_hash(sealed, corrupt, hash) && !file_utils::raw_object_present(hash)? {
             s(hash);
         }
     }
@@ -2631,9 +2639,10 @@ fn check_leaf(
     Ok(())
 }
 
-/// Whether an object the walk found absent, or reached as a corrupt boundary, is held by hash
-/// alone: recorded in `sealed` and absent. A corrupt object is present, and a recorded object that
-/// is present seals nothing, so it stays a loss.
+/// Whether an object is held by hash alone: recorded in `sealed`, and not a corrupt boundary. This
+/// checks no presence: call it only for an object the walk found absent, or for a terminal leaf
+/// or chunk, which has nothing beneath it, so a present one is never reported either way. A
+/// corrupt object is present but wrong, so it stays a loss.
 fn held_by_hash(sealed: Option<&SealedSet>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
     !corrupt.contains(hash) && sealed_utils::is_recorded(sealed, hash)
 }
