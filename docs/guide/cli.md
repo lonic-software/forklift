@@ -1789,8 +1789,8 @@ before changing anything; so does a sealed-object record that cannot be read. Th
 nothing beneath an object the warehouse holds by hash alone (see `audit`). A full (non-sparse)
 warehouse has nothing to prune. Use `--dry-run` before you leap. (Objects already inside a pack
 are reported but not reclaimed yet — a scope-aware repack is future work.) A prune, dry run
-included, is **refused while a mutating command runs in another bay**, since that writer could reuse an object the prune is about to free; run it again
-once the other command finishes. (A `forklift-server` never serves a sparse warehouse, so no
+included, is **refused while a mutating command runs in another bay**, since that writer could
+reuse an object the prune is about to free; run it again once the other command finishes. (A `forklift-server` never serves a sparse warehouse, so no
 server is in the way.)
 
 Pruning a **large (chunked) file** frees its recipe **and every chunk** it names, not just the
@@ -2138,8 +2138,8 @@ refusal before ever reaching its own fetch):
   tree or file the warehouse holds by hash alone (see `audit`) is not reported when absent (a
   staged file still is: it is this checkout's own work); if the sealed-object record cannot be
   read, the incomplete record of what was affected is left standing and `heal` says so. This can
-  take noticeably longer than the ordinary case (it is checking the whole object store, not just the affected paths), and it prints progress as it
-  goes. If nothing turns out to be missing, the taint clears — exit 0, same as any other clean
+  take noticeably longer than the ordinary case (it is checking the whole object store, not just
+  the affected paths), and it prints progress as it goes. If nothing turns out to be missing, the taint clears — exit 0, same as any other clean
   heal. If something is genuinely gone and still needed, the taint stays standing on exactly
   that (no longer incomplete) remainder; running `heal` again resolves it exactly like the
   "something is genuinely gone" case above, including trying a configured remote.
