@@ -441,7 +441,8 @@ serverless head serve this endpoint with these checks and answers, and the serve
 more: a `503` when its storage stayed busy through every attempt it could afford, or an attempt
 may have landed and could not be confirmed. Either claims nothing about the pallet, and sending
 the same request again is safe: a delete that landed meanwhile answers `200` while its tombstone
-still holds `old_head`, and any other answer is the one that request would get anyway.
+still holds `old_head`. A `409` to the resend does not show that the first delete failed: the
+pallet may have been created again, or deleted at another head, after it landed.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 

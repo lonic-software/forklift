@@ -1162,13 +1162,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // A read that fails too leaves the fate where the attempts left it.
                     return match self.refs.get_head(PalletNamespace::User, &bare) {
                         Ok(RefHead::Deleted(tombstone)) if tombstone == old_head => Ok(()),
-                        Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(uncertain.get())),
+                        Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(uncertain.get(), None)),
                         Ok(current) => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
-                        Err(error) => {
-                            let mut answer = self.delete_contention(uncertain.get());
-                            answer.message.push_str(&format!(" Reading the pallet back failed too: {}", error));
-                            Err(answer)
-                        }
+                        Err(error) => Err(self.delete_contention(uncertain.get(), Some(&error))),
                     };
                 }
             }
@@ -1434,9 +1430,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// The `503` for a delete whose fate this request could not settle: with `uncertain` false
     /// every attempt was refused for a reason showing no input moved, so nothing did whatever the
     /// ref read back says or whether it could be read; with it true an attempt may have landed,
-    /// and neither the attempts nor the ref read back confirmed it. Running the
-    /// same delete again is safe whatever happened: one that landed meanwhile answers `200`.
-    fn delete_contention(&self, uncertain: bool) -> HeadError {
+    /// and neither the attempts nor the ref read back confirmed it. `read_fault` is why the ref
+    /// could not be read back, when it could not. Running the same delete again is safe whatever
+    /// happened: one that landed answers `200` while its tombstone still holds the head it removed.
+    fn delete_contention(&self, uncertain: bool, read_fault: Option<&str>) -> HeadError {
         let what = match uncertain {
             true => format!("The delete could not be confirmed: {}", UNCONFIRMED),
             false => "The delete could not complete: the warehouse's storage stayed busy through \
@@ -1445,9 +1442,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 .to_string(),
         };
 
+        let read = match read_fault {
+            Some(fault) => format!(" Reading the pallet back failed too ({}).", fault.trim_end_matches('.')),
+            None => String::new(),
+        };
+
         HeadError::service_unavailable(format!(
-            "{} Run the delete again; if it already landed, the remote answers that it is done.",
-            what
+            "{}{} Run the delete again: one that already landed answers that it is done, unless the \
+            pallet was created again or deleted at another head since.",
+            what, read
         ))
     }
 
