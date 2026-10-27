@@ -390,7 +390,7 @@ async fn delete_remote_pallet(name: &str) -> Result<(), String> {
     // Read before the delete, so a local read error cannot turn a delete that landed into a failure.
     let local_head = pallet_utils::get_pallet_head(name)?;
 
-    client.delete_ref(name, head).await.map_err(|why| moved_since_read(why, name, "delete"))?;
+    client.delete_ref(name, head).await.map_err(|why| moved_since_read(why, name, RemoteAction::Delete))?;
 
     output::emit(&RemoteDeleted {
         remote: client.url().to_string(),
@@ -440,35 +440,56 @@ impl CommandOutput for RemoteDeleted {
     }
 }
 
-/// A remote's [`error::RefusalCode::RemoteAhead`] answer to a `verb` (delete or restore) of user
-/// pallet `name`, which saw the pallet as the handshake left it: lowering does not help it, while
-/// running it again reads the remote anew. It keeps its code, and a restore's
-/// [`error::RefusalCode::PalletDeletedOnRemote`] is answered the same way. Any other error is
-/// passed on as it is.
-fn moved_since_read(why: String, name: &str, verb: &str) -> String {
+/// A delete or restore of a pallet on the remote.
+#[derive(Clone, Copy)]
+enum RemoteAction {
+    Delete,
+    Restore,
+}
+
+impl RemoteAction {
+    fn flag(self) -> &'static str {
+        match self {
+            RemoteAction::Delete => "delete",
+            RemoteAction::Restore => "restore",
+        }
+    }
+}
+
+/// A remote's refusal of an `action` on user pallet `name` because the pallet changed after the
+/// handshake this command read: lowering does not help, while running it again reads the remote
+/// anew. A [`error::RefusalCode::RemoteAhead`] (the pallet moved) and a restore's
+/// [`error::RefusalCode::PalletDeletedOnRemote`] (it was deleted again, at another head) name the
+/// rerun; a delete's names the listing, since another delete got there first. Each keeps its code
+/// (the server's text for a deleted pallet is worded for a lift, so it is not carried over), and
+/// any other error is passed on as it is.
+fn moved_since_read(why: String, name: &str, action: RemoteAction) -> String {
     let Some((code, human, _)) = error::deframe(&why) else {
         return why;
     };
 
-    // A restore finding another tombstone (the pallet deleted again at another head) is the same
-    // race; the server words that refusal for a lift, so its text is not carried over.
-    let (refusal, seen) = match error::RefusalCode::from_code(code) {
-        Some(refusal @ error::RefusalCode::RemoteAhead) =>
-            (refusal, format!(" ({})", human.strip_suffix(" Lower and retry.").unwrap_or(human))),
-        Some(refusal @ error::RefusalCode::PalletDeletedOnRemote) if verb == "restore" =>
-            (refusal, " (it was deleted again)".to_string()),
+    let rerun = format!("forklift palletize --{} {} --remote", action.flag(), name);
+    let (refusal, message, next_step) = match (error::RefusalCode::from_code(code), action) {
+        (Some(refusal @ error::RefusalCode::RemoteAhead), _) => (refusal, format!(
+            "The remote's pallet \"{}\" changed after this command read it ({}); nothing was changed. \
+            Running the {} again acts on what the remote holds now.",
+            name, human.strip_suffix(" Lower and retry.").unwrap_or(human), action.flag()
+        ), rerun),
+        (Some(refusal @ error::RefusalCode::PalletDeletedOnRemote), RemoteAction::Restore) => (refusal, format!(
+            "The remote's pallet \"{}\" was deleted again after this command read it; nothing was \
+            changed. Running the restore again brings it back at its new tombstone's head.",
+            name
+        ), rerun),
+        (Some(refusal @ error::RefusalCode::PalletDeletedOnRemote), RemoteAction::Delete) => (refusal, format!(
+            "The remote's pallet \"{}\" was deleted by someone else after this command read it, at \
+            a head this command did not see; nothing more was changed, and the pallet stays deleted \
+            there.",
+            name
+        ), "forklift palletize --remote".to_string()),
         _ => return why,
     };
 
-    error::CoreError::refusal(
-        refusal,
-        format!(
-            "The remote's pallet \"{}\" changed after this command read it{}; nothing was changed. \
-            Running the {} again acts on what the remote holds now.",
-            name, seen, verb
-        ),
-        format!("forklift palletize --{} {} --remote", verb, name),
-    ).into()
+    error::CoreError::refusal(refusal, message, next_step).into()
 }
 
 /// Bring user pallet `name`, deleted on the configured remote, back there at the head its tombstone
@@ -485,7 +506,7 @@ async fn restore_remote_pallet(name: &str) -> Result<(), String> {
         });
     };
 
-    client.update_ref(name, None, head, Some(head)).await.map_err(|why| moved_since_read(why, name, "restore"))?;
+    client.update_ref(name, None, head, Some(head)).await.map_err(|why| moved_since_read(why, name, RemoteAction::Restore))?;
 
     output::emit(&Restored { pallet: name.to_string(), head: head.clone(), remote: Some(client.url().to_string()) });
 
@@ -926,7 +947,7 @@ mod tests {
     #[test]
     fn a_remote_that_moved_since_the_read_names_running_the_command_again() {
         let moved: String = pallet_utils::pallet_moved_refusal(Some(&"b".repeat(64)), Some(&"a".repeat(64))).into();
-        let error: crate::output::ForkliftError = moved_since_read(moved, "feat", "delete").into();
+        let error: crate::output::ForkliftError = moved_since_read(moved, "feat", RemoteAction::Delete).into();
 
         assert_eq!(error.code.as_str(), "remote_ahead");
         assert_eq!(error.next_step.as_deref(), Some("forklift palletize --delete feat --remote"));
@@ -935,12 +956,15 @@ mod tests {
         let deleted: String = error::CoreError::refusal(
             error::RefusalCode::PalletDeletedOnRemote, "words for a lift", "forklift palletize --restore feat --remote"
         ).into();
-        let error: crate::output::ForkliftError = moved_since_read(deleted.clone(), "feat", "restore").into();
+        let error: crate::output::ForkliftError = moved_since_read(deleted.clone(), "feat", RemoteAction::Restore).into();
         assert_eq!(error.code.as_str(), "pallet_deleted_on_remote", "a restore keeps the code");
+        assert_eq!(error.next_step.as_deref(), Some("forklift palletize --restore feat --remote"));
         assert!(!error.message.contains("words for a lift"), "{}", error.message);
-        assert_eq!(moved_since_read(deleted.clone(), "feat", "delete"), deleted, "a delete passes it on");
+        let error: crate::output::ForkliftError = moved_since_read(deleted.clone(), "feat", RemoteAction::Delete).into();
+        assert_eq!(error.code.as_str(), "pallet_deleted_on_remote");
+        assert_eq!(error.next_step.as_deref(), Some("forklift palletize --remote"), "a delete is not told to restore");
 
-        let other = moved_since_read("the transport failed".to_string(), "feat", "restore");
+        let other = moved_since_read("the transport failed".to_string(), "feat", RemoteAction::Restore);
         assert_eq!(other, "the transport failed", "anything else is passed on as it is");
     }
 
