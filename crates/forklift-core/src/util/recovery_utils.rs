@@ -2881,10 +2881,10 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix what is named above (a bay's state, the office record, or a pack index: restore its \
-        pack files from a good copy, move an index that does not parse out of the pack folder only \
-        if it holds nothing this warehouse needs, or \
-        re-create the warehouse for one of another format version), then run \
+        "Fix what is named above (a bay's state, the office record, the fetch scope, the \
+        sealed-object record, or a pack index: restore its pack files from a good copy, move an \
+        index that does not parse out of the pack folder only if it holds nothing this warehouse \
+        needs, or re-create the warehouse for one of another format version), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )

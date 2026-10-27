@@ -1785,7 +1785,9 @@ the remote holds it again, a deleted pallet's once
 the delete leaves the undo journal. So you can park edits
 under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
 `expand` has brought the path back. If any of that state cannot be read, the prune refuses
-before changing anything. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
+before changing anything. Nothing beneath an object the warehouse holds by hash alone (see
+`audit`) is read or freed, and a sealed-object record that cannot be read refuses the prune the
+same way. A full (non-sparse) warehouse has nothing to prune. Use `--dry-run`
 before you leap. (Objects already inside a pack are reported but not reclaimed yet — a scope-aware
 repack is future work.) A prune, dry run included, is **refused while a mutating command runs in
 another bay**, since that writer could reuse an object the prune is about to free; run it again
@@ -2133,7 +2135,9 @@ refusal before ever reaching its own fetch):
   parked change, staged file, and trust pin to see what is still needed, then records
   exactly what came out dangling. In a clone made with `--only`, pallet content outside the
   clone's paths was never fetched, so its absence is not reported; if the file recording those
-  paths cannot be read, the incomplete record is left standing and `heal` says so. This can take
+  paths cannot be read, the incomplete record is left standing and `heal` says so. Likewise an
+  object the warehouse holds by hash alone (see `audit`) is not reported when absent, and a
+  sealed-object record that cannot be read leaves the incomplete record standing. This can take
   noticeably longer than the ordinary case (it is
   checking the whole object store, not just the affected paths), and it prints progress as it
   goes. If nothing turns out to be missing, the taint clears — exit 0, same as any other clean
