@@ -1930,17 +1930,18 @@ mod tests {
     }
 
     // Revert: judge the served refusal before the bay is found to match the entry → the served
-    // refusal hides the moved pallet.
+    // refusal hides the switched pallet and points at an operation that is no longer the last.
     #[test]
-    fn a_bay_moved_on_in_a_served_root_is_refused_for_that() {
-        let _scratch = Scratch::new("gate-served-moved");
+    fn a_bay_switched_since_in_a_served_root_is_refused_for_that() {
+        let _scratch = Scratch::new("gate-served-switched");
         let (entry, _pre, post) = stacked_on_a_child();
-        advance("main", Some(&post), &pallet_utils::tests::child_of(&post, "later")).unwrap();
+        advance("other", None, &post).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("other", Some(post))).unwrap();
         assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
 
         let refused = check_undoable(&entry).unwrap_err();
 
-        assert_eq!(refused, current_pallet_moved("main", "stack"));
+        assert!(refused.contains("\"other\" is current now") && !refused.contains("has been served"), "{}", refused);
     }
 
     // Revert: count every changed user wire whatever its ref holds now → the refusal names
