@@ -9664,10 +9664,11 @@ mod tests {
     /// A handshake whose pallet head is not the canonical spelling of a hash is refused before
     /// any caller can write it into a local ref. Uppercase is the case that matters: on a
     /// case-insensitive filesystem it finds a held object's file, skips the fetch that would
-    /// verify it, and the ref it leaves behind is refused on every later read.
+    /// verify it, and the ref it leaves behind is refused on every later read. A tombstone's head
+    /// is held to the same spelling. Revert: check the live heads alone → the tombstone passes.
     #[test]
     fn fetch_info_refuses_a_handshake_with_a_non_canonical_pallet_head() {
-        let serve = |head: String| {
+        let serve = |head: String, tombstone: String| {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let body = serde_json::json!({
@@ -9675,6 +9676,7 @@ mod tests {
                 "default_pallet": "main",
                 "pallets": { "main": head },
                 "trust": null,
+                "tombstones": { "gone": tombstone },
             }).to_string();
 
             std::thread::spawn(move || {
@@ -9698,11 +9700,14 @@ mod tests {
         };
 
         let hash = "ab".repeat(32);
-        assert!(serve(hash.clone()).is_ok(), "a canonical head must pass");
+        assert!(serve(hash.clone(), hash.clone()).is_ok(), "a canonical head must pass");
 
-        let error = serve(hash.to_uppercase()).err().expect("an uppercase head must be refused");
+        let error = serve(hash.to_uppercase(), hash.clone()).err().expect("an uppercase head must be refused");
         assert!(error.contains("not an object hash"), "{}", error);
         assert!(!error.contains(&hash.to_uppercase()), "the remote's value is not repeated: {}", error);
+
+        let error = serve(hash.clone(), hash.to_uppercase()).err().expect("an uppercase tombstone must be refused");
+        assert!(error.contains("not an object hash"), "{}", error);
     }
 
     impl BatchOutcome {
