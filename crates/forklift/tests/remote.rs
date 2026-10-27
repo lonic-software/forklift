@@ -6044,8 +6044,8 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
 }
 
-/// Point the served root's `main` at `head`, as an `undo` on the server, or a pallet deleted there
-/// and re-created under its name, would.
+/// Point the served root's `main` at `head`, as a pallet deleted there and re-created under its
+/// name would, or an `undo` on a server whose served mark was lost.
 fn move_served_main(area: &TestArea, head: &str) {
     std::fs::write(area.path("server-root/.forklift/pallets/main"), format!("{}\n", head)).unwrap();
 }

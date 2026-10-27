@@ -844,12 +844,7 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
     }
 
     // In `put_back_refs`' order, so the refusal names the current pallet when it is one.
-    let current = &entry.after.current_pallet;
-    let order = entry.before.heads.keys()
-        .filter(|wire| *wire == current)
-        .chain(entry.before.heads.keys().filter(|wire| *wire != current));
-
-    for wire in order {
+    for wire in put_back_order(entry) {
         let (Some(pre_head), Some(Some(post_head))) = (entry.before.head(wire), entry.after.heads.get(wire)) else {
             continue;
         };
@@ -866,8 +861,8 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
             "Undoing \"{}\" would move pallet \"{}\" back off the head that operation left, and \
             this warehouse has been served, so its clones may rely on that head. Nothing was undone, \
             and undo cannot reach an older operation past this one. To take the change out, stack a \
-            parcel that reverts it; a pallet deleted before it comes back with \
-            \"forklift palletize --restore <name>\".",
+            parcel that reverts it; a pallet deleted since this warehouse was served comes back \
+            with \"forklift palletize --restore <name>\".",
             entry.op, crate::error::sanitize(&reference.name)
         ));
     }
@@ -999,11 +994,8 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
 /// Put back the refs `entry`'s operation wrote, the current pallet's first: see [`restore_refs`].
 fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
     let current = &entry.after.current_pallet;
-    let order = entry.before.heads.keys()
-        .filter(|wire| *wire == current)
-        .chain(entry.before.heads.keys().filter(|wire| *wire != current));
 
-    for wire in order {
+    for wire in put_back_order(entry) {
         let (Some(pre_head), Some(post_after)) = (entry.before.head(wire), entry.after.heads.get(wire)) else {
             continue;
         };
@@ -1039,6 +1031,15 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// The wires of `entry`'s refs in the order an undo puts them back: the current pallet first.
+fn put_back_order(entry: &JournalEntry) -> impl Iterator<Item = &String> {
+    let current = &entry.after.current_pallet;
+
+    entry.before.heads.keys()
+        .filter(move |wire| *wire == current)
+        .chain(entry.before.heads.keys().filter(move |wire| *wire != current))
 }
 
 /// After a ref write failed partway through [`restore_refs`], move the current pallet's ref back
