@@ -1613,15 +1613,18 @@ fn a_batch_past_its_byte_budget_answers_a_marked_prefix() {
     assert_eq!(bundled(&area, "whole", answer, &hashes), hashes);
 }
 
-/// A batch always carries an object: one larger than the whole budget is sent alone, and objects
-/// the store lacks neither count toward the budget nor mark the answer.
-/// Revert: let `batch_answer_full` stop an empty answer → the first answer carries nothing.
+/// The byte budget never stops an answer that carries nothing: an object larger than the whole
+/// budget is sent alone, and objects the store lacks count toward nothing. An answer short only
+/// of what the store lacks is not marked; one that stopped before looking for every requested
+/// object is, even when the store lacks the ones it skipped.
+/// Revert: let the byte rule in `batch_answer_full` stop an empty answer → the first answer
+/// carries nothing.
 #[test]
 fn a_batch_always_carries_one_object_and_absent_ones_do_not_mark_it() {
     let area = Area::new("batch-one");
     let objects = sized_objects(3, 64 * 1024, "one");
-    let absent = synthetic_objects(2, "never-stored");
-    let mut hashes: Vec<String> = absent.iter().map(|(hash, _)| hash.clone()).collect();
+    let absent: Vec<String> = synthetic_objects(2, "never-stored").into_iter().map(|(hash, _)| hash).collect();
+    let mut hashes = absent.clone();
     hashes.extend(objects.iter().map(|(hash, _)| hash.clone()));
 
     let head = seeded_head(MemoryObjectStore::new(), &objects).with_batch_limits(1, std::time::Duration::ZERO);
@@ -1633,11 +1636,39 @@ fn a_batch_always_carries_one_object_and_absent_ones_do_not_mark_it() {
     let answer = head.batch(&hashes[..2]).expect("batch");
     assert!(!answer.truncated, "an answer short only of what the store lacks is not marked");
 
-    // A deadline already past still lets one object through.
+    // Cut before objects the store lacks: the head did not look for them, so it cannot say the
+    // answer is short only of those, and marks it.
+    let cut = [hashes[2].clone(), absent[0].clone(), absent[1].clone()];
+    let answer = head.batch(&cut).expect("batch");
+    assert!(answer.truncated, "an answer that skipped looking for an object is marked");
+    assert_eq!(bundled(&area, "skipped", answer, &cut), cut[..1]);
+
+    // A deadline already past still looks for the first object, and carries it when it is held.
     let head = seeded_head(MemoryObjectStore::new(), &objects).with_deadline(std::time::SystemTime::now());
-    let answer = head.batch(&hashes).expect("batch");
+    let answer = head.batch(&hashes[2..]).expect("batch");
     assert!(answer.truncated);
-    assert_eq!(bundled(&area, "late", answer, &hashes), hashes[2..3]);
+    assert_eq!(bundled(&area, "late", answer, &hashes[2..]), hashes[2..3]);
+}
+
+/// The deadline counts lookups of objects the store lacks: a batch of them over a slow store
+/// stops when the deadline nears, marked, rather than running past it while it carries nothing.
+/// Revert: let the deadline rule in `batch_answer_full` wait for a carried object → all twelve
+/// lookups run, past the deadline, and the answer is unmarked.
+#[test]
+fn a_batch_of_absent_objects_over_a_slow_store_answers_before_the_invocation_deadline() {
+    let hashes: Vec<String> = synthetic_objects(12, "slow-absent").into_iter().map(|(hash, _)| hash).collect();
+
+    let window = std::time::Duration::from_secs(3);
+    let started = std::time::SystemTime::now();
+    let head = seeded_head(MemoryObjectStore::new().with_read_delay(std::time::Duration::from_millis(300)), &[])
+        .with_batch_limits(u64::MAX, std::time::Duration::from_secs(2))
+        .with_deadline(started + window);
+
+    let answer = head.batch(&hashes).expect("batch");
+    let elapsed = started.elapsed().expect("a forward clock");
+
+    assert!(answer.truncated, "an answer cut at the deadline is marked, carried objects or not");
+    assert!(elapsed < window, "it answered before the deadline: {:?}", elapsed);
 }
 
 /// A batch over a slow store stops mirroring when the invocation deadline nears, and answers

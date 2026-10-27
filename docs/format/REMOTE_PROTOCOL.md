@@ -206,19 +206,21 @@ The bytes live under an **ephemeral, content-addressed response prefix**, never 
 namespace, so nothing there is reachable as an object at a hash key and invariant 1 is not in
 play — and the client hash-verifies every record on import regardless.
 
-A head may also **cut its answer short**: send fewer of the requested objects than it holds, to
-bound its memory or to answer inside its own time limit. It marks such an answer with the header
-`Forklift-Batch: truncated`, on the answer to the `POST` itself — the `200` carrying the bundle,
-or the `303` to it, so a client reads the mark before following the redirect. A cut answer is
-still a valid bundle and is imported; it always carries at least one requested object, so asking
-again makes progress. A client that sees the mark fetches the rest with loose `GET`s and does not
-ask this endpoint again for the rest of the command, since the next chunk would be cut short as
-well. An answer that is short only because the remote lacks objects carries no mark, and the
+A head may also **cut its answer short**: stop before it has looked for every requested object,
+to bound its memory or to answer inside its own time limit. It marks such an answer with the
+header `Forklift-Batch: truncated`, on the answer to the `POST` itself — the `200` carrying the
+bundle, or the `303` to it, so a client reads the mark before following the redirect. The mark
+says only that the head stopped looking; the objects it skipped may or may not be ones it holds.
+A cut answer is still a valid bundle, possibly an empty one, and is imported. A client that sees
+the mark fetches the rest with loose `GET`s and does not ask this endpoint again for the rest of
+the command, since the next chunk would be cut short as well. An answer that looked for every
+requested object carries no mark, even when it is short because the remote lacks some, and the
 client keeps using the endpoint. A value other than `truncated` is no mark.
 
-The serverless head stops adding objects once its bundle holds 32 MiB of object data, or when
-its invocation is within 10 s of its deadline, so one answer carries at most 32 MiB plus one
-object. The self-hosted server answers every batch whole; the client's 512-hash chunks bound it.
+The serverless head stops once its bundle holds 32 MiB of object data, or when its invocation is
+within 10 s of its deadline, so one answer carries at most 32 MiB plus one object. The byte
+budget never stops an answer that carries nothing, so an object larger than the budget is sent on
+its own; the deadline stops one that has spent its time looking for objects it lacks. The self-hosted server answers every batch whole; the client's 512-hash chunks bound it.
 
 ### `GET /v1/parcels/{parcel}/subtree/{path}` (additive; the path-addressed fetch)
 

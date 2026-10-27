@@ -3501,7 +3501,7 @@ impl RemoteClient {
 
     /// Fetch many objects in one round trip as a bundle-format stream
     /// (`POST /v1/objects/batch`) and import them as the stream arrives (see
-    /// [`Self::import_response`]). Either outcome other than [`BatchOutcome::Imported`] closes this
+    /// [`Self::import_response`]). Every outcome other than [`BatchOutcome::Imported`] closes this
     /// remote's batch lane (see `batch_lane_closed`), and the caller falls back to loose fetches
     /// for what is still missing:
     /// * [`BatchOutcome::EndpointAbsent`] — the remote predates the endpoint (a `404`).

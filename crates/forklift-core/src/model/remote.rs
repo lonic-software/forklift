@@ -45,11 +45,12 @@ pub const LIFT_COMMIT_NOT_READY: &str = "not-ready";
 
 /// The response header a head sets, with the value [`BATCH_TRUNCATED`], on its answer to
 /// `POST /v1/objects/batch` (the `200` with the bundle, or the `303` to it) when it stopped before
-/// every requested object it holds was in the bundle — to bound its memory or its time. The
-/// objects it did send are a valid answer and are imported; the header tells the client not to
-/// ask for more batches from this remote in this command, since the next one would be cut short
-/// too, and to fetch the rest one object at a time. An answer that is short only because the
-/// remote lacks objects carries no header. Header names are case-insensitive; this is the
+/// looking for every requested object — to bound its memory or its time. The objects it skipped
+/// may or may not be ones it holds. The objects it did send are a valid answer and are imported;
+/// the header tells the client not to ask for more batches from this remote in this command, since
+/// the next one would be cut short too, and to fetch the rest one object at a time. An answer that
+/// looked for every requested object carries no header, even when it is short of ones the remote
+/// lacks. Header names are case-insensitive; this is the
 /// lower-case form.
 pub const BATCH_HEADER: &str = "forklift-batch";
 
