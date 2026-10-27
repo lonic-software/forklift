@@ -260,7 +260,7 @@ operation at all (every "prune" in `remote_utils.rs` is walk-pruning, not a netw
 
 Rather than fight that growth, `verify.sh` tripwires it so a failure caused by it is
 self-identifying instead of looking like a real verifier/KMS regression (its own header calls
-that confusion "the worst possible false signal"). Before any of the four checklist steps run —
+that confusion "the worst possible false signal"). Before any of the checklist steps run —
 so it always fires even when a later step would otherwise fail first — the script sums
 `Contents[].Size` over the whole bucket (not just `staging/`; the growth is in `objects/`) and
 compares it against two thresholds:
@@ -272,6 +272,11 @@ compares it against two thresholds:
 Both are round numbers sized for a comfortable multi-month runway on a daily cron (roughly 3-4
 months to the soft threshold, roughly 15 months to the hard one at ~9 MiB/run) — a tripwire, not
 a derived capacity plan.
+
+Each run also leaves one tombstone in the handshake: step 5 lifts a pallet named
+`verify-slash/<timestamp>-<pid>`, so a name with `/` crosses the real gateway, and deletes it again.
+Nothing prunes a tombstone today, so the handshake's `tombstones` map grows by one entry a run, a
+few dozen bytes each.
 
 **When the hard threshold fires:** the `examples/staging/` warehouse is fixture-only and
 disposable (see that directory's own `main.tf` header) — it exists solely to give the scheduled

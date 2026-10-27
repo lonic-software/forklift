@@ -100,7 +100,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # verify.sh drives the real `forklift` CLI (prepare/load/stack/lift/franchise/history)
+      # verify.sh drives the real `forklift` CLI (prepare/load/stack/lift/franchise/history/palletize/shift)
       # against the deployed stack's endpoint — the Lambda binaries themselves are already
       # running there and are not built by this workflow.
       - name: Build the forklift CLI
