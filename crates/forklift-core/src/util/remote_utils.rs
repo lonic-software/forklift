@@ -160,6 +160,12 @@ fn encode_path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT).to_string()
 }
 
+/// The path of a per-pallet route, `/v1/pallets/{pallet}` followed by `tail`: every route that
+/// takes a pallet builds its path here, so none can put the name in raw.
+fn pallet_route(pallet: &str, tail: &str) -> String {
+    format!("/v1/pallets/{}{}", encode_path_segment(pallet), tail)
+}
+
 /// How many objects one batch-fetch request asks for: bounds the response the server
 /// builds in memory while still amortizing the round trip over many objects.
 const BATCH_FETCH_CHUNK: usize = 512;
@@ -3266,7 +3272,7 @@ impl RemoteClient {
             let posture = Posture::HeadDeadline { head: self.retryable_head_budget() };
             let outcome = self.send_waiting_out_throttle(
                 posture,
-                reqwest::Method::POST, &format!("/v1/pallets/{}/holds", encode_path_segment(pallet)),
+                reqwest::Method::POST, &pallet_route(pallet, "/holds"),
                 SendBody::json(&HoldsRequest { candidates: batch.to_vec() })?,
                 "the holds check",
             ).await?;
@@ -4237,7 +4243,7 @@ impl RemoteClient {
 
         let outcome = self.send_on(
             Posture::UnboundedNoRedirect(UnboundedTicket::Fork94),
-            reqwest::Method::POST, &format!("/v1/pallets/{}", encode_path_segment(pallet)),
+            reqwest::Method::POST, &pallet_route(pallet, ""),
             SendBody::json(&body)?,
         ).await;
         let response = self.response_from_send_mutation(&action, outcome)?;
@@ -8107,6 +8113,7 @@ mod tests {
         assert_eq!(encode_path_segment("feature/x"), "feature%2Fx");
         assert_eq!(encode_path_segment("@haul"), "%40haul");
         assert_eq!(encode_path_segment("main"), "main");
+        assert_eq!(pallet_route("feature/x", "/holds"), "/v1/pallets/feature%2Fx/holds");
     }
 
     #[test]
