@@ -6044,8 +6044,8 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
 }
 
-/// Point the served root's `main` at `head`, as an `undo` on the server, or a pallet deleted there
-/// and re-created under its name, would.
+/// Point the served root's `main` at `head`, as an edit on the server's disk would, or a pallet
+/// re-created there after its tombstone was dropped.
 fn move_served_main(area: &TestArea, head: &str) {
     std::fs::write(area.path("server-root/.forklift/pallets/main"), format!("{}\n", head)).unwrap();
 }
@@ -6080,9 +6080,9 @@ fn scope_prune_frees_nothing_on_a_forged_held_head() {
 #[test]
 fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     // A remote ref is not forward-only. The remote served `ahead` and this warehouse recorded it;
-    // then the served `main` moves back to `base` (an undo), and later to a head of another
-    // lineage (a pallet re-created under the name). Neither reaches `ahead`, so the remote
-    // answers `not_held` and the history only `ahead` reaches is kept both times.
+    // then the served `main` moves back to `base`, and later to a head of another lineage (a
+    // pallet re-created under the name after its tombstone was dropped). Neither reaches `ahead`,
+    // so the remote answers `not_held` and the history only `ahead` reaches is kept both times.
     let area = TestArea::new("scope-prune-remote-moved-back");
     let _server = sparse_with_docs(&area);
     let base = pallet_head(&area, "sparse", "main");
@@ -6106,7 +6106,7 @@ fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     let v2_blob = path_object_hash(&area, "sparse", &ahead, "docs/guide.md");
     assert_success(&area.forklift("sparse", &["narrow", "docs"]));
 
-    for (moved_to, why) in [(&base, "an undo"), (&side, "a re-created pallet")] {
+    for (moved_to, why) in [(&base, "a head moved back"), (&side, "a re-created pallet")] {
         move_served_main(&area, moved_to);
         let pruned = area.forklift("sparse", &["--json", "scope-prune", "--dry-run", "docs"]);
         assert_success(&pruned);

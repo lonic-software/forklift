@@ -684,6 +684,17 @@ pub enum RefUpdateError {
         acknowledged: bool,
     },
 
+    /// A move of a user pallet in this served warehouse to a parcel that does not descend from
+    /// the head it leaves, which the warehouse's clones may rely on (see
+    /// [`update_pallet_head_in`]); nothing was written.
+    Backward {
+        /// The pallet whose ref was to move.
+        pallet: String,
+
+        /// The head it holds, which the move would leave.
+        head: String,
+    },
+
     /// Anything else: an invalid name or value, or the ref could not be read or written.
     Failed(String),
 }
@@ -746,6 +757,13 @@ impl std::fmt::Display for RefUpdateError {
                     pallet, pallet
                 )
             }
+            RefUpdateError::Backward { pallet, head } => write!(
+                f,
+                "Refusing to move pallet \"{}\" off {}: the new head does not descend from it, and \
+                this warehouse has been served, so its clones may rely on that head. Nothing was \
+                written. To take a change out, stack a parcel that reverts it.",
+                pallet, head
+            ),
             RefUpdateError::Failed(message) => f.write_str(message),
         }
     }
@@ -968,6 +986,10 @@ pub fn update_meta_pallet_head(name: &str,
 /// that acknowledges that tombstone and whose new head descends from (or is) the tombstone's head
 /// may take the name, through [`recreate_pallet_head`] or a remote's acknowledged update, and it
 /// clears the tombstone in the same hold, since the new ref then reaches everything it held.
+/// Moving a user pallet there to a parcel that does not descend from its head is refused with
+/// [`RefUpdateError::Backward`]: a clone may have freed its own copy of that head's history
+/// because the remote holds it, and nothing else would root it once the ref leaves. The wire is
+/// fast-forward-only already; this holds the local writers (an `undo`) to the same rule.
 ///
 /// # Arguments
 /// * `namespace`     - The pallet namespace.
@@ -985,6 +1007,8 @@ pub fn update_meta_pallet_head(name: &str,
 ///                                      completely present; nothing was written.
 /// * `Err(RefUpdateError::Deleted)`   - The pallet was deleted in this served warehouse; nothing
 ///                                      was written.
+/// * `Err(RefUpdateError::Backward)`  - A user pallet in this served warehouse would move to a
+///                                      parcel not descending from its head; nothing was written.
 /// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
 ///                                      ref could not be locked, read or written (the write may
 ///                                      still have landed: read the ref back to tell).
@@ -1052,7 +1076,8 @@ impl VerifiedClosure {
 ///
 /// A creation's tombstone check works the same way: whether `new` descends from the tombstone's
 /// head is walked before the lock, and the hold re-reads the tombstone, starting over when it
-/// changed meanwhile.
+/// changed meanwhile. So does a served warehouse's refusal of a move off a head `new` does not
+/// descend from: the hold re-reads the served mark.
 fn update_pallet_head_checked(
     namespace: PalletNamespace,
     name: &str,
@@ -1085,6 +1110,7 @@ fn update_pallet_head_checked(
     let left = left_unreached(namespace, expected, new)?;
 
     let mut tombstone = recreated_tombstone(namespace, name, expected, new, acknowledged)?;
+    let mut backward = served_backward(namespace, expected, new)?;
 
     loop {
         #[cfg(test)]
@@ -1110,6 +1136,21 @@ fn update_pallet_head_checked(
             if !acknowledged || !descends {
                 return Err(RefUpdateError::Deleted { pallet: name.to_string(), head: head.clone(), acknowledged });
             }
+        }
+
+        // `mark_served` writes the mark under this lock, so a move judged here either lands
+        // before the warehouse is first served or is judged against the mark.
+        if served_move(namespace, expected, new)? != backward.is_some() {
+            drop(lock);
+            backward = served_backward(namespace, expected, new)?;
+            continue;
+        }
+
+        if backward == Some(true) {
+            return Err(RefUpdateError::Backward {
+                pallet: name.to_string(),
+                head: expected.unwrap_or_default().to_string(),
+            });
         }
 
         if let Some(scope) = &verified_at {
@@ -1169,6 +1210,27 @@ fn tombstone_of(namespace: PalletNamespace,
     }
 
     Ok(tombstone_utils::read_tombstones()?.remove(name))
+}
+
+/// Whether a write of `new` over `expected` moves a user pallet of a served warehouse, whose clones
+/// may rely on the head it leaves. The mark is read fail-closed. A meta pallet is not held to it:
+/// the office lift after a re-genesis, the one move off a head the protocol allows, arrives here
+/// on a served root.
+fn served_move(namespace: PalletNamespace, expected: Option<&str>, new: &str) -> Result<bool, String> {
+    Ok(namespace == PalletNamespace::User
+        && expected.is_some_and(|old| old != new)
+        && crate::util::tombstone_utils::is_served()?)
+}
+
+/// For a [`served_move`], whether `new` does not descend from the head the move leaves, which
+/// refuses it; `None` for any other write.
+fn served_backward(namespace: PalletNamespace,
+                   expected: Option<&str>,
+                   new: &str) -> Result<Option<bool>, String> {
+    match expected {
+        Some(old) if served_move(namespace, expected, new)? => Ok(Some(!crate::util::merge_utils::is_ancestor(old, new)?)),
+        _ => Ok(None),
+    }
 }
 
 /// Remove `name`'s tombstone from the list, under the held ref lock.
@@ -2641,7 +2703,7 @@ pub(crate) mod tests {
     }
 
     /// A parcel on `parent`, so a head on it descends from `parent`.
-    fn child_of(parent: &str, tag: &str) -> String {
+    pub(crate) fn child_of(parent: &str, tag: &str) -> String {
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;
         use crate::model::tree_item::TreeItem;
 
@@ -2801,6 +2863,80 @@ pub(crate) mod tests {
 
             let refused = tombstone_utils::restore_pallet("gone").unwrap_err();
             assert!(refused.contains("No deleted pallet \"gone\""), "{}", refused);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A served root's user pallets move only forward: a move off a head the new one does not
+    /// descend from is refused, since the root's clones may rely on that head.
+    mod served_moves {
+        use super::*;
+        use crate::util::tombstone_utils;
+
+        /// A root with "main" at `next`, a child of `base`; served when `served`.
+        fn at_next(name: &str, served: bool) -> (PathBuf, StorageRootScope, String, String) {
+            let (root, scope) = scratch(name);
+            let base = stub_parcel("base");
+            let next = child_of(&base, "next");
+            update_pallet_head("main", None, &base, &RefPreconditions::NONE).unwrap();
+            update_pallet_head("main", Some(&base), &next, &RefPreconditions::NONE).unwrap();
+
+            if served {
+                assert!(tombstone_utils::mark_served(false).unwrap());
+            }
+
+            (root, scope, base, next)
+        }
+
+        // Revert: drop the refusal → the move back lands.
+        #[test]
+        fn a_move_back_in_a_served_root_is_refused() {
+            let (root, _scope, base, next) = at_next("served-back", true);
+
+            let refused = update_pallet_head("main", Some(&next), &base, &RefPreconditions::NONE);
+
+            assert!(matches!(&refused, Err(RefUpdateError::Backward { pallet, head }) if pallet == "main" && *head == next), "{:?}", refused);
+            assert_eq!(get_pallet_head("main").unwrap(), Some(next), "nothing was written");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // Revert: refuse whatever the mark says → the unserved root's move back is refused.
+        #[test]
+        fn a_move_back_in_a_root_never_served_lands() {
+            let (root, _scope, base, next) = at_next("unserved-back", false);
+
+            update_pallet_head("main", Some(&next), &base, &RefPreconditions::NONE).unwrap();
+
+            assert_eq!(get_pallet_head("main").unwrap(), Some(base));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // Revert: refuse every served move → the move forward is refused.
+        #[test]
+        fn a_move_forward_in_a_served_root_lands() {
+            let (root, _scope, _base, next) = at_next("served-forward", true);
+            let after = child_of(&next, "after");
+
+            update_pallet_head("main", Some(&next), &after, &RefPreconditions::NONE).unwrap();
+
+            assert_eq!(get_pallet_head("main").unwrap(), Some(after));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // Revert: drop the in-hold re-read of the mark → the move judged unserved before the lock
+        // lands after the mark.
+        #[test]
+        fn a_mark_written_before_the_hold_refuses_the_move() {
+            let (root, _scope, base, next) = at_next("served-in-hold", false);
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                assert!(tombstone_utils::mark_served(false).unwrap());
+            })));
+
+            let refused = update_pallet_head("main", Some(&next), &base, &RefPreconditions::NONE);
+
+            assert!(matches!(&refused, Err(RefUpdateError::Backward { .. })), "{:?}", refused);
+            assert_eq!(get_pallet_head("main").unwrap(), Some(next), "nothing was written");
             let _ = std::fs::remove_dir_all(&root);
         }
     }

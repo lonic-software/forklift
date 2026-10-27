@@ -48,9 +48,8 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     judge_request(&paths)?;
 
     // The remote's heads are read next, outside the store hold, so a slow remote never keeps
-    // other bays' writers out. A remote ref can move after this read (an undo on the served root
-    // moves one back) and the plan cannot see it; the store hold does not reach the remote, so
-    // reading under it would leave the same window.
+    // other bays' writers out. A remote ref can move after this read, and the plan cannot see it;
+    // the store hold does not reach the remote, so reading under it would leave the same window.
     let remote_heads = remote_pallet_heads().await?;
 
     // Exclusive store access before the judgement the plan uses (FORK-150). The keep-set depends

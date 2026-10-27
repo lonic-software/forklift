@@ -1044,10 +1044,14 @@ pub enum Command {
                       switched (e.g. by palletize or deliver), its head has moved, or a \
                       consolidation or cherry-pick was started or finished since the journaled \
                       operation, it refuses \
-                      instead of reaching past that. An unreadable journal is reported by name, \
-                      never read as empty. A pallet delete is reversed by bringing the pallet \
-                      back at the head it was deleted at; if that name has been taken since, \
-                      \"--as <new-name>\" brings it back under another name."
+                      instead of reaching past that. In a warehouse that has been served, a \
+                      stack, consolidate or cherry-pick is not undone when it would move a user \
+                      pallet back off the head it left, since the warehouse's clones may rely on \
+                      that head: stack a parcel that reverts the change instead. An unreadable \
+                      journal is reported by name, never read as empty. A pallet delete is \
+                      reversed by bringing the pallet back at the head it was deleted at; if that \
+                      name has been taken since, \"--as <new-name>\" brings it back under another \
+                      name."
     )]
     Undo {
         /// When the last journaled operation is a pallet delete: bring the deleted pallet back
