@@ -1696,9 +1696,10 @@ correctly keeps it). It is **multi-bay-aware** — it refuses (`scope_prune_bloc
 free a path any checkout (the main tree or a bay) still materializes, so narrow that path away
 everywhere first. The pruned history is sealed by hash and re-fetchable from the origin with
 `expand`, so the prune frees only history the origin holds. It asks the remote for its pallet
-heads first, and refuses, changing nothing, if the remote cannot be reached or is not trusted.
-History those heads do not reach (stacks never lifted, or a remote that has moved on since your
-last `lower`) keeps whatever lifting it would read under the path. The report counts what was kept
+heads first, and which earlier heads recorded here it still holds (see below), and refuses,
+changing nothing, if the remote cannot be reached or is not trusted. History none of those heads
+reach (stacks never lifted, or lifted to a head the remote no longer confirms) keeps whatever
+lifting it would read under the path. The report counts what was kept
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
 then run the same `scope-prune` again, which frees the rest. Other work that exists only here is
 never freed either, whatever its path: content loaded but not yet stacked, parked parcels, an
