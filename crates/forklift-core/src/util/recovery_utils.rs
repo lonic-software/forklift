@@ -100,10 +100,10 @@
 //! stat it has no use for. `Some(collector)` for the targetless enumerator
 //! ([`enumerate_absent_reachable`]) — every absence found, at every level including terminal
 //! leaves and chunks, is recorded, except a tree, recipe, chunk or leaf the sealed-object record
-//! holds by hash alone (never a parcel, a staged object or a corrupt boundary). Both share [`walk_closure_for`]'s exact descent (one code path,
-//! two modes, so they can never drift apart); [`enumerate_absent_reachable`] additionally passes an
-//! **empty target set**, so every node's targets-check is vacuous and every node's descent-guard is
-//! actually reached.
+//! holds by hash alone (never a parcel, a staged object or a corrupt boundary). Both share
+//! [`walk_closure_for`]'s exact descent (one code path, two modes, so they can never drift apart);
+//! [`enumerate_absent_reachable`] additionally passes an **empty target set**, so every node's
+//! targets-check is vacuous and every node's descent-guard is actually reached.
 //!
 //! ## Partial clears
 //!
@@ -2889,11 +2889,12 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix what is named above (a bay's state, the office record, the fetch scope, or a pack \
-        index: restore its pack files from a good copy, move an index that does not parse out of \
-        the pack folder only if it holds nothing this warehouse needs, or re-create the warehouse \
-        for one of another format version; the sealed-object record: make it readable again, from a \
-        good copy or with the version of Forklift that wrote it), then run \
+        "Fix what is named above (a bay's state, the office record or the fetch scope: restore it \
+        from a good copy; a pack index: restore its pack files from a good copy, move an index \
+        that does not parse out of the pack folder only if it holds nothing this warehouse needs, \
+        or re-create the warehouse for one of another format version; the sealed-object record: \
+        make it readable again, from a good copy or with the version of Forklift that wrote it), \
+        then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )
