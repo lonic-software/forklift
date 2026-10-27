@@ -546,8 +546,8 @@ enum Route {
 
 /// Resolve the warehouse id and the endpoint of a request, stripping the `/warehouses/{id}`
 /// prefix in multi mode. A path that matches nothing is a `404`; an invalid warehouse id is a
-/// `422` (the same shape `forklift-server` gives), as is a captured segment that does not
-/// percent-decode to UTF-8 (see [`param`]).
+/// `422` (the same shape `forklift-server` gives). A captured segment that does not
+/// percent-decode to UTF-8 is also a `422`, where `forklift-server` answers `400` (see [`param`]).
 fn resolve_route<B>(
     routing: &Routing,
     request: &Request<B>,
@@ -625,15 +625,17 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> He
 fn param(segment: &str) -> HeadResult<String> {
     percent_decode_str(segment).decode_utf8().map(|value| value.into_owned()).map_err(|_| {
         HeadError::unprocessable(format!(
-            "The path segment {} is not UTF-8 once percent-decoded.", segment))
+            "The value {} is not UTF-8 once percent-decoded.", segment))
     })
 }
 
-/// A lift session id, as decoded from the path or the query: ASCII alphanumerics and `-` only,
-/// as the client's hyphenated UUIDs are. The id becomes the staging prefix `staging/{session}/`,
-/// so a `/` in one would put another session's keys under its sweep; anything else is a `422`.
+/// A lift session id, wherever the request names it (the commit path, the upload query, the
+/// `upload-targets` body): one or more ASCII alphanumerics and `-`, as the client's hyphenated
+/// UUIDs are. The id becomes the staging prefix `staging/{session}/`, so a `/` in one would place
+/// its staging keys under another session's sweep prefix; anything else is a `422`.
 fn session_id(session: &str) -> HeadResult<String> {
-    if session.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+    let valid = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-';
+    if !session.is_empty() && session.bytes().all(valid) {
         Ok(session.to_string())
     } else {
         Err(HeadError::unprocessable(format!(
@@ -711,7 +713,8 @@ where
         Route::UploadTargets => {
             let request: UploadTargetsRequest = parse_json(&body)?;
             reject_oversized_upload_targets(request.hashes.len())?;
-            let response = head.upload_targets(caller, &request.session, &request.hashes)?;
+            let session = session_id(&request.session)?;
+            let response = head.upload_targets(caller, &session, &request.hashes)?;
             Ok(json_response(StatusCode::OK, &response))
         }
 

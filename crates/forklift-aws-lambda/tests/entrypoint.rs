@@ -414,6 +414,12 @@ fn captured_segments_and_the_session_query_are_percent_decoded() {
         fixture.call(put_bytes(&format!("/v1/objects/{}?session=%FF", hash), b"ignored".to_vec()));
     assert_eq!(status(&response), 422, "a session decoding to no UTF-8 is refused on upload");
 
+    for session in ["lift-1/x", ""] {
+        let request = UploadTargetsRequest { session: session.to_string(), hashes: vec![hash.clone()] };
+        let response = fixture.call(post_json("/v1/objects/upload-targets", &request));
+        assert_eq!(status(&response), 422, "the upload-targets session {:?} is refused", session);
+    }
+
     let commit = CommitLiftRequest { control_plane: vec![hash.clone()], blobs: vec![], more: false };
     assert_eq!(status(&fixture.call(post_json("/v1/lift/lift-1%2Fx/commit", &commit))), 422);
     assert_eq!(status(&fixture.call(post_json("/v1/lift/%FF/commit", &commit))), 422);
