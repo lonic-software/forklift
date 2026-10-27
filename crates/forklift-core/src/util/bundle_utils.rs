@@ -476,9 +476,10 @@ fn remove_stale_staging(parent: &Path) {
 /// * `Err(String)` - If a present object could not be read, or one is above the ceiling.
 pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
     let mut bundle = BundleWriter::new()?;
+    let mut looked: HashSet<&str> = HashSet::new();
 
     for hash in hashes {
-        if bundle.holds(hash) || !file_utils::does_object_exist(hash)? {
+        if !looked.insert(hash.as_str()) || !file_utils::does_object_exist(hash)? {
             continue;
         }
 
@@ -511,11 +512,6 @@ impl BundleWriter {
             .map_err(|e| format!("Error while starting the bundle stream: {}", e))?;
 
         Ok(BundleWriter { encoder, written: HashSet::new(), object_bytes: 0 })
-    }
-
-    /// Whether `hash` is in the bundle already.
-    pub fn holds(&self, hash: &str) -> bool {
-        self.written.contains(hash)
     }
 
     /// Whether no object has been pushed yet.

@@ -1033,8 +1033,8 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         {
-          "const": "truncated",
-          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer or it ran short of time to answer.",
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
           "type": "string"
         }
       ]
@@ -1975,8 +1975,8 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         {
-          "const": "truncated",
-          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer or it ran short of time to answer.",
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
           "type": "string"
         }
       ]
@@ -2226,8 +2226,8 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         {
-          "const": "truncated",
-          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer or it ran short of time to answer.",
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
           "type": "string"
         }
       ]
@@ -4668,8 +4668,8 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         {
-          "const": "truncated",
-          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer or it ran short of time to answer.",
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
           "type": "string"
         }
       ]

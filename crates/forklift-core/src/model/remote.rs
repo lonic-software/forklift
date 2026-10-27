@@ -43,19 +43,25 @@ pub const LIFT_COMMIT_HEADER: &str = "forklift-commit";
 /// promises only that the copy exists, not that it will ever be promoted.
 pub const LIFT_COMMIT_NOT_READY: &str = "not-ready";
 
-/// The response header a head sets, with the value [`BATCH_TRUNCATED`], on its answer to
-/// `POST /v1/objects/batch` (the `200` with the bundle, or the `303` to it) when it stopped before
-/// looking for every requested object — to bound its memory or its time. The objects it skipped
-/// may or may not be ones it holds. The objects it did send are a valid answer and are imported;
-/// the header tells the client not to ask for more batches from this remote in this command, since
-/// the next one is likely to meet the same bound, and to fetch the rest one object at a time. An answer that
-/// looked for every requested object carries no header, even when it is short of ones the remote
-/// lacks. Header names are case-insensitive; this is the
-/// lower-case form.
+/// The response header a head sets on its answer to `POST /v1/objects/batch` (the `200` with the
+/// bundle, or the `303` to it) when it stopped before looking for every requested object. Its
+/// value says why: [`BATCH_CUT_BUDGET`] or [`BATCH_CUT_DEADLINE`]. The objects it skipped may or
+/// may not be ones it holds, and the objects it did send are a valid answer and are imported. An
+/// answer that looked for every requested object carries no header, even when it is short of ones
+/// the remote lacks. A value a client does not know is no mark. Header names are
+/// case-insensitive; this is the lower-case form.
 pub const BATCH_HEADER: &str = "forklift-batch";
 
-/// The value of [`BATCH_HEADER`] meaning "this batch answer was cut short".
-pub const BATCH_TRUNCATED: &str = "truncated";
+/// The value of [`BATCH_HEADER`] meaning "cut at the head's byte budget". Such an answer carries
+/// at least one object, and the client asks again for the rest: the cut bounds one answer's size,
+/// not the remote's speed.
+pub const BATCH_CUT_BUDGET: &str = "budget";
+
+/// The value of [`BATCH_HEADER`] meaning "cut because the head ran short of time". The client
+/// asks this remote for no more batches in this command and fetches the rest one object at a
+/// time: a head that cannot finish one batch in its time limit is a store slow enough that
+/// parallel single-object fetches serve better than another batch would.
+pub const BATCH_CUT_DEADLINE: &str = "deadline";
 
 /// The `GET /v1/warehouse` handshake: protocol version, refs and trust in one round trip.
 #[derive(Serialize, Deserialize)]

@@ -52,7 +52,7 @@ use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, HoldsRequest, HoldsResponse, MissingObjectsRequest,
     MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
-    MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, BATCH_HEADER, BATCH_TRUNCATED,
+    MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, BATCH_CUT_BUDGET, BATCH_CUT_DEADLINE, BATCH_HEADER,
     LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
 use forklift_core::util::authority_utils::Principal;
@@ -63,7 +63,7 @@ use forklift_core::util::warehouse_utils;
 
 use crate::aws::AwsConfig;
 use crate::error::{HeadError, HeadResult};
-use crate::head::{BatchDelivery, Head, ObjectReadResult, ObjectWriteResult, TrustResult};
+use crate::head::{BatchCut, BatchDelivery, Head, ObjectReadResult, ObjectWriteResult, TrustResult};
 use crate::store::{ObjectStore, RefStore, SignatureOutcome};
 
 /// How the deployment addresses warehouses, the serverless twin of `forklift-server`'s
@@ -776,11 +776,12 @@ where
             };
             // On the answer to the `POST` itself, not on the bundle: a redirected client reads it
             // here before it follows the `Location`.
-            if answer.truncated {
-                response.headers_mut().insert(
-                    BATCH_HEADER,
-                    header::HeaderValue::from_static(BATCH_TRUNCATED),
-                );
+            if let Some(cut) = answer.cut {
+                let value = match cut {
+                    BatchCut::Budget => BATCH_CUT_BUDGET,
+                    BatchCut::Deadline => BATCH_CUT_DEADLINE,
+                };
+                response.headers_mut().insert(BATCH_HEADER, header::HeaderValue::from_static(value));
             }
             Ok(response)
         }

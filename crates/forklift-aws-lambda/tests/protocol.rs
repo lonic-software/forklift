@@ -25,7 +25,7 @@ use forklift_aws_lambda::store::{
     CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
-use forklift_aws_lambda::{AsyncBridge, BatchDelivery, BatchResult, Head};
+use forklift_aws_lambda::{AsyncBridge, BatchCut, BatchDelivery, BatchResult, Head};
 
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals::StorageRootScope;
@@ -1498,7 +1498,7 @@ fn batch_returns_a_bundle_stream() {
     let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
 
     let answer = head.batch(&hashes).expect("batch");
-    assert!(!answer.truncated, "a small batch is answered whole");
+    assert!(answer.cut.is_none(), "a small batch is answered whole");
     match answer.delivery {
         BatchDelivery::Bundle(bundle) => {
             assert!(!bundle.is_empty(), "the batch produced a non-empty bundle stream")
@@ -1588,7 +1588,7 @@ fn bundled(area: &Area, name: &str, answer: BatchResult, requested: &[String]) -
 
 /// A batch past the byte budget stops at the object that crossed it, marked truncated: a strict
 /// prefix of what was asked, at least one object, and over the budget by less than one object.
-/// Revert: drop the byte rule from `batch_answer_full` → every object comes back, unmarked.
+/// Revert: drop the byte rule from `batch_answer_cut` → every object comes back, unmarked.
 #[test]
 fn a_batch_past_its_byte_budget_answers_a_marked_prefix() {
     const SIZE: usize = 100 * 1024;
@@ -1599,7 +1599,7 @@ fn a_batch_past_its_byte_budget_answers_a_marked_prefix() {
     let head = seeded_head(MemoryObjectStore::new(), &objects)
         .with_batch_limits(250 * 1024, std::time::Duration::ZERO);
     let answer = head.batch(&hashes).expect("batch");
-    assert!(answer.truncated, "an answer cut at the budget is marked");
+    assert!(answer.cut == Some(BatchCut::Budget), "an answer cut at the budget is marked so");
 
     let carried = bundled(&area, "budget", answer, &hashes);
     assert_eq!(carried, hashes[..3], "it stops at the object that crossed 250 KiB, in request order");
@@ -1609,7 +1609,7 @@ fn a_batch_past_its_byte_budget_answers_a_marked_prefix() {
     let head = seeded_head(MemoryObjectStore::new(), &objects)
         .with_batch_limits(10 * SIZE as u64 + 1, std::time::Duration::ZERO);
     let answer = head.batch(&hashes).expect("batch");
-    assert!(!answer.truncated, "a whole answer is not marked");
+    assert!(answer.cut.is_none(), "a whole answer is not marked");
     assert_eq!(bundled(&area, "whole", answer, &hashes), hashes);
 }
 
@@ -1617,7 +1617,7 @@ fn a_batch_past_its_byte_budget_answers_a_marked_prefix() {
 /// held is still sent, and objects the store lacks count toward nothing. An answer short only
 /// of what the store lacks is not marked; one that stopped before looking for every requested
 /// object is, even when the store lacks the ones it skipped.
-/// Revert: let the byte rule in `batch_answer_full` stop an empty answer → the first answer
+/// Revert: let the byte rule in `batch_answer_cut` stop an empty answer → the first answer
 /// carries nothing.
 #[test]
 fn a_batch_always_carries_one_object_and_absent_ones_do_not_mark_it() {
@@ -1631,30 +1631,34 @@ fn a_batch_always_carries_one_object_and_absent_ones_do_not_mark_it() {
     // stops lets one through.
     let head = seeded_head(MemoryObjectStore::new(), &objects).with_batch_limits(0, std::time::Duration::ZERO);
     let answer = head.batch(&hashes).expect("batch");
-    assert!(answer.truncated);
+    assert_eq!(answer.cut, Some(BatchCut::Budget));
     assert_eq!(bundled(&area, "one", answer, &hashes), hashes[2..3], "the absent ones are skipped, then one object");
 
     // Only absent objects: nothing to carry, and nothing was cut.
     let answer = head.batch(&hashes[..2]).expect("batch");
-    assert!(!answer.truncated, "an answer short only of what the store lacks is not marked");
+    assert!(answer.cut.is_none(), "an answer short only of what the store lacks is not marked");
 
     // Cut before objects the store lacks: the head did not look for them, so it cannot say the
     // answer is short only of those, and marks it.
     let cut = [hashes[2].clone(), absent[0].clone(), absent[1].clone()];
     let answer = head.batch(&cut).expect("batch");
-    assert!(answer.truncated, "an answer that skipped looking for an object is marked");
+    assert!(answer.cut == Some(BatchCut::Budget), "an answer that skipped looking for an object is marked");
     assert_eq!(bundled(&area, "skipped", answer, &cut), cut[..1]);
 
     // A deadline already past still looks for the first object, and carries it when it is held.
-    let head = seeded_head(MemoryObjectStore::new(), &objects).with_deadline(std::time::SystemTime::now());
+    // The budget is spent too, and the deadline is the cut it names: the one that tells the client
+    // not to ask again.
+    let head = seeded_head(MemoryObjectStore::new(), &objects)
+        .with_batch_limits(0, std::time::Duration::from_secs(10))
+        .with_deadline(std::time::SystemTime::now());
     let answer = head.batch(&hashes[2..]).expect("batch");
-    assert!(answer.truncated);
+    assert_eq!(answer.cut, Some(BatchCut::Deadline));
     assert_eq!(bundled(&area, "late", answer, &hashes[2..]), hashes[2..3]);
 }
 
 /// The deadline counts lookups of objects the store lacks: a batch of them over a slow store
 /// stops when the deadline nears, marked, rather than running past it while it carries nothing.
-/// Revert: let the deadline rule in `batch_answer_full` wait for a carried object → all twelve
+/// Revert: let the deadline rule in `batch_answer_cut` wait for a carried object → all twelve
 /// lookups run, past the deadline, and the answer is unmarked.
 #[test]
 fn a_batch_of_absent_objects_over_a_slow_store_answers_before_the_invocation_deadline() {
@@ -1669,13 +1673,13 @@ fn a_batch_of_absent_objects_over_a_slow_store_answers_before_the_invocation_dea
     let answer = head.batch(&hashes).expect("batch");
     let elapsed = started.elapsed().expect("a forward clock");
 
-    assert!(answer.truncated, "an answer cut at the deadline is marked, carried objects or not");
+    assert!(answer.cut == Some(BatchCut::Deadline), "an answer cut at the deadline is marked so, carried objects or not");
     assert!(elapsed < window, "it answered before the deadline: {:?}", elapsed);
 }
 
 /// A batch over a slow store stops mirroring when the invocation deadline nears, and answers
 /// before the deadline with a marked, strict subset.
-/// Revert: drop the deadline rule from `batch_answer_full` → all twelve reads run, past the
+/// Revert: drop the deadline rule from `batch_answer_cut` → all twelve reads run, past the
 /// deadline, and the answer is whole.
 #[test]
 fn a_batch_over_a_slow_store_answers_before_the_invocation_deadline() {
@@ -1695,7 +1699,7 @@ fn a_batch_over_a_slow_store_answers_before_the_invocation_deadline() {
     let answer = head.batch(&hashes).expect("batch");
     let elapsed = started.elapsed().expect("a forward clock");
 
-    assert!(answer.truncated, "an answer cut at the deadline is marked");
+    assert!(answer.cut == Some(BatchCut::Deadline), "an answer cut at the deadline is marked so");
     assert!(elapsed < window, "it answered before the deadline: {:?}", elapsed);
 
     let carried = bundled(&area, "deadline", answer, &hashes);

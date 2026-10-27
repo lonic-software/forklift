@@ -33,7 +33,7 @@ use forklift_core::model::remote::{
     HoldAnswer, HoldsRequest, HoldsResponse,
     CommitLiftRequest, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
     ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse, WarehouseInfo,
-    BATCH_HEADER, BATCH_TRUNCATED, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_MISSING_BATCH,
+    BATCH_CUT_BUDGET, BATCH_CUT_DEADLINE, BATCH_HEADER, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_MISSING_BATCH,
 };
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{self, PalletNamespace};
@@ -868,12 +868,14 @@ fn batch_offloads_or_streams_by_store() {
     assert!(!url.contains("/objects/"), "a response body is never an object");
 }
 
-/// A batch the head cut short says so in a `Forklift-Batch: truncated` header on the answer to the
-/// `POST` itself — the `200` with the bundle and the `303` to it alike, since a redirected client
-/// reads it before following — and a whole one carries no such header.
-/// Revert: drop the header insert from the `Batch` route → both cut answers lack it.
+/// A batch the head cut short says why in a `Forklift-Batch` header on the answer to the `POST`
+/// itself — the `200` with the bundle and the `303` to it alike, since a redirected client reads
+/// it before following: `budget` for a cut at the byte budget, `deadline` for one near the
+/// invocation deadline. A whole answer carries no such header.
+/// Revert: drop the header insert from the `Batch` route → every cut answer lacks it; swap the two
+/// values → each cut names the other.
 #[test]
-fn a_truncated_batch_is_marked_on_both_answers() {
+fn a_cut_batch_is_marked_with_why_on_both_answers() {
     let objects: Vec<(String, Vec<u8>)> = (0..2)
         .map(|i| {
             let bytes = format!("truncated-batch-{i}").into_bytes();
@@ -887,24 +889,36 @@ fn a_truncated_batch_is_marked_on_both_answers() {
             fixture.objects.put_verified(hash, bytes).expect("seed");
         }
 
-        let call = |byte_budget: u64| {
+        let call = |byte_budget: u64, deadline: Option<std::time::SystemTime>| {
             let (objects, refs) = (fixture.objects.clone(), fixture.refs.clone());
             handle(
                 &fixture.routing,
                 &fixture.auth,
                 move |_warehouse| {
-                    Ok(Head::new(SharedObjects(objects), SharedRefs(refs))
-                        .with_batch_limits(byte_budget, std::time::Duration::ZERO))
+                    let head = Head::new(SharedObjects(objects), SharedRefs(refs))
+                        .with_batch_limits(byte_budget, std::time::Duration::from_secs(60));
+                    Ok(match deadline {
+                        Some(deadline) => head.with_deadline(deadline),
+                        None => head,
+                    })
                 },
                 post_json("/v1/objects/batch", &MissingObjectsRequest { hashes: hashes.clone() }),
             )
         };
 
-        let cut = call(1);
-        assert!(matches!(status(&cut), 200 | 303), "{}", status(&cut));
-        assert_eq!(cut.headers().get(BATCH_HEADER).map(|v| v.to_str().unwrap()), Some(BATCH_TRUNCATED));
+        let mark = |response: &Response<Vec<u8>>| -> Option<String> {
+            response.headers().get(BATCH_HEADER).map(|v| v.to_str().unwrap().to_string())
+        };
 
-        let whole = call(u64::MAX);
+        let cut = call(1, None);
+        assert!(matches!(status(&cut), 200 | 303), "{}", status(&cut));
+        assert_eq!(mark(&cut).as_deref(), Some(BATCH_CUT_BUDGET));
+
+        let late = call(u64::MAX, Some(std::time::SystemTime::now()));
+        assert_eq!(status(&late), status(&cut));
+        assert_eq!(mark(&late).as_deref(), Some(BATCH_CUT_DEADLINE));
+
+        let whole = call(u64::MAX, None);
         assert_eq!(status(&whole), status(&cut), "the same store answers the same way");
         assert!(whole.headers().get(BATCH_HEADER).is_none(), "a whole answer is unmarked");
     }

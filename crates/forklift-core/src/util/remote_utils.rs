@@ -14,7 +14,7 @@ use crate::model::remote::{
     CommitLiftRequest, ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse,
     MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest, ResolveRequest,
     ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse, WarehouseInfo,
-    BATCH_HEADER, BATCH_TRUNCATED, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_HOLDS_CANDIDATES, MAX_MISSING_BATCH,
+    BATCH_CUT_BUDGET, BATCH_CUT_DEADLINE, BATCH_HEADER, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY, MAX_HOLDS_CANDIDATES, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
 use crate::enums::config_scope::ConfigScope;
@@ -324,14 +324,18 @@ pub struct FetchStats {
 }
 
 /// What one [`RemoteClient::fetch_batch`] call came to, short of an error. Every outcome but
-/// `Imported` closes the remote's batch lane; see that function's doc.
+/// `Imported` and `Partial` closes the remote's batch lane; see that function's doc.
 #[derive(Debug)]
 pub enum BatchOutcome {
     /// The bundle was read to its end and imported.
     Imported(bundle_utils::ImportStats),
-    /// The bundle was read to its end and imported, but the remote marked it cut short (see
-    /// [`BATCH_HEADER`]): it stopped before everything it holds, to bound its memory or time.
-    Truncated(bundle_utils::ImportStats),
+    /// The bundle was read to its end and imported, but the remote marked it cut at its byte
+    /// budget ([`BATCH_CUT_BUDGET`]): it stopped before looking for everything asked, and the rest
+    /// is worth asking for again.
+    Partial(bundle_utils::ImportStats),
+    /// The bundle was read to its end and imported, but the remote marked it cut for running short
+    /// of time ([`BATCH_CUT_DEADLINE`]).
+    OutOfTime(bundle_utils::ImportStats),
     /// The remote has no batch endpoint.
     EndpointAbsent,
     /// The remote sent no status line in time, so the batch was abandoned.
@@ -352,9 +356,8 @@ pub enum BatchLaneClosure {
     EndpointAbsent,
     /// The remote was too slow to start a batch answer.
     Degraded,
-    /// The remote cut a batch answer short, as it does when the objects asked for are too large
-    /// for one answer or it ran short of time to answer.
-    Truncated,
+    /// The remote ran short of time to answer a batch, and sent only part of it.
+    OutOfTime,
 }
 
 /// What a lift actually transferred.
@@ -3501,15 +3504,16 @@ impl RemoteClient {
 
     /// Fetch many objects in one round trip as a bundle-format stream
     /// (`POST /v1/objects/batch`) and import them as the stream arrives (see
-    /// [`Self::import_response`]). Every outcome other than [`BatchOutcome::Imported`] closes this
+    /// [`Self::import_response`]). An answer the remote marked cut at its byte budget
+    /// ([`BatchOutcome::Partial`]) leaves the lane open: what it sent is imported, and the caller
+    /// asks again for the rest. Every other outcome but [`BatchOutcome::Imported`] closes this
     /// remote's batch lane (see `batch_lane_closed`), and the caller falls back to loose fetches
     /// for what is still missing:
     /// * [`BatchOutcome::EndpointAbsent`] — the remote predates the endpoint (a `404`).
-    /// * [`BatchOutcome::Truncated`] — the remote marked its answer cut short (see
-    ///   [`BATCH_HEADER`]). What it sent is imported. The remote is bounded by its memory or its
-    ///   time, and a later chunk is likely to meet the same bound, so the lane closes rather than
-    ///   pay a cut answer on top of the loose GETs for each chunk; the price is that a later chunk
-    ///   which would have fit goes loose too.
+    /// * [`BatchOutcome::OutOfTime`] — the remote marked its answer cut for running short of time
+    ///   (see [`BATCH_CUT_DEADLINE`]). What it sent is imported. A store too slow to finish one
+    ///   batch in the remote's time limit would cost that whole limit again on every later chunk,
+    ///   and parallel loose GETs serve it better.
     /// * [`BatchOutcome::Degraded`] — no status line arrived inside [`Self::batch_head_budget`].
     ///   This is the one transport failure that degrades instead of failing the command, because it
     ///   is the one that says nothing about whether the remote works: the head is still building a
@@ -3604,8 +3608,7 @@ impl RemoteClient {
 
         // Read off the answer to the `POST` itself: a redirected answer carries it on the `303`,
         // not on the bundle behind it. A value this client does not know is no mark.
-        let truncated = response.headers().get(BATCH_HEADER)
-            .is_some_and(|value| value.as_bytes() == BATCH_TRUNCATED.as_bytes());
+        let cut = response.headers().get(BATCH_HEADER).map(|value| value.as_bytes().to_vec());
 
         // `body_posture` follows whichever station actually produced the response bytes below:
         // the `POST` above when there was no redirect to follow — whose client-level silence
@@ -3622,12 +3625,14 @@ impl RemoteClient {
         let admission = bundle_utils::StreamAdmission::Requested(requested);
         let stats = self.import_response(response, "reading the batch response", body_posture, admission).await?;
 
-        if truncated {
-            self.close_batch_lane(BatchLaneClosure::Truncated);
-            return Ok(BatchOutcome::Truncated(stats));
+        match cut.as_deref() {
+            Some(value) if value == BATCH_CUT_DEADLINE.as_bytes() => {
+                self.close_batch_lane(BatchLaneClosure::OutOfTime);
+                Ok(BatchOutcome::OutOfTime(stats))
+            }
+            Some(value) if value == BATCH_CUT_BUDGET.as_bytes() => Ok(BatchOutcome::Partial(stats)),
+            _ => Ok(BatchOutcome::Imported(stats)),
         }
-
-        Ok(BatchOutcome::Imported(stats))
     }
 
     /// [`Self::send_on`], re-sending while the remote answers `429`: every route of the hosted API
@@ -5571,16 +5576,46 @@ async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
 
     // Batch fetch first: one round trip per chunk, a bundle-format stream back
     // (forklift's packfile moment). A remote without the endpoint, or one too slow to start its
-    // answer, or one that cuts its answer short, closes the batch lane and everything falls back
-    // to loose GETs, for this wave and every later one; whatever a batch did not deliver (the
-    // remote may lack objects, or have cut the answer short) is fetched loose below too.
+    // answer or to finish it, closes the batch lane and everything falls back to loose GETs, for
+    // this wave and every later one; whatever a batch did not deliver (the remote may lack
+    // objects, or have cut the answer short) is fetched loose below too.
     if missing.len() > 1 {
-        for chunk in missing.chunks(chunk_size) {
-            if !client.batch_lane_open() {
-                break;
-            }
-            if !matches!(client.fetch_batch(chunk).await?, BatchOutcome::Imported(_)) {
-                break;
+        'chunks: for chunk in missing.chunks(chunk_size) {
+            let mut asked: Vec<String> = chunk.to_vec();
+
+            loop {
+                if !client.batch_lane_open() {
+                    break 'chunks;
+                }
+
+                match client.fetch_batch(&asked).await? {
+                    BatchOutcome::Imported(_) => break,
+                    // Cut at the remote's byte budget: ask again for what is still missing. A
+                    // budget cut carries an object, so each round asks for less; one that carried
+                    // nothing new is a remote that will not make progress, and the rest of the
+                    // wave goes loose.
+                    BatchOutcome::Partial(_) => {
+                        let mut rest: Vec<String> = Vec::new();
+
+                        for hash in &asked {
+                            if !file_utils::does_object_exist(hash)? {
+                                rest.push(hash.clone());
+                            }
+                        }
+
+                        if rest.len() == asked.len() {
+                            break 'chunks;
+                        }
+                        if rest.is_empty() {
+                            break;
+                        }
+
+                        asked = rest;
+                    }
+                    BatchOutcome::OutOfTime(_) | BatchOutcome::EndpointAbsent | BatchOutcome::Degraded => {
+                        break 'chunks;
+                    }
+                }
             }
         }
 
@@ -9465,20 +9500,25 @@ mod tests {
             bundle: Vec<u8>,
             objects: HashMap<String, Vec<u8>>,
         ) -> FakeOffloadingRemote {
-            FakeOffloadingRemote::start_marking(redirect_status, bundle, objects, false)
+            FakeOffloadingRemote::start_marking(redirect_status, bundle, objects, None)
         }
 
         /// `redirect_status` is what `POST /v1/objects/batch` and every
         /// `GET /v1/parcels/{parcel}/subtree/{path}` answer with (this fix's server
         /// half only ever emits `303`, but `307`/`308` from an older or non-conforming head
         /// must be followed identically); `bundle` is served at the redirect target;
-        /// `objects` seeds the loose `GET /v1/objects/{hash}` endpoint. `truncated` marks every
-        /// batch redirect with [`BATCH_HEADER`], as a head that cut its answer short does.
+        /// `objects` seeds the loose `GET /v1/objects/{hash}` endpoint. `cut` is how the head
+        /// cuts its batch answers:
+        /// * `Some(FakeCut::Deadline)` marks every batch redirect [`BATCH_CUT_DEADLINE`] and serves
+        ///   `bundle`, as a head that ran short of time does;
+        /// * `Some(FakeCut::Budget(k))` answers each batch with a bundle of the first `k` requested
+        ///   objects it holds, built for that request, marked [`BATCH_CUT_BUDGET`] when it left any
+        ///   requested hash out — a head with a budget of `k` objects.
         fn start_marking(
             redirect_status: u16,
             bundle: Vec<u8>,
             objects: HashMap<String, Vec<u8>>,
-            truncated: bool,
+            cut: Option<FakeCut>,
         ) -> FakeOffloadingRemote {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -9486,7 +9526,7 @@ mod tests {
             let storage_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let storage = format!("http://{}", storage_listener.local_addr().unwrap());
             let hits: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
-            let bundle = Arc::new(bundle);
+            let bundle = Arc::new(Mutex::new(bundle));
             let objects = Arc::new(objects);
 
             for (listener, at_storage) in [(listener, false), (storage_listener, true)] {
@@ -9505,7 +9545,7 @@ mod tests {
 
                         std::thread::spawn(move || {
                             handle_offloading_request(
-                                stream, redirect_status, truncated, &storage, at_storage, &bundle, &objects, &hits
+                                stream, redirect_status, cut, &storage, at_storage, &bundle, &objects, &hits
                             );
                         });
                     }
@@ -9531,20 +9571,27 @@ mod tests {
         }
     }
 
+    /// How a [`FakeOffloadingRemote`] cuts its batch answers; see [`FakeOffloadingRemote::start_marking`].
+    #[derive(Clone, Copy)]
+    enum FakeCut {
+        Budget(usize),
+        Deadline,
+    }
+
     /// Handle exactly one connection/request for [`FakeOffloadingRemote`].
     fn handle_offloading_request(
         mut stream: std::net::TcpStream,
         redirect_status: u16,
-        truncated: bool,
+        cut: Option<FakeCut>,
         storage: &str,
         at_storage: bool,
-        bundle: &[u8],
+        bundle: &Mutex<Vec<u8>>,
         objects: &HashMap<String, Vec<u8>>,
         hits: &Mutex<Vec<(String, String, bool)>>,
     ) {
         use std::io::Write;
 
-        let Some((method, path, had_auth, _body)) = read_test_request(&mut stream) else { return };
+        let Some((method, path, had_auth, body)) = read_test_request(&mut stream) else { return };
         hits.lock().unwrap().push((method.clone(), path.clone(), had_auth));
 
         let redirected = (method == "POST" && path == "/v1/objects/batch")
@@ -9565,11 +9612,27 @@ mod tests {
                 301 | 302 => "/responses/bundle".to_string(),
                 _ => format!("{}/responses/bundle", storage),
             };
-            let mark = if truncated && method == "POST" {
-                format!("{}: {}\r\n", BATCH_HEADER, BATCH_TRUNCATED)
-            } else {
-                String::new()
+            let mark = match cut {
+                Some(_) if method != "POST" => None,
+                Some(FakeCut::Deadline) => Some(BATCH_CUT_DEADLINE),
+                Some(FakeCut::Budget(carry)) => {
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let requested: Vec<String> = request["hashes"].as_array().unwrap().iter()
+                        .map(|hash| hash.as_str().unwrap().to_string())
+                        .collect();
+                    let held: Vec<&String> = requested.iter().filter(|hash| objects.contains_key(*hash)).collect();
+
+                    let mut writer = bundle_utils::BundleWriter::new().unwrap();
+                    for hash in held.iter().take(carry) {
+                        writer.push(hash, &objects[*hash]).unwrap();
+                    }
+                    *bundle.lock().unwrap() = writer.finish().unwrap();
+
+                    (held.len() > carry).then_some(BATCH_CUT_BUDGET)
+                }
+                None => None,
             };
+            let mark = mark.map(|value| format!("{}: {}\r\n", BATCH_HEADER, value)).unwrap_or_default();
             let _ = write!(
                 stream,
                 "HTTP/1.1 {} {}\r\nLocation: {}\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
@@ -9586,13 +9649,14 @@ mod tests {
         }
 
         if method == "GET" && path == "/responses/bundle" {
+            let bundle = bundle.lock().unwrap().clone();
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
                 Content-Length: {}\r\nConnection: close\r\n\r\n",
                 bundle.len()
             );
-            let _ = stream.write_all(bundle);
+            let _ = stream.write_all(&bundle);
             let _ = stream.flush();
             return;
         }
@@ -9671,51 +9735,87 @@ mod tests {
         }
     }
 
-    /// A wave whose first batch the remote marks truncated asks for no second batch: what the
+    /// A wave whose first batch the remote marks cut for time asks for no second batch: what the
     /// first carried is kept, and every other object arrives loose. The mark rides the `303`, so
     /// it is read before the redirect is followed. An unmarked answer that is short (the remote
     /// lacks objects) keeps the lane open, and every chunk is asked for. The wave loop is driven
     /// with 4-hash chunks rather than the production 512, so the fixture stays small.
-    /// Revert: drop the `truncated` branch from `fetch_batch` → the second chunk is posted too,
-    /// and its answer carries objects it did not ask for, failing the fetch.
+    /// Revert: drop the deadline arm from `fetch_batch` → the second chunk is posted too, and its
+    /// answer carries objects it did not ask for, failing the fetch.
     #[test]
-    fn a_truncated_batch_closes_the_lane_and_the_rest_arrive_loose() {
+    fn a_batch_cut_for_time_closes_the_lane_and_the_rest_arrive_loose() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-        for truncated in [true, false] {
+        for out_of_time in [true, false] {
             let (hashes, objects, bundle) = {
-                let _server_scope = Scratch::new(&format!("truncated-batch-server-{}", truncated));
-                let hashes: Vec<String> = (0..10).map(|i| store_blob(&format!("wave-{}-{}", truncated, i))).collect();
+                let _server_scope = Scratch::new(&format!("deadline-batch-server-{}", out_of_time));
+                let hashes: Vec<String> = (0..10).map(|i| store_blob(&format!("wave-{}-{}", out_of_time, i))).collect();
                 let objects: HashMap<String, Vec<u8>> = hashes.iter()
                     .map(|hash| (hash.clone(), file_utils::retrieve_object_by_hash(hash).unwrap()))
                     .collect();
                 // A cut answer carries a prefix of the first chunk; the short one carries nothing,
                 // so it fits every chunk's request.
-                let carried: &[String] = if truncated { &hashes[..2] } else { &[] };
+                let carried: &[String] = if out_of_time { &hashes[..2] } else { &[] };
                 (hashes.clone(), objects, bundle_utils::build_partial_bundle(carried).unwrap())
             };
 
-            let _client_scope = Scratch::new(&format!("truncated-batch-client-{}", truncated));
-            let remote = FakeOffloadingRemote::start_marking(303, bundle, objects, truncated);
+            let _client_scope = Scratch::new(&format!("deadline-batch-client-{}", out_of_time));
+            let cut = out_of_time.then_some(FakeCut::Deadline);
+            let remote = FakeOffloadingRemote::start_marking(303, bundle, objects, cut);
             let client = RemoteClient::new(&remote.url, None).unwrap();
 
             let fetched = runtime.block_on(fetch_missing_objects_in_chunks(&client, &hashes, 4))
-                .unwrap_or_else(|e| panic!("truncated {}: {}", truncated, e));
+                .unwrap_or_else(|e| panic!("out of time {}: {}", out_of_time, e));
 
-            assert_eq!(fetched, 10, "truncated {}", truncated);
+            assert_eq!(fetched, 10, "out of time {}", out_of_time);
             assert!(hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
             let loose = hashes.iter().filter(|hash| remote.hits_for(&format!("/v1/objects/{}", hash)) > 0).count();
 
-            if truncated {
+            if out_of_time {
                 assert_eq!(remote.batch_hits(), 1, "one batch, then no more");
                 assert_eq!(loose, 8, "what the batch carried is not fetched again");
-                assert_eq!(client.batch_lane_closure(), Some(BatchLaneClosure::Truncated));
+                assert_eq!(client.batch_lane_closure(), Some(BatchLaneClosure::OutOfTime));
             } else {
                 assert_eq!(remote.batch_hits(), 3, "an unmarked short answer keeps the lane open");
                 assert_eq!(loose, 10);
                 assert_eq!(client.batch_lane_closure(), None);
             }
         }
+    }
+
+    /// A batch the remote cuts at its byte budget is asked for again until the chunk is in: no
+    /// object goes loose, the lane stays open, and every chunk of the wave rides the batch. Here
+    /// the head carries two objects per answer, so 10 hashes in 4-hash chunks take 2 + 2 + 1
+    /// batches.
+    /// Revert: let `fetch_missing_objects_in_chunks` stop at a budget cut, as at a deadline cut →
+    /// one batch, then the rest loose.
+    #[test]
+    fn a_batch_cut_at_the_budget_is_asked_again_for_the_rest() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let (hashes, objects) = {
+            let _server_scope = Scratch::new("budget-batch-server");
+            let hashes: Vec<String> = (0..10).map(|i| store_blob(&format!("budget-wave-{}", i))).collect();
+            let objects: HashMap<String, Vec<u8>> = hashes.iter()
+                .map(|hash| (hash.clone(), file_utils::retrieve_object_by_hash(hash).unwrap()))
+                .collect();
+            (hashes, objects)
+        };
+
+        let _client_scope = Scratch::new("budget-batch-client");
+        let remote = FakeOffloadingRemote::start_marking(303, Vec::new(), objects, Some(FakeCut::Budget(2)));
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+
+        let fetched = runtime.block_on(fetch_missing_objects_in_chunks(&client, &hashes, 4)).unwrap();
+
+        assert_eq!(fetched, 10);
+        assert!(hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
+        assert_eq!(remote.batch_hits(), 5, "each chunk is asked for until it is in");
+        assert!(
+            hashes.iter().all(|hash| remote.hits_for(&format!("/v1/objects/{}", hash)) == 0),
+            "nothing goes loose"
+        );
+        assert_eq!(client.batch_lane_closure(), None);
     }
 
     /// The subtree endpoint may be offloaded the same way: `REMOTE_PROTOCOL.md` lets a

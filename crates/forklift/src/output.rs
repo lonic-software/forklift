@@ -35,8 +35,8 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 9 (this one): `batch_lane` may be `truncated`, when the remote cut a batch download
-/// short and the rest of the command fetched one object at a time.
+/// Version 9 (this one): `batch_lane` may be `out_of_time`, when the remote ran out of time for a
+/// batch download and the rest of the command fetched one object at a time.
 /// Version 8: the `pallet_deleted_on_remote` error code exists; `palletize --remote`
 /// lists the remote's deleted pallets as `deleted`, and `palletize` lists this served warehouse's
 /// own as `deleted`; `palletize --delete`/`--restore` with `--remote` report `remote`.
@@ -213,8 +213,8 @@ pub fn batch_lane_line(closure: BatchLaneClosure) -> &'static str {
             was fetched one object at a time.",
         BatchLaneClosure::EndpointAbsent => "The remote does not serve batch downloads, so objects \
             were fetched one at a time.",
-        BatchLaneClosure::Truncated => "The remote sent only part of a batch download, so the rest \
-            was fetched one object at a time.",
+        BatchLaneClosure::OutOfTime => "The remote ran out of time for a batch download, so the \
+            rest was fetched one object at a time.",
     }
 }
 
@@ -1081,17 +1081,17 @@ mod tests {
     fn a_closed_batch_lane_says_why_it_closed() {
         let degraded = batch_lane_line(BatchLaneClosure::Degraded);
         let absent = batch_lane_line(BatchLaneClosure::EndpointAbsent);
-        let truncated = batch_lane_line(BatchLaneClosure::Truncated);
+        let out_of_time = batch_lane_line(BatchLaneClosure::OutOfTime);
 
         assert!(degraded.contains("slow to start a batch download"), "{}", degraded);
         assert!(absent.contains("does not serve batch downloads"), "{}", absent);
-        assert!(truncated.contains("only part of a batch download"), "{}", truncated);
+        assert!(out_of_time.contains("ran out of time for a batch download"), "{}", out_of_time);
         assert!(degraded.contains("one object at a time") && absent.contains("one at a time"));
-        assert!(truncated.contains("one object at a time"));
+        assert!(out_of_time.contains("one object at a time"));
 
         assert_eq!(serde_json::to_value(BatchLaneClosure::Degraded).unwrap(), "degraded");
         assert_eq!(serde_json::to_value(BatchLaneClosure::EndpointAbsent).unwrap(), "endpoint_absent");
-        assert_eq!(serde_json::to_value(BatchLaneClosure::Truncated).unwrap(), "truncated");
+        assert_eq!(serde_json::to_value(BatchLaneClosure::OutOfTime).unwrap(), "out_of_time");
     }
 
     #[test]

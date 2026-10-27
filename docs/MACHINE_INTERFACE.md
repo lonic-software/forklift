@@ -83,8 +83,8 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 9** (current): `batch_lane` may also be `truncated`, when the remote sent only part of a
-batch download and the rest of the command fetched one object at a time.
+**Schema 9** (current): `batch_lane` may also be `out_of_time`, when the remote ran out of time for
+a batch download and the rest of the command fetched one object at a time.
 
 **Schema 8**: the `pallet_deleted_on_remote` error code exists; `palletize --remote` lists the
 remote's deleted pallets as `deleted`, and `palletize` lists this served warehouse's own as

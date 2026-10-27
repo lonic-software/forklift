@@ -99,10 +99,19 @@ pub enum ObjectWriteResult {
 pub struct BatchResult {
     /// Where the bundle is.
     pub delivery: BatchDelivery,
-    /// Whether the head stopped before looking for every requested object — to stay inside its
-    /// byte budget or its invocation deadline. The router marks the answer
-    /// `Forklift-Batch: truncated`, and the client fetches the rest one object at a time.
-    pub truncated: bool,
+    /// Why the head stopped before looking for every requested object, if it did. The router
+    /// marks the answer with it (`Forklift-Batch`).
+    pub cut: Option<BatchCut>,
+}
+
+/// Why a `batch` answer stopped before looking for every requested object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchCut {
+    /// The bundle reached [`BATCH_BYTE_BUDGET`]; the client asks again for the rest.
+    Budget,
+    /// The invocation deadline came within [`BATCH_ANSWER_RESERVE`]; the client fetches the rest
+    /// one object at a time.
+    Deadline,
 }
 
 /// Where a `batch` bundle is: the bytes themselves, or a presigned `GET` for them.
@@ -147,7 +156,7 @@ const MAX_CACHED_OFFICE_STATES: usize = 32;
 const HOLDS_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How many object bytes one `batch` answer carries before the head stops and answers with what
-/// it has, marked truncated. It bounds the function's memory: the bundle is held whole until it is
+/// it has, marked as cut at the budget. It bounds the function's memory: the bundle is held whole until it is
 /// offloaded, and it can overshoot this by the one object that crossed it (up to
 /// `MAX_OBJECT_BYTES`, 64 MiB). See docs/DEPLOYMENT.md "Memory sizing" for the measurement it is
 /// sized from.
@@ -1245,8 +1254,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// may name 512 objects of up to 64 MiB each, and the function has neither the memory nor the
     /// time for that. It always looks for the first requested object, and the byte budget never
     /// stops an answer that carries nothing. An answer that stopped before looking for every
-    /// requested object is marked truncated — whether or not the store holds the ones it skipped,
-    /// which it did not stop to find out — and the client fetches the rest one object at a time.
+    /// requested object is marked with why it stopped — whether or not the store holds the ones it
+    /// skipped, which it did not stop to find out. A budget cut sends the client back for the rest;
+    /// a deadline cut sends it to fetching the rest one object at a time.
     ///
     /// The bundle is the one *response* that has no small bound — it is as large as the
     /// objects asked for, up to that budget — so a store that can offload it hands back a
@@ -1258,18 +1268,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
-        let (bundle, truncated) = scratch.scoped(|| -> HeadResult<(Vec<u8>, bool)> {
+        let (bundle, cut) = scratch.scoped(|| -> HeadResult<(Vec<u8>, Option<BatchCut>)> {
             let mut bundle = bundle_utils::BundleWriter::new().map_err(HeadError::internal)?;
             let mut seen: HashSet<&str> = HashSet::new();
-            let mut truncated = false;
+            let mut cut = None;
 
             for hash in hashes {
                 if !seen.insert(hash.as_str()) {
                     continue;
                 }
 
-                if self.batch_answer_full(&bundle, seen.len() > 1) {
-                    truncated = true;
+                cut = self.batch_answer_cut(&bundle, seen.len() > 1);
+                if cut.is_some() {
                     break;
                 }
 
@@ -1305,7 +1315,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
             }
 
-            Ok((bundle.finish().map_err(HeadError::internal)?, truncated))
+            Ok((bundle.finish().map_err(HeadError::internal)?, cut))
         })?;
 
         let delivery = match self.objects.offload_response(bundle).map_err(HeadError::internal)? {
@@ -1313,21 +1323,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             OffloadedResponse::Inline(bundle) => BatchDelivery::Bundle(bundle),
         };
 
-        Ok(BatchResult { delivery, truncated })
+        Ok(BatchResult { delivery, cut })
     }
 
-    /// Whether a `batch` answer holding `bundle` stops before looking for its next object: it
-    /// carries an object and is past the byte budget, or it has `looked` for an object already and
-    /// the invocation deadline is within the answer reserve. The deadline counts lookups of objects
-    /// the store lacks too, since on a slow store those spend the time as surely as reads do.
-    fn batch_answer_full(&self, bundle: &bundle_utils::BundleWriter, looked: bool) -> bool {
-        if !bundle.is_empty() && bundle.object_bytes() >= self.batch_byte_budget {
-            return true;
-        }
-
-        looked && self.deadline.is_some_and(|deadline| {
+    /// Whether a `batch` answer holding `bundle` stops before looking for its next object, and
+    /// why: it has `looked` for an object already and the invocation deadline is within the answer
+    /// reserve, or it carries an object and is past the byte budget. The deadline counts lookups of
+    /// objects the store lacks too, since on a slow store those spend the time as surely as reads
+    /// do. It is judged first, so an answer that meets both rules says it ran short of time — the
+    /// cut that tells the client not to ask again.
+    fn batch_answer_cut(&self, bundle: &bundle_utils::BundleWriter, looked: bool) -> Option<BatchCut> {
+        let out_of_time = looked && self.deadline.is_some_and(|deadline| {
             deadline.duration_since(SystemTime::now()).unwrap_or_default() < self.batch_answer_reserve
-        })
+        });
+
+        if out_of_time {
+            Some(BatchCut::Deadline)
+        } else if !bundle.is_empty() && bundle.object_bytes() >= self.batch_byte_budget {
+            Some(BatchCut::Budget)
+        } else {
+            None
+        }
     }
 
     /// `GET /v1/bundles/latest` — the whole-warehouse bundle. Building it is periodic ECS

@@ -289,7 +289,9 @@ have parcels the other lacks, *remote ahead* when you need to lower first.
 [Working with remotes](cli.md#6-working-with-remotes).
 
 **Batch endpoint, batch lane.** The request that fetches many objects at once. A client that finds
-it missing or slow **closes the lane** and fetches one at a time. See
+it missing, slow to start answering, or out of time before it finishes **closes the lane** and
+fetches one at a time. An answer the remote cut short only for size does not close it: the client
+asks again for the rest. See
 [`lower`](cli.md#lower--pull-lo).
 
 **Tor.** A transport for reaching remotes behind NAT; see
