@@ -6014,7 +6014,8 @@ fn scope_prune_refuses_and_changes_nothing_on_a_held_heads_record_that_does_not_
 
     let refused = area.forklift("sparse", &["scope-prune", "docs"]);
     assert!(!refused.status.success(), "a corrupt record refuses the prune");
-    assert!(stderr(&refused).contains("held-heads"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("held-heads") && stderr(&refused).contains("removing it is safe"),
+            "the refusal names the record and the way out: {}", stderr(&refused));
     assert!(object_present(&area, "sparse", &docs_blob), "nothing is freed");
     assert_eq!(std::fs::read(&scope_file).unwrap(), scope_before, "the fetch scope is unchanged");
 }
@@ -6059,6 +6060,11 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
     assert!(object_present(&area, "sparse", &docs_blob), "an unanswered holds check confirms nothing");
     assert!(stderr(&pruned).contains("\"warning\":\"holds_unanswered\""), "the pallet left unconfirmed is named: {}",
             stderr(&pruned));
+
+    // The way out the warning names: after a lower the remote's current head is here and reaches it.
+    assert_success(&area.forklift("sparse", &["lower"]));
+    assert_success(&area.forklift("sparse", &["scope-prune", "docs"]));
+    assert!(!object_present(&area, "sparse", &docs_blob), "after a lower the prune frees it");
 }
 
 /// The entries of warehouse `name`'s held-heads record, as `<head> <pallet>` lines (the header

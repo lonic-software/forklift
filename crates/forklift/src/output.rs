@@ -938,8 +938,8 @@ pub fn warn_holds_unanswered(pallet: &str, error: &str) {
 
 /// The pure half of [`warn_holds_unanswered`], asserted in both modes without capturing stderr.
 fn holds_unanswered_warning_text(mode: OutputMode, pallet: &str, error: &str) -> String {
-    let next_step = "History only the earlier heads reach was kept. Run the prune again once the \
-        remote answers, or lower the pallet, to free it.";
+    let next_step = "History only those heads reach was kept. A lower of the pallet frees it; if the \
+        remote was busy or out of time, running the prune again may too.";
     match mode {
         OutputMode::Human => format!(
             "Warning: the remote did not say whether it still holds the earlier heads of pallet \"{}\". {} {}",

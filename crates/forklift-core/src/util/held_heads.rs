@@ -13,7 +13,8 @@
 //! keeps at most [`CAP_PER_PALLET`] heads: a new head replaces the recorded heads it descends from,
 //! a head recorded again moves to the newest, and past the cap the oldest go. Writes are
 //! serialized by the [`RefLock`](crate::util::lock_utils::RefLock) and replace the file
-//! atomically, so a lock-free reader sees one whole version. A file that does not parse is an error, never an empty record.
+//! atomically, so a lock-free reader sees one whole version. A file that does not parse is an
+//! error, never an empty record.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -84,9 +85,10 @@ pub fn candidates(pallet: &str) -> Result<Vec<String>, String> {
 /// meta pallet records nothing: prune's unlifted walk covers only user parcels.
 ///
 /// Call it only once the remote has accepted the head (a lift's compare-and-set returned) or, on a
-/// `lower` or a `franchise`, the remote served it and this warehouse holds its history (the ref or the bay's base is
-/// at it or past it); never before a refusal check: an entry for a head the remote never took is harmless to a prune, which asks the remote,
-/// but it is a false record. The caller treats an error as a warning, because the head has landed either way and a lost entry
+/// `lower` or a `franchise`, the remote served it and this warehouse holds its history (the ref or
+/// the bay's base is at it or past it); never before a refusal check: an entry for a head the
+/// remote never took is harmless to a prune, which asks the remote, but it is a false record. The
+/// caller treats an error as a warning, because the head has landed either way and a lost entry
 /// only leaves prune as conservative as it is without one.
 ///
 /// Which recorded heads `head` descends from is decided before the lock is taken, since it walks
@@ -136,10 +138,11 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
 /// It fails closed. A candidate counts only on a `held` answer, so a forged entry, one the remote
 /// moved back past (an `undo` on the served root), one from a pallet deleted and re-created under
 /// its name, and one whose history the remote no longer has all count as not held. A pallet the
-/// remote no longer lists is not asked, and one whose call fails (a head too old to have the
-/// route answers `404`) confirms none of its candidates and is named in
-/// [`Confirmation::unanswered`], so the caller can say why less was freed. A record that does not
-/// parse is the one error: the prune refuses rather than guess at it.
+/// remote no longer lists is not asked. One whose call fails (a head too old to have the route
+/// answers `404`), or that the remote answers `unknown` about (it was busy or out of time),
+/// confirms none of those candidates and is named in [`Confirmation::unanswered`], so the caller
+/// can say why less was freed. A record that cannot be read or does not parse is the one error:
+/// the prune refuses rather than guess at it, and the message says the record can be removed.
 ///
 /// # Arguments
 /// * `client`         - The remote, already trust-checked by the caller.
@@ -149,9 +152,22 @@ pub async fn confirmed_heads(client: &RemoteClient, remote_pallets: &BTreeMap<St
 
     // One call after another: prune is not a hot path, and a server walks only a few holds
     // checks at once, answering `unknown` past that, so asking in parallel would confirm less.
-    for (pallet, candidates) in to_ask(&read_held_heads()?, remote_pallets) {
+    let entries = read_held_heads().map_err(|e| format!(
+        "{} The record only names heads to ask the remote about, so removing it is safe; the next \
+        lift, lower or franchise starts a new one.", e
+    ))?;
+    for (pallet, candidates) in to_ask(&entries, remote_pallets) {
         match client.holds(&pallet, &candidates).await {
-            Ok(answers) => confirmation.heads.extend(held(&candidates, &answers)),
+            Ok(answers) => {
+                confirmation.heads.extend(held(&candidates, &answers));
+                let unsure = undecided(&candidates, &answers);
+                if unsure > 0 {
+                    confirmation.unanswered.push((pallet, format!(
+                        "The remote could not tell whether it still holds {} of the pallet's recorded \
+                        head(s): it was busy, or the check ran out of time.", unsure
+                    )));
+                }
+            }
             Err(why) => confirmation.unanswered.push((pallet, why)),
         }
     }
@@ -165,7 +181,8 @@ pub struct Confirmation {
     /// The recorded heads the remote answered `held`.
     pub heads: Vec<String>,
 
-    /// The pallets whose holds call failed, each with its error; none of their candidates count.
+    /// The pallets whose holds call failed or left candidates `unknown`, each with why; those
+    /// candidates do not count.
     pub unanswered: Vec<(String, String)>,
 }
 
@@ -189,6 +206,13 @@ fn held(candidates: &[String], answers: &BTreeMap<String, HoldAnswer>) -> Vec<St
         .filter(|candidate| answers.get(*candidate) == Some(&HoldAnswer::Held))
         .cloned()
         .collect()
+}
+
+/// How many `candidates` the remote neither confirmed nor denied: answered `unknown`, or left out.
+fn undecided(candidates: &[String], answers: &BTreeMap<String, HoldAnswer>) -> usize {
+    candidates.iter()
+        .filter(|candidate| !matches!(answers.get(*candidate), Some(HoldAnswer::Held | HoldAnswer::NotHeld)))
+        .count()
 }
 
 /// Replace the record. Only under the ref lock.
@@ -293,6 +317,7 @@ mod tests {
 
         assert_eq!(held(&candidates, &answers), vec![hash(1), hash(5)],
             "not_held, unknown and no answer confirm nothing, and an answer for a hash not asked is not taken");
+        assert_eq!(undecided(&candidates, &answers), 2, "an unknown answer and a missing one are undecided");
     }
 
     #[test]

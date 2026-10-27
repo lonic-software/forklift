@@ -1734,11 +1734,12 @@ left, or reports there is nothing left to free.
 each recorded head its current heads have moved past, and frees the history of the heads it
 confirms, so another warehouse lifting ahead does not keep your history pinned until you lower.
 A head the remote does not confirm frees nothing: one an `undo` on the server moved back past, or
-one of a pallet deleted and re-created there. When the remote cannot answer at all (a server too
-old to know the check), the prune prints a `holds_unanswered` warning naming the pallet and frees
-only what the remote's current heads allow. A
-`lift`, `lower` or `franchise` that cannot write the record prints a `held_head_unrecorded`
-warning and keeps its result and exit code. A record that does not parse makes a prune refuse,
+one of a pallet deleted and re-created there. When the remote cannot answer (a server too old to
+know the check, or one too busy to finish it), the prune prints a `holds_unanswered` warning
+naming the pallet and frees only what the remote's current heads allow; a `lower` of that pallet
+frees the rest. A `lift`, `lower` or `franchise` that cannot write the record prints a
+`held_head_unrecorded` warning and keeps its result and exit code. A record that does not parse
+makes a prune refuse,
 changing nothing; it can be removed, since it only names heads to ask the remote about, and the
 next `lift`, `lower` or `franchise` starts a new one.
 
