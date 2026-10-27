@@ -1089,6 +1089,36 @@ pub fn read_hauls() -> Result<HaulsRead, String> {
     Ok(read)
 }
 
+/// Refuse a delete of `pallet` while an open haul in `hauls` names it as its source or target, or
+/// while a haul cannot be read (it might). Returns the merged hauls whose target it is: their proof will
+/// read as unproven once the target is gone.
+pub fn refuse_an_open_haul(pallet: &str, hauls: &HaulsRead) -> Result<Vec<String>, String> {
+    if let Some(unreadable) = hauls.unreadable.first() {
+        return Err(format!(
+            "Cannot tell whether haul {} names pallet \"{}\": {} Nothing was deleted.",
+            unreadable.id, pallet, unreadable.reason
+        ));
+    }
+
+    let mut merged = Vec::new();
+
+    for haul in &hauls.hauls {
+        let names = haul.opened.source == pallet || haul.opened.target == pallet;
+
+        match haul.status {
+            HaulStatus::Open if names => return Err(format!(
+                "Open haul {} (\"{}\" into \"{}\") names pallet \"{}\"; merge or close the haul \
+                before deleting the pallet.",
+                haul.id, haul.opened.source, haul.opened.target, pallet
+            )),
+            HaulStatus::Merged(_) if haul.opened.target == pallet => merged.push(haul.id.clone()),
+            _ => {}
+        }
+    }
+
+    Ok(merged)
+}
+
 /// A cell's value, by the schema its name holds; an error naming why it cannot be read.
 fn readable<'c>(path: &str, cell: &'c CellRead, schema: &str) -> Result<&'c CellEnvelope, String> {
     match cell {

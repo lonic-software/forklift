@@ -101,7 +101,8 @@ The one-round-trip handshake: protocol version, refs and trust.
   "default_pallet": "main",
   "pallets": { "main": "<parcel-hash>", "@office": "<parcel-hash>" },
   "trust": { "genesis": "<hash>", "enabled_at": 1780000000, "boundary": ["<hash>"],
-             "prior_genesis": "<hash, re-genesis only>", "adopts": "<hash, re-genesis only>" }
+             "prior_genesis": "<hash, re-genesis only>", "adopts": "<hash, re-genesis only>" },
+  "tombstones": { "old-feature": "<parcel-hash>" }
 }
 ```
 
@@ -113,6 +114,16 @@ spelling. `default_pallet` is what a
 franchise (clone) checks out when the user does not choose; it is the remote's current
 pallet. A pallet that exists but has nothing stacked (unborn) is simply absent from
 `pallets`.
+
+`tombstones` (additive) maps each user pallet deleted on this remote to the head its ref held
+when it was deleted. A head that deletes pallets keeps that head as long as the tombstone stands,
+so a client that freed history because this remote held it can still fetch it, and it sends the
+map, empty when nothing was deleted. A head that cannot delete pallets sends `null` or omits the
+field, and a client reads that as "this remote does not support deleting pallets" before sending
+a `DELETE`. A name keeps its tombstone until a creation that acknowledges it (below) or the
+server's operator drops it; nothing expires one. A ref update or `DELETE` whose `old_head` names
+a pallet that is gone because it was deleted is refused with `409` naming the deletion, without
+`code` `remote_ahead`: lowering cannot resolve it.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
 endpoint) are *qualified references*: a user pallet is bare (`main`), a **meta pallet** —
@@ -326,7 +337,7 @@ pallet names are a fixed list — `office`, `manifest`, `haul`, `tags`, `kv` —
 `@name` is refused with `422` before any other check.
 
 ```json
-{ "old_head": "<hash-or-null>", "new_head": "<hash>" }
+{ "old_head": "<hash-or-null>", "new_head": "<hash>", "tombstone": "<hash, optional>" }
 ```
 
 `{name}` is one path segment, here and on every route that takes a pallet. A client
@@ -346,6 +357,10 @@ holds route of `feature`).
    must never point at missing history.
 3. **Ancestry**: `old_head` is an ancestor of `new_head` (fast-forward only; there is
    no force push in protocol v1), else `409`.
+   A creation (`old_head: null`) of a user pallet that has a tombstone must acknowledge it,
+   naming the tombstone's head in `tombstone`, and `new_head` must be that head or descend from
+   it, else `409`: the name stays reserved for the history it held. The creation clears the
+   tombstone when it lands.
 4. **Trust** (only when the remote holds an anchor):
    * for the office pallet: the whole office chain from the genesis to `new_head`
      verifies forward. Each parcel is signed by a key active in the *previous* state,
@@ -399,6 +414,26 @@ longer fails at ref-update time. It never failed on a lost tree or blob behind i
 that ancestry is trusted, by the same induction. The `audit` command is what re-proves a
 whole history.
 
+### `DELETE /v1/pallets/{name}` (additive; heads that list `tombstones`)
+
+Deletes a user pallet: its ref goes, and a tombstone holding the head it was at takes its place
+(see the handshake). Body: `{ "old_head": "<hash>" }`, the head the client read. Checks, in order:
+
+1. a meta pallet (`@name`) is refused with `422`;
+2. the operator must be allowed to move the pallet (the same rule as a ref update), else `403`;
+3. **CAS**: the current head equals `old_head`, else `409` with `code` `remote_ahead` — except
+   that a pallet already deleted at `old_head` (its tombstone holds it) answers `200`, so a retry
+   whose first try landed reads as done;
+4. the remote's `default_pallet`, which a franchise checks out, is refused with `409`, and so is
+   a pallet a checkout of the server's own warehouse stands on, one an open haul names, and any
+   pallet while a haul cannot be read.
+
+A request that passes them removes the ref and writes the tombstone atomically with respect to
+every other ref write, conditioned on the office and anchor the authorization read; when either
+moved meanwhile, the head decides again. It answers `200` with no body. The open-haul check is
+made when the request is read, so a haul opened just before the removal is not refused; it keeps
+its proposed head, and the tombstone keeps the target's.
+
 ### `POST /v1/pallets/{name}/holds` (additive)
 
 Body: `{"candidates": ["<parcel hash>", …]}` (at most 16 per request).
@@ -408,7 +443,7 @@ ancestors.
 
 - `held` — the walk from the pallet's head reached the parcel.
 - `not_held` — the walk read the pallet's whole history without reaching it, or the warehouse has
-  no such pallet.
+  no such pallet. For a deleted pallet the walk starts at its tombstone's head.
 - `unknown` — the walk stopped before it could tell: it read its step bound of parcels, ran past
   its time bound, or could not read a parcel. Both bounds are fixed on every head.
 

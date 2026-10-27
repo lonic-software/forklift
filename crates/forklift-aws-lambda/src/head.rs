@@ -273,6 +273,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // (`ref_update`) descends a recipe to presence-check its chunks before a ref moves. A
             // chunk-aware client reads this to know it may lift chunked content here.
             chunking: true,
+            // This head deletes no pallets yet, so it keeps no tombstones.
+            tombstones: None,
         })
     }
 

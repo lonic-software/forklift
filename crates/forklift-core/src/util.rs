@@ -51,6 +51,7 @@ pub mod trust_utils;
 pub mod path_utils;
 pub mod remote_utils;
 pub mod fetch_ledger;
+pub mod tombstone_utils;
 pub mod take_utils;
 pub mod held_heads;
 pub mod progress_utils;

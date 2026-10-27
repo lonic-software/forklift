@@ -3164,6 +3164,31 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+### `Restored`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A pallet brought back from its tombstone.",
+  "properties": {
+    "head": {
+      "description": "The head it is back at: the one its tombstone held.",
+      "type": "string"
+    },
+    "pallet": {
+      "description": "The pallet that was brought back.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "pallet",
+    "head"
+  ],
+  "title": "Restored",
+  "type": "object"
+}
+```
+
 ### `PalletList`
 
 ```json

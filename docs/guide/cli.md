@@ -1078,6 +1078,7 @@ forklift palletize --remote        # list the remote's pallets, against the ones
 forklift palletize --remote --all  # also the remote's meta pallets
 forklift palletize --delete old    # delete "old" (its parcels stay; `undo` brings it back)
 forklift palletize --delete old --force  # ...even when nothing else holds its work
+forklift palletize --restore old   # bring back "old", deleted in a served warehouse
 ```
 
 The list shows user pallets only by default; `--all` adds the meta pallets (the office
@@ -1138,6 +1139,17 @@ delete is undone, when 100 later journaled operations in that bay push it out, o
 removed (`bay remove`); after that, work no other pallet holds is collectable. With `--json` the
 delete reports `pallet`, `head`, `contained_by` (`pallet "<name>"`, `the remote`, or `null`
 when forced) and, when any, `merged_hauls`.
+
+In a warehouse a `forklift-server` has served, a delete also leaves a **tombstone**: the head the
+pallet was at, kept by `gc`, repacks and `scope prune` for as long as the tombstone stands, since
+clones may have freed that history because the server held it. The name stays reserved for that
+history: creating a pallet of that name is refused unless it is a re-creation that acknowledges
+the tombstone and descends from its head. `undo` of the delete is one, and so is
+`--restore <name>`, which brings the pallet back at its tombstone's head and clears the
+tombstone. It refuses, as `undo` does, while a checkout stands on the name at another head, and
+when that history no longer passes the warehouse's trust check or is no longer complete. With
+`--json` it reports `pallet` and `head`. Only the server's operator can free the name for
+unrelated history (`forklift-server tombstone drop`).
 
 ### `shift` — switch pallets (`sh`)
 

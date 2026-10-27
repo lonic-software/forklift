@@ -25,12 +25,12 @@ use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
 use forklift_core::model::hooks::{
     AdmissionHookRequest, AdmissionHookResponse, AuthenticationHookRequest,
     AuthenticationHookResponse, HookEvent, ResolutionHookRequest, ResolutionHookResponse,
-    EVENT_KEY_REVOKED, EVENT_PALLET_UPDATED, EVENT_TRUST_ESTABLISHED, EVENT_TRUST_RESET,
+    EVENT_KEY_REVOKED, EVENT_PALLET_DELETED, EVENT_PALLET_UPDATED, EVENT_TRUST_ESTABLISHED, EVENT_TRUST_RESET,
     EVENT_WAREHOUSE_CREATED,
 };
 use forklift_core::model::remote::{
     ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest,
-    MissingObjectsResponse, RefUpdateRequest,
+    MissingObjectsResponse, RefDeleteRequest, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
@@ -98,13 +98,20 @@ impl WarehouseHandle {
     /// The shared hold is tried, never waited for: this runs under the registry mutex, on a
     /// runtime thread.
     ///
+    /// The root is marked as served (`tombstone_utils::mark_served`) before the handle is
+    /// returned, durably, and a root whose mark cannot be written is refused. A first mark waits for
+    /// a bay's ref lock only when `wait` (a single root, served once at startup, under no registry);
+    /// otherwise the root is refused as busy, and a later request serves it: from then on every ref
+    /// removal there leaves a tombstone, which a client that freed its copy of a head this server
+    /// listed relies on.
+    ///
     /// A sparse root (one franchised with `--only`) is refused for good. Clients treat a served
     /// head as proof that the server holds its whole closure: scope-prune frees local copies of
     /// what the remote heads reach, so a sparse root would let a client free content the server
     /// cannot serve back. Checking once, here, is enough because a full root never turns sparse:
     /// of the fetch-scope writers, franchise sets it as it creates the warehouse, `expand` never
     /// widens one to full, and scope-prune only narrows one that is already sparse.
-    fn serving(root: PathBuf) -> Result<WarehouseHandle, ServingRefusal> {
+    fn serving(root: PathBuf, wait: bool) -> Result<WarehouseHandle, ServingRefusal> {
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
         // absolute path or an open file, so they stay valid once the scope drops).
@@ -122,7 +129,15 @@ impl WarehouseHandle {
             }
 
             let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
-            (serve_lock, StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?)
+            let store_access = StoreAccessLock::try_shared().map_err(ServingRefusal::Busy)?;
+
+            if !forklift_core::util::tombstone_utils::mark_served(wait).map_err(ServingRefusal::Unreadable)? {
+                return Err(ServingRefusal::Busy(
+                    "A command in this warehouse is changing its pallets. Try again once it finishes.".to_string()
+                ));
+            }
+
+            (serve_lock, store_access)
         };
         let mut handle = WarehouseHandle::new(root);
         handle._serve_lock = Some(serve_lock);
@@ -141,7 +156,7 @@ enum ServingRefusal {
     /// It holds a franchise that has not finished: it is resumed or deleted first.
     Unfinished(String),
 
-    /// Its fetch scope could not be read.
+    /// Its fetch scope could not be read, or its served mark could not be read or written.
     Unreadable(String),
 
     /// It is sparse, and is never served.
@@ -680,7 +695,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
             // Hold the serve lock for the served root for the process lifetime: a second
             // server on the same root is refused here rather than silently breaking the CAS.
-            let handle = WarehouseHandle::serving(root.clone())
+            let handle = WarehouseHandle::serving(root.clone(), true)
                 .map_err(|refusal| refusal.message(&format!("\"{}\"", root.to_string_lossy())))?;
             ServeMode::Single(Arc::new(handle))
         }
@@ -789,7 +804,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .route("/objects/{hash}", get(get_object).put(put_object))
         .route("/signatures/{hash}", get(get_signature).put(put_signature))
         .route("/trust", put(put_trust))
-        .route("/pallets/{name}", post(post_ref_update))
+        .route("/pallets/{name}", post(post_ref_update).delete(delete_ref))
         .route("/pallets/{name}/holds", post(post_holds))
         .route("/resolve", post(post_resolve))
         .route("/bundles/latest", get(get_bundle));
@@ -1004,6 +1019,62 @@ fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
     (StatusCode::CONFLICT, pallet_utils::pallet_moved_refusal(current, expected).into())
 }
 
+/// Whether user pallet `bare` is deleted at `head`: its tombstone holds that head. What a retried
+/// delete whose first try landed finds.
+fn already_deleted(bare: &str, head: &str) -> Result<bool, HandlerError> {
+    let tombstones = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?;
+
+    Ok(tombstones.get(bare).map(String::as_str) == Some(head))
+}
+
+/// [`pallet_moved`], unless the pallet expected at a head is gone because it was deleted here: then
+/// a refusal naming the deletion, since lowering cannot resolve it (a lift after a lower would be
+/// a creation, which the tombstone binds).
+fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
+                           bare: &str,
+                           current: Option<&str>,
+                           expected: Option<&str>) -> HandlerError {
+    if current.is_some() || expected.is_none() || namespace != pallet_utils::PalletNamespace::User {
+        return pallet_moved(current, expected);
+    }
+
+    match forklift_core::util::tombstone_utils::read_tombstones() {
+        Ok(tombstones) => match tombstones.get(bare) {
+            Some(head) => (StatusCode::CONFLICT, format!(
+                "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
+                history. Use another name for new work, or ask the remote's operator to drop the \
+                tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
+                bare, head, bare
+            )),
+            None => pallet_moved(current, expected),
+        },
+        Err(error) => internal(error),
+    }
+}
+
+/// The refusal for a creation of a pallet deleted on this head whose tombstone still stands: a `409`
+/// unless the writer acknowledged the tombstone and the new head descends from its head.
+fn pallet_deleted(pallet: &str, head: &str, acknowledged: bool) -> HandlerError {
+    let message = match acknowledged {
+        false => format!(
+            "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
+            history: re-creating it must acknowledge the deletion. Lift the work under another name, \
+            or ask the remote's operator to drop the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). \
+            Nothing was written.",
+            pallet, head, pallet
+        ),
+        true => format!(
+            "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
+            it: the name stays reserved for that history. Lift the work under another name, or ask \
+            the remote's operator to drop the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). \
+            Nothing was written.",
+            pallet, head, pallet
+        ),
+    };
+
+    (StatusCode::CONFLICT, message)
+}
+
 /// The refusal for a ref update whose audit consumed an office head that moved before the write:
 /// the pallet did not move, but the office state the audit trusted did. The same wording as the
 /// Lambda head's.
@@ -1071,7 +1142,10 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             installing the anchor would leave that history outside trust. Nothing was written.",
             pallet.to_wire(), found
         )),
-        moved @ (RefUpdateError::Moved(_) | RefUpdateError::Incomplete { .. } | RefUpdateError::WitnessMoved { .. }) => {
+        moved @ (RefUpdateError::Moved(_)
+            | RefUpdateError::Incomplete { .. }
+            | RefUpdateError::WitnessMoved { .. }
+            | RefUpdateError::Deleted { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
         RefUpdateError::Failed(message) => internal(message),
@@ -1647,7 +1721,7 @@ fn resolve_warehouse(state: &AppState,
     // warehouse stays refused (409) until it is replaced, and an unfinished franchise (503) until
     // it is resumed or deleted.
     let handle = Arc::new(
-        WarehouseHandle::serving(root).map_err(|refusal| match refusal {
+        WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
             ServingRefusal::Busy(reason) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, reason),
@@ -1945,6 +2019,9 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             // content here (the byte plane is the local object store, so a chunk GET/PUT is served
             // whole like any other loose object).
             chunking: true,
+            // This head deletes pallets, and every tombstone it keeps is listed, as widely as the
+            // live refs are.
+            tombstones: Some(forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?),
         })
     }).await;
 
@@ -2005,7 +2082,8 @@ static HOLDS_WALKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(M
 /// `POST /v1/pallets/{name}/holds` — which of these parcels does the pallet still hold, its head
 /// or one of the head's ancestors? A bounded walk ([`merge_utils::holds`]): a candidate it
 /// could not settle is answered `unknown`, never `not_held`. Reading history is what fetching
-/// already allows, so nothing past authentication is asked.
+/// already allows, so nothing past authentication is asked. A pallet deleted here is walked from
+/// the head its tombstone holds, which stays stored and served like a live ref's.
 async fn post_holds(State(state): State<Arc<AppState>>,
                     headers: HeaderMap,
                     Path(params): Path<PathParams>,
@@ -2048,7 +2126,13 @@ async fn post_holds(State(state): State<Arc<AppState>>,
 
     let result = blocking(warehouse, move || {
         let _permit = permit;
-        let head = pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)?;
+        let head = match pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)? {
+            Some(head) => Some(head),
+            None if pallet_ref.namespace == pallet_utils::PalletNamespace::User => {
+                forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.remove(&pallet_ref.name)
+            }
+            None => None,
+        };
 
         let holds = merge_utils::holds(head.as_deref(), &request.candidates, None, |round| {
             round.iter().map(|hash| object_utils::load_parcel(hash).map(|parcel| parcel.parents)).collect()
@@ -2685,7 +2769,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             let current = pallet_utils::get_pallet_head_in(namespace, &bare).map_err(internal)?;
 
             if current != request.old_head {
-                return Err(pallet_moved(current.as_deref(), request.old_head.as_deref()));
+                return Err(pallet_moved_or_deleted(namespace, &bare, current.as_deref(), request.old_head.as_deref()));
             }
 
             // The head is stored as given; a spelling the ref reader refuses is the request's fault,
@@ -2711,6 +2795,21 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
                     .map_err(unprocessable)?,
             };
+
+            // An early refusal too, after the closure check, so its walk of the new history reads
+            // only what is present: the ref write applies the same rule under its lock.
+            if request.old_head.is_none() && !is_meta {
+                if let Some(head) = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.remove(&bare) {
+                    let acknowledged = request.tombstone.as_deref() == Some(head.as_str());
+
+                    let descends = acknowledged
+                        && merge_utils::is_ancestor(&head, &request.new_head).map_err(internal)?;
+
+                    if !acknowledged || !descends {
+                        return Err(pallet_deleted(&bare, &head, acknowledged));
+                    }
+                }
+            }
 
             if let Some(old_head) = &request.old_head {
                 // The one sanctioned non-fast-forward: the office lift right after a
@@ -2828,7 +2927,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             };
 
             match pallet_utils::update_pallet_head_verified(
-                namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified
+                namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified,
+                request.tombstone.as_deref()
             ) {
                 Ok(()) => return Ok(events),
                 // The office or the anchor the decision consumed moved under it, the pallet did
@@ -2840,7 +2940,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     verified_closure = Some(verified);
                 }
                 Err(RefUpdateError::Moved(moved)) => {
-                    return Err(pallet_moved(moved.found.as_deref(), request.old_head.as_deref()));
+                    return Err(pallet_moved_or_deleted(namespace, &bare, moved.found.as_deref(), request.old_head.as_deref()));
                 }
                 Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
                 Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
@@ -2848,6 +2948,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     return Err((StatusCode::CONFLICT, moved.to_string()));
                 }
                 Err(incomplete @ RefUpdateError::Incomplete { .. }) => return Err(unprocessable(incomplete.to_string())),
+                Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
+                    return Err(pallet_deleted(&pallet, &head, acknowledged));
+                }
                 Err(RefUpdateError::Failed(e)) => return Err(internal(e)),
             }
 
@@ -2864,6 +2967,168 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 
             StatusCode::OK.into_response()
         }
+        Err(error) => error_response(error),
+    }
+}
+
+/// `DELETE /v1/pallets/{name}` — remove a user pallet's ref, conditioned on the head the client
+/// read (`old_head`). The removal leaves a tombstone holding that head (this root is served, so
+/// it carries the mark): gc keeps the history, the handshake lists it, and re-creating the name
+/// must descend from it and acknowledge it. Framed as [`post_ref_update`] is: the same
+/// authorization (deleting a ref is moving it), decided again when the office or the anchor moved
+/// under the write. Refused, as the local delete is, for the pallet a bay of this root stands on
+/// (the default pallet first, which a franchise checks out) and for one an open haul names.
+async fn delete_ref(State(state): State<Arc<AppState>>,
+                    headers: HeaderMap,
+                    Path(params): Path<PathParams>,
+                    Json(request): Json<RefDeleteRequest>) -> Response {
+    let principal = match check_auth(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(error) => return error_response(error),
+    };
+
+    let warehouse = match resolve_warehouse(&state, &params) {
+        Ok(warehouse) => warehouse,
+        Err(error) => return error_response(error),
+    };
+
+    let name = match param(&params, "name") {
+        Ok(name) => name,
+        Err(error) => return error_response(error),
+    };
+
+    if let Err(error) = check_admission(&state, &params, &principal, "ref_delete", Some(&name)).await {
+        return error_response(error);
+    }
+
+    let warehouse_id = params.get("warehouse").cloned();
+
+    let acting_operator = match &principal {
+        Principal::Operator(identifier) => Some(identifier.clone()),
+        _ => None,
+    };
+
+    let result = blocking(Arc::clone(&warehouse), move || {
+        let pallet_ref = pallet_utils::PalletRef::parse(&name).map_err(unprocessable)?;
+
+        if pallet_ref.namespace == pallet_utils::PalletNamespace::Meta {
+            return Err(unprocessable(format!(
+                "Meta pallet \"{}\" cannot be deleted: it is tracked metadata, not a line of work.",
+                name
+            )));
+        }
+
+        let bare = pallet_ref.name.clone();
+        let old_head = request.old_head.clone();
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+
+            // Read once per attempt, and pinned by the removal's preconditions below, as
+            // post_ref_update reads and pins them.
+            let (anchor, anchor_bytes) = match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
+                Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
+                None => (None, None),
+            };
+            let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(internal)?;
+
+            if let Principal::Operator(_) = &principal {
+                let office_state = office_state_at(&office_head)?;
+                authority_utils::may_move(&principal, &anchor, &office_state, &pallet_ref).map_err(forbidden)?;
+            }
+
+            let current = pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::User, &bare).map_err(internal)?;
+
+            if current.as_deref() != Some(old_head.as_str()) {
+                // A retried delete whose first try landed (its answer lost) finds the tombstone it
+                // wrote: the pallet is deleted at the head the client read, which is what it asked.
+                if current.is_none() && already_deleted(&bare, &old_head)? {
+                    return Ok(None);
+                }
+
+                return Err(pallet_moved_or_deleted(pallet_utils::PalletNamespace::User, &bare, current.as_deref(), Some(&old_head)));
+            }
+
+            if pallet_utils::read_position().map_err(internal)?.pallet == bare {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Pallet \"{}\" is this remote's default pallet, which a new warehouse checks \
+                        out; it cannot be deleted. Nothing was deleted.",
+                        bare
+                    ),
+                ));
+            }
+
+            if let Some((which, _)) = bay_utils::bays_on(&bare).map_err(internal)?.into_iter().next() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "A bay of this remote ({}) stands on pallet \"{}\"; it cannot be deleted. \
+                        Nothing was deleted.",
+                        which, bare
+                    ),
+                ));
+            }
+
+            // A read-time check, as the local delete's is: a haul opened after it still holds its
+            // proposed head, and the tombstone the target's last one.
+            forklift_core::util::haul_utils::refuse_an_open_haul(&bare, &forklift_core::util::haul_utils::read_hauls().map_err(internal)?)
+                .map_err(|refusal| (StatusCode::CONFLICT, refusal))?;
+
+            let preconditions = RefPreconditions {
+                office: OfficePrecondition::At(office_head),
+                anchor: match anchor_bytes {
+                    Some(bytes) => AnchorPrecondition::Bytes(bytes),
+                    None => AnchorPrecondition::Absent,
+                },
+                pallets: PalletsPrecondition::NotConsumed,
+            };
+
+            let removed = match pallet_utils::remove_pallet_head_in(
+                pallet_utils::PalletNamespace::User, &bare, &old_head, &preconditions, None
+            ) {
+                Ok(()) => true,
+                Err(RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved) if attempt < REF_UPDATE_ATTEMPTS => false,
+                // A retry racing the try that landed finds the ref gone under the lock: its
+                // tombstone at the head the client read says it is done.
+                Err(RefUpdateError::Moved(moved)) if moved.found.is_none() && already_deleted(&bare, &old_head)? => return Ok(None),
+                Err(RefUpdateError::Moved(moved)) => return Err(pallet_moved_or_deleted(
+                    pallet_utils::PalletNamespace::User, &bare, moved.found.as_deref(), Some(&old_head)
+                )),
+                Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
+                Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
+                // A failed removal can still have landed, and then its tombstone stands: what the
+                // ref holds now decides.
+                Err(RefUpdateError::Failed(e)) => match pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::User, &bare) {
+                    Ok(None) => true,
+                    _ => return Err(internal(e)),
+                },
+                Err(error) => return Err((StatusCode::CONFLICT, error.to_string())),
+            };
+
+            if removed {
+                let mut event = HookEvent::new(EVENT_PALLET_DELETED);
+                event.warehouse = warehouse_id.clone();
+                event.operator = acting_operator.clone();
+                event.pallet = Some(name.clone());
+                event.old_head = Some(old_head.clone());
+
+                return Ok(Some(event));
+            }
+        }
+    }).await;
+
+    match result {
+        Ok(Some(event)) => {
+            emit_event(&state, event);
+
+            maybe_rebuild_bundle(&state, warehouse);
+
+            StatusCode::OK.into_response()
+        }
+        Ok(None) => StatusCode::OK.into_response(),
         Err(error) => error_response(error),
     }
 }
@@ -4492,12 +4757,12 @@ mod tests {
 
         let full = base.join("full");
         mark_warehouse(&full);
-        drop(WarehouseHandle::serving(full.clone()).expect("a full root is served"));
+        drop(WarehouseHandle::serving(full.clone(), false).expect("a full root is served"));
 
         let sparse = base.join("sparse");
         mark_warehouse(&sparse);
         make_sparse(&sparse);
-        let refused = WarehouseHandle::serving(sparse.clone()).err().expect("a sparse root is refused");
+        let refused = WarehouseHandle::serving(sparse.clone(), false).err().expect("a sparse root is refused");
         assert!(matches!(refused, ServingRefusal::Sparse), "{:?}", refused);
         let message = refused.message("\"/srv/wh\"");
         assert!(message.starts_with("\"/srv/wh\" is a sparse warehouse"), "{}", message);
@@ -4509,7 +4774,7 @@ mod tests {
             let _scope = StorageRootScope::enter(&garbled);
             std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
         }
-        let refused = WarehouseHandle::serving(garbled).err().expect("an unreadable scope is refused");
+        let refused = WarehouseHandle::serving(garbled, false).err().expect("an unreadable scope is refused");
         assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
 
         let _ = std::fs::remove_dir_all(&base);
@@ -5478,7 +5743,7 @@ mod tests {
 
         let state = Arc::new(single_mode_state(fixture.root.clone()));
         let params = ref_update_params("@office");
-        let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64) };
+        let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64), tombstone: None };
 
         // The transport layer authenticates via the bearer-token map; give "dana" a
         // token so `check_auth` yields `Principal::Operator("dana")`.
@@ -5505,7 +5770,7 @@ mod tests {
         let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
 
         let params = ref_update_params("someone-elses-pallet");
-        let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64) };
+        let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64), tombstone: None };
 
         let response = post_ref_update(
             State(state), headers_with_bearer("tok-erin"), Path(params), Json(body)
@@ -5529,7 +5794,7 @@ mod tests {
         // A `new_head` that was never uploaded: this must fail *later*, on object
         // presence, never on authorization — the FORBIDDEN branch must not fire for an
         // operator who is allowed to write this pallet.
-        let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64) };
+        let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64), tombstone: None };
 
         let response = post_ref_update(
             State(state), headers_with_bearer("tok-frank"), Path(params), Json(body)
@@ -5554,7 +5819,7 @@ mod tests {
         operator_tokens.insert("tok-frank".to_string(), "frank".to_string());
         let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
 
-        let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64) };
+        let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64), tombstone: None };
         let response = post_ref_update(
             State(state), headers_with_bearer("tok-frank"), Path(ref_update_params("Main")), Json(body)
         ).await.into_response();
@@ -5585,7 +5850,7 @@ mod tests {
         post_ref_update(
             State(admin_token_state(fixture)), headers_with_bearer("tok-alice"),
             Path(ref_update_params("@office")),
-            Json(RefUpdateRequest { old_head: Some(head), new_head: promotion })
+            Json(RefUpdateRequest { old_head: Some(head), new_head: promotion, tombstone: None })
         ).await.into_response().status()
     }
 
@@ -5629,7 +5894,7 @@ mod tests {
         let response = post_ref_update(
             State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
             Path(ref_update_params("@office")),
-            Json(RefUpdateRequest { old_head: Some(held.clone()), new_head: lifted })
+            Json(RefUpdateRequest { old_head: Some(held.clone()), new_head: lifted, tombstone: None })
         ).await.into_response();
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -5814,7 +6079,7 @@ mod tests {
         let (_seam, reached, gate) = arm_office_lookup_checkpoint("quinn-seam");
 
         let params = ref_update_params("main");
-        let body = RefUpdateRequest { old_head: None, new_head };
+        let body = RefUpdateRequest { old_head: None, new_head, tombstone: None };
         let push = tokio::spawn(post_ref_update(
             State(Arc::clone(&state)), headers_with_bearer("tok-quinn-seam"), Path(params), Json(body)
         ));
@@ -5921,7 +6186,7 @@ mod tests {
         let state = Arc::new(AppState { operator_tokens, ..single_mode_state(root.clone()) });
 
         let params = ref_update_params("@office");
-        let body = RefUpdateRequest { old_head: None, new_head: genesis_hash };
+        let body = RefUpdateRequest { old_head: None, new_head: genesis_hash, tombstone: None };
 
         let response = post_ref_update(
             State(state), headers_with_bearer("tok-alice"), Path(params), Json(body)
@@ -6018,7 +6283,7 @@ mod tests {
 
         let response = post_ref_update(
             State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("office-moved")),
-            Json(RefUpdateRequest { old_head: None, new_head }),
+            Json(RefUpdateRequest { old_head: None, new_head, tombstone: None }),
         ).await.into_response();
 
         assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("office-moved").unwrap(), None,
@@ -6052,7 +6317,7 @@ mod tests {
 
         let response = post_ref_update(
             State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("anchor-moved")),
-            Json(RefUpdateRequest { old_head: None, new_head }),
+            Json(RefUpdateRequest { old_head: None, new_head, tombstone: None }),
         ).await.into_response();
 
         assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("anchor-moved").unwrap(), None,
@@ -6067,7 +6332,7 @@ mod tests {
     fn spawn_open_push(state: &Arc<AppState>, name: &str, new_head: String) -> tokio::task::JoinHandle<Response> {
         tokio::spawn(post_ref_update(
             State(Arc::clone(state)), HeaderMap::new(), Path(ref_update_params(name)),
-            Json(RefUpdateRequest { old_head: None, new_head }),
+            Json(RefUpdateRequest { old_head: None, new_head, tombstone: None }),
         ))
     }
 
@@ -6152,6 +6417,217 @@ mod tests {
     /// A first anchor for an empty warehouse, adopting nothing.
     fn first_anchor(boundary: Vec<String>) -> TrustAnchorDto {
         TrustAnchorDto { genesis: "0".repeat(64), enabled_at: 1, boundary, prior_genesis: None, adopts: None }
+    }
+
+    /// A parcel on `parent`, so a head on it descends from `parent`.
+    fn store_child_parcel(parent: &str, description: &str) -> String {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        use forklift_core::enums::dir_entry_type::DirEntryType;
+        use forklift_core::model::parcel::Parcel;
+
+        let mut root_object = LooseObjectBuilder::build_tree(&TreeItem::new(String::new(), String::new(), DirEntryType::Tree));
+        root_object.store().unwrap();
+
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: root_object.hash,
+            parents: vec![parent.to_string()],
+            actions: Vec::new(),
+            description: Some(description.to_string()),
+        });
+        parcel_object.store().unwrap();
+        parcel_object.hash
+    }
+
+    /// Deleting a pallet over the protocol, the tombstone it leaves, and what that tombstone
+    /// changes for the handshake, holds and a re-creation.
+    mod pallet_delete {
+        use super::*;
+        use forklift_core::util::tombstone_utils;
+
+        /// A served root (marked as `serving` marks it) whose bay stands on "main", with pallet
+        /// "side" at a head of its own; returns that head.
+        fn served_with_side(name: &str) -> (PathBuf, StorageRootScope, String) {
+            let (root, scope) = trust_warehouse(name);
+            let main = store_bare_parcel("main");
+            let side = store_bare_parcel("side");
+            pallet_utils::update_pallet_head("main", None, &main, &RefPreconditions::NONE).unwrap();
+            pallet_utils::update_pallet_head("side", None, &side, &RefPreconditions::NONE).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
+            assert!(tombstone_utils::mark_served(false).unwrap());
+
+            (root, scope, side)
+        }
+
+        async fn delete(root: &std::path::Path, name: &str, old_head: &str) -> Response {
+            delete_ref(
+                State(Arc::new(single_mode_state(root.to_path_buf()))), HeaderMap::new(), Path(ref_update_params(name)),
+                Json(RefDeleteRequest { old_head: old_head.to_string() }),
+            ).await.into_response()
+        }
+
+        async fn create(root: &std::path::Path, name: &str, new_head: &str, tombstone: Option<&str>) -> Response {
+            post_ref_update(
+                State(Arc::new(single_mode_state(root.to_path_buf()))), HeaderMap::new(), Path(ref_update_params(name)),
+                Json(RefUpdateRequest { old_head: None, new_head: new_head.to_string(), tombstone: tombstone.map(str::to_string) }),
+            ).await.into_response()
+        }
+
+        /// Revert: drop the `mark_served` call from `serving` → the served root carries no mark →
+        /// red.
+        #[test]
+        fn serving_a_root_marks_it_served() {
+            let root = scratch_dir("serving-marks");
+            mark_warehouse(&root);
+
+            drop(WarehouseHandle::serving(root.clone(), false).expect("a full root is served"));
+
+            let _scope = StorageRootScope::enter(&root);
+            assert!(tombstone_utils::is_served().unwrap(), "a served root carries the mark");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[tokio::test]
+        async fn a_delete_removes_the_ref_and_the_handshake_lists_its_tombstone() {
+            let (root, _scope, side) = served_with_side("delete-lands");
+
+            let response = delete(&root, "side", &side).await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{}", body_text(response).await);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
+
+            let info = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(PathParams::new()))
+                .await.into_response();
+            let info: WarehouseInfo = serde_json::from_str(&body_text(info).await).unwrap();
+            assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
+            assert!(!info.pallets.contains_key("side"), "a deleted pallet is not listed");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Revert: map the moved ref to `pallet_moved` alone → the refusal says "Lower and retry"
+        /// → red.
+        #[tokio::test]
+        async fn a_lift_onto_a_pallet_deleted_here_names_the_deletion_not_a_lower() {
+            let (root, _scope, side) = served_with_side("delete-then-lift");
+            let on_it = store_child_parcel(&side, "on side");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+
+            let response = post_ref_update(
+                State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(ref_update_params("side")),
+                Json(RefUpdateRequest { old_head: Some(side.clone()), new_head: on_it, tombstone: None }),
+            ).await.into_response();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = body_text(response).await;
+            assert!(body.contains("was deleted on this remote") && !body.contains("Lower and retry"), "{}", body);
+            assert!(body.contains("tombstone drop --root <warehouse> side"), "{}", body);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Revert: drop the replay's tombstone check → the retry reads as a moved ref → red.
+        #[tokio::test]
+        async fn a_retried_delete_that_already_landed_answers_ok_and_another_head_still_conflicts() {
+            let (root, _scope, side) = served_with_side("delete-replay");
+            let main = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+
+            let replay = delete(&root, "side", &side).await;
+            assert_eq!(replay.status(), StatusCode::OK, "{}", body_text(replay).await);
+
+            let other = delete(&root, "side", &main).await;
+            assert_eq!(other.status(), StatusCode::CONFLICT, "a delete at a head the tombstone does not hold is refused");
+            assert_eq!(tombstone_utils::read_tombstones().unwrap(), BTreeMap::from([("side".to_string(), side)]));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Revert: drop the meta refusal → `@tags` is removed (or the request fails otherwise) →
+        /// red. Revert: drop the default-pallet refusal → "main" is deleted → red.
+        #[tokio::test]
+        async fn a_delete_refuses_a_meta_pallet_a_moved_ref_and_the_default_pallet() {
+            let (root, _scope, side) = served_with_side("delete-refusals");
+            let tags = store_bare_parcel("tags");
+            pallet_utils::update_meta_pallet_head("tags", None, &tags, &RefPreconditions::NONE).unwrap();
+            let main = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+
+            let meta = delete(&root, "@tags", &tags).await;
+            assert_eq!(meta.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+            let moved = delete(&root, "side", &main).await;
+            assert_eq!(moved.status(), StatusCode::CONFLICT);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(side), "a moved ref stays");
+
+            let default = delete(&root, "main", &main).await;
+            assert_eq!(default.status(), StatusCode::CONFLICT);
+            assert!(body_text(default).await.contains("default pallet"));
+            assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(main));
+
+            assert_eq!(pallet_utils::get_meta_pallet_head("tags").unwrap(), Some(tags));
+            assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "no refusal leaves a tombstone");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Revert: drop the early refusal and pass no tombstone to the write → the unacknowledged
+        /// creation lands → red. Revert: drop only the early refusal → the write refuses it all the
+        /// same (the rule lives in the ref core), so this stays green: the early refusal is not
+        /// the guard.
+        #[tokio::test]
+        async fn re_creating_a_deleted_pallet_must_acknowledge_its_tombstone_and_descend_from_it() {
+            let (root, _scope, side) = served_with_side("delete-recreate");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+            let on_it = store_child_parcel(&side, "on side");
+            let unrelated = store_bare_parcel("unrelated");
+
+            let unacknowledged = create(&root, "side", &on_it, None).await;
+            assert_eq!(unacknowledged.status(), StatusCode::CONFLICT);
+            assert!(body_text(unacknowledged).await.contains("acknowledge the deletion"));
+
+            let unrelated = create(&root, "side", &unrelated, Some(&side)).await;
+            assert_eq!(unrelated.status(), StatusCode::CONFLICT);
+            assert!(body_text(unrelated).await.contains("does not descend"));
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
+
+            let acknowledged = create(&root, "side", &on_it, Some(&side)).await;
+            assert_eq!(acknowledged.status(), StatusCode::OK, "{}", body_text(acknowledged).await);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(on_it));
+            assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "the re-creation clears the tombstone");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A re-creation whose history is not all uploaded is refused as missing history (`422`),
+        /// before any walk of it.
+        ///
+        /// Revert: run the early tombstone check before the closure check → the walk fails on the
+        /// absent parent → `500` → red.
+        #[tokio::test]
+        async fn a_re_creation_with_missing_history_is_a_422() {
+            let (root, _scope, side) = served_with_side("delete-recreate-missing");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+            let absent = store_child_parcel(&side, "never uploaded");
+            let on_absent = store_child_parcel(&absent, "uploaded");
+            let (folder, file) = file_utils::get_path_for_object(&absent).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
+
+            let response = create(&root, "side", &on_absent, Some(&side)).await;
+
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{}", body_text(response).await);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Revert: walk nothing for an absent ref in `post_holds` → the deleted head reads as not
+        /// held → red.
+        #[tokio::test]
+        async fn holds_are_answered_from_a_deleted_pallets_tombstone() {
+            let (root, _scope, side) = served_with_side("delete-holds");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+
+            let response = post_holds(
+                State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(ref_update_params("side")),
+                Json(HoldsRequest { candidates: vec![side.clone()] }),
+            ).await.into_response();
+
+            let holds: HoldsResponse = serde_json::from_str(&body_text(response).await).unwrap();
+            assert_eq!(holds.holds.get(&side), Some(&HoldAnswer::Held));
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// A storage-only warehouse entered on this thread, for a test of `PUT /v1/trust`.
@@ -6297,7 +6773,7 @@ mod tests {
 
         let response = post_ref_update(
             State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
-            Path(ref_update_params("@foo")), Json(RefUpdateRequest { old_head: None, new_head })
+            Path(ref_update_params("@foo")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
         assert_eq!(response.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -6335,7 +6811,7 @@ mod tests {
         let new_head = forged.into_inner().expect("the forged parcel was signed");
         let response = post_ref_update(
             State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
-            Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head })
+            Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
         assert_eq!(response.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -6363,7 +6839,7 @@ mod tests {
 
         let response = post_ref_update(
             State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(),
-            Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head })
+            Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
         assert_eq!(response.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -6412,13 +6888,13 @@ mod tests {
             State(Arc::clone(&state)),
             headers_with_bearer("tok-quinn"),
             Path(ref_update_params("main")),
-            Json(RefUpdateRequest { old_head: None, new_head: quinn_head }),
+            Json(RefUpdateRequest { old_head: None, new_head: quinn_head, tombstone: None }),
         ));
         let roger_push = tokio::spawn(post_ref_update(
             State(Arc::clone(&state)),
             headers_with_bearer("tok-roger"),
             Path(ref_update_params("side")),
-            Json(RefUpdateRequest { old_head: None, new_head: roger_head }),
+            Json(RefUpdateRequest { old_head: None, new_head: roger_head, tombstone: None }),
         ));
 
         let quinn_status = quinn_push.await.unwrap().into_response().status();

@@ -86,7 +86,7 @@ enum Command {
 
     /// Delete unreferenced objects (mark-and-sweep from every live root)
     #[command(
-        long_about = "Delete objects no pallet head, trust pin, or parked, consolidating or \
+        long_about = "Delete objects no pallet head, tombstone, trust pin, or parked, consolidating or \
                       staged work reaches (a failed or abandoned lift \
                       leaves verified objects behind). Unreferenced objects younger than \
                       the grace period are kept: an in-flight lift may still be uploading \
@@ -100,6 +100,42 @@ enum Command {
         /// The grace period in hours
         #[arg(long, default_value_t = 24)]
         grace_hours: u64,
+    },
+
+    /// List or drop the tombstones that pallets deleted in a served warehouse leave
+    #[command(
+        long_about = "A pallet deleted in a warehouse that has been served leaves a tombstone: \
+                      the head its ref held, which gc keeps, so the clones that freed that \
+                      history against the server can fetch it again. The name stays reserved \
+                      for that history until a re-creation that acknowledges it clears it, or \
+                      until it is dropped here."
+    )]
+    Tombstone {
+        #[command(subcommand)]
+        action: TombstoneAction,
+    },
+}
+
+/// What `forklift-server tombstone` does.
+#[derive(Subcommand)]
+enum TombstoneAction {
+    /// List each deleted pallet's tombstone and the head it holds
+    List {
+        /// The warehouse root to read
+        #[arg(long)]
+        root: String,
+    },
+
+    /// Drop a deleted pallet's tombstone: the name is free for unrelated history, and the history
+    /// it held is collected by the next gc unless something else reaches it. Refused while the
+    /// warehouse is being served
+    Drop {
+        /// The warehouse root to change
+        #[arg(long)]
+        root: String,
+
+        /// The deleted pallet's name
+        name: String,
     },
 }
 
@@ -123,6 +159,8 @@ async fn async_main() {
         Command::Prepare { root } => prepare(&root),
         Command::Bundle { root } => bundle(&root),
         Command::Gc { root, grace_hours } => gc(&root, grace_hours),
+        Command::Tombstone { action: TombstoneAction::List { root } } => list_tombstones(&root),
+        Command::Tombstone { action: TombstoneAction::Drop { root, name } } => drop_tombstone(&root, &name),
     };
 
     if let Err(e) = result {
@@ -623,6 +661,40 @@ fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
         "Scanned {} object(s): deleted {} unreferenced, kept {} within the {}h grace \
         period.",
         stats.scanned, stats.deleted, stats.kept_recent, grace_hours
+    );
+
+    Ok(())
+}
+
+/// List the tombstones of the warehouse at `root`.
+fn list_tombstones(root: &str) -> Result<(), String> {
+    let resolved = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
+
+    let tombstones = forklift_core::util::tombstone_utils::read_tombstones()?;
+
+    if tombstones.is_empty() {
+        println!("No deleted pallet has a tombstone in this warehouse.");
+    }
+
+    for (pallet, head) in tombstones {
+        println!("{} {}", head, pallet);
+    }
+
+    Ok(())
+}
+
+/// Drop deleted pallet `name`'s tombstone in the warehouse at `root`.
+fn drop_tombstone(root: &str, name: &str) -> Result<(), String> {
+    let resolved = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
+
+    let head = forklift_core::util::tombstone_utils::drop_tombstone(name)?;
+
+    println!(
+        "Dropped the tombstone of pallet \"{}\" (it held {}). The name is free, and the next gc \
+        collects that history unless something else reaches it.",
+        name, head
     );
 
     Ok(())

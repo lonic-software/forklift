@@ -47,6 +47,8 @@ one, the way out. Every writer replaces its file atomically, so a crash never le
 | `path` (in a bay's state folder) | `bay-path` | The bay's working directory. |
 | `position` (bay-local) | `position` | The current pallet's name, then the bay's base: the parcel its files stand on, empty while the pallet is unborn. See [pallet refs](PALLET_REFS.md). |
 | `scope` (bay-local), `.forklift/config/fetch-scope` | `scope` | See [the scope file format](SCOPE_FILE_FORMAT.md), which adds an empty-file rule of its own. |
+| `.forklift/served` | `served` | None. Its presence marks a warehouse a `forklift-server` has served; nothing removes it. A mark that exists but cannot be read is an error, never "not served". |
+| `.forklift/tombstones` | `tombstones` | One `<head> <pallet>` per deleted pallet of a served warehouse: the head its ref held, then its name. |
 
 Bay-local files live in the bay's state folder: `.forklift/` for the main tree,
 `.forklift/bays/<name>/` for a bay. Paths in the `bay` and `bay-path` records are filesystem

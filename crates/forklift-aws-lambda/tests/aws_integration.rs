@@ -1165,7 +1165,7 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
         assert!(head.missing(&all).expect("missing").is_empty());
 
         // The lift commits, and a stale replay conflicts.
-        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
         head.ref_update(&Principal::Static, "main", &request).expect("lift main");
 
         // The holds walk reads its rounds through S3's concurrent `get_many`, whose results keep
@@ -1338,7 +1338,7 @@ async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s(
     }
 
     // 4. The lift commits over the DynamoDB CAS.
-    let update = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let update = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     let response = edge(
         s3.clone(),
         dynamodb.clone(),
@@ -2150,7 +2150,7 @@ async fn ref_update_refuses_a_missing_chunk_and_commits_once_complete_over_s3_an
             "the recipe itself is present on the head"
         );
 
-        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
         let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a missing chunk fails the closure");
         assert_eq!(err.status, forklift_aws_lambda::Status::Unprocessable);
 

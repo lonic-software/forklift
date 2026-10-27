@@ -243,7 +243,7 @@ use crate::globals::{forklift_root, FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_INVEN
 use crate::util::{
     audit_utils, bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
     office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
-    taint_utils,
+    taint_utils, tombstone_utils,
 };
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
@@ -1428,6 +1428,10 @@ struct WalkRoots {
     /// either: `haul merge` says so when it needs the head. Like a `Gap` pin, this cannot tell a
     /// head never fetched from one held here and then lost to damage: both read as absent.
     haul_heads: Vec<String>,
+    /// The head every tombstone of a served root holds ([`GcRootSources::tombstone_heads`]), walked
+    /// like [`Self::parcels`]: it was a ref of this warehouse, which held its whole history (a
+    /// served root is never sparse), so a parcel missing under it is reported, never read as a gap.
+    tombstone_heads: Vec<String>,
     /// The parcels the git mirror's roots record names ([`GcRootSources::mirror_roots`]), walked
     /// like [`Self::haul_heads`]: the record keeps history the remote can serve again, so a parcel
     /// it names that is absent here is a gap, never a dangling reference.
@@ -1457,6 +1461,10 @@ pub(crate) struct GcRootSources {
     /// apart from [`Self::parcels`] because a haul opened elsewhere *declares* its head, which
     /// this warehouse may never have fetched: its absence is a gap, never lost data.
     pub haul_heads: Vec<String>,
+    /// The head every tombstone of a served root holds ([`tombstone_utils::tombstone_heads`]): a
+    /// pallet deleted there keeps its last head for the clones that pruned against it. Kept apart
+    /// from [`Self::parcels`] like [`Self::haul_heads`], since it is read under `bay_policy`.
+    pub tombstone_heads: Vec<String>,
     /// Every parcel the git mirror's roots record names ([`mirror_utils::read_mirror_roots`]):
     /// where each mirrored pallet's next export starts. Kept apart from [`Self::parcels`] for the
     /// reason [`Self::haul_heads`] is: the remote holds that history, so its absence here is a
@@ -1560,6 +1568,24 @@ pub(crate) fn gc_root_sources(
         },
     };
 
+    // A tombstone is the only holder of a deleted pallet's head in a served root. Read under
+    // `bay_policy` like the hauls: gc and prune refuse on an unreadable list, heal reads past it.
+    let tombstone_heads = match tombstone_utils::tombstone_heads() {
+        Ok(heads) => heads,
+        Err(e) => match bay_policy {
+            bay_utils::BayReadPolicy::FailClosed => return Err(e),
+            bay_utils::BayReadPolicy::Tolerate => {
+                degraded.push(format!(
+                    "the tombstones could not be read this run ({}); the heads of deleted pallets were \
+                    treated as held by nothing rather than blocking this command. If a newer forklift \
+                    wrote them, upgrade, then run this command again.",
+                    e
+                ));
+                Vec::new()
+            }
+        },
+    };
+
     let mirror_roots = match mirror_utils::read_mirror_roots() {
         Ok(roots) => roots.into_values().collect(),
         Err(e) => match bay_policy {
@@ -1592,7 +1618,7 @@ pub(crate) fn gc_root_sources(
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_leaves)?;
     }
 
-    Ok(GcRootSources { parcels, haul_heads, mirror_roots, pin_parcels: trust_pins.roots, shard_leaves, degraded })
+    Ok(GcRootSources { parcels, haul_heads, tombstone_heads, mirror_roots, pin_parcels: trust_pins.roots, shard_leaves, degraded })
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -1673,6 +1699,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         tags_unread,
         pin_parcels: sources.pin_parcels,
         haul_heads: sources.haul_heads,
+        tombstone_heads: sources.tombstone_heads,
         mirror_roots: sources.mirror_roots,
         shard_referenced: sources.shard_leaves,
         degraded_sources: sources.degraded,
@@ -2111,6 +2138,9 @@ fn walk_closure_for(
     let mut queue: VecDeque<(String, AbsencePolicy)> = roots.parcels.iter()
         .cloned()
         .map(|hash| (hash, AbsencePolicy::Report))
+        // A tombstone head was a ref of this warehouse, whose history it held whole (a served root
+        // is never sparse), so a parcel missing under it is lost, as under a pallet head.
+        .chain(roots.tombstone_heads.iter().map(|hash| (hash.clone(), AbsencePolicy::Report)))
         .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
         .chain(roots.haul_heads.iter().chain(&roots.mirror_roots).map(|hash| (hash.clone(), AbsencePolicy::Gap)))
         .collect();
@@ -3477,6 +3507,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: vec![(pinned.hash.clone(), office_utils::PinAbsencePolicy::Gap)],
             haul_heads: Vec::new(),
+            tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
@@ -3520,6 +3551,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: vec![(adopted.hash.clone(), office_utils::PinAbsencePolicy::Loss)],
             haul_heads: Vec::new(),
+            tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
@@ -4848,6 +4880,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: Vec::new(),
             haul_heads: vec![never_fetched.clone(), proposed.hash.clone()],
+            tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),
@@ -4858,6 +4891,44 @@ mod tests {
             walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// FORK-255: a tombstone head was a ref of this served root, which held its whole history, so
+    /// one lost to damage is reported, as a pallet head is. Mutation: queue `roots.tombstone_heads`
+    /// with `AbsencePolicy::Gap` in `walk_closure_for` → nothing reaches the sink → red.
+    #[test]
+    fn an_absent_tombstone_head_is_reported_never_a_gap() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-tombstone-heads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+
+        let lost = "c".repeat(64);
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: Vec::new(),
+            haul_heads: Vec::new(),
+            tombstone_heads: vec![lost.clone()],
+            mirror_roots: Vec::new(),
+            shard_referenced: Vec::new(),
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: Vec<String> = Vec::new();
+        {
+            let mut sink = |hash: &str| reported.push(hash.to_string());
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
+        }
+        assert_eq!(reported, vec![lost]);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4910,6 +4981,7 @@ mod tests {
             tags_unread: None,
             pin_parcels: Vec::new(),
             haul_heads: Vec::new(),
+            tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
             degraded_sources: Vec::new(),

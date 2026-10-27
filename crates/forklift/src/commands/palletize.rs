@@ -2,9 +2,8 @@ use serde::Serialize;
 use crate::commands::shift;
 use crate::output::{self, CommandOutput};
 use forklift_core::error;
-use forklift_core::util::{bay_utils, file_utils, haul_utils, journal_utils, merge_utils, take_utils};
+use forklift_core::util::{bay_utils, file_utils, haul_utils, journal_utils, merge_utils, take_utils, tombstone_utils};
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
-use forklift_core::util::haul_utils::HaulStatus;
 use forklift_core::util::pallet_utils::{self, PalletNamespace, PalletRef, PalletsPrecondition, RefPreconditions, RefUpdateError};
 use forklift_core::util::remote_utils::{self, RemoteClient};
 
@@ -26,6 +25,7 @@ use forklift_core::util::remote_utils::{self, RemoteClient};
 /// * `remote`   - List the remote's pallets instead of the local ones.
 /// * `delete`   - Delete pallet `name` instead of creating it.
 /// * `force`    - With `delete`: delete even when no other pallet holds its work.
+/// * `restore`  - Bring deleted pallet `name` back at its tombstone's head instead of creating it.
 ///
 /// # Returns
 /// * `Ok(())`      - If the command was handled successfully.
@@ -35,9 +35,11 @@ pub async fn handle_command(name: Option<String>,
                             all: bool,
                             remote: bool,
                             delete: bool,
-                            force: bool) -> Result<(), String> {
+                            force: bool,
+                            restore: bool) -> Result<(), String> {
     match name {
         Some(name) if delete => delete_pallet(&name, force).await,
+        Some(name) if restore => restore_pallet(&name),
         Some(name) => create_pallet(&name, revision.as_deref()).await,
         None if remote => list_remote_pallets(all).await,
         None => list_pallets(all),
@@ -106,8 +108,9 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
         None => {
             let head = position.base.clone();
 
-            if let Some(head) = &head {
-                pallet_utils::update_pallet_head(name, None, head, &pallet_utils::RefPreconditions::NONE)?;
+            match &head {
+                Some(head) => pallet_utils::update_pallet_head(name, None, head, &pallet_utils::RefPreconditions::NONE)?,
+                None => tombstone_utils::refuse_a_tombstoned_name(name)?,
             }
 
             pallet_utils::write_position(&pallet_utils::BayPosition::new(name, head.clone()))?;
@@ -194,7 +197,7 @@ async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
         ));
     }
 
-    let merged_hauls = refuse_an_open_haul(&reference.name, &haul_utils::read_hauls()?)?;
+    let merged_hauls = haul_utils::refuse_an_open_haul(&reference.name, &haul_utils::read_hauls()?)?;
 
     let (contained_by, preconditions) = if force {
         (None, RefPreconditions::NONE)
@@ -207,7 +210,7 @@ async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
 
     let entry = journal_utils::delete_entry(&reference.name, &head)?;
 
-    match pallet_utils::remove_pallet_head_in(PalletNamespace::User, &reference.name, &head, &preconditions, &entry) {
+    match pallet_utils::remove_pallet_head_in(PalletNamespace::User, &reference.name, &head, &preconditions, Some(&entry)) {
         Ok(()) => {}
         Err(RefUpdateError::Moved(_)) => return Err(format!(
             "Pallet \"{}\" moved while it was being deleted; nothing was deleted. Run the command \
@@ -232,36 +235,6 @@ async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
     });
 
     Ok(())
-}
-
-/// Refuse a delete of `pallet` while an open haul in `hauls` names it as its source or target, or
-/// while a haul cannot be read (it might). Returns the merged hauls whose target it is: their proof will
-/// read as unproven once the target is gone.
-fn refuse_an_open_haul(pallet: &str, hauls: &haul_utils::HaulsRead) -> Result<Vec<String>, String> {
-    if let Some(unreadable) = hauls.unreadable.first() {
-        return Err(format!(
-            "Cannot tell whether haul {} names pallet \"{}\": {} Nothing was deleted.",
-            unreadable.id, pallet, unreadable.reason
-        ));
-    }
-
-    let mut merged = Vec::new();
-
-    for haul in &hauls.hauls {
-        let names = haul.opened.source == pallet || haul.opened.target == pallet;
-
-        match haul.status {
-            HaulStatus::Open if names => return Err(format!(
-                "Open haul {} (\"{}\" into \"{}\") names pallet \"{}\"; merge or close the haul \
-                before deleting the pallet.",
-                haul.id, haul.opened.source, haul.opened.target, pallet
-            )),
-            HaulStatus::Merged(_) if haul.opened.target == pallet => merged.push(haul.id.clone()),
-            _ => {}
-        }
-    }
-
-    Ok(merged)
 }
 
 /// What holds `head` besides `pallet`: another local user pallet reaching it, which the removal
@@ -346,6 +319,32 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
     }
 
     Err(unreadable.unwrap_or(format!("{} Neither does the remote.", unheld)))
+}
+
+/// Bring pallet `name`, deleted in this served warehouse, back at the head its tombstone holds.
+fn restore_pallet(name: &str) -> Result<(), String> {
+    let head = tombstone_utils::restore_pallet(name)?;
+
+    output::emit(&Restored { pallet: name.to_string(), head });
+
+    Ok(())
+}
+
+/// A pallet brought back from its tombstone.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct Restored {
+    /// The pallet that was brought back.
+    pallet: String,
+
+    /// The head it is back at: the one its tombstone held.
+    head: String,
+}
+
+impl CommandOutput for Restored {
+    fn render_human(&self) {
+        println!("Restored pallet \"{}\" at {}.", self.pallet, self.head);
+    }
 }
 
 /// A deleted pallet.
@@ -663,6 +662,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<Palletized>(),
         crate::docgen::OutputSchema::of::<Deleted>(),
+        crate::docgen::OutputSchema::of::<Restored>(),
         crate::docgen::OutputSchema::of::<PalletList>(),
         crate::docgen::OutputSchema::of::<RemotePalletList>(),
     ]
@@ -699,7 +699,7 @@ mod tests {
                 pallets: PalletsPrecondition::Witness { pallet: "x".to_string(), head: head.clone() },
                 ..RefPreconditions::NONE
             };
-            pallet_utils::remove_pallet_head_in(PalletNamespace::User, "y", &head, &witness, &entry).unwrap();
+            pallet_utils::remove_pallet_head_in(PalletNamespace::User, "y", &head, &witness, Some(&entry)).unwrap();
         }))));
 
         let refused = test_support::block_on(delete_pallet("x", false)).expect_err("the second delete must refuse");
@@ -742,8 +742,8 @@ mod tests {
             ..Default::default()
         };
 
-        let refused = refuse_an_open_haul("side", &hauls).unwrap_err();
+        let refused = haul_utils::refuse_an_open_haul("side", &hauls).unwrap_err();
         assert!(refused.contains("Cannot tell whether haul 0123abcd names pallet \"side\""), "{}", refused);
-        assert_eq!(refuse_an_open_haul("side", &haul_utils::HaulsRead::default()), Ok(Vec::new()));
+        assert_eq!(haul_utils::refuse_an_open_haul("side", &haul_utils::HaulsRead::default()), Ok(Vec::new()));
     }
 }

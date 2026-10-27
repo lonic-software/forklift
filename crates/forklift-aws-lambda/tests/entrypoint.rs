@@ -288,7 +288,7 @@ fn the_untrusted_lift_walk_maps_every_status() {
     assert!(missing.missing.is_empty());
 
     // The lift commits.
-    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     let response = fixture.call(post_json("/v1/pallets/main", &commit));
     assert_eq!(status(&response), 200);
 
@@ -328,7 +328,7 @@ fn the_holds_endpoint_walks_the_stored_history() {
     for (hash, bytes) in &harvest.objects {
         assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
     }
-    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/main", &commit))), 200);
 
     let stranger = "0".repeat(64);
@@ -370,7 +370,7 @@ fn a_pallet_named_with_a_slash_routes_as_one_encoded_segment() {
         assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
     }
 
-    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x", &commit))), 404);
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature%2Fx", &commit))), 200);
 
@@ -431,7 +431,7 @@ fn captured_segments_and_the_session_query_are_percent_decoded() {
 fn a_ref_update_to_a_mixed_case_pallet_is_a_422() {
     let fixture = Fixture::direct();
 
-    let request = RefUpdateRequest { old_head: None, new_head: "b".repeat(64) };
+    let request = RefUpdateRequest { old_head: None, new_head: "b".repeat(64), tombstone: None };
     let response = fixture.call(post_json("/v1/pallets/Main", &request));
     assert_eq!(status(&response), 422);
     let error: serde_json::Value = body_json(&response);
@@ -759,16 +759,16 @@ fn a_trusted_lift_runs_the_audit_through_http() {
     assert_eq!(status(&fixture.call(put_json("/v1/trust", &anchor))), 200);
 
     // A user lift before the office is refused: the audit has no keys (422).
-    let premature = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let premature = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/main", &premature))), 422);
 
     // The office lifts to its meta path, then the working pallet audits clean.
-    let office = RefUpdateRequest { old_head: None, new_head: office_head.clone() };
+    let office = RefUpdateRequest { old_head: None, new_head: office_head.clone(), tombstone: None };
     assert_eq!(
         status(&fixture.call(post_json(&format!("/v1/pallets/@{}", OFFICE_PALLET_NAME), &office))),
         200
     );
-    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/main", &main))), 200);
 
     let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
@@ -856,7 +856,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
         "trust established on the shared bearer alone"
     );
 
-    let office = RefUpdateRequest { old_head: None, new_head: office_head.clone() };
+    let office = RefUpdateRequest { old_head: None, new_head: office_head.clone(), tombstone: None };
     assert_eq!(
         status(&office_fixture.call(bearer(
             "POST",
@@ -894,7 +894,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
         "seeding the office ref outside the HTTP path must not itself be refused"
     );
 
-    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(
         status(&main_fixture.call(bearer("POST", "/v1/pallets/main", serde_json::to_vec(&main).unwrap()))),
         200,
@@ -995,17 +995,17 @@ fn write_routes(fixture: &Fixture, token: &str, office_head: &str, main_head: &s
         ))),
         ("move main", call(post_json(
             "/v1/pallets/main",
-            &RefUpdateRequest { old_head: None, new_head: main_head.to_string() },
+            &RefUpdateRequest { old_head: None, new_head: main_head.to_string(), tombstone: None },
         ))),
         ("move side", call(post_json(
             "/v1/pallets/side",
-            &RefUpdateRequest { old_head: None, new_head: main_head.to_string() },
+            &RefUpdateRequest { old_head: None, new_head: main_head.to_string(), tombstone: None },
         ))),
         // Moving the office to a head that is not even an object: any caller the gate lets
         // through is refused 422 for the spelling, so a 403 here is the gate's alone.
         ("move the office", call(post_json(
             &format!("/v1/pallets/@{}", OFFICE_PALLET_NAME),
-            &RefUpdateRequest { old_head: Some(office_head.to_string()), new_head: "not-a-hash".to_string() },
+            &RefUpdateRequest { old_head: Some(office_head.to_string()), new_head: "not-a-hash".to_string(), tombstone: None },
         ))),
     ]
 }
@@ -1016,7 +1016,7 @@ fn lifted_office(harvest: &Harvest, office_head: &str) -> Fixture {
     let anchor = harvest.trust.clone().expect("trust established");
 
     assert_eq!(status(&fixture.call(bearing("admin-secret", put_json("/v1/trust", &anchor)))), 201);
-    let office = RefUpdateRequest { old_head: None, new_head: office_head.to_string() };
+    let office = RefUpdateRequest { old_head: None, new_head: office_head.to_string(), tombstone: None };
     assert_eq!(
         status(&fixture.call(bearing("admin-secret", post_json(&format!("/v1/pallets/@{}", OFFICE_PALLET_NAME), &office)))),
         200
@@ -1111,7 +1111,7 @@ fn an_untrusted_warehouse_admits_any_operator() {
     let fresh_hash = object_utils::hash_object_bytes(&fresh);
     assert_eq!(status(&fixture.call(bearing("nobody-token", put_bytes(&format!("/v1/objects/{}", fresh_hash), fresh)))), 201);
 
-    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(status(&fixture.call(bearing("nobody-token", post_json("/v1/pallets/main", &main)))), 200);
 }
 
@@ -1128,7 +1128,7 @@ fn in_multi_warehouse_routing_an_operator_writes_only_where_the_administrator_se
     let fresh = b"bytes for a warehouse nobody set up".to_vec();
     let fresh_hash = object_utils::hash_object_bytes(&fresh);
     let object = || put_bytes(&format!("/warehouses/new/v1/objects/{}", fresh_hash), fresh.clone());
-    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let main = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
 
     for token in ["wes-token", "nobody-token"] {
         assert_eq!(status(&fixture.call(bearing(token, put_json("/warehouses/new/v1/trust", &anchor)))), 403, "{}", token);
@@ -1162,7 +1162,7 @@ fn before_the_office_is_lifted_an_operator_moves_neither_a_working_nor_a_meta_pa
     assert_eq!(status(&fixture.call(bearing("admin-secret", put_json("/v1/trust", &anchor)))), 201);
 
     for pallet in ["main", "@haul"] {
-        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+        let request = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
         let response = fixture.call(bearing("rea-token", post_json(&format!("/v1/pallets/{}", pallet), &request)));
 
         assert_eq!(status(&response), 422, "{}", pallet);

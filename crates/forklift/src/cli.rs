@@ -601,7 +601,8 @@ pub enum Command {
                       listed with the current one marked; with \"--remote\", the remote's pallets \
                       are listed instead, each with how it relates to the local one. With \
                       \"--delete\", the named pallet is deleted instead: its ref goes, its parcels \
-                      stay, and \"forklift undo\" brings it back."
+                      stay, and \"forklift undo\" brings it back. With \"--restore\", a pallet \
+                      deleted in a served warehouse comes back at the head its tombstone holds."
     )]
     Palletize {
         /// The name of the new pallet; omit it to list the pallets
@@ -629,9 +630,15 @@ pub enum Command {
         delete: bool,
 
         /// With "--delete": delete even when no other pallet holds the pallet's work. It stays
-        /// recoverable by "forklift undo" only while the delete is in this bay's undo journal
+        /// recoverable by "forklift undo" while the delete is in this bay's undo journal, and in a
+        /// warehouse a server has served by "--restore" while its tombstone stands
         #[arg(long, requires = "delete")]
         force: bool,
+
+        /// Bring back the named pallet, deleted in this warehouse after it was served, at the head
+        /// its tombstone holds. Refused while a bay stands on the name at another head
+        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all", "remote", "delete"])]
+        restore: bool,
     },
 
     /// Park the work in progress and reset to the pallet head

@@ -169,11 +169,11 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// allowed to differ here the way they already differ on an unreadable bay
 /// (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
-    // Pallet heads (both namespaces), haul heads, the git mirror's roots, bay-scoped parcel roots,
-    // trust-pin roots and staged shard leaves: the sources this function shares, hash for hash, with
-    // `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`, so the two
-    // cannot drift apart (see that function's doc comment, and `collect_walk_roots`' for the
-    // superset invariant this list must stay a subset of). GC does
+    // Pallet heads (both namespaces), haul heads, tombstone heads, the git mirror's roots, bay-scoped
+    // parcel roots, trust-pin roots and staged shard leaves: the sources this function shares, hash
+    // for hash, with `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`,
+    // so the two cannot drift apart (see that function's doc comment, and `collect_walk_roots`' for
+    // the superset invariant this list must stay a subset of). GC does
     // not need the pin/ordinary distinction `collect_walk_roots` cares about (an absent root, pin
     // or ordinary, is just a gap to `collect_reachable_for_sweep` below — see this
     // function's own doc comment), so both lists are flattened into one plain `roots` bag.
@@ -191,6 +191,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
 
     let mut roots: Vec<String> = sources.parcels;
     roots.extend(sources.haul_heads);
+    roots.extend(sources.tombstone_heads);
     roots.extend(sources.mirror_roots);
     roots.extend(sources.pin_parcels.into_iter().map(|(hash, _policy)| hash));
 
@@ -523,6 +524,38 @@ pub(crate) mod tests {
         // The blob *beneath* the sealed boundary is never reached (the boundary was not descended)
         // — correct, and by the store invariant it is absent locally anyway.
         assert!(!live.contains(&f.web_blob), "nothing beneath a sealed boundary is individually marked");
+    }
+
+    /// A pallet deleted in a served root keeps its history through its tombstone: gc marks the
+    /// tombstone's head live though no ref reaches it, and refuses on a list it cannot read.
+    ///
+    /// Revert: drop the tombstone heads from `collect_live_set`'s roots → the deleted pallet's
+    /// parcel is not live → red.
+    #[test]
+    fn a_tombstone_keeps_the_deleted_pallets_history_live() {
+        let _scratch = Scratch::new("gc-tombstone");
+        let blob = store_blob("deleted work\n");
+        let tree = store_tree(&[("d.txt", &blob, DirEntryType::Normal)]);
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("deleted".to_string()),
+        });
+        parcel.store().unwrap();
+        let none = pallet_utils::RefPreconditions::NONE;
+        assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
+        pallet_utils::update_pallet_head("gone", None, &parcel.hash, &none).unwrap();
+        pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "gone", &parcel.hash, &none, None).unwrap();
+
+        let live = collect_live_set().unwrap();
+        for hash in [&parcel.hash, &tree, &blob] {
+            assert!(live.contains(hash), "the tombstone's history must be live: {}", hash);
+        }
+
+        std::fs::write(crate::globals::forklift_root().join("tombstones"), b"not a record\n").unwrap();
+        let error = collect_live_set().unwrap_err();
+        assert!(error.contains("tombstones"), "an unreadable list refuses the walk: {}", error);
     }
 
     /// FORK-150: gc is refused while any writer holds the store, and the unreachable loose object

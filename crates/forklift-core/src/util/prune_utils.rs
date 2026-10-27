@@ -151,7 +151,9 @@ fn plan_from(
     // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
     // recorded head, which no ref need still reach.
     let proposed = gc_utils::collect_reachable_for_sweep(&sources.haul_heads)?;
-    let removed = gc_utils::collect_reachable_for_sweep(removed_heads)?;
+    // A tombstone of a served root holds a deleted pallet's head as this delete's removed heads do.
+    let removed: Vec<String> = removed_heads.iter().chain(&sources.tombstone_heads).cloned().collect();
+    let removed = gc_utils::collect_reachable_for_sweep(&removed)?;
     // The git mirror's roots are held the same way: the mirror exports only what the remote held,
     // but a remote reset since would leave the only copy here.
     let mirrored = gc_utils::collect_reachable_for_sweep(&sources.mirror_roots)?;
@@ -1299,6 +1301,14 @@ mod tests {
         both.mirror_roots = vec![deleted.clone()];
         let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], both).unwrap();
         assert_eq!((plan.kept_for_hauls, plan.kept_for_mirror), (3, 0));
+
+        // A tombstone of a served root holds it as this delete's removed heads do. Mutation: leave
+        // the tombstone heads out of the removed heads → the parent's web tree is freed.
+        let mut tombstoned = root_sources().unwrap();
+        tombstoned.tombstone_heads = vec![deleted.clone()];
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], tombstoned).unwrap();
+        assert_eq!(plan.to_free, vec![f.web_blob.clone()], "a tombstone's history is kept like a deleted pallet's");
+        assert_eq!((plan.kept_for_deleted, plan.kept_unlifted), (3, 0));
 
         // A live pallet sharing the unlifted history counts it as its own.
         pallet_utils::update_pallet_head("feature", None, &deleted, &pallet_utils::RefPreconditions::NONE).unwrap();

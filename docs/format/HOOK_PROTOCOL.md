@@ -113,10 +113,10 @@ Request:
 
 ```json
 {
-  "action": "upload" | "ref_update" | "warehouse_create",
+  "action": "upload" | "ref_update" | "ref_delete" | "warehouse_create",
   "warehouse": "<warehouse id — multi-warehouse servers only>",
   "operator": "<office identifier of the acting principal, when it has one>",
-  "pallet": "<the pallet a ref_update targets>"
+  "pallet": "<the pallet a ref_update or ref_delete targets>"
 }
 ```
 
@@ -142,11 +142,11 @@ acknowledges; the response body is ignored.
 
 ```json
 {
-  "event": "pallet_updated" | "key_revoked" | "trust_established" | "trust_reset" | "warehouse_created",
+  "event": "pallet_updated" | "pallet_deleted" | "key_revoked" | "trust_established" | "trust_reset" | "warehouse_created",
   "warehouse": "<warehouse id — multi-warehouse servers only>",
   "operator": "<acting/affected office identifier, when known>",
-  "pallet": "<the moved pallet — pallet_updated>",
-  "old_head": "<head before the move; absent when the pallet was unborn>",
+  "pallet": "<the moved pallet — pallet_updated, pallet_deleted>",
+  "old_head": "<head before the move; absent when the pallet was unborn; the deleted head — pallet_deleted>",
   "new_head": "<head after the move>",
   "key_id": "<the revoked key — key_revoked>",
   "detail": "<revocation reason (retirement/compromise), or the genesis hash of trust_* events>"
@@ -155,6 +155,8 @@ acknowledges; the response body is ignored.
 
 * `pallet_updated` — a ref update was accepted (a lift; consolidations arrive the
   same way). Office lifts fire it too, with `pallet` = the office pallet.
+* `pallet_deleted` — `DELETE /v1/pallets/{name}` removed a pallet; `old_head` is the head its
+  tombstone now holds, and there is no `new_head`.
 * `key_revoked` — an accepted office lift revoked a key (`operator` is the key's
   owner). One event per newly revoked key.
 * `trust_established` / `trust_reset` — the trust anchor was set / replaced by a
