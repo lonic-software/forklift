@@ -43,6 +43,7 @@
 use std::collections::HashMap;
 
 use http::{header, Method, Request, Response, StatusCode};
+use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -561,8 +562,9 @@ fn resolve_route<B>(
         Routing::Multi => match segments.split_first() {
             Some((&"warehouses", tail)) => match tail.split_first() {
                 Some((&id, endpoint)) => {
-                    validate_warehouse_id(id)?;
-                    (id.to_string(), endpoint)
+                    let id = param(id).ok_or_else(|| not_found(path))?;
+                    validate_warehouse_id(&id)?;
+                    (id, endpoint)
                 }
                 None => return Err(not_found(path)),
             },
@@ -583,7 +585,7 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> Op
     // under `/v1`. The two disagree and no client speaks it yet, so accept both forms.
     if method == Method::POST {
         if let ["lift", session, "commit"] | ["v1", "lift", session, "commit"] = segments {
-            return Some(Route::CommitLift((*session).to_string()));
+            return Some(Route::CommitLift(param(session)?));
         }
     }
 
@@ -597,20 +599,28 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> Op
         (&Method::POST, ["objects", "missing"]) => Some(Route::Missing),
         (&Method::POST, ["objects", "upload-targets"]) => Some(Route::UploadTargets),
         (&Method::POST, ["objects", "batch"]) => Some(Route::Batch),
-        (&Method::GET, ["objects", hash]) => Some(Route::ObjectGet((*hash).to_string())),
+        (&Method::GET, ["objects", hash]) => Some(Route::ObjectGet(param(hash)?)),
         (&Method::PUT, ["objects", hash]) => Some(Route::ObjectPut {
-            hash: (*hash).to_string(),
+            hash: param(hash)?,
             session: query_param(query, "session"),
         }),
-        (&Method::GET, ["signatures", hash]) => Some(Route::SignatureGet((*hash).to_string())),
-        (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut((*hash).to_string())),
+        (&Method::GET, ["signatures", hash]) => Some(Route::SignatureGet(param(hash)?)),
+        (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut(param(hash)?)),
         (&Method::PUT, ["trust"]) => Some(Route::PutTrust),
-        (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate((*name).to_string())),
-        (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds((*name).to_string())),
+        (&Method::POST, ["pallets", name]) => Some(Route::RefUpdate(param(name)?)),
+        (&Method::POST, ["pallets", name, "holds"]) => Some(Route::Holds(param(name)?)),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
         _ => None,
     }
+}
+
+/// A captured path parameter, percent-decoded as `forklift-server`'s `Path` extractor decodes
+/// it. The path is split into segments first, so an encoded `/` stays inside its segment: a
+/// pallet named `feature/x` arrives as the one segment `feature%2Fx`. `None` for a segment that
+/// does not decode to UTF-8, which the caller turns into a `404`.
+fn param(segment: &str) -> Option<String> {
+    percent_decode_str(segment).decode_utf8().ok().map(|value| value.into_owned())
 }
 
 /// The `422` for an `upload-targets` request over [`MAX_UPLOAD_TARGETS_BATCH`] — reads exactly

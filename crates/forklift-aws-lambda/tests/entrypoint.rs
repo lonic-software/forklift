@@ -351,6 +351,42 @@ fn the_holds_endpoint_walks_the_stored_history() {
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/main/holds", &uppercase))), 422);
 }
 
+/// FORK-297: a pallet name with `/` travels as one percent-encoded segment, as the client sends
+/// it, and is decoded back to the name on both per-pallet routes. Unencoded, the name is two
+/// segments and no route.
+#[test]
+fn a_pallet_named_with_a_slash_routes_as_one_encoded_segment() {
+    let area = Area::new("slash-pallet");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main has a head");
+
+    let fixture = Fixture::direct();
+    for (hash, bytes) in &harvest.objects {
+        assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
+    }
+
+    let commit = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x", &commit))), 404);
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature%2Fx", &commit))), 200);
+
+    let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
+    assert_eq!(info.pallets.get("feature/x"), Some(&main_head));
+    assert_eq!(info.pallets.get("feature"), None);
+
+    let request = HoldsRequest { candidates: vec![main_head.clone()] };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/feature/x/holds", &request))), 404);
+    let holds: HoldsResponse = body_json(&fixture.call(post_json("/v1/pallets/feature%2Fx/holds", &request)));
+    assert_eq!(holds.holds[&main_head], HoldAnswer::Held, "the holds of feature/x, not of a prefix");
+
+    // A segment that decodes to no UTF-8 name is no route.
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/%FF", &commit))), 404);
+}
+
 /// FORK-77: a ref update naming a pallet outside the portable grammar is a 422 naming it, and
 /// no ref moves — `Main` never becomes a second spelling of `main`.
 #[test]

@@ -148,9 +148,16 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
 /// leading, trailing, or doubled `/` — is encoded independently against [`PATH_SEGMENT`].
 fn encode_path_segments(path: &str) -> String {
     path.split('/')
-        .map(|segment| utf8_percent_encode(segment, PATH_SEGMENT).to_string())
+        .map(encode_path_segment)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Percent-encode a value as ONE URL path segment against [`PATH_SEGMENT`], `/` included: a
+/// pallet name such as `feature/x` is one route parameter, which an unencoded `/` would split
+/// into two segments that no route matches.
+fn encode_path_segment(value: &str) -> String {
+    utf8_percent_encode(value, PATH_SEGMENT).to_string()
 }
 
 /// How many objects one batch-fetch request asks for: bounds the response the server
@@ -3259,7 +3266,7 @@ impl RemoteClient {
             let posture = Posture::HeadDeadline { head: self.retryable_head_budget() };
             let outcome = self.send_waiting_out_throttle(
                 posture,
-                reqwest::Method::POST, &format!("/v1/pallets/{}/holds", pallet),
+                reqwest::Method::POST, &format!("/v1/pallets/{}/holds", encode_path_segment(pallet)),
                 SendBody::json(&HoldsRequest { candidates: batch.to_vec() })?,
                 "the holds check",
             ).await?;
@@ -4230,7 +4237,7 @@ impl RemoteClient {
 
         let outcome = self.send_on(
             Posture::UnboundedNoRedirect(UnboundedTicket::Fork94),
-            reqwest::Method::POST, &format!("/v1/pallets/{}", pallet),
+            reqwest::Method::POST, &format!("/v1/pallets/{}", encode_path_segment(pallet)),
             SendBody::json(&body)?,
         ).await;
         let response = self.response_from_send_mutation(&action, outcome)?;
@@ -8093,6 +8100,13 @@ mod tests {
 
         // An empty segment (leading/trailing/doubled `/`) is preserved as empty, not collapsed.
         assert_eq!(encode_path_segments("/a//b/"), "/a//b/");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_a_slash_into_the_one_segment() {
+        assert_eq!(encode_path_segment("feature/x"), "feature%2Fx");
+        assert_eq!(encode_path_segment("@haul"), "%40haul");
+        assert_eq!(encode_path_segment("main"), "main");
     }
 
     #[test]

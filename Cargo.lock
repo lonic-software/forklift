@@ -1222,6 +1222,7 @@ dependencies = [
  "http 1.4.2",
  "lambda_http",
  "lambda_runtime",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
