@@ -315,7 +315,8 @@ mismatch present from the start: the remedy is identical, and the client cannot 
 the two apart.
 A remote may also answer `503` when the write loses to unrelated concurrent traffic rather than
 to either value actually moving. The AWS serverless head has already re-issued the write itself,
-within a small bounded budget, before it answers `503`, so the answer means the write could not
+within a small bounded budget, before it answers `503` (or stopped early, when a re-issue failed
+after an attempt of unknown fate), so the answer means the write could not
 be confirmed within that budget — and since an attempt may have timed out or still been in
 progress, the anchor may already be the new one. A `503` therefore establishes nothing about the
 anchor either way: read the trust anchor before repeating the request (repeating it unread is
@@ -397,7 +398,8 @@ office pallet, rather than a value having moved). The head re-issues that transa
 itself before answering — the transaction alone, never the audit, under one idempotency token
 per request, at most four attempts in all and only while its invocation window can afford
 another — so a `503` reaches the client only when the transaction could not be completed within
-that budget. Unlike every other status in this section, `503` makes no claim about server or
+that budget, or a re-issue failed after an attempt whose fate is unknown. Unlike every other
+status in this section, `503` makes no claim about server or
 request state, including whether the update itself landed: an attempt that timed out or was
 still in progress when the budget ran out may commit, and a retry of the identical request
 would then be answered `409`, the pallet having moved to the client's own new head. So a client
@@ -438,8 +440,8 @@ its proposed head, and the tombstone keeps the target's. Both `forklift-server` 
 serverless head serve this endpoint with these checks and answers, and the serverless head one
 more: a `503` when its storage stayed busy through every attempt it could afford, or an attempt
 may have landed and could not be confirmed. Either claims nothing about the pallet, and sending
-the same request again is always safe: a delete that landed meanwhile answers `200`, from the
-tombstone it left.
+the same request again is safe: a delete that landed meanwhile answers `200` while its tombstone
+still holds `old_head`, and any other answer is the one that request would get anyway.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 

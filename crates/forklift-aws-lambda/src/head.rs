@@ -566,7 +566,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // test protects.
         //
         // A transient refusal is re-issued, alone and under one request token, before it is
-        // answered (see `reissue.rs`); what reaches this match is the last attempt's outcome.
+        // answered (see `reissue.rs`); what reaches this match is the last attempt's outcome, or a
+        // transient end of unknown fate standing in for a fault that followed one.
         // Whether *any* attempt may have landed is kept apart from it: under one token, an
         // earlier attempt of unknown fate can still commit after a later one is refused.
         let replacement = anchor.to_anchor();
@@ -662,9 +663,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// told to "run the push again" for a re-genesis it issued would be looking for an operation
     /// it never performed.
     ///
-    /// Reached only once the head's own re-issues are spent or the invocation window cannot
-    /// afford another, so the message says the head already retried rather than inviting the
-    /// operator to wonder whether it did.
+    /// Reached only once the head's own re-issues are spent, the invocation window cannot afford
+    /// another, or one faulted after an attempt of unknown fate, so the message says the head
+    /// already retried rather than inviting the operator to wonder whether it did.
     ///
     /// When `uncertain` — some attempt of this request may yet land — the message claims nothing
     /// about what was changed and sends the operator to read the anchor first.
@@ -1163,7 +1164,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         Ok(RefHead::Deleted(tombstone)) if tombstone == old_head => Ok(()),
                         Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(uncertain.get())),
                         Ok(current) => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
-                        Err(_) => Err(self.delete_contention(uncertain.get())),
+                        Err(error) => {
+                            let mut answer = self.delete_contention(uncertain.get());
+                            answer.message.push_str(&format!(" Reading the pallet back failed too: {}", error));
+                            Err(answer)
+                        }
                     };
                 }
             }
@@ -1471,7 +1476,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// succeed with nothing having moved at all.
     ///
     /// Reached only after the head has re-issued the commit itself as many times as one budget
-    /// and the invocation window allow (claim C14, arm two; `reissue.rs`). The client's
+    /// and the invocation window allow, or a re-issue faulted after an attempt of unknown fate
+    /// (claim C14, arm two; `reissue.rs`). The client's
     /// `update_ref` has no retry path of its own for this status, so the wording says "run the
     /// push again" — an instruction a person or a script can act on — and never "retry" bare,
     /// which would imply a client-side mechanism that does not exist.

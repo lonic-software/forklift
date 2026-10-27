@@ -2441,6 +2441,7 @@ fn a_commit_of_unknown_fate_answers_503_without_claiming_nothing_moved() {
             .expect_err("a fault is a refusal");
 
         assert_eq!(err.status, status, "{name}: {}", err.message);
+        assert_eq!(err.message.contains("may or may not have been applied"), status == Status::ServiceUnavailable, "{name}: {}", err.message);
     }
 
     let (_area, head, main_head) =
@@ -3521,6 +3522,7 @@ fn an_anchor_write_of_unknown_fate_answers_503_without_claiming_nothing_changed(
         let err = head.put_trust(&Principal::Static, &mine).expect_err("a fault is a refusal");
 
         assert_eq!(err.status, status, "{}", err.message);
+        assert_eq!(err.message.contains("may or may not have been applied"), status == Status::ServiceUnavailable, "{}", err.message);
     }
 
     let head = Head::new(MemoryObjectStore::new(), TransientOnAnchorWrite::new(store, usize::MAX));
@@ -4019,6 +4021,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
         let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the ref cannot be read");
         assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
         assert!(err.message.contains(says), "{}", err.message);
+        assert!(err.message.contains("throttled"), "the read's own fault is named: {}", err.message);
     }
 
     // A fault on the re-issue does not hide an attempt of unknown fate before it: the ref decides

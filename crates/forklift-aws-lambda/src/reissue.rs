@@ -30,7 +30,9 @@
 //!
 //! What the loop returns is the last attempt's outcome. A transient one there means the budget
 //! is spent or unaffordable, and the caller answers `503` — never `409`, which would claim an
-//! input moved.
+//! input moved. A fault (`Err`) ends the loop at once; the caller answers it as the transient end
+//! of unknown fate when an earlier attempt under the token was of unknown fate, since that attempt
+//! may still land (`head.rs`'s `settled_as_transient`), and as the fault itself otherwise.
 
 use std::time::{Duration, Instant, SystemTime};
 
