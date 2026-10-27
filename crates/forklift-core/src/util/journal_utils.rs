@@ -839,7 +839,7 @@ fn is_half_undone(entry: &JournalEntry, now: &BayState) -> Result<bool, String> 
 /// writer moved on since is left alone by the put-back, so it moves nothing back. A `shift` is
 /// undone by shifting back, which puts no ref back.
 fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
-    if entry.op == "shift" || !crate::util::tombstone_utils::is_served()? {
+    if entry.op == "shift" {
         return Ok(());
     }
 
@@ -853,7 +853,9 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
 
         if pre_head == post_head
             || reference.namespace != PalletNamespace::User
-            || pallet_utils::get_pallet_head(&reference.name)?.as_deref() != Some(post_head.as_str()) {
+            || pallet_utils::get_pallet_head(&reference.name)?.as_deref() != Some(post_head.as_str())
+            // Read last, so an undo that moves no pallet back never depends on the mark.
+            || !crate::util::tombstone_utils::is_served()? {
             continue;
         }
 

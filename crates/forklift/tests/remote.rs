@@ -6080,9 +6080,10 @@ fn scope_prune_frees_nothing_on_a_forged_held_head() {
 #[test]
 fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     // A remote ref is not forward-only. The remote served `ahead` and this warehouse recorded it;
-    // then the served `main` moves back to `base` (as an undo could where the served mark was lost), and later to a head of another
-    // lineage (a pallet re-created under the name). Neither reaches `ahead`, so the remote
-    // answers `not_held` and the history only `ahead` reaches is kept both times.
+    // then the served `main` moves back to `base` (as an undo could where the served mark was
+    // lost), and later to a head of another lineage (a pallet re-created under the name). Neither
+    // reaches `ahead`, so the remote answers `not_held` and the history only `ahead` reaches is
+    // kept both times.
     let area = TestArea::new("scope-prune-remote-moved-back");
     let _server = sparse_with_docs(&area);
     let base = pallet_head(&area, "sparse", "main");
