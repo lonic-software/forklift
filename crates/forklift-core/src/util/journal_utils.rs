@@ -732,7 +732,9 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// are shared by every bay, and `restore_refs` already leaves any that moved alone.
 ///
 /// A bay that matches is still refused when the entry would put back a cherry-pick whose source
-/// this store no longer holds (see [`refuse_a_pick_without_its_source`]).
+/// this store no longer holds (see [`refuse_a_pick_without_its_source`]), and, in a served
+/// warehouse, when it would put a user pallet back (see [`refuse_a_served_rewind`]). A half-undone
+/// entry passes there, so its retry settles the bay.
 ///
 /// A delete is never refused here, nor is the bay read for it: it changed no bay state and puts
 /// none back, so nothing the bay did since stands between it and its undo.
@@ -752,12 +754,16 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     let now = BayState::read()?;
     let after = entry.after.bay_state();
 
-    if now == after {
-        return refuse_a_pick_without_its_source(entry);
+    // A half-undone entry is resumed even in a served warehouse: putting its refs back is refused
+    // there, and that refusal puts the bay back at the operation's head (see `restore_refs`).
+    if now != after && is_half_undone(entry, &now)? {
+        return Ok(());
     }
 
-    if is_half_undone(entry, &now)? {
-        return Ok(());
+    refuse_a_served_rewind(entry)?;
+
+    if now == after {
+        return refuse_a_pick_without_its_source(entry);
     }
 
     if now.current_pallet != after.current_pallet {
@@ -822,6 +828,38 @@ fn is_half_undone(entry: &JournalEntry, now: &BayState) -> Result<bool, String> 
     }
 
     Ok(pallet_utils::get_pallet_head(&before.current_pallet)? != before.current_head)
+}
+
+/// Refuses, in a served warehouse, an undo that would put a user pallet back. Every head a
+/// journaled operation wrote moved its pallet forward, so putting one back leaves a head the
+/// warehouse's clones may rely on, which nothing would root once the ref leaves it; the ref write
+/// itself is refused too (see [`pallet_utils::update_pallet_head_in`]), and this refuses before
+/// anything is written. A `shift` is undone by shifting back, which puts no ref back.
+fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
+    if entry.op == "shift" {
+        return Ok(());
+    }
+
+    let rewound = entry.before.heads.keys().find(|wire| {
+        let (Some(pre_head), Some(Some(post_head))) = (entry.before.head(wire), entry.after.heads.get(*wire)) else {
+            return false;
+        };
+
+        pre_head != post_head && PalletRef::parse(wire).is_ok_and(|reference| reference.namespace == PalletNamespace::User)
+    });
+
+    let Some(wire) = rewound else { return Ok(()) };
+
+    if !crate::util::tombstone_utils::is_served()? {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Undoing \"{}\" would move pallet \"{}\" back off the head that operation left, and this \
+        warehouse has been served, so its clones may rely on that head. Nothing was undone. To take \
+        the change out, stack a parcel that reverts it.",
+        entry.op, crate::error::sanitize(wire)
+    ))
 }
 
 /// Refuses an undo that would put back a cherry-pick whose source this store no longer holds. The
@@ -1856,6 +1894,68 @@ mod tests {
         assert_eq!(pallet_utils::get_pallet_head("victim").unwrap(), Some(hash('5')));
         assert_eq!(read().unwrap(), full, "the journal is exactly as the removal found it");
         assert_eq!(removed_heads_in(&bay_root()).unwrap(), vec![hash('7')]);
+    }
+
+    /// A journaled stack moving "main" from a parcel to a child of it; the entry and both heads.
+    fn stacked_on_a_child() -> (JournalEntry, String, String) {
+        let pre = hash('1');
+        let post = pallet_utils::tests::child_of(&pre, "stacked");
+        advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &pre).unwrap();
+
+        let before = capture().unwrap();
+        advance("main", Some(&pre), &post).unwrap();
+        push_if_changed("stack", before).unwrap();
+
+        (peek().unwrap().unwrap(), pre, post)
+    }
+
+    // Revert: drop the served refusal from the gate → the gate passes.
+    #[test]
+    fn check_undoable_refuses_putting_a_pallet_back_in_a_served_root() {
+        let _scratch = Scratch::new("gate-served");
+        let (entry, _pre, post) = stacked_on_a_child();
+        check_undoable(&entry).unwrap();
+
+        assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
+        let refused = check_undoable(&entry).unwrap_err();
+
+        assert!(refused.contains("has been served") && refused.contains("\"main\""), "{}", refused);
+        assert_eq!(pallet_utils::read_position().unwrap().base, Some(post), "the bay is untouched");
+    }
+
+    // Revert: drop the ref core's served refusal → the put-back lands after the gate passed.
+    #[test]
+    fn a_root_served_after_the_gate_refuses_the_put_back_and_keeps_the_bay_at_the_operation() {
+        let _scratch = Scratch::new("restore-served-race");
+        let (entry, _pre, post) = stacked_on_a_child();
+        check_undoable(&entry).unwrap();
+
+        assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
+        let refused = restore_refs(&entry).unwrap_err();
+
+        assert!(refused.contains("has been served"), "{}", refused);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(post.clone()));
+        assert_eq!(pallet_utils::read_position().unwrap().base, Some(post), "the bay is back at the operation");
+        assert!(check_undoable(&entry).is_err(), "a retry is refused by the gate");
+    }
+
+    // Revert: judge the served refusal before the half-undone pass → the gate refuses the retry,
+    // stranding the bay at the earlier head.
+    #[test]
+    fn a_half_undone_entry_in_a_served_root_passes_the_gate_and_its_retry_settles_the_bay() {
+        let _scratch = Scratch::new("restore-served-half");
+        let (entry, pre, post) = stacked_on_a_child();
+
+        // Where an undo that stopped after its first write leaves the bay.
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(pre))).unwrap();
+        assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
+
+        check_undoable(&entry).expect("a half-undone entry is resumed");
+        restore_refs(&entry).unwrap_err();
+
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(post.clone()));
+        assert_eq!(pallet_utils::read_position().unwrap().base, Some(post), "the bay is back at the operation");
+        assert!(check_undoable(&entry).unwrap_err().contains("has been served"));
     }
 
     #[test]

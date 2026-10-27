@@ -1158,7 +1158,8 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
         moved @ (RefUpdateError::Moved(_)
             | RefUpdateError::Incomplete { .. }
             | RefUpdateError::WitnessMoved { .. }
-            | RefUpdateError::Deleted { .. }) => {
+            | RefUpdateError::Deleted { .. }
+            | RefUpdateError::Backward { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
         RefUpdateError::Failed(message) => internal(message),
@@ -2960,6 +2961,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 Err(moved @ (RefUpdateError::PalletsMoved { .. } | RefUpdateError::WitnessMoved { .. })) => {
                     return Err((StatusCode::CONFLICT, moved.to_string()));
                 }
+                // The fast-forward check above refuses such a move first; a conflict all the same.
+                Err(backward @ RefUpdateError::Backward { .. }) => return Err((StatusCode::CONFLICT, backward.to_string())),
                 Err(incomplete @ RefUpdateError::Incomplete { .. }) => return Err(unprocessable(incomplete.to_string())),
                 Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
                     return Err(pallet_deleted(&pallet, &head, acknowledged));
