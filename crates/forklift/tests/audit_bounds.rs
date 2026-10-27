@@ -944,6 +944,28 @@ fn audit_tolerates_a_recorded_absent_spine_tree() {
     });
 }
 
+/// An in-scope blob directly in a spine tree (the scope names the file itself) is tolerated when
+/// recorded, as in the fully-in-scope walk.
+#[test]
+fn audit_tolerates_a_recorded_absent_blob_on_the_spine() {
+    let warehouse = Warehouse::new("sealed-spine-blob");
+    let head = warehouse.stack_files(&[("deep/f.txt", "f\n"), ("deep/g.txt", "g\n")], "K");
+
+    warehouse.scoped(|| {
+        let scope = MaterializationScope::from_prefixes(["deep/f.txt"]);
+        let blob = file_hash(&head, "deep/f.txt");
+        warehouse.delete_object(&blob);
+
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &scope, false)
+            .expect_err("an unrecorded absent in-scope blob is a loss");
+        assert!(err.contains(&blob), "{}", err);
+
+        warehouse.seal(&[&blob]);
+        audit_utils::verify_parcel_closure_scoped(&head, None, &scope, false)
+            .expect("a recorded absent in-scope blob is held by hash");
+    });
+}
+
 /// A record this build cannot read fails the audit rather than being taken as empty.
 #[test]
 fn an_unreadable_record_fails_the_audit() {
