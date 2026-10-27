@@ -3002,6 +3002,13 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
             let current = pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::User, &bare).map_err(internal)?;
 
             if current.as_deref() != Some(old_head.as_str()) {
+                // A retried delete whose first try landed (its answer lost) finds the tombstone it
+                // wrote: the pallet is deleted at the head the client read, which is what it asked.
+                if current.is_none()
+                    && forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.get(&bare) == Some(&old_head) {
+                    return Ok(None);
+                }
+
                 return Err(pallet_moved(current.as_deref(), Some(&old_head)));
             }
 
@@ -3065,19 +3072,20 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                 event.pallet = Some(name.clone());
                 event.old_head = Some(old_head.clone());
 
-                return Ok(event);
+                return Ok(Some(event));
             }
         }
     }).await;
 
     match result {
-        Ok(event) => {
+        Ok(Some(event)) => {
             emit_event(&state, event);
 
             maybe_rebuild_bundle(&state, warehouse);
 
             StatusCode::OK.into_response()
         }
+        Ok(None) => StatusCode::OK.into_response(),
         Err(error) => error_response(error),
     }
 }
@@ -6449,6 +6457,22 @@ mod tests {
             let info: WarehouseInfo = serde_json::from_str(&body_text(info).await).unwrap();
             assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
             assert!(!info.pallets.contains_key("side"), "a deleted pallet is not listed");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Revert: drop the replay's tombstone check → the retry reads as a moved ref → red.
+        #[tokio::test]
+        async fn a_retried_delete_that_already_landed_answers_ok_and_another_head_still_conflicts() {
+            let (root, _scope, side) = served_with_side("delete-replay");
+            let main = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+
+            let replay = delete(&root, "side", &side).await;
+            assert_eq!(replay.status(), StatusCode::OK, "{}", body_text(replay).await);
+
+            let other = delete(&root, "side", &main).await;
+            assert_eq!(other.status(), StatusCode::CONFLICT, "a delete at a head the tombstone does not hold is refused");
+            assert_eq!(tombstone_utils::read_tombstones().unwrap(), BTreeMap::from([("side".to_string(), side)]));
             let _ = std::fs::remove_dir_all(&root);
         }
 

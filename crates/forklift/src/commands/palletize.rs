@@ -108,8 +108,9 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
         None => {
             let head = position.base.clone();
 
-            if let Some(head) = &head {
-                pallet_utils::update_pallet_head(name, None, head, &pallet_utils::RefPreconditions::NONE)?;
+            match &head {
+                Some(head) => pallet_utils::update_pallet_head(name, None, head, &pallet_utils::RefPreconditions::NONE)?,
+                None => tombstone_utils::refuse_a_tombstoned_name(name)?,
             }
 
             pallet_utils::write_position(&pallet_utils::BayPosition::new(name, head.clone()))?;

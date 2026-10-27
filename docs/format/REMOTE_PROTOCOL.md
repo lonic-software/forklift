@@ -419,7 +419,9 @@ Deletes a user pallet: its ref goes, and a tombstone holding the head it was at 
 
 1. a meta pallet (`@name`) is refused with `422`;
 2. the operator must be allowed to move the pallet (the same rule as a ref update), else `403`;
-3. **CAS**: the current head equals `old_head`, else `409` with `code` `remote_ahead`;
+3. **CAS**: the current head equals `old_head`, else `409` with `code` `remote_ahead` — except
+   that a pallet already deleted at `old_head` (its tombstone holds it) answers `200`, so a retry
+   whose first try landed reads as done;
 4. the remote's `default_pallet`, which a franchise checks out, is refused with `409`, and so is
    a pallet a checkout of the server's own warehouse stands on, one an open haul names, and any
    pallet while a haul cannot be read.

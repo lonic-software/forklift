@@ -174,7 +174,7 @@ pub fn drop_tombstone(wire: &str) -> Result<String, String> {
 ///                   landing and the name reads back at the head.
 pub fn restore_pallet(wire: &str) -> Result<String, String> {
     use crate::util::journal_utils;
-    use crate::util::pallet_utils::{self, RefUpdateError};
+    use crate::util::pallet_utils::{self, RefMoved, RefUpdateError};
 
     pallet_utils::validate_pallet_name(wire)?;
 
@@ -189,13 +189,11 @@ pub fn restore_pallet(wire: &str) -> Result<String, String> {
 
     match pallet_utils::recreate_pallet_head(wire, &head, &preconditions, &head) {
         Ok(()) => Ok(head),
-        Err(RefUpdateError::Moved(moved)) => Err(match moved.found {
-            Some(found) => format!(
-                "Pallet \"{}\" exists again, at {}; it is not overwritten. {}",
-                wire, found, closing
-            ),
-            None => format!("Pallet \"{}\" changed while it was being restored. Run \"{}\" again.", wire, rerun),
-        }),
+        // A creation only reports a move when the ref exists.
+        Err(RefUpdateError::Moved(RefMoved { found: Some(found), .. })) => Err(format!(
+            "Pallet \"{}\" exists again, at {}; it is not overwritten. {}",
+            wire, found, closing
+        )),
         Err(RefUpdateError::Incomplete { missing, .. }) => Err(format!(
             "The history of deleted pallet \"{}\" ({}) is no longer complete in this warehouse: {} {}",
             wire, head, missing, closing
@@ -205,6 +203,26 @@ pub fn restore_pallet(wire: &str) -> Result<String, String> {
             _ => Err(error),
         },
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Refuse to name a new unborn pallet `wire` when the name has a tombstone. A pallet created at a
+/// head meets the tombstone in its ref write; an unborn one writes no ref until its first stack,
+/// which the tombstone would refuse only after the work was done.
+///
+/// # Returns
+/// * `Ok(())`      - The name has no tombstone.
+/// * `Err(String)` - The refusal, naming the deleted head and the way out, or why the tombstones
+///                   could not be read.
+pub fn refuse_a_tombstoned_name(wire: &str) -> Result<(), String> {
+    match read_tombstones()?.get(wire) {
+        Some(head) => Err(format!(
+            "Pallet \"{}\" was deleted in this served warehouse, at {}, and the name is kept for it. \
+            Choose another name, or bring the pallet back with \"forklift palletize --restore {}\". \
+            Nothing was created.",
+            wire, head, wire
+        )),
+        None => Ok(()),
     }
 }
 
@@ -262,6 +280,22 @@ mod tests {
 
         let _lock = RefLock::acquire().unwrap();
         assert!(mark_served().unwrap(), "a marked root is answered without the lock");
+    }
+
+    #[test]
+    fn a_tombstoned_name_is_refused_for_a_new_unborn_pallet() {
+        let _scratch = Scratch::new("reserved");
+        let head = "a".repeat(64);
+
+        refuse_a_tombstoned_name("gone").unwrap();
+
+        let lock = RefLock::acquire().unwrap();
+        write_tombstones(&lock, &BTreeMap::from([("gone".to_string(), head.clone())])).unwrap();
+        drop(lock);
+
+        let refused = refuse_a_tombstoned_name("gone").unwrap_err();
+        assert!(refused.contains(&head) && refused.contains("forklift palletize --restore gone"), "{}", refused);
+        refuse_a_tombstoned_name("other").unwrap();
     }
 
     #[test]
