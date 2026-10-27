@@ -1696,9 +1696,10 @@ correctly keeps it). It is **multi-bay-aware** — it refuses (`scope_prune_bloc
 free a path any checkout (the main tree or a bay) still materializes, so narrow that path away
 everywhere first. The pruned history is sealed by hash and re-fetchable from the origin with
 `expand`, so the prune frees only history the origin holds. It asks the remote for its pallet
-heads first, and refuses, changing nothing, if the remote cannot be reached or is not trusted.
-History those heads do not reach (stacks never lifted, or a remote that has moved on since your
-last `lower`) keeps whatever lifting it would read under the path. The report counts what was kept
+heads first, and which earlier heads recorded here it still holds (see below), and refuses,
+changing nothing, if the remote cannot be reached or is not trusted. History none of those heads
+reach (stacks never lifted, or lifted to a head the remote no longer confirms) keeps whatever
+lifting it would read under the path. The report counts what was kept
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
 then run the same `scope-prune` again, which frees the rest. Other work that exists only here is
 never freed either, whatever its path: content loaded but not yet stacked, parked parcels, an
@@ -1729,12 +1730,19 @@ scope has already narrowed but some objects are left behind. Running `scope-prun
 *same* path resumes rather than refusing "not a fetched path" — it finishes freeing whatever is
 left, or reports there is nothing left to free.
 
-`lift` and `lower` keep a small record of the remote heads they landed or were served
-(`.forklift/held-heads`, at most 16 per pallet), so that a prune can later ask the remote about
-history its current heads no longer reach; nothing reads it yet. A `lift` or `lower` that cannot
-write the record prints a `held_head_unrecorded` warning and keeps its result and exit code. A
-record that does not parse can be removed: it only names heads to ask the remote about, and the
-next `lift` or `lower` starts a new one.
+`lift`, `lower` and `franchise` keep a small record of the remote heads they landed or were served
+(`.forklift/held-heads`, at most 16 per pallet). A prune asks the remote whether it still holds
+each recorded head its current heads have moved past, and frees the history of the heads it
+confirms, so another warehouse lifting ahead does not keep your history pinned until you lower.
+A head the remote does not confirm frees nothing: one an `undo` on the server moved back past, or
+one of a pallet deleted and re-created there. When the remote cannot answer (a server too old to
+know the check, or one too busy to finish it), the prune prints a `holds_unanswered` warning
+naming the pallet and frees only what the remote's current heads allow; a `lower` of that pallet
+lets a later prune free what the remote's current head reaches. A `lift`, `lower` or `franchise`
+that cannot write the record prints a `held_head_unrecorded` warning and keeps its result and exit
+code. A record that does not parse makes a prune refuse, changing nothing; it can be removed,
+since it only names heads to ask the remote about, and the next `lift`, `lower` or `franchise`
+starts a new one.
 
 ---
 

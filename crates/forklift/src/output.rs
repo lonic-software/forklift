@@ -900,15 +900,15 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
     }
 }
 
-/// The `--json` warning code for a remote head that a lift landed or a lower was served but that
-/// could not be added to the held-heads record.
+/// The `--json` warning code for a remote head that a lift landed, or a lower or franchise was
+/// served, but that could not be added to the held-heads record.
 pub const CODE_HELD_HEAD_UNRECORDED: &str = "held_head_unrecorded";
 
 /// What to do about [`CODE_HELD_HEAD_UNRECORDED`]. The record only nominates heads for a later
 /// prune to ask the remote about, so the command's own work stands.
 pub const HELD_HEAD_UNRECORDED_NEXT_STEP: &str =
     "Resolve the reported cause; a held-heads record that does not parse can be removed, and the \
-     next lift or lower starts a new one. The command's own work is unaffected.";
+     next lift, lower or franchise starts a new one. The command's own work is unaffected.";
 
 /// Surface a remote head left out of the held-heads record, on the stderr side-channel the other
 /// warnings use: the command succeeded, and the exit code stays its own.
@@ -924,6 +924,30 @@ fn held_head_unrecorded_warning_text(mode: OutputMode, error: &str) -> String {
             forklift_core::error::sanitize_lines(error), HELD_HEAD_UNRECORDED_NEXT_STEP
         ),
         OutputMode::Json => warning_envelope(CODE_HELD_HEAD_UNRECORDED, error, HELD_HEAD_UNRECORDED_NEXT_STEP, None),
+    }
+}
+
+/// The `--json` warning code for a pallet whose recorded heads the remote did not answer about.
+pub const CODE_HOLDS_UNANSWERED: &str = "holds_unanswered";
+
+/// Name a pallet whose holds check failed, on the stderr side-channel the other warnings use: the
+/// prune freed only what the remote's current heads allow, and its exit code stays its own.
+pub fn warn_holds_unanswered(pallet: &str, error: &str) {
+    eprintln!("{}", holds_unanswered_warning_text(mode(), pallet, error));
+}
+
+/// The pure half of [`warn_holds_unanswered`], asserted in both modes without capturing stderr.
+fn holds_unanswered_warning_text(mode: OutputMode, pallet: &str, error: &str) -> String {
+    let next_step = "History only the unconfirmed heads reach was kept. Lowering that pallet (shift to \
+        it first) lets a later prune free what the remote's current head reaches; if the remote was \
+        busy or out of time, running the prune again may free more.";
+    match mode {
+        OutputMode::Human => format!(
+            "Warning: recorded heads of pallet \"{}\" were not confirmed by the remote. {} {}",
+            forklift_core::error::sanitize(pallet), forklift_core::error::sanitize_lines(error), next_step
+        ),
+        OutputMode::Json => warning_envelope(CODE_HOLDS_UNANSWERED, error, next_step,
+                                             Some(&serde_json::json!({ "pallet": pallet }))),
     }
 }
 
@@ -1230,6 +1254,20 @@ mod tests {
             value["next_step"].as_str().unwrap().contains("forklift heal"),
             "next_step: {}", value["next_step"]
         );
+    }
+
+    #[test]
+    fn the_holds_unanswered_warning_names_the_pallet_and_the_cause_in_both_modes() {
+        let error = "The remote answered 404 Not Found";
+
+        let human = holds_unanswered_warning_text(OutputMode::Human, "main", error);
+        assert!(human.contains(error) && human.contains("\"main\""), "human text: {}", human);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&holds_unanswered_warning_text(OutputMode::Json, "main", error)).unwrap();
+        assert_eq!(value["warning"], "holds_unanswered");
+        assert_eq!(value["message"], error);
+        assert_eq!(value["details"]["pallet"], "main");
     }
 
     #[test]

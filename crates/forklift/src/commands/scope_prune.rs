@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::error::{self, CoreError};
-use forklift_core::util::{bay_utils, journal_utils};
+use forklift_core::util::{bay_utils, held_heads, journal_utils};
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
@@ -48,8 +48,9 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     judge_request(&paths)?;
 
     // The remote's heads are read next, outside the store hold, so a slow remote never keeps
-    // other bays' writers out. They cannot go stale against the plan in a way that frees more: a
-    // remote ref only moves forward, so what an earlier read reaches the remote still holds.
+    // other bays' writers out. A remote ref can move after this read (an undo on the served root
+    // moves one back) and the plan cannot see it; the store hold does not reach the remote, so
+    // reading under it would leave the same window.
     let remote_heads = remote_pallet_heads().await?;
 
     // Exclusive store access before the judgement the plan uses (FORK-150). The keep-set depends
@@ -202,14 +203,21 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
     Ok(PruneRequest { post_prune, to_reclaim, all_resumed })
 }
 
-/// The remote's pallet heads, from a handshake whose trust is judged as a lower would judge it but
-/// adopts nothing. The prune frees only what history these heads reach needs, so it never runs
-/// without them: an unreachable or untrusted remote refuses the prune before anything changes.
+/// The heads whose history the remote holds: its pallet heads, from a handshake whose trust is
+/// judged as a lower would judge it but adopts nothing, and the earlier heads of the held-heads
+/// record that the remote confirms its pallets still reach. The prune frees only what history
+/// these heads reach needs, so it never runs without them: an unreachable or untrusted remote
+/// refuses the prune before anything changes.
+///
+/// A recorded head counts only when the remote answers that it holds it, so the record never frees
+/// more than the current heads alone unless the remote affirms it; when the confirmation cannot be
+/// had, the prune frees what the current heads alone allow and warns which pallet went unanswered.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - The head of every pallet the remote holds.
-/// * `Err(String)`     - If no remote is configured, it cannot be reached, or its trust state is
-///   refused; the message says nothing was changed.
+/// * `Ok(Vec<String>)` - The head of every pallet the remote holds, and the confirmed recorded
+///   heads.
+/// * `Err(String)`     - If no remote is configured, it cannot be reached, its trust state is
+///   refused, or the held-heads record does not parse; the message says nothing was changed.
 async fn remote_pallet_heads() -> Result<Vec<String>, String> {
     let note = "\"scope-prune\" asks the remote which history it holds, so that it never frees work \
         that exists only here; nothing was changed.";
@@ -218,7 +226,13 @@ async fn remote_pallet_heads() -> Result<Vec<String>, String> {
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
     remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
 
-    Ok(info.pallets.into_values().collect())
+    let confirmation = held_heads::confirmed_heads(&client, &info.pallets).await
+        .map_err(|e| error::append_to_message(e, note))?;
+    for (pallet, why) in &confirmation.unanswered {
+        output::warn_holds_unanswered(pallet, why);
+    }
+
+    Ok(info.pallets.into_values().chain(confirmation.heads).collect())
 }
 
 /// Refuse the prune if the main tree or any bay still materializes a pruned path. Every
@@ -276,7 +290,7 @@ pub(crate) struct PruneReport {
     retained_shared: usize,
 
     /// Candidates kept because lifting history the remote does not hold reads them: work stacked
-    /// here and never lifted, or lifted to a remote head not lowered here since. Some may be the
+    /// here and never lifted, or lifted to a remote head the remote did not confirm. Some may be the
     /// only copy, the rest are base trees the lift compares against; a later prune of the same
     /// path frees them once that history is lifted.
     kept_unlifted: usize,
