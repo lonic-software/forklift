@@ -2008,8 +2008,8 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     // as lost.
     let sealed = sealed_utils::read_sealed().unwrap_or_else(|error| {
         roots.degraded_sources.push(format!(
-            "objects held by hash alone could not be told apart from lost ones this run: {}",
-            error
+            "objects held by hash alone could not be told apart from lost ones this run: {}.",
+            error.trim_end_matches('.')
         ));
         SealedSet::default()
     });
