@@ -3178,6 +3178,13 @@ A command not listed here either reports only the generic human-message shape `{
     "pallet": {
       "description": "The pallet that was brought back.",
       "type": "string"
+    },
+    "remote": {
+      "description": "The remote's URL, when the pallet was restored there (`--remote`); omitted for this\nwarehouse's own.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
@@ -3189,11 +3196,71 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+### `RemoteDeleted`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A pallet deleted on the remote.",
+  "properties": {
+    "already": {
+      "description": "Whether the remote had deleted it already (at `head`), as a rerun of a delete that landed\nfinds it: nothing was sent.",
+      "type": "boolean"
+    },
+    "head": {
+      "description": "The head it was deleted at, which the remote keeps under its tombstone.",
+      "type": "string"
+    },
+    "local_head": {
+      "description": "The local pallet's head, untouched by the delete; `null` when there is no local pallet of\nthat name.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pallet": {
+      "description": "The pallet that was deleted there.",
+      "type": "string"
+    },
+    "remote": {
+      "description": "The remote's URL.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "remote",
+    "pallet",
+    "head",
+    "local_head",
+    "already"
+  ],
+  "title": "RemoteDeleted",
+  "type": "object"
+}
+```
+
 ### `PalletList`
 
 ```json
 {
   "$defs": {
+    "DeletedEntry": {
+      "description": "A deleted pallet whose tombstone still stands.",
+      "properties": {
+        "head": {
+          "description": "The head it was deleted at, which the tombstone keeps.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "head"
+      ],
+      "type": "object"
+    },
     "PalletEntry": {
       "description": "One pallet in the list.",
       "properties": {
@@ -3230,6 +3297,13 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "Whether the current pallet is unborn (no parcel stacked on it yet).",
       "type": "boolean"
     },
+    "deleted": {
+      "description": "The pallets deleted in this warehouse since a server served it, whose tombstones still\nstand; `palletize --restore <name>` brings one back. Omitted when empty.",
+      "items": {
+        "$ref": "#/$defs/DeletedEntry"
+      },
+      "type": "array"
+    },
     "meta": {
       "description": "The meta pallets in their qualified form (`@office`), present only when `--all`\nwas given.",
       "items": {
@@ -3260,6 +3334,31 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "RemoteDeletedEntry": {
+      "description": "A pallet deleted on the remote.",
+      "properties": {
+        "head": {
+          "description": "The head it was deleted at, which the remote keeps under its tombstone.",
+          "type": "string"
+        },
+        "local_head": {
+          "description": "The local pallet's head, which the remote's delete leaves alone; `null` when there is no\nlocal pallet of that name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "head",
+        "local_head"
+      ],
+      "type": "object"
+    },
     "RemotePalletEntry": {
       "description": "One remote pallet.",
       "properties": {
@@ -3318,6 +3417,13 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The remote's pallets, each against the local pallet of that name.",
   "properties": {
+    "deleted": {
+      "description": "The pallets deleted on the remote whose tombstones still stand; the remote keeps each one's\nhistory, and `palletize --restore <name> --remote` brings it back. Omitted when empty.",
+      "items": {
+        "$ref": "#/$defs/RemoteDeletedEntry"
+      },
+      "type": "array"
+    },
     "meta": {
       "description": "The remote's meta pallets in their qualified form (`@office`), listed only when `--all`\nwas given; omitted when empty.",
       "items": {

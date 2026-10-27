@@ -132,14 +132,15 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
     write_held_heads(&lock, &entries)
 }
 
-/// The recorded heads the remote confirms it still holds: for each pallet the remote lists, the
-/// candidates its current head reaches, in one [`RemoteClient::holds`] call per pallet. These are
+/// The recorded heads the remote confirms it still holds: for each pallet the remote lists or keeps
+/// a tombstone of, the candidates its head reaches, in one [`RemoteClient::holds`] call per pallet
+/// (the remote walks a deleted pallet from its tombstone). These are
 /// what a prune may add to the remote's current heads as history the remote holds.
 ///
 /// It fails closed. A candidate counts only on a `held` answer, so a forged entry, one the remote
 /// moved back past (an `undo` on the served root), one from a pallet deleted and re-created under
 /// its name, and one whose history the remote no longer has all count as not held. A pallet the
-/// remote no longer lists is not asked. One whose call fails (a head too old to have the route
+/// remote neither lists nor keeps a tombstone of is not asked. One whose call fails (a head too old to have the route
 /// answers `404`), or that the remote answers `unknown` about (it was busy or out of time),
 /// confirms none of those candidates and is named in [`Confirmation::unanswered`], so the caller
 /// can say why less was freed. A record that cannot be read or does not parse is the one error:
@@ -147,7 +148,9 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
 ///
 /// # Arguments
 /// * `client`         - The remote, already trust-checked by the caller.
-/// * `remote_pallets` - The remote's current heads by pallet wire name, from that handshake.
+/// * `remote_pallets` - The remote's heads by pallet wire name, from that handshake: each live
+///                      head, else the tombstone's
+///                      ([`crate::model::remote::WarehouseInfo::held_pallet_heads`]).
 pub async fn confirmed_heads(client: &RemoteClient, remote_pallets: &BTreeMap<String, String>) -> Result<Confirmation, String> {
     let mut confirmation = Confirmation::default();
 
@@ -187,8 +190,8 @@ pub struct Confirmation {
     pub unanswered: Vec<(String, String)>,
 }
 
-/// The candidates to ask about, by pallet: the recorded heads of every pallet the remote lists,
-/// less its current head, which the caller already counts.
+/// The candidates to ask about, by pallet: the recorded heads of every pallet in `remote_pallets`,
+/// less its head there, which the caller already counts.
 fn to_ask(entries: &[HeldHead], remote_pallets: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
     let mut to_ask: BTreeMap<String, Vec<String>> = BTreeMap::new();
 

@@ -68,6 +68,9 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
             );
         }
 
+        // Live heads only: a pallet the remote deleted (its tombstone's head) stays outside, since
+        // a deletion is how a compromised key's work is taken down, and a restore of it must not
+        // pass the audit for having been vouched for here.
         for head in info.pallets.values() {
             if !boundary.contains(head) {
                 boundary.push(head.clone());

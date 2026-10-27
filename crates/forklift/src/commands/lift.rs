@@ -25,11 +25,15 @@ const MAX_AUTO_MERGES: usize = 5;
 /// first — the key registry must be on the remote before the signed parcels arrive,
 /// because the remote audits every ref update.
 ///
+/// # Arguments
+/// * `recreate` - Re-create a pallet the remote deleted, acknowledging its tombstone (refused
+///                unless the local head descends from the tombstone's).
+///
 /// # Returns
 /// * `Ok(())`      - If the lift completed (or there was nothing to lift).
 /// * `Err(String)` - If no remote is configured, the remote is ahead, or a transfer
 ///                   failed.
-pub async fn handle_command() -> Result<(), String> {
+pub async fn handle_command(recreate: bool) -> Result<(), String> {
     ensure_origin_remote()?;
 
     let progress = events::progress();
@@ -43,6 +47,19 @@ pub async fn handle_command() -> Result<(), String> {
     loop {
         let client = RemoteClient::from_config()?;
         let info = client.fetch_info().await?;
+
+        // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
+        let position = pallet_utils::read_position()?;
+        let pallet = position.pallet.clone();
+        let local_head = pallet_utils::get_pallet_head(&pallet)?;
+
+        // A lift onto a pallet the remote deleted is refused here, before the office or any meta
+        // pallet uploads, unless it is acknowledged; the remote refuses an unacknowledged creation
+        // of a deleted pallet all the same.
+        let tombstone = match &local_head {
+            Some(head) => remote_utils::acknowledged_tombstone(&info, &pallet, head, recreate)?,
+            None => None,
+        };
 
         let office_new_parcels = match remote_utils::push_local_trust(&client, &info).await? {
             Some(LiftResult::Lifted(stats)) => Some(stats.new_parcels),
@@ -68,11 +85,7 @@ pub async fn handle_command() -> Result<(), String> {
             }
         }
 
-        // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
-        let position = pallet_utils::read_position()?;
-        let pallet = position.pallet.clone();
-
-        let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
+        let Some(head) = local_head else {
             lift_haul(&client, &info, None, &mut meta_pallets, &mut meta_failed).await;
 
             return Err(lower::with_meta_failures(format!(
@@ -117,7 +130,9 @@ pub async fn handle_command() -> Result<(), String> {
             mirror: None,
         };
 
-        let lifted = remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref(), info.chunking, &progress).await;
+        let lifted = remote_utils::lift_pallet(
+            &client, &pallet, &head, remote_head.as_deref(), tombstone.as_deref(), info.chunking, &progress
+        ).await;
 
         let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
         lift_haul(&client, &info, landed, &mut report.meta_pallets, &mut report.meta_failed).await;

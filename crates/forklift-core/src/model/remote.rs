@@ -78,6 +78,26 @@ pub struct WarehouseInfo {
     pub tombstones: Option<BTreeMap<String, String>>,
 }
 
+impl WarehouseInfo {
+    /// The head this remote holds history from for each pallet name: a listed pallet's head, else
+    /// the head of its tombstone, which the remote keeps rooted and serves until it is dropped. A
+    /// name listed with a tombstone too is taken at its live head, as the holds route walks it.
+    pub fn held_pallet_heads(&self) -> BTreeMap<String, String> {
+        let mut heads = self.pallets.clone();
+
+        for (name, head) in self.tombstones.iter().flatten() {
+            heads.entry(name.clone()).or_insert_with(|| head.clone());
+        }
+
+        heads
+    }
+
+    /// The head of the tombstone this remote keeps for pallet `name`, if it deleted it.
+    pub fn tombstone(&self, name: &str) -> Option<&String> {
+        self.tombstones.as_ref().and_then(|tombstones| tombstones.get(name))
+    }
+}
+
 /// The trust anchor on the wire (the TOML file's fields as JSON). The re-genesis
 /// fields (§8.7) are absent for an original enrollment.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -250,8 +270,9 @@ pub struct RefUpdateRequest {
     pub tombstone: Option<String>,
 }
 
-/// The body of `DELETE /v1/pallets/{name}`: the compare-and-set removal of a user pallet's ref,
-/// which leaves a tombstone (see [`WarehouseInfo::tombstones`]).
+/// The query of `DELETE /v1/pallets/{name}` (`?old_head=`; the request has no body, which a proxy
+/// may drop): the compare-and-set removal of a user pallet's ref, which leaves a tombstone (see
+/// [`WarehouseInfo::tombstones`]).
 #[derive(Serialize, Deserialize)]
 pub struct RefDeleteRequest {
     /// The head the remote is expected to have right now. A mismatch is a `409` and nothing
@@ -372,6 +393,22 @@ pub struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Revert: skip the tombstones → "gone" has no head; let them override → "both" reads at its
+    /// tombstone.
+    #[test]
+    fn a_tombstone_stands_in_for_a_pallet_the_remote_no_longer_lists() {
+        let mut info: WarehouseInfo = serde_json::from_str(
+            r#"{"protocol": "1", "pallets": {"live": "l", "both": "b"}, "default_pallet": "live"}"#
+        ).unwrap();
+        assert_eq!(info.held_pallet_heads(), info.pallets, "a head that cannot delete adds nothing");
+
+        info.tombstones = Some(BTreeMap::from([("gone".to_string(), "g".to_string()), ("both".to_string(), "t".to_string())]));
+        let held = info.held_pallet_heads();
+        assert_eq!(held.get("gone").map(String::as_str), Some("g"));
+        assert_eq!(held.get("both").map(String::as_str), Some("b"), "a live ref is taken at its head");
+        assert_eq!(held.len(), 3);
+    }
 
     /// New client × **old** server: an old error body has no `code`/`next_step`, so a new client
     /// must read them as absent (`#[serde(default)]`) rather than fail to parse.

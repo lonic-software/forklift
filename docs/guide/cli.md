@@ -1079,6 +1079,8 @@ forklift palletize --remote --all  # also the remote's meta pallets
 forklift palletize --delete old    # delete "old" (its parcels stay; `undo` brings it back)
 forklift palletize --delete old --force  # ...even when nothing else holds its work
 forklift palletize --restore old   # bring back "old", deleted in a served warehouse
+forklift palletize --delete old --remote   # delete "old" on the remote (it keeps the history)
+forklift palletize --restore old --remote  # bring "old" back on the remote
 ```
 
 The list shows user pallets only by default; `--all` adds the meta pallets (the office
@@ -1108,8 +1110,11 @@ special-case it):
 remote has, and more — `lift` from it publishes it) or `differs` (anything else: the remote moved
 on, or the two diverged — `lower <name>` fast-forwards it or reports the divergence). It fetches
 nothing and writes nothing. With `--json`, each entry carries `name`, `remote_head`, `local_head`
-(`null` when absent) and `relation`; with `--all` the meta pallets come under `meta`. A name the remote lists that this version cannot read (a server with other naming rules) is
-not compared, and is listed apart, under `unnamed`.
+(`null` when absent) and `relation`; with `--all` the meta pallets come under `meta`. A name the
+remote lists that this version cannot read (a server with other naming rules) is not compared,
+and is listed apart, under `unnamed`. Pallets deleted on the remote are listed apart too, under
+`deleted`, each with the `head` the remote keeps and the `local_head` here. In a warehouse a
+server has served, the plain list likewise carries its own deleted pallets under `deleted`.
 
 A command naming a pallet this warehouse does not hold (`shift`, `consolidate`, `audit`,
 `haul open`) refuses with `pallet_not_found` (exit 29), and names `lower <name>` when a remote is
@@ -1150,6 +1155,32 @@ tombstone. It refuses, as `undo` does, while a checkout stands on the name at an
 when that history no longer passes the warehouse's trust check or is no longer complete. With
 `--json` it reports `pallet` and `head`. Only the server's operator can free the name for
 unrelated history (`forklift-server tombstone drop`).
+
+With `--remote`, `--delete <name>` deletes the remote's pallet instead, at the head the remote
+lists: the remote keeps that head under its tombstone, so nothing it held is lost, and no clone's
+own pallet changes — this one's included. Its owner deletes it with a plain `--delete`, which
+counts the remote's tombstone as holding its work. `--restore <name> --remote` brings the pallet
+back on the remote at its tombstone's head; it needs none of that history here. Neither takes
+`--force`, and a remote that cannot delete pallets (it lists no tombstones in its handshake) is
+refused before anything is sent. The server refuses its default pallet, a pallet a checkout of its
+own warehouse stands on, and one an open haul names, and authorizes either as a move of the
+pallet. With `--json` the delete reports `remote`, `pallet`, `head`, `local_head` and `already`,
+and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has already deleted
+(as a rerun after a lost answer finds it) reports it done with `already` set, and sends nothing.
+
+A pallet deleted on the remote is not lowered or lifted as if it had never existed.
+`lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming
+`palletize --restore <name> --remote`. A `lift` that would re-create it refuses with
+`pallet_deleted_on_remote` (exit 35) before uploading anything, naming the step that fits the
+work here: when it descends from the deleted head, `lift --recreate` re-creates the pallet with it,
+acknowledging the deletion; otherwise `palletize --restore <name> --remote`, then lower and
+consolidate the remote's history into the work before lifting. To drop the work here instead,
+shift to another pallet and `palletize --delete` it.
+
+A key revoked after a pallet was deleted on the remote does not vouch for what the tombstone
+holds: the distrust boundary takes the remote's live pallets only, since deleting a pallet is how
+a compromised key's work is taken down. A restore of work signed by that key outside the boundary
+is refused by the audit like any other.
 
 ### `shift` — switch pallets (`sh`)
 
@@ -1557,10 +1588,12 @@ forklift config remote.token <secret>      # only if the server requires one
 
 ```sh
 forklift lift
+forklift lift --recreate   # re-create a pallet deleted on the remote, from work that descends from it
 ```
 
 Uploads the current pallet's new parcels to the remote and moves the remote's ref
-with a compare-and-swap. When trust is established, the office pallet and trust
+with a compare-and-swap. A pallet the remote deleted is re-created only with `--recreate`; see
+[`palletize`](#palletize--create-a-pallet--list-pallets-pz). When trust is established, the office pallet and trust
 anchor are lifted first (the server verifies every signature before accepting).
 The remote only accepts **fast-forward** updates — no force push.
 
