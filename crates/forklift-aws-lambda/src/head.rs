@@ -1159,9 +1159,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 CasOutcome::AnchorMoved => return Err(self.anchor_moved()),
                 CasOutcome::Transient(_) => {
                     // Under one token an earlier attempt may still have landed: the ref decides.
+                    // A ref that left `old_head` some other way is answered as the commit's
+                    // conflict would have been, not as contention that moved nothing.
                     return match self.refs.get_head(PalletNamespace::User, &bare).map_err(HeadError::internal)? {
                         RefHead::Deleted(tombstone) if tombstone == old_head => Ok(()),
-                        _ => Err(self.delete_contention(uncertain.get())),
+                        RefHead::Live(head) if head == old_head => Err(self.delete_contention(uncertain.get())),
+                        current => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
                     };
                 }
             }

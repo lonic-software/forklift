@@ -55,8 +55,9 @@ impl DynamoOps {
     }
 
     /// The commit for [`RefStore::compare_and_set_head`](crate::store::RefStore::compare_and_set_head)
-    /// (FORK-95 design memo, claim C13): one transaction conditioned on every movable input a
-    /// ref-update audit consumed, replacing what was a bare `update_item()` call before this
+    /// and [`RefStore::delete_head`](crate::store::RefStore::delete_head) (FORK-95 design memo,
+    /// claim C13): one transaction conditioned on every movable input the ref update's audit or
+    /// the delete's decision consumed, replacing what was a bare `update_item()` call before this
     /// wrapper method existed — `update_item` is gone from this file because nothing calls it
     /// any more (`#![deny(dead_code)]`, above, would refuse to compile it otherwise).
     pub(crate) fn transact_write_items(&self) -> TransactWriteItemsFluentBuilder {

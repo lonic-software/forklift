@@ -3774,6 +3774,8 @@ enum DeleteRace {
     LandsThenTransient,
     /// Answer every attempt as transient of unknown fate without forwarding it.
     Transient,
+    /// Run this against the shared store before the first attempt, then answer as [`Self::Transient`].
+    TransientAfter(RefCell<Option<RacingWrite>>),
 }
 
 /// Wraps a shared [`MemoryRefStore`], interfering with `delete_head` as its [`DeleteRace`]
@@ -3828,6 +3830,12 @@ impl RefStore for RacesTheDelete {
                 Ok(CasOutcome::Transient(TransientCause::FateUnknown))
             }
             DeleteRace::Transient => Ok(CasOutcome::Transient(TransientCause::FateUnknown)),
+            DeleteRace::TransientAfter(race) => {
+                if let Some(race) = race.borrow_mut().take() {
+                    race(&self.inner);
+                }
+                Ok(CasOutcome::Transient(TransientCause::FateUnknown))
+            }
         }
     }
 
@@ -3870,27 +3878,31 @@ fn racing_head(area: &Area, race: impl FnOnce(String, String) -> DeleteRace) -> 
     (store, head, feature_v2, feature_v3)
 }
 
+/// A lift of `feature` from `from` to `to`, raced against a delete.
+fn racing_lift(from: String, to: String) -> RacingWrite {
+    Box::new(move |store: &MemoryRefStore| {
+        let outcome = store
+            .compare_and_set_head(
+                pallet_utils::PalletNamespace::User,
+                "feature",
+                ExpectedHead::At(&from),
+                &to,
+                OfficePrecondition::NotConsumed,
+                None,
+                &request_token(),
+            )
+            .expect("the racing lift");
+        assert_eq!(outcome, CasOutcome::Committed);
+    })
+}
+
 /// A lift landing between the delete's read and its commit refuses the delete as moved, and the
 /// lift stands.
 #[test]
 fn a_lift_racing_the_delete_refuses_it_as_moved() {
     let area = Area::new("delete-races-lift");
-    let (store, head, feature_v2, feature_v3) = racing_head(&area, |from, to| {
-        DeleteRace::before(move |store: &MemoryRefStore| {
-            let outcome = store
-                .compare_and_set_head(
-                    pallet_utils::PalletNamespace::User,
-                    "feature",
-                    ExpectedHead::At(&from),
-                    &to,
-                    OfficePrecondition::NotConsumed,
-                    None,
-                    &request_token(),
-                )
-                .expect("the racing lift");
-            assert_eq!(outcome, CasOutcome::Committed);
-        })
-    });
+    let (store, head, feature_v2, feature_v3) =
+        racing_head(&area, |from, to| DeleteRace::Before(RefCell::new(Some(racing_lift(from, to)))));
 
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the pallet moved");
     assert_eq!(err.status, Status::Conflict);
@@ -3917,7 +3929,8 @@ fn of_two_racing_deletes_the_loser_answers_200() {
 }
 
 /// A delete answered transient on every attempt asks the ref: it answers `200` when an attempt
-/// landed, and `503` when none did, with the pallet live.
+/// landed, `503` when none did and the pallet is still live, and `remote_ahead` when the pallet
+/// moved meanwhile, since then nothing is in doubt.
 #[test]
 fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     let area = Area::new("delete-transient-landed");
@@ -3930,6 +3943,13 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_v2));
+
+    let area = Area::new("delete-transient-moved");
+    let (_, head, feature_v2, _) =
+        racing_head(&area, |from, to| DeleteRace::TransientAfter(RefCell::new(Some(racing_lift(from, to)))));
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the pallet moved");
+    assert_eq!(err.status, Status::Conflict, "{}", err.message);
+    assert_eq!(code_and_next_step(&err.message).0, "remote_ahead", "{}", err.message);
 }
 
 /// Enroll `identifier` in `dir`'s office with `role_args` (`office role`'s arguments after the

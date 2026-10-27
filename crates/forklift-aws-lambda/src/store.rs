@@ -105,7 +105,8 @@ pub enum PromoteOutcome {
     },
 }
 
-/// Whether a ref-update audit consumed the office head at all, and what it consumed if so.
+/// Whether a commit's decision (a ref update's audit, or a delete's authorization) consumed the
+/// office head at all, and what it consumed if so.
 ///
 /// Before this type existed, `compare_and_set_head` took a plain `office_head: Option<&str>`
 /// alongside `anchor: Option<&str>` — two adjacent parameters of the same type, but `None`
