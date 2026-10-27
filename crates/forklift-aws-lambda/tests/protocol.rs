@@ -4021,7 +4021,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
         let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the ref cannot be read");
         assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
         assert!(err.message.contains(says), "{}", err.message);
-        assert!(err.message.contains("throttled"), "the read's own fault is named: {}", err.message);
+        assert!(err.message.contains("(throttled). Run the delete again"), "the read's own fault is named: {}", err.message);
     }
 
     // A fault on the re-issue does not hide an attempt of unknown fate before it: the ref decides
@@ -4037,7 +4037,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert!(err.message.contains("could not be confirmed"), "{}", err.message);
-    assert!(err.message.contains("before deleting it again"), "read first, never resend blind: {}", err.message);
+    assert!(err.message.contains("Run the delete again"), "{}", err.message);
 
     let area = Area::new("delete-contended-then-fault");
     let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::Contended, false));

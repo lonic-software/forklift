@@ -439,10 +439,9 @@ made when the request is read, so a haul opened just before the removal is not r
 its proposed head, and the tombstone keeps the target's. Both `forklift-server` and the
 serverless head serve this endpoint with these checks and answers, and the serverless head one
 more: a `503` when its storage stayed busy through every attempt it could afford, or an attempt
-may have landed and could not be confirmed. Either claims nothing about the pallet. After the
-first, the same request can be sent again; after the second, a client reads the pallet's state
-(the handshake's `tombstones`) before deleting again, since a delete that landed may since have
-been restored at `old_head` itself, which an identical resend would delete.
+may have landed and could not be confirmed. Either claims nothing about the pallet, and a client
+treats both alike: it may send the same request again, which is answered from the pallet's state
+at that time — `200` when a tombstone still holds `old_head`, as one left by a delete that landed.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 
