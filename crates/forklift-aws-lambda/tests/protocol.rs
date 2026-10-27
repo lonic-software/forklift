@@ -4013,7 +4013,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert!(err.message.contains(&format!("The delete was for \"feature\" at {}.", feature_v2)), "{}", err.message);
-    assert!(err.message.contains("still live at that head"), "{}", err.message);
+    assert!(err.message.contains(&format!("still live at {} when", feature_v2)), "{}", err.message);
     assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_v2));
 
     // A ref that cannot be read leaves the fate where the attempts left it.
@@ -4045,6 +4045,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     assert!(err.message.contains("could not be confirmed"), "{}", err.message);
     assert!(err.message.contains(&format!("The delete was for \"feature\" at {}.", feature_v2)), "{}", err.message);
     assert!(!err.message.contains("None of its attempts was applied"), "{}", err.message);
+    assert!(err.message.contains(&format!("still live at {} when", feature_v2)), "{}", err.message);
 
     let area = Area::new("delete-contended-then-fault");
     let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::Contended, false));

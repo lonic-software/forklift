@@ -1433,8 +1433,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// and neither the attempts nor the ref read back confirmed it. `read_fault` is why the ref
     /// could not be read back, when it could not. Both state only what this request knows — the
     /// head it was for and, when it read the pallet back, that it was still live there — and send
-    /// the caller to look before deleting again, since a rerun deletes whatever head it then
-    /// finds. What a listing then means is the protocol's to say, not this message's.
+    /// the caller to look before deleting again, since the CLI's rerun deletes the pallet at
+    /// whatever head its handshake then finds (the endpoint itself only deletes at `old_head`).
+    /// What a listing then means is the protocol's to say, not this message's.
     fn delete_contention(&self, bare: &str, old_head: &str, uncertain: bool, read_fault: Option<&str>) -> HeadError {
         let what = match uncertain {
             true => format!("The delete could not be confirmed: {}", UNCONFIRMED),
@@ -1443,21 +1444,19 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 pallet at the same time. None of its attempts was applied."
                 .to_string(),
         };
-        let next = format!(
-            "The delete was for \"{}\" at {}. Check the remote's pallets (\"forklift palletize \
-            --remote --json\") before deleting it again: a new delete removes whatever head the \
-            pallet is at then.",
-            bare, old_head
-        );
+        let target = format!("The delete was for \"{}\" at {}.", bare, old_head);
+        let next = "Check the remote's pallets (\"forklift palletize --remote --json\") before \
+            deleting it again: \"forklift palletize --delete\" deletes the pallet at whatever head \
+            the remote then holds.";
 
         let fault = read_fault.map(|fault| fault.split_whitespace().collect::<Vec<_>>().join(" "));
         let read = match fault.as_deref().map(|fault| fault.strip_suffix('.').unwrap_or(fault)) {
             Some(fault) if !fault.is_empty() => format!(" Reading the pallet back failed too ({}).", fault),
             Some(_) => " Reading the pallet back failed too.".to_string(),
-            None => " It was still live at that head when this request read it back.".to_string(),
+            None => format!(" It was still live at {} when this request read it back.", old_head),
         };
 
-        HeadError::service_unavailable(format!("{} {}{}", what, next, read))
+        HeadError::service_unavailable(format!("{} {}{} {}", what, target, read, next))
     }
 
     /// The `409` for an office lift landing between the audit and the commit: the pallet

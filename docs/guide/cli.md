@@ -1183,7 +1183,7 @@ already deleted (as a rerun after a lost answer finds it) reports it done with `
 sends nothing. A rerun deletes the pallet at the head the remote then holds, so after a lost answer
 check that head first (`palletize --remote --json`): the pallet may have moved, or been deleted and
 created again, meanwhile. A serverless remote whose storage could not settle a delete answers with
-an error naming the head the delete was for, and what each state of that listing means.
+an error naming the head the delete was for, and sends you to that listing before deleting again.
 
 A pallet deleted on the remote is not lowered or lifted as if it had never existed.
 `lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming
