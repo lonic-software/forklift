@@ -242,9 +242,10 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
     audit_utils, bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
-    office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
+    office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     taint_utils, tombstone_utils,
 };
+use crate::util::sealed_utils::SealedSet;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 
@@ -1948,7 +1949,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     let no_corrupt: BTreeSet<String> = BTreeSet::new();
     // Unscoped: gc's live set descends every present tree whatever the fetch scope, so the
     // targeted walk must too, or it could miss a target gc would keep (the superset invariant).
-    let outcome = walk_closure_for(targets, &roots, &no_corrupt, &MaterializationScope::full(), None)?;
+    let outcome = walk_closure_for(targets, &roots, &no_corrupt, &MaterializationScope::full(), None, None)?;
     Ok(ClosureWalkResult {
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
@@ -2003,11 +2004,21 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         ));
         MaterializationScope::full()
     });
+    // The same holds for the sealed-object record: without it, an object held by hash alone reads
+    // as lost.
+    let sealed = sealed_utils::read_sealed().unwrap_or_else(|error| {
+        roots.degraded_sources.push(format!(
+            "the sealed-object record could not be read this run ({}), so objects held by hash \
+            alone could not be told apart from lost ones.",
+            error
+        ));
+        SealedSet::default()
+    });
     let empty_targets: BTreeSet<String> = BTreeSet::new();
     let mut absent: BTreeSet<String> = BTreeSet::new();
     let outcome = {
         let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
-        walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&mut collecting_sink))?
+        walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&sealed), Some(&mut collecting_sink))?
     };
     Ok(ClosureWalkResult {
         hashes: absent,
@@ -2121,6 +2132,7 @@ fn walk_closure_for(
     roots: &WalkRoots,
     corrupt: &BTreeSet<String>,
     scope: &MaterializationScope,
+    sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
@@ -2128,8 +2140,10 @@ fn walk_closure_for(
     let mut visited_trees = TreeVisits::default();
     let mut visited_parcels: HashSet<String> = HashSet::new();
 
+    // A staged object is the bay's own work, which the remote need not hold, so the record never
+    // holds its absence.
     for (hash, item_type) in &roots.shard_referenced {
-        check_leaf(hash, *item_type, targets, corrupt, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
+        check_leaf(hash, *item_type, targets, corrupt, None, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
     }
 
     // One combined queue, ordinary and pin roots alike — see this function's own doc comment for
@@ -2147,7 +2161,7 @@ fn walk_closure_for(
 
     drain_parcel_queue(
         &mut queue, targets, corrupt, &mut referenced, &mut unwalked, &mut visited_parcels, &mut visited_trees,
-        scope, sink,
+        scope, sealed, sink,
     )?;
 
     // F6: every declared pin root this run can positively confirm is genuinely never held — see
@@ -2315,6 +2329,7 @@ fn drain_parcel_queue(
     visited_parcels: &mut HashSet<String>,
     visited_trees: &mut TreeVisits,
     scope: &MaterializationScope,
+    sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     while let Some((hash, policy)) = queue.pop_front() {
@@ -2372,7 +2387,7 @@ fn drain_parcel_queue(
         visited_parcels.insert(hash.clone());
         let parcel = object_utils::load_parcel(&hash)?;
         walk_tree(
-            &parcel.tree_hash, targets, corrupt, referenced, unwalked, visited_trees, scope, reborrow_sink(&mut sink),
+            &parcel.tree_hash, targets, corrupt, referenced, unwalked, visited_trees, scope, sealed, reborrow_sink(&mut sink),
         )?;
 
         for parent in parcel.parents {
@@ -2407,6 +2422,7 @@ fn walk_tree(
     unwalked: &mut BTreeMap<String, String>,
     visited_trees: &mut TreeVisits,
     scope: &MaterializationScope,
+    sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     // Each entry carries its warehouse path while it is on the spine of `scope`, and `None` once
@@ -2441,7 +2457,9 @@ fn walk_tree(
         match descent {
             Descent::Present => {}
             Descent::Absent => {
-                if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
+                if !held_by_hash(sealed, corrupt, &tree_hash) {
+                    if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
+                }
                 continue;
             }
             Descent::Unwalkable(reason) => {
@@ -2481,7 +2499,7 @@ fn walk_tree(
 
         for (_, file) in tree.get_files() {
             if in_scope(&file.name).is_some() {
-                check_leaf(&file.hash, file.item_type, targets, corrupt, referenced, unwalked, reborrow_sink(&mut sink))?;
+                check_leaf(&file.hash, file.item_type, targets, corrupt, sealed, referenced, unwalked, reborrow_sink(&mut sink))?;
             }
         }
 
@@ -2559,6 +2577,7 @@ fn check_leaf(
     item_type: DirEntryType,
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
+    sealed: Option<&SealedSet>,
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
@@ -2577,7 +2596,9 @@ fn check_leaf(
         match descent {
             Descent::Present => {}
             Descent::Absent => {
-                if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
+                if !held_by_hash(sealed, corrupt, hash) {
+                    if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
+                }
                 return Ok(());
             }
             Descent::Unwalkable(reason) => {
@@ -2594,7 +2615,7 @@ fn check_leaf(
             // Enumerating-mode only (gated on the sink, not merely no-opped): the targeted walk
             // never needs a chunk's raw presence, only whether it is a target (handled above).
             if let Some(s) = reborrow_sink(&mut sink) {
-                if !file_utils::raw_object_present(&chunk)? {
+                if !file_utils::raw_object_present(&chunk)? && !sealed_utils::is_recorded(sealed, &chunk) {
                     s(&chunk);
                 }
             }
@@ -2602,12 +2623,19 @@ fn check_leaf(
     } else if let Some(s) = reborrow_sink(&mut sink) {
         // Enumerating-mode only, same reasoning: a plain leaf's bytes are never loaded by this
         // walk either way.
-        if !file_utils::raw_object_present(hash)? {
+        if !file_utils::raw_object_present(hash)? && !sealed_utils::is_recorded(sealed, hash) {
             s(hash);
         }
     }
 
     Ok(())
+}
+
+/// Whether an object the walk found absent, or reached as a corrupt boundary, is held by hash
+/// alone: recorded in `sealed` and absent. A corrupt object is present, and a recorded object that
+/// is present seals nothing, so it stays a loss.
+fn held_by_hash(sealed: Option<&SealedSet>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
+    !corrupt.contains(hash) && sealed_utils::is_recorded(sealed, hash)
 }
 
 /// Whether, and how cleanly, [`attempt_heal_driven_refetch`] actually consulted a configured
@@ -3516,7 +3544,7 @@ mod tests {
         {
             let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
             walk_closure_for(
-                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), Some(&mut sink),
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -3560,7 +3588,7 @@ mod tests {
         {
             let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
             walk_closure_for(
-                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), Some(&mut sink),
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -4888,7 +4916,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
 
@@ -4926,7 +4954,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost]);
 
@@ -4989,7 +5017,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         let outcome = {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink))
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink))
                 .expect("tag subjects must never abort the walk")
         };
 
@@ -5002,7 +5030,7 @@ mod tests {
         );
 
         let targets: BTreeSet<String> = [absent.clone(), lost_parent.clone()].into_iter().collect();
-        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), &MaterializationScope::full(), None)
+        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), &MaterializationScope::full(), None, None)
             .expect("the targeted walk runs");
         assert!(
             targeted.referenced.is_empty(),
