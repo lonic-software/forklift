@@ -821,8 +821,9 @@ fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Re
 /// what lies beneath it is not targeted: this walk only decides what may be freed, and missing a
 /// target frees less, never more. For the same reason a parcel whose path to a pruned prefix runs
 /// through a tree held by hash alone contributes no targets ([`resolve_unsealed_subtree`]). That
-/// resolver's held check is the one fail-closed probe here: a recorded tree only an unreadable
-/// pack index might hold fails the plan, which frees nothing.
+/// resolver, unlike the walk below it, fails the plan (which then frees nothing) on what it cannot
+/// read on the way to a prefix: an absent tree the record does not hold, or a recorded one only an
+/// unreadable pack index might hold.
 fn collect_prune_targets(
     user_parcels: &[String],
     pruned_prefixes: &[String],
