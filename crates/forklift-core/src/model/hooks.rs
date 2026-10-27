@@ -65,7 +65,7 @@ pub struct AuthenticationHookResponse {
 /// access decision; it can never make invalid content valid or forge anything.
 #[derive(Serialize, Deserialize)]
 pub struct AdmissionHookRequest {
-    /// What is being attempted: `upload`, `ref_update` or `warehouse_create`.
+    /// What is being attempted: `upload`, `ref_update`, `ref_delete` or `warehouse_create`.
     pub action: String,
 
     /// The warehouse id (multi-warehouse servers; absent in single mode).
@@ -77,7 +77,7 @@ pub struct AdmissionHookRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
 
-    /// The pallet a `ref_update` targets.
+    /// The pallet a `ref_update` or `ref_delete` targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pallet: Option<String>,
 }
@@ -148,6 +148,9 @@ impl HookEvent {
 /// A pallet head moved (a lift was accepted; consolidations arrive as this too —
 /// the merge parcel is the new head).
 pub const EVENT_PALLET_UPDATED: &str = "pallet_updated";
+
+/// A pallet was deleted (`old_head` carries the head its tombstone now holds).
+pub const EVENT_PALLET_DELETED: &str = "pallet_deleted";
 
 /// A key was revoked in the office (`detail` carries the reason).
 pub const EVENT_KEY_REVOKED: &str = "key_revoked";

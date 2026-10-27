@@ -548,9 +548,13 @@ pub fn restore_deleted(entry: &JournalEntry, as_name: Option<&str>) -> Result<Re
 
     exact?;
 
-    refuse_a_bay_out_of_step(&name, &head, as_name)?;
+    let rerun = match as_name {
+        Some(as_name) => format!("forklift undo --as {}", as_name),
+        None => "forklift undo".to_string(),
+    };
+    refuse_a_bay_out_of_step(&name, &head, "undo", &rerun, "Nothing was undone.")?;
 
-    let preconditions = trust_preconditions(&wire, &head)?;
+    let preconditions = trust_preconditions(&wire, &head, "Nothing was undone.")?;
 
     // The ref write verifies the history is still complete; a refusal names what to run instead.
     create_deleted(&wire, &name, as_name.is_some(), &head, &preconditions)
@@ -576,13 +580,15 @@ enum CreateRefused {
 }
 
 /// The compare-and-set [`restore_deleted`] ends in: create `name` at `head`, judging a lost race
-/// by the head the name was found at, and a failed write by reading the name back.
+/// by the head the name was found at, and a failed write by reading the name back. In a served
+/// warehouse the delete left a tombstone at `head`, which the creation acknowledges and clears; one
+/// left under `name` at another head refuses it.
 fn create_deleted(wire: &str,
                   name: &str,
                   renamed: bool,
                   head: &str,
                   preconditions: &pallet_utils::RefPreconditions) -> Result<Restored, CreateRefused> {
-    match pallet_utils::update_pallet_head_in(PalletNamespace::User, name, None, head, preconditions) {
+    match pallet_utils::recreate_pallet_head(name, head, preconditions, head) {
         Ok(()) => Ok(Restored::Created),
         Err(RefUpdateError::Moved(moved)) => settle_on(wire, name, renamed, head, moved.found).map_err(CreateRefused::Other),
         Err(RefUpdateError::Failed(error)) => match pallet_utils::get_pallet_head(name) {
@@ -619,8 +625,13 @@ fn settle_on(wire: &str, name: &str, renamed: bool, head: &str, found: Option<St
 
 /// Refuse to create `name` at `head` while a checkout stands on the name at no base or another one:
 /// the ref would appear under it out of step with its files. A checkout at exactly `head` is the
-/// usual loser of a delete's race with a shift, and the restore puts it back in step.
-fn refuse_a_bay_out_of_step(name: &str, head: &str, as_name: Option<&str>) -> Result<(), String> {
+/// usual loser of a delete's race with a shift, and the restore puts it back in step. `act` names
+/// the command in the refusal, `rerun` what to run again, and `closing` ends it.
+pub(crate) fn refuse_a_bay_out_of_step(name: &str,
+                                       head: &str,
+                                       act: &str,
+                                       rerun: &str,
+                                       closing: &str) -> Result<(), String> {
     for (which, position) in crate::util::bay_utils::bays_on(name)? {
         if position.base.as_deref() == Some(head) {
             continue;
@@ -630,19 +641,14 @@ fn refuse_a_bay_out_of_step(name: &str, head: &str, as_name: Option<&str>) -> Re
             Some(base) => format!("at {}", base),
             None => "on nothing stacked".to_string(),
         };
-        let rerun = match as_name {
-            Some(as_name) => format!("forklift undo --as {}", as_name),
-            None => "forklift undo".to_string(),
-        };
-
         let mut which = which;
         which[..1].make_ascii_uppercase();
 
         return Err(format!(
-            "{} stands on pallet \"{}\" {}, and the undo would create that pallet at {}, out of \
+            "{} stands on pallet \"{}\" {}, and the {} would create that pallet at {}, out of \
             step with its files. Shift it to another pallet, run \"{}\" again, then shift it back. \
-            Nothing was undone.",
-            which, name, at, head, rerun
+            {}",
+            which, name, at, act, head, rerun, closing
         ));
     }
 
@@ -652,8 +658,8 @@ fn refuse_a_bay_out_of_step(name: &str, head: &str, as_name: Option<&str>) -> Re
 /// The trust state a restored head must pass, and the preconditions that pin it for the write: in
 /// a warehouse with an anchor, `head`'s history must verify against the anchor and office as they
 /// are now, and both must still hold when the ref is written; without one, there must still be
-/// none, so an enrollment cannot slip in between and miss the head.
-fn trust_preconditions(wire: &str, head: &str) -> Result<pallet_utils::RefPreconditions, String> {
+/// none, so an enrollment cannot slip in between and miss the head. `closing` ends a refusal.
+pub(crate) fn trust_preconditions(wire: &str, head: &str, closing: &str) -> Result<pallet_utils::RefPreconditions, String> {
     use crate::util::{audit_utils, office_utils};
     use pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
@@ -666,13 +672,12 @@ fn trust_preconditions(wire: &str, head: &str) -> Result<pallet_utils::RefPrecon
     };
 
     let Some(office_head) = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? else {
-        return Err("Trust is established but the office pallet is missing; nothing was undone.".to_string());
+        return Err(format!("Trust is established but the office pallet is missing. {}", closing));
     };
 
     let untrusted = |e: String| format!(
-        "The history of deleted pallet \"{}\" no longer passes this warehouse's trust check: {} \
-        Nothing was undone.",
-        wire, e
+        "The history of deleted pallet \"{}\" no longer passes this warehouse's trust check: {} {}",
+        wire, e, closing
     );
 
     let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| untrusted(e.into()))?;
@@ -1307,7 +1312,7 @@ mod tests {
         advance("main", Some(&hash('1')), &hash('2')).unwrap();
         let delete = delete_entry("side", &hash('3'));
         pallet_utils::remove_pallet_head_in(PalletNamespace::User, "side", &hash('3'),
-                                            &pallet_utils::RefPreconditions::NONE, &delete).unwrap();
+                                            &pallet_utils::RefPreconditions::NONE, Some(&delete)).unwrap();
 
         let refused = push_if_changed("stack", before);
         assert!(refused.is_err_and(|error| error.contains("with a removal it cannot have made")));
@@ -1809,7 +1814,7 @@ mod tests {
         let delete = delete_entry("victim", &hash('5'));
 
         pallet_utils::remove_pallet_head_in(PalletNamespace::User, "victim", &hash('5'),
-                                            &pallet_utils::RefPreconditions::NONE, &delete).unwrap();
+                                            &pallet_utils::RefPreconditions::NONE, Some(&delete)).unwrap();
 
         assert_eq!(pallet_utils::get_pallet_head("victim").unwrap(), None);
         assert_eq!(read().unwrap().last(), Some(&delete));
@@ -1844,7 +1849,7 @@ mod tests {
         std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o555)).unwrap();
         let refused = pallet_utils::remove_pallet_head_in(PalletNamespace::User, "victim", &hash('5'),
                                                           &pallet_utils::RefPreconditions::NONE,
-                                                          &delete_entry("victim", &hash('5')));
+                                                          Some(&delete_entry("victim", &hash('5'))));
         std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
@@ -2311,7 +2316,7 @@ mod tests {
         let _scratch = Scratch::new("restore-no-anchor");
 
         // An enrollment between the trust read and the write must make the create lose.
-        let preconditions = trust_preconditions("side", &hash('a')).unwrap();
+        let preconditions = trust_preconditions("side", &hash('a'), "Nothing was undone.").unwrap();
         assert!(matches!(preconditions.anchor, pallet_utils::AnchorPrecondition::Absent));
     }
 

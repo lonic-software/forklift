@@ -4238,6 +4238,7 @@ impl RemoteClient {
         let body = RefUpdateRequest {
             old_head: old_head.map(|hash| hash.to_string()),
             new_head: new_head.to_string(),
+            tombstone: None,
         };
         let action = format!("moving the remote pallet \"{}\"", pallet);
 

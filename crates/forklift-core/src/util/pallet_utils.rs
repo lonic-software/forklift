@@ -669,6 +669,21 @@ pub enum RefUpdateError {
         missing: String,
     },
 
+    /// A creation of a user pallet that was deleted in this served warehouse, whose tombstone
+    /// still stands: re-creating the name must acknowledge that tombstone and descend from its
+    /// head (see [`update_pallet_head_in`]); nothing was written.
+    Deleted {
+        /// The deleted pallet.
+        pallet: String,
+
+        /// The head it was deleted at, which its tombstone holds.
+        head: String,
+
+        /// Whether the writer acknowledged the tombstone: then the refusal is that the new head
+        /// does not descend from its head.
+        acknowledged: bool,
+    },
+
     /// Anything else: an invalid name or value, or the ref could not be read or written.
     Failed(String),
 }
@@ -706,6 +721,31 @@ impl std::fmt::Display for RefUpdateError {
                 ran (it was at {}, and is now at {}); this command wrote nothing. Run it again.",
                 pallet, expected, found.as_deref().unwrap_or("no head")
             ),
+            RefUpdateError::Deleted { pallet, head, acknowledged } => {
+                match acknowledged {
+                    false => write!(
+                        f,
+                        "Pallet \"{}\" was deleted at {}, and this warehouse has been served, so the \
+                        name stays reserved for that history. Nothing was written.",
+                        pallet, head
+                    )?,
+                    true => write!(
+                        f,
+                        "Refusing to re-create deleted pallet \"{}\": the new head does not descend \
+                        from {}, the head it was deleted at, and this warehouse has been served, so \
+                        the name stays reserved for that history. Nothing was written.",
+                        pallet, head
+                    )?,
+                }
+
+                write!(
+                    f,
+                    " Run \"forklift palletize --restore {}\" to bring it back at that head; or, \
+                    where the warehouse is served from, \"forklift-server tombstone drop --root <warehouse> {}\" frees \
+                    the name for unrelated history (and lets the deleted history be collected).",
+                    pallet, pallet
+                )
+            }
             RefUpdateError::Failed(message) => f.write_str(message),
         }
     }
@@ -923,6 +963,12 @@ pub fn update_meta_pallet_head(name: &str,
 /// bay or process anywhere between those reads and this write is refused rather than overwritten.
 /// A target that is the office itself may carry an [`OfficePrecondition::At`] too; both must hold.
 ///
+/// In a served warehouse (see [`tombstone_utils`](crate::util::tombstone_utils)), creating a user
+/// pallet whose name has a tombstone is refused with [`RefUpdateError::Deleted`]: only a creation
+/// that acknowledges that tombstone and whose new head descends from (or is) the tombstone's head
+/// may take the name, through [`recreate_pallet_head`] or a remote's acknowledged update, and it
+/// clears the tombstone in the same hold, since the new ref then reaches everything it held.
+///
 /// # Arguments
 /// * `namespace`     - The pallet namespace.
 /// * `name`          - The name of the pallet. Must be a valid pallet name.
@@ -937,6 +983,8 @@ pub fn update_meta_pallet_head(name: &str,
 ///                                    - A precondition did not hold; nothing was written.
 /// * `Err(RefUpdateError::Incomplete)` - A user pallet's new head does not have its history
 ///                                      completely present; nothing was written.
+/// * `Err(RefUpdateError::Deleted)`   - The pallet was deleted in this served warehouse; nothing
+///                                      was written.
 /// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
 ///                                      ref could not be locked, read or written (the write may
 ///                                      still have landed: read the ref back to tell).
@@ -947,12 +995,24 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, None)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None)
+}
+
+/// Create user pallet `name` at `new`, acknowledging the tombstone a delete in this served
+/// warehouse left at `tombstone` (see [`update_pallet_head_in`]): the creation is refused unless
+/// that is the name's tombstone and `new` descends from it, and clears it when it lands. A name
+/// with no tombstone is created as [`update_pallet_head_in`] creates it.
+pub fn recreate_pallet_head(name: &str,
+                            new: &str,
+                            preconditions: &RefPreconditions,
+                            tombstone: &str) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone))
 }
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
 /// remote's ref update, after its own closure check): the write skips its own verification when
-/// `verified` is for `new` at the current fetch scope, and verifies as usual otherwise.
+/// `verified` is for `new` at the current fetch scope, and verifies as usual otherwise. A creation
+/// may acknowledge the name's tombstone, as [`recreate_pallet_head`]'s does.
 pub fn update_pallet_head_verified(
     namespace: PalletNamespace,
     name: &str,
@@ -960,8 +1020,9 @@ pub fn update_pallet_head_verified(
     new: &str,
     preconditions: &RefPreconditions,
     verified: &VerifiedClosure,
+    tombstone: Option<&str>,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified))
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone)
 }
 
 /// That a head's closure was verified, and at which fetch scope. Minted only by the verifier
@@ -988,6 +1049,10 @@ impl VerifiedClosure {
 /// in between, though (an `expand` in another bay commits a widened one under the lock), so the
 /// hold re-reads it, and when it is no longer the scope verified against, the hold is released and
 /// the closure verified again at the new one.
+///
+/// A creation's tombstone check works the same way: whether `new` descends from the tombstone's
+/// head is walked before the lock, and the hold re-reads the tombstone, starting over when it
+/// changed meanwhile.
 fn update_pallet_head_checked(
     namespace: PalletNamespace,
     name: &str,
@@ -995,6 +1060,7 @@ fn update_pallet_head_checked(
     new: &str,
     preconditions: &RefPreconditions,
     verified: Option<&VerifiedClosure>,
+    acknowledged: Option<&str>,
 ) -> Result<(), RefUpdateError> {
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
@@ -1018,6 +1084,8 @@ fn update_pallet_head_checked(
     // this walk first.
     let left = left_unreached(namespace, expected, new)?;
 
+    let mut tombstone = recreated_tombstone(namespace, name, expected, new)?;
+
     loop {
         #[cfg(test)]
         tests::before_hold_checkpoint();
@@ -1030,6 +1098,20 @@ fn update_pallet_head_checked(
         require_head(namespace, name, expected)?;
         check_preconditions(&lock, preconditions)?;
 
+        if tombstone_of(namespace, name, expected)? != tombstone.as_ref().map(|(head, _)| head.clone()) {
+            drop(lock);
+            tombstone = recreated_tombstone(namespace, name, expected, new)?;
+            continue;
+        }
+
+        if let Some((head, descends)) = &tombstone {
+            let acknowledged = acknowledged == Some(head.as_str());
+
+            if !acknowledged || !descends {
+                return Err(RefUpdateError::Deleted { pallet: name.to_string(), head: head.clone(), acknowledged });
+            }
+        }
+
         if let Some(scope) = &verified_at {
             let current = crate::util::scope_utils::read_fetch_scope()?;
 
@@ -1041,8 +1123,60 @@ fn update_pallet_head_checked(
             }
         }
 
-        return update_pallet_head_locked(&lock, namespace, name, expected, new, left);
+        update_pallet_head_locked(&lock, namespace, name, expected, new, left)?;
+
+        if tombstone.is_some() {
+            clear_tombstone(&lock, name).map_err(|e| RefUpdateError::Failed(format!(
+                "Pallet \"{}\" was re-created, but its tombstone could not be cleared: {}", name, e
+            )))?;
+        }
+
+        return Ok(());
     }
+}
+
+/// The head of the tombstone a write of `new` over `expected` would re-create, and whether `new`
+/// descends from (or is) it: `None` unless the write creates a user pallet whose name has a
+/// tombstone (see [`tombstone_of`]).
+fn recreated_tombstone(namespace: PalletNamespace,
+                       name: &str,
+                       expected: Option<&str>,
+                       new: &str) -> Result<Option<(String, bool)>, String> {
+    let Some(head) = tombstone_of(namespace, name, expected)? else {
+        return Ok(None);
+    };
+
+    let descends = head == new || crate::util::merge_utils::is_ancestor(&head, new)?;
+
+    Ok(Some((head, descends)))
+}
+
+/// The head of the tombstone of user pallet `name`, when a write over `expected` creates it: only
+/// a creation is bound by a tombstone, and only a served warehouse has any. The mark is read
+/// fail-closed.
+fn tombstone_of(namespace: PalletNamespace,
+                name: &str,
+                expected: Option<&str>) -> Result<Option<String>, String> {
+    use crate::util::tombstone_utils;
+
+    if expected.is_some() || namespace != PalletNamespace::User || !tombstone_utils::is_served()? {
+        return Ok(None);
+    }
+
+    Ok(tombstone_utils::read_tombstones()?.remove(name))
+}
+
+/// Remove `name`'s tombstone from the list, under the held ref lock.
+fn clear_tombstone(lock: &crate::util::lock_utils::RefLock, name: &str) -> Result<(), String> {
+    use crate::util::tombstone_utils;
+
+    let mut tombstones = tombstone_utils::read_tombstones()?;
+
+    if tombstones.remove(name).is_some() {
+        tombstone_utils::write_tombstones(lock, &tombstones)?;
+    }
+
+    Ok(())
 }
 
 /// Whether a write of `new` over `expected` must verify `new`'s closure: a user-pallet ref moving
@@ -1185,31 +1319,39 @@ pub(crate) fn update_pallet_head_locked(
 }
 
 /// Remove the ref of user pallet `name`, which must hold `expected`: the compare-and-set core's
-/// one removing write. Objects are untouched; what keeps the removed head stored while it can be
-/// put back is `journal`, the delete's undo entry, whose live entries gc, compaction and
-/// scope-prune root (see [`journal_utils::removed_heads`](crate::util::journal_utils::removed_heads)).
+/// one removing write. Objects are untouched. What keeps the removed head stored depends on the
+/// warehouse: in a served one (see [`tombstone_utils`](crate::util::tombstone_utils)) the removal
+/// leaves a tombstone, which gc, compaction and prune root until it is cleared or dropped; in any
+/// other, `journal`, the delete's undo entry, whose live entries they root while the delete can be
+/// undone (see [`journal_utils::removed_heads`](crate::util::journal_utils::removed_heads)). A
+/// removal with no undo entry (a remote's delete, which no bay made) is refused outside a served
+/// warehouse, since nothing would root its head.
 ///
 /// Under the [`RefLock`](crate::util::lock_utils::RefLock), in this order: the ref's own compare,
 /// the `preconditions`, the fetched-heads ledger (a sparse warehouse records the removed head,
-/// which this ref no longer reaches, so `expand` walks it), then `journal` appended to the bay's
-/// undo journal, durably, before the ref file is unlinked. The unlink and every folder a nested
-/// name leaves empty are synced through the durability taint, so what is visible is durable.
+/// which this ref no longer reaches, so `expand` walks it), the served mark, read fail-closed,
+/// then the tombstone (in a served warehouse, replacing any the name had) and `journal` appended
+/// to the bay's undo journal, each durably, before the ref file is unlinked. The unlink and every
+/// folder a nested name leaves empty are synced through the durability taint, so what is visible
+/// is durable.
 ///
 /// A failed unlink or sync can still have landed, so the ref is read back inside the hold. Still
-/// at `expected`: nothing was removed, and the journal is written back exactly as it was read
-/// before the append (not the appended journal with its last entry popped: an append to a full
-/// journal drops the oldest entry, which can itself root a removed head). Gone: the removal is
-/// logged and the failure reported; the caller reads the ref back to tell. Unreadable: the entry
-/// stays, and an undo of it finds the ref either absent or at `expected`, both of which it handles.
+/// at `expected`: nothing was removed, and the tombstone list and the journal are written back
+/// exactly as they were read before (not the appended journal with its last entry popped: an
+/// append to a full journal drops the oldest entry, which can itself root a removed head). Gone:
+/// the removal is logged and the failure reported; the caller reads the ref back to tell.
+/// Unreadable: both records stay. A tombstone beside a live ref of its name only keeps its head,
+/// and an undo of the entry finds the ref either absent or at `expected`, both of which it handles.
 ///
 /// # Arguments
 /// * `namespace`     - The pallet namespace; a meta pallet is refused.
 /// * `name`          - The name of the pallet. Must be a valid pallet name.
 /// * `expected`      - The head the ref must hold.
 /// * `preconditions` - What the caller's decision consumed besides the ref.
-/// * `journal`       - The undo entry to append in the hold. It must record exactly this removal
-///                     (`name` at `expected`): the entry is what keeps the head rooted while the
-///                     delete can be undone, so a removal it does not record is refused.
+/// * `journal`       - The undo entry to append in the hold, for a delete a bay makes. It must
+///                     record exactly this removal (`name` at `expected`): outside a served
+///                     warehouse the entry is what keeps the head rooted while the delete can be
+///                     undone, so a removal it does not record is refused.
 ///
 /// # Returns
 /// * `Ok(())`                       - The ref was removed.
@@ -1217,15 +1359,16 @@ pub(crate) fn update_pallet_head_locked(
 /// * `Err(RefUpdateError::OfficeMoved | AnchorMoved | PalletsMoved | WitnessMoved)`
 ///                                  - A precondition did not hold; nothing was written.
 /// * `Err(RefUpdateError::Failed)`  - The pallet is a meta pallet, the name is invalid, `journal`
-///                                    does not record this removal, a bulk store session is
-///                                    open, or a read or write failed (the
-///                                    removal may still have landed: read the ref back to tell).
+///                                    does not record this removal, there is no `journal` and the
+///                                    warehouse is not served, a bulk store session is open, or a
+///                                    read or write failed (the removal may still have landed:
+///                                    read the ref back to tell).
 pub fn remove_pallet_head_in(
     namespace: PalletNamespace,
     name: &str,
     expected: &str,
     preconditions: &RefPreconditions,
-    journal: &crate::util::journal_utils::JournalEntry,
+    journal: Option<&crate::util::journal_utils::JournalEntry>,
 ) -> Result<(), RefUpdateError> {
     if namespace == PalletNamespace::Meta {
         return Err(RefUpdateError::Failed(format!(
@@ -1239,20 +1382,22 @@ pub fn remove_pallet_head_in(
 
     let wire = PalletRef { namespace, name: name.to_string() }.to_wire();
 
-    if crate::util::journal_utils::removed_by(journal) != vec![(wire.clone(), expected.to_string())] {
-        return Err(RefUpdateError::Failed(format!(
-            "Refusing to remove pallet \"{}\": the undo entry written with the removal does not \
-            record removing it at {}.",
-            wire, expected
-        )));
+    if let Some(journal) = journal {
+        if crate::util::journal_utils::removed_by(journal) != vec![(wire.clone(), expected.to_string())] {
+            return Err(RefUpdateError::Failed(format!(
+                "Refusing to remove pallet \"{}\": the undo entry written with the removal does not \
+                record removing it at {}.",
+                wire, expected
+            )));
+        }
+
+        // Before anything is written, the ledger record included: an entry the journal would refuse.
+        crate::util::journal_utils::validate_entry(journal).map_err(|e| RefUpdateError::Failed(format!(
+            "Refusing to remove pallet \"{}\": its undo entry {}.", wire, e
+        )))?;
     }
 
-    // Before anything is written, the ledger record included: an entry the journal would refuse.
-    crate::util::journal_utils::validate_entry(journal).map_err(|e| RefUpdateError::Failed(format!(
-        "Refusing to remove pallet \"{}\": its undo entry {}.", wire, e
-    )))?;
-
-    // The journal entry must be durable before the unlink; a bulk session would only stage it.
+    // The records must be durable before the unlink; a bulk session would only stage them.
     if file_utils::is_bulk_session_open() {
         return Err(RefUpdateError::Failed(
             "A pallet ref cannot be removed while a bulk store session is open.".to_string()
@@ -1272,7 +1417,36 @@ pub fn remove_pallet_head_in(
         crate::util::fetch_ledger::record_fetch(&lock, expected, name)?;
     }
 
-    let read_before_append = crate::util::journal_utils::append_in_hold(&lock, journal)?;
+    let tombstones_before = match crate::util::tombstone_utils::is_served()? {
+        true => {
+            let read = crate::util::tombstone_utils::read_tombstones()?;
+            let mut tombstones = read.clone();
+            tombstones.insert(wire.clone(), expected.to_string());
+            crate::util::tombstone_utils::write_tombstones(&lock, &tombstones)?;
+
+            Some(read)
+        }
+        false if journal.is_none() => return Err(RefUpdateError::Failed(format!(
+            "Refusing to remove pallet \"{}\": this warehouse has never been served, so it keeps no \
+            tombstones, and a removal no bay can undo would leave its head held by nothing.",
+            wire
+        ))),
+        false => None,
+    };
+
+    let journal_before = match journal {
+        Some(journal) => match crate::util::journal_utils::append_in_hold(&lock, journal) {
+            Ok(read) => Some(read),
+            Err(e) => return Err(RefUpdateError::Failed(match &tombstones_before {
+                Some(read) => match crate::util::tombstone_utils::write_tombstones(&lock, read) {
+                    Ok(()) => e,
+                    Err(put_back) => format!("{} The tombstones could not be put back either: {}", e, put_back),
+                },
+                None => e,
+            })),
+        },
+        None => None,
+    };
 
     let path = get_pallet_ref_path(namespace, name);
     let unlinked = unlink_ref(namespace, &path);
@@ -1283,17 +1457,24 @@ pub fn remove_pallet_head_in(
             unlinked.map_err(RefUpdateError::Failed)
         }
         Ok(Some(_)) => {
-            let error = unlinked.err().unwrap_or_else(|| format!(
+            let mut error = unlinked.err().unwrap_or_else(|| format!(
                 "The ref of pallet \"{}\" was still there after it was removed.", name
             ));
 
-            // Not removed: the journal goes back to what it held before the append.
-            let restored = crate::util::journal_utils::write_back_in_hold(&lock, &read_before_append);
+            // Not removed: both records go back to what they held before.
+            if let Some(read) = &journal_before {
+                if let Err(e) = crate::util::journal_utils::write_back_in_hold(&lock, read) {
+                    error = format!("{} The undo journal could not be put back either: {}", error, e);
+                }
+            }
 
-            Err(RefUpdateError::Failed(match restored {
-                Ok(()) => error,
-                Err(e) => format!("{} The undo journal could not be put back either: {}", error, e),
-            }))
+            if let Some(read) = &tombstones_before {
+                if let Err(e) = crate::util::tombstone_utils::write_tombstones(&lock, read) {
+                    error = format!("{} The tombstones could not be put back either: {}", error, e);
+                }
+            }
+
+            Err(RefUpdateError::Failed(error))
         }
         Err(read) => Err(RefUpdateError::Failed(match unlinked {
             Ok(()) => format!("The ref of pallet \"{}\" could not be read back after it was removed: {}", name, read),
@@ -1523,7 +1704,7 @@ pub(crate) mod tests {
                                                    new: &str,
                                                    preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
         let verified = VerifiedClosure::new(new, crate::util::scope_utils::read_fetch_scope()?);
-        update_pallet_head_verified(namespace, name, expected, new, preconditions, &verified)
+        update_pallet_head_verified(namespace, name, expected, new, preconditions, &verified, None)
     }
 
     /// A parcel over an empty tree, stored with its tree and distinct per `tag`: a head whose
@@ -1820,17 +2001,17 @@ pub(crate) mod tests {
 
             let wrong_head = VerifiedClosure::new(&other, full.clone());
             assert_incomplete(update_pallet_head_verified(
-                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_head
+                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_head, None
             ), "main", None);
 
             let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]));
             assert_incomplete(update_pallet_head_verified(
-                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_scope
+                PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_scope, None
             ), "main", None);
 
             // The token stands for a verification its caller made: the write takes its word.
             let token = VerifiedClosure::new(&head, full);
-            update_pallet_head_verified(PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &token).unwrap();
+            update_pallet_head_verified(PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &token, None).unwrap();
         }
 
         // Revert: verify meta-pallet writes too → the office write walks a parcel it never needed.
@@ -2448,6 +2629,158 @@ pub(crate) mod tests {
         }
     }
 
+    /// A parcel on `parent`, so a head on it descends from `parent`.
+    fn child_of(parent: &str, tag: &str) -> String {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::tree_item::TreeItem;
+
+        let mut tree = LooseObjectBuilder::build_tree(
+            &TreeItem::new(String::new(), String::new(), crate::enums::dir_entry_type::DirEntryType::Tree)
+        );
+        tree.store().unwrap();
+
+        let mut parcel = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
+            tree_hash: tree.hash.clone(),
+            parents: vec![parent.to_string()],
+            actions: Vec::new(),
+            description: Some(tag.to_string()),
+        });
+        parcel.store().unwrap();
+        parcel.hash
+    }
+
+    /// The tombstones a removal in a served root leaves, and the rule they put on re-creating the
+    /// name.
+    mod tombstones {
+        use super::*;
+        use std::collections::BTreeMap;
+        use crate::util::tombstone_utils;
+
+        #[test]
+        fn a_removal_in_a_served_root_leaves_a_tombstone_and_one_in_an_unserved_root_none() {
+            let (root, _scope) = scratch("tombstone-left");
+            update_pallet_head("kept", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+            update_pallet_head("gone", None, &hash('b'), &RefPreconditions::NONE).unwrap();
+
+            remove_pallet_head_in(PalletNamespace::User, "kept", &hash('a'), &RefPreconditions::NONE, Some(&deleting("kept", &hash('a')))).unwrap();
+            assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "a root never served keeps no tombstones");
+
+            tombstone_utils::mark_served().unwrap();
+            remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, None).unwrap();
+
+            assert_eq!(get_pallet_head("gone").unwrap(), None);
+            assert_eq!(tombstone_utils::read_tombstones().unwrap(), BTreeMap::from([("gone".to_string(), hash('b'))]));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_removal_with_no_undo_entry_is_refused_in_a_root_never_served() {
+            let (root, _scope) = scratch("tombstone-unserved");
+            update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+
+            let refused = remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, None).unwrap_err();
+
+            assert!(refused.to_string().contains("never been served"), "{}", refused);
+            assert_eq!(get_pallet_head("gone").unwrap(), Some(hash('a')), "nothing was removed");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_refused_removal_leaves_the_tombstones_as_they_were() {
+            let (root, _scope) = scratch("tombstone-refused");
+            update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+            tombstone_utils::mark_served().unwrap();
+
+            let refused = remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, None);
+
+            assert!(matches!(refused, Err(RefUpdateError::Moved(_))), "{:?}", refused);
+            assert!(tombstone_utils::read_tombstones().unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A served root with pallet "gone" deleted at `hash('a')`.
+        fn deleted_in_a_served_root(name: &str) -> (PathBuf, StorageRootScope) {
+            let (root, scope) = scratch(name);
+            update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+            tombstone_utils::mark_served().unwrap();
+            remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, None).unwrap();
+
+            (root, scope)
+        }
+
+        #[test]
+        fn creating_a_tombstoned_name_without_acknowledging_it_is_refused() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-unacknowledged");
+            let on_it = child_of(&hash('a'), "on it");
+
+            let refused = update_pallet_head("gone", None, &on_it, &RefPreconditions::NONE).unwrap_err();
+
+            assert!(matches!(&refused, RefUpdateError::Deleted { acknowledged: false, .. }), "{:?}", refused);
+            assert!(refused.to_string().contains("forklift palletize --restore gone"), "{}", refused);
+            assert_eq!(get_pallet_head("gone").unwrap(), None);
+            assert_eq!(tombstone_utils::tombstone_heads().unwrap(), vec![hash('a')], "the tombstone stands");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn an_acknowledged_creation_that_does_not_descend_from_the_tombstone_is_refused() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-unrelated");
+
+            let refused = recreate_pallet_head("gone", &hash('z'), &RefPreconditions::NONE, &hash('a')).unwrap_err();
+            assert!(matches!(&refused, RefUpdateError::Deleted { acknowledged: true, .. }), "{:?}", refused);
+
+            let refused = recreate_pallet_head("gone", &hash('a'), &RefPreconditions::NONE, &hash('z')).unwrap_err();
+            assert!(matches!(&refused, RefUpdateError::Deleted { acknowledged: false, .. }), "another head acknowledges nothing: {:?}", refused);
+
+            assert_eq!(get_pallet_head("gone").unwrap(), None);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn an_acknowledged_creation_on_the_tombstone_lands_and_clears_it() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-cleared");
+            let on_it = child_of(&hash('a'), "on it");
+
+            recreate_pallet_head("gone", &on_it, &RefPreconditions::NONE, &hash('a')).unwrap();
+
+            assert_eq!(get_pallet_head("gone").unwrap(), Some(on_it));
+            assert!(tombstone_utils::read_tombstones().unwrap().is_empty(), "the re-creation clears the tombstone");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_name_with_no_tombstone_is_created_as_ever_in_a_served_root() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-other-name");
+
+            update_pallet_head("fresh", None, &hash('z'), &RefPreconditions::NONE).unwrap();
+
+            assert_eq!(get_pallet_head("fresh").unwrap(), Some(hash('z')));
+            assert_eq!(tombstone_utils::tombstone_heads().unwrap(), vec![hash('a')]);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_restore_brings_the_pallet_back_at_its_tombstone_and_clears_it() {
+            let (root, _scope) = deleted_in_a_served_root("tombstone-restore");
+            write_position(&BayPosition::new("gone", Some(hash('z')))).unwrap();
+
+            let refused = tombstone_utils::restore_pallet("gone").unwrap_err();
+            assert!(refused.contains("out of step") && refused.contains("\"forklift palletize --restore gone\" again"), "{}", refused);
+            assert_eq!(get_pallet_head("gone").unwrap(), None, "nothing was restored");
+
+            // A bay at exactly the tombstone's head is put back in step by the restore.
+            write_position(&BayPosition::new("gone", Some(hash('a')))).unwrap();
+            assert_eq!(tombstone_utils::restore_pallet("gone").unwrap(), hash('a'));
+
+            assert_eq!(get_pallet_head("gone").unwrap(), Some(hash('a')));
+            assert!(tombstone_utils::read_tombstones().unwrap().is_empty());
+
+            let refused = tombstone_utils::restore_pallet("gone").unwrap_err();
+            assert!(refused.contains("No deleted pallet \"gone\""), "{}", refused);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
     #[test]
     fn removing_a_ref_unlinks_it_and_each_folder_its_nested_name_leaves_empty() {
         let (root, _scope) = scratch("remove-nested");
@@ -2455,13 +2788,13 @@ pub(crate) mod tests {
         update_pallet_head("team/y", None, &hash('b'), &RefPreconditions::NONE).unwrap();
         let pallets = get_pallet_ref_path(PalletNamespace::User, "team").parent().unwrap().to_path_buf();
 
-        remove_pallet_head_in(PalletNamespace::User, "team/web/x", &hash('a'), &RefPreconditions::NONE, &deleting("team/web/x", &hash('a'))).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "team/web/x", &hash('a'), &RefPreconditions::NONE, Some(&deleting("team/web/x", &hash('a')))).unwrap();
 
         assert!(!pallets.join("team").join("web").exists(), "the emptied folder of a nested name goes with it");
         assert!(pallets.join("team").join("y").is_file(), "a folder still holding a ref stays");
         assert_eq!(get_pallet_head("team/web/x").unwrap(), None);
 
-        remove_pallet_head_in(PalletNamespace::User, "team/y", &hash('b'), &RefPreconditions::NONE, &deleting("team/y", &hash('b'))).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "team/y", &hash('b'), &RefPreconditions::NONE, Some(&deleting("team/y", &hash('b')))).unwrap();
         assert!(!pallets.join("team").exists());
         assert!(pallets.is_dir(), "the pallets folder itself is never removed");
         assert!(all_pallet_refs().unwrap().is_empty());
@@ -2475,7 +2808,7 @@ pub(crate) mod tests {
         update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         start_write_log();
 
-        remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, &deleting("gone", &hash('a'))).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, Some(&deleting("gone", &hash('a')))).unwrap();
 
         assert_eq!(take_write_log(), vec![("gone".to_string(), Some(hash('a')), None)]);
         let _ = std::fs::remove_dir_all(&root);
@@ -2487,20 +2820,20 @@ pub(crate) mod tests {
         update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         update_meta_pallet_head("tags", None, &hash('b'), &RefPreconditions::NONE).unwrap();
 
-        let meta = remove_pallet_head_in(PalletNamespace::Meta, "tags", &hash('b'), &RefPreconditions::NONE, &deleting("tags", &hash('b')));
+        let meta = remove_pallet_head_in(PalletNamespace::Meta, "tags", &hash('b'), &RefPreconditions::NONE, Some(&deleting("tags", &hash('b'))));
         assert!(matches!(&meta, Err(RefUpdateError::Failed(message)) if message.contains("never removed")), "{:?}", meta);
         assert_eq!(get_meta_pallet_head("tags").unwrap(), Some(hash('b')));
 
-        let moved = remove_pallet_head_in(PalletNamespace::User, "main", &hash('c'), &RefPreconditions::NONE, &deleting("main", &hash('c')));
+        let moved = remove_pallet_head_in(PalletNamespace::User, "main", &hash('c'), &RefPreconditions::NONE, Some(&deleting("main", &hash('c'))));
         assert!(matches!(&moved, Err(RefUpdateError::Moved(m)) if m.found == Some(hash('a'))), "{:?}", moved);
         assert_eq!(get_pallet_head("main").unwrap(), Some(hash('a')));
 
-        let missing = remove_pallet_head_in(PalletNamespace::User, "absent", &hash('a'), &RefPreconditions::NONE, &deleting("absent", &hash('a')));
+        let missing = remove_pallet_head_in(PalletNamespace::User, "absent", &hash('a'), &RefPreconditions::NONE, Some(&deleting("absent", &hash('a'))));
         assert!(matches!(&missing, Err(RefUpdateError::Moved(m)) if m.found.is_none()), "{:?}", missing);
 
         // The entry is what roots the removed head, so one recording another removal is refused.
         for entry in [deleting("other", &hash('a')), deleting("main", &hash('c'))] {
-            let unrecorded = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, &entry);
+            let unrecorded = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, Some(&entry));
             assert!(matches!(&unrecorded, Err(RefUpdateError::Failed(message)) if message.contains("does not record")),
                     "{:?}", unrecorded);
         }
@@ -2516,7 +2849,7 @@ pub(crate) mod tests {
         update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
 
         let session = file_utils::BulkStoreSession::open().unwrap();
-        let refused = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, &deleting("main", &hash('a')));
+        let refused = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, Some(&deleting("main", &hash('a'))));
         drop(session);
 
         assert!(matches!(&refused, Err(RefUpdateError::Failed(message)) if message.contains("bulk store session")), "{:?}", refused);
@@ -2531,21 +2864,21 @@ pub(crate) mod tests {
         update_pallet_head("holder", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         update_pallet_head("holder", Some(&hash('a')), &hash('c'), &RefPreconditions::NONE).unwrap();
 
-        let refused = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('a')), &deleting("victim", &hash('a')));
+        let refused = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('a')), Some(&deleting("victim", &hash('a'))));
         assert_eq!(refused, Err(RefUpdateError::WitnessMoved {
             pallet: "holder".to_string(), expected: hash('a'), found: Some(hash('c')),
         }));
         assert_eq!(get_pallet_head("victim").unwrap(), Some(hash('a')), "a refused removal writes nothing");
 
         // An absent witness is a moved one too.
-        let gone = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("nobody", &hash('a')), &deleting("victim", &hash('a')));
+        let gone = remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("nobody", &hash('a')), Some(&deleting("victim", &hash('a'))));
         assert!(matches!(gone, Err(RefUpdateError::WitnessMoved { found: None, .. })));
 
         // The same precondition guards an ordinary write.
         let write = update_pallet_head("victim", Some(&hash('a')), &hash('d'), &witness("holder", &hash('a')));
         assert!(matches!(write, Err(RefUpdateError::WitnessMoved { .. })));
 
-        remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('c')), &deleting("victim", &hash('a'))).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "victim", &hash('a'), &witness("holder", &hash('c')), Some(&deleting("victim", &hash('a')))).unwrap();
         assert_eq!(get_pallet_head("victim").unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2556,11 +2889,11 @@ pub(crate) mod tests {
         update_pallet_head("full", None, &hash('a'), &RefPreconditions::NONE).unwrap();
         update_pallet_head("sparse", None, &hash('b'), &RefPreconditions::NONE).unwrap();
 
-        remove_pallet_head_in(PalletNamespace::User, "full", &hash('a'), &RefPreconditions::NONE, &deleting("full", &hash('a'))).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "full", &hash('a'), &RefPreconditions::NONE, Some(&deleting("full", &hash('a')))).unwrap();
         assert!(crate::util::fetch_ledger::read_ledger().unwrap().is_empty(), "a full warehouse keeps no ledger");
 
         crate::util::scope_utils::set_fetch_scope(&crate::util::scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
-        remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, &deleting("sparse", &hash('b'))).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, Some(&deleting("sparse", &hash('b')))).unwrap();
 
         let ledger = crate::util::fetch_ledger::read_ledger().unwrap();
         assert!(ledger.iter().any(|entry| entry.head == hash('b') && entry.pallet == "sparse"), "{:?}", ledger);
@@ -2582,7 +2915,7 @@ pub(crate) mod tests {
         assert!(get_pallet_ref_path(PalletNamespace::User, "team/x").is_file(), "the folder's ref is untouched");
 
         // So does an empty one, left by a removal that could not take its folder.
-        remove_pallet_head_in(PalletNamespace::User, "team/x", &hash('a'), &RefPreconditions::NONE, &deleting("team/x", &hash('a'))).unwrap();
+        remove_pallet_head_in(PalletNamespace::User, "team/x", &hash('a'), &RefPreconditions::NONE, Some(&deleting("team/x", &hash('a')))).unwrap();
         std::fs::create_dir_all(get_pallet_ref_path(PalletNamespace::User, "team")).unwrap();
         assert!(all_pallet_refs().unwrap().is_empty());
         assert!(matches!(update_pallet_head("team", None, &hash('b'), &RefPreconditions::NONE),

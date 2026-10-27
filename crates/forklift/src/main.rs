@@ -449,7 +449,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
                 commands::office::accept_regenesis(confirm).await,
             Some(OfficeAction::List) | None => commands::office::list().await,
         },
-        Command::Palletize { name, revision, all, remote, delete, force } => commands::palletize::handle_command(name, revision, all, remote, delete, force).await,
+        Command::Palletize { name, revision, all, remote, delete, force, restore } => commands::palletize::handle_command(name, revision, all, remote, delete, force, restore).await,
         Command::Park { action } => match action {
             Some(ParkAction::Pop) => commands::park::pop_parked(),
             Some(ParkAction::List) => commands::park::list_parked(),

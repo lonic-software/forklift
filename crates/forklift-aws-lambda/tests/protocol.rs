@@ -291,7 +291,7 @@ fn untrusted_lift_and_the_cas_guards() {
     assert!(head.missing(&all).expect("missing").is_empty());
 
     // The lift commits.
-    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     head.ref_update(&Principal::Static, "main", &request).expect("lift main");
 
     // The handshake reflects it.
@@ -309,6 +309,7 @@ fn untrusted_lift_and_the_cas_guards() {
     let stale = RefUpdateRequest {
         old_head: Some("0".repeat(64)),
         new_head: main_head.clone(),
+        tombstone: None,
     };
     assert_eq!(
         head.ref_update(&Principal::Static, "main", &stale).expect_err("stale old_head").status,
@@ -338,7 +339,7 @@ fn a_holds_walk_stops_short_of_the_invocation_deadline() {
 
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &harvest);
-    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     head.ref_update(&Principal::Static, "main", &request).expect("lift main");
     let candidates = [main_head.clone(), first.clone()];
 
@@ -383,7 +384,7 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
     }
     assert!(skipped.is_some(), "a blob was found to withhold");
 
-    let request = RefUpdateRequest { old_head: None, new_head: main_head };
+    let request = RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None };
     let err = head.ref_update(&Principal::Static, "main", &request).expect_err("incomplete closure");
     assert_eq!(err.status, Status::Unprocessable);
 }
@@ -438,7 +439,7 @@ fn a_ref_update_with_a_missing_chunk_is_refused() {
     }
     assert!(head.object_get(&recipe_hash).is_ok(), "the recipe itself is present on the head");
 
-    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let request = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a missing chunk fails the closure");
     assert_eq!(err.status, Status::Unprocessable);
 
@@ -500,10 +501,11 @@ fn trusted_lift_audits_the_office_and_the_pallet() {
     head.ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
         old_head: None,
         new_head: office_head.clone(),
+        tombstone: None,
     })
     .expect("lift office");
 
-    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head.clone() })
+    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None })
         .expect("lift main (audited)");
 
     let info = head.handshake().expect("handshake");
@@ -536,24 +538,25 @@ fn kv_lifts_under_the_office_and_unknown_meta_names_are_refused() {
 
     // Before the office: there are no keys to check the stamps against.
     let err = head
-        .ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: None, new_head: first.clone() })
+        .ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: None, new_head: first.clone(), tombstone: None })
         .expect_err("kv before the office");
     assert_eq!(err.status, Status::Unprocessable);
 
     head.ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
         old_head: None,
         new_head: office_head,
+        tombstone: None,
     })
     .expect("lift office");
 
     let err = head
-        .ref_update(&Principal::Static, "@foo", &RefUpdateRequest { old_head: None, new_head: first.clone() })
+        .ref_update(&Principal::Static, "@foo", &RefUpdateRequest { old_head: None, new_head: first.clone(), tombstone: None })
         .expect_err("an unknown meta pallet");
     assert_eq!(err.status, Status::Unprocessable);
 
-    head.ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: None, new_head: first.clone() })
+    head.ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: None, new_head: first.clone(), tombstone: None })
         .expect("lift kv");
-    head.ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: Some(first), new_head: second.clone() })
+    head.ref_update(&Principal::Static, "@kv", &RefUpdateRequest { old_head: Some(first), new_head: second.clone(), tombstone: None })
         .expect("lift kv again, checked from the head it holds");
     assert_eq!(head.handshake().expect("handshake").pallets.get("@kv"), Some(&second));
 }
@@ -581,16 +584,16 @@ fn a_haul_lifts_only_under_the_office() {
     let untrusted = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&untrusted, &harvest);
     let err = untrusted
-        .ref_update(&Principal::Static, "@haul", &RefUpdateRequest { old_head: None, new_head: hauls.clone() })
+        .ref_update(&Principal::Static, "@haul", &RefUpdateRequest { old_head: None, new_head: hauls.clone(), tombstone: None })
         .expect_err("a haul on a warehouse without an office");
     assert_eq!(err.status, Status::Unprocessable);
 
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &harvest);
     head.put_trust(&Principal::Static, &harvest.trust.clone().expect("trust")).expect("put trust");
-    head.ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest { old_head: None, new_head: office_head })
+    head.ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest { old_head: None, new_head: office_head, tombstone: None })
         .expect("lift office");
-    head.ref_update(&Principal::Static, "@haul", &RefUpdateRequest { old_head: None, new_head: hauls.clone() })
+    head.ref_update(&Principal::Static, "@haul", &RefUpdateRequest { old_head: None, new_head: hauls.clone(), tombstone: None })
         .expect("lift haul under the office");
     assert_eq!(head.handshake().expect("handshake").pallets.get("@haul"), Some(&hauls));
 }
@@ -637,10 +640,10 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
         let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
         upload_all(&head, &after);
         head.put_trust(&Principal::Static, &after.trust.clone().expect("trust")).expect("put trust");
-        head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office.to_string() })
+        head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office.to_string(), tombstone: None })
             .expect("lift office");
 
-        head.ref_update(&Principal::Static, "@tags", &RefUpdateRequest { old_head: None, new_head: tags.clone() })
+        head.ref_update(&Principal::Static, "@tags", &RefUpdateRequest { old_head: None, new_head: tags.clone(), tombstone: None })
     };
 
     lift(&admitting_office).expect("a tag from an admin");
@@ -697,10 +700,10 @@ fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
         let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
         upload_all(&head, &after);
         head.put_trust(&Principal::Static, &after.trust.clone().expect("trust")).expect("put trust");
-        head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office.to_string() })
+        head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office.to_string(), tombstone: None })
             .expect("lift office");
 
-        head.ref_update(&Principal::Static, "@haul", &RefUpdateRequest { old_head: None, new_head: haul.clone() })
+        head.ref_update(&Principal::Static, "@haul", &RefUpdateRequest { old_head: None, new_head: haul.clone(), tombstone: None })
     };
 
     lift(&granting_office).expect("a merge by a writer of the target");
@@ -791,12 +794,13 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
         let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
         upload_all(&head, &harvest);
         head.put_trust(&Principal::Static, &harvest.trust.clone().expect("trust")).expect("put trust");
-        head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office_head.clone() })
+        head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office_head.clone(), tombstone: None })
             .expect("lift the admitted office");
 
         head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest {
             old_head: Some(office_head.clone()),
             new_head: promotion.to_string(),
+            tombstone: None,
         })
     };
 
@@ -812,7 +816,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &harvest);
     head.put_trust(&Principal::Static, &harvest.trust.clone().expect("trust")).expect("put trust");
-    head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office_head.clone() })
+    head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office_head.clone(), tombstone: None })
         .expect("lift the admitted office");
     let trust = head.refs.get_trust().expect("read trust");
     assert!(matches!(
@@ -831,6 +835,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
     let err = head.ref_update(&Principal::Static, &office_wire, &RefUpdateRequest {
         old_head: Some(by_worker.clone()),
         new_head: demotion,
+        tombstone: None,
     })
     .expect_err("a demotion on top of a held overstep");
     assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
@@ -859,7 +864,7 @@ fn a_user_lift_before_the_office_is_refused() {
 
     // Skipping the office lift: main's audit finds no office pallet.
     let err = head
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None })
         .expect_err("office missing");
     assert_eq!(err.status, Status::Unprocessable);
 }
@@ -889,6 +894,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
         .ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
             old_head: None,
             new_head: office_head.clone(),
+            tombstone: None,
         })
         .expect_err("office without an anchor");
     assert_eq!(err.status, Status::Unprocessable);
@@ -1284,14 +1290,14 @@ fn mirror_reads(touches: usize) -> (usize, usize) {
     let bounded = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&bounded, &latest);
     bounded
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: old_head.clone(), tombstone: None })
         .expect("establish the old head");
     bounded.objects.reset_reads();
     bounded
         .ref_update(
             &Principal::Static,
             "main",
-            &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone() },
+            &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone(), tombstone: None },
         )
         .expect("the bounded ref update still audits clean");
 
@@ -1300,7 +1306,7 @@ fn mirror_reads(touches: usize) -> (usize, usize) {
     upload_all(&unbounded, &latest);
     unbounded.objects.reset_reads();
     unbounded
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head, tombstone: None })
         .expect("the unbounded ref update audits clean");
 
     (bounded.objects.reads(), unbounded.objects.reads())
@@ -1369,9 +1375,9 @@ fn a_trusted_merge_lift_below_the_bound_still_audits() {
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &before);
     head.put_trust(&Principal::Static, before.trust.as_ref().expect("trust")).expect("plant trust");
-    head.ref_update(&Principal::Static, "@office", &RefUpdateRequest { old_head: None, new_head: office_head })
+    head.ref_update(&Principal::Static, "@office", &RefUpdateRequest { old_head: None, new_head: office_head, tombstone: None })
         .expect("lift the office");
-    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: old_head.clone(), tombstone: None })
         .expect("establish the old head");
 
     // The merge parcel: its second parent is the branch tip, whose ancestry forks below
@@ -1390,7 +1396,7 @@ fn a_trusted_merge_lift_below_the_bound_still_audits() {
     assert_eq!(parents.len(), 2, "consolidate stacked a real merge parcel");
 
     upload_all(&head, &after);
-    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: Some(old_head), new_head })
+    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: Some(old_head), new_head, tombstone: None })
         .expect("a merge lift across the bound audits clean");
 }
 
@@ -1433,7 +1439,7 @@ fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
     upload_all(&head, &latest);
 
     head.objects.reset_reads();
-    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: old_head.clone(), tombstone: None })
         .expect("cold ref update");
     let cold = head.objects.reads();
 
@@ -1441,7 +1447,7 @@ fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
     head.ref_update(
         &Principal::Static,
         "main",
-        &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone() },
+        &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone(), tombstone: None },
     )
     .expect("warm ref update");
     let warm = head.objects.reads();
@@ -1887,9 +1893,9 @@ async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
         upload_all(&head, &harvested);
         head.put_trust(&Principal::Static, harvested.trust.as_ref().expect("trust")).expect("plant trust");
 
-        head.ref_update(&Principal::Static, "@office", &RefUpdateRequest { old_head: None, new_head: office_head })
+        head.ref_update(&Principal::Static, "@office", &RefUpdateRequest { old_head: None, new_head: office_head, tombstone: None })
             .expect("lift the office over an async store");
-        head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None })
             .expect("lift the pallet over an async store");
 
         assert_eq!(
@@ -2304,7 +2310,7 @@ fn a_commit_that_stays_transient_is_attempted_four_times_under_one_token_then_an
         uploaded_first_push("transient-cas-outcome", TransientOnCommit::always());
 
     let err = head
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head.clone() })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None })
         .expect_err("a Transient CasOutcome must refuse the commit, not accept it");
 
     assert_eq!(err.status, Status::ServiceUnavailable);
@@ -2314,7 +2320,7 @@ fn a_commit_that_stays_transient_is_attempted_four_times_under_one_token_then_an
     assert_eq!(first.len(), 4, "one budget is four attempts");
     assert!(first.iter().all(|token| *token == first[0]), "one token per request: {first:?}");
 
-    let _ = head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head });
+    let _ = head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None });
     let both = head.refs.tokens();
     assert_eq!(both.len(), 8);
     assert!(both[4..].iter().all(|token| *token == both[4]));
@@ -2348,7 +2354,7 @@ fn a_commit_of_unknown_fate_answers_503_without_claiming_nothing_moved() {
         let head = head.with_deadline(std::time::SystemTime::now() + std::time::Duration::from_secs(3));
 
         let err = head
-            .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head })
+            .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None })
             .expect_err("an uncertain outcome is still a refusal");
 
         assert_eq!(err.status, Status::ServiceUnavailable);
@@ -2360,7 +2366,7 @@ fn a_commit_of_unknown_fate_answers_503_without_claiming_nothing_moved() {
     let (_area, head, main_head) =
         uploaded_first_push("contended-cas-message", TransientOnCommit::always());
     let err = head
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None })
         .expect_err("contention outlasting the budget is a refusal");
 
     assert!(err.message.contains("No input is known to have moved"), "{}", err.message);
@@ -2373,7 +2379,7 @@ fn a_commit_refused_transiently_once_is_reissued_and_lands() {
     let (_area, head, main_head) =
         uploaded_first_push("transient-cas-once", TransientOnCommit::times(1));
 
-    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head.clone() })
+    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None })
         .expect("the re-issue lands");
 
     assert_eq!(head.refs.tokens().len(), 2);
@@ -2391,7 +2397,7 @@ fn a_moved_pallet_head_is_answered_on_the_first_attempt() {
         uploaded_first_push("moved-cas-not-reissued", TransientOnCommit::always_moved());
 
     let err = head
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None })
         .expect_err("the commit reports the pallet moved");
 
     assert_eq!(err.status, Status::Conflict);
@@ -2407,7 +2413,7 @@ fn a_commit_near_its_deadline_is_not_reissued() {
     let head = head.with_deadline(std::time::SystemTime::now() + std::time::Duration::from_millis(500));
 
     let err = head
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None })
         .expect_err("transient");
 
     assert_eq!(err.status, Status::ServiceUnavailable);
@@ -2447,10 +2453,11 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
         .ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
             old_head: None,
             new_head: office_head.clone(),
+            tombstone: None,
         })
         .expect("lift office");
     setup
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone(), tombstone: None })
         .expect("lift main v1");
 
     // Attack: lift main v1 -> v2 while an office lift lands right after the audit's
@@ -2470,6 +2477,7 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
         .ref_update(&Principal::Static, "main", &RefUpdateRequest {
             old_head: Some(main_v1.clone()),
             new_head: main_v2.clone(),
+            tombstone: None,
         })
         .expect_err("the office moved between the audit and the commit");
     assert_eq!(err.status, Status::Conflict);
@@ -2540,7 +2548,7 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
 
     let caller = Principal::Operator(writer.to_string());
     let office_wire = format!("@{}", OFFICE_PALLET_NAME);
-    let advance = RefUpdateRequest { old_head: Some(main_v1.clone()), new_head: main_v2.clone() };
+    let advance = RefUpdateRequest { old_head: Some(main_v1.clone()), new_head: main_v2.clone(), tombstone: None };
 
     // Trust, the granting office and main v1, set up by the administrator.
     let set_up = || {
@@ -2549,10 +2557,10 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
         upload_all(&setup, &latest);
         setup.put_trust(&Principal::Static, &anchor).expect("put trust");
         setup
-            .ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office_granted.clone() })
+            .ref_update(&Principal::Static, &office_wire, &RefUpdateRequest { old_head: None, new_head: office_granted.clone(), tombstone: None })
             .expect("lift the granting office");
         setup
-            .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+            .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone(), tombstone: None })
             .expect("lift main v1");
         store
     };
@@ -2570,6 +2578,7 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
         .ref_update(&Principal::Static, &office_wire, &RefUpdateRequest {
             old_head: Some(office_granted.clone()),
             new_head: office_revoked.clone(),
+            tombstone: None,
         })
         .expect("lift the revoking office");
     let err = revoking.ref_update(&caller, "main", &advance).expect_err("the revoked writer");
@@ -2654,7 +2663,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
     let setup = Head::new(MemoryObjectStore::new(), SharedMemoryRefs(store.clone()));
     upload_all(&setup, &latest);
     setup
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone(), tombstone: None })
         .expect("lift main v1 (untrusted, unaudited)");
 
     // Attack: lift main v1 -> v2 while the office pallet moves right after `ref_update`'s
@@ -2675,6 +2684,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
         .ref_update(&Principal::Static, "main", &RefUpdateRequest {
             old_head: Some(main_v1),
             new_head: main_v2.clone(),
+            tombstone: None,
         })
         .expect(
             "an untrusted push must never be refused for an office move its audit never \
@@ -2718,10 +2728,11 @@ fn a_concurrent_trust_anchor_change_refuses_the_commit_as_anchor_moved_not_palle
         .ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
             old_head: None,
             new_head: office_head.clone(),
+            tombstone: None,
         })
         .expect("lift office");
     setup
-        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+        .ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone(), tombstone: None })
         .expect("lift main v1");
 
     // A well-formed but different anchor. Its content need not be a valid re-genesis chain —
@@ -2753,6 +2764,7 @@ fn a_concurrent_trust_anchor_change_refuses_the_commit_as_anchor_moved_not_palle
         .ref_update(&Principal::Static, "main", &RefUpdateRequest {
             old_head: Some(main_v1.clone()),
             new_head: main_v2.clone(),
+            tombstone: None,
         })
         .expect_err("the trust anchor moved between the audit and the commit");
     assert_eq!(err.status, Status::Conflict);
@@ -2799,9 +2811,10 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
     head.ref_update(&Principal::Static, &format!("@{}", OFFICE_PALLET_NAME), &RefUpdateRequest {
         old_head: None,
         new_head: office_head.clone(),
+        tombstone: None,
     })
     .expect("lift office");
-    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone() })
+    head.ref_update(&Principal::Static, "main", &RefUpdateRequest { old_head: None, new_head: main_v1.clone(), tombstone: None })
         .expect("lift main v1");
 
     // A pallet this transaction never names moves concurrently. Planting it is itself a
@@ -2829,6 +2842,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
     head.ref_update(&Principal::Static, "main", &RefUpdateRequest {
         old_head: Some(main_v1),
         new_head: main_v2.clone(),
+        tombstone: None,
     })
     .expect("an unrelated pallet moving must never refuse this commit");
 

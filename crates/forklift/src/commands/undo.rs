@@ -291,12 +291,39 @@ mod tests {
         let freed = test_support::store_parcel(&hash('f'), &[]);
         test_support::write_ref_unchecked("side", &freed);
         let entry = journal_utils::delete_entry("side", &freed).unwrap();
-        pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "side", &freed, &none, &entry).unwrap();
+        pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "side", &freed, &none, Some(&entry)).unwrap();
 
         let error = test_support::block_on(handle_command(None)).expect_err("the undo must refuse");
         assert!(error.contains("is no longer complete in this warehouse"), "{}", error);
         assert!(error.contains("forklift lower side"), "{}", error);
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None, "nothing was created");
         assert_eq!(journal_utils::peek().unwrap(), Some(entry), "a refused undo keeps its entry");
+    }
+
+    /// In a served warehouse the delete leaves a tombstone, and undo's restore acknowledges it:
+    /// the pallet comes back and the tombstone goes.
+    ///
+    /// Revert: restore through `update_pallet_head_in` (no acknowledgement) → the restore is
+    /// refused as a re-creation of a deleted pallet → red.
+    #[test]
+    fn undo_of_a_delete_in_a_served_warehouse_clears_its_tombstone() {
+        let _warehouse = Warehouse::storage_only("undo-delete-served");
+        let none = pallet_utils::RefPreconditions::NONE;
+        forklift_core::util::tombstone_utils::mark_served().unwrap();
+
+        let tree = test_support::store_tree("a.txt", b"a\n");
+        let main = test_support::store_parcel(&tree, &[]);
+        let side = test_support::store_parcel(&tree, &[&main]);
+        pallet_utils::update_pallet_head("main", None, &main, &none).unwrap();
+        pallet_utils::update_pallet_head("side", None, &side, &none).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
+        let entry = journal_utils::delete_entry("side", &side).unwrap();
+        pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "side", &side, &none, Some(&entry)).unwrap();
+        assert_eq!(forklift_core::util::tombstone_utils::tombstone_heads().unwrap(), vec![side.clone()]);
+
+        test_support::block_on(handle_command(None)).expect("the undo restores the pallet");
+
+        assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(side));
+        assert!(forklift_core::util::tombstone_utils::read_tombstones().unwrap().is_empty(), "the tombstone is cleared");
     }
 }

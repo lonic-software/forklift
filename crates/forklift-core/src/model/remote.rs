@@ -68,6 +68,14 @@ pub struct WarehouseInfo {
     /// an old client ignores the unknown field and is wholly unaffected.
     #[serde(default)]
     pub chunking: bool,
+
+    /// The pallets deleted on this head whose tombstones still stand, each mapped to the head it
+    /// was deleted at, which the head keeps and serves until the tombstone is cleared or dropped.
+    /// `Some` (possibly empty) also says the head deletes pallets (`DELETE /v1/pallets/{name}`);
+    /// absent or `None` says it does not. An **additive** capability field like
+    /// [`Self::chunking`]: an older head never writes it, and an older client ignores it.
+    #[serde(default)]
+    pub tombstones: Option<BTreeMap<String, String>>,
 }
 
 /// The trust anchor on the wire (the TOML file's fields as JSON). The re-genesis
@@ -233,6 +241,22 @@ pub struct RefUpdateRequest {
 
     /// The parcel the pallet head moves to.
     pub new_head: String,
+
+    /// On a creation (`old_head` `None`) of a pallet deleted on this head, the head its tombstone
+    /// holds: the writer acknowledges the deletion. A head refuses re-creating a deleted pallet
+    /// without it, or from history that does not descend from that head. Additive: absent reads as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<String>,
+}
+
+/// The body of `DELETE /v1/pallets/{name}`: the compare-and-set removal of a user pallet's ref,
+/// which leaves a tombstone (see [`WarehouseInfo::tombstones`]).
+#[derive(Serialize, Deserialize)]
+pub struct RefDeleteRequest {
+    /// The head the remote is expected to have right now. A mismatch is a `409` and nothing
+    /// moves.
+    pub old_head: String,
 }
 
 /// The body of `POST /v1/lift/{session}/commit` (additive; the serverless head). After a
@@ -406,6 +430,7 @@ mod tests {
             pallets: BTreeMap::new(),
             trust: None,
             chunking: true,
+            tombstones: None,
         };
 
         let wire = serde_json::to_string(&info).expect("serialize");
