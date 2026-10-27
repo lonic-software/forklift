@@ -2136,8 +2136,8 @@ refusal before ever reaching its own fetch):
   clone's paths was never fetched, so its absence is not reported; if the file recording those
   paths cannot be read, the incomplete record is left standing and `heal` says so. Likewise a
   tree or file the warehouse holds by hash alone (see `audit`) is not reported when absent (a
-  staged file still is: it is this checkout's own work); if the sealed-object record cannot be read,
-  the incomplete record of what was affected is left standing and `heal` says so. This can take
+  staged file still is: it is this checkout's own work); if the sealed-object record cannot be
+  read, the incomplete record of what was affected is left standing and `heal` says so. This can take
   noticeably longer than the ordinary case (it is
   checking the whole object store, not just the affected paths), and it prints progress as it
   goes. If nothing turns out to be missing, the taint clears — exit 0, same as any other clean
