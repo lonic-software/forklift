@@ -3825,7 +3825,7 @@ fn a_tail_naming_no_valid_pallet_never_reaches_the_admission_hook() {
     let deletes = admitted("ref_delete");
     assert!(deletes.len() == 1 && deletes[0].contains("\"pallet\":\"feature/x\""), "{:?}", deletes);
 
-    for tail in ["feature/..", "..%2Fmain", "feature/./x", "feature/X", "feature//x"] {
+    for tail in ["feature/..", "..%2Fmain", "feature/./x", "feature/X", "feature//x", "feature/x/", "/main"] {
         let (status, body) =
             http_send_json_as(&server.url, "POST", &format!("/v1/pallets/{}", tail), &update, token);
         assert!(status.starts_with("HTTP/1.1 422"), "update {}: {} / {}", tail, status, body);
@@ -6081,8 +6081,9 @@ fn scope_prune_frees_work_the_remote_keeps_under_a_tombstone() {
 
 #[test]
 fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
-    // FORK-297: a pallet name may carry `/`, and the per-pallet routes take it whole. The lift moves `feature/x` on the remote, and the prune's holds check of it is
-    // answered, so the history the remote confirms under that name is freed.
+    // FORK-297: a pallet name may carry `/`, and the per-pallet routes take it whole. The lift
+    // moves `feature/x` on the remote, and the prune's holds check of it is answered, so the
+    // history the remote confirms under that name is freed.
     let area = TestArea::new("scope-prune-slash-pallet");
     let server = sparse_with_docs(&area);
 
@@ -6117,7 +6118,10 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
 }
 
-/// What stands between the client and forklift-server in [`a_slash_named_pallet_crosses`].
+/// What stands between the client and forklift-server in [`a_slash_named_pallet_crosses`]. Each
+/// mode witnesses one side: behind `Decoding`, a server route that takes only one segment splits
+/// the name; behind `Refusing`, a client that sends `feature%2Fx` is turned away. A client sending
+/// `%2F` passes the decoding proxy, since forklift-server's routes take the decoded segments.
 enum SlashProxy {
     /// Decodes `%2F` to `/` before forwarding, as the serverless head's API gateway does.
     Decoding,

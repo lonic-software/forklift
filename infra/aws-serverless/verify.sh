@@ -391,7 +391,7 @@ README's \"Layer 3 retention & reset\" section."
 fi
 
 # ---------------------------------------------------------------------------------------------
-# Step 1/4 (checklist step 1) — handshake.
+# Step 1/5 (checklist step 1) — handshake.
 # ---------------------------------------------------------------------------------------------
 
 log "step 1/5 (checklist #1): handshake — GET ${ENDPOINT}${PREFIX}/v1/warehouse"
@@ -410,7 +410,7 @@ chunking="$(jq -r '.chunking // empty' "$WORKDIR/handshake.json" 2>/dev/null || 
 log "  OK — 200, chunking: true"
 
 # ---------------------------------------------------------------------------------------------
-# Step 2/4 (checklist steps 2 and 3, combined into one lift) — a small round trip plus a chunked
+# Step 2/5 (checklist steps 2 and 3, combined into one lift) — a small round trip plus a chunked
 # (>= 8 MiB) round trip. Combined deliberately: both call the identical
 # ObjectStore::verify_and_promote (docs/DEPLOYMENT.md "Architecture overview"), one synchronously
 # from the control plane and one asynchronously via the verifier's S3-event trigger, so one lift
@@ -499,7 +499,7 @@ done
 log "  OK — small files and big.bin round-tripped identically"
 
 # ---------------------------------------------------------------------------------------------
-# Step 3/4 (checklist step 4) — after a successful lift, staging/ must not have grown: commit_
+# Step 3/5 (checklist step 4) — after a successful lift, staging/ must not have grown: commit_
 # lift's final batch sweeps everything THIS run staged. See the "staging/ baseline" section
 # above (PR #80 review, finding #7) for why this is a before/after delta on the bucket-wide
 # count rather than an absolute zero: a leftover from an unrelated aborted run must not wedge
@@ -517,7 +517,7 @@ fi
 log "  OK — staging/ did not grow ($staging_key_count_before -> $staging_key_count_after key(s))"
 
 # ---------------------------------------------------------------------------------------------
-# Step 4/4 — signature-sidecar fetch (binary response path) and the explicit control-plane read
+# Step 4/5 — signature-sidecar fetch (binary response path) and the explicit control-plane read
 # (KMS, control-plane half — see the caveat below).
 #
 # GET /v1/signatures/{hash} is the one endpoint that returns raw bytes directly through the

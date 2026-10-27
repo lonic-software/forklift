@@ -566,8 +566,10 @@ fn resolve_route<B>(
     let path = request.uri().path();
     let method = request.method();
 
-    // Split into non-empty segments; the leading/trailing slashes drop out.
-    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    // Split into segments after the leading slash. Empty segments are kept, as `forklift-server`'s
+    // router keeps them: a trailing slash or a `//` matches no route, or reaches a pallet name
+    // whose parse refuses the empty component.
+    let segments: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
 
     let (warehouse_id, rest) = match routing {
         Routing::Single(id) => (id.clone(), segments.as_slice()),
@@ -620,25 +622,31 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> He
         (&Method::GET, ["signatures", hash]) => Some(Route::SignatureGet(param(hash)?)),
         (&Method::PUT, ["signatures", hash]) => Some(Route::SignaturePut(param(hash)?)),
         (&Method::PUT, ["trust"]) => Some(Route::PutTrust),
-        (&Method::POST, ["pallets", name @ ..]) if !name.is_empty() => Some(Route::RefUpdate(pallet_name(name)?)),
-        (&Method::DELETE, ["pallets", name @ ..]) if !name.is_empty() => Some(Route::RefDelete {
+        (&Method::POST, ["pallets", name @ ..]) if is_tail(name) => Some(Route::RefUpdate(pallet_name(name)?)),
+        (&Method::DELETE, ["pallets", name @ ..]) if is_tail(name) => Some(Route::RefDelete {
             name: pallet_name(name)?,
             old_head: query_param(query, "old_head")?.ok_or_else(|| {
                 HeadError::unprocessable("A pallet delete names the head it deletes: ?old_head=<hash>.")
             })?,
         }),
-        (&Method::POST, ["holds", name @ ..]) if !name.is_empty() => Some(Route::Holds(pallet_name(name)?)),
+        (&Method::POST, ["holds", name @ ..]) if is_tail(name) => Some(Route::Holds(pallet_name(name)?)),
         (&Method::POST, ["resolve"]) => Some(Route::Resolve),
         (&Method::GET, ["bundles", "latest"]) => Some(Route::BundleLatest),
         _ => None,
     })
 }
 
+/// Whether the rest of the path after `pallets` or `holds` names something: `/v1/pallets/` and
+/// `/v1/pallets` match no route, as on `forklift-server`, whose wildcard needs a non-empty tail.
+fn is_tail(segments: &[&str]) -> bool {
+    !matches!(segments, [] | [""])
+}
+
 /// A pallet name, the rest of the path after `pallets` or `holds`: the client sends a name such
 /// as `feature/x` as literal segments, last in the path, so each segment is decoded on its own
-/// and the decoded segments are joined with `/`. Empty segments were dropped by the split, so
-/// `a//b` reads as `a/b`; no valid name has an empty component, and every handler still parses
-/// the name, refusing `.`, `..` and anything outside the name alphabet.
+/// and the decoded segments are joined with `/`. An empty segment stays an empty component, so
+/// `a//b` and `a/b/` are not `a/b`; every handler parses the name, refusing an empty component,
+/// `.`, `..` and anything outside the name alphabet.
 fn pallet_name(segments: &[&str]) -> HeadResult<String> {
     Ok(segments.iter().map(|segment| param(segment)).collect::<HeadResult<Vec<_>>>()?.join("/"))
 }

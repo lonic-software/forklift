@@ -457,7 +457,8 @@ fn a_pallet_named_with_a_slash_routes_as_literal_segments() {
 }
 
 /// A tail that is no valid pallet name is refused on every per-pallet route before the ref store
-/// is touched: a `.`, `..` or uppercase component is a 422, and no tail at all matches no route.
+/// is touched: a `.`, `..`, empty or uppercase component is a 422, and no tail at all matches no
+/// route.
 #[test]
 fn a_tail_naming_no_valid_pallet_is_refused_on_every_route() {
     let fixture = Fixture::direct();
@@ -465,7 +466,9 @@ fn a_tail_naming_no_valid_pallet_is_refused_on_every_route() {
     let commit = RefUpdateRequest { old_head: None, new_head: hash.clone(), tombstone: None };
     let request = HoldsRequest { candidates: vec![hash.clone()] };
 
-    for tail in ["feature/..", "../main", "feature/./x", "feature/X"] {
+    for tail in [
+        "feature/..", "../main", "..%2Fmain", "feature/./x", "feature/X", "feature//x", "feature/x/", "/main",
+    ] {
         let update = fixture.call(post_json(&format!("/v1/pallets/{}", tail), &commit));
         assert_eq!(status(&update), 422, "update {}", tail);
         let holds = fixture.call(post_json(&format!("/v1/holds/{}", tail), &request));
