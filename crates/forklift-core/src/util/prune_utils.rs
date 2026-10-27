@@ -570,7 +570,7 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
 ///
 /// A tree or recipe recorded in `sealed` and absent is held by hash alone: it is retained and not
 /// descended, as a fresh franchise would hold it. A recorded one that is present is walked like
-/// any other. Any other absent tree or recipe fails the plan.
+/// any other. Any other absent tree or recipe the walk loads fails the plan.
 fn collect_retained(
     user_parcels: &[String],
     meta_parcels: &[String],
