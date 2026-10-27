@@ -320,6 +320,12 @@ lifts to `POST /v1/pallets/@office`. The meta pallet names are a fixed list — 
 `manifest`, `haul`, `tags`, `kv` — and any other `@name` is refused with `422` before any other
 check.
 
+`{name}` is one path segment, here and on every route that takes a pallet. A client
+percent-encodes the whole reference, `/` included, so `feature/x` travels as `feature%2Fx` and
+`@office` as `%40office`. A server percent-decodes the segment back to the reference. An
+unencoded `/` splits the name across segments, so the request matches no route or the wrong one
+(a raw `feature/holds` reads as the holds route of `feature`).
+
 ```json
 { "old_head": "<hash-or-null>", "new_head": "<hash>" }
 ```
