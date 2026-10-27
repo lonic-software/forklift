@@ -3709,6 +3709,8 @@ fn a_deleted_pallet_is_re_created_only_from_its_history_with_acknowledgement() {
     let refused = [
         ("an update from the old head", Some(feature_v2.clone()), feature_v3.clone(), None, "deleted on this remote"),
         ("an unacknowledged creation", None, feature_v3.clone(), None, "acknowledge the deletion"),
+        // Refused before its history is read: nothing of it was uploaded.
+        ("an unacknowledged creation of absent history", None, "f".repeat(64), None, "acknowledge the deletion"),
         ("another head acknowledged", None, feature_v3.clone(), Some(main_head.clone()), "acknowledge the deletion"),
         ("a non-descendant", None, main_head.clone(), Some(feature_v2.clone()), "does not descend"),
     ];
@@ -3776,6 +3778,8 @@ enum DeleteRace {
     Transient,
     /// Run this against the shared store before the first attempt, then answer as [`Self::Transient`].
     TransientAfter(RefCell<Option<RacingWrite>>),
+    /// Answer as [`Self::Transient`], and fail every ref read once the first attempt was made.
+    TransientThenUnreadable(Cell<bool>),
 }
 
 /// Wraps a shared [`MemoryRefStore`], interfering with `delete_head` as its [`DeleteRace`]
@@ -3793,7 +3797,10 @@ impl DeleteRace {
 
 impl RefStore for RacesTheDelete {
     fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
-        self.inner.get_head(namespace, name)
+        match &self.race {
+            DeleteRace::TransientThenUnreadable(attempted) if attempted.get() => Err("throttled".to_string()),
+            _ => self.inner.get_head(namespace, name),
+        }
     }
 
     fn compare_and_set_head(
@@ -3830,6 +3837,10 @@ impl RefStore for RacesTheDelete {
                 Ok(CasOutcome::Transient(TransientCause::FateUnknown))
             }
             DeleteRace::Transient => Ok(CasOutcome::Transient(TransientCause::FateUnknown)),
+            DeleteRace::TransientThenUnreadable(attempted) => {
+                attempted.set(true);
+                Ok(CasOutcome::Transient(TransientCause::FateUnknown))
+            }
             DeleteRace::TransientAfter(race) => {
                 if let Some(race) = race.borrow_mut().take() {
                     race(&self.inner);
@@ -3929,8 +3940,8 @@ fn of_two_racing_deletes_the_loser_answers_200() {
 }
 
 /// A delete answered transient on every attempt asks the ref: it answers `200` when an attempt
-/// landed, `503` when none did and the pallet is still live, and `remote_ahead` when the pallet
-/// moved meanwhile, since then nothing is in doubt.
+/// landed, `503` when none did and the pallet is still live or the ref cannot be read either, and
+/// `remote_ahead` when the pallet moved meanwhile, since then nothing is in doubt.
 #[test]
 fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     let area = Area::new("delete-transient-landed");
@@ -3943,6 +3954,11 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_v2));
+
+    let area = Area::new("delete-transient-unreadable");
+    let (_, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::TransientThenUnreadable(Cell::new(false)));
+    let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the ref cannot be read");
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
 
     let area = Area::new("delete-transient-moved");
     let (_, head, feature_v2, _) =

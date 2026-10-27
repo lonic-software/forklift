@@ -11,21 +11,22 @@
 //!
 //! Authentication is the adapter's concern (`entrypoint::authenticate`, with an optional API
 //! Gateway authorizer on top of it): it resolves who is calling to a [`Principal`], which every
-//! mutating method here takes. Authorization is this type's: each mutating method judges its
-//! caller with the office authority rules shared with `forklift-server`
+//! mutating method here takes. Authorization is this type's: each mutating method judges its caller
+//! with the office authority rules shared with `forklift-server`
 //! (`forklift_core::util::authority_utils`), against the office state it reads for itself. An
 //! upload (`upload_targets`, `object_put`, `signature_put`, `commit_lift`) is refused to an
 //! operator the office does not enroll and to a reader; a ref update is refused to an operator
-//! whose role and pallet grants do not admit that pallet; a trust re-genesis is refused to every
-//! operator, since its authority comes from the very chain being replaced. The shared bearer
-//! ([`Principal::Static`]) and an open head ([`Principal::Open`]) are the deployment's own
-//! credential, and pass every rule.
+//! whose role and pallet grants do not admit that pallet, and so is a pallet delete; a trust
+//! re-genesis is refused to every operator, since its authority comes from the very chain being
+//! replaced. The shared bearer ([`Principal::Static`]) and an open head ([`Principal::Open`]) are
+//! the deployment's own credential, and pass every rule.
 //!
 //! The content invariants hold on top of that, for every caller alike: hash-verified objects, a
-//! fast-forward-only CAS, and — on a trusted warehouse — the full offline audit (the signed office
-//! chain, and for any non-office pallet its pushed history's own signature validity) before a ref
-//! moves. See [`Head::ref_update`]'s own doc comment and `docs/DEPLOYMENT.md`'s "What the bearer
-//! tokens do — and do not — control".
+//! fast-forward-only CAS (a delete moves no head: it leaves a tombstone at the head it removes),
+//! and — on a trusted warehouse — the full offline audit (the signed office chain, and for any
+//! non-office pallet its pushed history's own signature validity) before a ref moves. See
+//! [`Head::ref_update`]'s own doc comment and `docs/DEPLOYMENT.md`'s "What the bearer tokens do —
+//! and do not — control".
 //!
 //! **Every method here is synchronous and must be called from a blocking thread**
 //! (`tokio::task::spawn_blocking`), exactly as `forklift-server` runs its handlers' storage
@@ -782,12 +783,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // Fail fast on an obviously stale request; the conditional write below is the
         // authoritative gate that also catches a head that moves during the audit. A pallet
         // deleted here answers an update with the deletion, since lowering cannot resolve it, and
-        // binds a creation to its tombstone: the commit expects the tombstone, and the audit below
-        // decides whether this creation may lift over it.
+        // binds a creation to its tombstone: one that does not acknowledge it is refused here, and
+        // for one that does the commit expects the tombstone and the audit below decides whether
+        // its history descends from it.
         let expected = match (request.old_head.as_deref(), &current) {
             (Some(old), RefHead::Live(head)) if old == head => ExpectedHead::At(old),
             (Some(_), RefHead::Deleted(tombstone)) => return Err(self.deleted(&bare, tombstone)),
             (None, RefHead::Absent) => ExpectedHead::Unborn,
+            (None, RefHead::Deleted(tombstone)) if request.tombstone.as_deref() != Some(tombstone.as_str()) => {
+                return Err(self.recreation_refused(&bare, tombstone, false))
+            }
             (None, RefHead::Deleted(tombstone)) => ExpectedHead::Deleted(tombstone),
             _ => return Err(self.moved(&current.live().map(str::to_string), &request.old_head)),
         };
@@ -921,21 +926,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )
             .map_err(HeadError::unprocessable)?;
 
-            // A creation over a tombstone lifts only when it acknowledged the deletion and its
-            // new head descends from the deleted one. Checked after the closure, so the walk of
-            // the new history reads only what is present.
+            // An acknowledged creation over a tombstone lifts only when its new head descends from
+            // the deleted one. Checked after the closure, so the walk of the new history reads
+            // only what is present.
             if let ExpectedHead::Deleted(tombstone) = expected {
-                let acknowledged = request.tombstone.as_deref() == Some(tombstone);
-                let descends = acknowledged
-                    && merge_utils::is_ancestor(tombstone, &request.new_head).map_err(HeadError::internal)?;
-
-                if !descends {
-                    return Err(HeadError::conflict(String::from(pallet_utils::pallet_recreation_refusal(
-                        &bare,
-                        tombstone,
-                        acknowledged,
-                        false,
-                    ))));
+                if !merge_utils::is_ancestor(tombstone, &request.new_head).map_err(HeadError::internal)? {
+                    return Err(self.recreation_refused(&bare, tombstone, true));
                 }
             }
 
@@ -1161,10 +1157,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // Under one token an earlier attempt may still have landed: the ref decides.
                     // A ref that left `old_head` some other way is answered as the commit's
                     // conflict would have been, not as contention that moved nothing.
-                    return match self.refs.get_head(PalletNamespace::User, &bare).map_err(HeadError::internal)? {
-                        RefHead::Deleted(tombstone) if tombstone == old_head => Ok(()),
-                        RefHead::Live(head) if head == old_head => Err(self.delete_contention(uncertain.get())),
-                        current => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
+                    // A read that fails too leaves the fate where the attempts left it.
+                    return match self.refs.get_head(PalletNamespace::User, &bare) {
+                        Ok(RefHead::Deleted(tombstone)) if tombstone == old_head => Ok(()),
+                        Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(uncertain.get())),
+                        Ok(current) => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
+                        Err(_) => Err(self.delete_contention(uncertain.get())),
                     };
                 }
             }
@@ -1404,6 +1402,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         HeadError::conflict(String::from(
             forklift_core::util::pallet_utils::pallet_moved_refusal(current.as_deref(), expected.as_deref())
         ))
+    }
+
+    /// The `409` for a creation over the tombstone at `tombstone` that did not acknowledge it
+    /// (`acknowledged` false), or whose new head does not descend from it.
+    fn recreation_refused(&self, bare: &str, tombstone: &str, acknowledged: bool) -> HeadError {
+        HeadError::conflict(String::from(pallet_utils::pallet_recreation_refusal(bare, tombstone, acknowledged, false)))
     }
 
     /// The `409` for a ref found deleted at `tombstone` by a request that expected it live.
