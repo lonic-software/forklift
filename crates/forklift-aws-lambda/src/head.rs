@@ -1431,10 +1431,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// every attempt was refused for a reason showing no input moved, so nothing did whatever the
     /// ref read back says or whether it could be read; with it true an attempt may have landed,
     /// and neither the attempts nor the ref read back confirmed it. `read_fault` is why the ref
-    /// could not be read back, when it could not. Both name `old_head`, the head the delete was
-    /// for, and say how each state the remote's listing can show answers it — deleted at
-    /// `old_head` is done, live there is not, and live anywhere else moved since — since a client
-    /// cannot tell the two apart, and a rerun deletes whatever head it then finds.
+    /// could not be read back, when it could not. Both state only what this request knows — the
+    /// head it was for and, when it read the pallet back, that it was still live there — and send
+    /// the caller to look before deleting again, since a rerun deletes whatever head it then
+    /// finds. What a listing then means is the protocol's to say, not this message's.
     fn delete_contention(&self, bare: &str, old_head: &str, uncertain: bool, read_fault: Option<&str>) -> HeadError {
         let what = match uncertain {
             true => format!("The delete could not be confirmed: {}", UNCONFIRMED),
@@ -1444,22 +1444,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 .to_string(),
         };
         let next = format!(
-            "List the remote's pallets (\"forklift palletize --remote --json\"): \"{name}\" under \
-            `deleted` at {head} means the delete was done; live with `remote_head` {head} means it \
-            was not, and running it again deletes that head; live at any other head means the \
-            pallet moved since, and a delete now would delete that head instead.",
-            name = bare,
-            head = old_head
+            "The delete was for \"{}\" at {}. Check the remote's pallets (\"forklift palletize \
+            --remote --json\") before deleting it again: a new delete removes whatever head the \
+            pallet is at then.",
+            bare, old_head
         );
 
         let fault = read_fault.map(|fault| fault.split_whitespace().collect::<Vec<_>>().join(" "));
         let read = match fault.as_deref().map(|fault| fault.strip_suffix('.').unwrap_or(fault)) {
             Some(fault) if !fault.is_empty() => format!(" Reading the pallet back failed too ({}).", fault),
             Some(_) => " Reading the pallet back failed too.".to_string(),
-            None => String::new(),
+            None => " It was still live at that head when this request read it back.".to_string(),
         };
 
-        HeadError::service_unavailable(format!("{}{} {}", what, read, next))
+        HeadError::service_unavailable(format!("{} {}{}", what, next, read))
     }
 
     /// The `409` for an office lift landing between the audit and the commit: the pallet

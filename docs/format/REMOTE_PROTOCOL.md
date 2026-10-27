@@ -442,10 +442,11 @@ more: a `503` when its storage stayed busy through every attempt it could afford
 may have landed and could not be confirmed. Either claims nothing about the pallet's state now,
 and nothing in the status or headers tells them apart, so a client treats both as possibly
 landed: it reads the pallet's state before deleting again rather than deleting whatever head it
-finds then. A tombstone at `old_head` means the delete was done, the pallet live at `old_head`
-that it was not, and live at another head that it moved since; the message names `old_head` for
-a person reading it. The identical request may be sent again; it is answered from the state at
-that time — `200` from a tombstone still at `old_head` once it passes checks 1 and 2.
+finds then. A tombstone at `old_head` shows that a delete at `old_head` landed, this one or
+another; the pallet live at `old_head` that none has landed yet, though an attempt of unknown fate
+may still; anything else that the pallet moved since. The identical request may be sent again;
+it is answered from the state at that time — `200` from a tombstone still at `old_head` once it
+passes checks 1 and 2.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 
