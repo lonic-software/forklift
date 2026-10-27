@@ -443,8 +443,9 @@ may have landed and could not be confirmed. Either claims nothing about the pall
 and nothing in the status or headers tells them apart, so a client treats both as possibly
 landed: it reads the pallet's state before deleting again rather than deleting whatever head it
 finds then. A tombstone at `old_head` shows that a delete at `old_head` landed, this one or
-another; the pallet live at `old_head` that none has, or that a restore undid one, and an attempt
-of unknown fate may still land; anything else that the pallet moved since. The message names the
+another; the pallet live at `old_head` that none has, or that a restore undid one — and after the
+second kind of `503` an attempt of unknown fate may still land; anything else that the pallet
+moved since. The message names the
 pallet and `old_head` for a person, and says whether the head read the pallet back live there
 before answering; that read is already past, and changes none of the above. The identical
 request may be sent again; it is answered from the state at that time — `200` from a tombstone

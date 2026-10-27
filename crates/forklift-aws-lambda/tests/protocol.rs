@@ -4014,6 +4014,11 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert!(err.message.contains(&format!("The delete was for \"feature\" at {}.", feature_v2)), "{}", err.message);
     assert!(err.message.contains(&format!("still live at {} when", feature_v2)), "{}", err.message);
+    assert!(
+        err.message.ends_with("Check the remote's pallets (\"forklift palletize --remote --json\") before deleting \"feature\" again."),
+        "{}",
+        err.message
+    );
     assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_v2));
 
     // A ref that cannot be read leaves the fate where the attempts left it.
