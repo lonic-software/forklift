@@ -144,8 +144,9 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
 /// the remote neither lists nor keeps a tombstone of is not asked. One whose call fails (a head
 /// too old to have the route answers `404`), or that the remote answers `unknown` about (it was
 /// busy or out of time), confirms none of those candidates and is named in
-/// [`Confirmation::unanswered`], so the caller can say why less was freed. A record that cannot be read or does not parse is the one error:
-/// the prune refuses rather than guess at it, and the message says the record can be removed.
+/// [`Confirmation::unanswered`], so the caller can say why less was freed. A record that cannot be
+/// read or does not parse is the one error: the prune refuses rather than guess at it, and the
+/// message says the record can be removed.
 ///
 /// # Arguments
 /// * `client`         - The remote, already trust-checked by the caller.
