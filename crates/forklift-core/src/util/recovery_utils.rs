@@ -3645,6 +3645,138 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Write the sealed-by-hash record holding exactly `hashes`. Call inside a storage scope.
+    fn seal(hashes: &[&str]) {
+        let mut bytes = sealed_utils::header_bytes();
+        for hash in hashes {
+            bytes.extend(sealed_utils::encode_frame(sealed_utils::SealOp::Record, hash).unwrap());
+        }
+        let path = sealed_utils::sealed_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// FORK-133: the enumerating walk holds a recorded absent tree, recipe, chunk or blob by hash
+    /// alone, so a torn rescan's remainder leaves it out, while an unrecorded absence beside each
+    /// is still recorded. A recorded object that is present seals nothing: the tree `kept` is
+    /// recorded and present, and its lost child is still recorded. A recorded parent parcel stays
+    /// a loss, and so does a recorded hash the caller proved corrupt, which is present.
+    ///
+    /// Mutations, each red on its own assertion: drop the tolerance at `walk_tree`'s absent tree,
+    /// at `check_leaf`'s absent recipe, at its absent chunk, or at its absent plain leaf; test the
+    /// record before presence in `walk_tree` (the present `kept` is not descended); drop the
+    /// corrupt half of `held_by_hash`; or have the collecting sink drop every recorded hash (the
+    /// parent parcel is held).
+    #[test]
+    fn the_enumerating_walk_holds_a_recorded_absence_by_hash_alone() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+        use crate::util::gc_utils::tests::{store_chunk, store_recipe, store_tree};
+
+        let (dir, _scope) = enter_temp_root("sealed-enumerate");
+        let (held_tree, lost_tree) = ("1".repeat(64), "2".repeat(64));
+        let (held_blob, lost_blob) = ("3".repeat(64), "4".repeat(64));
+        let (held_recipe, lost_recipe) = ("5".repeat(64), "6".repeat(64));
+        let (held_chunk, lost_chunk) = ("7".repeat(64), "8".repeat(64));
+        let (kept_child, held_parent, corrupt_tree) = ("9".repeat(64), "a".repeat(64), "b".repeat(64));
+
+        let present_chunk = store_chunk(b"a chunk that is present");
+        let recipe = store_recipe(&[(present_chunk, 23), (held_chunk.clone(), 23), (lost_chunk.clone(), 23)]);
+        let kept = store_tree(&[("gone.txt", &kept_child, DirEntryType::Normal)]);
+        let root = store_tree(&[
+            ("held", &held_tree, DirEntryType::Tree),
+            ("lost", &lost_tree, DirEntryType::Tree),
+            ("held.txt", &held_blob, DirEntryType::Normal),
+            ("lost.txt", &lost_blob, DirEntryType::Normal),
+            ("held.bin", &held_recipe, DirEntryType::NormalChunked),
+            ("lost.bin", &lost_recipe, DirEntryType::NormalChunked),
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+            ("kept", &kept, DirEntryType::Tree),
+            ("corrupt", &corrupt_tree, DirEntryType::Tree),
+        ]);
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: root, parents: vec![held_parent.clone()], actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::tests::update_pallet_head_unverified("main", None, &parcel.hash, &pallet_utils::RefPreconditions::NONE)
+            .unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", None)).unwrap();
+        seal(&[&held_tree, &held_blob, &held_recipe, &held_chunk, &kept, &held_parent, &corrupt_tree]);
+
+        let walk = enumerate_absent_reachable(&[corrupt_tree.clone()].into_iter().collect()).unwrap();
+        assert!(walk.degraded_sources.is_empty(), "{:?}", walk.degraded_sources);
+        let absent = &walk.hashes;
+
+        assert!(!absent.contains(&held_tree), "a recorded absent tree is held: {:?}", absent);
+        assert!(!absent.contains(&held_recipe), "a recorded absent recipe is held: {:?}", absent);
+        assert!(!absent.contains(&held_chunk), "a recorded absent chunk is held: {:?}", absent);
+        assert!(!absent.contains(&held_blob), "a recorded absent blob is held: {:?}", absent);
+        assert!(absent.contains(&kept_child), "a present recorded tree is walked: {:?}", absent);
+        assert!(absent.contains(&corrupt_tree), "a corrupt recorded tree is present, so lost: {:?}", absent);
+        assert!(absent.contains(&held_parent), "a recorded parcel stays a loss: {:?}", absent);
+        assert_eq!(
+            absent,
+            &[lost_tree, lost_blob, lost_recipe, lost_chunk, kept_child, corrupt_tree, held_parent].into_iter().collect(),
+            "every unrecorded absence is still recorded"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-133: a staged object is the bay's own work, so its absence is a loss even when its
+    /// hash is recorded. Mutation: pass the record to the staged leaves' `check_leaf` → red.
+    #[test]
+    fn a_recorded_staged_object_that_is_absent_stays_a_loss() {
+        let (dir, _scope) = enter_temp_root("sealed-staged");
+        let staged = "c".repeat(64);
+        seal(&[&staged]);
+        let record = sealed_utils::read_sealed().unwrap();
+
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: Vec::new(),
+            haul_heads: Vec::new(),
+            tombstone_heads: Vec::new(),
+            mirror_roots: Vec::new(),
+            shard_referenced: vec![(staged.clone(), DirEntryType::Normal)],
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            walk_closure_for(
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&record), Some(&mut sink),
+            ).unwrap();
+        }
+        assert_eq!(reported, [staged].into_iter().collect::<BTreeSet<String>>());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-133: a sealed-object record that cannot be read is a degraded source, so the rescan
+    /// refuses rather than clearing on a walk that cannot tell held from lost; the walk itself
+    /// holds nothing. Mutation: propagate the read error → `Err` → red; or ignore it with no note →
+    /// the degraded assertion reddens.
+    #[test]
+    fn an_unreadable_sealed_record_is_a_degraded_source_and_the_walk_holds_nothing() {
+        use crate::util::gc_utils::tests::{store_root_parcel, store_tree};
+
+        let (dir, _scope) = enter_temp_root("sealed-unreadable");
+        let held = "d".repeat(64);
+        store_root_parcel(&store_tree(&[("held.txt", &held, DirEntryType::Normal)]));
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", None)).unwrap();
+        std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert!(walk.degraded_sources.iter().any(|note| note.contains("sealed-object record could not be read")),
+            "{:?}", walk.degraded_sources);
+        assert_eq!(walk.hashes, [held].into_iter().collect::<BTreeSet<String>>());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Shared fixture for the chunked-leaf tests below: a pallet head "main" whose parcel's spine
     /// tree has one `NormalChunked` file entry naming a recipe that IS stored (present), with one
     /// chunk in its list. The chunk object itself is never stored — its hash is only ever compared
