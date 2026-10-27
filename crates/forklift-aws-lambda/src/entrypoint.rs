@@ -597,8 +597,9 @@ fn resolve_route<B>(
 /// segment or query value that does not percent-decode to UTF-8 is a `422`.
 fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> HeadResult<Option<Route>> {
     // An empty segment in the path as received matches no route, as on `forklift-server`, whose
-    // captures never match an empty segment. A pallet name is the exception: it is the rest of the path, so an empty
-    // component reaches the handler, which refuses it like any other invalid name.
+    // captures never match an empty segment. A pallet name is the exception: it is the rest of the
+    // path, so an empty component reaches the handler, which refuses it like any other invalid
+    // name.
     if !matches!(segments, ["v1", "pallets" | "holds", ..]) && segments.contains(&"") {
         return Ok(None);
     }
