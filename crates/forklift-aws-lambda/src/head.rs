@@ -1431,27 +1431,34 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// every attempt was refused for a reason showing no input moved, so nothing did whatever the
     /// ref read back says or whether it could be read; with it true an attempt may have landed,
     /// and neither the attempts nor the ref read back confirmed it. `read_fault` is why the ref
-    /// could not be read back, when it could not. Running the same delete again is safe whatever
-    /// happened: one that landed answers `200` while its tombstone still holds the head it removed.
+    /// could not be read back, when it could not. After an uncertain one the message sends the
+    /// caller to read the pallet's state before deleting again rather than promising what a resend
+    /// answers: a delete that landed may since have been restored at the very head it removed,
+    /// which an identical resend would delete.
     fn delete_contention(&self, uncertain: bool, read_fault: Option<&str>) -> HeadError {
-        let what = match uncertain {
-            true => format!("The delete could not be confirmed: {}", UNCONFIRMED),
-            false => "The delete could not complete: the warehouse's storage stayed busy through \
-                every attempt this request could afford, most likely a push touching its office \
-                pallet at the same time. Nothing is known to have moved."
-                .to_string(),
+        let (what, next) = match uncertain {
+            true => (
+                format!("The delete could not be confirmed: {}", UNCONFIRMED),
+                "Fetch the warehouse to see whether the pallet is deleted before deleting it again.",
+            ),
+            false => (
+                "The delete could not complete: the warehouse's storage stayed busy through every \
+                attempt this request could afford, most likely a push touching its office pallet at \
+                the same time. Nothing is known to have moved."
+                    .to_string(),
+                "Run the delete again.",
+            ),
         };
 
         let read = match read_fault {
-            Some(fault) => format!(" Reading the pallet back failed too ({}).", fault.trim_end_matches('.')),
+            Some(fault) => {
+                let fault = fault.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!(" Reading the pallet back failed too: {}", fault)
+            }
             None => String::new(),
         };
 
-        HeadError::service_unavailable(format!(
-            "{}{} Run the delete again: one that already landed answers that it is done, unless the \
-            pallet was created again or deleted at another head since.",
-            what, read
-        ))
+        HeadError::service_unavailable(format!("{}{} {}", what, read, next))
     }
 
     /// The `409` for an office lift landing between the audit and the commit: the pallet
