@@ -47,4 +47,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `staged_upload_discarded` | 32 | A lift's commit named an upload the remote no longer holds (discarded or never received); running the lift again uploads it afresh |
 | `mirror_incomplete` | 33 | A mirror run left at least one pallet out of step with git; the others went through, and each failed pallet's message names its step |
 | `history_unverified` | 34 | History about to be adopted as a pallet's does not verify against the trust anchor it was judged against (the one held here, or at first contact the one the remote serves); nothing was adopted |
+| `pallet_deleted_on_remote` | 35 | The remote has the pallet only as a tombstone: it was deleted there, and the name stays reserved for that history; "palletize --restore <name> --remote" brings it back, "lift --recreate" re-creates it from work that descends from it |
 

@@ -122,8 +122,8 @@ map, empty when nothing was deleted. A head that cannot delete pallets sends `nu
 field, and a client reads that as "this remote does not support deleting pallets" before sending
 a `DELETE`. A name keeps its tombstone until a creation that acknowledges it (below) or the
 server's operator drops it; nothing expires one. A ref update or `DELETE` whose `old_head` names
-a pallet that is gone because it was deleted is refused with `409` naming the deletion, without
-`code` `remote_ahead`: lowering cannot resolve it.
+a pallet that is gone because it was deleted is refused with `409` and `code`
+`pallet_deleted_on_remote`, not `remote_ahead`: lowering cannot resolve it.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
 endpoint) are *qualified references*: a user pallet is bare (`main`), a **meta pallet** —
@@ -359,8 +359,8 @@ holds route of `feature`).
    no force push in protocol v1), else `409`.
    A creation (`old_head: null`) of a user pallet that has a tombstone must acknowledge it,
    naming the tombstone's head in `tombstone`, and `new_head` must be that head or descend from
-   it, else `409`: the name stays reserved for the history it held. The creation clears the
-   tombstone when it lands.
+   it, else `409` with `code` `pallet_deleted_on_remote`: the name stays reserved for the history
+   it held. The creation clears the tombstone when it lands.
 4. **Trust** (only when the remote holds an anchor):
    * for the office pallet: the whole office chain from the genesis to `new_head`
      verifies forward. Each parcel is signed by a key active in the *previous* state,
@@ -417,7 +417,9 @@ whole history.
 ### `DELETE /v1/pallets/{name}` (additive; heads that list `tombstones`)
 
 Deletes a user pallet: its ref goes, and a tombstone holding the head it was at takes its place
-(see the handshake). Body: `{ "old_head": "<hash>" }`, the head the client read. Checks, in order:
+(see the handshake). The query carries `old_head`, the head the client read
+(`DELETE /v1/pallets/{name}?old_head=<hash>`), and there is no body: a `DELETE`'s body has no
+defined meaning in HTTP, and a proxy may drop it. Checks, in order:
 
 1. a meta pallet (`@name`) is refused with `422`;
 2. the operator must be allowed to move the pallet (the same rule as a ref update), else `403`;

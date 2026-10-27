@@ -40,6 +40,7 @@ vocabulary, forklift uses shipping-yard words — the concepts map one-to-one:
 | `checkout <branch>` | **shift** | switch the working directory to a pallet |
 | `checkout -b` / branch | **palletize** | create a new pallet |
 | `branch -d` / `branch -D` | **palletize --delete** / **--delete --force** | delete a pallet (undoable; its parcels stay) |
+| `push --delete <remote> <branch>` | **palletize --delete --remote** | delete a pallet on the remote (restorable with **--restore --remote**) |
 | `merge` | **consolidate** | merge another pallet in |
 | `stash` | **park** | set work aside and return to the head |
 | `add` | **load** | stage a file or directory |
