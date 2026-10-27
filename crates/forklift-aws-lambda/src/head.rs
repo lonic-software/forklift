@@ -783,16 +783,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // Fail fast on an obviously stale request; the conditional write below is the
         // authoritative gate that also catches a head that moves during the audit. A pallet
         // deleted here answers an update with the deletion, since lowering cannot resolve it, and
-        // binds a creation to its tombstone: one that does not acknowledge it is refused here, and
-        // for one that does the commit expects the tombstone and the audit below decides whether
-        // its history descends from it.
+        // binds a creation to its tombstone: the commit expects the tombstone, and the audit below
+        // decides whether this creation may lift over it.
         let expected = match (request.old_head.as_deref(), &current) {
             (Some(old), RefHead::Live(head)) if old == head => ExpectedHead::At(old),
             (Some(_), RefHead::Deleted(tombstone)) => return Err(self.deleted(&bare, tombstone)),
             (None, RefHead::Absent) => ExpectedHead::Unborn,
-            (None, RefHead::Deleted(tombstone)) if request.tombstone.as_deref() != Some(tombstone.as_str()) => {
-                return Err(self.recreation_refused(&bare, tombstone, false))
-            }
             (None, RefHead::Deleted(tombstone)) => ExpectedHead::Deleted(tombstone),
             _ => return Err(self.moved(&current.live().map(str::to_string), &request.old_head)),
         };
@@ -926,12 +922,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )
             .map_err(HeadError::unprocessable)?;
 
-            // An acknowledged creation over a tombstone lifts only when its new head descends from
-            // the deleted one. Checked after the closure, so the walk of the new history reads
-            // only what is present.
+            // A creation over a tombstone lifts only when it acknowledged the deletion and its
+            // new head descends from the deleted one. Checked after the closure, so the walk of
+            // the new history reads only what is present, and in the order `forklift-server`
+            // checks it.
             if let ExpectedHead::Deleted(tombstone) = expected {
-                if !merge_utils::is_ancestor(tombstone, &request.new_head).map_err(HeadError::internal)? {
-                    return Err(self.recreation_refused(&bare, tombstone, true));
+                let acknowledged = request.tombstone.as_deref() == Some(tombstone);
+                let descends = acknowledged
+                    && merge_utils::is_ancestor(tombstone, &request.new_head).map_err(HeadError::internal)?;
+
+                if !descends {
+                    return Err(self.recreation_refused(&bare, tombstone, acknowledged));
                 }
             }
 
@@ -1121,7 +1122,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             };
 
             let uncertain = Cell::new(false);
-            let outcome = reissue(
+            let outcome = match reissue(
                 self.deadline,
                 |token| {
                     self.refs.delete_head(
@@ -1137,8 +1138,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
                     _ => None,
                 },
-            )
-            .map_err(HeadError::internal)?;
+            ) {
+                Ok(outcome) => outcome,
+                // A fault after an attempt of unknown fate leaves that attempt to the ref, as a
+                // transient end does: it may have landed.
+                Err(_) if uncertain.get() => CasOutcome::Transient(TransientCause::FateUnknown),
+                Err(error) => return Err(HeadError::internal(error)),
+            };
 
             match outcome {
                 CasOutcome::Committed => return Ok(()),
@@ -1157,12 +1163,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // Under one token an earlier attempt may still have landed: the ref decides.
                     // A ref that left `old_head` some other way is answered as the commit's
                     // conflict would have been, not as contention that moved nothing.
-                    // A read that fails too leaves the fate where the attempts left it.
+                    // A read that fails too leaves an attempt that may have landed
+                    // unconfirmed; with none in doubt, it is the read's own fault.
                     return match self.refs.get_head(PalletNamespace::User, &bare) {
                         Ok(RefHead::Deleted(tombstone)) if tombstone == old_head => Ok(()),
                         Ok(RefHead::Live(head)) if head == old_head => Err(self.delete_contention(uncertain.get())),
                         Ok(current) => Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string()))),
-                        Err(_) => Err(self.delete_contention(uncertain.get())),
+                        Err(_) if uncertain.get() => Err(self.delete_contention(true)),
+                        Err(error) => Err(HeadError::internal(error)),
                     };
                 }
             }
@@ -1425,9 +1433,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
     }
 
-    /// The `503` for a delete whose commit stayed refused for a reason showing no input moved.
-    /// Running the same delete again is safe whatever happened: one that landed meanwhile
-    /// answers `200`.
+    /// The `503` for a delete whose fate this request could not settle: with `uncertain` false
+    /// every attempt was refused for a reason showing no input moved; with it true an attempt
+    /// may have landed, and neither the commit nor the ref read back confirmed it. Running the
+    /// same delete again is safe whatever happened: one that landed meanwhile answers `200`.
     fn delete_contention(&self, uncertain: bool) -> HeadError {
         let what = match uncertain {
             true => format!("The delete could not be confirmed: {}", UNCONFIRMED),

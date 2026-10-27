@@ -20,10 +20,11 @@
 //! DynamoDB, and its pallet writes, [`RefStore::compare_and_set_head`] and
 //! [`RefStore::delete_head`], are conditional writes: exactly the CAS that lets the serverless head
 //! scale horizontally, where the server head's compare-and-set rests on a file lock on one
-//! machine's filesystem (§4.5, §4.6). Each conditions on all three of its decision's movable inputs
-//! at once — the pallet's own head, the office head, and the trust anchor — as one DynamoDB
-//! transaction, so nothing this store cannot see move can make a commit outlive the audit it
-//! followed (FORK-95 design memo, "The invariant" / claim C6). Unlike the filesystem, object
+//! machine's filesystem (§4.5, §4.6). Each conditions on the movable inputs its decision read —
+//! the pallet's own head, and, where the caller asks for them, the office head and the trust
+//! anchor — as one DynamoDB transaction, so nothing this store cannot see move can make a commit
+//! outlive the checks it followed: a ref update's audit, a delete's authority (FORK-95 design
+//! memo, "The invariant" / claim C6). Unlike the filesystem, object
 //! storage has no directory walk, so ref enumeration is an explicit primitive
 //! ([`RefStore::list_refs`]).
 //!
