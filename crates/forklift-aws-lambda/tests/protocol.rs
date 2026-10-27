@@ -1586,7 +1586,7 @@ fn bundled(area: &Area, name: &str, answer: BatchResult, requested: &[String]) -
     requested.iter().filter(|hash| file_utils::does_object_exist(hash).expect("presence")).cloned().collect()
 }
 
-/// A batch past the byte budget stops at the object that crossed it, marked truncated: a strict
+/// A batch past the byte budget stops at the object that crossed it, marked as cut at the budget: a strict
 /// prefix of what was asked, at least one object, and over the budget by less than one object.
 /// Revert: drop the byte rule from `batch_answer_cut` → every object comes back, unmarked.
 #[test]

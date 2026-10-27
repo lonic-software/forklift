@@ -54,7 +54,8 @@ pub const BATCH_HEADER: &str = "forklift-batch";
 
 /// The value of [`BATCH_HEADER`] meaning "cut at the head's byte budget". Such an answer carries
 /// at least one object, and the client asks again for the rest: the cut bounds one answer's size,
-/// not the remote's speed.
+/// not the remote's speed. One that carried nothing new is not asked again; the client fetches the
+/// rest of that request loose and keeps using the endpoint.
 pub const BATCH_CUT_BUDGET: &str = "budget";
 
 /// The value of [`BATCH_HEADER`] meaning "cut because the head ran short of time". The client

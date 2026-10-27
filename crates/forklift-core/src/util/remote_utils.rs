@@ -5576,9 +5576,10 @@ async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
 
     // Batch fetch first: one round trip per chunk, a bundle-format stream back
     // (forklift's packfile moment). A remote without the endpoint, or one too slow to start its
-    // answer or to finish it, closes the batch lane and everything falls back to loose GETs, for
-    // this wave and every later one; whatever a batch did not deliver (the remote may lack
-    // objects, or have cut the answer short) is fetched loose below too.
+    // answer or to finish it, or one that ran out of time for an answer, closes the batch lane and
+    // everything falls back to loose GETs, for this wave and every later one. An answer cut at the
+    // remote's byte budget is asked for again; whatever the batches did not deliver (the remote
+    // may lack objects) is fetched loose below.
     if missing.len() > 1 {
         'chunks: for chunk in missing.chunks(chunk_size) {
             let mut asked: Vec<String> = chunk.to_vec();
@@ -5592,8 +5593,8 @@ async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
                     BatchOutcome::Imported(_) => break,
                     // Cut at the remote's byte budget: ask again for what is still missing. A
                     // budget cut carries an object, so each round asks for less; one that carried
-                    // nothing new is a remote that will not make progress, and the rest of the
-                    // wave goes loose.
+                    // nothing new will not make progress, and the rest of this chunk goes loose.
+                    // The next chunk is still asked for: it is the one answer that misbehaved.
                     BatchOutcome::Partial(_) => {
                         let mut rest: Vec<String> = Vec::new();
 
@@ -5604,7 +5605,7 @@ async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
                         }
 
                         if rest.len() == asked.len() {
-                            break 'chunks;
+                            break;
                         }
                         if rest.is_empty() {
                             break;
@@ -9511,6 +9512,7 @@ mod tests {
         /// cuts its batch answers:
         /// * `Some(FakeCut::Deadline)` marks every batch redirect [`BATCH_CUT_DEADLINE`] and serves
         ///   `bundle`, as a head that ran short of time does;
+        /// * `Some(FakeCut::Other(value, k))` answers as `Budget(k)` does, but marks `value`.
         /// * `Some(FakeCut::Budget(k))` answers each batch with a bundle of the first `k` requested
         ///   objects it holds, built for that request, marked [`BATCH_CUT_BUDGET`] when it left any
         ///   requested hash out — a head with a budget of `k` objects.
@@ -9576,6 +9578,26 @@ mod tests {
     enum FakeCut {
         Budget(usize),
         Deadline,
+        Other(&'static str, usize),
+    }
+
+    /// Point `bundle` at the first `carry` objects the batch request in `body` asks for and
+    /// `objects` holds, as a head with a budget of `carry` objects answers; whether it left any
+    /// requested object it holds out.
+    fn carried_prefix(body: &[u8], carry: usize, objects: &HashMap<String, Vec<u8>>, bundle: &Mutex<Vec<u8>>) -> bool {
+        let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let requested: Vec<String> = request["hashes"].as_array().unwrap().iter()
+            .map(|hash| hash.as_str().unwrap().to_string())
+            .collect();
+        let held: Vec<&String> = requested.iter().filter(|hash| objects.contains_key(*hash)).collect();
+
+        let mut writer = bundle_utils::BundleWriter::new().unwrap();
+        for hash in held.iter().take(carry) {
+            writer.push(hash, &objects[*hash]).unwrap();
+        }
+        *bundle.lock().unwrap() = writer.finish().unwrap();
+
+        held.len() > carry
     }
 
     /// Handle exactly one connection/request for [`FakeOffloadingRemote`].
@@ -9615,21 +9637,8 @@ mod tests {
             let mark = match cut {
                 Some(_) if method != "POST" => None,
                 Some(FakeCut::Deadline) => Some(BATCH_CUT_DEADLINE),
-                Some(FakeCut::Budget(carry)) => {
-                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    let requested: Vec<String> = request["hashes"].as_array().unwrap().iter()
-                        .map(|hash| hash.as_str().unwrap().to_string())
-                        .collect();
-                    let held: Vec<&String> = requested.iter().filter(|hash| objects.contains_key(*hash)).collect();
-
-                    let mut writer = bundle_utils::BundleWriter::new().unwrap();
-                    for hash in held.iter().take(carry) {
-                        writer.push(hash, &objects[*hash]).unwrap();
-                    }
-                    *bundle.lock().unwrap() = writer.finish().unwrap();
-
-                    (held.len() > carry).then_some(BATCH_CUT_BUDGET)
-                }
+                Some(FakeCut::Budget(carry)) => carried_prefix(&body, carry, objects, bundle).then_some(BATCH_CUT_BUDGET),
+                Some(FakeCut::Other(value, carry)) => carried_prefix(&body, carry, objects, bundle).then_some(value),
                 None => None,
             };
             let mark = mark.map(|value| format!("{}: {}\r\n", BATCH_HEADER, value)).unwrap_or_default();
@@ -9819,17 +9828,18 @@ mod tests {
     }
 
     /// A remote that marks a batch cut at its budget yet carries nothing breaks the protocol's
-    /// promise of progress; the client asks it once and fetches that wave loose rather than ask
-    /// again forever. The lane stays open: it is the one answer that misbehaved.
+    /// promise of progress; the client asks it once per chunk and fetches that chunk loose rather
+    /// than ask again forever. The lane stays open and the next chunk is still asked for: it is
+    /// the one answer that misbehaved. 10 hashes in 4-hash chunks take one batch per chunk.
     /// Revert: drop the no-progress check from `fetch_missing_objects_in_chunks` → it posts the
-    /// same chunk without end, and the fetch never returns.
+    /// same chunk without end, and the fetch never returns; let it end the wave → one batch.
     #[test]
     fn a_budget_cut_that_carries_nothing_is_not_asked_again() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
         let (hashes, objects) = {
             let _server_scope = Scratch::new("empty-budget-batch-server");
-            let hashes: Vec<String> = (0..3).map(|i| store_blob(&format!("empty-budget-{}", i))).collect();
+            let hashes: Vec<String> = (0..10).map(|i| store_blob(&format!("empty-budget-{}", i))).collect();
             let objects: HashMap<String, Vec<u8>> = hashes.iter()
                 .map(|hash| (hash.clone(), file_utils::retrieve_object_by_hash(hash).unwrap()))
                 .collect();
@@ -9845,8 +9855,42 @@ mod tests {
             .expect("the client stops asking")
             .unwrap();
 
-        assert_eq!(fetched, 3);
-        assert_eq!(remote.batch_hits(), 1);
+        assert_eq!(fetched, 10);
+        assert!(hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
+        assert_eq!(remote.batch_hits(), 3, "every chunk is asked for once");
+        assert_eq!(client.batch_lane_closure(), None);
+    }
+
+    /// A batch answer marked with a value the protocol does not name, such as an older head's
+    /// `truncated`, carries no mark: what came is kept, the chunk is not asked for again, the lane
+    /// stays open and the next chunk is asked for. Each answer carries one object, so 10 hashes in
+    /// 4-hash chunks take three batches and seven loose fetches.
+    /// Revert: map an unknown value in `fetch_batch` to a budget cut → each chunk is asked for
+    /// until it is in, ten batches; to a deadline cut → one batch, and the lane closes.
+    #[test]
+    fn a_batch_marked_with_an_unknown_value_is_not_cut() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let (hashes, objects) = {
+            let _server_scope = Scratch::new("unknown-mark-batch-server");
+            let hashes: Vec<String> = (0..10).map(|i| store_blob(&format!("unknown-mark-{}", i))).collect();
+            let objects: HashMap<String, Vec<u8>> = hashes.iter()
+                .map(|hash| (hash.clone(), file_utils::retrieve_object_by_hash(hash).unwrap()))
+                .collect();
+            (hashes, objects)
+        };
+
+        let _client_scope = Scratch::new("unknown-mark-batch-client");
+        let remote = FakeOffloadingRemote::start_marking(303, Vec::new(), objects, Some(FakeCut::Other("truncated", 1)));
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+
+        let fetched = runtime.block_on(fetch_missing_objects_in_chunks(&client, &hashes, 4)).unwrap();
+
+        assert_eq!(fetched, 10);
+        assert!(hashes.iter().all(|hash| file_utils::does_object_exist(hash).unwrap()));
+        assert_eq!(remote.batch_hits(), 3, "each chunk is asked for once");
+        let loose = hashes.iter().filter(|hash| remote.hits_for(&format!("/v1/objects/{}", hash)) > 0).count();
+        assert_eq!(loose, 7, "what each batch carried is not fetched again");
         assert_eq!(client.batch_lane_closure(), None);
     }
 

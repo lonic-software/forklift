@@ -156,8 +156,8 @@ const MAX_CACHED_OFFICE_STATES: usize = 32;
 const HOLDS_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How many object bytes one `batch` answer carries before the head stops and answers with what
-/// it has, marked as cut at the budget. It bounds the function's memory: the bundle is held whole until it is
-/// offloaded, and it can overshoot this by the one object that crossed it (up to
+/// it has, marked as cut at the budget. It bounds the function's memory: the bundle is held whole
+/// until it is offloaded, and it can overshoot this by the one object that crossed it (up to
 /// `MAX_OBJECT_BYTES`, 64 MiB). See docs/DEPLOYMENT.md "Memory sizing" for the measurement it is
 /// sized from.
 pub const BATCH_BYTE_BUDGET: u64 = 32 * 1024 * 1024;

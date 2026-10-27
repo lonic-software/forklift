@@ -215,7 +215,9 @@ answer is still a valid bundle and is imported. Its value says why the head stop
 
 - `budget` — the answer reached the head's size bound. It carries at least one object, and the
   client asks again, in a new `POST`, for the requested objects it still lacks. The bound limits
-  one answer, not the remote, so the client keeps using the endpoint.
+  one answer, not the remote, so the client keeps using the endpoint. An answer so marked that
+  carried nothing the client lacked is not asked again: the client fetches the rest of that
+  request with loose `GET`s and goes on using the endpoint for its other requests.
 - `deadline` — the head ran short of time, and the answer may be empty. The client fetches the
   rest with loose `GET`s and does not ask this endpoint again for the rest of the command: a
   store too slow to finish one batch in the head's time limit would spend that whole limit again
