@@ -9818,6 +9818,38 @@ mod tests {
         assert_eq!(client.batch_lane_closure(), None);
     }
 
+    /// A remote that marks a batch cut at its budget yet carries nothing breaks the protocol's
+    /// promise of progress; the client asks it once and fetches that wave loose rather than ask
+    /// again forever. The lane stays open: it is the one answer that misbehaved.
+    /// Revert: drop the no-progress check from `fetch_missing_objects_in_chunks` → it posts the
+    /// same chunk without end, and the fetch never returns.
+    #[test]
+    fn a_budget_cut_that_carries_nothing_is_not_asked_again() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let (hashes, objects) = {
+            let _server_scope = Scratch::new("empty-budget-batch-server");
+            let hashes: Vec<String> = (0..3).map(|i| store_blob(&format!("empty-budget-{}", i))).collect();
+            let objects: HashMap<String, Vec<u8>> = hashes.iter()
+                .map(|hash| (hash.clone(), file_utils::retrieve_object_by_hash(hash).unwrap()))
+                .collect();
+            (hashes, objects)
+        };
+
+        let _client_scope = Scratch::new("empty-budget-batch-client");
+        let remote = FakeOffloadingRemote::start_marking(303, Vec::new(), objects, Some(FakeCut::Budget(0)));
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+
+        let fetch = fetch_missing_objects_in_chunks(&client, &hashes, 4);
+        let fetched = runtime.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(20), fetch).await })
+            .expect("the client stops asking")
+            .unwrap();
+
+        assert_eq!(fetched, 3);
+        assert_eq!(remote.batch_hits(), 1);
+        assert_eq!(client.batch_lane_closure(), None);
+    }
+
     /// The subtree endpoint may be offloaded the same way: `REMOTE_PROTOCOL.md` lets a
     /// storage-backed head answer it with a `307` to a presigned bundle. It rides a no-redirect
     /// client, so the follow is by hand, and the bearer token never leaves the remote's origin —
