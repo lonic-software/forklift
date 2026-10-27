@@ -1259,7 +1259,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
         let (bundle, truncated) = scratch.scoped(|| -> HeadResult<(Vec<u8>, bool)> {
-            let mut bundle = bundle_utils::PartialBundle::new().map_err(HeadError::internal)?;
+            let mut bundle = bundle_utils::BundleWriter::new().map_err(HeadError::internal)?;
             let mut seen: HashSet<&str> = HashSet::new();
             let mut truncated = false;
 
@@ -1320,7 +1320,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// carries an object and is past the byte budget, or it has `looked` for an object already and
     /// the invocation deadline is within the answer reserve. The deadline counts lookups of objects
     /// the store lacks too, since on a slow store those spend the time as surely as reads do.
-    fn batch_answer_full(&self, bundle: &bundle_utils::PartialBundle, looked: bool) -> bool {
+    fn batch_answer_full(&self, bundle: &bundle_utils::BundleWriter, looked: bool) -> bool {
         if !bundle.is_empty() && bundle.object_bytes() >= self.batch_byte_budget {
             return true;
         }

@@ -466,7 +466,7 @@ fn remove_stale_staging(parent: &Path) {
 /// writer-side refusal `build_bundle` gives, rather than silently omitting content the
 /// caller asked for by name.
 ///
-/// A hash repeated in `hashes` is written once, at its first occurrence (see [`PartialBundle`]).
+/// A hash repeated in `hashes` is written once, at its first occurrence (see [`BundleWriter`]).
 ///
 /// # Arguments
 /// * `hashes` - The objects to pack.
@@ -475,7 +475,7 @@ fn remove_stale_staging(parent: &Path) {
 /// * `Ok(Vec<u8>)` - The bundle bytes (header line + one zstd stream of records).
 /// * `Err(String)` - If a present object could not be read, or one is above the ceiling.
 pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
-    let mut bundle = PartialBundle::new()?;
+    let mut bundle = BundleWriter::new()?;
 
     for hash in hashes {
         if bundle.holds(hash) || !file_utils::does_object_exist(hash)? {
@@ -494,15 +494,15 @@ pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
 /// hand already and so need not read them back from the store: a serverless head mirroring a
 /// batch from its object store pushes each object as it arrives, and stops when its answer is
 /// big enough.
-pub struct PartialBundle {
+pub struct BundleWriter {
     encoder: zstd::stream::Encoder<'static, Vec<u8>>,
     written: HashSet<String>,
     object_bytes: u64,
 }
 
-impl PartialBundle {
+impl BundleWriter {
     /// An empty bundle: the header line and the start of the record stream.
-    pub fn new() -> Result<PartialBundle, String> {
+    pub fn new() -> Result<BundleWriter, String> {
         // Partial responses are the compact record stream: they are incremental additions to an
         // existing store, not the whole-clone artifact whose native packs can be installed as a unit.
         let mut bytes: Vec<u8> = Vec::new();
@@ -512,7 +512,7 @@ impl PartialBundle {
         let encoder = zstd::stream::Encoder::new(bytes, 0)
             .map_err(|e| format!("Error while starting the bundle stream: {}", e))?;
 
-        Ok(PartialBundle { encoder, written: HashSet::new(), object_bytes: 0 })
+        Ok(BundleWriter { encoder, written: HashSet::new(), object_bytes: 0 })
     }
 
     /// Whether `hash` is in the bundle already.

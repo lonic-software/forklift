@@ -353,7 +353,7 @@ pub enum BatchLaneClosure {
     /// The remote was too slow to start a batch answer.
     Degraded,
     /// The remote cut a batch answer short, as it does when the objects asked for are too large
-    /// for one answer.
+    /// for one answer or it ran short of time to answer.
     Truncated,
 }
 
@@ -3506,8 +3506,10 @@ impl RemoteClient {
     /// for what is still missing:
     /// * [`BatchOutcome::EndpointAbsent`] — the remote predates the endpoint (a `404`).
     /// * [`BatchOutcome::Truncated`] — the remote marked its answer cut short (see
-    ///   [`BATCH_HEADER`]). What it sent is imported; the next chunk would be cut short too, so
-    ///   asking again only adds a round trip that carries part of what loose GETs would.
+    ///   [`BATCH_HEADER`]). What it sent is imported. The remote is bounded by its memory or its
+    ///   time, and a later chunk is likely to meet the same bound, so the lane closes rather than
+    ///   pay a cut answer on top of the loose GETs for each chunk; the price is that a later chunk
+    ///   which would have fit goes loose too.
     /// * [`BatchOutcome::Degraded`] — no status line arrived inside [`Self::batch_head_budget`].
     ///   This is the one transport failure that degrades instead of failing the command, because it
     ///   is the one that says nothing about whether the remote works: the head is still building a
@@ -5554,7 +5556,7 @@ pub(crate) async fn fetch_missing_objects(client: &RemoteClient, hashes: &[Strin
 /// [`fetch_missing_objects`], asking for at most `chunk` objects per batch.
 async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
                                          hashes: &[String],
-                                         chunk: usize) -> Result<usize, String> {
+                                         chunk_size: usize) -> Result<usize, String> {
     let mut missing: Vec<String> = Vec::new();
 
     for hash in hashes {
@@ -5573,7 +5575,7 @@ async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
     // to loose GETs, for this wave and every later one; whatever a batch did not deliver (the
     // remote may lack objects, or have cut the answer short) is fetched loose below too.
     if missing.len() > 1 {
-        for chunk in missing.chunks(chunk) {
+        for chunk in missing.chunks(chunk_size) {
             if !client.batch_lane_open() {
                 break;
             }

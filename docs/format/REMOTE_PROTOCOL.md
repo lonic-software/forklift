@@ -213,7 +213,8 @@ bundle, or the `303` to it, so a client reads the mark before following the redi
 says only that the head stopped looking; the objects it skipped may or may not be ones it holds.
 A cut answer is still a valid bundle, possibly an empty one, and is imported. A client that sees
 the mark fetches the rest with loose `GET`s and does not ask this endpoint again for the rest of
-the command, since the next chunk would be cut short as well. An answer that looked for every
+the command, since the next chunk is likely to meet the same bound — at the price of fetching
+loose a later chunk that would have fit. An answer that looked for every
 requested object carries no mark, even when it is short because the remote lacks some, and the
 client keeps using the endpoint. A value other than `truncated` is no mark.
 

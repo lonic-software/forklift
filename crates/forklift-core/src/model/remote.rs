@@ -48,7 +48,7 @@ pub const LIFT_COMMIT_NOT_READY: &str = "not-ready";
 /// looking for every requested object — to bound its memory or its time. The objects it skipped
 /// may or may not be ones it holds. The objects it did send are a valid answer and are imported;
 /// the header tells the client not to ask for more batches from this remote in this command, since
-/// the next one would be cut short too, and to fetch the rest one object at a time. An answer that
+/// the next one is likely to meet the same bound, and to fetch the rest one object at a time. An answer that
 /// looked for every requested object carries no header, even when it is short of ones the remote
 /// lacks. Header names are case-insensitive; this is the
 /// lower-case form.
