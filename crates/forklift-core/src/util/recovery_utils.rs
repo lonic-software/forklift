@@ -99,10 +99,11 @@
 //! terminal-leaf presence check never runs at all, so the targeted walk pays no per-leaf/per-chunk
 //! stat it has no use for. `Some(collector)` for the targetless enumerator
 //! ([`enumerate_absent_reachable`]) — every absence found, at every level including terminal
-//! leaves and chunks, is recorded. Both share [`walk_closure_for`]'s exact descent (one code path,
-//! two modes, so they can never drift apart); [`enumerate_absent_reachable`] additionally passes an
-//! **empty target set**, so every node's targets-check is vacuous and every node's descent-guard is
-//! actually reached.
+//! leaves and chunks, is recorded, except a tree, recipe, chunk or leaf the sealed-object record
+//! holds by hash alone (never a parcel, a staged object or a corrupt boundary). Both share
+//! [`walk_closure_for`]'s exact descent (one code path, two modes, so they can never drift apart);
+//! [`enumerate_absent_reachable`] additionally passes an **empty target set**, so every node's
+//! targets-check is vacuous and every node's descent-guard is actually reached.
 //!
 //! ## Partial clears
 //!
@@ -242,9 +243,10 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
     audit_utils, bay_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
-    office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sign_utils, tag_utils,
+    office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     taint_utils, tombstone_utils,
 };
+use crate::util::sealed_utils::SealedSet;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 
@@ -1100,7 +1102,8 @@ fn rescan_torn_taint(
 
     // A degraded source (see `collect_walk_roots`'s own doc comment) — a bay whose parked
     // parcels or in-progress consolidation could not be read, or the office record backing the
-    // revoked-key distrust-boundary pins — narrows this enumeration's root set, so an object
+    // revoked-key distrust-boundary pins; or the fetch scope or sealed-object record, which
+    // decide what the walk may leave out — narrows this enumeration's root set, so an object
     // referenced only through that one source is invisible to it — it would simply never appear
     // in `referenced_absent`, never enter `remainder`, and (unlike the ordinary, non-torn
     // pipeline's per-candidate `roots_incomplete` fallback in `resolve_the_rest`) there is no
@@ -1890,8 +1893,8 @@ fn walk_shard_data_files_below(inventory_root: &Path, folder: &Path, found: &mut
 
 /// A closure walk's result, paired with any source [`collect_walk_roots`] had to skip this run
 /// rather than abort on — see that function's own doc comment on its `Tolerate` policies.
-/// `degraded_sources` is empty unless at least one bay's state, or the office record, was
-/// unreadable; when it is not empty, `hashes` is only as complete as what every *readable* source
+/// `degraded_sources` is empty unless at least one bay's state, the office record, the fetch scope
+/// or the sealed-object record was unreadable; when it is not empty, `hashes` is only as complete as what every *readable* source
 /// could contribute — never a reason to treat `hashes` itself as wrong, only as conservative.
 pub(crate) struct ClosureWalkResult {
     /// [`closure_references_any`]: the subset of its `targets` actually found referenced.
@@ -1948,7 +1951,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     let no_corrupt: BTreeSet<String> = BTreeSet::new();
     // Unscoped: gc's live set descends every present tree whatever the fetch scope, so the
     // targeted walk must too, or it could miss a target gc would keep (the superset invariant).
-    let outcome = walk_closure_for(targets, &roots, &no_corrupt, &MaterializationScope::full(), None)?;
+    let outcome = walk_closure_for(targets, &roots, &no_corrupt, &MaterializationScope::full(), None, None)?;
     Ok(ClosureWalkResult {
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
@@ -1975,6 +1978,11 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// objects as vanished would refuse every torn heal there. A fetch scope that cannot be read is a
 /// degraded source, and the walk then runs in full.
 ///
+/// Likewise an absent tree, recipe, chunk or leaf that the sealed-object record holds is held by
+/// hash alone (the remote holds it and its closure) and is neither recorded nor descended into. A
+/// parcel, a staged object and a corrupt boundary are never held. A sealed-object record that
+/// cannot be read is a degraded source, and the walk then holds nothing.
+///
 /// `corrupt` is the §8.3 corrupt-boundary carve-out: a hash in this set that the walk reaches is
 /// treated exactly like a raw-absent one — recorded via the sink, not descended into — even
 /// though [`file_utils::raw_object_present`] would say it *is* present. Without this, a reachable
@@ -1984,8 +1992,9 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// no other caller yet, but the parameter is real, not vestigial — see `rescan_torn_taint`).
 ///
 /// # Returns
-/// * `Ok(ClosureWalkResult)` - Every raw-absent (or corrupt-boundary) hash the walk reached,
-///                            recorded once each, plus any degraded-source notes.
+/// * `Ok(ClosureWalkResult)` - Every raw-absent (or corrupt-boundary) hash the walk reached and
+///                            does not hold by hash alone, recorded once each, plus any
+///                            degraded-source notes.
 /// * `Err(String)`          - A ref source could not be read, or a *present*, non-corrupt-boundary
 ///                            object could not be loaded (corrupt/unreadable) — the walk still
 ///                            fails loud on that, exactly as before the carve-out existed (I5: an
@@ -2003,11 +2012,20 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         ));
         MaterializationScope::full()
     });
+    // The same holds for the sealed-object record: without it, an object held by hash alone reads
+    // as lost.
+    let sealed = sealed_utils::read_sealed().unwrap_or_else(|error| {
+        roots.degraded_sources.push(format!(
+            "objects held by hash alone could not be told apart from lost ones this run. {}.",
+            error.trim_end_matches('.')
+        ));
+        SealedSet::default()
+    });
     let empty_targets: BTreeSet<String> = BTreeSet::new();
     let mut absent: BTreeSet<String> = BTreeSet::new();
     let outcome = {
         let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
-        walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&mut collecting_sink))?
+        walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&sealed), Some(&mut collecting_sink))?
     };
     Ok(ClosureWalkResult {
         hashes: absent,
@@ -2121,6 +2139,7 @@ fn walk_closure_for(
     roots: &WalkRoots,
     corrupt: &BTreeSet<String>,
     scope: &MaterializationScope,
+    sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
@@ -2128,8 +2147,10 @@ fn walk_closure_for(
     let mut visited_trees = TreeVisits::default();
     let mut visited_parcels: HashSet<String> = HashSet::new();
 
+    // A staged object is the bay's own work, which the remote need not hold, so the record never
+    // holds its absence.
     for (hash, item_type) in &roots.shard_referenced {
-        check_leaf(hash, *item_type, targets, corrupt, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
+        check_leaf(hash, *item_type, targets, corrupt, None, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
     }
 
     // One combined queue, ordinary and pin roots alike — see this function's own doc comment for
@@ -2147,7 +2168,7 @@ fn walk_closure_for(
 
     drain_parcel_queue(
         &mut queue, targets, corrupt, &mut referenced, &mut unwalked, &mut visited_parcels, &mut visited_trees,
-        scope, sink,
+        scope, sealed, sink,
     )?;
 
     // F6: every declared pin root this run can positively confirm is genuinely never held — see
@@ -2315,6 +2336,7 @@ fn drain_parcel_queue(
     visited_parcels: &mut HashSet<String>,
     visited_trees: &mut TreeVisits,
     scope: &MaterializationScope,
+    sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     while let Some((hash, policy)) = queue.pop_front() {
@@ -2372,7 +2394,7 @@ fn drain_parcel_queue(
         visited_parcels.insert(hash.clone());
         let parcel = object_utils::load_parcel(&hash)?;
         walk_tree(
-            &parcel.tree_hash, targets, corrupt, referenced, unwalked, visited_trees, scope, reborrow_sink(&mut sink),
+            &parcel.tree_hash, targets, corrupt, referenced, unwalked, visited_trees, scope, sealed, reborrow_sink(&mut sink),
         )?;
 
         for parent in parcel.parents {
@@ -2407,6 +2429,7 @@ fn walk_tree(
     unwalked: &mut BTreeMap<String, String>,
     visited_trees: &mut TreeVisits,
     scope: &MaterializationScope,
+    sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     // Each entry carries its warehouse path while it is on the spine of `scope`, and `None` once
@@ -2426,22 +2449,25 @@ fn walk_tree(
         if !visited_trees.first_visit(&tree_hash, spine_path.as_deref()) {
             continue;
         }
-        // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a sealed subtree
-        // boundary in a sparse/shallow warehouse is legitimately absent, or already known corrupt
+        // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a subtree boundary
+        // never fetched in a sparse/shallow warehouse is legitimately absent, or already known corrupt
         // by the caller (`corrupt` — step 1's hash-verify found this exact hash present but
-        // wrong) — either way, record it (if a sink is listening) and stop; nothing beneath it is
-        // trustworthy either way (the store invariant a warehouse never holds a child without its
-        // parent tree, mirrored from `gc_utils::collect_live_set`'s own tree descent, extends to
-        // "nor a child whose parent's own bytes cannot be trusted"). Unconditional in both modes —
-        // a descent guard, not a sink-feeding-only stat. Without the corrupt half of this check, a
-        // corrupt reachable tree would instead hit `load_tree`'s bare `?` below and abort the
-        // whole rescan (I5) — see
+        // wrong) — either way, record it (if a sink is listening, and unless the sealed record
+        // holds the absent hash by hash alone; a corrupt one it never holds) and stop; nothing
+        // beneath it is trustworthy either way (the store invariant a warehouse never holds a
+        // child without its parent tree, mirrored from `gc_utils::collect_live_set`'s own tree
+        // descent, extends to "nor a child whose parent's own bytes cannot be trusted").
+        // Unconditional in both modes — a descent guard, not a sink-feeding-only stat. Without
+        // the corrupt half of this check, a corrupt reachable tree would instead hit
+        // `load_tree`'s bare `?` below and abort the whole rescan (I5) — see
         // [`tests::a_corrupt_reachable_tree_is_a_recorded_boundary_not_a_walk_abort`].
         let descent = if corrupt.contains(&tree_hash) { Descent::Absent } else { descent_presence(&tree_hash)? };
         match descent {
             Descent::Present => {}
             Descent::Absent => {
-                if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
+                if !held_by_hash(sealed, corrupt, &tree_hash) {
+                    if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
+                }
                 continue;
             }
             Descent::Unwalkable(reason) => {
@@ -2481,7 +2507,7 @@ fn walk_tree(
 
         for (_, file) in tree.get_files() {
             if in_scope(&file.name).is_some() {
-                check_leaf(&file.hash, file.item_type, targets, corrupt, referenced, unwalked, reborrow_sink(&mut sink))?;
+                check_leaf(&file.hash, file.item_type, targets, corrupt, sealed, referenced, unwalked, reborrow_sink(&mut sink))?;
             }
         }
 
@@ -2543,7 +2569,8 @@ impl TreeVisits {
 ///
 /// Presence-tolerant (I3): a **chunked** leaf's recipe can itself be raw-absent (sparse/shallow) —
 /// its chunks are then locally absent too (mirrors `gc_utils::mark_recipe_chunks_live`), so an
-/// absent recipe is recorded (if a sink is listening) and its chunk list is never fetched. This
+/// absent recipe is recorded (if a sink is listening, and unless `sealed` holds it by hash alone)
+/// and its chunk list is never fetched. This
 /// recipe-presence guard is a real descent guard (skips the `recipe_chunk_hashes` load) and runs
 /// **unconditionally in both modes**, exactly like the parcel/subtree guards.
 ///
@@ -2559,6 +2586,7 @@ fn check_leaf(
     item_type: DirEntryType,
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
+    sealed: Option<&SealedSet>,
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
@@ -2577,7 +2605,9 @@ fn check_leaf(
         match descent {
             Descent::Present => {}
             Descent::Absent => {
-                if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
+                if !held_by_hash(sealed, corrupt, hash) {
+                    if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
+                }
                 return Ok(());
             }
             Descent::Unwalkable(reason) => {
@@ -2594,7 +2624,7 @@ fn check_leaf(
             // Enumerating-mode only (gated on the sink, not merely no-opped): the targeted walk
             // never needs a chunk's raw presence, only whether it is a target (handled above).
             if let Some(s) = reborrow_sink(&mut sink) {
-                if !file_utils::raw_object_present(&chunk)? {
+                if !held_by_hash(sealed, corrupt, &chunk) && !file_utils::raw_object_present(&chunk)? {
                     s(&chunk);
                 }
             }
@@ -2602,12 +2632,20 @@ fn check_leaf(
     } else if let Some(s) = reborrow_sink(&mut sink) {
         // Enumerating-mode only, same reasoning: a plain leaf's bytes are never loaded by this
         // walk either way.
-        if !file_utils::raw_object_present(hash)? {
+        if !held_by_hash(sealed, corrupt, hash) && !file_utils::raw_object_present(hash)? {
             s(hash);
         }
     }
 
     Ok(())
+}
+
+/// Whether an object is held by hash alone: recorded in `sealed`, and not a corrupt boundary. This
+/// checks no presence: call it only for an object the walk found absent, or for a terminal leaf
+/// or chunk, which has nothing beneath it, so a present one is never reported either way. A
+/// corrupt object is present but wrong, so it stays a loss.
+fn held_by_hash(sealed: Option<&SealedSet>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
+    !corrupt.contains(hash) && sealed_utils::is_recorded(sealed, hash)
 }
 
 /// Whether, and how cleanly, [`attempt_heal_driven_refetch`] actually consulted a configured
@@ -2834,8 +2872,9 @@ fn rescan_failure_refusal(root: &Path, error: &str) -> CoreError {
 }
 
 /// The store-wide rescan ran and restaged whatever it legitimately could, but at least one
-/// source of durable references (a bay's saved state, or the office record), or a node the walk
-/// could not descend (FORK-217), could not be read, so step 2's enumeration cannot be trusted to have found every reference — see
+/// source the walk needs (a bay's saved state, the office record, the fetch scope or the
+/// sealed-object record), or a node the walk could not descend (FORK-217), could not be read, so
+/// step 2's enumeration cannot be trusted to have found every reference — see
 /// [`rescan_torn_taint`]'s own comment at its degraded-source guard for the full reasoning. The
 /// torn record is left completely untouched, distinct from [`rescan_failure_refusal`] (an
 /// operational failure of the rescan's own machinery) even though both leave the record standing
@@ -2852,10 +2891,11 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix what is named above (a bay's state, the office record, or a pack index: restore its \
-        pack files from a good copy, move an index that does not parse out of the pack folder only \
-        if it holds nothing this warehouse needs, or \
-        re-create the warehouse for one of another format version), then run \
+        "Fix what is named above (for a pack index, for example: restore its pack files from a \
+        good copy, move an index that does not parse out of the pack folder only if it holds \
+        nothing this warehouse needs, or re-create the warehouse for one of another format \
+        version; for the sealed-object record: make it readable again, restoring it from a good \
+        copy or, if another version of Forklift wrote it, using that version), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )
@@ -3516,7 +3556,7 @@ mod tests {
         {
             let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
             walk_closure_for(
-                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), Some(&mut sink),
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -3560,7 +3600,7 @@ mod tests {
         {
             let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
             walk_closure_for(
-                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), Some(&mut sink),
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -3613,6 +3653,139 @@ mod tests {
         assert!(walk.degraded_sources.iter().any(|note| note.contains("fetch scope could not be read")),
             "{:?}", walk.degraded_sources);
         assert_eq!(walk.hashes, [sealed].into_iter().collect::<BTreeSet<String>>());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Write the sealed-by-hash record holding exactly `hashes`. Call inside a storage scope.
+    fn seal(hashes: &[&str]) {
+        let mut bytes = sealed_utils::header_bytes();
+        for hash in hashes {
+            bytes.extend(sealed_utils::encode_frame(sealed_utils::SealOp::Record, hash).unwrap());
+        }
+        let path = sealed_utils::sealed_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// FORK-133: the enumerating walk holds a recorded absent tree, recipe, chunk or blob by hash
+    /// alone, so a torn rescan's remainder leaves it out, while an unrecorded absence beside each
+    /// is still recorded. A recorded object that is present seals nothing: the tree `kept` is
+    /// recorded and present, and its lost child is still recorded. A recorded parent parcel stays
+    /// a loss, and so does a recorded hash the caller proved corrupt: its bytes are present but
+    /// wrong, which the fixture stands for by the `corrupt` set alone.
+    ///
+    /// Mutations, each red on its own assertion: drop the tolerance at `walk_tree`'s absent tree,
+    /// at `check_leaf`'s absent recipe, at its absent chunk, or at its absent plain leaf; test the
+    /// record before presence in `walk_tree` (the present `kept` is not descended); drop the
+    /// corrupt half of `held_by_hash`; or have the collecting sink drop every recorded hash (the
+    /// corrupt tree and the parent parcel are held).
+    #[test]
+    fn the_enumerating_walk_holds_a_recorded_absence_by_hash_alone() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+        use crate::util::gc_utils::tests::{store_chunk, store_recipe, store_tree};
+
+        let (dir, _scope) = enter_temp_root("sealed-enumerate");
+        let (held_tree, lost_tree) = ("1".repeat(64), "2".repeat(64));
+        let (held_blob, lost_blob) = ("3".repeat(64), "4".repeat(64));
+        let (held_recipe, lost_recipe) = ("5".repeat(64), "6".repeat(64));
+        let (held_chunk, lost_chunk) = ("7".repeat(64), "8".repeat(64));
+        let (kept_child, held_parent, corrupt_tree) = ("9".repeat(64), "a".repeat(64), "b".repeat(64));
+
+        let present_chunk = store_chunk(b"a chunk that is present");
+        let recipe = store_recipe(&[(present_chunk, 23), (held_chunk.clone(), 23), (lost_chunk.clone(), 23)]);
+        let kept = store_tree(&[("gone.txt", &kept_child, DirEntryType::Normal)]);
+        let root = store_tree(&[
+            ("held", &held_tree, DirEntryType::Tree),
+            ("lost", &lost_tree, DirEntryType::Tree),
+            ("held.txt", &held_blob, DirEntryType::Normal),
+            ("lost.txt", &lost_blob, DirEntryType::Normal),
+            ("held.bin", &held_recipe, DirEntryType::NormalChunked),
+            ("lost.bin", &lost_recipe, DirEntryType::NormalChunked),
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+            ("kept", &kept, DirEntryType::Tree),
+            ("corrupt", &corrupt_tree, DirEntryType::Tree),
+        ]);
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: root, parents: vec![held_parent.clone()], actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::tests::update_pallet_head_unverified("main", None, &parcel.hash, &pallet_utils::RefPreconditions::NONE)
+            .unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", None)).unwrap();
+        seal(&[&held_tree, &held_blob, &held_recipe, &held_chunk, &kept, &held_parent, &corrupt_tree]);
+
+        let walk = enumerate_absent_reachable(&[corrupt_tree.clone()].into_iter().collect()).unwrap();
+        assert!(walk.degraded_sources.is_empty(), "{:?}", walk.degraded_sources);
+        let absent = &walk.hashes;
+
+        assert!(!absent.contains(&held_tree), "a recorded absent tree is held: {:?}", absent);
+        assert!(!absent.contains(&held_recipe), "a recorded absent recipe is held: {:?}", absent);
+        assert!(!absent.contains(&held_chunk), "a recorded absent chunk is held: {:?}", absent);
+        assert!(!absent.contains(&held_blob), "a recorded absent blob is held: {:?}", absent);
+        assert!(absent.contains(&kept_child), "a present recorded tree is walked: {:?}", absent);
+        assert!(absent.contains(&corrupt_tree), "a corrupt recorded tree stays a loss: {:?}", absent);
+        assert!(absent.contains(&held_parent), "a recorded parcel stays a loss: {:?}", absent);
+        assert_eq!(
+            absent,
+            &[lost_tree, lost_blob, lost_recipe, lost_chunk, kept_child, corrupt_tree, held_parent].into_iter().collect(),
+            "every unrecorded absence is still recorded"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-133: a staged object is the bay's own work, so its absence is a loss even when its
+    /// hash is recorded. Mutation: pass the record to the staged leaves' `check_leaf` → red.
+    #[test]
+    fn a_recorded_staged_object_that_is_absent_stays_a_loss() {
+        let (dir, _scope) = enter_temp_root("sealed-staged");
+        let staged = "c".repeat(64);
+        seal(&[&staged]);
+        let record = sealed_utils::read_sealed().unwrap();
+
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: Vec::new(),
+            haul_heads: Vec::new(),
+            tombstone_heads: Vec::new(),
+            mirror_roots: Vec::new(),
+            shard_referenced: vec![(staged.clone(), DirEntryType::Normal)],
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
+            walk_closure_for(
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&record), Some(&mut sink),
+            ).unwrap();
+        }
+        assert_eq!(reported, [staged].into_iter().collect::<BTreeSet<String>>());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FORK-133: a sealed-object record that cannot be read is a degraded source, so the rescan
+    /// refuses rather than clearing on a walk that cannot tell held from lost; the walk itself
+    /// holds nothing. Mutation: propagate the read error → `Err` → red; or ignore it with no note →
+    /// the degraded assertion reddens.
+    #[test]
+    fn an_unreadable_sealed_record_is_a_degraded_source_and_the_walk_holds_nothing() {
+        use crate::util::gc_utils::tests::{store_root_parcel, store_tree};
+
+        let (dir, _scope) = enter_temp_root("sealed-unreadable");
+        let held = "d".repeat(64);
+        store_root_parcel(&store_tree(&[("held.txt", &held, DirEntryType::Normal)]));
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", None)).unwrap();
+        std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert!(walk.degraded_sources.iter().any(|note| note.contains("objects held by hash alone could not be told apart")),
+            "{:?}", walk.degraded_sources);
+        assert_eq!(walk.hashes, [held].into_iter().collect::<BTreeSet<String>>());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4888,7 +5061,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
 
@@ -4926,7 +5099,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost]);
 
@@ -4989,7 +5162,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         let outcome = {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink))
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink))
                 .expect("tag subjects must never abort the walk")
         };
 
@@ -5002,7 +5175,7 @@ mod tests {
         );
 
         let targets: BTreeSet<String> = [absent.clone(), lost_parent.clone()].into_iter().collect();
-        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), &MaterializationScope::full(), None)
+        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), &MaterializationScope::full(), None, None)
             .expect("the targeted walk runs");
         assert!(
             targeted.referenced.is_empty(),
