@@ -2015,4 +2015,129 @@ mod tests {
             plan_outcome(how, &parked, &f.web_blob)
         });
     }
+
+    /// Write the sealed-by-hash record holding exactly `hashes`.
+    fn seal(hashes: &[&str]) {
+        let mut bytes = sealed_utils::header_bytes();
+        for hash in hashes {
+            bytes.extend(sealed_utils::encode_frame(sealed_utils::SealOp::Record, hash).unwrap());
+        }
+        std::fs::write(sealed_utils::sealed_path(), bytes).unwrap();
+    }
+
+    /// Point a second pallet, `other`, at a parcel over `tree_hash` with the given parents.
+    fn plant_other(tree_hash: &str, parents: Vec<String>) -> String {
+        let parcel = store_parcel(tree_hash, parents);
+        let current = pallet_utils::get_pallet_head("other").unwrap();
+        pallet_utils::tests::update_pallet_head_unverified(
+            "other", current.as_deref(), &parcel, &pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+        parcel
+    }
+
+    /// FORK-133: an unlifted parcel whose `src` is absent fails the plan until the record holds
+    /// that tree; then the scoped walk retains it without loading it, and neither the prune
+    /// targets nor the unlifted keep look beneath it, because the remote holds what it closes
+    /// over. The prune still frees the pruned path of the pallet that has it.
+    ///
+    /// Mutations, each red: drop the spine walk's held check in `collect_retained`; resolve the
+    /// prune targets, or the unlifted parcel's own path, through
+    /// `tree_utils::resolve_subtree_hash`.
+    #[test]
+    fn plan_prune_holds_a_recorded_absent_tree_on_the_pruned_path_by_hash_alone() {
+        let _scratch = Scratch::new("sealed-path");
+        let f = build_fixture();
+        let held_src = "1".repeat(64);
+        plant_other(&store_tree(&[
+            ("src", &held_src, DirEntryType::Tree),
+            ("README.md", &f.readme_blob, DirEntryType::Normal),
+        ]), Vec::new());
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let remote = [f.parcel.clone()];
+        assert!(plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()).is_err(),
+            "an unrecorded absent tree fails the plan");
+
+        seal(&[&held_src]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()).unwrap();
+        let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
+        assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
+        assert_eq!(plan.kept_unlifted, 0, "nothing beneath a tree held by hash alone is kept");
+    }
+
+    /// FORK-133: an unlifted parcel's base that runs through a tree held by hash alone explains
+    /// nothing, so the change is kept in full rather than failing the plan. Mutation: resolve the
+    /// bases through `tree_utils::resolve_subtree_hash` → red.
+    #[test]
+    fn plan_prune_keeps_an_unlifted_change_whose_base_is_held_by_hash_alone() {
+        let _scratch = Scratch::new("sealed-base");
+        let f = build_fixture();
+        let held_src = "2".repeat(64);
+        let base = plant_other(&store_tree(&[("src", &held_src, DirEntryType::Tree)]), Vec::new());
+        plant_other(&f.root_tree, vec![base]);
+        seal(&[&held_src]);
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
+            .unwrap();
+        assert!(plan.to_free.is_empty(), "the unlifted change keeps the whole pruned path: {:?}", plan.to_free);
+        assert_eq!(plan.kept_unlifted, 2);
+        assert_eq!(plan.unlifted_pallets, vec!["other".to_string()]);
+    }
+
+    /// FORK-133: an in-scope tree, an in-scope recipe under a present tree, and a spine-level
+    /// in-scope recipe, each recorded and absent, are retained without being loaded. Mutations,
+    /// each red: drop the full walk's held check, or the held check on either recipe descent.
+    #[test]
+    fn plan_prune_retains_a_recorded_absent_tree_or_recipe_in_scope_without_loading_it() {
+        let _scratch = Scratch::new("sealed-in-scope");
+        let f = build_fixture();
+        let (held_lib, held_deep, held_top) = ("3".repeat(64), "4".repeat(64), "5".repeat(64));
+        let api = store_tree(&[("h.bin", &held_deep, DirEntryType::NormalChunked)]);
+        let src = store_tree(&[("api", &api, DirEntryType::Tree), ("web", &f.web_tree, DirEntryType::Tree)]);
+        plant_other(&store_tree(&[
+            ("src", &src, DirEntryType::Tree),
+            ("lib", &held_lib, DirEntryType::Tree),
+            ("big.bin", &held_top, DirEntryType::NormalChunked),
+        ]), Vec::new());
+        seal(&[&held_lib, &held_deep, &held_top]);
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api", "lib", "big.bin"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
+        assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
+    }
+
+    /// FORK-133: a recorded tree that is present seals nothing: it is walked, so a blob it shares
+    /// with the pruned path is kept. Mutation: drop the presence half of `held_by_hash` → the
+    /// shared blob is freed → red.
+    #[test]
+    fn plan_prune_walks_a_recorded_tree_that_is_present() {
+        let _scratch = Scratch::new("sealed-present");
+        let f = build_fixture();
+        let api = store_tree(&[("shared.txt", &f.web_blob, DirEntryType::Normal)]);
+        let src = store_tree(&[("api", &api, DirEntryType::Tree), ("web", &f.web_tree, DirEntryType::Tree)]);
+        plant_other(&store_tree(&[("src", &src, DirEntryType::Tree)]), Vec::new());
+        seal(&[&api, &src]);
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        assert_eq!(plan.to_free, vec![f.web_tree], "the blob the present recorded tree names is kept");
+    }
+
+    /// FORK-133: a sealed-object record that cannot be read fails the plan before anything is
+    /// freed: a prune that cannot tell held from lost must not guess. Mutation: read it as empty
+    /// on error → the plan succeeds → red.
+    #[test]
+    fn plan_prune_fails_on_an_unreadable_sealed_record() {
+        let _scratch = Scratch::new("sealed-unreadable");
+        build_fixture();
+        std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
+
+        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) else {
+            panic!("an unreadable record must fail the plan");
+        };
+        assert!(error.contains("sealed-object record"), "{}", error);
+    }
 }

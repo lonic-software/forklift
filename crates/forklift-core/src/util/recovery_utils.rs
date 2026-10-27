@@ -2445,7 +2445,8 @@ fn walk_tree(
         // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a sealed subtree
         // boundary in a sparse/shallow warehouse is legitimately absent, or already known corrupt
         // by the caller (`corrupt` — step 1's hash-verify found this exact hash present but
-        // wrong) — either way, record it (if a sink is listening) and stop; nothing beneath it is
+        // wrong) — either way, record it (if a sink is listening, and unless the sealed record
+        // holds the absent hash by hash alone; a corrupt one it never holds) and stop; nothing beneath it is
         // trustworthy either way (the store invariant a warehouse never holds a child without its
         // parent tree, mirrored from `gc_utils::collect_live_set`'s own tree descent, extends to
         // "nor a child whose parent's own bytes cannot be trusted"). Unconditional in both modes —
@@ -3660,13 +3661,14 @@ mod tests {
     /// alone, so a torn rescan's remainder leaves it out, while an unrecorded absence beside each
     /// is still recorded. A recorded object that is present seals nothing: the tree `kept` is
     /// recorded and present, and its lost child is still recorded. A recorded parent parcel stays
-    /// a loss, and so does a recorded hash the caller proved corrupt, which is present.
+    /// a loss, and so does a recorded hash the caller proved corrupt: its bytes are present but
+    /// wrong, which the fixture stands for by the `corrupt` set alone.
     ///
     /// Mutations, each red on its own assertion: drop the tolerance at `walk_tree`'s absent tree,
     /// at `check_leaf`'s absent recipe, at its absent chunk, or at its absent plain leaf; test the
     /// record before presence in `walk_tree` (the present `kept` is not descended); drop the
     /// corrupt half of `held_by_hash`; or have the collecting sink drop every recorded hash (the
-    /// parent parcel is held).
+    /// corrupt tree and the parent parcel are held).
     #[test]
     fn the_enumerating_walk_holds_a_recorded_absence_by_hash_alone() {
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -3712,7 +3714,7 @@ mod tests {
         assert!(!absent.contains(&held_chunk), "a recorded absent chunk is held: {:?}", absent);
         assert!(!absent.contains(&held_blob), "a recorded absent blob is held: {:?}", absent);
         assert!(absent.contains(&kept_child), "a present recorded tree is walked: {:?}", absent);
-        assert!(absent.contains(&corrupt_tree), "a corrupt recorded tree is present, so lost: {:?}", absent);
+        assert!(absent.contains(&corrupt_tree), "a corrupt recorded tree stays a loss: {:?}", absent);
         assert!(absent.contains(&held_parent), "a recorded parcel stays a loss: {:?}", absent);
         assert_eq!(
             absent,
