@@ -68,7 +68,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
             );
         }
 
-        for head in info.pallets.values() {
+        for head in info.held_pallet_heads().values() {
             if !boundary.contains(head) {
                 boundary.push(head.clone());
             }
@@ -593,7 +593,7 @@ async fn revocation_boundary(offline: bool) -> Result<Vec<String>, String> {
             e
         ))?;
 
-        for head in info.pallets.values() {
+        for head in info.held_pallet_heads().values() {
             if !boundary.contains(head) {
                 boundary.push(head.clone());
             }
