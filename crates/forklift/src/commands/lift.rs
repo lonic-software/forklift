@@ -48,12 +48,16 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         let client = RemoteClient::from_config()?;
         let info = client.fetch_info().await?;
 
+        // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
+        let position = pallet_utils::read_position()?;
+        let pallet = position.pallet.clone();
+        let local_head = pallet_utils::get_pallet_head(&pallet)?;
+
         // A lift onto a pallet the remote deleted is refused here, before the office or any meta
         // pallet uploads, unless it is acknowledged; the remote refuses an unacknowledged creation
         // of a deleted pallet all the same.
-        let current = pallet_utils::read_position()?.pallet;
-        let tombstone = match pallet_utils::get_pallet_head(&current)? {
-            Some(head) => remote_utils::acknowledged_tombstone(&info, &current, &head, recreate)?,
+        let tombstone = match &local_head {
+            Some(head) => remote_utils::acknowledged_tombstone(&info, &pallet, head, recreate)?,
             None => None,
         };
 
@@ -81,11 +85,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
             }
         }
 
-        // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
-        let position = pallet_utils::read_position()?;
-        let pallet = position.pallet.clone();
-
-        let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
+        let Some(head) = local_head else {
             lift_haul(&client, &info, None, &mut meta_pallets, &mut meta_failed).await;
 
             return Err(lower::with_meta_failures(format!(

@@ -5839,7 +5839,7 @@ pub fn acknowledged_tombstone(info: &WarehouseInfo,
         return Ok(None);
     }
 
-    let Some(head) = info.tombstones.as_ref().and_then(|tombstones| tombstones.get(pallet)) else {
+    let Some(head) = info.tombstone(pallet) else {
         return Ok(None);
     };
 
