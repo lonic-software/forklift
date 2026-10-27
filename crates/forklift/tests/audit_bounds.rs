@@ -18,8 +18,10 @@ use std::process::Output;
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{
-    audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils,
+    audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sealed_utils, tree_utils,
 };
+use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::sealed_utils::SealOp;
 
 mod common;
 use common::forklift_command;
@@ -163,6 +165,16 @@ impl Warehouse {
 
         std::fs::remove_file(objects.join(&hash[2..])).expect("the parcel object existed");
         let _ = std::fs::remove_file(objects.join(format!("{}.sig", &hash[2..])));
+    }
+
+    /// Write the sealed-by-hash record holding exactly `hashes`, as the record's writers would.
+    fn seal(&self, hashes: &[&str]) {
+        let mut bytes = sealed_utils::header_bytes();
+        for hash in hashes {
+            bytes.extend(sealed_utils::encode_frame(SealOp::Record, hash).unwrap());
+        }
+
+        std::fs::write(self.root.join(".forklift").join("sealed"), bytes).unwrap();
     }
 
     /// Run `work` inside this warehouse's storage scope.
@@ -777,5 +789,171 @@ fn the_new_segment_is_the_gap_between_two_heads() {
 
         // A head behind the bound contributes nothing new.
         assert!(audit_utils::new_parcels(&first, Some(&third)).unwrap().is_empty());
+    });
+}
+
+/// The tree a path names in a parcel's root tree.
+fn subtree(head: &str, path: &str) -> String {
+    let root = object_utils::load_parcel(head).unwrap().tree_hash;
+    tree_utils::resolve_subtree_hash(&root, path).unwrap().expect("the path is a directory")
+}
+
+/// The blob (or recipe) a file path names in a parcel's root tree.
+fn file_hash(head: &str, path: &str) -> String {
+    let root = object_utils::load_parcel(head).unwrap().tree_hash;
+    object_utils::resolve_tree_file(&root, path).unwrap().expect("the path is a file").0
+}
+
+/// An absent tree the record holds is held by hash alone: audit tolerates it and everything
+/// beneath it, absent too. The push gate, given the same store and record, still refuses.
+#[test]
+fn audit_tolerates_a_recorded_absent_tree_and_what_lies_under_it_but_the_push_gate_does_not() {
+    let warehouse = Warehouse::new("sealed-tree");
+    let head = warehouse.stack_files(
+        &[("keep/a.txt", "a\n"), ("gone/x/y.txt", "y\n"), ("gone/z.txt", "z\n")],
+        "K",
+    );
+
+    warehouse.scoped(|| {
+        let full = MaterializationScope::full();
+        let gone = subtree(&head, "gone");
+        let below = file_hash(&head, "gone/z.txt");
+        warehouse.delete_object(&gone);
+        warehouse.delete_object(&below);
+
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect_err("an unrecorded absent tree is a loss");
+        assert!(err.contains(&gone), "{}", err);
+
+        warehouse.seal(&[&gone]);
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect("a recorded absent tree is held by hash, and nothing under it is checked");
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, true)
+            .expect("audit --full tolerates it too");
+
+        let err = audit_utils::verify_parcel_closure(&head, None)
+            .expect_err("the push gate tolerates no recorded absence");
+        assert!(err.contains(&gone), "{}", err);
+    });
+}
+
+/// A recorded object that is present seals nothing: audit walks it as any other tree, so an
+/// unrecorded absence beneath it is still a loss.
+#[test]
+fn a_recorded_tree_that_is_present_seals_nothing_beneath_it() {
+    let warehouse = Warehouse::new("sealed-present");
+    let head = warehouse.stack_files(&[("dir/sub/a.txt", "a\n"), ("dir/b.txt", "b\n")], "K");
+
+    warehouse.scoped(|| {
+        let dir = subtree(&head, "dir");
+        let lost = file_hash(&head, "dir/sub/a.txt");
+        warehouse.seal(&[&dir]);
+        warehouse.delete_object(&lost);
+
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &MaterializationScope::full(), false)
+            .expect_err("a present recorded tree is walked, and its lost blob reported");
+        assert!(err.contains(&lost), "{}", err);
+    });
+}
+
+/// A recorded absent blob is tolerated where an unrecorded one is a loss.
+#[test]
+fn audit_tolerates_a_recorded_absent_blob_only() {
+    let warehouse = Warehouse::new("sealed-blob");
+    let head = warehouse.stack_files(&[("a.txt", "a\n"), ("b.txt", "b\n")], "K");
+
+    warehouse.scoped(|| {
+        let full = MaterializationScope::full();
+        let a = file_hash(&head, "a.txt");
+        let b = file_hash(&head, "b.txt");
+        warehouse.delete_object(&a);
+        warehouse.delete_object(&b);
+        warehouse.seal(&[&a]);
+
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect_err("the unrecorded blob is still a loss");
+        assert!(err.contains(&b) && !err.contains(&a), "{}", err);
+
+        warehouse.seal(&[&a, &b]);
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect("both blobs are held by hash");
+    });
+}
+
+/// A chunked file: a recorded absent recipe seals its chunks (none is checked), and a recorded
+/// absent chunk under a present recipe is tolerated by audit and by audit --full, which cannot
+/// assemble that file and presence-checks it instead. An unrecorded absent chunk stays a loss.
+#[test]
+fn audit_tolerates_a_recorded_absent_recipe_or_chunk() {
+    let warehouse = Warehouse::new("sealed-chunks");
+    let head = warehouse.stack_large("big.bin", 0x5EA1, CHUNK_THRESHOLD + 60_000, "a giant");
+
+    warehouse.scoped(|| {
+        let full = MaterializationScope::full();
+        let recipe = file_hash(&head, "big.bin");
+        let chunks: Vec<String> = object_utils::load_recipe(&recipe).unwrap().chunks.iter()
+            .map(|chunk| chunk.hash.clone())
+            .collect();
+        assert!(chunks.len() >= 2, "the fixture needs two chunks");
+        warehouse.delete_object(&chunks[0]);
+
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect_err("an unrecorded absent chunk is a loss");
+        assert!(err.contains(&chunks[0]), "{}", err);
+
+        warehouse.seal(&[&chunks[0]]);
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect("a recorded absent chunk is held by hash");
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, true)
+            .expect("audit --full presence-checks a file it cannot assemble");
+
+        warehouse.delete_object(&chunks[1]);
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &full, true)
+            .expect_err("beside a recorded chunk, an unrecorded absent one is still a loss");
+        assert!(err.contains(&chunks[1]), "{}", err);
+
+        warehouse.delete_object(&recipe);
+        warehouse.seal(&[&recipe]);
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, false)
+            .expect("a recorded absent recipe seals every chunk it names");
+
+        let err = audit_utils::verify_parcel_closure(&head, None)
+            .expect_err("the push gate tolerates no recorded absence");
+        assert!(err.contains(&recipe), "{}", err);
+    });
+}
+
+/// In a sparse warehouse, a recorded absent tree on the scope's spine is tolerated as well.
+#[test]
+fn audit_tolerates_a_recorded_absent_spine_tree() {
+    let warehouse = Warehouse::new("sealed-spine");
+    let head = warehouse.stack_files(&[("deep/in/a.txt", "a\n"), ("deep/out.txt", "o\n")], "K");
+
+    warehouse.scoped(|| {
+        let scope = MaterializationScope::from_prefixes(["deep/in"]);
+        let deep = subtree(&head, "deep");
+        warehouse.delete_object(&deep);
+
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &scope, false)
+            .expect_err("an unrecorded absent spine tree is a loss");
+        assert!(err.contains(&deep), "{}", err);
+
+        warehouse.seal(&[&deep]);
+        audit_utils::verify_parcel_closure_scoped(&head, None, &scope, false)
+            .expect("a recorded absent spine tree is held by hash");
+    });
+}
+
+/// A record this build cannot read fails the audit rather than being taken as empty.
+#[test]
+fn an_unreadable_record_fails_the_audit() {
+    let warehouse = Warehouse::new("sealed-unreadable");
+    let head = warehouse.stack_files(&[("a.txt", "a\n")], "K");
+    std::fs::write(warehouse.root.join(".forklift").join("sealed"), b"/forklift-sealed 99\n").unwrap();
+
+    warehouse.scoped(|| {
+        let err = audit_utils::verify_parcel_closure_scoped(&head, None, &MaterializationScope::full(), false)
+            .expect_err("an unknown record version is refused");
+        assert!(err.contains("sealed-object record") && err.contains("format"), "{}", err);
     });
 }

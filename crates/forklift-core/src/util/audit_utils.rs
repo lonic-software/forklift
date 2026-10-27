@@ -10,6 +10,7 @@ use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
 use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
+use crate::util::sealed_utils::{self, SealedSet};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
@@ -1844,7 +1845,8 @@ pub fn verify_parcel_closure_with(
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
 ) -> Result<(), String> {
-    let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree };
+    // A ref move is a durability promise: the push gate tolerates no recorded absence.
+    let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
 
     verify_closure_core(
         head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &MaterializationScope::full(),
@@ -1859,6 +1861,9 @@ struct ClosureSeams<'a> {
     chunks_missing: &'a dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &'a dyn Fn(&str) -> Result<TreeItem, String>,
+    /// The sealed-by-hash record, for the audit; `None` on every ref-moving gate, which tolerates
+    /// no recorded absence.
+    sealed: Option<&'a SealedSet>,
 }
 
 /// The closure walk behind every verifier here.
@@ -1881,7 +1886,7 @@ fn verify_closure_core(
     reverify: bool,
     seams: &ClosureSeams,
 ) -> Result<(), String> {
-    let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree } = *seams;
+    let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed } = *seams;
 
     // Only the new segment: the closure behind each bound was proven complete when that head
     // was written. This walk used to build its prune set with `collect_reachable` from the bound,
@@ -2054,7 +2059,7 @@ fn verify_closure_core(
         // content re-verification is `audit --full` only.
         verify_tree_closure_scoped(
             &parcel.tree_hash, "", &bases, &mut visited_trees, &mut spine_seen,
-            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, scope, reverify,
+            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, scope, reverify, sealed,
         )?;
     }
 
@@ -2162,11 +2167,15 @@ pub fn verify_parcel_closure_scoped(
     // overrides the *shape* with parallel S3 HEADs. An out-of-scope recipe is sealed, never
     // loaded, so its chunks are never even named — the store invariant "recipe absent ⟹ chunks
     // absent" holds.
+    // An object recorded as sealed by hash is held by hash alone, like content outside the scope:
+    // absent, it is tolerated and not descended.
+    let sealed = sealed_utils::read_sealed()?;
     let seams = ClosureSeams {
         blob_exists: &|hash| file_utils::does_object_exist(hash),
         chunks_missing: &local_chunks_missing,
         load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
         load_base_tree: &|hash| object_utils::load_tree(hash),
+        sealed: Some(&sealed),
     };
 
     verify_closure_core(head, known_complete.as_ref().map(std::slice::from_ref), known_complete, scope, reverify, &seams)
@@ -2202,6 +2211,7 @@ pub fn verify_ref_head_closure(head: &str,
         chunks_missing: &local_chunks_missing,
         load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
         load_base_tree: &|hash| object_utils::load_tree(hash),
+        sealed: None,
     };
 
     verify_closure_core(head, Some(&bounds), base, scope, false, &seams)
@@ -2245,12 +2255,13 @@ fn verify_tree_closure_scoped(tree_hash: &str,
                               load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
                               load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
                               scope: &MaterializationScope,
-                              reverify: bool) -> Result<(), String> {
+                              reverify: bool,
+                              sealed: Option<&SealedSet>) -> Result<(), String> {
     match scope.classify(prefix) {
         ScopeClass::InScope => {
             return verify_tree_closure(
                 tree_hash, bases, verified, blob_exists, chunks_missing, load_recipe_chunks,
-                load_base_tree, reverify,
+                load_base_tree, reverify, sealed,
             )
         }
         ScopeClass::OutOfScope => return Ok(()),
@@ -2264,6 +2275,10 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         || verified.contains(tree_hash)
         || !spine_seen.insert((tree_hash.to_string(), prefix.to_string()))
     {
+        return Ok(());
+    }
+
+    if sealed_absent(sealed, tree_hash, blob_exists)? {
         return Ok(());
     }
 
@@ -2281,6 +2296,9 @@ fn verify_tree_closure_scoped(tree_hash: &str,
             continue; // a base carries it here: present by the base's own verification
         }
         if !blob_exists(&file.hash)? {
+            if sealed_utils::is_recorded(sealed, &file.hash) {
+                continue; // held by hash alone: a chunked file's recipe seals its chunks too
+            }
             return Err(format!(
                 "Blob {} (\"{}\" in tree {}) is missing.",
                 file.hash, file.name, tree_hash
@@ -2291,7 +2309,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         // descend it and verify its chunks at the audit's content level, exactly as the
         // fully-in-scope walk does.
         if file.item_type.is_chunked() {
-            verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
+            verify_chunked_file(&file.hash, reverify, sealed, load_recipe_chunks, chunks_missing)?;
         }
     }
 
@@ -2303,6 +2321,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         verify_tree_closure_scoped(
             &subtree.hash, &path, base_subtrees.get(name).map_or(&[][..], Vec::as_slice), verified,
             spine_seen, blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, scope, reverify,
+            sealed,
         )?;
     }
 
@@ -2430,7 +2449,8 @@ fn verify_tree_closure(tree_hash: &str,
                        chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
                        load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
                        load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
-                       reverify: bool)
+                       reverify: bool,
+                       sealed: Option<&SealedSet>)
                        -> Result<(), String> {
     // An explicit stack rather than recursion: a ref write runs this walk, and a tree nested a
     // few thousand levels deep would otherwise overflow the thread's stack.
@@ -2453,6 +2473,10 @@ fn verify_tree_closure(tree_hash: &str,
         // same call did. Pruned without loading any tree — this is the whole W1 saving, and it is
         // exactly where an untouched large chunked file's ~million chunks are NOT re-presence-checked.
         if base_tree_hashes.contains(&tree_hash) {
+            continue;
+        }
+
+        if sealed_absent(sealed, &tree_hash, blob_exists)? {
             continue;
         }
 
@@ -2483,6 +2507,9 @@ fn verify_tree_closure(tree_hash: &str,
             }
 
             if !blob_exists(&file.hash)? {
+                if sealed_utils::is_recorded(sealed, &file.hash) {
+                    continue; // held by hash alone: a chunked file's recipe seals its chunks too
+                }
                 return Err(format!(
                     "Blob {} (\"{}\" in tree {}) is missing.",
                     file.hash, file.name, tree_hash
@@ -2497,7 +2524,7 @@ fn verify_tree_closure(tree_hash: &str,
             // ref move is a durability promise a fetch is not.) The prune above only reaches this for
             // a file no candidate base already vouches for, so W4 is never weakened.
             if file.item_type.is_chunked() {
-                verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
+                verify_chunked_file(&file.hash, reverify, sealed, load_recipe_chunks, chunks_missing)?;
             }
         }
 
@@ -2526,23 +2553,64 @@ fn verify_tree_closure(tree_hash: &str,
 ///   the local store, so it is the `audit --full` path only, never a remote commit gate.
 ///
 /// # Arguments
+/// A chunk recorded as sealed by hash is tolerated absent on both paths. A file one of whose chunks
+/// is held that way cannot be assembled, so re-verify presence-checks it instead.
+///
+/// # Arguments
 /// * `recipe_hash`        - The chunked file's tree-entry hash (a recipe).
 /// * `reverify`           - `true` re-reads and re-assembles; `false` presence-checks.
-/// * `load_recipe_chunks` - Reads the recipe's chunk hashes (used only by the presence path).
-/// * `chunks_missing`     - Bulk chunk-presence probe (used only by the presence path): given the
-///                          recipe's chunk-hash list, returns the subset the store lacks.
+/// * `sealed`             - The sealed-by-hash record, or `None` on a ref-moving gate.
+/// * `load_recipe_chunks` - Reads the recipe's chunk hashes.
+/// * `chunks_missing`     - Bulk chunk-presence probe: given the recipe's chunk-hash list, returns
+///                          the subset the store lacks.
 fn verify_chunked_file(
     recipe_hash: &str,
     reverify: bool,
+    sealed: Option<&SealedSet>,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
-    if reverify {
+    // Absent chunks the record does not hold; the rest are tolerated.
+    let unsealed_missing = |chunks: &[String]| -> Result<Vec<String>, String> {
+        let mut missing = chunks_missing(chunks)?;
+        missing.retain(|chunk| !sealed_utils::is_recorded(sealed, chunk));
+        Ok(missing)
+    };
+
+    if reverify && !holds_sealed_absence(recipe_hash, sealed, load_recipe_chunks, chunks_missing)? {
         object_utils::assemble_chunked_file(recipe_hash, &mut std::io::sink())?;
         Ok(())
     } else {
-        verify_recipe_chunks_present(recipe_hash, load_recipe_chunks, chunks_missing)
+        verify_recipe_chunks_present(recipe_hash, load_recipe_chunks, &unsealed_missing)
     }
+}
+
+/// Whether a recipe names a chunk that is both recorded as sealed by hash and absent. Reads
+/// nothing when the record is empty or does not apply.
+fn holds_sealed_absence(
+    recipe_hash: &str,
+    sealed: Option<&SealedSet>,
+    load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
+    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
+) -> Result<bool, String> {
+    if sealed.is_none_or(SealedSet::is_empty) {
+        return Ok(false);
+    }
+
+    let chunks = load_recipe_chunks(recipe_hash)
+        .map_err(|e| format!("Recipe {} is missing or unreadable: {}", recipe_hash, e))?;
+    let recorded: Vec<String> = chunks.into_iter().filter(|chunk| sealed_utils::is_recorded(sealed, chunk)).collect();
+
+    Ok(!recorded.is_empty() && !chunks_missing(&recorded)?.is_empty())
+}
+
+/// Whether a tree the walk is about to load is recorded as sealed by hash and absent: held by hash
+/// alone, so neither it nor anything beneath it is checked. A recorded tree that is present seals
+/// nothing and is walked. Probes presence only for a recorded hash.
+fn sealed_absent(sealed: Option<&SealedSet>,
+                 tree_hash: &str,
+                 object_exists: &dyn Fn(&str) -> Result<bool, String>) -> Result<bool, String> {
+    Ok(sealed_utils::is_recorded(sealed, tree_hash) && !object_exists(tree_hash)?)
 }
 
 /// How many absent chunk hashes a closure-check failure names before summarizing the rest as
