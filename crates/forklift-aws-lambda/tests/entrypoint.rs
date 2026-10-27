@@ -503,8 +503,9 @@ fn a_tail_naming_no_valid_pallet_is_refused_on_every_route() {
     assert_eq!(info.tombstone("main"), None);
 }
 
-/// An empty segment outside a pallet name matches no route, as on `forklift-server`: a trailing
-/// slash, an empty capture and an empty warehouse id are each a 404, never a 422 for an empty value.
+/// An empty segment outside a pallet name, in the path as the router receives it, matches no
+/// route, as on `forklift-server`: a trailing slash, an empty capture and an empty warehouse id are
+/// each a 404, never a 422 for an empty value. (Behind API Gateway a `//` never arrives.)
 #[test]
 fn an_empty_segment_outside_a_pallet_name_matches_no_route() {
     let fixture = Fixture::direct();
