@@ -189,6 +189,15 @@ pub fn restore_pallet(wire: &str) -> Result<String, String> {
 
     pallet_utils::validate_pallet_name(wire)?;
 
+    // Only a served root's tombstones bind its ref writes, so only those are restored.
+    if !is_served()? {
+        return Err(format!(
+            "This warehouse has never been served, so it keeps no tombstones: pallet \"{}\" cannot be \
+            restored from one. A pallet deleted here is brought back with \"forklift undo\".",
+            wire
+        ));
+    }
+
     let Some(head) = read_tombstones()?.remove(wire) else {
         return Err(format!("No deleted pallet \"{}\" has a tombstone in this warehouse.", wire));
     };
@@ -329,6 +338,19 @@ mod tests {
         let refused = refuse_a_tombstoned_name("gone").unwrap_err();
         assert!(refused.contains(&head) && refused.contains("forklift palletize --restore gone"), "{}", refused);
         refuse_a_tombstoned_name("other").unwrap();
+    }
+
+    #[test]
+    fn a_restore_in_a_root_never_served_is_refused() {
+        let _scratch = Scratch::new("restore-unserved");
+
+        let lock = RefLock::acquire().unwrap();
+        write_tombstones(&lock, &BTreeMap::from([("gone".to_string(), "a".repeat(64))])).unwrap();
+        drop(lock);
+
+        let refused = restore_pallet("gone").unwrap_err();
+        assert!(refused.contains("never been served"), "{}", refused);
+        assert_eq!(crate::util::pallet_utils::get_pallet_head("gone").unwrap(), None);
     }
 
     #[test]

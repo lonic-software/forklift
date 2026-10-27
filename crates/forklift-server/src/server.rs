@@ -1019,6 +1019,31 @@ fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
     (StatusCode::CONFLICT, pallet_utils::pallet_moved_refusal(current, expected).into())
 }
 
+/// [`pallet_moved`], unless the pallet expected at a head is gone because it was deleted here: then
+/// a refusal naming the deletion, since lowering cannot resolve it (a lift after a lower would be
+/// a creation, which the tombstone binds).
+fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
+                           bare: &str,
+                           current: Option<&str>,
+                           expected: Option<&str>) -> HandlerError {
+    if current.is_some() || expected.is_none() || namespace != pallet_utils::PalletNamespace::User {
+        return pallet_moved(current, expected);
+    }
+
+    match forklift_core::util::tombstone_utils::read_tombstones() {
+        Ok(tombstones) => match tombstones.get(bare) {
+            Some(head) => (StatusCode::CONFLICT, format!(
+                "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
+                history. Lift the work under another name, or ask the remote's operator to drop the \
+                tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
+                bare, head, bare
+            )),
+            None => pallet_moved(current, expected),
+        },
+        Err(error) => internal(error),
+    }
+}
+
 /// The refusal for a creation of a pallet deleted on this head whose tombstone still stands: a `409`
 /// unless the writer acknowledged the tombstone and the new head descends from its head.
 fn pallet_deleted(pallet: &str, head: &str, acknowledged: bool) -> HandlerError {
@@ -1026,14 +1051,14 @@ fn pallet_deleted(pallet: &str, head: &str, acknowledged: bool) -> HandlerError 
         false => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
             history: re-creating it must acknowledge the deletion. Lift the work under another name, \
-            or ask the remote's operator to drop the tombstone (\"forklift-server tombstone drop {}\"). \
+            or ask the remote's operator to drop the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). \
             Nothing was written.",
             pallet, head, pallet
         ),
         true => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
             it: the name stays reserved for that history. Lift the work under another name, or ask \
-            the remote's operator to drop the tombstone (\"forklift-server tombstone drop {}\"). \
+            the remote's operator to drop the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). \
             Nothing was written.",
             pallet, head, pallet
         ),
@@ -2736,7 +2761,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             let current = pallet_utils::get_pallet_head_in(namespace, &bare).map_err(internal)?;
 
             if current != request.old_head {
-                return Err(pallet_moved(current.as_deref(), request.old_head.as_deref()));
+                return Err(pallet_moved_or_deleted(namespace, &bare, current.as_deref(), request.old_head.as_deref()));
             }
 
             // The head is stored as given; a spelling the ref reader refuses is the request's fault,
@@ -2907,7 +2932,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     verified_closure = Some(verified);
                 }
                 Err(RefUpdateError::Moved(moved)) => {
-                    return Err(pallet_moved(moved.found.as_deref(), request.old_head.as_deref()));
+                    return Err(pallet_moved_or_deleted(namespace, &bare, moved.found.as_deref(), request.old_head.as_deref()));
                 }
                 Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
                 Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
@@ -3015,7 +3040,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                     return Ok(None);
                 }
 
-                return Err(pallet_moved(current.as_deref(), Some(&old_head)));
+                return Err(pallet_moved_or_deleted(pallet_utils::PalletNamespace::User, &bare, current.as_deref(), Some(&old_head)));
             }
 
             if pallet_utils::read_position().map_err(internal)?.pallet == bare {
@@ -3059,7 +3084,9 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
             ) {
                 Ok(()) => true,
                 Err(RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved) if attempt < REF_UPDATE_ATTEMPTS => false,
-                Err(RefUpdateError::Moved(moved)) => return Err(pallet_moved(moved.found.as_deref(), Some(&old_head))),
+                Err(RefUpdateError::Moved(moved)) => return Err(pallet_moved_or_deleted(
+                    pallet_utils::PalletNamespace::User, &bare, moved.found.as_deref(), Some(&old_head)
+                )),
                 Err(RefUpdateError::OfficeMoved { found }) => return Err(office_moved(found.as_deref())),
                 Err(RefUpdateError::AnchorMoved) => return Err(anchor_moved()),
                 // A failed removal can still have landed, and then its tombstone stands: what the
@@ -6463,6 +6490,26 @@ mod tests {
             let info: WarehouseInfo = serde_json::from_str(&body_text(info).await).unwrap();
             assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
             assert!(!info.pallets.contains_key("side"), "a deleted pallet is not listed");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Revert: map the moved ref to `pallet_moved` alone → the refusal says "Lower and retry"
+        /// → red.
+        #[tokio::test]
+        async fn a_lift_onto_a_pallet_deleted_here_names_the_deletion_not_a_lower() {
+            let (root, _scope, side) = served_with_side("delete-then-lift");
+            let on_it = store_child_parcel(&side, "on side");
+            assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
+
+            let response = post_ref_update(
+                State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(ref_update_params("side")),
+                Json(RefUpdateRequest { old_head: Some(side.clone()), new_head: on_it, tombstone: None }),
+            ).await.into_response();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = body_text(response).await;
+            assert!(body.contains("was deleted on this remote") && !body.contains("Lower and retry"), "{}", body);
+            assert!(body.contains("tombstone drop --root <warehouse> side"), "{}", body);
             let _ = std::fs::remove_dir_all(&root);
         }
 

@@ -121,7 +121,9 @@ so a client that freed history because this remote held it can still fetch it, a
 map, empty when nothing was deleted. A head that cannot delete pallets sends `null` or omits the
 field, and a client reads that as "this remote does not support deleting pallets" before sending
 a `DELETE`. A name keeps its tombstone until a creation that acknowledges it (below) or the
-server's operator drops it; nothing expires one.
+server's operator drops it; nothing expires one. A ref update or `DELETE` whose `old_head` names
+a pallet that is gone because it was deleted is refused with `409` naming the deletion, without
+`code` `remote_ahead`: lowering cannot resolve it.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
 endpoint) are *qualified references*: a user pallet is bare (`main`), a **meta pallet** —
