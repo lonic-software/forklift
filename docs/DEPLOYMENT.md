@@ -312,9 +312,9 @@ docs, and the exact shape `tests/aws_integration.rs`'s `provision()` creates):
 | `wh` | `S` | Partition key — the warehouse id |
 | `entity` | `S` | Sort key — `pallet#{qualified-ref}` (e.g. `pallet#main`, `pallet#@office`) or the literal string `trust` |
 
-Item payload attributes (`head` for a pallet item, `anchor` — a JSON string — for the trust
-item) are not part of the key schema and need no separate declaration when you create the
-table; DynamoDB is schemaless beyond the key.
+Item payload attributes (`head` for a live pallet item, `deleted_head` for a deleted one's
+tombstone, `anchor` — a JSON string — for the trust item) are not part of the key schema and need
+no separate declaration when you create the table; DynamoDB is schemaless beyond the key.
 
 ### The CAS
 
@@ -323,7 +323,8 @@ lets this head scale horizontally, where `forklift-server`'s compare-and-set res
 on one machine's filesystem.
 As of FORK-95 it is a `TransactWriteItems` of up to three actions rather than a single-item
 `UpdateItem`: an `Update` on the target pallet's own item (`ConditionExpression` encoding the
-caller's expected head, exactly the prior single-item shape), a `ConditionCheck` on the office
+item state the caller expects: no item for a creation, `head` at the old head for a move, or
+`deleted_head` at the tombstone for an acknowledged re-creation), a `ConditionCheck` on the office
 pallet's item at the office head a ref update's audit consumed (skipped when the target pallet
 *is* the office pallet — the `Update` above already pins that item, and DynamoDB refuses two
 actions on one item in the same transaction), and a `ConditionCheck` on the trust item at the
@@ -333,6 +334,12 @@ condition holding or applies nothing; on a condition failure
 which precondition moved without a second round trip. `put_trust_if_absent` is still the
 single-item shape (a conditional `PutItem`) for the one-way trust door.
 
+A pallet delete (`delete_head`) is the same transaction. Its `Update` keeps the item and moves its
+`head` into `deleted_head` (`SET deleted_head = :old REMOVE head`), conditioned on `head` still
+being the old head. The office `ConditionCheck` is always built for it: at the office head the
+delete's authorization read, or, when the office is unborn, on the office item having no head. A
+tombstone is item state, so a creation conditioned on the item's absence refuses it.
+
 `replace_trust` — the one sanctioned overwrite of the anchor, a re-genesis — is the **second**
 transaction this crate issues, added in FORK-95 slice 4: a `Put` on the trust item conditioned
 on the incumbent anchor's stored bytes, plus a `ConditionCheck` on the office item at the head
@@ -341,7 +348,8 @@ office item are never the same item, so nothing collapses). It was an unconditio
 before that, which is how two concurrent re-geneses could both validate against the same
 incumbent and both write, one silently overwriting the other. **No secondary index is used or
 needed:** every action conditions on a single item's own attribute(s), and ref enumeration
-(`list_refs`) is answered by a plain `Query` on the base table (`wh = … AND begins_with(entity,
+(`list_refs`, which reads each pallet item as live at its `head` or deleted at its `deleted_head`)
+is answered by a plain `Query` on the base table (`wh = … AND begins_with(entity,
 "pallet#")`) — the partition key plus a sort-key prefix, which needs no GSI.
 
 **There is no `dynamodb:TransactWriteItems` IAM action to grant.** AWS's own model —
@@ -469,6 +477,7 @@ directly). In multi-warehouse mode every path below is additionally prefixed wit
 | `PUT` | `/v1/signatures/{hash}` | Store a signature sidecar |
 | `PUT` | `/v1/trust` | Establish or re-genesis the trust anchor |
 | `POST` | `/v1/pallets/{name}` | The ref-update CAS |
+| `DELETE` | `/v1/pallets/{name}?old_head={hash}` | Delete a user pallet, leaving a tombstone at its head |
 | `POST` | `/v1/pallets/{name}/holds` | Which of up to 16 parcels the pallet still holds (a bounded walk; `unknown` past its step or time bound) |
 | `POST` | `/v1/resolve` | Operator id → display name (always an empty map on this head — no resolution hook) |
 | `GET` | `/v1/bundles/latest` | Latest whole-warehouse bundle (always `404` today — no bundle builder exists for this head yet) |

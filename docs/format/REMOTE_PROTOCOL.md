@@ -121,9 +121,9 @@ so a client that freed history because this remote held it can still fetch it, a
 map, empty when nothing was deleted. A head that cannot delete pallets sends `null` or omits the
 field, and a client reads that as "this remote does not support deleting pallets" before sending
 a `DELETE`. A name keeps its tombstone until a creation that acknowledges it (below) or the
-server's operator drops it; nothing expires one. A ref update or `DELETE` whose `old_head` names
-a pallet that is gone because it was deleted is refused with `409` and `code`
-`pallet_deleted_on_remote`, not `remote_ahead`: lowering cannot resolve it.
+server's operator drops it (the serverless head has no drop); nothing expires one. A ref update
+or `DELETE` whose `old_head` names a pallet that is gone because it was deleted is refused with
+`409` and `code` `pallet_deleted_on_remote`, not `remote_ahead`: lowering cannot resolve it.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
 endpoint) are *qualified references*: a user pallet is bare (`main`), a **meta pallet** —
@@ -427,14 +427,15 @@ defined meaning in HTTP, and a proxy may drop it. Checks, in order:
    that a pallet already deleted at `old_head` (its tombstone holds it) answers `200`, so a retry
    whose first try landed reads as done;
 4. the remote's `default_pallet`, which a franchise checks out, is refused with `409`, and so is
-   a pallet a checkout of the server's own warehouse stands on, one an open haul names, and any
-   pallet while a haul cannot be read.
+   a pallet a checkout of the server's own warehouse stands on (the serverless head has none), one
+   an open haul names, and any pallet while a haul cannot be read.
 
 A request that passes them removes the ref and writes the tombstone atomically with respect to
 every other ref write, conditioned on the office and anchor the authorization read; when either
 moved meanwhile, the head decides again. It answers `200` with no body. The open-haul check is
 made when the request is read, so a haul opened just before the removal is not refused; it keeps
-its proposed head, and the tombstone keeps the target's.
+its proposed head, and the tombstone keeps the target's. Both `forklift-server` and the
+serverless head serve this endpoint with these checks and answers.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 

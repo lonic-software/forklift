@@ -3627,7 +3627,7 @@ fn code_and_next_step(message: &str) -> (String, String) {
 }
 
 /// A delete leaves a tombstone: the handshake names it in place of the head, holds walks from it,
-/// and a retry at it answers `200` with nothing written.
+/// a retry at it answers `200` with nothing written, and a restore at its head clears it.
 #[test]
 fn a_delete_leaves_a_tombstone_the_handshake_and_holds_read() {
     let area = Area::new("delete");
@@ -3648,6 +3648,12 @@ fn a_delete_leaves_a_tombstone_the_handshake_and_holds_read() {
 
     head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("a retry at the tombstone");
     assert_eq!(head.handshake().expect("handshake").tombstone("feature"), Some(&feature_v2));
+
+    // A restore is the acknowledged re-creation at the tombstone's own head.
+    let restore = RefUpdateRequest { old_head: None, new_head: feature_v2.clone(), tombstone: Some(feature_v2.clone()) };
+    head.ref_update(&Principal::Static, "feature", &restore).expect("restore feature");
+    let info = head.handshake().expect("handshake");
+    assert_eq!((info.pallets.get("feature"), info.tombstone("feature")), (Some(&feature_v2), None));
 }
 
 /// Each refusal of a delete, in the direct head's codes, and nothing deleted by any of them: a
@@ -3757,10 +3763,13 @@ fn an_open_haul_refuses_the_delete() {
     assert_eq!(head.handshake().expect("handshake").pallets.get("feature"), Some(&feature_head));
 }
 
+/// A write raced against a delete, run once on the shared store.
+type RacingWrite = Box<dyn FnOnce(&MemoryRefStore)>;
+
 /// What [`RacesTheDelete`] does when the head's delete reaches the store.
 enum DeleteRace {
     /// Run this against the shared store before the first attempt, then forward every attempt.
-    Before(RefCell<Option<Box<dyn FnOnce(&MemoryRefStore)>>>),
+    Before(RefCell<Option<RacingWrite>>),
     /// Forward the delete, then answer it as transient of unknown fate, on every attempt.
     LandsThenTransient,
     /// Answer every attempt as transient of unknown fate without forwarding it.
