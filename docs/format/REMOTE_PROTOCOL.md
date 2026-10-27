@@ -345,10 +345,12 @@ pallet names are a fixed list — `office`, `manifest`, `haul`, `tags`, `kv` —
 follows it. A client sends the reference's `/` as literal separators and percent-encodes each
 component on its own, so `feature/x` travels as `feature/x` and `@office` as `%40office`, never
 `%2F` for a `/`. A server percent-decodes each segment and joins them with `/`, keeping an empty
-segment as an empty component, so `a//b` and `a/b/` name no valid reference and are refused, never
-read as `a/b`. A segment that does not decode to UTF-8 is refused with a `4xx`. A `/` sent as
-`%2F` is not dependable: an API gateway or reverse proxy may decode it before the request is
-routed, so a reference carried as one encoded segment would arrive split.
+segment as an empty component, so `a//b` and `a/b/` name no valid reference and are refused. A
+segment that does not decode to UTF-8 is refused with a `4xx`. What a server is sent is not always
+what the client sent, so a client never relies on either refusal: it sends only valid references,
+which have no empty component. An API gateway or reverse proxy may decode `%2F` before the request
+is routed, so a reference carried as one encoded segment would arrive split, and may collapse `//`
+to `/` (API Gateway's HTTP API does), so `a//b` would arrive as `a/b`.
 
 `old_head: null` means "the pallet must not exist yet". Checks, in order:
 

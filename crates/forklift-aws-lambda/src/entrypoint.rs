@@ -652,7 +652,8 @@ fn is_tail(segments: &[&str]) -> bool {
 /// A pallet name, the rest of the path after `pallets` or `holds`: the client sends a name such
 /// as `feature/x` as literal segments, last in the path, so each segment is decoded on its own
 /// and the decoded segments are joined with `/`. An empty segment stays an empty component, so
-/// `a//b` and `a/b/` are not `a/b`; every handler parses the name, refusing an empty component,
+/// `a//b` and `a/b/` are not `a/b` (API Gateway collapses a `//` before this sees the path, but
+/// keeps a trailing `/`); every handler parses the name, refusing an empty component,
 /// `.`, `..` and anything outside the name alphabet.
 fn pallet_name(segments: &[&str]) -> HeadResult<String> {
     Ok(segments.iter().map(|segment| param(segment)).collect::<HeadResult<Vec<_>>>()?.join("/"))
