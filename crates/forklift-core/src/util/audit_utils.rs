@@ -5,6 +5,7 @@
 //! state a local audit would reject.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
@@ -1871,17 +1872,17 @@ struct ClosureSeams<'a> {
 /// tolerates no recorded absence.
 pub struct SealedTolerance<'a> {
     record: &'a SealedSet,
-    held: Mutex<HashSet<String>>,
+    held: RefCell<HashSet<String>>,
 }
 
 impl<'a> SealedTolerance<'a> {
     pub fn new(record: &'a SealedSet) -> SealedTolerance<'a> {
-        SealedTolerance { record, held: Mutex::new(HashSet::new()) }
+        SealedTolerance { record, held: RefCell::new(HashSet::new()) }
     }
 
     /// How many distinct absent objects the walk held by hash alone.
     pub fn held(&self) -> usize {
-        self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
+        self.held.borrow().len()
     }
 
     fn is_empty(&self) -> bool {
@@ -1893,7 +1894,7 @@ impl<'a> SealedTolerance<'a> {
     fn holds_absent(&self, hash: &str) -> bool {
         let held = self.record.contains(hash);
         if held {
-            self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(hash.to_string());
+            self.held.borrow_mut().insert(hash.to_string());
         }
         held
     }
@@ -2636,9 +2637,12 @@ fn verify_chunked_file(
     report_missing_chunks(recipe_hash, &chunks, &|_| Ok(unheld(absent.clone())))?;
 
     // Every absent chunk is held by hash, so the file cannot be assembled: re-read the present
-    // ones, each re-hashed on its content-addressed load.
-    let absent: HashSet<&str> = absent.iter().map(String::as_str).collect();
-    for chunk in chunks.iter().filter(|chunk| !absent.contains(chunk.as_str())) {
+    // ones, each once, re-hashed on its content-addressed load (the same read assembly makes).
+    let mut skip: HashSet<&str> = absent.iter().map(String::as_str).collect();
+    for chunk in &chunks {
+        if !skip.insert(chunk.as_str()) {
+            continue;
+        }
         object_utils::load_chunk(chunk)
             .map_err(|e| format!("Chunk {} of recipe {} is corrupt or unreadable: {}", chunk, recipe_hash, e))?;
     }

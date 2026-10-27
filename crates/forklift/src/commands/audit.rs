@@ -78,14 +78,14 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         // never read as a full-clone pass. A full store keeps today's signature-only audit
         // unchanged — unless `--full` is asked, which re-reads every present chunk and re-verifies
         // each chunked file's content hash even on a full clone. Object presence is a warehouse
-        // property, so the fetch scope is the seam either way. A warehouse that holds objects by
-        // hash alone (the sealed record) gets the content audit too, so what it holds that way is
-        // counted and reported rather than passed over by a signature-only pass.
+        // property, so the fetch scope is the seam either way. Whenever the content audit runs, it
+        // counts and reports what the sealed record held by hash alone; a signature-only pass makes
+        // no content claim, so it has nothing of that kind to report.
         let fetch_scope = scope_utils::read_fetch_scope()?;
         let is_sparse = !fetch_scope.is_full();
-        let record = sealed_utils::read_sealed()?;
 
-        if is_sparse || full || !record.is_empty() {
+        if is_sparse || full {
+            let record = sealed_utils::read_sealed()?;
             let sealed = SealedTolerance::new(&record);
             audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full, Some(&sealed))?;
             report.scope = Some(AuditScope::new(
@@ -193,7 +193,7 @@ impl AuditScope {
             in_scope_content: "verified",
             held_by_hash: held,
             chunks: if full {
-                "re-read and re-hashed; each chunked file re-assembled to verify its content hash"
+                "re-read and re-hashed; each fully-present chunked file re-assembled to verify its content hash"
             } else {
                 "presence-checked"
             },

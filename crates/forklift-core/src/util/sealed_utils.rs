@@ -24,6 +24,8 @@
 //! validates, because the magic is nonzero. One append writes one frame, so a torn one leaves at
 //! most a frame's worth of bytes before any trailing zeros; more than that after the last valid
 //! frame is damage inside the log, and fails the read rather than dropping the frames behind it.
+//! Damage confined to the last frame's worth of bytes cannot be told from a torn append, so it
+//! reads as one: the entry there is not replayed. That is the one loss the log can hide.
 //! A frame that validates but whose entry does not parse fails the read, as does a header naming
 //! another version: neither is guessed at.
 

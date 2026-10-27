@@ -1008,8 +1008,8 @@ fn audit_tolerates_a_recorded_absent_blob_on_the_spine() {
     });
 }
 
-/// `forklift audit` on a full clone that holds an object by hash alone runs the content audit
-/// and says so, rather than passing the absence over with a signature-only pass.
+/// `forklift audit --full` on a full clone that holds an object by hash alone says how many it
+/// held. A plain audit of a full clone stays signature-only and makes no content claim.
 #[test]
 fn audit_cli_reports_what_the_record_held() {
     let warehouse = Warehouse::new("sealed-cli");
@@ -1023,12 +1023,17 @@ fn audit_cli_reports_what_the_record_held() {
     warehouse.delete_object(&a);
     warehouse.seal(&[&a]);
 
-    let json = warehouse.run_ok(&["audit", "--json"]);
+    let signatures_only = warehouse.run_ok(&["audit", "--json"]);
+    let signatures_stdout = String::from_utf8_lossy(&signatures_only.stdout);
+    assert!(!signatures_stdout.contains("\"scope\""),
+        "a plain full-clone audit stays signature-only: {}", signatures_stdout);
+
+    let json = warehouse.run_ok(&["audit", "--full", "--json"]);
     let stdout = String::from_utf8_lossy(&json.stdout);
     assert!(stdout.contains("\"held_by_hash\":1") || stdout.contains("\"held_by_hash\": 1"),
         "the --json envelope counts the held absence: {}", stdout);
 
-    let human = warehouse.run_ok(&["audit"]);
+    let human = warehouse.run_ok(&["audit", "--full"]);
     let human_stdout = String::from_utf8_lossy(&human.stdout);
     assert!(human_stdout.contains("1 absent object(s) are held by hash alone"), "{}", human_stdout);
 }
