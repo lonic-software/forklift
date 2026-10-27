@@ -1042,9 +1042,10 @@ fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
         Ok(tombstones) => match tombstones.get(bare) {
             Some(head) => (StatusCode::CONFLICT, deleted_refusal(format!(
                 "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-                history. Use another name for new work, or ask the remote's operator to drop the \
-                tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
-                bare, head, bare
+                history. \"forklift palletize --restore {} --remote\" brings it back; otherwise use \
+                another name for new work, or ask the remote's operator to drop the tombstone \
+                (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
+                bare, head, bare, bare
             ), bare)),
             None => pallet_moved(current, expected),
         },
@@ -1058,17 +1059,20 @@ fn pallet_deleted(pallet: &str, head: &str, acknowledged: bool) -> HandlerError 
     let message = match acknowledged {
         false => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-            history: re-creating it must acknowledge the deletion. Lift the work under another name, \
-            or ask the remote's operator to drop the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). \
-            Nothing was written.",
-            pallet, head, pallet
+            history: re-creating it must acknowledge the deletion (\"forklift lift --recreate\", for \
+            work that descends from it). \"forklift palletize --restore {} --remote\" brings it back \
+            instead; otherwise lift the work under another name, or ask the remote's operator to drop \
+            the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was \
+            written.",
+            pallet, head, pallet, pallet
         ),
         true => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
-            it: the name stays reserved for that history. Lift the work under another name, or ask \
-            the remote's operator to drop the tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). \
-            Nothing was written.",
-            pallet, head, pallet
+            it: the name stays reserved for that history. \"forklift palletize --restore {} --remote\" \
+            brings it back, to lower and consolidate into this work; otherwise lift the work under \
+            another name, or ask the remote's operator to drop the tombstone \
+            (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
+            pallet, head, pallet, pallet
         ),
     };
 

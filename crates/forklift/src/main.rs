@@ -147,7 +147,10 @@ fn parse_or_exit() -> Cli {
             output::set_command(matches.subcommand_name());
 
             match Cli::from_arg_matches_mut(&mut matches) {
-                Ok(cli) => return cli,
+                Ok(cli) => match cross_argument_error(&cli) {
+                    None => return cli,
+                    Some(message) => Cli::command().error(ErrorKind::MissingRequiredArgument, message),
+                },
                 Err(error) => error,
             }
         }
@@ -167,6 +170,19 @@ fn parse_or_exit() -> Cli {
     output::set_mode(OutputMode::Json);
     output::set_command(named_command(&args).as_deref());
     report_usage_error(&error);
+}
+
+/// A combination of arguments clap's attributes cannot express, refused as a usage error like
+/// the ones they do: `palletize --remote` with a pallet name is a delete or a restore, never a
+/// listing.
+fn cross_argument_error(cli: &Cli) -> Option<&'static str> {
+    match &cli.command {
+        Command::Palletize { name: Some(_), remote: true, delete: false, restore: false, .. } => Some(
+            "\"--remote\" with a pallet name needs \"--delete\" or \"--restore\"; without a name, \
+            \"forklift palletize --remote\" lists the remote's pallets"
+        ),
+        _ => None,
+    }
 }
 
 /// The canonical name of the top-level command the arguments name, when the parse that would

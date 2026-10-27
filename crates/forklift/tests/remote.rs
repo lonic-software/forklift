@@ -8293,6 +8293,14 @@ fn refusal_of(output: &Output, exit: i32) -> serde_json::Value {
     json_of(output)["error"].clone()
 }
 
+/// The remote's head of meta pallet `name`, if it has one, read through `dir`'s remote listing.
+fn remote_meta_head(area: &TestArea, dir: &str, name: &str) -> Option<String> {
+    let listed = json_of(&area.forklift(dir, &["--json", "palletize", "--remote", "--all"]));
+    listed["data"]["meta"].as_array()?.iter()
+        .find(|entry| entry["name"] == name)
+        .map(|entry| entry["head"].as_str().unwrap().to_string())
+}
+
 // Revert: drop the tombstone arm of `acknowledged_tombstone` → the remote refuses the lift after
 // the upload, naming the restore, not "--recreate"; drop the acknowledgement from the creation →
 // the remote refuses "--recreate".
@@ -8324,10 +8332,14 @@ fn a_pallet_deleted_on_the_remote_is_listed_and_lifts_back_only_acknowledged() {
     // This clone's work descends from the deleted head: "--recreate" re-creates the pallet with it.
     assert_success(&area.forklift("b", &["shift", "feat"]));
     stack_file(&area, "b", "more.txt", "more\n");
+    // An office change waits to lift too: the refusal comes before the office uploads.
+    let office_before = remote_meta_head(&area, "b", "@office");
+    assert_success(&area.forklift("b", &["office", "enroll"]));
     let refused = refusal_of(&area.forklift("b", &["--json", "lift"]), 35);
     assert_eq!(refused["code"], "pallet_deleted_on_remote", "{}", refused);
     assert_eq!(refused["next_step"], "forklift lift --recreate", "{}", refused);
     assert!(!area.path("server-root/.forklift/pallets/feat").exists(), "nothing was lifted");
+    assert_eq!(remote_meta_head(&area, "b", "@office"), office_before, "not even the office");
 
     assert_success(&area.forklift("b", &["lift", "--recreate"]));
     assert_eq!(pallet_head(&area, "server-root", "feat"), pallet_head(&area, "b", "feat"));
@@ -8361,7 +8373,8 @@ fn a_stale_clone_restores_a_pallet_deleted_on_the_remote_rather_than_re_creating
     let again = area.forklift("b", &["palletize", "--restore", "feat", "--remote"]);
     assert!(!again.status.success() && stderr(&again).contains("is not deleted"), "{}{}", stdout(&again), stderr(&again));
     let named = area.forklift("b", &["palletize", "feat", "--remote"]);
-    assert!(!named.status.success() && stderr(&named).contains("needs \"--delete\" or \"--restore\""), "{}", stderr(&named));
+    assert_eq!(named.status.code(), Some(2), "a usage error: {}", stderr(&named));
+    assert!(stderr(&named).contains("needs \"--delete\" or \"--restore\""), "{}", stderr(&named));
 }
 
 // Revert: drop the capability check → the delete is sent, and reaches the server behind the proxy.

@@ -48,6 +48,15 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         let client = RemoteClient::from_config()?;
         let info = client.fetch_info().await?;
 
+        // A lift onto a pallet the remote deleted is refused here, before the office or any meta
+        // pallet uploads, unless it is acknowledged; the remote refuses an unacknowledged creation
+        // of a deleted pallet all the same.
+        let current = pallet_utils::read_position()?.pallet;
+        let tombstone = match pallet_utils::get_pallet_head(&current)? {
+            Some(head) => remote_utils::acknowledged_tombstone(&info, &current, &head, recreate)?,
+            None => None,
+        };
+
         let office_new_parcels = match remote_utils::push_local_trust(&client, &info).await? {
             Some(LiftResult::Lifted(stats)) => Some(stats.new_parcels),
             _ => None,
@@ -121,14 +130,9 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
             mirror: None,
         };
 
-        // Refused here, before anything is uploaded, unless it is acknowledged; the remote refuses
-        // an unacknowledged creation of a deleted pallet all the same.
-        let lifted = match remote_utils::acknowledged_tombstone(&info, &pallet, &head, recreate) {
-            Ok(tombstone) => remote_utils::lift_pallet(
-                &client, &pallet, &head, remote_head.as_deref(), tombstone.as_deref(), info.chunking, &progress
-            ).await,
-            Err(why) => Err(why),
-        };
+        let lifted = remote_utils::lift_pallet(
+            &client, &pallet, &head, remote_head.as_deref(), tombstone.as_deref(), info.chunking, &progress
+        ).await;
 
         let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
         lift_haul(&client, &info, landed, &mut report.meta_pallets, &mut report.meta_failed).await;
