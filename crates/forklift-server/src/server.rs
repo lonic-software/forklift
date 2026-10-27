@@ -1019,6 +1019,14 @@ fn pallet_moved(current: Option<&str>, expected: Option<&str>) -> HandlerError {
     (StatusCode::CONFLICT, pallet_utils::pallet_moved_refusal(current, expected).into())
 }
 
+/// Whether user pallet `bare` is deleted at `head`: its tombstone holds that head. What a retried
+/// delete whose first try landed finds.
+fn already_deleted(bare: &str, head: &str) -> Result<bool, HandlerError> {
+    let tombstones = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?;
+
+    Ok(tombstones.get(bare).map(String::as_str) == Some(head))
+}
+
 /// [`pallet_moved`], unless the pallet expected at a head is gone because it was deleted here: then
 /// a refusal naming the deletion, since lowering cannot resolve it (a lift after a lower would be
 /// a creation, which the tombstone binds).
@@ -1034,7 +1042,7 @@ fn pallet_moved_or_deleted(namespace: pallet_utils::PalletNamespace,
         Ok(tombstones) => match tombstones.get(bare) {
             Some(head) => (StatusCode::CONFLICT, format!(
                 "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-                history. Lift the work under another name, or ask the remote's operator to drop the \
+                history. Use another name for new work, or ask the remote's operator to drop the \
                 tombstone (\"forklift-server tombstone drop --root <warehouse> {}\"). Nothing was written.",
                 bare, head, bare
             )),
@@ -3035,8 +3043,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
             if current.as_deref() != Some(old_head.as_str()) {
                 // A retried delete whose first try landed (its answer lost) finds the tombstone it
                 // wrote: the pallet is deleted at the head the client read, which is what it asked.
-                if current.is_none()
-                    && forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.get(&bare) == Some(&old_head) {
+                if current.is_none() && already_deleted(&bare, &old_head)? {
                     return Ok(None);
                 }
 
@@ -3084,6 +3091,9 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
             ) {
                 Ok(()) => true,
                 Err(RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved) if attempt < REF_UPDATE_ATTEMPTS => false,
+                // A retry racing the try that landed finds the ref gone under the lock: its
+                // tombstone at the head the client read says it is done.
+                Err(RefUpdateError::Moved(moved)) if moved.found.is_none() && already_deleted(&bare, &old_head)? => return Ok(None),
                 Err(RefUpdateError::Moved(moved)) => return Err(pallet_moved_or_deleted(
                     pallet_utils::PalletNamespace::User, &bare, moved.found.as_deref(), Some(&old_head)
                 )),

@@ -630,7 +630,8 @@ pub enum Command {
         delete: bool,
 
         /// With "--delete": delete even when no other pallet holds the pallet's work. It stays
-        /// recoverable by "forklift undo" only while the delete is in this bay's undo journal
+        /// recoverable by "forklift undo" while the delete is in this bay's undo journal, and in a
+        /// warehouse a server has served by "--restore" while its tombstone stands
         #[arg(long, requires = "delete")]
         force: bool,
 
