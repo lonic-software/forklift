@@ -292,7 +292,7 @@ fn remote_pallet_head<'a>(info: &'a forklift_core::model::remote::WarehouseInfo,
 /// deleted on the remote is refused naming the deletion and its restore instead.
 fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, pallet: &str, next_step: &str) -> CoreError {
     // A deleted pallet's history is still there, under its tombstone: restoring it is the way on.
-    if let Some(head) = info.tombstones.as_ref().and_then(|tombstones| tombstones.get(pallet)) {
+    if let Some(head) = info.tombstone(pallet) {
         return CoreError::refusal(
             RefusalCode::PalletNotFound,
             format!(

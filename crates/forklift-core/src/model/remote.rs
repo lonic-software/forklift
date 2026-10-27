@@ -91,6 +91,11 @@ impl WarehouseInfo {
 
         heads
     }
+
+    /// The head of the tombstone this remote keeps for pallet `name`, if it deleted it.
+    pub fn tombstone(&self, name: &str) -> Option<&String> {
+        self.tombstones.as_ref().and_then(|tombstones| tombstones.get(name))
+    }
 }
 
 /// The trust anchor on the wire (the TOML file's fields as JSON). The re-genesis
@@ -265,8 +270,9 @@ pub struct RefUpdateRequest {
     pub tombstone: Option<String>,
 }
 
-/// The body of `DELETE /v1/pallets/{name}`: the compare-and-set removal of a user pallet's ref,
-/// which leaves a tombstone (see [`WarehouseInfo::tombstones`]).
+/// The query of `DELETE /v1/pallets/{name}` (`?old_head=`; the request has no body, which a proxy
+/// may drop): the compare-and-set removal of a user pallet's ref, which leaves a tombstone (see
+/// [`WarehouseInfo::tombstones`]).
 #[derive(Serialize, Deserialize)]
 pub struct RefDeleteRequest {
     /// The head the remote is expected to have right now. A mismatch is a `409` and nothing

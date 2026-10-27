@@ -379,7 +379,7 @@ async fn delete_remote_pallet(name: &str) -> Result<(), String> {
     let (client, info) = remote_for_deletes(name, "delete").await?;
 
     let Some(head) = info.pallets.get(name) else {
-        return Err(match info.tombstones.as_ref().and_then(|tombstones| tombstones.get(name)) {
+        return Err(match info.tombstone(name) {
             Some(head) => format!("The remote's pallet \"{}\" is already deleted (at {}).", name, head),
             None => format!(
                 "The remote has no pallet \"{}\"; \"forklift palletize --remote\" lists them.", name
@@ -390,7 +390,7 @@ async fn delete_remote_pallet(name: &str) -> Result<(), String> {
     // Read before the delete, so a local read error cannot turn a delete that landed into a failure.
     let local_head = pallet_utils::get_pallet_head(name)?;
 
-    client.delete_ref(name, head).await?;
+    client.delete_ref(name, head).await.map_err(|why| moved_since_read(why, name, "delete"))?;
 
     output::emit(&RemoteDeleted {
         remote: client.url().to_string(),
@@ -440,12 +440,30 @@ impl CommandOutput for RemoteDeleted {
     }
 }
 
+/// A remote's [`error::RefusalCode::RemoteAhead`] answer to a `verb` (delete or restore) of user
+/// pallet `name`, which saw the pallet as the handshake left it: lowering does not help it, while
+/// running it again reads the remote anew. Any other error is passed on as it is.
+fn moved_since_read(why: String, name: &str, verb: &str) -> String {
+    match error::deframe(&why) {
+        Some((code, human, _)) if code == error::RefusalCode::RemoteAhead.as_str() => error::CoreError::refusal(
+            error::RefusalCode::RemoteAhead,
+            format!(
+                "The remote's pallet \"{}\" changed after this command read it ({}); nothing was \
+                changed. Running the {} again acts on what the remote holds now.",
+                name, human.strip_suffix(" Lower and retry.").unwrap_or(human), verb
+            ),
+            format!("forklift palletize --{} {} --remote", verb, name),
+        ).into(),
+        _ => why,
+    }
+}
+
 /// Bring user pallet `name`, deleted on the configured remote, back there at the head its tombstone
 /// holds, acknowledging the deletion. Needs no history here: the remote still holds it.
 async fn restore_remote_pallet(name: &str) -> Result<(), String> {
     let (client, info) = remote_for_deletes(name, "restore").await?;
 
-    let Some(head) = info.tombstones.as_ref().and_then(|tombstones| tombstones.get(name)) else {
+    let Some(head) = info.tombstone(name) else {
         return Err(match info.pallets.contains_key(name) {
             true => format!("The remote's pallet \"{}\" is not deleted; there is nothing to restore.", name),
             false => format!(
@@ -454,7 +472,7 @@ async fn restore_remote_pallet(name: &str) -> Result<(), String> {
         });
     };
 
-    client.update_ref(name, None, head, Some(head)).await?;
+    client.update_ref(name, None, head, Some(head)).await.map_err(|why| moved_since_read(why, name, "restore"))?;
 
     output::emit(&Restored { pallet: name.to_string(), head: head.clone(), remote: Some(client.url().to_string()) });
 
@@ -890,6 +908,19 @@ mod tests {
     thread_local! {
         /// Runs once just after a delete judged its containment, before the removal.
         pub(super) static AFTER_CONTAINMENT: std::cell::Cell<Option<Box<dyn FnOnce()>>> = std::cell::Cell::new(None);
+    }
+
+    #[test]
+    fn a_remote_that_moved_since_the_read_names_running_the_command_again() {
+        let moved: String = pallet_utils::pallet_moved_refusal(Some(&"b".repeat(64)), Some(&"a".repeat(64))).into();
+        let error: crate::output::ForkliftError = moved_since_read(moved, "feat", "delete").into();
+
+        assert_eq!(error.code.as_str(), "remote_ahead");
+        assert_eq!(error.next_step.as_deref(), Some("forklift palletize --delete feat --remote"));
+        assert!(!error.message.contains("Lower and retry"), "{}", error.message);
+
+        let other = moved_since_read("the transport failed".to_string(), "feat", "restore");
+        assert_eq!(other, "the transport failed", "anything else is passed on as it is");
     }
 
     #[test]

@@ -502,7 +502,8 @@ error_codes! {
     /// nothing was adopted.
     HistoryUnverified,
 
-    /// The remote has the pallet only as a tombstone: it was deleted there. Nothing was lifted.
+    /// The remote has the pallet only as a tombstone: it was deleted there. The refused lift, ref
+    /// update or delete wrote nothing there.
     PalletDeletedOnRemote,
 }
 
