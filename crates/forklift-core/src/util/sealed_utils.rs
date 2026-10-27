@@ -21,8 +21,11 @@
 //!
 //! A reader takes no lock. It stops at the first frame that does not validate, which is how a torn
 //! append reads: everything after the last valid frame is ignored. A region of zeros never
-//! validates, because the magic is nonzero. A frame that validates but whose entry does not parse
-//! fails the read, as does a header naming another version: neither is guessed at.
+//! validates, because the magic is nonzero. One append writes one frame, so a torn one leaves at
+//! most a frame's worth of bytes before any trailing zeros; more than that after the last valid
+//! frame is damage inside the log, and fails the read rather than dropping the frames behind it.
+//! A frame that validates but whose entry does not parse fails the read, as does a header naming
+//! another version: neither is guessed at.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -44,6 +47,9 @@ const FRAME_OVERHEAD: usize = 12;
 
 /// The length of an object hash, in bytes.
 const HASH_LEN: usize = 32;
+
+/// The length of every frame this version writes: one operation byte and a hash, framed.
+const FRAME_LEN: usize = FRAME_OVERHEAD + 1 + HASH_LEN;
 
 /// What one frame does to the hash it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,6 +217,18 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
         offset += frame_len;
     }
 
+    // A torn append leaves at most one frame's bytes, then perhaps zeros the filesystem extended
+    // the file with. Anything longer is not a torn tail: the frames behind it would be lost.
+    let unread = &bytes[offset..];
+    let torn = unread.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
+    if torn > FRAME_LEN {
+        return Err(format!(
+            "is damaged at byte {}: {} bytes that are not a valid frame follow it, more than one \
+            interrupted write leaves.",
+            offset, torn
+        ));
+    }
+
     Ok(ParsedSealed { set: SealedSet { hashes }, valid_len: offset })
 }
 
@@ -313,6 +331,26 @@ mod tests {
         let parsed = parse(&bytes).unwrap();
         assert!(parsed.set.contains(A));
         assert!(!parsed.set.contains(B));
+    }
+
+    #[test]
+    fn a_whole_torn_frame_is_still_a_torn_tail() {
+        let mut bytes = record(&[(SealOp::Record, A), (SealOp::Remove, A)]);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        let parsed = parse(&bytes).unwrap();
+        assert!(parsed.set.contains(A), "the torn removal is not replayed");
+    }
+
+    #[test]
+    fn damage_with_frames_behind_it_fails_the_read() {
+        let mut bytes = record(&[(SealOp::Record, A), (SealOp::Record, B), (SealOp::Remove, A)]);
+        let middle = header_bytes().len() + FRAME_LEN + 9;
+        bytes[middle] ^= 0xff;
+
+        let err = parse(&bytes).expect_err("a later removal must not be silently dropped");
+        assert!(err.contains("damaged"), "{}", err);
     }
 
     #[test]

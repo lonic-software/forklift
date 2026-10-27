@@ -138,8 +138,14 @@ A command not listed here either reports only the generic human-message shape `{
             "null"
           ]
         },
+        "held_by_hash": {
+          "description": "How many absent objects the warehouse's sealed record holds by hash alone: each is pinned to\nthe hash a parent that is present commits, but is not on disk, and nothing beneath it was\nchecked. Omitted when none.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "in_scope_content": {
-          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present.",
+          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present, except\nthe absent objects counted in `held_by_hash`.",
           "type": "string"
         },
         "out_of_scope_content": {
