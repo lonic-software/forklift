@@ -458,31 +458,49 @@ fn a_pallet_named_with_a_slash_routes_as_literal_segments() {
 
 /// A tail that is no valid pallet name is refused on every per-pallet route before the ref store
 /// is touched: a `.`, `..`, empty or uppercase component is a 422, and no tail at all matches no
-/// route.
+/// route. The heads are real and `feature/x` and `main` exist, so a tail read as one of them (a
+/// `//` or trailing `/` collapsed, a `..` resolved) would move or delete it.
 #[test]
 fn a_tail_naming_no_valid_pallet_is_refused_on_every_route() {
-    let fixture = Fixture::direct();
-    let hash = "b".repeat(64);
-    let commit = RefUpdateRequest { old_head: None, new_head: hash.clone(), tombstone: None };
-    let request = HoldsRequest { candidates: vec![hash.clone()] };
+    let area = Area::new("invalid-pallet-tail");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    let harvest = harvest(&area.path("wh"));
+    let head = harvest.head_of("main").expect("main has a head");
 
+    let fixture = Fixture::direct();
+    for (hash, bytes) in &harvest.objects {
+        assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
+    }
+    let create = RefUpdateRequest { old_head: None, new_head: head.clone(), tombstone: None };
+    for name in ["feature/x", "main"] {
+        assert_eq!(status(&fixture.call(post_json(&format!("/v1/pallets/{}", name), &create))), 200);
+    }
+
+    let request = HoldsRequest { candidates: vec![head.clone()] };
     for tail in [
         "feature/..", "../main", "..%2Fmain", "feature/./x", "feature/X", "feature//x", "feature/x/", "/main",
     ] {
-        let update = fixture.call(post_json(&format!("/v1/pallets/{}", tail), &commit));
+        let update = fixture.call(post_json(&format!("/v1/pallets/{}", tail), &create));
         assert_eq!(status(&update), 422, "update {}", tail);
         let holds = fixture.call(post_json(&format!("/v1/holds/{}", tail), &request));
         assert_eq!(status(&holds), 422, "holds {}", tail);
-        let removal = fixture.call(delete(&format!("/v1/pallets/{}?old_head={}", tail, hash)));
+        let removal = fixture.call(delete(&format!("/v1/pallets/{}?old_head={}", tail, head)));
         assert_eq!(status(&removal), 422, "delete {}", tail);
     }
 
-    assert_eq!(status(&fixture.call(post_json("/v1/pallets/", &commit))), 404);
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/", &create))), 404);
     assert_eq!(status(&fixture.call(post_json("/v1/holds/", &request))), 404);
-    assert_eq!(status(&fixture.call(delete(&format!("/v1/pallets/?old_head={}", hash)))), 404);
+    assert_eq!(status(&fixture.call(delete(&format!("/v1/pallets/?old_head={}", head)))), 404);
 
     let info: WarehouseInfo = body_json(&fixture.call(get("/v1/warehouse")));
-    assert!(info.pallets.is_empty(), "no ref moved: {:?}", info.pallets);
+    assert_eq!(info.pallets.len(), 2, "no ref moved: {:?}", info.pallets);
+    assert_eq!(info.pallets.get("feature/x"), Some(&head));
+    assert_eq!(info.pallets.get("main"), Some(&head));
+    assert_eq!(info.tombstone("feature/x"), None);
+    assert_eq!(info.tombstone("main"), None);
 }
 
 /// Every captured segment is percent-decoded, not only the pallet name: an object hash sent
