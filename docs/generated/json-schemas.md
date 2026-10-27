@@ -1031,6 +1031,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
           "type": "string"
+        },
+        {
+          "const": "truncated",
+          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer.",
+          "type": "string"
         }
       ]
     }
@@ -1968,6 +1973,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
           "type": "string"
+        },
+        {
+          "const": "truncated",
+          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer.",
+          "type": "string"
         }
       ]
     },
@@ -2213,6 +2223,11 @@ A command not listed here either reports only the generic human-message shape `{
         {
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
+          "type": "string"
+        },
+        {
+          "const": "truncated",
+          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer.",
           "type": "string"
         }
       ]
@@ -4650,6 +4665,11 @@ A command not listed here either reports only the generic human-message shape `{
         {
           "const": "degraded",
           "description": "The remote was too slow to start a batch answer.",
+          "type": "string"
+        },
+        {
+          "const": "truncated",
+          "description": "The remote cut a batch answer short, as it does when the objects asked for are too large\nfor one answer.",
           "type": "string"
         }
       ]

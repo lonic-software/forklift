@@ -23,7 +23,7 @@ use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::store::{
-    CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome,
+    CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome,
     PutOutcome, PutTarget, RefHead, RefListing, RefStore, SignatureOutcome, TrustOutcome,
     TrustWriteOutcome,
 };
@@ -45,6 +45,8 @@ pub struct MemoryObjectStore {
     /// When set, `access`/`put_target` answer with a presigned-style URL under this base
     /// instead of serving bytes directly — the AWS deployment's behaviour.
     redirect_base: Option<String>,
+    /// How long each object read takes, standing in for a slow store.
+    read_delay: Option<std::time::Duration>,
 }
 
 impl MemoryObjectStore {
@@ -57,6 +59,12 @@ impl MemoryObjectStore {
     /// exercise the head's `307` + verify-and-promote branch without S3.
     pub fn with_redirect(base: impl Into<String>) -> MemoryObjectStore {
         MemoryObjectStore { redirect_base: Some(base.into()), ..Default::default() }
+    }
+
+    /// The same store, taking `delay` over every object read — a slow store, for the tests of
+    /// what a head does as its invocation deadline nears.
+    pub fn with_read_delay(self, delay: std::time::Duration) -> MemoryObjectStore {
+        MemoryObjectStore { read_delay: Some(delay), ..self }
     }
 
     /// Seed a *staged* upload, as if the client had `PUT` these bytes to the presigned
@@ -111,6 +119,10 @@ impl ObjectStore for MemoryObjectStore {
 
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         self.reads.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(delay) = self.read_delay {
+            std::thread::sleep(delay);
+        }
 
         Ok(self.objects.lock().unwrap().get(hash).cloned())
     }
@@ -221,17 +233,17 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
-    fn offload_response(&self, bytes: &[u8]) -> Result<Option<String>, String> {
+    fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
         let Some(base) = &self.redirect_base else {
-            return Ok(None);
+            return Ok(OffloadedResponse::Inline(bytes));
         };
 
         // A content-addressed *response* key, deliberately outside the `objects/` namespace.
-        let key = object_utils::hash_object_bytes(bytes);
+        let key = object_utils::hash_object_bytes(&bytes);
 
-        self.responses.lock().unwrap().insert(key.clone(), bytes.to_vec());
+        self.responses.lock().unwrap().insert(key.clone(), bytes);
 
-        Ok(Some(format!("{}/responses/{}", base, key)))
+        Ok(OffloadedResponse::Url(format!("{}/responses/{}", base, key)))
     }
 }
 

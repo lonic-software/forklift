@@ -43,6 +43,19 @@ pub const LIFT_COMMIT_HEADER: &str = "forklift-commit";
 /// promises only that the copy exists, not that it will ever be promoted.
 pub const LIFT_COMMIT_NOT_READY: &str = "not-ready";
 
+/// The response header a head sets, with the value [`BATCH_TRUNCATED`], on its answer to
+/// `POST /v1/objects/batch` (the `200` with the bundle, or the `303` to it) when it stopped before
+/// every requested object it holds was in the bundle — to bound its memory or its time. The
+/// objects it did send are a valid answer and are imported; the header tells the client not to
+/// ask for more batches from this remote in this command, since the next one would be cut short
+/// too, and to fetch the rest one object at a time. An answer that is short only because the
+/// remote lacks objects carries no header. Header names are case-insensitive; this is the
+/// lower-case form.
+pub const BATCH_HEADER: &str = "forklift-batch";
+
+/// The value of [`BATCH_HEADER`] meaning "this batch answer was cut short".
+pub const BATCH_TRUNCATED: &str = "truncated";
+
 /// The `GET /v1/warehouse` handshake: protocol version, refs and trust in one round trip.
 #[derive(Serialize, Deserialize)]
 pub struct WarehouseInfo {

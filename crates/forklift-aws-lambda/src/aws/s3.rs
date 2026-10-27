@@ -113,7 +113,9 @@ use crate::aws::sdk::{
     describe, http_status, is_head_object_not_found, is_no_such_key, is_precondition_failed,
 };
 use crate::blocking::AsyncBridge;
-use crate::store::{ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, SignatureOutcome};
+use crate::store::{
+    ObjectAccess, ObjectStore, OffloadedResponse, PromoteOutcome, PutOutcome, PutTarget, SignatureOutcome,
+};
 
 /// How long a presigned URL is valid. Short and constant, the same for a read and a staged
 /// write: long enough for a client to upload or download one object over a slow link, short
@@ -800,17 +802,17 @@ impl ObjectStore for S3ObjectStore {
         })
     }
 
-    fn offload_response(&self, bytes: &[u8]) -> Result<Option<String>, String> {
+    fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
         // A content-addressed key in the ephemeral response prefix — never an object. Two
         // identical bundles land on the same key, so the write is an idempotent overwrite.
-        let key = response_key(&object_utils::hash_object_bytes(bytes));
+        let key = response_key(&object_utils::hash_object_bytes(&bytes));
 
         self.bridge.block_on(async {
-            self.put_overwrite(&key, bytes.to_vec()).await?;
+            self.put_overwrite(&key, bytes).await?;
 
             let url = self.presign_get(&key).await?;
 
-            Ok(Some(url))
+            Ok(OffloadedResponse::Url(url))
         })
     }
 }

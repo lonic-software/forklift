@@ -87,6 +87,15 @@ pub enum PutTarget {
     SessionRequired,
 }
 
+/// Where a large response body went (see [`ObjectStore::offload_response`]).
+#[derive(Debug)]
+pub enum OffloadedResponse {
+    /// Parked in storage; the client fetches it from this presigned `GET`.
+    Url(String),
+    /// Not parked: the head serves these bytes itself.
+    Inline(Vec<u8>),
+}
+
 /// The outcome of verifying a staged object and promoting it to its canonical hash key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromoteOutcome {
@@ -431,14 +440,18 @@ pub trait ObjectStore {
 
     /// Park a large *response* body (a `batch` bundle) in storage and return a presigned
     /// `GET` for it, so the bytes never travel through the control plane — which on Lambda
-    /// cannot return more than a few megabytes anyway. `None` means "serve it inline"
-    /// (the self-host / fake behaviour).
+    /// cannot return more than a few megabytes anyway. [`OffloadedResponse::Inline`] hands the
+    /// bytes back to be served inline (the self-host / fake behaviour).
+    ///
+    /// The body is taken by value so a store that uploads it moves it into the upload rather
+    /// than copying it: a bundle is the largest thing the control plane holds, and a second copy
+    /// of it is what overruns the function's memory first.
     ///
     /// The bytes land under an ephemeral, content-addressed prefix that is *not* the
     /// canonical object namespace, so nothing here is reachable as an object at a hash key
     /// and invariant 1 is not in play. Clients verify bundle records on import regardless.
-    fn offload_response(&self, _bytes: &[u8]) -> Result<Option<String>, String> {
-        Ok(None)
+    fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
+        Ok(OffloadedResponse::Inline(bytes))
     }
 }
 

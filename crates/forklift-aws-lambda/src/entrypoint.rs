@@ -52,7 +52,8 @@ use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, HoldsRequest, HoldsResponse, MissingObjectsRequest,
     MissingObjectsResponse, RefUpdateRequest,
     ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
-    MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
+    MAX_UPLOAD_TARGETS_BATCH, distinct_resolve_identifiers, BATCH_HEADER, BATCH_TRUNCATED,
+    LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
 use forklift_core::util::authority_utils::Principal;
 use forklift_core::util::object_utils::is_object_hash;
@@ -62,7 +63,7 @@ use forklift_core::util::warehouse_utils;
 
 use crate::aws::AwsConfig;
 use crate::error::{HeadError, HeadResult};
-use crate::head::{BatchResult, Head, ObjectReadResult, ObjectWriteResult, TrustResult};
+use crate::head::{BatchDelivery, Head, ObjectReadResult, ObjectWriteResult, TrustResult};
 use crate::store::{ObjectStore, RefStore, SignatureOutcome};
 
 /// How the deployment addresses warehouses, the serverless twin of `forklift-server`'s
@@ -764,14 +765,24 @@ where
 
         Route::Batch => {
             let request: MissingObjectsRequest = parse_json(&body)?;
-            match head.batch(&request.hashes)? {
+            let answer = head.batch(&request.hashes)?;
+            let mut response = match answer.delivery {
                 // A bundle is already a zstd stream; mark it `identity` so nothing re-wraps it.
-                BatchResult::Bundle(bundle) => Ok(octet_stream(StatusCode::OK, bundle, true)),
+                BatchDelivery::Bundle(bundle) => octet_stream(StatusCode::OK, bundle, true),
                 // `303`, not `307`/`308`: the redirect target is a presigned `GET`, but this
                 // request was a `POST` — the client must switch methods, not replay it (see
                 // `redirect`'s doc comment).
-                BatchResult::Redirect(url) => Ok(redirect(&url, StatusCode::SEE_OTHER)),
+                BatchDelivery::Redirect(url) => redirect(&url, StatusCode::SEE_OTHER),
+            };
+            // On the answer to the `POST` itself, not on the bundle: a redirected client reads it
+            // here before it follows the `Location`.
+            if answer.truncated {
+                response.headers_mut().insert(
+                    BATCH_HEADER,
+                    header::HeaderValue::from_static(BATCH_TRUNCATED),
+                );
             }
+            Ok(response)
         }
 
         Route::ObjectGet(hash) => match head.object_get(&hash)? {
