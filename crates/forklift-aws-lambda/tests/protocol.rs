@@ -3849,7 +3849,7 @@ impl DeleteRace {
 impl RefStore for RacesTheDelete {
     fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
         match &self.race {
-            DeleteRace::TransientThenUnreadable(_, attempted) if attempted.get() => Err("throttled".to_string()),
+            DeleteRace::TransientThenUnreadable(_, attempted) if attempted.get() => Err("throttled.".to_string()),
             _ => self.inner.get_head(namespace, name),
         }
     }
@@ -4024,11 +4024,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
         let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the ref cannot be read");
         assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
         assert!(err.message.contains(says), "{}", err.message);
-        let next = match cause {
-            TransientCause::Contended => "Run the delete again.",
-            _ => "before deleting it again",
-        };
-        assert!(err.message.contains(next), "{}", err.message);
+        assert!(err.message.contains("Check the pallet's remote head"), "{}", err.message);
         assert!(err.message.contains("(throttled). "), "the read's own fault is named: {}", err.message);
     }
 

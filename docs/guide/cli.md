@@ -1180,7 +1180,10 @@ only through a restore or a re-creation from its history. It runs no hooks, so i
 `pallet_deleted` event. With `--json` the delete reports `remote`, `pallet`, `head`, `local_head`
 and `already`, and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has
 already deleted (as a rerun after a lost answer finds it) reports it done with `already` set, and
-sends nothing.
+sends nothing. A rerun deletes the pallet at the head the remote then holds, so after a lost answer
+check that head first (`palletize --remote --json`): the pallet may have moved, or been deleted and
+created again, meanwhile. A serverless remote whose storage could not settle a delete says so with a
+`503` that tells you the same.
 
 A pallet deleted on the remote is not lowered or lifted as if it had never existed.
 `lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming

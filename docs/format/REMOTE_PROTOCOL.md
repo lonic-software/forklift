@@ -442,8 +442,8 @@ more: a `503` when its storage stayed busy through every attempt it could afford
 may have landed and could not be confirmed. Either claims nothing about the pallet, and nothing
 in the status or headers tells them apart, so a client treats both as possibly landed: it reads
 the pallet's state before deleting again rather than deleting whatever head it finds then. The
-identical request may be sent again; it is answered from the state at that time, after the
-checks above — `200` from a tombstone still at `old_head` once it passes the authority check.
+identical request may be sent again; it is answered from the state at that time — `200` from a
+tombstone still at `old_head` once it passes checks 1 and 2.
 
 ### `POST /v1/pallets/{name}/holds` (additive)
 
