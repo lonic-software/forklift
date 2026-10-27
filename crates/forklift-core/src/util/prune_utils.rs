@@ -119,9 +119,9 @@ pub struct PruneStats {
 /// * `pruned_prefixes` - The warehouse path keys being pruned (each a current fetch-scope
 ///   prefix, validated by the caller).
 /// * `post_prune`      - The warehouse fetch scope that will remain after the prune.
-/// * `remote_heads`    - The remote's pallet heads, from a handshake whose trust was checked.
-///   History they reach is what the remote holds; every other parcel keeps its content under
-///   the pruned path (see [`retain_unlifted`]).
+/// * `remote_heads`    - The remote's pallet heads, from a handshake whose trust was checked, and
+///   the recorded heads it confirmed it still holds. History they reach is what the remote holds;
+///   every other parcel keeps its content under the pruned path (see [`retain_unlifted`]).
 /// * `removed_heads`   - The heads of pallets deleted here whose delete can still be undone
 ///   (`journal_utils::removed_heads`). They join the local pallet heads, never `remote_heads`:
 ///   their unlifted history may be the only copy.
@@ -275,7 +275,7 @@ fn with_held<'a>(live_parcels: &[String], held: impl Iterator<Item = &'a String>
 ///
 /// # Arguments
 /// * `user_parcels` - The parcels the user pallet heads reach.
-/// * `remote_heads` - The remote's pallet heads.
+/// * `remote_heads` - The remote's pallet heads, and the recorded heads it confirmed.
 fn unlifted_parcels(user_parcels: &[String], remote_heads: &[String]) -> Result<HashSet<String>, String> {
     let user: HashSet<&String> = user_parcels.iter().collect();
     let mut on_remote: HashSet<String> = HashSet::new();

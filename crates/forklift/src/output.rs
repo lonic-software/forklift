@@ -938,12 +938,12 @@ pub fn warn_holds_unanswered(pallet: &str, error: &str) {
 
 /// The pure half of [`warn_holds_unanswered`], asserted in both modes without capturing stderr.
 fn holds_unanswered_warning_text(mode: OutputMode, pallet: &str, error: &str) -> String {
-    let next_step = "History only those heads reach was kept. A lower of the pallet frees what the \
-        remote's current head reaches; if the remote was busy or out of time, running the prune again \
-        may free more.";
+    let next_step = "History only the unconfirmed heads reach was kept. Lowering that pallet (shift to \
+        it first) lets a later prune free what the remote's current head reaches; if the remote was \
+        busy or out of time, running the prune again may free more.";
     match mode {
         OutputMode::Human => format!(
-            "Warning: the remote did not say whether it still holds the earlier heads of pallet \"{}\". {} {}",
+            "Warning: recorded heads of pallet \"{}\" were not confirmed by the remote. {} {}",
             forklift_core::error::sanitize(pallet), forklift_core::error::sanitize_lines(error), next_step
         ),
         OutputMode::Json => warning_envelope(CODE_HOLDS_UNANSWERED, error, next_step,
