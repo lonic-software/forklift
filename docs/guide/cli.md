@@ -610,7 +610,9 @@ In a warehouse that `forklift-server` has served, it refuses to undo a `stack`, 
 `cherry-pick` that moved a pallet, keeping the entry: the remote's clones may already rely on the
 parcel it would take off, and with no ref holding it the server's `gc` could free their only copy
 (the wire is fast-forward-only for the same reason). Take a change out there by stacking a parcel
-that reverts it. Undoing a delete or a `shift` is unaffected. Working-tree
+that reverts it. An older entry stays out of `undo`'s reach behind it: a pallet deleted before
+it comes back with `forklift palletize --restore <name>`. Undoing a delete or a `shift` is
+unaffected. Working-tree
 commands in between — `load`, `remove`, `park` — change none of that and do not block it:
 after a `park`, `undo` soft-resets beneath the parked work. `park pop` then re-applies it,
 unless the parked work touches a path the undone parcel changed — it refuses that until the

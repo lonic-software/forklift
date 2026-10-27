@@ -866,7 +866,8 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
             "Undoing \"{}\" would move pallet \"{}\" back off the head that operation left, and \
             this warehouse has been served, so its clones may rely on that head. Nothing was undone, \
             and undo cannot reach an older operation past this one. To take the change out, stack a \
-            parcel that reverts it.",
+            parcel that reverts it; a pallet deleted before it comes back with \
+            \"forklift palletize --restore <name>\".",
             entry.op, crate::error::sanitize(&reference.name)
         ));
     }
