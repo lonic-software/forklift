@@ -169,8 +169,9 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// allowed to differ here the way they already differ on an unreadable bay
 /// (`bay_utils::BayReadPolicy`).
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
-    // Pallet heads (both namespaces), haul heads, the git mirror's roots, bay-scoped parcel roots,
-    // trust-pin roots and staged shard leaves: the sources this function shares, hash for hash, with
+    // Pallet heads (both namespaces), haul heads, tombstone heads, the git mirror's roots, bay-scoped
+    // parcel roots, trust-pin roots and staged shard leaves: the sources this function shares, hash
+    // for hash, with
     // `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`, so the two
     // cannot drift apart (see that function's doc comment, and `collect_walk_roots`' for the
     // superset invariant this list must stay a subset of). GC does

@@ -1333,8 +1333,8 @@ pub(crate) fn update_pallet_head_locked(
 /// warehouse, since nothing would root its head.
 ///
 /// Under the [`RefLock`](crate::util::lock_utils::RefLock), in this order: the ref's own compare,
-/// the `preconditions`, the fetched-heads ledger (a sparse warehouse records the removed head,
-/// which this ref no longer reaches, so `expand` walks it), the served mark, read fail-closed,
+/// the `preconditions`, the served mark, read fail-closed, the fetched-heads ledger (a sparse
+/// warehouse records the removed head, which this ref no longer reaches, so `expand` walks it),
 /// then the tombstone (in a served warehouse, replacing any the name had) and `journal` appended
 /// to the bay's undo journal, each durably, before the ref file is unlinked. The unlink and every
 /// folder a nested name leaves empty are synced through the durability taint, so what is visible
@@ -1418,11 +1418,22 @@ pub fn remove_pallet_head_in(
     require_head(namespace, name, Some(expected))?;
     check_preconditions(&lock, preconditions)?;
 
+    // Read before anything is written, so the refusal below leaves the ledger as it was.
+    let served = crate::util::tombstone_utils::is_served()?;
+
+    if !served && journal.is_none() {
+        return Err(RefUpdateError::Failed(format!(
+            "Refusing to remove pallet \"{}\": this warehouse has never been served, so it keeps no \
+            tombstones, and a removal no bay can undo would leave its head held by nothing.",
+            wire
+        )));
+    }
+
     if sparse {
         crate::util::fetch_ledger::record_fetch(&lock, expected, name)?;
     }
 
-    let tombstones_before = match crate::util::tombstone_utils::is_served()? {
+    let tombstones_before = match served {
         true => {
             let read = crate::util::tombstone_utils::read_tombstones()?;
             let mut tombstones = read.clone();
@@ -1431,11 +1442,6 @@ pub fn remove_pallet_head_in(
 
             Some(read)
         }
-        false if journal.is_none() => return Err(RefUpdateError::Failed(format!(
-            "Refusing to remove pallet \"{}\": this warehouse has never been served, so it keeps no \
-            tombstones, and a removal no bay can undo would leave its head held by nothing.",
-            wire
-        ))),
         false => None,
     };
 
@@ -2911,6 +2917,10 @@ pub(crate) mod tests {
         assert!(crate::util::fetch_ledger::read_ledger().unwrap().is_empty(), "a full warehouse keeps no ledger");
 
         crate::util::scope_utils::set_fetch_scope(&crate::util::scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
+        // A removal refused for want of anything to root its head writes nothing first.
+        remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, None).unwrap_err();
+        assert!(crate::util::fetch_ledger::read_ledger().unwrap().is_empty(), "a refused removal records nothing");
+
         remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, Some(&deleting("sparse", &hash('b')))).unwrap();
 
         let ledger = crate::util::fetch_ledger::read_ledger().unwrap();

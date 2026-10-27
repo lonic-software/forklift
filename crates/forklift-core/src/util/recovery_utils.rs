@@ -1429,8 +1429,8 @@ struct WalkRoots {
     /// head never fetched from one held here and then lost to damage: both read as absent.
     haul_heads: Vec<String>,
     /// The head every tombstone of a served root holds ([`GcRootSources::tombstone_heads`]), walked
-    /// like [`Self::haul_heads`]: heal reads past damage, and a tombstone's head lost to it reads as
-    /// a gap, never a dangling reference.
+    /// like [`Self::parcels`]: it was a ref of this warehouse, which held its whole history (a
+    /// served root is never sparse), so a parcel missing under it is reported, never read as a gap.
     tombstone_heads: Vec<String>,
     /// The parcels the git mirror's roots record names ([`GcRootSources::mirror_roots`]), walked
     /// like [`Self::haul_heads`]: the record keeps history the remote can serve again, so a parcel
@@ -2138,8 +2138,11 @@ fn walk_closure_for(
     let mut queue: VecDeque<(String, AbsencePolicy)> = roots.parcels.iter()
         .cloned()
         .map(|hash| (hash, AbsencePolicy::Report))
+        // A tombstone head was a ref of this warehouse, whose history it held whole (a served root
+        // is never sparse), so a parcel missing under it is lost, as under a pallet head.
+        .chain(roots.tombstone_heads.iter().map(|hash| (hash.clone(), AbsencePolicy::Report)))
         .chain(roots.pin_parcels.iter().map(|(hash, policy)| (hash.clone(), AbsencePolicy::from(*policy))))
-        .chain(roots.haul_heads.iter().chain(&roots.tombstone_heads).chain(&roots.mirror_roots).map(|hash| (hash.clone(), AbsencePolicy::Gap)))
+        .chain(roots.haul_heads.iter().chain(&roots.mirror_roots).map(|hash| (hash.clone(), AbsencePolicy::Gap)))
         .collect();
 
     drain_parcel_queue(
@@ -4888,6 +4891,44 @@ mod tests {
             walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// FORK-255: a tombstone head was a ref of this served root, which held its whole history, so
+    /// one lost to damage is reported, as a pallet head is. Mutation: queue `roots.tombstone_heads`
+    /// with `AbsencePolicy::Gap` in `walk_closure_for` → nothing reaches the sink → red.
+    #[test]
+    fn an_absent_tombstone_head_is_reported_never_a_gap() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-tombstone-heads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+
+        let lost = "c".repeat(64);
+        let roots = WalkRoots {
+            parcels: Vec::new(),
+            tag_subjects: Vec::new(),
+            tags_unread: None,
+            pin_parcels: Vec::new(),
+            haul_heads: Vec::new(),
+            tombstone_heads: vec![lost.clone()],
+            mirror_roots: Vec::new(),
+            shard_referenced: Vec::new(),
+            degraded_sources: Vec::new(),
+        };
+        let mut reported: Vec<String> = Vec::new();
+        {
+            let mut sink = |hash: &str| reported.push(hash.to_string());
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&mut sink)).unwrap();
+        }
+        assert_eq!(reported, vec![lost]);
 
         std::fs::remove_dir_all(&root).ok();
     }
