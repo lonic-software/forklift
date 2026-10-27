@@ -5850,7 +5850,11 @@ pub fn acknowledged_tombstone(info: &WarehouseInfo,
         return Ok(Some(head.clone()));
     }
 
-    let drop = format!("\"forklift palletize --delete {}\" drops the local pallet instead.", pallet);
+    let drop = format!(
+        "To drop the local pallet instead, shift to another pallet and run \"forklift palletize \
+        --delete {}\".",
+        pallet
+    );
     let (message, next_step) = match descends {
         true => (format!(
             "The remote's pallet \"{}\" was deleted at {}, and the name stays reserved for that \
@@ -5921,7 +5925,9 @@ async fn lift_pallet_inner(client: &RemoteClient,
     }
 
     let (new_parcels, uploaded_objects, uploaded_signatures) =
-        upload_history(client, local_head, remote_head, chunking_supported, progress).await?;
+        // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
+        // uploads only the work past it.
+        upload_history(client, local_head, remote_head.or(tombstone), chunking_supported, progress).await?;
 
     client.update_ref(pallet, remote_head, local_head, tombstone).await?;
 

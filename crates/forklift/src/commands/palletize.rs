@@ -44,10 +44,8 @@ pub async fn handle_command(name: Option<String>,
     match name {
         Some(name) if delete && remote => delete_remote_pallet(&name).await,
         Some(name) if restore && remote => restore_remote_pallet(&name).await,
-        Some(_) if remote => Err(
-            "\"--remote\" with a pallet name needs \"--delete\" or \"--restore\"; without a name, \
-            \"forklift palletize --remote\" lists the remote's pallets.".to_string()
-        ),
+        // Refused at parse time (`cross_argument_error`); never a local creation.
+        Some(_) if remote => Err("\"--remote\" with a pallet name needs \"--delete\" or \"--restore\".".to_string()),
         Some(name) if delete => delete_pallet(&name, force).await,
         Some(name) if restore => restore_pallet(&name),
         Some(name) => create_pallet(&name, revision.as_deref()).await,
@@ -389,13 +387,16 @@ async fn delete_remote_pallet(name: &str) -> Result<(), String> {
         });
     };
 
+    // Read before the delete, so a local read error cannot turn a delete that landed into a failure.
+    let local_head = pallet_utils::get_pallet_head(name)?;
+
     client.delete_ref(name, head).await?;
 
     output::emit(&RemoteDeleted {
         remote: client.url().to_string(),
         pallet: name.to_string(),
         head: head.clone(),
-        local_head: pallet_utils::get_pallet_head(name)?,
+        local_head,
     });
 
     Ok(())
