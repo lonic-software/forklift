@@ -253,8 +253,8 @@ body inline), but a staging head answers `422` without one, because bytes staged
 session could never be promoted.
 
 A session id is one or more ASCII letters, digits and `-` (the client sends a hyphenated UUID),
-wherever it appears: this query, the `upload-targets` body and the commit path. A staging head
-refuses any other id with `422`, since a `/` would place that session's staging keys under
+wherever it appears: this query, the `upload-targets` body and the commit path. A head that reads
+the session (the serverless head, whatever its store) refuses any other id with `422`, since a `/` would place that session's staging keys under
 another session's prefix.
 
 ### `GET /v1/signatures/{hash}` · `PUT /v1/signatures/{hash}`
