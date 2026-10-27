@@ -163,8 +163,8 @@ pub async fn confirmed_heads(client: &RemoteClient, remote_pallets: &BTreeMap<St
                 let unsure = undecided(&candidates, &answers);
                 if unsure > 0 {
                     confirmation.unanswered.push((pallet, format!(
-                        "The remote could not tell whether it still holds {} of the pallet's recorded \
-                        head(s): it was busy, or the check ran out of time.", unsure
+                        "The remote did not say whether it still holds {} of the pallet's recorded \
+                        head(s): it answered unknown (busy, or out of time) or left them out.", unsure
                     )));
                 }
             }

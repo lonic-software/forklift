@@ -1737,11 +1737,11 @@ A head the remote does not confirm frees nothing: one an `undo` on the server mo
 one of a pallet deleted and re-created there. When the remote cannot answer (a server too old to
 know the check, or one too busy to finish it), the prune prints a `holds_unanswered` warning
 naming the pallet and frees only what the remote's current heads allow; a `lower` of that pallet
-frees the rest. A `lift`, `lower` or `franchise` that cannot write the record prints a
-`held_head_unrecorded` warning and keeps its result and exit code. A record that does not parse
-makes a prune refuse,
-changing nothing; it can be removed, since it only names heads to ask the remote about, and the
-next `lift`, `lower` or `franchise` starts a new one.
+lets a later prune free what the remote's current head reaches. A `lift`, `lower` or `franchise`
+that cannot write the record prints a `held_head_unrecorded` warning and keeps its result and exit
+code. A record that does not parse makes a prune refuse, changing nothing; it can be removed,
+since it only names heads to ask the remote about, and the next `lift`, `lower` or `franchise`
+starts a new one.
 
 ---
 
