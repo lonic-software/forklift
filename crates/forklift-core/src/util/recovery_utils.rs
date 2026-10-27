@@ -1102,7 +1102,8 @@ fn rescan_torn_taint(
 
     // A degraded source (see `collect_walk_roots`'s own doc comment) — a bay whose parked
     // parcels or in-progress consolidation could not be read, or the office record backing the
-    // revoked-key distrust-boundary pins — narrows this enumeration's root set, so an object
+    // revoked-key distrust-boundary pins; or the fetch scope or sealed-object record, which
+    // decide what the walk may leave out — narrows this enumeration's root set, so an object
     // referenced only through that one source is invisible to it — it would simply never appear
     // in `referenced_absent`, never enter `remainder`, and (unlike the ordinary, non-torn
     // pipeline's per-candidate `roots_incomplete` fallback in `resolve_the_rest`) there is no
@@ -1892,8 +1893,8 @@ fn walk_shard_data_files_below(inventory_root: &Path, folder: &Path, found: &mut
 
 /// A closure walk's result, paired with any source [`collect_walk_roots`] had to skip this run
 /// rather than abort on — see that function's own doc comment on its `Tolerate` policies.
-/// `degraded_sources` is empty unless at least one bay's state, or the office record, was
-/// unreadable; when it is not empty, `hashes` is only as complete as what every *readable* source
+/// `degraded_sources` is empty unless at least one bay's state, the office record, the fetch scope
+/// or the sealed-object record was unreadable; when it is not empty, `hashes` is only as complete as what every *readable* source
 /// could contribute — never a reason to treat `hashes` itself as wrong, only as conservative.
 pub(crate) struct ClosureWalkResult {
     /// [`closure_references_any`]: the subset of its `targets` actually found referenced.
@@ -2448,8 +2449,8 @@ fn walk_tree(
         if !visited_trees.first_visit(&tree_hash, spine_path.as_deref()) {
             continue;
         }
-        // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a sealed subtree
-        // boundary in a sparse/shallow warehouse is legitimately absent, or already known corrupt
+        // Presence-tolerant (I3), plus the §8.3 corrupt-boundary carve-out: a subtree boundary
+        // never fetched in a sparse/shallow warehouse is legitimately absent, or already known corrupt
         // by the caller (`corrupt` — step 1's hash-verify found this exact hash present but
         // wrong) — either way, record it (if a sink is listening, and unless the sealed record
         // holds the absent hash by hash alone; a corrupt one it never holds) and stop; nothing
@@ -2871,8 +2872,9 @@ fn rescan_failure_refusal(root: &Path, error: &str) -> CoreError {
 }
 
 /// The store-wide rescan ran and restaged whatever it legitimately could, but at least one
-/// source of durable references (a bay's saved state, or the office record), or a node the walk
-/// could not descend (FORK-217), could not be read, so step 2's enumeration cannot be trusted to have found every reference — see
+/// source the walk needs (a bay's saved state, the office record, the fetch scope or the
+/// sealed-object record), or a node the walk could not descend (FORK-217), could not be read, so
+/// step 2's enumeration cannot be trusted to have found every reference — see
 /// [`rescan_torn_taint`]'s own comment at its degraded-source guard for the full reasoning. The
 /// torn record is left completely untouched, distinct from [`rescan_failure_refusal`] (an
 /// operational failure of the rescan's own machinery) even though both leave the record standing
@@ -2889,11 +2891,11 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), restaged_count,
             degraded.join(" "),
         ),
-        "Fix what is named above (a pack index: restore its pack files from a good copy, move an \
-        index that does not parse out of the pack folder only if it holds nothing this warehouse \
-        needs, or re-create the warehouse for one of another format version; the sealed-object \
-        record: make it readable again, restoring it from a good copy or, if another version of \
-        Forklift wrote it, using that version), then run \
+        "Fix what is named above (for a pack index, for example: restore its pack files from a \
+        good copy, move an index that does not parse out of the pack folder only if it holds \
+        nothing this warehouse needs, or re-create the warehouse for one of another format \
+        version; for the sealed-object record: make it readable again, restoring it from a good \
+        copy or, if another version of Forklift wrote it, using that version), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )

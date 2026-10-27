@@ -315,7 +315,9 @@ fn unlifted_parcels(user_parcels: &[String], remote_heads: &[String]) -> Result<
 /// Presence-tolerant like [`retain_local_closure`]: an absent object, parcel or base has nothing
 /// left to keep. An absent base explains nothing, so more is kept, never less. A path that runs
 /// through a tree held by hash alone ([`resolve_unsealed_subtree`]) keeps nothing either: the
-/// remote holds that tree and everything beneath it.
+/// remote holds that tree and everything beneath it. There this walk departs from the lift's,
+/// which loads every tree on the path and so cannot yet run past a held one; nothing the prune
+/// frees would let it.
 ///
 /// # Arguments
 /// * `unlifted`        - The parcels from [`unlifted_parcels`].
