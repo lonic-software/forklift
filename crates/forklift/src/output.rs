@@ -230,6 +230,11 @@ pub fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// `skip_serializing_if` predicate for a count that is written only when nonzero.
+pub fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// Render a byte count in a human-friendly binary unit (B/KiB/MiB/GiB/TiB). The object store's
 /// scale makes raw byte counts noise, so the size-reporting commands (`compact`, `store`) show
 /// this instead. JSON output always carries the exact byte count, never this string.

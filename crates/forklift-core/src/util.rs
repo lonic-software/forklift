@@ -44,6 +44,7 @@ pub mod operation_utils;
 pub mod franchise_utils;
 pub mod marker_utils;
 pub mod record_utils;
+pub mod sealed_utils;
 pub mod taint_utils;
 pub mod heal_utils;
 pub mod recovery_utils;

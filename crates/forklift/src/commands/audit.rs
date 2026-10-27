@@ -1,5 +1,6 @@
 use serde::Serialize;
-use forklift_core::util::{audit_utils, office_utils, pallet_utils, scope_utils};
+use forklift_core::util::{audit_utils, office_utils, pallet_utils, scope_utils, sealed_utils};
+use forklift_core::util::audit_utils::SealedTolerance;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use crate::output::{self, CommandOutput};
 
@@ -77,15 +78,20 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         // never read as a full-clone pass. A full store keeps today's signature-only audit
         // unchanged — unless `--full` is asked, which re-reads every present chunk and re-verifies
         // each chunked file's content hash even on a full clone. Object presence is a warehouse
-        // property, so the fetch scope is the seam either way.
+        // property, so the fetch scope is the seam either way. Whenever the content audit runs, it
+        // counts and reports what the sealed record held by hash alone; a signature-only pass makes
+        // no content claim, so it has nothing of that kind to report.
         let fetch_scope = scope_utils::read_fetch_scope()?;
         let is_sparse = !fetch_scope.is_full();
 
         if is_sparse || full {
-            audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full)?;
+            let record = sealed_utils::read_sealed()?;
+            let sealed = SealedTolerance::new(&record);
+            audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full, Some(&sealed))?;
             report.scope = Some(AuditScope::new(
                 is_sparse.then(|| fetch_scope.prefixes().to_vec()),
                 full,
+                sealed.held(),
             ));
         }
     }
@@ -147,12 +153,19 @@ pub(crate) struct AuditScope {
     /// scope (parcels and their sidecars are always fully present).
     signatures: &'static str,
 
-    /// In-scope content: every tree was re-hashed on read and every blob confirmed present.
+    /// In-scope content: every tree was re-hashed on read and every blob confirmed present, except
+    /// the absent objects counted in `held_by_hash`.
     in_scope_content: &'static str,
 
+    /// How many absent objects the warehouse's sealed record holds by hash alone: each is pinned to
+    /// the hash a parent that is present commits, but is not on disk, and nothing beneath it was
+    /// checked. Omitted when none.
+    #[serde(skip_serializing_if = "crate::output::is_zero")]
+    held_by_hash: usize,
+
     /// How a chunked file's chunks were checked: `presence-checked` in a normal audit (bounded, no
-    /// bytes re-read), or, under `--full`, re-read and re-hashed with each file re-assembled to
-    /// verify its recipe's content hash.
+    /// bytes re-read), or, under `--full`, re-read and re-hashed with each fully-present file
+    /// re-assembled to verify its recipe's content hash.
     chunks: &'static str,
 
     /// Out-of-scope content: sealed by the hash a signed parcel commits (unforgeable), verified
@@ -170,15 +183,17 @@ impl AuditScope {
     /// * `fetch_scope` - `Some(prefixes)` on a sparse warehouse (the sealed boundary), `None` on a
     ///   full clone.
     /// * `full`        - Whether `--full` re-read and re-verified chunks (vs. presence-checked).
-    fn new(fetch_scope: Option<Vec<String>>, full: bool) -> AuditScope {
+    /// * `held`        - How many absent objects the sealed record held by hash alone.
+    fn new(fetch_scope: Option<Vec<String>>, full: bool, held: usize) -> AuditScope {
         let sparse = fetch_scope.is_some();
 
         AuditScope {
             fetch_scope,
             signatures: "verified",
             in_scope_content: "verified",
+            held_by_hash: held,
             chunks: if full {
-                "re-read and re-hashed; each chunked file re-assembled to verify its content hash"
+                "re-read and re-hashed; each fully-present chunked file re-assembled to verify its content hash"
             } else {
                 "presence-checked"
             },
@@ -228,12 +243,26 @@ impl CommandOutput for AuditReport {
             );
             println!(
                 "Signatures are verified in full; within the fetched scope every tree was \
-                re-hashed and every blob and chunk confirmed present."
+                re-hashed and every blob and chunk confirmed present{}.",
+                if self.scope.as_ref().is_some_and(|scope| scope.held_by_hash > 0) {
+                    ", except those held by hash below"
+                } else {
+                    ""
+                }
             );
             println!(
                 "Out-of-scope content is pinned to the hash a signed parcel commits — it cannot \
                 be forged or substituted, only fetched. The boundary is advisory, not enforced \
                 by the remote."
+            );
+        }
+
+        // Whatever the store's scope, objects held by hash alone are never passed over in silence.
+        if let Some(AuditScope { held_by_hash: held @ 1.., .. }) = &self.scope {
+            println!(
+                "{} absent object(s) are held by hash alone: each is pinned to the hash a parent \
+                that is present commits, but is not on disk, and nothing beneath it was checked.",
+                held
             );
         }
     }
