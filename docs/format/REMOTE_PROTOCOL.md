@@ -220,8 +220,10 @@ client keeps using the endpoint. A value other than `truncated` is no mark.
 
 The serverless head stops once its bundle holds 32 MiB of object data, or when its invocation is
 within 10 s of its deadline, so one answer carries at most 32 MiB plus one object. The byte
-budget never stops an answer that carries nothing, so an object larger than the budget is sent on
-its own; the deadline stops one that has spent its time looking for objects it lacks. The self-hosted server answers every batch whole; the client's 512-hash chunks bound it.
+budget never stops an answer that carries nothing, so an object larger than the budget is still
+sent, alone or after smaller ones that left room under it; the deadline stops even an empty
+answer once it has spent its time looking for objects it lacks. The self-hosted server answers
+every batch whole; the client's 512-hash chunks bound it.
 
 ### `GET /v1/parcels/{parcel}/subtree/{path}` (additive; the path-addressed fetch)
 

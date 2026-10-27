@@ -1613,8 +1613,8 @@ fn a_batch_past_its_byte_budget_answers_a_marked_prefix() {
     assert_eq!(bundled(&area, "whole", answer, &hashes), hashes);
 }
 
-/// The byte budget never stops an answer that carries nothing: an object larger than the whole
-/// budget is sent alone, and objects the store lacks count toward nothing. An answer short only
+/// The byte budget never stops an answer that carries nothing: at a zero budget the first object
+/// held is still sent, and objects the store lacks count toward nothing. An answer short only
 /// of what the store lacks is not marked; one that stopped before looking for every requested
 /// object is, even when the store lacks the ones it skipped.
 /// Revert: let the byte rule in `batch_answer_full` stop an empty answer → the first answer
