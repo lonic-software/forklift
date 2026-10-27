@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use forklift_aws_lambda::aws::build_stores;
 use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::store::{
+    ExpectedHead,
     CasOutcome, OfficePrecondition, RefStore, TransientCause, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{AsyncBridge, AwsConfig, DynamoRefStore};
@@ -118,7 +119,7 @@ async fn the_ref_update_commit_sends_one_request_per_call() {
         refs.compare_and_set_head(
             PalletNamespace::User,
             "main",
-            None,
+            ExpectedHead::Unborn,
             &"c".repeat(64),
             OfficePrecondition::NotConsumed,
             None,
@@ -173,7 +174,7 @@ async fn a_stalled_transaction_is_abandoned_at_the_attempt_timeout() {
         refs.compare_and_set_head(
             PalletNamespace::User,
             "main",
-            None,
+            ExpectedHead::Unborn,
             &"c".repeat(64),
             OfficePrecondition::NotConsumed,
             None,

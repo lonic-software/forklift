@@ -28,7 +28,8 @@ use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::manifest_utils::operator_leaf;
 use crate::util::meta_tree::{
-    self, Admission, CellChange, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+    self, Admission, CellChange, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, MetaState, PalletRules,
+    ParcelChange,
 };
 use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState};
@@ -1052,6 +1053,20 @@ pub fn read_hauls() -> Result<HaulsRead, String> {
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
+    let author = |signer: &str| office.find_key(signer).map(|key| key.operator.clone()).unwrap_or(signer.to_string());
+
+    Ok(hauls_in(state, &author))
+}
+
+/// Read every haul at `@haul` head `head`, each cell's signer named by `author`. For a reader with
+/// no local pallet head to read from — a remote head judging a delete, whose objects sit in a
+/// scratch mirror and which needs a haul's status, not who wrote it.
+pub fn read_hauls_at(head: &str, author: &dyn Fn(&str) -> String) -> Result<HaulsRead, String> {
+    Ok(hauls_in(meta_tree::read_meta_state(HAUL_PALLET_NAME, head, &HaulRules)?, author))
+}
+
+/// The hauls in `@haul` state `state`, each cell's signer named by `author`.
+fn hauls_in(state: MetaState, author: &dyn Fn(&str) -> String) -> HaulsRead {
     let mut read = HaulsRead::default();
     let mut dirs: BTreeMap<String, HaulCells> = BTreeMap::new();
 
@@ -1075,10 +1090,8 @@ pub fn read_hauls() -> Result<HaulsRead, String> {
         }
     }
 
-    let author = |signer: &str| office.find_key(signer).map(|key| key.operator.clone()).unwrap_or(signer.to_string());
-
     for (id, cells) in dirs {
-        match read_haul(&id, cells, &author) {
+        match read_haul(&id, cells, author) {
             Ok(haul) => read.hauls.push(haul),
             Err(reason) => read.unreadable.push(UnreadableHaul { id, reason }),
         }
@@ -1086,7 +1099,7 @@ pub fn read_hauls() -> Result<HaulsRead, String> {
 
     read.hauls.sort_by(|a, b| b.opened.opened_at.cmp(&a.opened.opened_at).then(b.id.cmp(&a.id)));
 
-    Ok(read)
+    read
 }
 
 /// Refuse a delete of `pallet` while an open haul in `hauls` names it as its source or target, or

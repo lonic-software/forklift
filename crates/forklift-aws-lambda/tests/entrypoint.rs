@@ -22,6 +22,7 @@ use serde::Serialize;
 use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{
+    ExpectedHead, RefHead, RefListing,
     CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
@@ -88,14 +89,14 @@ impl ObjectStore for SharedObjects {
 struct SharedRefs(Arc<MemoryRefStore>);
 
 impl RefStore for SharedRefs {
-    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
+    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<RefHead, String> {
         self.0.get_head(namespace, name)
     }
     fn compare_and_set_head(
         &self,
         namespace: PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -103,7 +104,18 @@ impl RefStore for SharedRefs {
     ) -> Result<CasOutcome, String> {
         self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.0.delete_head(namespace, name, old, office_head, anchor, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.0.list_refs()
     }
     fn default_pallet(&self) -> Result<String, String> {
@@ -883,7 +895,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
             .compare_and_set_head(
                 PalletNamespace::Meta,
                 OFFICE_PALLET_NAME,
-                None,
+                ExpectedHead::Unborn,
                 &office_head,
                 OfficePrecondition::NotConsumed,
                 Some(stored_anchor.as_str()),

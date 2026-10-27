@@ -48,16 +48,17 @@ use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::authority_utils::{self, Denied, Principal};
 use forklift_core::util::office_utils::{self, OfficeState, TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
+use forklift_core::util::haul_utils::{self, HAUL_PALLET_NAME};
 use forklift_core::util::{
-    audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, sign_utils,
+    audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, pallet_utils, sign_utils,
 };
 
 use crate::error::{HeadError, HeadResult};
 use crate::reissue::reissue;
 use crate::scratch::{materialize, materialize_state, Mirror, Scratch};
 use crate::store::{
-    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
-    RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
+    CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutTarget,
+    RefHead, RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
 /// The `genesis` of a stored anchor's bytes.
@@ -134,6 +135,11 @@ const MAX_CACHED_OFFICE_STATES: usize = 32;
 /// read round already in flight to finish.
 const HOLDS_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How many times a pallet delete decides afresh when its commit is refused because the office or
+/// the anchor moved underneath it — the direct head's bound for the same loop. Only the last
+/// attempt's refusal is answered.
+const DELETE_ATTEMPTS: usize = 3;
+
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
     pub objects: O,
@@ -192,6 +198,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
     }
 
+    /// The office pallet's live head, or `None` while it is unborn. Meta pallets are never
+    /// deleted, so the office has no tombstone to read.
+    fn read_office_head(&self) -> HeadResult<Option<String>> {
+        Ok(self
+            .refs
+            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+            .map_err(HeadError::internal)?
+            .live()
+            .map(str::to_string))
+    }
+
     /// The office state at an office head **already read once by the caller**, for the
     /// authority rules: the head's whole tree is mirrored into the scratch and read there, the
     /// stored state as `forklift-server` reads it (no chain verification — the ref update's
@@ -242,7 +259,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let anchor = self.refs.get_trust().map_err(HeadError::internal)?.map(|(anchor, _)| anchor);
 
         let office_head = match anchor {
-            Some(_) => self.refs.get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME).map_err(HeadError::internal)?,
+            Some(_) => self.read_office_head()?,
             None => None,
         };
 
@@ -253,11 +270,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
     pub fn handshake(&self) -> HeadResult<WarehouseInfo> {
-        let mut pallets = BTreeMap::new();
-
-        for (pallet_ref, head) in self.refs.list_refs().map_err(HeadError::internal)? {
-            pallets.insert(pallet_ref.to_wire(), head);
-        }
+        let listing = self.refs.list_refs().map_err(HeadError::internal)?;
+        let pallets: BTreeMap<String, String> =
+            listing.live.into_iter().map(|(pallet_ref, head)| (pallet_ref.to_wire(), head)).collect();
+        let tombstones: BTreeMap<String, String> =
+            listing.tombstones.into_iter().map(|(pallet_ref, head)| (pallet_ref.to_wire(), head)).collect();
 
         Ok(WarehouseInfo {
             protocol: PROTOCOL_VERSION.to_string(),
@@ -273,8 +290,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // (`ref_update`) descends a recipe to presence-check its chunks before a ref moves. A
             // chunk-aware client reads this to know it may lift chunked content here.
             chunking: true,
-            // This head deletes no pallets yet, so it keeps no tombstones.
-            tombstones: None,
+            // Always present, empty or not: this head deletes pallets, and a client reads an absent
+            // map as a head that keeps no tombstones.
+            tombstones: Some(tombstones),
         })
     }
 
@@ -309,7 +327,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         candidates.iter().try_for_each(|hash| require_object_hash(hash))?;
 
         let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
-        let head = self.refs.get_head(pallet_ref.namespace, &pallet_ref.name).map_err(HeadError::internal)?;
+        // A deleted pallet still holds the history its tombstone names: a client restoring it, or
+        // re-creating it from work that descends from it, asks what it holds.
+        let head = match self.refs.get_head(pallet_ref.namespace, &pallet_ref.name).map_err(HeadError::internal)? {
+            RefHead::Live(head) | RefHead::Deleted(head) => Some(head),
+            RefHead::Absent => None,
+        };
 
         let deadline = self.deadline.map(|deadline| {
             let left = deadline.duration_since(SystemTime::now()).unwrap_or_default();
@@ -494,10 +517,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // No anchor but an office: the anchor was lost, and whichever client lifts first
             // would otherwise plant its own over a chain it never verified. No head lifts an
             // office without an anchor, so the office cannot appear after this read.
-            let office_head = self
-                .refs
-                .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
-                .map_err(HeadError::internal)?;
+            let office_head = self.read_office_head()?;
             if office_head.is_some() {
                 return Err(Self::anchor_lost());
             }
@@ -530,10 +550,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         authority_utils::may_regenesis(caller).map_err(forbidden)?;
 
-        let office_head = self
-            .refs
-            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
-            .map_err(HeadError::internal)?;
+        let office_head = self.read_office_head()?;
 
         if anchor.adopts.as_deref() != office_head.as_deref() {
             return Err(self.adopts_mismatch(anchor.adopts.as_deref(), office_head.as_deref()));
@@ -739,15 +756,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             None => (None, None),
         };
 
-        let office_head = self
-            .refs
-            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
-            .map_err(HeadError::internal)?;
+        let office_head = self.read_office_head()?;
 
-        // The pallet's own head. For the office that is the office head just read: one read, so
+        // The pallet's own ref. For the office that is the office head just read: one read, so
         // the authority decision and the stale check can never see two different offices.
         let current = if is_office {
-            office_head.clone()
+            office_head.clone().map_or(RefHead::Absent, RefHead::Live)
         } else {
             self.refs.get_head(namespace, &bare).map_err(HeadError::internal)?
         };
@@ -766,10 +780,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
 
         // Fail fast on an obviously stale request; the conditional write below is the
-        // authoritative gate that also catches a head that moves during the audit.
-        if current.as_deref() != request.old_head.as_deref() {
-            return Err(self.moved(&current, &request.old_head));
-        }
+        // authoritative gate that also catches a head that moves during the audit. A pallet
+        // deleted here answers an update with the deletion, since lowering cannot resolve it, and
+        // binds a creation to its tombstone: the commit expects the tombstone, and the audit below
+        // decides whether this creation may lift over it.
+        let expected = match (request.old_head.as_deref(), &current) {
+            (Some(old), RefHead::Live(head)) if old == head => ExpectedHead::At(old),
+            (Some(_), RefHead::Deleted(tombstone)) => return Err(self.deleted(&bare, tombstone)),
+            (None, RefHead::Absent) => ExpectedHead::Unborn,
+            (None, RefHead::Deleted(tombstone)) => ExpectedHead::Deleted(tombstone),
+            _ => return Err(self.moved(&current.live().map(str::to_string), &request.old_head)),
+        };
 
         // The head is stored as given; refuse a spelling the ref reader would refuse, the same
         // answer the self-hosted server gives, before presence decides it by S3's key casing.
@@ -900,6 +921,24 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )
             .map_err(HeadError::unprocessable)?;
 
+            // A creation over a tombstone lifts only when it acknowledged the deletion and its
+            // new head descends from the deleted one. Checked after the closure, so the walk of
+            // the new history reads only what is present.
+            if let ExpectedHead::Deleted(tombstone) = expected {
+                let acknowledged = request.tombstone.as_deref() == Some(tombstone);
+                let descends = acknowledged
+                    && merge_utils::is_ancestor(tombstone, &request.new_head).map_err(HeadError::internal)?;
+
+                if !descends {
+                    return Err(HeadError::conflict(String::from(pallet_utils::pallet_recreation_refusal(
+                        &bare,
+                        tombstone,
+                        acknowledged,
+                        false,
+                    ))));
+                }
+            }
+
             // 2. Fast-forward, with the one sanctioned exception: the office lift right
             // after a re-genesis, moving away from the anchor's adopted pin (§8.7).
             if let Some(old_head) = &request.old_head {
@@ -994,7 +1033,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 self.refs.compare_and_set_head(
                     namespace,
                     &bare,
-                    request.old_head.as_deref(),
+                    expected,
                     &request.new_head,
                     office_head_for_commit,
                     anchor_bytes.as_deref(),
@@ -1010,11 +1049,145 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         match outcome {
             CasOutcome::Committed => Ok(()),
-            CasOutcome::Conflict { current } => Err(self.moved(&current, &request.old_head)),
+            CasOutcome::Conflict { current } => Err(self.moved_or_deleted(&bare, &current, &request.old_head)),
             CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
             CasOutcome::AnchorMoved => Err(self.anchor_moved()),
             CasOutcome::Transient(_) => Err(self.transient_contention(uncertain.get())),
         }
+    }
+
+    /// `DELETE /v1/pallets/{name}?old_head=` — delete a user pallet the caller saw at `old_head`,
+    /// leaving a tombstone of that head in its place.
+    ///
+    /// The checks run in the direct head's order and answer with its codes: a meta pallet is
+    /// `422`; an operator whose role and grants do not admit the pallet is `403`; a pallet not at
+    /// `old_head` is the moved refusal, or the deleted one when it was deleted at another head —
+    /// and `200` with nothing written when it is already deleted at `old_head`, the state a delete
+    /// whose answer was lost left behind; the warehouse's default pallet is `409`, and so is a
+    /// pallet an open haul names (a read-time check, as on every head).
+    ///
+    /// The commit conditions on the pallet's head, on the office as the authority check read it
+    /// (unborn included: in the trust-bootstrap window the check admits every operator *because*
+    /// no office exists, so an office lifted before the commit must refuse it), and on the
+    /// anchor's stored bytes. A refusal because the office or the anchor moved decides again from
+    /// fresh reads, up to [`DELETE_ATTEMPTS`] times; a transient refusal is re-issued as a ref
+    /// update's is.
+    pub fn delete_pallet(&self, caller: &Principal, name: &str, old_head: &str) -> HeadResult<()> {
+        let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
+
+        if pallet_ref.namespace == PalletNamespace::Meta {
+            return Err(HeadError::unprocessable(format!(
+                "Meta pallet \"{}\" cannot be deleted: it is tracked metadata, not a line of work.",
+                name
+            )));
+        }
+
+        require_object_hash(old_head)?;
+
+        let bare = pallet_ref.name.clone();
+
+        for attempt in 1..=DELETE_ATTEMPTS {
+            let last = attempt == DELETE_ATTEMPTS;
+
+            // Read once per attempt; the commit conditions on exactly these values.
+            let (anchor, anchor_bytes) = match self.refs.get_trust().map_err(HeadError::internal)? {
+                Some((anchor, bytes)) => (Some(anchor), Some(bytes)),
+                None => (None, None),
+            };
+            let office_head = self.read_office_head()?;
+
+            if matches!(caller, Principal::Operator(_)) {
+                let office_state = self.office_state_at(&anchor, office_head.as_deref())?;
+
+                authority_utils::may_move(caller, &anchor, &office_state, &pallet_ref).map_err(forbidden)?;
+            }
+
+            match self.refs.get_head(PalletNamespace::User, &bare).map_err(HeadError::internal)? {
+                RefHead::Live(head) if head == old_head => {}
+                RefHead::Deleted(tombstone) if tombstone == old_head => return Ok(()),
+                RefHead::Deleted(tombstone) => return Err(self.deleted(&bare, &tombstone)),
+                current => return Err(self.moved(&current.live().map(str::to_string), &Some(old_head.to_string()))),
+            }
+
+            if bare == self.refs.default_pallet().map_err(HeadError::internal)? {
+                return Err(HeadError::conflict(format!(
+                    "Pallet \"{}\" is this remote's default pallet, which a new warehouse checks \
+                    out; it cannot be deleted. Nothing was deleted.",
+                    bare
+                )));
+            }
+
+            haul_utils::refuse_an_open_haul(&bare, &self.read_hauls()?).map_err(HeadError::conflict)?;
+
+            let office_precondition = match office_head.as_deref() {
+                Some(head) => OfficePrecondition::At(head),
+                None => OfficePrecondition::Unborn,
+            };
+
+            let uncertain = Cell::new(false);
+            let outcome = reissue(
+                self.deadline,
+                |token| {
+                    self.refs.delete_head(
+                        PalletNamespace::User,
+                        &bare,
+                        old_head,
+                        office_precondition,
+                        anchor_bytes.as_deref(),
+                        token,
+                    )
+                },
+                |outcome| match outcome {
+                    CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
+                    _ => None,
+                },
+            )
+            .map_err(HeadError::internal)?;
+
+            match outcome {
+                CasOutcome::Committed => return Ok(()),
+                CasOutcome::OfficeMoved { .. } | CasOutcome::AnchorMoved if !last => continue,
+                // Two deletes racing from the same head: the loser finds the tombstone the winner
+                // wrote, which is what it asked for.
+                CasOutcome::Conflict { current: RefHead::Deleted(tombstone) } if tombstone == old_head => {
+                    return Ok(())
+                }
+                CasOutcome::Conflict { current } => {
+                    return Err(self.moved_or_deleted(&bare, &current, &Some(old_head.to_string())))
+                }
+                CasOutcome::OfficeMoved { current } => return Err(self.office_moved(&current)),
+                CasOutcome::AnchorMoved => return Err(self.anchor_moved()),
+                CasOutcome::Transient(_) => {
+                    // Under one token an earlier attempt may still have landed: the ref decides.
+                    return match self.refs.get_head(PalletNamespace::User, &bare).map_err(HeadError::internal)? {
+                        RefHead::Deleted(tombstone) if tombstone == old_head => Ok(()),
+                        _ => Err(self.delete_contention(uncertain.get())),
+                    };
+                }
+            }
+        }
+
+        unreachable!("the last attempt answers every outcome")
+    }
+
+    /// The hauls at the warehouse's `@haul` head, mirrored into the scratch and read there; empty
+    /// while `@haul` is unborn. A delete needs only each haul's source, target and status, so no
+    /// signer is attributed.
+    fn read_hauls(&self) -> HeadResult<haul_utils::HaulsRead> {
+        let Some(haul_head) =
+            self.refs.get_head(PalletNamespace::Meta, HAUL_PALLET_NAME).map_err(HeadError::internal)?.live().map(str::to_string)
+        else {
+            return Ok(haul_utils::HaulsRead::default());
+        };
+
+        let scratch = self.scratch().map_err(HeadError::internal)?;
+
+        scratch
+            .scoped(|| {
+                materialize_state(&self.objects, &haul_head, &mut Mirror::default())?;
+                haul_utils::read_hauls_at(&haul_head, &|_| String::new())
+            })
+            .map_err(HeadError::internal)
     }
 
     /// `POST /v1/objects/batch` — many objects in one bundle-format stream (forklift's
@@ -1227,6 +1400,39 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     fn moved(&self, current: &Option<String>, expected: &Option<String>) -> HeadError {
         HeadError::conflict(String::from(
             forklift_core::util::pallet_utils::pallet_moved_refusal(current.as_deref(), expected.as_deref())
+        ))
+    }
+
+    /// The `409` for a ref found deleted at `tombstone` by a request that expected it live.
+    fn deleted(&self, bare: &str, tombstone: &str) -> HeadError {
+        HeadError::conflict(String::from(pallet_utils::pallet_deleted_refusal(bare, tombstone, false)))
+    }
+
+    /// The `409` for a commit whose pallet precondition failed: [`Self::deleted`] when the ref
+    /// is now a tombstone, else [`Self::moved`].
+    fn moved_or_deleted(&self, bare: &str, current: &RefHead, expected: &Option<String>) -> HeadError {
+        match current {
+            RefHead::Deleted(tombstone) => self.deleted(bare, tombstone),
+            RefHead::Live(head) => self.moved(&Some(head.clone()), expected),
+            RefHead::Absent => self.moved(&None, expected),
+        }
+    }
+
+    /// The `503` for a delete whose commit stayed refused for a reason showing no input moved.
+    /// Running the same delete again is safe whatever happened: one that landed meanwhile
+    /// answers `200`.
+    fn delete_contention(&self, uncertain: bool) -> HeadError {
+        let what = match uncertain {
+            true => format!("The delete could not be confirmed: {}", UNCONFIRMED),
+            false => "The delete could not complete: the warehouse's storage stayed busy through \
+                every attempt this request could afford, most likely a push touching its office \
+                pallet at the same time. Nothing is known to have moved."
+                .to_string(),
+        };
+
+        HeadError::service_unavailable(format!(
+            "{} Run the delete again; if it already landed, the remote answers that it is done.",
+            what
         ))
     }
 

@@ -21,6 +21,7 @@ use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
+    ExpectedHead, RefHead, RefListing,
     CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
@@ -823,7 +824,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
         head.refs.compare_and_set_head(
             pallet_utils::PalletNamespace::Meta,
             OFFICE_PALLET_NAME,
-            Some(&office_head),
+            ExpectedHead::At(&office_head),
             &by_worker,
             OfficePrecondition::NotConsumed,
             trust.as_ref().map(|(_, raw)| raw.as_str()),
@@ -898,7 +899,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
         })
         .expect_err("office without an anchor");
     assert_eq!(err.status, Status::Unprocessable);
-    assert_eq!(refs.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME), Ok(None));
+    assert_eq!(refs.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME), Ok(RefHead::Absent));
 
     // An office whose anchor was lost — planted beneath the head, as a stripped store would
     // hold it. Planting an anchor over it is refused, and nothing is stored.
@@ -906,7 +907,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
         refs.compare_and_set_head(
             pallet_utils::PalletNamespace::Meta,
             OFFICE_PALLET_NAME,
-            None,
+            ExpectedHead::Unborn,
             &office_head,
             OfficePrecondition::NotConsumed,
             None,
@@ -1462,7 +1463,7 @@ fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
 
     // And it is still correct: the head moved.
     assert_eq!(
-        head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().as_deref(),
+        head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().live(),
         Some(new_head.as_str())
     );
 
@@ -1818,7 +1819,7 @@ struct AsyncRefStore {
 }
 
 impl RefStore for AsyncRefStore {
-    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<Option<String>, String> {
+    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
         self.bridge.block_on(suspending(|| self.inner.get_head(namespace, name)))
     }
 
@@ -1826,7 +1827,7 @@ impl RefStore for AsyncRefStore {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -1837,7 +1838,18 @@ impl RefStore for AsyncRefStore {
         }))
     }
 
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)))
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.bridge.block_on(suspending(|| self.inner.list_refs()))
     }
 
@@ -1899,7 +1911,7 @@ async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
             .expect("lift the pallet over an async store");
 
         assert_eq!(
-            head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().as_deref(),
+            head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().live(),
             Some(expected.as_str())
         );
     })
@@ -1935,7 +1947,7 @@ impl RefStore for SharedMemoryRefs {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<RefHead, String> {
         self.0.get_head(namespace, name)
     }
 
@@ -1943,7 +1955,7 @@ impl RefStore for SharedMemoryRefs {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -1952,7 +1964,18 @@ impl RefStore for SharedMemoryRefs {
         self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.0.delete_head(namespace, name, old, office_head, anchor, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.0.list_refs()
     }
 
@@ -1994,7 +2017,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<RefHead, String> {
         let result = self.inner.get_head(namespace, name);
 
         if namespace == pallet_utils::PalletNamespace::Meta
@@ -2019,7 +2042,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
                     .compare_and_set_head(
                         pallet_utils::PalletNamespace::Meta,
                         OFFICE_PALLET_NAME,
-                        current.as_deref(),
+                        current.live().map_or(ExpectedHead::Unborn, ExpectedHead::At),
                         &self.move_to,
                         OfficePrecondition::NotConsumed,
                         anchor_bytes.as_deref(),
@@ -2041,7 +2064,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -2050,7 +2073,18 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
     }
 
@@ -2091,7 +2125,7 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<RefHead, String> {
         self.inner.get_head(namespace, name)
     }
 
@@ -2099,7 +2133,7 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -2108,7 +2142,18 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
     }
 
@@ -2138,7 +2183,7 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
 
             assert_eq!(
                 self.inner
-                    .replace_trust(&self.move_to, &expected, office_head.as_deref(), &request_token())
+                    .replace_trust(&self.move_to, &expected, office_head.live(), &request_token())
                     .expect("inject the concurrent re-genesis"),
                 TrustWriteOutcome::Replaced,
                 "the injected re-genesis must actually land, or the test it feeds proves \
@@ -2202,7 +2247,7 @@ impl TransientOnCommit {
     /// Every attempt answers that the pallet moved — the refusal the loop must not re-issue.
     fn always_moved() -> TransientOnCommit {
         TransientOnCommit {
-            refusal: CasOutcome::Conflict { current: Some("f".repeat(64)) },
+            refusal: CasOutcome::Conflict { current: RefHead::Live("f".repeat(64)) },
             ..TransientOnCommit::always()
         }
     }
@@ -2217,7 +2262,7 @@ impl RefStore for TransientOnCommit {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<RefHead, String> {
         self.inner.get_head(namespace, name)
     }
 
@@ -2225,7 +2270,7 @@ impl RefStore for TransientOnCommit {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -2250,7 +2295,18 @@ impl RefStore for TransientOnCommit {
         self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
     }
 
@@ -2385,7 +2441,7 @@ fn a_commit_refused_transiently_once_is_reissued_and_lands() {
     assert_eq!(head.refs.tokens().len(), 2);
     assert_eq!(
         head.refs.inner.get_head(pallet_utils::PalletNamespace::User, "main").unwrap(),
-        Some(main_head)
+        RefHead::Live(main_head)
     );
 }
 
@@ -2497,7 +2553,7 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
 
     // The control: main's own head is unaffected by the refused commit or the injected move.
     assert_eq!(
-        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").as_deref(),
+        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").live(),
         Some(main_v1.as_str())
     );
 }
@@ -2603,12 +2659,12 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
     assert!(err.message.to_lowercase().contains("office"), "{}", err.message);
 
     assert_eq!(
-        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").as_deref(),
+        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").live(),
         Some(main_v1.as_str()),
         "main did not move"
     );
     assert_eq!(
-        store.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).expect("get").as_deref(),
+        store.get_head(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).expect("get").live(),
         Some(office_revoked.as_str()),
         "the revocation landed"
     );
@@ -2652,7 +2708,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
         store.compare_and_set_head(
             pallet_utils::PalletNamespace::Meta,
             OFFICE_PALLET_NAME,
-            None,
+            ExpectedHead::Unborn,
             &office_head,
             OfficePrecondition::NotConsumed,
             None,
@@ -2692,7 +2748,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
         );
 
     assert_eq!(
-        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").as_deref(),
+        store.get_head(pallet_utils::PalletNamespace::User, "main").expect("get").live(),
         Some(main_v2.as_str())
     );
 }
@@ -2829,7 +2885,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
             .compare_and_set_head(
                 pallet_utils::PalletNamespace::User,
                 "unrelated",
-                None,
+                ExpectedHead::Unborn,
                 &"a".repeat(64),
                 OfficePrecondition::At(&office_head),
                 Some(&anchor_bytes),
@@ -2889,7 +2945,7 @@ fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, Stri
             .compare_and_set_head(
                 pallet_utils::PalletNamespace::Meta,
                 OFFICE_PALLET_NAME,
-                None,
+                ExpectedHead::Unborn,
                 office_head,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes),
@@ -3071,7 +3127,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
             .compare_and_set_head(
                 pallet_utils::PalletNamespace::User,
                 "main",
-                None,
+                ExpectedHead::Unborn,
                 &"e".repeat(64),
                 OfficePrecondition::NotConsumed,
                 Some(&bytes),
@@ -3129,7 +3185,7 @@ impl RefStore for TransientOnAnchorWrite {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<RefHead, String> {
         self.inner.get_head(namespace, name)
     }
 
@@ -3137,7 +3193,7 @@ impl RefStore for TransientOnAnchorWrite {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -3146,7 +3202,18 @@ impl RefStore for TransientOnAnchorWrite {
         self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
     }
 
@@ -3210,7 +3277,7 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<RefHead, String> {
         self.inner.get_head(namespace, name)
     }
 
@@ -3218,7 +3285,7 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         &self,
         namespace: pallet_utils::PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
@@ -3227,7 +3294,18 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
     }
 
-    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
     }
 

@@ -23,8 +23,9 @@ use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::store::{
-    CasOutcome, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome,
-    PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
+    CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OfficePrecondition, PromoteOutcome,
+    PutOutcome, PutTarget, RefHead, RefListing, RefStore, SignatureOutcome, TrustOutcome,
+    TrustWriteOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -243,7 +244,10 @@ impl ObjectStore for MemoryObjectStore {
 /// reason. Folding both into one guard is what makes `compare_and_set_head` genuinely atomic
 /// here, the same property `DynamoRefStore` gets from a real `TransactWriteItems`.
 struct RefState {
-    heads: HashMap<String, String>,
+    /// Every pallet's entry, live or tombstoned. An entry, not a head: a delete keeps it and
+    /// marks it deleted, the mirror of the DynamoDB item a delete keeps, so a creation expecting
+    /// no entry at all can be refused over a tombstone exactly as the real store refuses it.
+    pallets: HashMap<String, RefHead>,
     /// The trust anchor's *stored serialization* — the same representation `DynamoRefStore`
     /// keeps (the JSON text of the DTO), not the decoded value. The commit's anchor
     /// precondition is string equality on stored bytes; a fake that kept only a decoded value
@@ -261,7 +265,7 @@ pub struct MemoryRefStore {
 impl Default for MemoryRefStore {
     fn default() -> MemoryRefStore {
         MemoryRefStore {
-            state: Mutex::new(RefState { heads: HashMap::new(), trust: None }),
+            state: Mutex::new(RefState { pallets: HashMap::new(), trust: None }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
     }
@@ -288,11 +292,68 @@ impl MemoryRefStore {
         serde_json::to_string(&TrustAnchorDto::from(anchor))
             .map_err(|err| format!("encoding the trust anchor failed: {}", err))
     }
+
+    /// The office precondition to check, if any, for a write to the entry at `key`: `None` when
+    /// there is nothing to check, else the office head it must still hold (`None` inside: unborn).
+    ///
+    /// Nothing is checked in two cases. Structural: a write to `@office` itself needs no separate
+    /// office check — the pallet-head check already pins that exact entry, the fake's mirror of
+    /// the reason `DynamoRefStore` drops the redundant `ConditionCheck` there (two actions on one
+    /// item is refused by DynamoDB; here it would just be checking the same key twice). Semantic:
+    /// `OfficePrecondition::NotConsumed` means the caller never consumed an office head at all —
+    /// not "expect the office pallet to be unborn" — so it must not be compared against whatever
+    /// the office key currently holds; see `RefStore::compare_and_set_head`'s docs for why
+    /// treating it as "unborn" here would refuse an untrusted push whose office pallet genuinely
+    /// (if unaudited) has a real head, every time, not just under a race. `Unborn` is the
+    /// opposite claim and is checked: the office must still have no head.
+    fn office_condition<'a>(key: &str, office_head: OfficePrecondition<'a>) -> Option<Option<&'a str>> {
+        if key == Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME) {
+            return None;
+        }
+
+        match office_head {
+            OfficePrecondition::NotConsumed => None,
+            OfficePrecondition::Unborn => Some(None),
+            OfficePrecondition::At(head) => Some(Some(head)),
+        }
+    }
+
+    /// Check the office and anchor preconditions under the held guard: `Some` names the one that
+    /// failed, `None` means both hold.
+    fn moved_inputs(
+        state: &RefState,
+        office: Option<Option<&str>>,
+        anchor: Option<&str>,
+    ) -> Option<CasOutcome> {
+        if let Some(office_head) = office {
+            let current_office = state.live_head(&Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME));
+
+            if current_office.as_deref() != office_head {
+                return Some(CasOutcome::OfficeMoved { current: current_office });
+            }
+        }
+
+        if state.trust.as_deref() != anchor {
+            return Some(CasOutcome::AnchorMoved);
+        }
+
+        None
+    }
+}
+
+impl RefState {
+    fn entry(&self, key: &str) -> RefHead {
+        self.pallets.get(key).cloned().unwrap_or(RefHead::Absent)
+    }
+
+    fn live_head(&self, key: &str) -> Option<String> {
+        self.entry(key).live().map(str::to_string)
+    }
 }
 
 impl RefStore for MemoryRefStore {
-    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
-        Ok(self.state.lock().unwrap().heads.get(&Self::key(namespace, name)).cloned())
+    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<RefHead, String> {
+        Ok(self.state.lock().unwrap().entry(&Self::key(namespace, name)))
     }
 
     // One mutex makes every commit atomic in one step, so there is never an attempt whose
@@ -302,65 +363,84 @@ impl RefStore for MemoryRefStore {
         &self,
         namespace: PalletNamespace,
         name: &str,
-        expected: Option<&str>,
+        expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
         _request_token: &str,
     ) -> Result<CasOutcome, String> {
         let key = Self::key(namespace, name);
-        let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
-        // The office precondition is checked only when both hold at once. Structural: a lift
-        // to `@office` itself needs no separate office check — the pallet-head check below
-        // already pins that exact entry, the fake's mirror of the reason `DynamoRefStore`
-        // drops the redundant `ConditionCheck` there (two actions on one item is refused by
-        // DynamoDB; here it would just be checking the same key twice). Semantic:
-        // `OfficePrecondition::NotConsumed` means the caller's audit never consumed an office
-        // head at all — not "expect the office pallet to be unborn" — so it must not be
-        // compared against whatever the office key currently holds; see
-        // `RefStore::compare_and_set_head`'s docs for why treating it as "unborn" here would
-        // refuse an untrusted push whose office pallet genuinely (if unaudited) has a real
-        // head, every time, not just under a race.
-        let office_head = match office_head {
-            OfficePrecondition::At(head) if key != office_key => Some(head),
-            _ => None,
-        };
+        let office = Self::office_condition(&key, office_head);
 
         let mut state = self.state.lock().unwrap();
 
         // All three preconditions are evaluated, and the commit made, under this one guard —
         // the property this whole struct exists to provide (see `RefState`'s docs).
-        let current = state.heads.get(&key).cloned();
+        let current = state.entry(&key);
 
-        if current.as_deref() != expected {
+        let holds = match (expected, &current) {
+            (ExpectedHead::Unborn, RefHead::Absent) => true,
+            (ExpectedHead::Deleted(want), RefHead::Deleted(have)) => want == have,
+            (ExpectedHead::At(want), RefHead::Live(have)) => want == have,
+            _ => false,
+        };
+
+        if !holds {
             return Ok(CasOutcome::Conflict { current });
         }
 
-        if let Some(office_head) = office_head {
-            let current_office = state.heads.get(&office_key).cloned();
-
-            if current_office.as_deref() != Some(office_head) {
-                return Ok(CasOutcome::OfficeMoved { current: current_office });
-            }
+        if let Some(moved) = Self::moved_inputs(&state, office, anchor) {
+            return Ok(moved);
         }
 
-        if state.trust.as_deref() != anchor {
-            return Ok(CasOutcome::AnchorMoved);
-        }
-
-        state.heads.insert(key, new.to_string());
+        state.pallets.insert(key, RefHead::Live(new.to_string()));
 
         Ok(CasOutcome::Committed)
     }
 
-    fn list_refs(&self) -> Result<Vec<(PalletRef, String)>, String> {
-        self.state
-            .lock()
-            .unwrap()
-            .heads
-            .iter()
-            .map(|(wire, head)| Ok((PalletRef::parse(wire)?, head.clone())))
-            .collect()
+    fn delete_head(
+        &self,
+        namespace: PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        _request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        let key = Self::key(namespace, name);
+        let office = Self::office_condition(&key, office_head);
+
+        let mut state = self.state.lock().unwrap();
+        let current = state.entry(&key);
+
+        if current.live() != Some(old) {
+            return Ok(CasOutcome::Conflict { current });
+        }
+
+        if let Some(moved) = Self::moved_inputs(&state, office, anchor) {
+            return Ok(moved);
+        }
+
+        state.pallets.insert(key, RefHead::Deleted(old.to_string()));
+
+        Ok(CasOutcome::Committed)
+    }
+
+    fn list_refs(&self) -> Result<RefListing, String> {
+        let state = self.state.lock().unwrap();
+        let mut listing = RefListing::default();
+
+        for (wire, entry) in &state.pallets {
+            let pallet_ref = PalletRef::parse(wire)?;
+
+            match entry {
+                RefHead::Live(head) => listing.live.push((pallet_ref, head.clone())),
+                RefHead::Deleted(head) => listing.tombstones.push((pallet_ref, head.clone())),
+                RefHead::Absent => {}
+            }
+        }
+
+        Ok(listing)
     }
 
     fn default_pallet(&self) -> Result<String, String> {
@@ -444,7 +524,7 @@ impl RefStore for MemoryRefStore {
         // state: `put_trust` reads the office head unconditionally, so `None` here genuinely
         // means the validation consumed an unborn office and the write must condition on it
         // still being unborn.
-        let current_office = state.heads.get(&office_key).cloned();
+        let current_office = state.live_head(&office_key);
 
         if current_office.as_deref() != office_head {
             return Ok(TrustWriteOutcome::OfficeMoved { current: current_office });

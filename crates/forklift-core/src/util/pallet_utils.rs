@@ -403,6 +403,65 @@ pub fn pallet_moved_refusal(current: Option<&str>, expected: Option<&str>) -> Co
     ))
 }
 
+/// The refusal for a ref update that expected user pallet `pallet` at a head and found it deleted
+/// on the remote at `head`: lowering cannot resolve it (a lift after a lower would be a creation,
+/// which the tombstone binds), so it names the deletion and the way back. `offers_drop` is whether
+/// the remote's head has an operator command that drops a tombstone, which the message then names.
+pub fn pallet_deleted_refusal(pallet: &str, head: &str, offers_drop: bool) -> CoreError {
+    deleted_on_remote(pallet, format!(
+        "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
+        history. \"forklift palletize --restore {} --remote\" brings it back; otherwise use \
+        another name for new work{}. Nothing was written.",
+        pallet, head, pallet, tombstone_drop_clause(pallet, offers_drop)
+    ))
+}
+
+/// The refusal for a creation of user pallet `pallet`, deleted on the remote at `head`: the writer
+/// did not acknowledge the tombstone (`acknowledged` false), or did and the new head does not
+/// descend from its head. `offers_drop` as for [`pallet_deleted_refusal`].
+pub fn pallet_recreation_refusal(pallet: &str, head: &str, acknowledged: bool, offers_drop: bool) -> CoreError {
+    let drop = tombstone_drop_clause(pallet, offers_drop);
+    let message = match acknowledged {
+        false => format!(
+            "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
+            history: re-creating it must acknowledge the deletion (\"forklift lift --recreate\", for \
+            work that descends from it). \"forklift palletize --restore {} --remote\" brings it back \
+            instead; otherwise lift the work under another name{}. Nothing was written.",
+            pallet, head, pallet, drop
+        ),
+        true => format!(
+            "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
+            it: the name stays reserved for that history. \"forklift palletize --restore {} --remote\" \
+            brings it back, to lower and consolidate into this work; otherwise lift the work under \
+            another name{}. Nothing was written.",
+            pallet, head, pallet, drop
+        ),
+    };
+
+    deleted_on_remote(pallet, message)
+}
+
+/// The clause naming the operator's tombstone drop, when the remote's head has one.
+fn tombstone_drop_clause(pallet: &str, offers_drop: bool) -> String {
+    match offers_drop {
+        true => format!(
+            ", or ask the remote's operator to drop the tombstone \
+            (\"forklift-server tombstone drop --root <warehouse> {}\")",
+            pallet
+        ),
+        false => String::new(),
+    }
+}
+
+/// The [`RefusalCode::PalletDeletedOnRemote`] refusal carrying `message`, for user pallet `pallet`.
+fn deleted_on_remote(pallet: &str, message: String) -> CoreError {
+    CoreError::refusal(
+        RefusalCode::PalletDeletedOnRemote,
+        message,
+        format!("forklift palletize --restore {} --remote", pallet),
+    )
+}
+
 /// The next step of a [`RefusalCode::Behind`] refusal with nothing in progress: catch up.
 fn catch_up_step(pallet: &str) -> String {
     format!("forklift shift {}", pallet)
