@@ -605,7 +605,12 @@ pallet was switched since (`palletize` and `deliver` switch pallets without bein
 journaled), the current pallet's head moved (a merged haul, a fast-forwarding `lower`), or a
 consolidation or cherry-pick was started or finished. It also refuses to undo the `stack` that
 completed a cherry-pick once the picked parcel is gone from the warehouse (a `gc` can collect it
-when no pallet reaches it), since the pick it would put back could never complete. Continue forward instead. Working-tree
+when no pallet reaches it), since the pick it would put back could never complete. Continue forward instead.
+In a warehouse that `forklift-server` has served, it refuses to undo a `stack`, `consolidate` or
+`cherry-pick` that moved a pallet, keeping the entry: the remote's clones may already rely on the
+parcel it would take off, and with no ref holding it the server's `gc` could free their only copy
+(the wire is fast-forward-only for the same reason). Take a change out there by stacking a parcel
+that reverts it. Undoing a delete or a `shift` is unaffected. Working-tree
 commands in between — `load`, `remove`, `park` — change none of that and do not block it:
 after a `park`, `undo` soft-resets beneath the parked work. `park pop` then re-applies it,
 unless the parked work touches a path the undone parcel changed — it refuses that until the

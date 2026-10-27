@@ -1213,7 +1213,9 @@ fn tombstone_of(namespace: PalletNamespace,
 }
 
 /// Whether a write of `new` over `expected` moves a user pallet of a served warehouse, whose clones
-/// may rely on the head it leaves. The mark is read fail-closed.
+/// may rely on the head it leaves. The mark is read fail-closed. A meta pallet is not held to it:
+/// the office lift after a re-genesis, the one move off a head the protocol allows, arrives here
+/// on a served root.
 fn served_move(namespace: PalletNamespace, expected: Option<&str>, new: &str) -> Result<bool, String> {
     Ok(namespace == PalletNamespace::User
         && expected.is_some_and(|old| old != new)
