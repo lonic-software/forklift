@@ -10,8 +10,9 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, BundleDownload, PartialBundle, RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::{
-    bundle_utils, config_utils, file_utils, lock_utils, object_utils, operation_utils, pack_utils,
-    pallet_utils, remote_utils, scope_utils, shift_utils, take_utils, trust_utils, warehouse_utils,
+    bundle_utils, config_utils, file_utils, held_heads, lock_utils, object_utils, operation_utils,
+    pack_utils, pallet_utils, remote_utils, scope_utils, shift_utils, take_utils, trust_utils,
+    warehouse_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
@@ -636,6 +637,13 @@ async fn franchise_into_prepared_target(
     // here. The write stands only on the trust the history was verified against.
     pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &take_utils::installed(&take_trust)?)?;
     pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
+
+    // The head this warehouse was filled from is one the remote held, so a scope-prune may later
+    // ask whether it still does. Best effort: an unrecorded head only keeps history a prune
+    // could have freed.
+    if let Err(why) = held_heads::record_held_head(&pallet_name, &remote_head) {
+        output::warn_held_head_unrecorded(&why);
+    }
 
     // A failure here keeps everything fetched, like any other: a resume redoes the whole
     // materialize, never a part of it. Its dominant causes — a path this filesystem cannot

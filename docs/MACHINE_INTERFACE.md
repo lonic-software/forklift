@@ -793,9 +793,9 @@ Example session:
   history of a pallet this warehouse already held, or that history could not be read to judge it, with `details` `{ "pallets": ["<name>", …] }`.
   Those pallets stay as they are; a take of their history into another pallet is refused
   (`history_unverified`). The command's own result stands and its exit code is unchanged.
-* A `lift` or `lower` whose remote head could not be added to the warehouse's held-heads record
-  (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower, up to date or
-  ahead included) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
+* A `lift`, `lower` or `franchise` whose remote head could not be added to the warehouse's
+  held-heads record (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower,
+  up to date or ahead included, or a franchise) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
   result stands and its exit code is unchanged.
 * The same stderr channel also carries a maintenance warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":

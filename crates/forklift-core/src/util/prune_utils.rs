@@ -74,8 +74,8 @@ pub struct PrunePlan {
     pub retained_shared: usize,
 
     /// Candidates kept because lifting history the remote is not known to hold reads them: work
-    /// stacked here and never lifted, or lifted to a remote head this warehouse has not lowered
-    /// since. Some may be the only copy; the rest are the base trees that lift compares against.
+    /// stacked here and never lifted, or lifted to a remote head the remote did not confirm it
+    /// still holds. Some may be the only copy; the rest are the base trees that lift compares against.
     /// A later prune of the same path frees them once the remote's heads reach that history.
     /// Excludes what only a haul's, the git mirror's or a deleted pallet's history reads, counted
     /// in `kept_for_hauls`, `kept_for_mirror` and `kept_for_deleted`.
@@ -265,10 +265,10 @@ fn with_held<'a>(live_parcels: &[String], held: impl Iterator<Item = &'a String>
 
 /// The user-pallet parcels the remote is not known to hold: every one that no remote head
 /// present here reaches. A remote holds the full closure of each of its ref heads, since its
-/// commit gate checks the closure before a ref moves, and a ref only moves forward from there.
-/// So history those heads reach can be fetched again, and nothing else is known to be: a parcel
-/// stacked here and never lifted, or one lifted to a head the remote has since moved past and
-/// this warehouse has not lowered.
+/// commit gate checks the closure before a ref moves, and of each head it has just confirmed it
+/// still holds. So history those heads reach can be fetched again, and nothing else is known to
+/// be: a parcel stacked here and never lifted, or one lifted to a head the remote did not
+/// confirm.
 ///
 /// Conservative: a remote head absent here reaches nothing, which only counts more parcels as
 /// unlifted, and that frees less, never more.

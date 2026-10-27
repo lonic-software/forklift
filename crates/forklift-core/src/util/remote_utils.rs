@@ -11,10 +11,10 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use crate::model::remote::{
-    CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
-    RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest,
+    CommitLiftRequest, ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest,
+    MissingObjectsResponse, RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest,
     UploadTargetsResponse, WarehouseInfo, LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
-    MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
+    MAX_HOLDS_CANDIDATES, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
 use crate::enums::config_scope::ConfigScope;
 use crate::error::{CoreError, RefusalCode};
@@ -88,6 +88,10 @@ const HANDSHAKE_BODY_CAP: u64 = 64 * 1024 * 1024;
 /// Per-hash allowance in a `missing` answer: a 64-character hash, its quotes and separator, with
 /// room to spare.
 const MISSING_BODY_BYTES_PER_HASH: u64 = 128;
+
+/// Per-candidate allowance in a `holds` answer: a 64-character hash, its quotes, the longest
+/// answer and the separators, with room to spare.
+const HOLDS_BODY_BYTES_PER_CANDIDATE: u64 = 128;
 
 /// The cap for a structured error body. A refusal may list paths or hashes, so it is not held to
 /// [`body_utils::SMALL_BODY_CAP`]; one larger than this is reported as unread rather than parsed.
@@ -3232,6 +3236,48 @@ impl RemoteClient {
         }
 
         Ok(missing)
+    }
+
+    /// Ask whether `pallet` (its wire name) still holds each of `candidates`: whether its current
+    /// head on the remote is the candidate or reaches it. Only the answers for candidates asked are
+    /// returned, so a remote cannot add a hash of its own; a candidate it leaves out is absent.
+    /// Asked [`MAX_HOLDS_CANDIDATES`] at a time, the most a head accepts in one request.
+    ///
+    /// The caller acts only on [`HoldAnswer::Held`]. An `Err` (a head too old to know the route
+    /// answers `404`) confirms nothing either, so neither the error nor an answer it cannot use
+    /// may free more than the current heads alone would.
+    ///
+    /// Rides [`Posture::HeadDeadline`], its head-wait sized by [`Self::retryable_head_budget`]: the
+    /// head walks history before its first byte, for at most the 10s
+    /// [`MAX_HOLDS_WALK_TIME`](crate::util::merge_utils::MAX_HOLDS_WALK_TIME) both heads share, well
+    /// inside that budget. The answer's body is read under [`Self::presence_body_budget`].
+    pub async fn holds(&self, pallet: &str, candidates: &[String]) -> Result<BTreeMap<String, HoldAnswer>, String> {
+        let mut holds = BTreeMap::new();
+
+        for batch in candidates.chunks(MAX_HOLDS_CANDIDATES) {
+            let posture = Posture::HeadDeadline { head: self.retryable_head_budget() };
+            let outcome = self.send_waiting_out_throttle(
+                posture,
+                reqwest::Method::POST, &format!("/v1/pallets/{}/holds", pallet),
+                SendBody::json(&HoldsRequest { candidates: batch.to_vec() })?,
+                "the holds check",
+            ).await?;
+            let action = format!("asking the remote what pallet \"{}\" holds", pallet);
+            let response = self.response_from_send(&action, posture, outcome)?;
+
+            if !response.status().is_success() {
+                return Err(self.error_of(response, &format!("the holds check of pallet \"{}\"", pallet)).await);
+            }
+
+            let body: HoldsResponse = self.read_presence_json(
+                response, body_utils::per_item_body_cap(batch.len(), HOLDS_BODY_BYTES_PER_CANDIDATE),
+                &action, posture, "holds answer",
+            ).await?;
+
+            holds.extend(body.holds.into_iter().filter(|(candidate, _)| batch.contains(candidate)));
+        }
+
+        Ok(holds)
     }
 
     /// The total-deadline budget to arm for *this* client instance's call to [`Self::resolve`] —

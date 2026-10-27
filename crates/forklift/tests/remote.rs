@@ -5898,15 +5898,17 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
 }
 
 #[test]
-fn scope_prune_keeps_history_the_remote_has_moved_past_until_it_is_lowered() {
-    // The remote moved on from a head this warehouse holds, so the remote's head is absent here
-    // and reaches nothing: the prune cannot tell the local head is on the remote and keeps its
-    // content. After a lower, the remote's head is here and reaches it, so the prune frees it.
+fn scope_prune_frees_history_the_remote_confirms_it_still_holds() {
+    // FORK-254: the remote moved on from the head this warehouse was franchised from, so its
+    // current head is absent here and reaches nothing. The franchise recorded that head, the
+    // prune asks the remote about it, and the remote confirms it still holds it, so the history
+    // it reaches is freed without a lower.
     let area = TestArea::new("scope-prune-remote-ahead");
     let _server = sparse_with_docs(&area);
 
     let base = pallet_head(&area, "sparse", "main");
     let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
+    assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", base)], "franchise records its head");
 
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
@@ -5918,13 +5920,143 @@ fn scope_prune_keeps_history_the_remote_has_moved_past_until_it_is_lowered() {
     let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
     assert_success(&pruned);
     let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
-    assert_eq!(report["data"]["freed"], 0, "{}", stdout(&pruned));
-    assert!(object_present(&area, "sparse", &docs_blob), "history the remote is not known to hold is kept");
+    assert_eq!(report["data"]["kept_unlifted"], 0, "{}", stdout(&pruned));
+    assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
+}
+
+/// Point the served root's `main` at `head`, as an `undo` on the server, or a pallet deleted there
+/// and re-created under its name, would.
+fn move_served_main(area: &TestArea, head: &str) {
+    std::fs::write(area.path("server-root/.forklift/pallets/main"), format!("{}\n", head)).unwrap();
+}
+
+#[test]
+fn scope_prune_frees_nothing_on_a_forged_held_head() {
+    // An entry is only a candidate: one naming a head the remote never took, here this
+    // warehouse's own unlifted head, is answered `not_held` and frees nothing.
+    let area = TestArea::new("scope-prune-forged-held-head");
+    let _server = sparse_with_docs(&area);
+
+    std::fs::write(area.path("sparse/docs/guide.md"), "guide v2, never lifted\n").unwrap();
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "local docs edit"]));
+    let head = pallet_head(&area, "sparse", "main");
+    let v2_blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
+
+    let record = area.path("sparse/.forklift/held-heads");
+    let mut text = std::fs::read_to_string(&record).unwrap();
+    text.push_str(&format!("{} main\n", head));
+    std::fs::write(&record, text).unwrap();
+    assert_eq!(held_heads(&area, "sparse").last(), Some(&format!("{} main", head)));
+
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&pruned);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
+    assert_eq!(report["data"]["kept_unlifted"], 3, "{}", stdout(&pruned));
+    assert!(object_present(&area, "sparse", &v2_blob), "a forged entry frees nothing");
+}
+
+#[test]
+fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
+    // A remote ref is not forward-only. The remote served `ahead` and this warehouse recorded it;
+    // then the served `main` moves back to `base` (an undo), and later to a head of another
+    // lineage (a pallet re-created under the name). Neither reaches `ahead`, so the remote
+    // answers `not_held` and the history only `ahead` reaches is kept both times.
+    let area = TestArea::new("scope-prune-remote-moved-back");
+    let _server = sparse_with_docs(&area);
+    let base = pallet_head(&area, "sparse", "main");
+
+    area.write_file("dev/src/api/a.txt", "api v2\n");
+    area.write_file("dev/docs/guide.md", "guide v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    let ahead = pallet_head(&area, "dev", "main");
+
+    assert_success(&area.forklift("dev", &["palletize", "side", &base]));
+    area.write_file("dev/src/api/a.txt", "api side\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "side"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    let side = pallet_head(&area, "dev", "side");
 
     assert_success(&area.forklift("sparse", &["lower"]));
+    assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", ahead)]);
+    let v2_blob = path_object_hash(&area, "sparse", &ahead, "docs/guide.md");
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+
+    for (moved_to, why) in [(&base, "an undo"), (&side, "a re-created pallet")] {
+        move_served_main(&area, moved_to);
+        let pruned = area.forklift("sparse", &["--json", "scope-prune", "--dry-run", "docs"]);
+        assert_success(&pruned);
+        let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
+        assert!(report["data"]["kept_unlifted"].as_u64().unwrap() > 0, "{}: {}", why, stdout(&pruned));
+    }
 
     assert_success(&area.forklift("sparse", &["scope-prune", "docs"]));
-    assert!(!object_present(&area, "sparse", &docs_blob), "after a lower the prune frees it");
+    assert!(object_present(&area, "sparse", &v2_blob), "history the remote no longer holds is kept");
+}
+
+#[test]
+fn scope_prune_refuses_and_changes_nothing_on_a_held_heads_record_that_does_not_parse() {
+    // A record that does not parse is an error, never an empty record: read as empty it would only
+    // free less, but it would hide that the record is broken.
+    let area = TestArea::new("scope-prune-corrupt-held-heads");
+    let _server = sparse_with_docs(&area);
+    let base = pallet_head(&area, "sparse", "main");
+    let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
+
+    std::fs::write(area.path("sparse/.forklift/held-heads"), "not a held-heads record\n").unwrap();
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    let scope_file = area.path("sparse/.forklift/config/fetch-scope");
+    let scope_before = std::fs::read(&scope_file).unwrap();
+
+    let refused = area.forklift("sparse", &["scope-prune", "docs"]);
+    assert!(!refused.status.success(), "a corrupt record refuses the prune");
+    assert!(stderr(&refused).contains("held-heads"), "{}", stderr(&refused));
+    assert!(object_present(&area, "sparse", &docs_blob), "nothing is freed");
+    assert_eq!(std::fs::read(&scope_file).unwrap(), scope_before, "the fetch scope is unchanged");
+}
+
+#[test]
+fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_answer_holds() {
+    // A remote too old to know the holds endpoint answers 404: the recorded head is not confirmed,
+    // so the prune frees only what the remote's current heads reach, as before the record.
+    let area = TestArea::new("scope-prune-holds-404");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&asked);
+    let proxy = InterceptingProxy::start(&server.url, move |path| {
+        path.ends_with("/holds").then(|| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        })
+    });
+    assert_success(&area.forklift(".", &["franchise", &proxy.url, "sparse",
+        "--only", "src/api", "--only", "docs"]));
+    let base = pallet_head(&area, "sparse", "main");
+    let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
+
+    area.write_file("dev/src/api/a.txt", "api v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&pruned);
+    assert!(asked.load(std::sync::atomic::Ordering::SeqCst) > 0, "the prune asked the remote");
+    let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
+    assert_eq!(report["data"]["freed"], 0, "{}", stdout(&pruned));
+    assert!(object_present(&area, "sparse", &docs_blob), "an unanswered holds check confirms nothing");
 }
 
 /// The entries of warehouse `name`'s held-heads record, as `<head> <pallet>` lines (the header
@@ -5938,9 +6070,9 @@ fn held_heads(area: &TestArea, name: &str) -> Vec<String> {
 }
 
 #[test]
-fn a_landed_lift_or_lower_records_its_head_and_a_refused_lift_records_nothing() {
+fn a_landed_lift_lower_or_franchise_records_its_head_and_a_refused_lift_records_nothing() {
     // FORK-254: lift records the head the remote accepted, replacing the recorded heads it descends
-    // from; lower records the head it was served. A lift the remote refuses records nothing, since
+    // from; lower and franchise record the head they were served. A lift the remote refuses records nothing, since
     // the record is written only after the compare-and-set.
     let area = TestArea::new("held-heads-record");
     let server = sparse_with_docs(&area);
@@ -5963,7 +6095,8 @@ fn a_landed_lift_or_lower_records_its_head_and_a_refused_lift_records_nothing() 
     assert_success(&area.forklift("sparse", &["stack", "local"]));
     let refused = area.forklift("sparse", &["lift"]);
     assert!(!refused.status.success(), "the remote diverged, so the lift is refused: {}", stdout(&refused));
-    assert_eq!(held_heads(&area, "sparse"), Vec::<String>::new(), "a refused lift records nothing");
+    assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", base)],
+               "the franchise recorded its head, and a refused lift records nothing");
 
     assert_success(&area.forklift("clone", &["lower"]));
     assert_eq!(pallet_head(&area, "clone", "main"), ahead);

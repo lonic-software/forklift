@@ -1,4 +1,5 @@
-//! The held-heads record: remote heads of working pallets this warehouse lifted to or lowered.
+//! The held-heads record: remote heads of working pallets this warehouse lifted to, lowered or
+//! franchised from.
 //!
 //! `scope-prune` counts as held by the remote only history it reaches from the remote's current
 //! heads, so once another warehouse lifts past every head held here, this warehouse's history of
@@ -15,9 +16,12 @@
 //! serialized by the [`RefLock`](crate::util::lock_utils::RefLock) and replace the file
 //! atomically, so a lock-free reader sees one whole version. A file that does not parse is an error, never an empty record.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use crate::globals;
+use crate::model::remote::HoldAnswer;
 use crate::util::lock_utils::RefLock;
+use crate::util::remote_utils::RemoteClient;
 use crate::util::{file_utils, merge_utils, object_utils, pallet_utils, record_utils};
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
@@ -81,7 +85,7 @@ pub fn candidates(pallet: &str) -> Result<Vec<String>, String> {
 /// meta pallet records nothing: prune's unlifted walk covers only user parcels.
 ///
 /// Call it only once the remote has accepted the head (a lift's compare-and-set returned) or, on a
-/// `lower`, the remote served it and this warehouse holds its history (the ref or the bay's base is
+/// `lower` or a `franchise`, the remote served it and this warehouse holds its history (the ref or the bay's base is
 /// at it or past it); never before a refusal check: an entry for a head the remote never took is harmless to a prune, which asks the remote,
 /// but it is a false record. The caller treats an error as a warning, because the head has landed either way and a lost entry
 /// only leaves prune as conservative as it is without one.
@@ -124,6 +128,55 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
     }
 
     write_held_heads(&lock, &entries)
+}
+
+/// The recorded heads the remote confirms it still holds: for each pallet the remote lists, the
+/// candidates its current head reaches, in one [`RemoteClient::holds`] call per pallet. These are
+/// what a prune may add to the remote's current heads as history the remote holds.
+///
+/// It fails closed. A candidate counts only on a `held` answer, so a forged entry, one the remote
+/// moved back past (an `undo` on the served root), one from a pallet deleted and re-created under
+/// its name, and one whose history the remote no longer has all count as not held. A pallet the
+/// remote no longer lists is not asked, and one whose call fails (a head too old to have the
+/// route answers `404`) confirms none of its candidates. A record that does not parse is the one
+/// error: the prune refuses rather than guess at it.
+///
+/// # Arguments
+/// * `client`         - The remote, already trust-checked by the caller.
+/// * `remote_pallets` - The remote's current heads by pallet wire name, from that handshake.
+pub async fn confirmed_heads(client: &RemoteClient, remote_pallets: &BTreeMap<String, String>) -> Result<Vec<String>, String> {
+    let mut confirmed = Vec::new();
+
+    // One call after another: prune is not a hot path, and each pallet is a single request.
+    for (pallet, candidates) in to_ask(&read_held_heads()?, remote_pallets) {
+        if let Ok(answers) = client.holds(&pallet, &candidates).await {
+            confirmed.extend(held(&candidates, &answers));
+        }
+    }
+
+    Ok(confirmed)
+}
+
+/// The candidates to ask about, by pallet: the recorded heads of every pallet the remote lists,
+/// less its current head, which the caller already counts.
+fn to_ask(entries: &[HeldHead], remote_pallets: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
+    let mut to_ask: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for entry in entries {
+        if remote_pallets.get(&entry.pallet).is_some_and(|current| *current != entry.head) {
+            to_ask.entry(entry.pallet.clone()).or_default().push(entry.head.clone());
+        }
+    }
+
+    to_ask
+}
+
+/// The candidates answered [`HoldAnswer::Held`]; every other answer, and none, confirms nothing.
+fn held(candidates: &[String], answers: &BTreeMap<String, HoldAnswer>) -> Vec<String> {
+    candidates.iter()
+        .filter(|candidate| answers.get(*candidate) == Some(&HoldAnswer::Held))
+        .cloned()
+        .collect()
 }
 
 /// Replace the record. Only under the ref lock.
@@ -197,6 +250,37 @@ mod tests {
         let expected: Vec<String> = (2..CAP_PER_PALLET + 2).map(hash).collect();
         assert_eq!(candidates("main").unwrap(), expected, "the two oldest went, in order");
         assert_eq!(candidates("other").unwrap(), vec![hash(1000)], "another pallet's head is not dropped");
+    }
+
+    #[test]
+    fn only_listed_pallets_are_asked_and_their_current_head_is_not() {
+        let entry = |n: usize, pallet: &str| HeldHead { head: hash(n), pallet: pallet.to_string() };
+        let entries = [entry(1, "main"), entry(2, "main"), entry(3, "gone"), entry(4, "side")];
+        let remote = BTreeMap::from([
+            ("main".to_string(), hash(2)),
+            ("side".to_string(), hash(9)),
+            ("other".to_string(), hash(8)),
+        ]);
+
+        assert_eq!(to_ask(&entries, &remote), BTreeMap::from([
+            ("main".to_string(), vec![hash(1)]),
+            ("side".to_string(), vec![hash(4)]),
+        ]));
+    }
+
+    #[test]
+    fn only_a_held_answer_confirms_a_candidate() {
+        let candidates: Vec<String> = (1..=5).map(hash).collect();
+        let answers = BTreeMap::from([
+            (hash(1), HoldAnswer::Held),
+            (hash(2), HoldAnswer::NotHeld),
+            (hash(3), HoldAnswer::Unknown),
+            (hash(5), HoldAnswer::Held),
+            (hash(6), HoldAnswer::Held),
+        ]);
+
+        assert_eq!(held(&candidates, &answers), vec![hash(1), hash(5)],
+            "not_held, unknown and no answer confirm nothing, and an answer for a hash not asked is not taken");
     }
 
     #[test]

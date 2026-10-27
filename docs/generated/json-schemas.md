@@ -4704,7 +4704,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "kept_unlifted": {
-      "description": "Candidates kept because lifting history the remote does not hold reads them: work stacked\nhere and never lifted, or lifted to a remote head not lowered here since. Some may be the\nonly copy, the rest are base trees the lift compares against; a later prune of the same\npath frees them once that history is lifted.",
+      "description": "Candidates kept because lifting history the remote does not hold reads them: work stacked\nhere and never lifted, or lifted to a remote head the remote did not confirm. Some may be the\nonly copy, the rest are base trees the lift compares against; a later prune of the same\npath frees them once that history is lifted.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"

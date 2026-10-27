@@ -1729,12 +1729,16 @@ scope has already narrowed but some objects are left behind. Running `scope-prun
 *same* path resumes rather than refusing "not a fetched path" — it finishes freeing whatever is
 left, or reports there is nothing left to free.
 
-`lift` and `lower` keep a small record of the remote heads they landed or were served
-(`.forklift/held-heads`, at most 16 per pallet), so that a prune can later ask the remote about
-history its current heads no longer reach; nothing reads it yet. A `lift` or `lower` that cannot
-write the record prints a `held_head_unrecorded` warning and keeps its result and exit code. A
-record that does not parse can be removed: it only names heads to ask the remote about, and the
-next `lift` or `lower` starts a new one.
+`lift`, `lower` and `franchise` keep a small record of the remote heads they landed or were served
+(`.forklift/held-heads`, at most 16 per pallet). A prune asks the remote whether it still holds
+each recorded head its current heads have moved past, and frees the history of the heads it
+confirms, so another warehouse lifting ahead does not keep your history pinned until you lower.
+A head the remote does not confirm frees nothing: one an `undo` on the server moved back past, one
+of a pallet deleted and re-created there, and every head when the server is too old to answer. A
+`lift`, `lower` or `franchise` that cannot write the record prints a `held_head_unrecorded`
+warning and keeps its result and exit code. A record that does not parse makes a prune refuse,
+changing nothing; it can be removed, since it only names heads to ask the remote about, and the
+next `lift`, `lower` or `franchise` starts a new one.
 
 ---
 

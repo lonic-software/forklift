@@ -900,15 +900,15 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
     }
 }
 
-/// The `--json` warning code for a remote head that a lift landed or a lower was served but that
-/// could not be added to the held-heads record.
+/// The `--json` warning code for a remote head that a lift landed, or a lower or franchise was
+/// served, but that could not be added to the held-heads record.
 pub const CODE_HELD_HEAD_UNRECORDED: &str = "held_head_unrecorded";
 
 /// What to do about [`CODE_HELD_HEAD_UNRECORDED`]. The record only nominates heads for a later
 /// prune to ask the remote about, so the command's own work stands.
 pub const HELD_HEAD_UNRECORDED_NEXT_STEP: &str =
     "Resolve the reported cause; a held-heads record that does not parse can be removed, and the \
-     next lift or lower starts a new one. The command's own work is unaffected.";
+     next lift, lower or franchise starts a new one. The command's own work is unaffected.";
 
 /// Surface a remote head left out of the held-heads record, on the stderr side-channel the other
 /// warnings use: the command succeeded, and the exit code stays its own.
