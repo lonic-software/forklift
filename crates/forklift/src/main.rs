@@ -142,14 +142,17 @@ fn parse_or_exit() -> Cli {
         command = command.color(choice.for_clap());
     }
 
-    let error = match command.try_get_matches_from(&args) {
+    let error = match command.try_get_matches_from_mut(&args) {
         Ok(mut matches) => {
             output::set_command(matches.subcommand_name());
 
             match Cli::from_arg_matches_mut(&mut matches) {
                 Ok(cli) => match cross_argument_error(&cli) {
                     None => return cli,
-                    Some(message) => Cli::command().error(ErrorKind::MissingRequiredArgument, message),
+                    // Raised on the subcommand, so the usage line clap prints is its own.
+                    Some((name, message)) => command.find_subcommand_mut(name)
+                        .expect("the parsed subcommand exists")
+                        .error(ErrorKind::MissingRequiredArgument, message),
                 },
                 Err(error) => error,
             }
@@ -175,12 +178,13 @@ fn parse_or_exit() -> Cli {
 /// A combination of arguments clap's attributes cannot express, refused as a usage error like
 /// the ones they do: `palletize --remote` with a pallet name is a delete or a restore, never a
 /// listing.
-fn cross_argument_error(cli: &Cli) -> Option<&'static str> {
+fn cross_argument_error(cli: &Cli) -> Option<(&'static str, &'static str)> {
     match &cli.command {
-        Command::Palletize { name: Some(_), remote: true, delete: false, restore: false, .. } => Some(
+        Command::Palletize { name: Some(_), remote: true, delete: false, restore: false, .. } => Some((
+            "palletize",
             "\"--remote\" with a pallet name needs \"--delete\" or \"--restore\"; without a name, \
             \"forklift palletize --remote\" lists the remote's pallets"
-        ),
+        )),
         _ => None,
     }
 }
