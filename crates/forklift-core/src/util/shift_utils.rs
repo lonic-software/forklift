@@ -59,10 +59,10 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
     let mut ops: Vec<FileOp> = Vec::new();
     let mut removed_dirs: Vec<String> = Vec::new();
 
-    // In a scoped (sparse) bay this restricts materialization to the in-scope subtree(s): the
-    // walk copies nothing out of scope, so no out-of-scope blob is ever written and no absent
-    // object is touched. The scope is full (no restriction) in a plain bay or the main tree, so
-    // this is a no-op there and the behavior is byte-for-byte what it always was.
+    // In a scoped checkout (a scoped bay, or a sparse warehouse's main tree) this restricts
+    // materialization to the in-scope subtree(s): the walk copies nothing out of scope, so no
+    // out-of-scope blob is ever written and no absent object is touched. The scope is full (no
+    // restriction) in a plain bay or a full warehouse's main tree, so this is a no-op there.
     let scope = scope_utils::current_scope()?;
 
     let mut aliased_removes = Vec::new();
@@ -1249,9 +1249,9 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
                                   provenance: TreeProvenance) -> Result<TreeInventories, String> {
     let root_tree = object_utils::load_tree(root_tree_hash)?;
 
-    // In a scoped bay only the in-scope subtree(s) are inventoried; the spine is descended but
-    // its out-of-scope files and siblings are never loaded or shard-ed. Full scope (a plain bay
-    // or the main tree) inventories the whole tree exactly as before.
+    // In a scoped checkout only the in-scope subtree(s) are inventoried; the spine is descended
+    // but its out-of-scope files and siblings are never loaded or shard-ed. Full scope (a plain
+    // bay or a full warehouse's main tree) inventories the whole tree.
     let scope = scope_utils::current_scope()?;
 
     let mut shards: Vec<(String, Inventory)> = Vec::new();

@@ -145,10 +145,10 @@ async fn collect_staged_changes_impl(head_tree_hash: Option<&str>, collect_shard
         None => None,
     };
 
-    // In a scoped bay the head carries out-of-scope subtrees the dock never materialized: those
-    // must be classified as sealed (skipped), not force-loaded and reported as `Removed`. Full
-    // scope (a plain bay or the main tree) classifies everything in scope, so the walk is
-    // unchanged there.
+    // In a scoped checkout the head carries out-of-scope subtrees the dock never materialized:
+    // those must be classified as sealed (skipped), not force-loaded and reported as `Removed`.
+    // Full scope (a plain bay or a full warehouse's main tree) classifies everything in scope,
+    // so the walk is unchanged there.
     let scope = Arc::new(scope_utils::current_scope()?);
 
     let context = Arc::new(ChangeWalkContext::new(collect_shards));

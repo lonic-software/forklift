@@ -5220,8 +5220,8 @@ fn narrow_shrinks_the_scope_and_frees_nothing() {
 #[test]
 fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     // A sparse workspace only ever proved its out-of-scope closure present on its origin, so it
-    // refuses to lift to a different remote up front, with a stable code — and even if forced
-    // (origin unset), the lift fails loudly rather than silently corrupting the other remote.
+    // refuses to lift to a different remote up front, with a stable code — and unsetting the
+    // recorded origin does not get around it: a partial warehouse with no origin is refused too.
     let origin = TestArea::new("non-origin");
     let server1 = Server::start(&origin, None);
 
@@ -5246,11 +5246,25 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     assert!(json["error"]["message"].as_str().unwrap().contains(&server1.url),
         "the refusal names the origin: {}", stdout(&refused));
 
-    // Defense in depth: forcing it (origin unset) does not silently succeed — the sparse history
-    // cannot be closed against the empty remote, so it fails loudly.
+    // Unsetting the origin is refused at the client the same way, naming the ways out, rather than
+    // left to the empty remote's closure check.
+    //
+    // Revert: let `ensure_origin_remote` pass a partial warehouse with no origin → the lift fails at
+    // the remote instead, with another code → red.
     assert_success(&origin.forklift("sparse", &["config", "--unset", "remote.origin"]));
-    let forced = origin.forklift("sparse", &["lift"]);
-    assert!(!forced.status.success(), "a forced non-origin sparse lift must fail loudly: {}", stdout(&forced));
+    let forced = origin.forklift("sparse", &["--json", "lift"]);
+    assert_eq!(forced.status.code(), Some(11), "an originless sparse lift exits 11: {}", stderr(&forced));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&forced)).unwrap();
+    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", stdout(&forced));
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("is not recorded") && message.contains("forklift config remote.origin <url>"),
+        "the refusal names the missing origin and the ways out: {}", message);
+
+    // Recording the origin again restores the ordinary guard.
+    assert_success(&origin.forklift("sparse", &["config", "remote.origin", &server1.url]));
+    let again = origin.forklift("sparse", &["--json", "lift"]);
+    assert_eq!(again.status.code(), Some(11), "{}", stderr(&again));
+    assert!(stdout(&again).contains(&server1.url), "the origin guard is back: {}", stdout(&again));
 }
 
 /// A sparse warehouse's partiality is recorded in its marker, so deleting its fetch scope no longer
@@ -5290,6 +5304,81 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
     assert!(!area.path("sparse/docs").exists(), "expand fetched nothing");
     assert_success(&area.forklift("dev", &["lower"]));
     assert_eq!(area.read_file("dev/src/api/a.txt"), "api v1\n", "the refused lift reached the remote");
+}
+
+/// A sparse warehouse's main tree records its scope when it is franchised, so deleting that file
+/// does not make the main tree read as checking out every path: stocktake and stack refuse over
+/// staged work, naming the missing file and franchising again, instead of recording the paths it
+/// never fetched as removed.
+///
+/// Revert: read a sparse main tree with no scope file as full → the stack goes through (or tries
+/// to load the unfetched docs tree) instead of refusing → red.
+#[test]
+fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
+    let area = TestArea::new("sparse-main-scope-gone");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/d.txt", "docs v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    area.write_file("sparse/src/api/a.txt", "api v2\n");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    std::fs::remove_file(area.path("sparse/.forklift/scope")).unwrap();
+
+    for args in [&["stocktake"][..], &["stack", "second"]] {
+        let refused = area.forklift("sparse", &[&["--json"][..], args].concat());
+        assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
+        let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
+        assert!(message.contains("recorded as sparse but its main tree's scope"), "{:?}: {}", args, message);
+        assert!(message.contains("is missing") && message.contains("Franchise the remote again"), "{:?}: {}", args, message);
+    }
+    let log = area.forklift("sparse", &["log"]);
+    assert!(!stdout(&log).contains("second"), "nothing was stacked: {}", stdout(&log));
+}
+
+/// In a sparse warehouse every checkout is scoped, so an unscoped `bay add` is refused before any
+/// bay state exists, naming --scope and the fetch scope; the name stays free, and a scoped bay
+/// under it is then added.
+///
+/// Revert: drop the refusal in `resolve_scope` → the bay is created, or refused only after its
+/// pallet and directory exist → red.
+#[test]
+fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
+    let area = TestArea::new("sparse-unscoped-bay");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/d.txt", "docs v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+
+    let bay_dir = area.path("bay-plain");
+    let refused = area.forklift("sparse", &["--json", "bay", "add", "plain", bay_dir.to_str().unwrap()]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("sparse, so a bay cannot check out every path") && message.contains("--scope")
+        && message.contains("src/api"), "{}", message);
+    assert!(!bay_dir.exists(), "no bay directory is left behind");
+    assert!(!area.path("sparse/.forklift/bays/plain").exists(), "no bay state is left behind");
+    let pallets = area.forklift("sparse", &["palletize"]);
+    assert!(!stdout(&pallets).contains("plain"), "no pallet is left behind: {}", stdout(&pallets));
+
+    // A root scope names the whole tree too; the refusal points at the fetch scope, not at the plain
+    // bay refused above.
+    let root = area.forklift("sparse", &["--json", "bay", "add", "plain", bay_dir.to_str().unwrap(), "--scope", "."]);
+    let message = json_of(&root)["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("Name paths within the fetch scope (src/api)") && !message.contains("plain bay"), "{}", message);
+
+    assert_success(&area.forklift("sparse", &["bay", "add", "plain", bay_dir.to_str().unwrap(), "--scope", "src/api"]));
+    assert_eq!(area.read_file("sparse/.forklift/bays/plain/scope"), "/forklift-scope 3\nsrc/api\n");
 }
 
 /// A `--cache` franchise is a partial warehouse, as a sparse one is: it skips the bundle, writes

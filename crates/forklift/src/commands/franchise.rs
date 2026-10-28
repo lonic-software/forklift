@@ -511,13 +511,23 @@ async fn franchise_into_prepared_target(
     let mode = partial.prepare_mode(&fetch_scope);
     warehouse_utils::prepare_warehouse(mode)?;
 
-    let recorded = (warehouse_utils::warehouse_mode()?, scope_utils::read_fetch_scope()?, scope_utils::read_main_tree_scope()?);
-    if recorded != (mode.mode(), fetch_scope.clone(), fetch_scope.clone()) {
+    // A standing record the readers refuse is a mismatch too, reported the same way: the way out
+    // is this directory's, not the one the reader names for a warehouse in use.
+    let recorded = (|| Ok::<_, String>((
+        warehouse_utils::warehouse_mode()?, scope_utils::read_fetch_scope()?, scope_utils::read_main_tree_scope()?
+    )))();
+    let found = match recorded {
+        Ok(recorded) if recorded == (mode.mode(), fetch_scope.clone(), fetch_scope.clone()) => None,
+        Ok((mode, fetch, main)) => Some(format!(
+            "a {} one fetching {} and checking out {}", mode.word(), describe_scope(&fetch), describe_scope(&main)
+        )),
+        Err(reason) => Some(format!("one Forklift cannot use ({})", reason)),
+    };
+    if let Some(found) = found {
         return Err(format!(
-            "\"{}\" already records a warehouse other than the one this franchise asks for: a {} one \
-            fetching {} and checking out {}. Delete \"{}\" and franchise it again.",
-            attempt.directory, recorded.0.word(), describe_scope(&recorded.1), describe_scope(&recorded.2),
-            attempt.directory
+            "\"{}\" already records a warehouse other than the one this franchise asks for: {}. \
+            Delete \"{}\" and franchise it again.",
+            attempt.directory, found, attempt.directory
         ));
     }
 

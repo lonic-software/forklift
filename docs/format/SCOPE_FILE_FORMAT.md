@@ -1,17 +1,19 @@
 # Scope file format
 This format records a **task-scoped sparse-workspace scope** (§7.6): the subtree path
-prefixes a scoped bay materializes and operates on. It is used by two files:
+prefixes a checkout materializes and operates on. It is used by three files:
 
-- **Bay materialization scope** — `.forklift/bays/<name>/scope` (bay-local). What a scoped
-  bay checks out, stages and stacks.
+- **Bay materialization scope** — `.forklift/bays/<name>/scope` (bay-local). What a bay checks
+  out, stages and stacks. Every bay has one, an unscoped bay's naming every path.
+- **Main-tree materialization scope** — `.forklift/scope`. The same for the warehouse's main
+  working tree; only a sparse warehouse's main tree has one.
 - **Warehouse fetch scope** — `.forklift/config/fetch-scope` (shared across bays). What the
-  warehouse has fetched at all. The bay materialization scope is always a subset (⊆) of the
-  fetch scope. Only a warehouse whose [marker](STATE_RECORD_FORMAT.md#files) records it as
+  warehouse has fetched at all. Every materialization scope is a subset (⊆) of the fetch
+  scope. Only a warehouse whose [marker](STATE_RECORD_FORMAT.md#files) records it as
   `sparse` has one; see [the fetch scope and the mode](#the-fetch-scope-and-the-warehouse-mode).
 
 Both files are **local only and never tracked**: scope is a property of *this* checkout, not
 of the project, so it is never written into a parcel, pushed to a remote, or imposed on
-collaborators. A plain bay (or the main tree) has no scope file at all.
+collaborators. Which of them must exist is set out [below](#which-scope-files-must-exist).
 
 ## Structure
 A [state record](STATE_RECORD_FORMAT.md) of kind `scope`: a format header line, then one
@@ -34,11 +36,10 @@ Where:
   (including the last).
 
 ## Semantics
-- An **absent or empty file** means **full scope** — no restriction, the whole tree is in
-  scope. This is what makes a scoped bay opt-in: without a scope file, every scope-aware
-  operation behaves exactly as an unscoped workspace.
-  The fetch scope is the exception: whether it may be absent, and whether it may be empty, is
-  decided by the warehouse mode ([below](#the-fetch-scope-and-the-warehouse-mode)).
+- An **empty file** means **full scope** — no restriction, the whole tree is in scope, and
+  every scope-aware operation behaves exactly as in an unscoped checkout. An **absent** file is
+  never read as full on its own account: whether each file may be absent, or empty, is decided
+  by whose scope it is and by the warehouse mode ([below](#which-scope-files-must-exist)).
 - A header followed by no prefix is **refused**, and so is one with a root prefix (an empty
   string or `/`) anywhere among its prefixes, since the root takes in everything. Forklift
   never writes either: the full scope is the empty file.
@@ -51,10 +52,27 @@ Where:
   which wrote prefixes raw, so a prefix holding a line break read back as two. Nothing is
   migrated.
   The way out depends on the file: for the fetch scope or the main tree's scope, franchise
-  the remote again, into a new directory; for a bay's scope, remove the bay and add it again
-  with `bay add --scope`.
+  the remote again, into a new directory; for a bay's scope, remove the bay with `bay remove`
+  and add a new one under another name (a removed bay keeps its pallet, so its name stays
+  taken; copy any uncommitted work across by hand).
 
-## The fetch scope and the warehouse mode
+## Which scope files must exist
+A file is checked against these rules each time it is read, and every refusal names the way
+out.
+
+| File | Full or cache warehouse | Sparse warehouse | Way out |
+|---|---|---|---|
+| Fetch scope | absent | present, naming a prefix | absent where required: franchise again; present where not: delete it |
+| Main-tree scope | absent | present, naming a prefix, ⊆ the fetch scope | the same |
+| Bay scope | present, any scope | present, naming a prefix, ⊆ the fetch scope | remove the bay, add a new one under another name |
+
+The main tree's scope follows the mode, as the fetch scope does: only a sparse franchise
+scopes the main tree, and `narrow` cannot scope a checkout that holds every path. A bay's scope
+is the bay's own, since a full warehouse may hold a scoped bay, so `bay add` writes it for every
+bay, the empty file for an unscoped one, and a bay without one is refused in every mode. In a
+sparse warehouse `bay add` without `--scope` is refused before any bay state is made.
+
+### The fetch scope and the warehouse mode
 The warehouse marker records whether the warehouse is `full`, `sparse` or a `cache`, and the
 fetch-scope file must agree with it. A full warehouse holds every path and a cache fetches
 content as it needs it, so neither has a fetch-scope file. A sparse warehouse

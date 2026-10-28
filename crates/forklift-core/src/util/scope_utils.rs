@@ -114,9 +114,10 @@ pub enum ScopeClass {
 /// A bay's (or the warehouse's) materialization scope: a set of in-scope path prefixes.
 ///
 /// An empty set means **full scope** — no restriction, so [`classify`](Self::classify)
-/// returns [`ScopeClass::InScope`] for every path. This is what makes a scoped bay opt-in:
-/// a plain bay (or the main tree) has no scope file, reads back as full, and every
-/// scope-aware code path collapses to today's behavior unchanged.
+/// returns [`ScopeClass::InScope`] for every path, and every scope-aware code path collapses to
+/// the unscoped behavior. A full scope is recorded as the empty file; whether a scope file may be
+/// absent is decided by whose it is ([`read_fetch_scope`], [`read_main_tree_scope`],
+/// [`read_bay_scope`]), never by reading an absence as full.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationScope {
     /// Normalized in-scope prefixes: warehouse path keys (no leading/trailing slash, `/`
@@ -338,17 +339,12 @@ pub fn fetch_scope_path() -> PathBuf {
     globals::forklift_root().join(FOLDER_NAME_CONFIG).join(FILE_NAME_FETCH_SCOPE)
 }
 
-/// Read a scope file, returning [`MaterializationScope::full`] when the file is absent (the
-/// unscoped default that keeps plain bays and the main tree behaving exactly as before).
+/// Read a scope file, with an absent file as `None`: what an absence means depends on whose scope
+/// it is and on the warehouse's mode, so each reader decides.
 ///
 /// # Arguments
 /// * `path`   - The scope file.
 /// * `remedy` - The way out when the file is in the older, unversioned format.
-fn read_scope_file(path: &Path, remedy: &str) -> Result<MaterializationScope, String> {
-    Ok(read_scope_file_if_present(path, remedy)?.unwrap_or_else(MaterializationScope::full))
-}
-
-/// [`read_scope_file`], with an absent file as `None`.
 fn read_scope_file_if_present(path: &Path, remedy: &str) -> Result<Option<MaterializationScope>, String> {
     match std::fs::read(path) {
         Ok(bytes) => MaterializationScope::from_bytes(&bytes, remedy).map(Some).map_err(|reason| {
@@ -359,15 +355,28 @@ fn read_scope_file_if_present(path: &Path, remedy: &str) -> Result<Option<Materi
     }
 }
 
+/// Whether a scope file is present, without reading it: a scope file found where none belongs is
+/// refused whatever it holds.
+fn scope_file_is_present(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Error while reading the scope file \"{}\": {}", path.to_string_lossy(), e)),
+    }
+}
+
 /// Write a scope file atomically (its parent folder must already exist).
 fn write_scope_file(path: &Path, scope: &MaterializationScope) -> Result<(), String> {
     crate::util::file_utils::write_file_atomically(path, &scope.to_bytes())
 }
 
-/// The active bay's materialization scope (full when the bay has no scope file — i.e. it is
-/// a plain, unscoped bay or the main tree).
+/// The active checkout's materialization scope: the main tree's ([`read_main_tree_scope`]) or the
+/// active bay's ([`read_bay_scope`]), checked the same way.
 pub fn current_scope() -> Result<MaterializationScope, String> {
-    read_scope_file(&bay_scope_path(), current_scope_remedy())
+    match globals::active_bay() {
+        Some(_) => read_bay_scope_at(&bay_scope_path()),
+        None => read_main_tree_scope(),
+    }
 }
 
 /// Whether the active bay is scoped (has a non-full materialization scope). A quick gate for
@@ -393,17 +402,16 @@ fn read_fetch_state() -> Result<(WarehouseMode, MaterializationScope), String> {
         // Only a sparse warehouse is ever given a fetch scope, so one here was put in place by
         // hand. It is refused whatever it holds rather than parsed, and deleting it is safe: the
         // mode, not the file, says what the warehouse holds.
-        let kind = if mode == WarehouseMode::Full { "full" } else { "a cache" };
-        return match std::fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((mode, MaterializationScope::full())),
-            Err(e) => Err(format!("Error while reading the scope file \"{}\": {}", path.to_string_lossy(), e)),
-            Ok(_) => Err(format!(
-                "The warehouse is recorded as {} but holds a fetch scope (\"{}\"), which only a sparse \
-                 warehouse has, so Forklift cannot tell what it has fetched. Delete that file: the warehouse \
-                 is {} without it.",
-                kind, path.to_string_lossy(), kind
-            )),
-        };
+        if !scope_file_is_present(&path)? {
+            return Ok((mode, MaterializationScope::full()));
+        }
+        let kind = mode_kind(mode);
+        return Err(format!(
+            "The warehouse is recorded as {} but holds a fetch scope (\"{}\"), which only a sparse \
+             warehouse has, so Forklift cannot tell what it has fetched. Delete that file: the warehouse \
+             is {} without it.",
+            kind, path.to_string_lossy(), kind
+        ));
     }
 
     let missing = |found: &str| format!(
@@ -418,51 +426,126 @@ fn read_fetch_state() -> Result<(WarehouseMode, MaterializationScope), String> {
     }
 }
 
-/// The materialization scope of a named bay (full when the bay has no scope file). Read from
-/// any checkout so a warehouse-level operation — scope-prune — can intersect every bay's scope
-/// before freeing anything, not only the invoking bay's.
+/// How a refusal names a warehouse that is not sparse.
+fn mode_kind(mode: WarehouseMode) -> &'static str {
+    if mode == WarehouseMode::Full { "full" } else { "a cache" }
+}
+
+/// The materialization scope of a named bay. Read from any checkout so a warehouse-level
+/// operation — scope-prune — can intersect every bay's scope before freeing anything, not only
+/// the invoking bay's.
+///
+/// A bay's scope is its own, since a full warehouse may hold a scoped bay, so every bay records
+/// it, "every path" included, and a bay with no scope file is refused in every mode: reading the
+/// absence as full would check out paths the bay never held. In a sparse warehouse the scope must
+/// also name a path and lie within the fetch scope.
 ///
 /// # Arguments
 /// * `name` - The bay's name (as listed by `bay_utils::list_bays`).
 pub fn read_bay_scope(name: &str) -> Result<MaterializationScope, String> {
-    read_scope_file(&crate::util::bay_utils::bay_state_dir(name).join(FILE_NAME_BAY_SCOPE), REMEDY_READD_BAY)
+    read_bay_scope_at(&crate::util::bay_utils::bay_state_dir(name).join(FILE_NAME_BAY_SCOPE))
 }
 
-/// The materialization scope of the warehouse's main working tree (full when it has none).
-/// The main tree keeps its bay-local state directly under the shared root, so its scope file
-/// is at a fixed location every checkout can read — needed by scope-prune, which must intersect
-/// the main tree's scope too, not only the invoking checkout's and the named bays'.
+fn read_bay_scope_at(path: &Path) -> Result<MaterializationScope, String> {
+    let refused = |found: &str| format!(
+        "The bay's scope (\"{}\") {}, so Forklift cannot tell which paths the bay checks out. {}",
+        path.to_string_lossy(), found, REMEDY_READD_BAY
+    );
+    let Some(scope) = read_scope_file_if_present(path, REMEDY_READD_BAY)? else {
+        return Err(refused("is missing"));
+    };
+
+    let fetch = read_fetch_scope()?;
+
+    if !fetch.is_full() {
+        if scope.is_full() {
+            return Err(refused("names no path, which only a bay of a warehouse that is not sparse may do"));
+        }
+        if !scope.subset_of(&fetch) {
+            return Err(refused("is not within the warehouse's fetch scope"));
+        }
+    }
+
+    Ok(scope)
+}
+
+/// The materialization scope of the warehouse's main working tree. The main tree keeps its
+/// bay-local state directly under the shared root, so its scope file is at a fixed location every
+/// checkout can read — needed by scope-prune, which must intersect the main tree's scope too, not
+/// only the invoking checkout's and the named bays'.
+///
+/// Unlike a bay's, the main tree's scope follows the warehouse's mode: only a sparse franchise
+/// scopes it. A full or cache warehouse's main tree has no scope file and checks out every path; a
+/// file found there was put in place by hand and is refused whatever it holds. A sparse
+/// warehouse's main tree must have one that names a path within the fetch scope, so deleting it
+/// cannot make the main tree read as holding every path.
 pub fn read_main_tree_scope() -> Result<MaterializationScope, String> {
-    read_scope_file(&globals::forklift_root().join(FILE_NAME_BAY_SCOPE), REMEDY_REFRANCHISE)
+    let (mode, fetch) = read_fetch_state()?;
+    let path = globals::forklift_root().join(FILE_NAME_BAY_SCOPE);
+
+    if mode != WarehouseMode::Sparse {
+        if !scope_file_is_present(&path)? {
+            return Ok(MaterializationScope::full());
+        }
+        return Err(format!(
+            "The warehouse is recorded as {} but its main tree holds a scope (\"{}\"), which only a \
+             sparse warehouse's main tree has, so Forklift cannot tell which paths it checks out. Delete \
+             that file: the main tree checks out every path without it.",
+            mode_kind(mode), path.to_string_lossy()
+        ));
+    }
+
+    let refused = |found: &str| format!(
+        "The warehouse is recorded as sparse but its main tree's scope (\"{}\") {}, so Forklift cannot \
+         tell which paths the main tree checks out. {}",
+        path.to_string_lossy(), found, REMEDY_REFRANCHISE
+    );
+    match read_scope_file_if_present(&path, REMEDY_REFRANCHISE)? {
+        None => Err(refused("is missing")),
+        Some(scope) if scope.is_full() => Err(refused("names no path")),
+        Some(scope) if !scope.subset_of(&fetch) => Err(refused("is not within the warehouse's fetch scope")),
+        Some(scope) => Ok(scope),
+    }
 }
 
-/// The way out for an older-format scope file: the warehouse's own fetch scope, and the main
-/// tree's scope a sparse franchise records, are rebuilt by franchising again; a bay's scope by
-/// adding the bay again.
+/// The way out for a warehouse's fetch scope or main-tree scope Forklift cannot use: both are
+/// written when the warehouse is prepared, so it is franchised again.
 const REMEDY_REFRANCHISE: &str = "Franchise the remote again, into a new directory.";
-const REMEDY_READD_BAY: &str = "Remove the bay and add it again with \"bay add --scope\".";
+/// The way out for a bay's scope Forklift cannot use. A removed bay keeps its pallet, so its name
+/// stays taken and the new bay needs another.
+const REMEDY_READD_BAY: &str = "Remove the bay with \"bay remove\" and add a new one under another name; \
+    copy any uncommitted work across by hand.";
 
-/// The remedy for the active checkout's scope file: the main tree's, or a bay's.
-fn current_scope_remedy() -> &'static str {
-    if globals::active_bay().is_some() { REMEDY_READD_BAY } else { REMEDY_REFRANCHISE }
-}
-
-/// Set the active bay's materialization scope, refusing a scope that is not ⊆ the warehouse
-/// fetch scope (a bay can never materialize what the warehouse never fetched, design §3.1).
+/// Set the active checkout's materialization scope, refusing one the readers would refuse: a
+/// scope that is not ⊆ the warehouse fetch scope (a checkout can never materialize what the
+/// warehouse never fetched, design §3.1), a full one in a sparse warehouse, and any scope for the
+/// main tree of a warehouse that is not sparse ([`read_main_tree_scope`]).
 ///
 /// # Arguments
-/// * `scope` - The materialization scope to record for the active bay.
+/// * `scope` - The materialization scope to record for the active checkout.
 pub fn set_bay_scope(scope: &MaterializationScope) -> Result<(), String> {
+    let main_tree = globals::active_bay().is_none();
+    if main_tree && warehouse_utils::warehouse_mode()? != WarehouseMode::Sparse {
+        return Err("Only a sparse warehouse's main tree records a scope.".to_string());
+    }
+
     set_bay_scope_at(&bay_scope_path(), scope)
 }
 
-/// [`set_bay_scope`] for the bay whose state dir is `dir`, before its context is entered.
+/// [`set_bay_scope`] for the bay whose state dir is `dir`, before its context is entered. Every bay
+/// records its scope, a full one included ([`read_bay_scope`]).
 pub fn set_bay_scope_in(dir: &std::path::Path, scope: &MaterializationScope) -> Result<(), String> {
     set_bay_scope_at(&dir.join(FILE_NAME_BAY_SCOPE), scope)
 }
 
 fn set_bay_scope_at(path: &std::path::Path, scope: &MaterializationScope) -> Result<(), String> {
     let fetch = read_fetch_scope()?;
+
+    if !fetch.is_full() && scope.is_full() {
+        return Err(
+            "A checkout of a sparse warehouse must be scoped; it cannot check out every path.".to_string()
+        );
+    }
 
     if !scope.subset_of(&fetch) {
         return Err(
@@ -685,6 +768,24 @@ pub fn non_origin_lift_refusal(origin: &str, other: &str) -> CoreError {
             because that remote may lack objects this warehouse does not hold and never verified \
             there. {}",
             origin, other, next_step
+        ),
+        next_step,
+    )
+}
+
+/// A ready-made `non_origin_lift` refusal for a partial warehouse whose origin is not recorded:
+/// without it Forklift cannot tell whether the configured remote holds what this warehouse lacks.
+pub fn unrecorded_origin_lift_refusal() -> CoreError {
+    let next_step = "Franchise the remote again, into a new directory, or record the remote this \
+        warehouse was franchised from with \"forklift config remote.origin <url>\".";
+
+    refusal(
+        RefusalCode::NonOriginLift,
+        format!(
+            "This is a partial warehouse, but the remote it was franchised from (\"remote.origin\") \
+            is not recorded, so Forklift cannot tell whether the remote it would lift to holds the \
+            objects this warehouse does not. {}",
+            next_step
         ),
         next_step,
     )

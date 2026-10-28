@@ -97,10 +97,9 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
     // The materialization scope goes in before the marker, so recovery fills in only the scope:
     // the materialize (and every later scope-aware verb in this bay, `forklift heal` included)
-    // reads it back through `scope_utils::current_scope`.
-    if !scope.is_full() {
-        scope_utils::set_bay_scope_in(&bay_utils::bay_state_dir(name), &scope)?;
-    }
+    // reads it back through `scope_utils::current_scope`. It is written for an unscoped bay too,
+    // since a bay with no scope file is refused rather than read as unscoped.
+    scope_utils::set_bay_scope_in(&bay_utils::bay_state_dir(name), &scope)?;
     // Raised in the new bay before its position, and finished once its tree is materialized: a
     // bay interrupted between the two is filled in by `forklift heal` (or dropped by `bay remove`).
     let position = pallet_utils::BayPosition::new(name, Some(head.clone()));
@@ -143,7 +142,8 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
 }
 
 /// Normalize the `--scope` prefixes into a [`MaterializationScope`] and verify each names a
-/// directory (subtree) in the head tree. An empty list yields the full (unscoped) scope.
+/// directory (subtree) in the head tree. An empty list yields the full (unscoped) scope, which a
+/// sparse warehouse refuses here, before any bay state exists.
 ///
 /// On a sparse warehouse, every requested prefix is checked against the warehouse fetch scope
 /// **before** it is ever used to load a tree object: a prefix outside the fetch scope may name
@@ -154,21 +154,34 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
 /// behind — `scope_utils::set_bay_scope` re-checks the same ⊆ invariant later, but only after
 /// the pallet ref, directory and redirect already exist.
 fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<MaterializationScope, String> {
+    let fetch_scope = scope_utils::read_fetch_scope()?;
+
     if scope_paths.is_empty() {
+        if !fetch_scope.is_full() {
+            return Err(format!(
+                "This warehouse is sparse, so a bay cannot check out every path. Add it with \
+                --scope, naming paths within the fetch scope ({}).",
+                fetch_scope.prefixes().join(", ")
+            ));
+        }
         return Ok(MaterializationScope::full());
     }
-
-    let fetch_scope = scope_utils::read_fetch_scope()?;
     let mut keys: Vec<String> = Vec::new();
 
     for raw in scope_paths {
         let path = WarehousePath::from_user_input(raw)?;
 
         if path.is_root() {
-            return Err(
+            return Err(if fetch_scope.is_full() {
                 "A scope of the warehouse root is the whole tree — open a plain bay (without \
                 --scope) instead.".to_string()
-            );
+            } else {
+                format!(
+                    "A scope of the warehouse root is the whole tree, which a bay of this sparse \
+                    warehouse cannot check out. Name paths within the fetch scope ({}) instead.",
+                    fetch_scope.prefixes().join(", ")
+                )
+            });
         }
 
         let key = path.as_key().to_string();

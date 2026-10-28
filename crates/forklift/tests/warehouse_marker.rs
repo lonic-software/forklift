@@ -339,19 +339,23 @@ fn a_full_warehouse_with_a_fetch_scope_is_refused() {
     let config = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("config");
     std::fs::write(config.join("fetch-scope"), "/forklift-scope 3\napp\n").unwrap();
     std::fs::write(root.join("app.txt"), "changed\n").unwrap();
-    area.run_ok(&root, &["load", "."]);
 
-    let output = area.run(&root, &["--json", "stack", "second"]);
-    assert!(!output.status.success(), "{}", text(&output.stdout));
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let message = value["error"]["message"].as_str().unwrap();
-    assert!(message.contains("recorded as full but holds a fetch scope"), "{}", value);
+    // Load reads the main tree's scope, which is checked against the mode too, so it refuses as
+    // stack does.
+    for args in [&["load", "."][..], &["stack", "second"]] {
+        let output = area.run(&root, &[&["--json"][..], args].concat());
+        assert!(!output.status.success(), "{:?}: {}", args, text(&output.stdout));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("recorded as full but holds a fetch scope"), "{:?}: {}", args, value);
+        assert!(message.contains("Delete that file"), "{:?}: {}", args, value);
+    }
     let log = area.run_ok(&root, &["--json", "log"]);
     assert!(!text(&log.stdout).contains("second"), "the stack must not land: {}", text(&log.stdout));
 
     // The named way out works.
-    assert!(message.contains("Delete that file"), "{}", value);
     std::fs::remove_file(config.join("fetch-scope")).unwrap();
+    area.run_ok(&root, &["load", "."]);
     area.run_ok(&root, &["stack", "second"]);
 }
 
