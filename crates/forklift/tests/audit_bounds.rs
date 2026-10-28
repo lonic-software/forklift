@@ -1231,24 +1231,50 @@ fn heal_never_rebuilds_a_record_in_another_version() {
     assert_eq!(std::fs::read(&path).unwrap(), b"/forklift-sealed 99\n");
 }
 
-/// A rebuild that fails stops heal with its cause and the retry, said once: nothing after it runs
-/// to tell the user to run heal from inside heal. Mutation: carry on past the failure → red.
-#[cfg(unix)]
+/// A damaged record that cannot be rebuilt stops heal with its cause and the retry, said once:
+/// nothing after it runs to tell the user to run heal from inside heal. The ref lock is made
+/// unopenable by a folder in its place. Mutation: carry on past the failure → red.
 #[test]
 fn a_failed_rebuild_stops_heal() {
+    let warehouse = Warehouse::new("sealed-rebuild-failed");
+    warehouse.stack_files(&[("a.txt", "a\n")], "K");
+    let (bytes, _) = plant_damaged_record(&warehouse, &"a".repeat(64), &"b".repeat(64));
+    let lock = warehouse.root.join(".forklift").join("refs.lock");
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir(&lock).unwrap();
+
+    let failed = warehouse.run(&["heal"]);
+    std::fs::remove_dir(&lock).unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+
+    assert!(!failed.status.success(), "{}", stderr);
+    assert!(stderr.contains("Nothing else was healed"), "{}", stderr);
+    assert_eq!(stderr.matches("sealed-object record").count(), 1, "{}", stderr);
+    assert_eq!(std::fs::read(warehouse.root.join(".forklift").join("sealed")).unwrap(), bytes);
+}
+
+/// A record that cannot be read at all is not known to be damaged, so heal carries on past it
+/// (the only way out of a durability taint must not be blocked by it) and notes it once.
+/// Mutation: stop heal on a failed read → red.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_record_does_not_stop_heal() {
     use std::os::unix::fs::PermissionsExt;
 
-    let warehouse = Warehouse::new("sealed-rebuild-failed");
+    let warehouse = Warehouse::new("sealed-unreadable-heal");
     warehouse.stack_files(&[("a.txt", "a\n")], "K");
     let path = warehouse.root.join(".forklift").join("sealed");
     std::fs::write(&path, sealed_utils::header_bytes()).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        // Running as root: nothing is unreadable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
 
-    let failed = warehouse.run(&["heal"]);
+    let healed = warehouse.run_ok(&["heal", "--json"]);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let stderr = String::from_utf8_lossy(&failed.stderr);
+    let healed: serde_json::Value = serde_json::from_slice(&healed.stdout).unwrap();
 
-    assert!(!failed.status.success(), "{}", stderr);
-    assert!(stderr.contains("sealed-object record") && stderr.contains("Nothing else was healed"), "{}", stderr);
-    assert_eq!(stderr.matches("sealed-object record").count(), 1, "{}", stderr);
+    assert_eq!(healed["data"]["notes"].to_string().matches("sealed-object record").count(), 1, "{}", healed);
 }

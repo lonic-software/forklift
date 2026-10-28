@@ -26,14 +26,18 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
 /// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference), or
-///                   the sealed-object record could not be checked or rebuilt, which stops the run
-///                   before anything else.
+///                   the sealed-object record is damaged and could not be rebuilt, which stops
+///                   the run before anything else.
 pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String> {
     // First, so the taint's rescan below tells what the record holds by hash from what is lost. The
-    // rebuild writes only the record, which no recovery reads through the taint. A failure stops
-    // the run: everything after it would read the record it could not check or repair.
+    // rebuild writes only the record, which no recovery reads through the taint. A damaged record
+    // it could not rebuild stops the run, since everything after it would read the damage. One
+    // that cannot be read at all does not: the readers below degrade around it and say so.
     let record_rebuilt = sealed_utils::rebuild()
-        .map_err(|error| format!("{} Nothing else was healed: run \"forklift heal\" again once that is fixed.", error))?
+        .map_err(|error| format!(
+            "{}{} Nothing else was healed: once that is fixed, run \"forklift heal\" again.",
+            error, if error.ends_with('.') { "" } else { "." },
+        ))?
         .map(RecordRebuilt::from);
 
     // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports

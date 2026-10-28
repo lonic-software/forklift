@@ -411,15 +411,24 @@ pub struct Rebuilt {
 }
 
 /// [`rebuild_locked`] under a ref lock it takes and releases, taken only when a read without it
-/// finds the record damaged: a sound record, the usual case, waits on no writer.
+/// finds the record damaged: a sound record, the usual case, waits on no writer. A record that
+/// cannot be read at all is not known to be damaged, so it is left to the readers after this,
+/// each of which says what it could not read.
+///
+/// # Returns
+/// * `Ok(Some(Rebuilt))` - The record was damaged and now holds what it held before the damage.
+/// * `Ok(None)`          - There is no record, it is not damaged, or it cannot be read.
+/// * `Err(String)`       - The record is damaged and could not be rebuilt.
 pub fn rebuild() -> Result<Option<Rebuilt>, String> {
-    match std::fs::read(sealed_path()) {
-        Ok(bytes) if !matches!(parse_classified(&bytes), Err(Unparsed::Damaged { .. })) => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        _ => {}
+    let Ok(bytes) = std::fs::read(sealed_path()) else {
+        return Ok(None);
+    };
+    if !matches!(parse_classified(&bytes), Err(Unparsed::Damaged { .. })) {
+        return Ok(None);
     }
 
-    let lock = RefLock::acquire()?;
+    let lock = RefLock::acquire()
+        .map_err(|error| format!("The sealed-object record is damaged and could not be rebuilt: {}", error))?;
     rebuild_locked(&lock)
 }
 
@@ -461,7 +470,7 @@ fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
     };
     file_utils::replace_file_atomically(&path, &rebuilt).map_err(|error| format!(
         "Rebuilding the damaged sealed-object record, which drops the {} byte(s) from byte {} on, \
-        failed, though the rewrite may have landed: {}",
+        failed, though the rewrite may have landed. {}",
         bytes.len() - valid_len, valid_len, error
     ))?;
 
