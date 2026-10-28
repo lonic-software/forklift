@@ -7896,6 +7896,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = crate::globals::StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
             let local_head = "a".repeat(64);
             let old = office_utils::TrustAnchor {
@@ -8221,6 +8222,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
             Scratch { root, _scope: scope }
         }
@@ -16666,6 +16668,7 @@ mod tests {
 
         /// A sparse warehouse scoped to `src` whose `main` holds one parcel. Returns that parcel.
         fn sparse_main() -> String {
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
             let head = parcel("main", Vec::new());
             pallet_utils::update_pallet_head("main", None, &head, &RefPreconditions::NONE).unwrap();
@@ -16724,6 +16727,7 @@ mod tests {
                     // An expand commits while this transfer runs, dropping the head it found absent.
                     let lock = RefLock::acquire().unwrap();
                     fetch_ledger::write_ledger(&lock, &[]).unwrap();
+                    crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
                     scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
                 }
 
@@ -16778,6 +16782,7 @@ mod tests {
             let mut expansion = expand(&base, &["web"]);
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
 
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "docs"])).unwrap();
 
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Retry));
@@ -16793,6 +16798,7 @@ mod tests {
             let mut expansion = expand(&base, &["web"]);
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
 
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
 
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Covered(_)));

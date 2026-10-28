@@ -9,9 +9,10 @@ use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, BundleDownload, PartialBundle, RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::warehouse_utils::PrepareMode;
 use forklift_core::util::{
     bundle_utils, config_utils, file_utils, held_heads, lock_utils, object_utils, operation_utils,
-    pack_utils, pallet_utils, remote_utils, scope_utils, shift_utils, take_utils, trust_utils,
+    pack_utils, pallet_utils, remote_utils, shift_utils, take_utils, trust_utils,
     warehouse_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -503,7 +504,18 @@ async fn franchise_into_prepared_target(
     let sparse = partial.sparse;
     let url = attempt.record.url.clone();
 
-    warehouse_utils::prepare_warehouse()?;
+    // The mode is on disk from here on, a sparse warehouse's scopes with it, so every ref write
+    // below is gated by what this warehouse will hold. A resume clears the marker before this, so
+    // a recorded mode other than the one asked for is never expected; it is refused all the same.
+    let mode = partial.prepare_mode(&fetch_scope);
+    warehouse_utils::prepare_warehouse(mode)?;
+
+    if warehouse_utils::warehouse_mode()? != mode.mode() {
+        return Err(format!(
+            "\"{}\" was already prepared as a different kind of warehouse than this franchise asks for.",
+            attempt.directory
+        ));
+    }
 
     config_utils::set_value(config_utils::KEY_REMOTE_URL, &url, ConfigScope::Warehouse)?;
 
@@ -590,13 +602,8 @@ async fn franchise_into_prepared_target(
         pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, None))?;
 
         // There is no tree to validate --only against (the pallet has nothing stacked on the
-        // remote yet); record the requested sparse scope and origin as-is, so a later
-        // lower/expand into this pallet, once it is born, stays within it.
-        if sparse {
-            scope_utils::set_fetch_scope(&fetch_scope)?;
-            scope_utils::set_bay_scope(&fetch_scope)?;
-        }
-
+        // remote yet); the requested sparse scope stands as prepared, so a later lower/expand
+        // into this pallet, once it is born, stays within it.
         record_partial(partial, &url)?;
 
         attempt.finishing = true;
@@ -611,10 +618,11 @@ async fn franchise_into_prepared_target(
 
     let tree_hash = object_utils::load_parcel(&remote_head)?.tree_hash;
 
-    // Validate the --only paths against the fetched head BEFORE any of this warehouse's state
-    // (the fetch scope, the origin record, the pallet head) is written. The fetched objects are
-    // kept, so a resume with the path corrected fetches only what the new scope adds. The spine is
-    // fetched, so the walk to each in-scope subtree resolves without touching anything absent.
+    // Validate the --only paths against the fetched head before the origin record and the pallet
+    // head are written. The scopes are already recorded, but a resume clears them with the marker
+    // and prepares again, and the fetched objects are kept, so a resume with the path corrected
+    // fetches only what the new scope adds. The spine is fetched, so the walk to each in-scope
+    // subtree resolves without touching anything absent.
     if sparse {
         for prefix in fetch_scope.prefixes() {
             if !is_directory_in_tree(&tree_hash, prefix)? {
@@ -629,13 +637,8 @@ async fn franchise_into_prepared_target(
                 ).into());
             }
         }
-
-        scope_utils::set_fetch_scope(&fetch_scope)?;
-        scope_utils::set_bay_scope(&fetch_scope)?;
     }
 
-    // Before the pallet's head is written: the ref gate reads the mode to decide whether a
-    // recorded absence may stand.
     record_partial(partial, &url)?;
 
     // Raised before the pallet's head is written, and finished once the tree is materialized. The
@@ -699,15 +702,22 @@ impl Partial {
     fn any(self) -> bool {
         self.sparse || self.cache
     }
+
+    /// The mode the warehouse is prepared in. `--only` and `--cache` conflict, so at most one holds.
+    fn prepare_mode(self, fetch_scope: &MaterializationScope) -> PrepareMode<'_> {
+        if self.sparse {
+            PrepareMode::Sparse(fetch_scope)
+        } else if self.cache {
+            PrepareMode::Cache
+        } else {
+            PrepareMode::Full
+        }
+    }
 }
 
-/// Record what makes a partial franchise partial: the cache-mode marker, and the origin (the one
-/// remote that holds what it lacks). Nothing for a full franchise.
+/// Record the origin of a partial franchise: the one remote that holds what it lacks. Nothing for
+/// a full franchise.
 fn record_partial(partial: Partial, url: &str) -> Result<(), String> {
-    if partial.cache {
-        scope_utils::set_cache_mode()?;
-    }
-
     if partial.any() {
         config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, url, ConfigScope::Warehouse)?;
     }

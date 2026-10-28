@@ -5253,6 +5253,45 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     assert!(!forced.status.success(), "a forced non-origin sparse lift must fail loudly: {}", stdout(&forced));
 }
 
+/// A sparse warehouse's partiality is recorded in its marker, so deleting its fetch scope no longer
+/// turns it into a full one: lift, expand and lower each refuse, naming the missing file and
+/// franchising again, and nothing reaches the remote. Before, the warehouse read as full and lifted
+/// anywhere.
+///
+/// Revert: read a sparse warehouse with no fetch-scope file as full (`read_fetch_state` returning
+/// the full scope) → the lift goes through → red.
+#[test]
+fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
+    let area = TestArea::new("sparse-scope-gone");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/d.txt", "docs v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_eq!(area.read_file("sparse/.forklift/warehouse"), "/forklift-warehouse 2\nsparse\n");
+    area.write_file("sparse/src/api/a.txt", "api v2\n");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "second"]));
+
+    std::fs::remove_file(area.path("sparse/.forklift/config/fetch-scope")).unwrap();
+
+    for args in [&["lift"][..], &["expand", "docs"], &["lower"]] {
+        let refused = area.forklift("sparse", &[&["--json"][..], args].concat());
+        assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
+        let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
+        assert!(message.contains("recorded as sparse but its fetch scope"), "{:?}: {}", args, message);
+        assert!(message.contains("is missing"), "{:?}: {}", args, message);
+    }
+    assert!(!area.path("sparse/docs").exists(), "expand fetched nothing");
+    assert_success(&area.forklift("dev", &["lower"]));
+    assert_eq!(area.read_file("dev/src/api/a.txt"), "api v1\n", "the refused lift reached the remote");
+}
+
 /// A `--cache` franchise is a partial warehouse, as a sparse one is: it skips the bundle, writes
 /// its marker, records its origin and so refuses to lift elsewhere, runs the content audit, and
 /// refuses `expand`. Combined with `--only`, it is refused before anything is created.
@@ -5276,12 +5315,13 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     let full = area.forklift(".", &["--json", "franchise", &server.url, "full"]);
     assert_success(&full);
     assert!(json_of(&full)["data"].get("bundle_objects").is_some(), "{}", stdout(&full));
-    assert!(!area.path("full/.forklift/config/cache-mode").exists());
+    assert_eq!(area.read_file("full/.forklift/warehouse"), "/forklift-warehouse 2\nfull\n");
 
     let cached = area.forklift(".", &["--json", "franchise", &server.url, "cached", "--cache"]);
     assert_success(&cached);
     assert!(json_of(&cached)["data"].get("bundle_objects").is_none(), "no bundle: {}", stdout(&cached));
-    assert_eq!(std::fs::read(area.path("cached/.forklift/config/cache-mode")).unwrap(), b"/forklift-cache-mode 1\n");
+    assert_eq!(area.read_file("cached/.forklift/warehouse"), "/forklift-warehouse 2\ncache\n");
+    assert!(!area.path("cached/.forklift/config/fetch-scope").exists(), "a cache records no fetch scope");
     assert_eq!(area.read_file("cached/one.txt"), "one signed\n");
 
     let audit = area.forklift("cached", &["--json", "audit"]);
@@ -7482,8 +7522,9 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
 
 #[test]
 fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
-    // A fetch scope this build refuses skips the user pallets' history fetches. Re-running heal
-    // cannot fix that, so the remedy must name the scope file and its way out, not only the
+    // A fetch scope this build refuses (here one a full warehouse should never hold) skips the
+    // user pallets' history fetches. Re-running heal cannot fix that, so the remedy must name the
+    // scope file and its way out, not only the
     // "once connectivity is restored" wording a transient failure gets, and must keep the
     // reproduce-it remedy, since the remote was still asked for the object by hash.
     //
@@ -7515,9 +7556,9 @@ fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
     assert_eq!(status.status.code(), Some(21));
 
     let output = format!("{}{}", stdout(&status), stderr(&status));
-    assert!(output.contains("fetch-scope") && output.contains("older version of Forklift"),
+    assert!(output.contains("fetch-scope") && output.contains("recorded as full but holds a fetch scope"),
         "the remedy must name the unreadable scope file: {}", output);
-    assert!(output.contains("Franchise the remote again"),
+    assert!(output.contains("Delete that file"),
         "the remedy must name the way out: {}", output);
     assert!(output.contains("checked the configured remote") && output.contains("\"forklift load\" then \"forklift stack\""),
         "the remote was still asked by hash, and reproducing it is still a way out: {}", output);

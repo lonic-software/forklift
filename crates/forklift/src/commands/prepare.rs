@@ -19,7 +19,7 @@ pub fn handle_command(verbose: bool) -> Result<(), String> {
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
     warehouse_utils::check_preparable(&cwd, warehouse_utils::Head::Client)?;
 
-    let created = warehouse_utils::prepare_warehouse()?;
+    let created = warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full)?;
 
     output::emit(&Prepared { created, verbose });
 

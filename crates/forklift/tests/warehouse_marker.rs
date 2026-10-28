@@ -297,18 +297,64 @@ fn an_empty_forklift_folder_inside_a_bay_names_no_outer_warehouse() {
 
 /// A marker this build cannot read is said to be one, never answered as "no warehouse here" with
 /// a prepare that would refuse the same marker.
+/// A marker this build cannot read is refused by every command and by `prepare`, never answered
+/// with "prepare" and never read as a full warehouse: one with no mode, two, a mode this build
+/// does not know, or the version 1 marker an older Forklift wrote before the marker recorded the
+/// mode, whose refusal says so.
+///
+/// Revert: read a v1 marker, or a missing mode, as `full` → stocktake succeeds → red.
 #[test]
 fn an_unreadable_marker_is_not_answered_with_prepare() {
     let area = Area::new("unreadable");
     let root = area.warehouse("w");
-    std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse"), "/forklift-warehouse 2\n").unwrap();
+    let marker = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "/forklift-warehouse 2\nfull\n");
 
-    let output = area.run(&root, &["--json", "stocktake"]);
-    assert!(!output.status.success());
+    for bad in ["/forklift-warehouse 2\n", "/forklift-warehouse 2\nfull\ncache\n", "/forklift-warehouse 2\nshallow\n",
+                "/forklift-warehouse 1\n"] {
+        std::fs::write(&marker, bad).unwrap();
+        let before = listing(&root);
+
+        for args in [&["stocktake"][..], &["stack", "again"], &["prepare"]] {
+            let output = area.run(&root, &[&["--json"][..], args].concat());
+            assert!(!output.status.success(), "{:?} over {:?}", args, bad);
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_ne!(value["error"]["code"], "not_a_warehouse", "{}", value);
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(message.starts_with("The warehouse marker \""), "{}", value);
+            assert_eq!(message.contains("older version of Forklift"), bad == "/forklift-warehouse 1\n", "{}", value);
+            assert!(!value["error"]["next_step"].as_str().unwrap_or("").contains("prepare"), "{}", value);
+        }
+        assert_eq!(listing(&root), before, "{:?}: a refused command writes nothing", bad);
+    }
+}
+
+/// A full warehouse holds no fetch scope, so one placed there by hand is refused rather than
+/// read as the scope of a sparse warehouse (or ignored): commands that read the fetch scope say
+/// the warehouse is recorded as full, and deleting the file is the way out.
+///
+/// Revert: let a full warehouse return its fetch-scope file (or ignore it) → the stack lands → red.
+#[test]
+fn a_full_warehouse_with_a_fetch_scope_is_refused() {
+    let area = Area::new("stray-fetch-scope");
+    let root = area.warehouse("w");
+    let config = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("config");
+    std::fs::write(config.join("fetch-scope"), "/forklift-scope 3\napp\n").unwrap();
+    std::fs::write(root.join("app.txt"), "changed\n").unwrap();
+    area.run_ok(&root, &["load", "."]);
+
+    let output = area.run(&root, &["--json", "stack", "second"]);
+    assert!(!output.status.success(), "{}", text(&output.stdout));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_ne!(value["error"]["code"], "not_a_warehouse", "{}", value);
-    assert!(value["error"]["message"].as_str().unwrap().starts_with("The warehouse marker \""), "{}", value);
-    assert!(!value["error"]["next_step"].as_str().unwrap_or("").contains("prepare"), "{}", value);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("recorded as full but holds a fetch scope"), "{}", value);
+    let log = area.run_ok(&root, &["--json", "log"]);
+    assert!(!text(&log.stdout).contains("second"), "the stack must not land: {}", text(&log.stdout));
+
+    // The named way out works.
+    assert!(message.contains("Delete that file"), "{}", value);
+    std::fs::remove_file(config.join("fetch-scope")).unwrap();
+    area.run_ok(&root, &["stack", "second"]);
 }
 
 /// `forklift-server prepare` prints a refusal as its message and next step, never the frame

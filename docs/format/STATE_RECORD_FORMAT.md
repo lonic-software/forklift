@@ -47,6 +47,7 @@ one, the way out. Every writer replaces its file atomically, so a crash never le
 | `path` (in a bay's state folder) | `bay-path` | The bay's working directory. |
 | `position` (bay-local) | `position` | The current pallet's name, then the bay's base: the parcel its files stand on, empty while the pallet is unborn. See [pallet refs](PALLET_REFS.md). |
 | `scope` (bay-local), `.forklift/config/fetch-scope` | `scope` | See [the scope file format](SCOPE_FILE_FORMAT.md), which adds an empty-file rule of its own. |
+| `.forklift/warehouse` | `warehouse` | Exactly one: what the warehouse holds, `full`, `sparse` (franchised with `--only`) or `cache` (franchised with `--cache`). `prepare` writes it last, so its presence marks a complete warehouse. A marker with no entry, more than one, or a word this build does not know is refused, and so is a marker of kind version 1, which recorded no mode: make the warehouse again. A sparse warehouse's fetch scope must agree with it; see [the scope file format](SCOPE_FILE_FORMAT.md#the-fetch-scope-and-the-warehouse-mode). |
 | `.forklift/served` | `served` | None. Its presence marks a warehouse a `forklift-server` has served; nothing removes it. A mark that exists but cannot be read is an error, never "not served". |
 | `.forklift/tombstones` | `tombstones` | One `<head> <pallet>` per deleted pallet of a served warehouse: the head its ref held, then its name. |
 

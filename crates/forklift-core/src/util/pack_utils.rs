@@ -5741,6 +5741,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let content = b"read cache content".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
@@ -5794,6 +5795,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let content = b"mmap block probe content".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
@@ -5915,6 +5917,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // Two versions of one file: the second differs by a suffix, so a delta clearly pays.
         let base_object = LooseObjectBuilder::build_blob(&Blob {
@@ -5967,6 +5970,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let mut object = LooseObjectBuilder::build_blob(&Blob { content: b"already here".to_vec() });
         object.store().unwrap();
@@ -5998,6 +6002,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = crate::globals::forklift_root();
 
         let object = LooseObjectBuilder::build_blob(&Blob { content: b"pack taint content".to_vec() });
@@ -6038,6 +6043,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = crate::globals::forklift_root();
 
         // Build one native pack pair in a throwaway staging folder — `import_transport_packs`
@@ -6082,6 +6088,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // Three objects with real Blake3 hashes so the fan-out and index keys are valid.
         let contents: Vec<Vec<u8>> = vec![b"first object".to_vec(), b"second".to_vec(), vec![7u8; 5000]];
@@ -6135,6 +6142,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let content = b"a hash spelled two ways".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
@@ -6170,6 +6178,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let (hash, content) = (0..)
             .map(|i| format!("respelled {}", i).into_bytes())
@@ -6201,6 +6210,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // The plaintext must be neither chunk- nor parcel-shaped, or the chunk-skip (unrelated
         // to this fix) would swallow it under a revert of the fix and this test would go falsely
@@ -6248,6 +6258,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // A valid 64-hex address (so it is enumerated as a loose object at all) whose file holds
         // bytes that are not a zstd frame in the first place.
@@ -6287,6 +6298,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let giant = vec![0u8; object_utils::MAX_OBJECT_BYTES + 1];
         let giant_hash = blake3::hash(&giant).to_hex().to_string();
@@ -6322,6 +6334,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // A minimal *reachable* history -- one blob, its tree, one parentless parcel, `main`'s
         // head pointed at it -- so `compact --all`'s live-set walk (`gc_utils::collect_live_set`)
@@ -6462,6 +6475,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         // Minimal reachable history: one blob (the object under test), its tree, one parentless
@@ -6664,6 +6678,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- loose-vs-pack duplicate\n".to_vec();
@@ -6778,6 +6793,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- both-corrupt duplicate fixture\n".to_vec();
@@ -6929,6 +6945,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- identical-corrupt duplicate fixture\n".to_vec();
@@ -7037,6 +7054,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let original_content = b"the true original content of X -- clean self-duplicate fixture\n".to_vec();
@@ -7145,6 +7163,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let giant = deterministic_fill(object_utils::MAX_OBJECT_BYTES + 1);
@@ -7246,6 +7265,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = crate::globals::forklift_root();
 
         let content = b"compact-taint content".to_vec();
@@ -7316,6 +7336,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // A large high-entropy body (so its *full* zstd blob stays large and a delta genuinely
         // wins), derived deterministically by chaining Blake3 — no rng needed.
@@ -7425,6 +7446,7 @@ pub(crate) mod tests {
         let pack_folder = temp.join(".forklift/objects/pack");
         std::fs::create_dir_all(&pack_folder).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // Address the record by hash(A), but store a valid zstd blob of a *different* content B.
         let content_a = vec![1u8; 4000];
@@ -7706,6 +7728,7 @@ pub(crate) mod tests {
         let temp = fresh_root("delta-copy-reread-base");
         let _scope = StorageRootScope::enter(&temp);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let body = deterministic_fill(6000);
         let base = LooseObjectBuilder::build_blob(&Blob { content: [body.as_slice(), b"\nv1\n"].concat() });
@@ -7788,6 +7811,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
 
         let content = b"a genuinely good copy of X, sitting in the second, sorted-later pack";
@@ -7824,6 +7848,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
 
         let hash = "c".repeat(64);
@@ -7862,6 +7887,7 @@ pub(crate) mod tests {
         let pack_folder = temp.join(".forklift/objects/pack");
         std::fs::create_dir_all(&pack_folder).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // Data: header, then one RECORD_DELTA record with only 2 bytes after the
         // kind byte — nowhere near the 32-byte base hash the kind promises, let alone a VLQ
@@ -7910,6 +7936,7 @@ pub(crate) mod tests {
         let pack_folder = temp.join(".forklift/objects/pack");
         std::fs::create_dir_all(&pack_folder).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         const CHAIN_LEN: usize = 60;
         let hashes: Vec<[u8; HASH_LEN]> = (0..CHAIN_LEN)
@@ -7983,6 +8010,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let content = b"an object another process packs out from under us".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
@@ -8013,6 +8041,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let content = b"content to compact".to_vec();
         store_loose(&blake3::hash(&content).to_hex().to_string(), &content);
@@ -8043,6 +8072,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         // Two separate incremental packs, so the repack has more than one old pack to supersede.
@@ -8101,6 +8131,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // v1: "file.txt" holds content A, in a parentless root parcel.
         let mut blob_v1 = LooseObjectBuilder::build_blob(
@@ -8204,6 +8235,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // v1: "file.txt" holds a MAX_OBJECT_BYTES + 1 grandfathered giant, planted directly the
         // way a pre-ceiling bundle import would have left it (the ordinary write path refuses to
@@ -8307,6 +8339,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
 
         let x_content = b"pack A's object, unrelated to B's orphan".to_vec();
@@ -8410,6 +8443,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
 
         // 200 objects: eight buckets of about 25 records each.
@@ -8485,6 +8519,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
 
         let objects = numbered_objects("quarantine", 200);
@@ -8532,6 +8567,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
         std::fs::create_dir_all(&folder).unwrap();
 
@@ -8650,6 +8686,7 @@ pub(crate) mod tests {
         let temp = fresh_root(name);
         let scope = StorageRootScope::enter(&temp);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         (temp, scope)
     }
 
@@ -9441,6 +9478,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
 
         let y_content = b"named only by a quarantined index".to_vec();
@@ -9505,6 +9543,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let folder = pack_folder();
 
         let x_content = b"pack A's object, unrelated to B's corrupt index".to_vec();

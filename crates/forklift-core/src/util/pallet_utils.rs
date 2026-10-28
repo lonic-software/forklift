@@ -1861,6 +1861,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         (root, scope)
     }
@@ -2021,6 +2022,7 @@ pub(crate) mod tests {
         #[test]
         fn a_sparse_move_off_a_non_ancestor_onto_a_gone_ancestry_is_refused_as_incomplete() {
             let (_root, _scope) = scratch("closure-sparse-unreached");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
             let other = parcel(&two_dirs("x0", "y0"), &[]);
             write("main", None, &other).unwrap();
@@ -2094,6 +2096,7 @@ pub(crate) mod tests {
         #[test]
         fn a_sparse_warehouse_checks_only_what_its_scope_holds() {
             let (_root, _scope) = scratch("closure-sparse");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
@@ -2113,6 +2116,7 @@ pub(crate) mod tests {
         #[test]
         fn a_sparse_warehouse_keeps_the_base_tree_prune() {
             let (_root, _scope) = scratch("closure-sparse-prune");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
@@ -2157,6 +2161,7 @@ pub(crate) mod tests {
         #[test]
         fn a_scope_widened_between_the_check_and_the_hold_is_checked_again() {
             let (_root, _scope) = scratch("closure-widened");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
@@ -2164,6 +2169,7 @@ pub(crate) mod tests {
             remove(&blob("b-sealed"));
 
             BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
                 crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
             })));
 
@@ -2180,7 +2186,7 @@ pub(crate) mod tests {
         #[test]
         fn a_head_whose_root_tree_is_recorded_and_absent_is_accepted() {
             let (_root, _scope) = scratch("closure-recorded");
-            crate::util::scope_utils::set_cache_mode().unwrap();
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2207,7 +2213,7 @@ pub(crate) mod tests {
             assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
 
             // The same absence in a cache moves the ref.
-            crate::util::scope_utils::set_cache_mode().unwrap();
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
             write("main", Some(&base), &head).unwrap();
         }
 
@@ -2216,7 +2222,7 @@ pub(crate) mod tests {
         #[test]
         fn a_head_whose_root_tree_is_absent_and_unrecorded_is_refused() {
             let (_root, _scope) = scratch("closure-unrecorded");
-            crate::util::scope_utils::set_cache_mode().unwrap();
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2233,7 +2239,7 @@ pub(crate) mod tests {
         #[test]
         fn a_present_recorded_tree_with_a_missing_child_is_refused() {
             let (_root, _scope) = scratch("closure-present-recorded");
-            crate::util::scope_utils::set_cache_mode().unwrap();
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2249,7 +2255,7 @@ pub(crate) mod tests {
         #[test]
         fn a_record_entry_removed_between_the_check_and_the_hold_is_checked_again() {
             let (_root, _scope) = scratch("closure-record-moved");
-            crate::util::scope_utils::set_cache_mode().unwrap();
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2271,7 +2277,7 @@ pub(crate) mod tests {
         #[test]
         fn an_unreadable_record_blocks_only_a_head_that_needs_it() {
             let (_root, _scope) = scratch("closure-record-unreadable");
-            crate::util::scope_utils::set_cache_mode().unwrap();
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             std::fs::write(crate::util::sealed_utils::sealed_path(), b"not a record").unwrap();
@@ -3279,6 +3285,7 @@ pub(crate) mod tests {
         remove_pallet_head_in(PalletNamespace::User, "full", &hash('a'), &RefPreconditions::NONE, Some(&deleting("full", &hash('a')))).unwrap();
         assert!(crate::util::fetch_ledger::read_ledger().unwrap().is_empty(), "a full warehouse keeps no ledger");
 
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
         crate::util::scope_utils::set_fetch_scope(&crate::util::scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
         // A removal refused for want of anything to root its head writes nothing first.
         remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, None).unwrap_err();

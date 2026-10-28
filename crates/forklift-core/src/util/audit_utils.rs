@@ -3578,7 +3578,7 @@ mod tests {
             std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
 
             let scope = crate::globals::StorageRootScope::enter(&root);
-            crate::util::warehouse_utils::prepare_warehouse().unwrap();
+            crate::util::warehouse_utils::prepare_warehouse(crate::util::warehouse_utils::PrepareMode::Full).unwrap();
 
             let admin = crate::model::operator::Operator {
                 identifier: ALICE.to_string(),

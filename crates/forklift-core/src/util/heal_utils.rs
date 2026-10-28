@@ -1232,6 +1232,7 @@ mod tests {
 
         let root = scratch("196-vanished-unreconstructable-entry-heal");
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let h_hash = "c".repeat(64);

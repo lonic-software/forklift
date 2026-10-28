@@ -78,8 +78,8 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         // boundary so a partial pass can never read as a full-clone pass. A full store keeps
         // today's signature-only audit unchanged — unless `--full` is asked, which re-reads every
         // present chunk and re-verifies each chunked file's content hash even on a full clone.
-        // Object presence is a warehouse property, so the fetch scope and the cache-mode marker
-        // are the seam either way. Whenever the content audit runs, it counts and reports what
+        // Object presence is a warehouse property, so the mode the warehouse marker records (and a
+        // sparse warehouse's fetch scope) is the seam either way. Whenever the content audit runs, it counts and reports what
         // the sealed record held by hash alone; a signature-only pass makes no content claim, so
         // it has nothing of that kind to report.
         let fetch_scope = scope_utils::read_fetch_scope()?;

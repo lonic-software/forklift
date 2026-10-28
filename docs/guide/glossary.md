@@ -38,8 +38,9 @@ designed but not shipped are kept apart, in [Planned, not shipped](#planned-not-
 and bays.
 
 **Warehouse marker.** The file `.forklift/warehouse`, written last by `prepare`, which marks the
-folder as a complete warehouse rather than a half-built one. A `.forklift/` folder without it is not
-a warehouse, and commands refuse to run there.
+folder as a complete warehouse rather than a half-built one, and records what it holds: everything
+(full), a sparse franchise's paths (sparse), or what a cache has fetched so far (cache). A `.forklift/`
+folder without it is not a warehouse, and commands refuse to run there.
 
 **Parcel** (git: commit). One immutable recorded snapshot: a root tree, its parents, who made it,
 and a description. Facts learned later go into [post-metadata](#meta-pallets-and-metadata), never

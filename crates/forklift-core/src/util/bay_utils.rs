@@ -1048,7 +1048,7 @@ mod tests {
         std::fs::create_dir(&forklift).unwrap();
         assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::Unprepared, "a folder with no marker is no warehouse");
         let marker = forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER);
-        std::fs::write(&marker, "/forklift-warehouse 1\n").unwrap();
+        std::fs::write(&marker, "/forklift-warehouse 2\nfull\n").unwrap();
         assert_eq!(classify_forklift(&forklift).unwrap(), ForkliftKind::Warehouse);
         std::fs::remove_file(&marker).unwrap();
 
