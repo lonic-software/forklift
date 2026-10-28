@@ -498,10 +498,16 @@ pub fn is_cache_mode() -> Result<bool, String> {
     ))
 }
 
-/// Mark the warehouse as a cache (franchise `--cache` only). The configuration folder must exist.
+/// Mark the warehouse as a cache (franchise `--cache` only).
 pub fn set_cache_mode() -> Result<(), String> {
+    let path = cache_mode_path();
+
+    if let Some(parent) = path.parent() {
+        crate::util::file_utils::create_folder_if_not_exists(parent)?;
+    }
+
     let bytes = record_utils::to_bytes(CACHE_MODE_RECORD, CACHE_MODE_VERSION, std::iter::empty::<&str>());
-    crate::util::file_utils::write_file_atomically(&cache_mode_path(), &bytes)
+    crate::util::file_utils::write_file_atomically(&path, &bytes)
 }
 
 /// Build a classified scope refusal (design §7.4 taxonomy) as a typed [`CoreError::Refusal`]: the
