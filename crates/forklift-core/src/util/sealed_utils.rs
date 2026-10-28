@@ -46,7 +46,8 @@
 //! ordered and each one sees the last. A record that does not parse is never written over, except
 //! that `heal` rebuilds a damaged one ([`rebuild`]) as its header and the frames before the
 //! damage. A header naming another version, or a valid frame whose entries do not parse, is not
-//! damage (an intact frame is not what damage leaves) and is never rewritten. One whose valid prefix is followed by a torn append is rewritten atomically to that prefix and the
+//! damage (an intact frame is not what damage leaves), and a record whose first problem is either
+//! is never rewritten; one that follows damage is dropped with everything else past it. One whose valid prefix is followed by a torn append is rewritten atomically to that prefix and the
 //! new frames: a reader reading the file in pieces must never see a new frame after old torn bytes.
 //! The first write creates the record atomically, so its header is never torn. Compaction
 //! ([`compact`]) rewrites the log as the set it replays to, which drops no recorded hash. The
@@ -268,8 +269,9 @@ enum Unparsed {
     /// A header naming another version: that version wrote the record. Never rewritten.
     OtherVersion(String),
 
-    /// A frame whose CRC holds over entries this version's header does not define. An intact frame
-    /// is not what damage leaves, and no version is named to read it, so it is never rewritten.
+    /// A frame whose CRC holds over entries this version's header does not define, before any
+    /// damage. An intact frame is not what damage leaves, and no version is named to read it, so
+    /// the record is never rewritten.
     Unreadable(String),
 }
 
@@ -378,6 +380,8 @@ fn read_record(path: &Path) -> Result<Option<(Vec<u8>, ParsedSealed)>, String> {
                 path.to_string_lossy(),
                 unparsed.reason(),
                 match unparsed {
+                    Unparsed::Damaged { valid_len: 0, .. } => "Run \"forklift heal\", which rebuilds it empty: \
+                        every record in it is dropped, and an absent object it held by hash then reads as missing.",
                     Unparsed::Damaged { .. } => "Run \"forklift heal\", which rebuilds it from the part before the \
                         damage and reports what it drops.",
                     Unparsed::OtherVersion(_) => "Use the version of Forklift that wrote it: this one never \
@@ -406,8 +410,15 @@ pub struct Rebuilt {
     pub dropped_bytes: usize,
 }
 
-/// [`rebuild_locked`] under a ref lock it takes and releases.
+/// [`rebuild_locked`] under a ref lock it takes and releases, taken only when a read without it
+/// finds the record damaged: a sound record, the usual case, waits on no writer.
 pub fn rebuild() -> Result<Option<Rebuilt>, String> {
+    match std::fs::read(sealed_path()) {
+        Ok(bytes) if !matches!(parse_classified(&bytes), Err(Unparsed::Damaged { .. })) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        _ => {}
+    }
+
     let lock = RefLock::acquire()?;
     rebuild_locked(&lock)
 }
@@ -426,8 +437,8 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
 /// * `Ok(Some(Rebuilt))` - The record was damaged and now holds what it held before the damage.
 /// * `Ok(None)`          - There is no record, or it is not damaged.
 /// * `Err(String)`       - If the record cannot be read or the rewrite fails. A rewrite that fails
-///                         after its rename has still replaced the record: read it back to learn
-///                         which.
+///                         after its rename has still replaced the record, so the message says
+///                         what the rewrite drops.
 fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
     let path = sealed_path();
     let bytes = match std::fs::read(&path) {
@@ -448,7 +459,11 @@ fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
         0 => header_bytes(),
         _ => bytes[..valid_len].to_vec(),
     };
-    file_utils::replace_file_atomically(&path, &rebuilt)?;
+    file_utils::replace_file_atomically(&path, &rebuilt).map_err(|error| format!(
+        "Rebuilding the damaged sealed-object record, which drops the {} byte(s) from byte {} on, \
+        failed, though the rewrite may have landed: {}",
+        bytes.len() - valid_len, valid_len, error
+    ))?;
 
     Ok(Some(Rebuilt { at: valid_len, dropped_bytes: bytes.len() - valid_len }))
 }

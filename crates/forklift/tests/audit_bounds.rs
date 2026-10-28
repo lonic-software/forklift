@@ -1231,12 +1231,11 @@ fn heal_never_rebuilds_a_record_in_another_version() {
     assert_eq!(std::fs::read(&path).unwrap(), b"/forklift-sealed 99\n");
 }
 
-/// A rebuild that fails is reported with its cause and the retry, once: the record step after it
-/// adds no note telling the user to run heal from inside heal. Mutation: note the unreadable
-/// record anyway → red.
+/// A rebuild that fails stops heal with its cause and the retry, said once: nothing after it runs
+/// to tell the user to run heal from inside heal. Mutation: carry on past the failure → red.
 #[cfg(unix)]
 #[test]
-fn a_failed_rebuild_is_reported_once() {
+fn a_failed_rebuild_stops_heal() {
     use std::os::unix::fs::PermissionsExt;
 
     let warehouse = Warehouse::new("sealed-rebuild-failed");
@@ -1245,11 +1244,11 @@ fn a_failed_rebuild_is_reported_once() {
     std::fs::write(&path, sealed_utils::header_bytes()).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    let healed = warehouse.run_ok(&["heal", "--json"]);
+    let failed = warehouse.run(&["heal"]);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let healed: serde_json::Value = serde_json::from_slice(&healed.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
 
-    assert!(healed["data"]["record_rebuild_failed"].as_str().is_some_and(|error| error.contains("sealed-object record")),
-        "{}", healed);
-    assert!(!healed["data"]["notes"].to_string().contains("sealed-object record"), "{}", healed);
+    assert!(!failed.status.success(), "{}", stderr);
+    assert!(stderr.contains("sealed-object record") && stderr.contains("Nothing else was healed"), "{}", stderr);
+    assert_eq!(stderr.matches("sealed-object record").count(), 1, "{}", stderr);
 }

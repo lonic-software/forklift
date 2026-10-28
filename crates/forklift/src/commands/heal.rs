@@ -25,14 +25,16 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
-/// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference).
+/// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference), or
+///                   the sealed-object record could not be checked or rebuilt, which stops the run
+///                   before anything else.
 pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String> {
     // First, so the taint's rescan below tells what the record holds by hash from what is lost. The
-    // rebuild writes only the record, which no recovery reads through the taint.
-    let (record_rebuilt, record_rebuild_failed) = match sealed_utils::rebuild() {
-        Ok(rebuilt) => (rebuilt.map(RecordRebuilt::from), None),
-        Err(error) => (None, Some(error)),
-    };
+    // rebuild writes only the record, which no recovery reads through the taint. A failure stops
+    // the run: everything after it would read the record it could not check or repair.
+    let record_rebuilt = sealed_utils::rebuild()
+        .map_err(|error| format!("{} Nothing else was healed: run \"forklift heal\" again once that is fixed.", error))?
+        .map(RecordRebuilt::from);
 
     // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
@@ -47,11 +49,6 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
             if let Some(rebuilt) = &record_rebuilt {
                 error = forklift_core::error::append_to_message(error, &rebuilt.sentence());
             }
-            if let Some(failed) = &record_rebuild_failed {
-                error = forklift_core::error::append_to_message(error, &format!(
-                    "The damaged sealed-object record may not have been rebuilt: {}", failed,
-                ));
-            }
             return Err(match operation_utils::read() {
                 Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
                     "An interrupted {} also stands in this bay; heal finishes or undoes it once the \
@@ -63,7 +60,11 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     };
 
     // After the taint: an operation's recovery reads and writes the store the taint vouches for.
-    let operation = operation_utils::recover()?.map(|recovery| OperationRecovery {
+    let recovered = operation_utils::recover().map_err(|error| match &record_rebuilt {
+        Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
+        None => error,
+    })?;
+    let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
         outcome: match recovery.outcome {
             RecoveryOutcome::Finished => OperationOutcome::Finished,
@@ -79,11 +80,10 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     // A refill whose removal was lost leaves an object present and still recorded. That seals
     // nothing while it is present, but were it lost later it would read as held rather than lost.
     let mut notes = outcome.notes;
-    let (unsealed, unseal_failed) = unseal_present(store_access, record_rebuild_failed.is_some(), &mut notes);
+    let (unsealed, unseal_failed) = unseal_present(store_access, &mut notes);
 
     output::emit(&HealReport {
         record_rebuilt,
-        record_rebuild_failed,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
@@ -99,8 +99,7 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
 
 /// Remove the sealed-object record of every object the store holds, pushing each one's coverage
 /// down first. A record that cannot be read is noted rather than failing the run: audit fails over
-/// it, and a torn rescan leaves its taint standing over it. It is not noted when this run's rebuild
-/// of it failed, which the report states with its cause.
+/// it, and a torn rescan leaves its taint standing over it.
 ///
 /// # Returns
 /// What was removed and newly recorded, and why the removal failed if it did: a failure to check
@@ -108,12 +107,10 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
 /// Each object left recorded gets a note.
 fn unseal_present(
     store_access: &StoreAccessLock,
-    rebuild_failed: bool,
     notes: &mut Vec<String>,
 ) -> (sealed_utils::Unsealed, Option<String>) {
     let record = match sealed_utils::read_sealed() {
         Ok(record) => record,
-        Err(_) if rebuild_failed => return (sealed_utils::Unsealed::default(), None),
         Err(error) => {
             notes.push(format!("{} No object it names was checked against the store.", error));
             return (sealed_utils::Unsealed::default(), None);
@@ -147,11 +144,6 @@ pub(crate) struct HealReport {
     /// before the damage. An object whose record was dropped reads as missing if it is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     record_rebuilt: Option<RecordRebuilt>,
-
-    /// Why rebuilding a damaged sealed-object record failed, if it did. A rewrite that failed
-    /// after its rename has still landed. Running `heal` again retries.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    record_rebuild_failed: Option<String>,
 
     /// Whether a durability taint was actually standing (an already-healthy warehouse reports
     /// `false`, with `restaged` and `resolved` empty).
@@ -276,11 +268,6 @@ impl CommandOutput for HealReport {
             println!("{}", rebuilt.sentence());
         }
 
-        if let Some(error) = &self.record_rebuild_failed {
-            println!("The damaged sealed-object record may not have been rebuilt: {}", error);
-            println!("Run \"forklift heal\" again to retry.");
-        }
-
         if let Some(operation) = &self.operation {
             operation.render_human();
         }
@@ -299,7 +286,6 @@ impl CommandOutput for HealReport {
             }
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
             && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
-            && self.record_rebuild_failed.is_none()
         {
             println!("Nothing to heal — no durability taint is standing.");
         }

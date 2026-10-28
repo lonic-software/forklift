@@ -2191,10 +2191,11 @@ interrupted last write could not have left, which a crash with fsync turned off 
 before the damage, and reports where the damage started and how many bytes it dropped
 (`record_rebuilt` under `--json`; a refusal's message says it too). Everything from the damage on
 is dropped, intact records after it included, since their order against what the damage hid is
-unknown: an absent object whose record was among them reads as missing afterwards. A record in
-another version, or one holding an intact entry this version cannot read, is never rewritten; the
-note names the way out. A rebuild that fails is reported (`record_rebuild_failed`), and running
-`heal` again retries.
+unknown: an absent object whose record was among them reads as missing afterwards. A record
+missing its header is rebuilt empty. A record in another version, or one whose first problem is an
+intact entry this version cannot read, is never rewritten; the note names the way out. A rebuild
+that fails stops `heal` before it does anything else, and its message says what the rewrite drops,
+since it may have landed; running `heal` again retries.
 
 Once nothing is left to resolve, `heal` also removes from the sealed-object record every object
 that is on disk again, such as one fetched back by a refill whose own removal was interrupted. An
