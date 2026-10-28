@@ -315,8 +315,7 @@ fn parse_fsync_setting(value: Option<&str>) -> bool {
 }
 
 /// Process-wide count of durability barriers actually paid (DESIGN.html §5.0 D item 10) — one per
-/// completed immediate write ([`write_file_atomically`] outside an active bulk session, or
-/// [`write_file_atomically_unstaged`]) or one
+/// completed immediate write ([`write_file_atomically`], outside an active bulk session) or one
 /// per completed [`run_write_barrier`] call (the shared implementation behind both
 /// [`WriteBatch::finish`] and [`BulkStoreSession::finish`]), incremented exactly once per barrier
 /// no matter how many files/objects it covers. Gated by [`fsync_enabled`], like every other step
@@ -971,23 +970,9 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
         }
     }
 
-    write_file_atomically_now(&temporary_file_path, file_path, content)
-}
+    write_and_sync_file(&temporary_file_path, content)?;
 
-/// [`write_file_atomically`] that is never staged, for a record whose writer appends to it in
-/// place as well: a rename staged until a bulk session finishes would land over the appends made
-/// in between. With no session open the two are the same write.
-pub(crate) fn write_file_atomically_unstaged(file_path: &Path, content: &[u8]) -> Result<(), String> {
-    let temporary_file_path = temp_path_for(file_path)?;
-    write_file_atomically_now(&temporary_file_path, file_path, content)
-}
-
-/// The immediate half of [`write_file_atomically`]: write and sync the temp file, rename it into
-/// place, and sync the directory.
-fn write_file_atomically_now(temporary_file_path: &Path, file_path: &Path, content: &[u8]) -> Result<(), String> {
-    write_and_sync_file(temporary_file_path, content)?;
-
-    rename(temporary_file_path, file_path).map_err(|e|
+    rename(&temporary_file_path, file_path).map_err(|e|
         format!("Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e)
     )?;
 

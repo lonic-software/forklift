@@ -41,8 +41,9 @@
 //! whose valid prefix is followed by a torn append is cut back to that prefix, then appended to.
 //! The first write creates the record atomically, so its header is never torn. Compaction
 //! ([`compact`]) rewrites the log as the set it replays to, which drops no recorded hash. The
-//! atomic writes are never staged by a bulk store session: a rename that waited for the session to
-//! finish would land over the appends made in between.
+//! atomic writes are never staged by a bulk store session (they go through
+//! [`file_utils::replace_file_atomically`]): a rename that waited for the session to finish would
+//! land over the appends made in between.
 
 use std::collections::HashSet;
 use std::io::{Seek, Write};
@@ -218,23 +219,14 @@ fn read_frame(bytes: &[u8]) -> Option<(&[u8], usize)> {
     Some((&bytes[8..entry_end], entry_end + 4))
 }
 
-/// Check that `unread`, everything after the last valid frame, is what a torn append leaves: one
+/// Whether `unread`, everything after the last valid frame, is what a torn append leaves: one
 /// frame's worth of bytes at most before any trailing zeros, and no valid frame among them, since
 /// a frame is synced before the next is written. The torn frame's own header is not trusted for
 /// its length: a header torn inside its length field can name a shorter one.
-///
-/// # Returns
-/// * `Ok(())`     - A torn append, or nothing.
-/// * `Err(usize)` - Damage: how many bytes run up to the last nonzero one.
-fn check_torn_tail(unread: &[u8]) -> Result<(), usize> {
+fn is_torn_tail(unread: &[u8]) -> bool {
     let written = unread.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
 
-    let frame_after = (0..written).any(|at| read_frame(&unread[at..]).is_some());
-    if written > MAX_FRAME_LEN || frame_after {
-        return Err(written);
-    }
-
-    Ok(())
+    written <= MAX_FRAME_LEN && !(0..written).any(|at| read_frame(&unread[at..]).is_some())
 }
 
 /// Whether a frame may declare `length` bytes of entries: a whole number of them, at least one,
@@ -289,11 +281,10 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
 
     // A torn append leaves at most one frame's bytes, then perhaps zeros the filesystem extended
     // the file with. Anything longer is not a torn tail: the frames behind it would be lost.
-    if let Err(written) = check_torn_tail(&bytes[offset..]) {
+    if !is_torn_tail(&bytes[offset..]) {
         return Err(format!(
-            "is damaged at byte {}: {} bytes that are not a valid frame follow it, more than one \
-            interrupted write leaves.",
-            offset, written
+            "is damaged at byte {}: what follows it is not what an interrupted write leaves.",
+            offset
         ));
     }
 
@@ -368,8 +359,9 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
     let path = sealed_path();
     let existing = read_record(&path)?;
 
-    let (bytes, mut set) = match existing {
-        Some((bytes, parsed)) => (Some((bytes, parsed.valid_len)), parsed.set),
+    // Only the lengths are kept: the bytes are not needed past the parse.
+    let (lengths, mut set) = match existing {
+        Some((bytes, parsed)) => (Some((bytes.len(), parsed.valid_len)), parsed.set),
         None => (None, SealedSet::default()),
     };
 
@@ -381,12 +373,12 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
         return Ok(set);
     }
 
-    match bytes {
-        Some((bytes, valid_len)) => append_frames(&path, bytes.len(), valid_len, &frames)?,
+    match lengths {
+        Some((len, valid_len)) => append_frames(&path, len, valid_len, &frames)?,
         None => {
             let mut created = header_bytes();
             created.extend(frames.concat());
-            file_utils::write_file_atomically_unstaged(&path, &created)?;
+            file_utils::replace_file_atomically(&path, &created)?;
         }
     }
 
@@ -457,7 +449,7 @@ pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
     compacted.extend(encode_frames(&ops)?.concat());
 
     if compacted != bytes {
-        file_utils::write_file_atomically_unstaged(&path, &compacted)?;
+        file_utils::replace_file_atomically(&path, &compacted)?;
     }
 
     Ok(parsed.set)
