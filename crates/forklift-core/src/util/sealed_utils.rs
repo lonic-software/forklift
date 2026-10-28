@@ -4,8 +4,9 @@
 //! everything under an absent recorded tree or recipe is tolerated by that same non-descent. A
 //! recorded object that is present seals nothing: it is walked like any other.
 //!
-//! The record is an append-only log at `<forklift root>/sealed`, shared by every bay. It is
-//! replayed in order: a record entry adds a hash, a removal entry drops it.
+//! The record is a log at `<forklift root>/sealed`, shared by every bay. It is appended to, and
+//! rewritten whole only atomically (see Writing). It is replayed in order: a record entry adds a
+//! hash, a removal entry drops it.
 //!
 //! ## Format
 //!
@@ -243,9 +244,9 @@ fn is_entries_len(length: usize) -> bool {
 /// # Returns
 /// * `Ok(ParsedSealed)` - The replayed set and the length of the valid prefix.
 /// * `Err(String)`      - If the header is missing or names another version, a valid frame
-///                        holds entries that do not parse, or what follows the last valid frame
-///                        is not a torn append: more than one frame's worth of bytes, or a valid
-///                        frame among them. Phrased to follow "The record ".
+///                        is of a size no frame has or holds an entry that does not parse, or
+///                        what follows the last valid frame is not a torn append: more than one
+///                        frame's worth of bytes, or a valid frame among them. Phrased to follow "The record ".
 pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
     let header = header_bytes();
 
@@ -272,7 +273,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
         );
 
         if !is_entries_len(entries.len()) {
-            return Err(unreadable(offset));
+            return Err(format!("holds a frame at byte {} of a size no frame has.", offset));
         }
 
         for (index, entry) in entries.chunks(ENTRY_LEN).enumerate() {
@@ -592,7 +593,7 @@ mod tests {
 
         let mut short_hash = record(&[(SealOp::Record, A)]);
         short_hash.extend(frame_with_entry(&[1u8, 0xaa, 0xbb]));
-        assert!(parse(&short_hash).unwrap_err().contains("cannot read"));
+        assert!(parse(&short_hash).unwrap_err().contains("of a size no frame has"));
     }
 
     #[test]
@@ -690,7 +691,7 @@ mod tests {
         entries.extend_from_slice(&[0xaa; HASH_LEN]);
         entries.push(1);
         ragged.extend(frame_with_entry(&entries));
-        assert!(parse(&ragged).unwrap_err().contains("cannot read"));
+        assert!(parse(&ragged).unwrap_err().contains("of a size no frame has"));
 
         let mut oversized = record(&[(SealOp::Record, A)]);
         let entries: Vec<u8> = (0..MAX_FRAME_ENTRIES + 1).flat_map(|_| {
@@ -699,7 +700,7 @@ mod tests {
             entry
         }).collect();
         oversized.extend(frame_with_entry(&entries));
-        assert!(parse(&oversized).unwrap_err().contains("cannot read"));
+        assert!(parse(&oversized).unwrap_err().contains("of a size no frame has"));
     }
 
     fn scratch(name: &str) -> (PathBuf, crate::globals::StorageRootScope) {

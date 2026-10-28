@@ -998,7 +998,8 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     Ok(())
 }
 
-/// Replace a file that is **not store content** — a configuration file — atomically: a fresh
+/// Replace a file that is **not store content** — a configuration file, or the sealed-object
+/// record (`sealed_utils`), whose writes must land at once — atomically: a fresh
 /// temporary file in the same folder, fsynced through its own write handle, renamed over
 /// `file_path`, then the folder fsynced. A reader opening `file_path` at any moment sees the old
 /// file or the new one, complete, never an empty or partial one; that holds even with
@@ -1012,7 +1013,8 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 /// config write. Nor does this count towards [`BARRIER_COUNT`], which measures store barriers.
 ///
 /// Callers serialize their own writers: this function makes one write untearable, not two
-/// concurrent edits of the same file safe (see `config_utils`'s edit lock).
+/// concurrent edits of the same file safe (see `config_utils`'s edit lock, and the ref lock the
+/// sealed-object record's writers hold).
 ///
 /// The replacement is a new file, so on Unix it is given the old file's permission bits before
 /// any content is written: a configuration holding `remote.token` that its owner made `0600`
