@@ -723,13 +723,41 @@ mod tests {
         assert!(set.contains(A));
         assert_eq!(std::fs::read(sealed_path()).unwrap(), record(&[(SealOp::Record, A)]));
 
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(sealed_path()).unwrap().ino()
+        };
         let set = append(&[(SealOp::Record, B), (SealOp::Remove, A)]).unwrap();
         assert!(!set.contains(A) && set.contains(B));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(sealed_path()).unwrap().ino(), created, "not rewritten");
+        }
         assert_eq!(read_sealed().unwrap(), set);
 
         let mut expected = record(&[(SealOp::Record, A)]);
         expected.extend(encode_frames(&[(SealOp::Record, B), (SealOp::Remove, A)]).unwrap().concat());
         assert_eq!(std::fs::read(sealed_path()).unwrap(), expected, "appended in place, one frame");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_append_past_one_frame_lands_as_several_frames_in_place() {
+        let (root, _scope) = scratch("split-append");
+        append(&[(SealOp::Record, A)]).unwrap();
+
+        let hashes: Vec<String> = (0..MAX_FRAME_ENTRIES + 1).map(|i| format!("{:064x}", i + 1)).collect();
+        let ops: Vec<(SealOp, &str)> = hashes.iter().map(|hash| (SealOp::Record, hash.as_str())).collect();
+        let set = append(&ops).unwrap();
+
+        let mut expected = record(&[(SealOp::Record, A)]);
+        expected.extend(encode_frames(&ops).unwrap().concat());
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), expected, "two frames, appended");
+        assert_eq!(read_sealed().unwrap(), set);
+        assert!(set.contains(A) && hashes.iter().all(|hash| set.contains(hash)));
 
         let _ = std::fs::remove_dir_all(&root);
     }
