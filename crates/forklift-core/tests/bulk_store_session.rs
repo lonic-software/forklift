@@ -216,36 +216,33 @@ fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint(
 }
 
 #[test]
-fn the_sealed_object_record_refuses_every_write_while_a_session_is_open() {
+fn the_sealed_object_record_is_written_through_an_open_session() {
     use forklift_core::util::sealed_utils::{self, SealOp};
 
-    // The session would only stage the record's atomic rewrites, and an append between a staged
-    // rewrite and its rename would be lost under it, so no write reaches the record at all.
+    // The record is appended to in place, so a rewrite of it that the session staged would land
+    // over the appends made before the session finished. Its writes are never staged: each is in
+    // place when it returns, session or not.
     let _guard = lock_session();
     let root = std::env::temp_dir().join(format!("forklift-bulk-sealed-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
     let _scope = StorageRootScope::enter(&root);
 
-    let hash = "aa00000000000000000000000000000000000000000000000000000000000001";
+    let a = "aa00000000000000000000000000000000000000000000000000000000000001";
+    let b = "bb00000000000000000000000000000000000000000000000000000000000002";
     let session = BulkStoreSession::open().unwrap();
-    let created = sealed_utils::append(&[(SealOp::Record, hash)]);
-    let compacted = sealed_utils::compact();
+
+    sealed_utils::append(&[(SealOp::Record, a)]).unwrap();
+    assert!(sealed_utils::read_sealed().unwrap().contains(a), "created in place, not staged");
+
+    sealed_utils::append(&[(SealOp::Record, b), (SealOp::Remove, a)]).unwrap();
+    sealed_utils::compact().unwrap();
+    sealed_utils::append(&[(SealOp::Record, a)]).unwrap();
+
+    // Dropped unfinished: anything it had staged is discarded, and nothing was.
     drop(session);
-
-    assert!(created.unwrap_err().contains("bulk store session"));
-    assert!(compacted.unwrap_err().contains("bulk store session"));
-    assert!(!sealed_utils::sealed_path().exists(), "nothing was created, not even staged");
-
-    // With an existing record, too: an append in place is refused like the rewrites.
-    sealed_utils::append(&[(SealOp::Record, hash)]).unwrap();
-    let before = std::fs::read(sealed_utils::sealed_path()).unwrap();
-    let session = BulkStoreSession::open().unwrap();
-    let appended = sealed_utils::append(&[(SealOp::Remove, hash)]);
-    drop(session);
-
-    assert!(appended.unwrap_err().contains("bulk store session"));
-    assert_eq!(std::fs::read(sealed_utils::sealed_path()).unwrap(), before);
+    let set = sealed_utils::read_sealed().unwrap();
+    assert!(set.contains(a) && set.contains(b), "the compaction and the appends around it all stand");
 
     std::fs::remove_dir_all(&root).ok();
 }

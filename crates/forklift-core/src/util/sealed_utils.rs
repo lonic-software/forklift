@@ -23,13 +23,14 @@
 //! A reader takes no lock. It stops at the first frame that does not validate, which is how a torn
 //! append reads: everything after the last valid frame is ignored. A region of zeros never
 //! validates, because the magic is nonzero. Every frame is synced before the next is written (see
-//! [`append_locked`]), so a torn append leaves at most one frame's worth of bytes before any
-//! trailing zeros: the length its header declares when the header survived, and the largest frame
-//! when it did not. More than that after the last valid frame is damage inside the log, and fails
-//! the read rather than dropping the frames behind it. Damage within that bound cannot be told
-//! from a torn append, so it reads as one: the entries there are not replayed. That is the one loss
-//! the log can hide, and it hides only entries: a lost record reads as a missing object, which
-//! every walk reports, and a lost removal leaves a present object recorded, which seals nothing.
+//! [`append_locked`]), so a torn append is the last frame and only that: nothing after it
+//! validates, and at most the largest frame's worth of bytes precede any trailing zeros. A valid
+//! frame anywhere past the last one read, or more bytes than that, is damage inside the log, and
+//! fails the read rather than dropping the frames behind it. Damage that leaves no valid frame
+//! after it within that many bytes of the end cannot be told from a torn append, so it reads as
+//! one: the entries there are not replayed. That is the one loss the log can hide, and it hides
+//! only entries: a lost record reads as a missing object, which every walk reports, and a lost
+//! removal leaves a present object recorded, which seals nothing.
 //! A frame that validates but whose entries do not parse fails the read, as does a header naming
 //! another version: neither is guessed at.
 //!
@@ -37,11 +38,11 @@
 //!
 //! Every write takes the ref lock ([`RefLock`]) and re-reads the record under it, so writes are
 //! ordered and each one sees the last. A record that does not parse is never written over. One
-//! whose valid prefix is followed by a torn append is rewritten to that prefix atomically, then
-//! appended to. The first write creates the record atomically, so its header is never torn.
-//! Compaction ([`compact`]) rewrites the log as the set it replays to, which drops no recorded
-//! hash. Every write refuses while a bulk store session is open, because the session would stage
-//! the atomic rewrites until it finishes, and an append in between would be lost under them.
+//! whose valid prefix is followed by a torn append is cut back to that prefix, then appended to.
+//! The first write creates the record atomically, so its header is never torn. Compaction
+//! ([`compact`]) rewrites the log as the set it replays to, which drops no recorded hash. The
+//! atomic writes are never staged by a bulk store session: a rename that waited for the session to
+//! finish would land over the appends made in between.
 
 use std::collections::HashSet;
 use std::io::{Seek, Write};
@@ -60,11 +61,8 @@ const SEALED_VERSION: u32 = 1;
 /// Opens every frame. Nonzero, so a zero-filled region left by a crash never reads as a frame.
 pub const FRAME_MAGIC: u32 = 0x5345_414C;
 
-/// The bytes of a frame before its entries: the magic and the length.
-const FRAME_HEAD: usize = 8;
-
 /// The bytes of a frame around its entries: magic and length before them, the CRC after.
-const FRAME_OVERHEAD: usize = FRAME_HEAD + 4;
+const FRAME_OVERHEAD: usize = 12;
 
 /// The length of an object hash, in bytes.
 const HASH_LEN: usize = 32;
@@ -158,7 +156,7 @@ pub fn header_bytes() -> Vec<u8> {
 ///
 /// # Returns
 /// * `Ok(Vec<u8>)` - The frame's bytes.
-/// * `Err(String)` - If `hash` is not a 32-byte hex hash.
+/// * `Err(String)` - If `hash` is not a 32-byte lowercase hex hash.
 pub fn encode_frame(op: SealOp, hash: &str) -> Result<Vec<u8>, String> {
     encode_frames(&[(op, hash)]).map(|frames| frames.concat())
 }
@@ -167,16 +165,17 @@ pub fn encode_frame(op: SealOp, hash: &str) -> Result<Vec<u8>, String> {
 ///
 /// # Returns
 /// * `Ok(Vec<Vec<u8>>)` - Each frame's bytes (none for no ops).
-/// * `Err(String)`      - If a hash is not a 32-byte hex hash.
+/// * `Err(String)`      - If a hash is not a 32-byte lowercase hex hash.
 fn encode_frames(ops: &[(SealOp, &str)]) -> Result<Vec<Vec<u8>>, String> {
     let mut frames = Vec::new();
 
     for batch in ops.chunks(MAX_FRAME_ENTRIES) {
         let mut entries = Vec::with_capacity(batch.len() * ENTRY_LEN);
         for (op, hash) in batch {
+            // Lowercase only, the spelling a replay gives back, so a caller's set and the record's agree.
             let raw = sign_utils::from_hex(hash)
                 .ok()
-                .filter(|raw| raw.len() == HASH_LEN)
+                .filter(|raw| raw.len() == HASH_LEN && sign_utils::to_hex(raw) == *hash)
                 .ok_or_else(|| format!("\"{}\" is not an object hash.", hash))?;
             entries.push(op.to_byte());
             entries.extend_from_slice(&raw);
@@ -219,20 +218,23 @@ fn read_frame(bytes: &[u8]) -> Option<(&[u8], usize)> {
     Some((&bytes[8..entry_end], entry_end + 4))
 }
 
-/// Whether `unread`, everything after the last valid frame, is what a torn append leaves: its
-/// bytes up to the last nonzero one fit in one frame. That frame's length is the one its header
-/// declares when the header is whole and names a length a frame can have, and the largest frame's
-/// otherwise, since a torn header (or one whose bytes never reached the disk) names none.
-fn is_torn_tail(unread: &[u8]) -> bool {
+/// Check that `unread`, everything after the last valid frame, is what a torn append leaves: one
+/// frame's worth of bytes at most before any trailing zeros, and no valid frame among them, since
+/// a frame is synced before the next is written. The torn frame's own header is not trusted for
+/// its length: a header torn inside its length field can name a shorter one.
+///
+/// # Returns
+/// * `Ok(())`     - A torn append, or nothing.
+/// * `Err(usize)` - Damage: how many bytes run up to the last nonzero one.
+fn check_torn_tail(unread: &[u8]) -> Result<(), usize> {
     let written = unread.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
 
-    let declared = unread.get(..FRAME_HEAD).and_then(|head| {
-        let magic = u32::from_le_bytes(head[..4].try_into().expect("four bytes"));
-        let length = u32::from_le_bytes(head[4..].try_into().expect("four bytes")) as usize;
-        (magic == FRAME_MAGIC && is_entries_len(length)).then_some(FRAME_OVERHEAD + length)
-    });
+    let frame_after = (0..written).any(|at| read_frame(&unread[at..]).is_some());
+    if written > MAX_FRAME_LEN || frame_after {
+        return Err(written);
+    }
 
-    written <= declared.unwrap_or(MAX_FRAME_LEN)
+    Ok(())
 }
 
 /// Whether a frame may declare `length` bytes of entries: a whole number of them, at least one,
@@ -287,9 +289,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
 
     // A torn append leaves at most one frame's bytes, then perhaps zeros the filesystem extended
     // the file with. Anything longer is not a torn tail: the frames behind it would be lost.
-    let unread = &bytes[offset..];
-    if !is_torn_tail(unread) {
-        let written = unread.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
+    if let Err(written) = check_torn_tail(&bytes[offset..]) {
         return Err(format!(
             "is damaged at byte {}: {} bytes that are not a valid frame follow it, more than one \
             interrupted write leaves.",
@@ -349,9 +349,8 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///
 /// The record is re-read under the lock first. A record that does not parse is left as it is. With
 /// no record yet, it is created holding `ops`, atomically. When a torn append follows the valid
-/// frames, the record is rewritten atomically to those frames and `ops`, which drops the torn
-/// bytes. Otherwise the frames are appended in place, each synced before the next is written, so a
-/// torn append can only ever be the last frame. Every way, `ops` are on disk when this returns —
+/// frames, the record is cut back to them and synced. Then the frames are appended, each synced
+/// before the next is written, so a torn append can only ever be the last frame. Every way, `ops` are on disk when this returns —
 /// unless fsync is turned off, when a crash may leave the record damaged.
 ///
 /// # Arguments
@@ -360,14 +359,11 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///
 /// # Returns
 /// * `Ok(SealedSet)` - The set the record now replays to.
-/// * `Err(String)`   - If a bulk store session is open, a hash is not an object hash, the record
-///                     cannot be read or parsed, or the write fails. Nothing is written in the
-///                     first three cases. A failed write may still have landed some of its frames
+/// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, or
+///                     the write fails. Nothing is written in the first two cases. A failed write may still have landed some of its frames
 ///                     whole, and may leave a torn one, which the next write drops: read the
 ///                     record back to learn which.
 pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
-    refuse_in_bulk_session()?;
-
     let frames = encode_frames(ops)?;
     let path = sealed_path();
     let existing = read_record(&path)?;
@@ -386,24 +382,21 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
     }
 
     match bytes {
-        Some((bytes, valid_len)) if valid_len == bytes.len() => append_frames(&path, &frames)?,
-        Some((bytes, valid_len)) => {
-            let mut rewritten = bytes[..valid_len].to_vec();
-            rewritten.extend(frames.concat());
-            file_utils::write_file_atomically(&path, &rewritten)?;
-        }
+        Some((bytes, valid_len)) => append_frames(&path, bytes.len(), valid_len, &frames)?,
         None => {
             let mut created = header_bytes();
             created.extend(frames.concat());
-            file_utils::write_file_atomically(&path, &created)?;
+            file_utils::write_file_atomically_unstaged(&path, &created)?;
         }
     }
 
     Ok(set)
 }
 
-/// Append `frames` to the end of the record at `path`, syncing each before writing the next.
-fn append_frames(path: &Path, frames: &[Vec<u8>]) -> Result<(), String> {
+/// Append `frames` to the record at `path`, `len` bytes long, after cutting it back to its first
+/// `valid_len` bytes when a torn append follows them, syncing the cut and each frame before the
+/// next write.
+fn append_frames(path: &Path, len: usize, valid_len: usize, frames: &[Vec<u8>]) -> Result<(), String> {
     let failed = |e: std::io::Error| format!(
         "Error while appending to the sealed-object record \"{}\": {}",
         path.to_string_lossy(),
@@ -411,9 +404,16 @@ fn append_frames(path: &Path, frames: &[Vec<u8>]) -> Result<(), String> {
     );
 
     // A write handle that is not an append-only one: Windows flushes only a handle opened for
-    // writing. The ref lock keeps every other writer out, so the end found here stays the end.
+    // writing. The ref lock keeps every other writer out, so the length read stays the length.
     let mut file = std::fs::OpenOptions::new().write(true).open(path).map_err(failed)?;
-    file.seek(std::io::SeekFrom::End(0)).map_err(failed)?;
+
+    if valid_len < len {
+        file.set_len(valid_len as u64).map_err(failed)?;
+        if file_utils::fsync_enabled() {
+            file.sync_all().map_err(failed)?;
+        }
+    }
+    file.seek(std::io::SeekFrom::Start(valid_len as u64)).map_err(failed)?;
 
     for frame in frames {
         file.write_all(frame).map_err(failed)?;
@@ -441,11 +441,9 @@ pub fn compact() -> Result<SealedSet, String> {
 ///
 /// # Returns
 /// * `Ok(SealedSet)` - The set the record replays to, unchanged.
-/// * `Err(String)`   - If a bulk store session is open, the record cannot be read or parsed, or
-///                     the rewrite fails. The record is left as it was.
+/// * `Err(String)`   - If the record cannot be read or parsed, or the rewrite fails. The record is
+///                     left as it was.
 pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
-    refuse_in_bulk_session()?;
-
     let path = sealed_path();
     let Some((bytes, parsed)) = read_record(&path)? else {
         return Ok(SealedSet::default());
@@ -459,20 +457,10 @@ pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
     compacted.extend(encode_frames(&ops)?.concat());
 
     if compacted != bytes {
-        file_utils::write_file_atomically(&path, &compacted)?;
+        file_utils::write_file_atomically_unstaged(&path, &compacted)?;
     }
 
     Ok(parsed.set)
-}
-
-/// Refuse a write to the record while a bulk store session is open: the session only stages an
-/// atomic rewrite until it finishes, so an append landing in between would be lost under it.
-fn refuse_in_bulk_session() -> Result<(), String> {
-    if file_utils::is_bulk_session_open() {
-        return Err("The sealed-object record cannot be written while a bulk store session is open.".to_string());
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -647,18 +635,31 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_frame_whose_header_landed_is_bounded_by_its_declared_length() {
-        let frame = encode_frames(&[(SealOp::Record, A), (SealOp::Record, B)]).unwrap().concat();
-        let mut torn = frame.clone();
-        let last = torn.len() - 1;
-        torn[last] ^= 0xff;
+    fn a_torn_frame_whose_length_field_tore_is_still_a_torn_tail() {
+        // A long append whose second length byte never landed, though later bytes of it did:
+        // the header now names a one-entry frame, far shorter than what follows.
+        let hashes: Vec<String> = (0..257).map(|i| format!("{:064x}", i + 1)).collect();
+        let ops: Vec<(SealOp, &str)> = hashes.iter().map(|hash| (SealOp::Record, hash.as_str())).collect();
+        let mut torn = encode_frames(&ops).unwrap().concat();
+        assert_eq!(&torn[4..6], &[0x21, 0x21]);
+        torn[5] = 0;
+        torn.truncate(torn.len() - 1);
 
-        let mut bytes = header_bytes();
+        let mut bytes = record(&[(SealOp::Record, A)]);
+        let valid = bytes.len();
         bytes.extend(&torn);
-        assert!(parse(&bytes).unwrap().set.is_empty(), "the frame alone, torn: a torn append");
+        assert_eq!(parse(&bytes).unwrap().valid_len, valid);
+    }
 
-        bytes.push(0x5a);
-        assert!(parse(&bytes).unwrap_err().contains("damaged"), "a byte past the frame it declares");
+    #[test]
+    fn a_valid_frame_after_the_break_is_damage_however_near_the_end() {
+        // Each frame is synced before the next is written, so a torn append has nothing valid
+        // after it: a frame that validates there proves the break is damage.
+        let mut bytes = record(&[(SealOp::Record, A), (SealOp::Record, B), (SealOp::Remove, A)]);
+        bytes[header_bytes().len() + FRAME_LEN] ^= 0xff;
+
+        let err = parse(&bytes).expect_err("the removal behind a damaged magic must not be dropped");
+        assert!(err.contains("damaged"), "{}", err);
     }
 
     #[test]
@@ -754,6 +755,8 @@ mod tests {
         let before = std::fs::read(sealed_path()).unwrap();
 
         assert!(append(&[(SealOp::Record, B), (SealOp::Record, "abc")]).is_err());
+        // An uppercase spelling is refused too: the replay would give it back lowercase.
+        assert!(append(&[(SealOp::Record, &B.to_uppercase())]).is_err());
         assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -775,10 +778,15 @@ mod tests {
         assert_eq!(std::fs::read(sealed_path()).unwrap(), record(&[(SealOp::Record, A)]));
         assert_eq!(read_sealed().unwrap(), before);
 
-        // Compacting a compact record, or no record, writes nothing.
-        let compacted = std::fs::metadata(sealed_path()).unwrap().modified().unwrap();
-        compact().unwrap();
-        assert_eq!(std::fs::metadata(sealed_path()).unwrap().modified().unwrap(), compacted);
+        // Compacting a compact record, or no record, writes nothing: no rename, so the same inode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let inode = || std::fs::metadata(sealed_path()).unwrap().ino();
+            let compacted = inode();
+            compact().unwrap();
+            assert_eq!(inode(), compacted);
+        }
         std::fs::remove_file(sealed_path()).unwrap();
         assert!(compact().unwrap().is_empty());
         assert!(!sealed_path().exists());
