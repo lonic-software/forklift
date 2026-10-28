@@ -132,7 +132,7 @@ impl SealedSet {
 }
 
 /// A parsed record: its replayed set, and how many leading bytes are the header and valid frames.
-/// A writer that finds bytes past `valid_len` rewrites the file to that prefix before appending.
+/// A writer that finds bytes past `valid_len` cuts the file back to that prefix before appending.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedSealed {
     pub set: SealedSet,
@@ -241,8 +241,9 @@ fn is_entries_len(length: usize) -> bool {
 /// # Returns
 /// * `Ok(ParsedSealed)` - The replayed set and the length of the valid prefix.
 /// * `Err(String)`      - If the header is missing or names another version, a valid frame
-///                        holds entries that do not parse, or more than one frame's worth of
-///                        bytes follows the last valid frame. Phrased to follow "The record ".
+///                        holds entries that do not parse, or what follows the last valid frame
+///                        is not a torn append: more than one frame's worth of bytes, or a valid
+///                        frame among them. Phrased to follow "The record ".
 pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
     let header = header_bytes();
 
@@ -352,9 +353,10 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 /// # Returns
 /// * `Ok(SealedSet)` - The set the record now replays to.
 /// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, or
-///                     the write fails. Nothing is written in the first two cases. A failed write may still have landed some of its frames
-///                     whole, and may leave a torn one, which the next write drops: read the
-///                     record back to learn which.
+///                     the write fails. Nothing is written in the first two cases. A failed
+///                     write may still have landed: some of its frames whole (and perhaps a
+///                     torn one, which the next write drops), or the whole new record when the
+///                     create failed after its rename. Read the record back to learn which.
 pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
     let frames = encode_frames(ops)?;
     let path = sealed_path();
@@ -434,8 +436,9 @@ pub fn compact() -> Result<SealedSet, String> {
 ///
 /// # Returns
 /// * `Ok(SealedSet)` - The set the record replays to, unchanged.
-/// * `Err(String)`   - If the record cannot be read or parsed, or the rewrite fails. The record is
-///                     left as it was.
+/// * `Err(String)`   - If the record cannot be read or parsed, which leaves it as it was, or the
+///                     rewrite fails. A rewrite that fails after its rename has still replaced
+///                     the record (with the same set): read it back to learn which.
 pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
     let path = sealed_path();
     let Some((bytes, parsed)) = read_record(&path)? else {
