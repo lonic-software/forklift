@@ -51,12 +51,13 @@
 //! [`file_utils::replace_file_atomically`]): a rename that waited for the session to finish would
 //! land over the appends made in between.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use crate::enums::object_type::ObjectType;
 use crate::globals;
-use crate::util::{file_utils, record_utils, sign_utils};
-use crate::util::lock_utils::RefLock;
+use crate::util::{file_utils, object_utils, pack_utils, record_utils, sign_utils};
+use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
 
 /// The record's file name under the shared forklift root.
 const FILE_NAME_SEALED: &str = "sealed";
@@ -363,8 +364,17 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///                     write may still have landed: some of its frames whole (and perhaps a
 ///                     torn one, which the next write drops), or the whole new record when the
 ///                     create failed after its rename. Read the record back to learn which.
-pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
-    let frames = encode_frames(ops)?;
+pub fn append_locked(lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
+    let ops: Vec<(SealOp, String)> = ops.iter().map(|(op, hash)| (*op, hash.to_string())).collect();
+    append_decided_locked(lock, |_| ops)
+}
+
+/// [`append_locked`] with the ops decided from the set the record replays to when it is re-read
+/// under the lock, so a decision about what is recorded is made on what is recorded.
+fn append_decided_locked(
+    _lock: &RefLock,
+    decide: impl FnOnce(&SealedSet) -> Vec<(SealOp, String)>,
+) -> Result<SealedSet, String> {
     let path = sealed_path();
     let existing = read_record(&path)?;
 
@@ -379,8 +389,12 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
         None => (Some(header_bytes()), SealedSet::default()),
     };
 
+    let ops = decide(&set);
+    let borrowed: Vec<(SealOp, &str)> = ops.iter().map(|(op, hash)| (*op, hash.as_str())).collect();
+    let frames = encode_frames(&borrowed)?;
+
     for (op, hash) in ops {
-        set.apply(*op, hash.to_string());
+        set.apply(op, hash);
     }
 
     if frames.is_empty() {
@@ -458,6 +472,198 @@ pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
     }
 
     Ok(parsed.set)
+}
+
+/// A hold on the store-access lock: the shared [`StoreAccessLock`], or the [`StoreAccessExclusive`]
+/// a deleter holds. While one is held, no other process deletes an object from the store.
+pub trait StoreAccessHold {}
+
+impl StoreAccessHold for StoreAccessLock {}
+
+impl StoreAccessHold for StoreAccessExclusive {}
+
+/// What [`unseal`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Unsealed {
+    /// The objects whose records were removed, sorted.
+    pub removed: Vec<String>,
+    /// The absent objects beneath them that the record holds now and did not before, sorted.
+    pub pushed_down: Vec<String>,
+    /// The objects left recorded, each with why: one not in the store, or one whose closure could
+    /// not be walked.
+    pub kept: Vec<(String, String)>,
+}
+
+/// The recorded objects the store holds, sorted. Each seals nothing while it is present, and
+/// [`unseal`] removes its record.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The recorded hashes present in the store, loose or packed.
+/// * `Err(String)`     - If the store could not be checked.
+pub fn present_recorded(record: &SealedSet) -> Result<Vec<String>, String> {
+    let mut present = Vec::new();
+
+    for hash in &record.hashes {
+        if file_utils::raw_object_present(hash)? {
+            present.push(hash.clone());
+        }
+    }
+
+    present.sort();
+    Ok(present)
+}
+
+/// Remove the records of the present objects `hashes`, each after a deep push-down: every absent
+/// object its present closure reaches is recorded first, so the removal exposes nothing it held.
+/// An absent object beneath a recorded one is held on the same premise as that one, that the
+/// remote holds its closure. The walk is by hash, not path: it records an absent object whatever
+/// the fetch scope says of the paths that reach it.
+///
+/// The walk runs without the ref lock. The commit takes it, re-reads the record, and appends the
+/// push-down's records, then the removals of those `hashes` still recorded, synced before this
+/// returns. Records first: a crash between them leaves an object present and recorded, which this
+/// repairs on the next run.
+///
+/// # Arguments
+/// * `_hold`  - The caller's store-access hold, shared or exclusive. It must span the whole call,
+///              so that nothing deletes an object the walk found present before the commit lands.
+///              This never takes one of its own, so a deleter calling it does not wait on itself.
+/// * `hashes` - The objects to unseal. One not in the store, or whose closure cannot be walked
+///              (an object beneath it is unreadable, or may be in a pack index that cannot be
+///              read), stays recorded and is listed in [`Unsealed::kept`].
+///
+/// # Returns
+/// * `Ok(Unsealed)` - What was removed, pushed down and kept.
+/// * `Err(String)`  - If the record cannot be read or parsed under the lock, the ref lock cannot be
+///                    taken, or the append fails ([`append_locked`] says what a failed append may
+///                    have left).
+pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unsealed, String> {
+    // Trees and recipes whose whole closure a walk that finished has checked: a later walk that
+    // reaches one has nothing more to find beneath it.
+    let mut closed: HashSet<String> = HashSet::new();
+    let mut absent: BTreeSet<String> = BTreeSet::new();
+    let mut walked: Vec<String> = Vec::new();
+    let mut kept: Vec<(String, String)> = Vec::new();
+
+    for hash in hashes {
+        match closure_absences(hash, &closed) {
+            Ok(closure) => {
+                closed.extend(closure.walked);
+                absent.extend(closure.absent);
+                walked.push(hash.clone());
+            }
+            Err(reason) => kept.push((hash.clone(), reason)),
+        }
+    }
+
+    if walked.is_empty() {
+        return Ok(Unsealed { kept, ..Unsealed::default() });
+    }
+
+    let lock = RefLock::acquire()?;
+    let mut removed = Vec::new();
+    let mut pushed_down = Vec::new();
+
+    append_decided_locked(&lock, |set| {
+        pushed_down = absent.into_iter().filter(|hash| !set.contains(hash)).collect();
+        removed = walked.into_iter().filter(|hash| set.contains(hash)).collect::<BTreeSet<String>>().into_iter().collect();
+
+        pushed_down.iter().map(|hash| (SealOp::Record, hash.clone()))
+            .chain(removed.iter().map(|hash| (SealOp::Remove, hash.clone())))
+            .collect()
+    })?;
+
+    Ok(Unsealed { removed, pushed_down, kept })
+}
+
+/// What one push-down walk found.
+struct ClosureAbsences {
+    /// The trees and recipes it walked.
+    walked: HashSet<String>,
+    /// The absent objects it reached.
+    absent: Vec<String>,
+}
+
+/// Walk the present closure of `hash`, collecting every absent object it reaches. An absent object
+/// is not descended: whatever lies beneath it is held by its own record. A tree or recipe in
+/// `closed` is not walked again.
+///
+/// # Returns
+/// * `Ok(ClosureAbsences)` - What the walk went through and what it found absent.
+/// * `Err(String)`         - Why the closure could not be walked: `hash` is not in the store, or
+///                           an object beneath it could not be read or may be in a pack index
+///                           that cannot be read.
+fn closure_absences(hash: &str, closed: &HashSet<String>) -> Result<ClosureAbsences, String> {
+    let mut walk = ClosureAbsences { walked: HashSet::new(), absent: Vec::new() };
+
+    if !is_present(hash)? {
+        return Err("it is not in the store".to_string());
+    }
+
+    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+    let mut trees: VecDeque<String> = VecDeque::new();
+
+    match object_utils::peek_object_header(&bytes)?.0 {
+        ObjectType::Tree => trees.push_back(hash.to_string()),
+        ObjectType::Recipe => recipe_absences(hash, closed, &mut walk)?,
+        // A blob, a chunk or a parcel holds nothing by hash beneath it.
+        _ => {}
+    }
+
+    while let Some(tree_hash) = trees.pop_front() {
+        if closed.contains(&tree_hash) || !walk.walked.insert(tree_hash.clone()) {
+            continue;
+        }
+
+        let tree = object_utils::load_tree_shared(&tree_hash)?;
+
+        for (_, file) in tree.get_files() {
+            if !is_present(&file.hash)? {
+                walk.absent.push(file.hash.clone());
+            } else if file.item_type.is_chunked() {
+                recipe_absences(&file.hash, closed, &mut walk)?;
+            }
+        }
+
+        for (_, subtree) in tree.get_subtrees() {
+            if is_present(&subtree.hash)? {
+                trees.push_back(subtree.hash.clone());
+            } else {
+                walk.absent.push(subtree.hash.clone());
+            }
+        }
+    }
+
+    Ok(walk)
+}
+
+/// Collect the absent chunks of the present recipe `hash` into `walk`, unless `closed` or `walk`
+/// already holds it.
+fn recipe_absences(hash: &str, closed: &HashSet<String>, walk: &mut ClosureAbsences) -> Result<(), String> {
+    if closed.contains(hash) || !walk.walked.insert(hash.to_string()) {
+        return Ok(());
+    }
+
+    for chunk in object_utils::recipe_chunk_hashes(hash)? {
+        if !is_present(&chunk)? {
+            walk.absent.push(chunk);
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether the store holds `hash`. An object only an unreadable pack index might hold is neither:
+/// its bytes may be on disk, and what it references may be present, so the walk cannot go on.
+fn is_present(hash: &str) -> Result<bool, String> {
+    if file_utils::raw_object_present(hash)? {
+        return Ok(true);
+    }
+
+    match pack_utils::sweep_unreadable_reason(hash)? {
+        None => Ok(false),
+        Some(reason) => Err(format!("{} may be in the store but cannot be read ({})", hash, reason)),
+    }
 }
 
 #[cfg(test)]

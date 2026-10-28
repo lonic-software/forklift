@@ -92,6 +92,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
                 is_sparse.then(|| fetch_scope.prefixes().to_vec()),
                 full,
                 sealed.held(),
+                sealed_utils::present_recorded(&record)?.len(),
             ));
         }
     }
@@ -163,6 +164,12 @@ pub(crate) struct AuditScope {
     #[serde(skip_serializing_if = "crate::output::is_zero")]
     held_by_hash: usize,
 
+    /// How many objects the sealed record names that are on disk all the same. That fails
+    /// nothing: a recorded object that is present is checked like any other. `heal` removes their
+    /// records. Omitted when none.
+    #[serde(skip_serializing_if = "crate::output::is_zero")]
+    present_and_recorded: usize,
+
     /// How a chunked file's chunks were checked: `presence-checked` in a normal audit (bounded, no
     /// bytes re-read), or, under `--full`, re-read and re-hashed with each fully-present file
     /// re-assembled to verify its recipe's content hash.
@@ -184,7 +191,8 @@ impl AuditScope {
     ///   full clone.
     /// * `full`        - Whether `--full` re-read and re-verified chunks (vs. presence-checked).
     /// * `held`        - How many absent objects the sealed record held by hash alone.
-    fn new(fetch_scope: Option<Vec<String>>, full: bool, held: usize) -> AuditScope {
+    /// * `present`     - How many objects the sealed record names that the store holds.
+    fn new(fetch_scope: Option<Vec<String>>, full: bool, held: usize, present: usize) -> AuditScope {
         let sparse = fetch_scope.is_some();
 
         AuditScope {
@@ -192,6 +200,7 @@ impl AuditScope {
             signatures: "verified",
             in_scope_content: "verified",
             held_by_hash: held,
+            present_and_recorded: present,
             chunks: if full {
                 "re-read and re-hashed; each fully-present chunked file re-assembled to verify its content hash"
             } else {
@@ -263,6 +272,14 @@ impl CommandOutput for AuditReport {
                 "{} absent object(s) are held by hash alone: each is pinned to the hash a parent \
                 that is present commits, but is not on disk, and nothing beneath it was checked.",
                 held
+            );
+        }
+
+        if let Some(AuditScope { present_and_recorded: present @ 1.., .. }) = &self.scope {
+            println!(
+                "{} object(s) on disk are still recorded as held by hash alone. That fails nothing, \
+                since a recorded object on disk is checked like any other wherever it is reached. Run \"forklift heal\" to remove their records.",
+                present
             );
         }
     }
