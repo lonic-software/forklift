@@ -10,22 +10,24 @@
 //! ## Format
 //!
 //! ```text
-//! /forklift-sealed 1\n
+//! /forklift-sealed 2\n
 //! frame*
 //! ```
 //!
 //! Each frame is `magic | length | entries | crc`: the magic is [`FRAME_MAGIC`], the length counts
 //! the entries' bytes, and the CRC-32 covers the magic, the length and the entries, all
 //! little-endian. An entry is one operation byte ([`SealOp`]) followed by the object's raw 32-byte
-//! hash. A frame holds at least one entry and at most [`MAX_FRAME_ENTRIES`], so it stands or falls
-//! whole: an append of many entries cannot land half-applied.
+//! hash. A frame holds at least one entry and at most [`MAX_FRAME_ENTRIES`], and stands or falls
+//! whole: an append of up to that many entries cannot land half-applied. A longer one is written a
+//! frame at a time, and lands frame by frame.
 //!
 //! A reader takes no lock. It stops at the first frame that does not validate, which is how a torn
 //! append reads: everything after the last valid frame is ignored. A region of zeros never
 //! validates, because the magic is nonzero. Every frame is synced before the next is written (see
 //! [`append_locked`]), so a torn append is the last frame and only that: nothing after it
-//! validates, and at most the largest frame's worth of bytes precede any trailing zeros. A valid
-//! frame anywhere past the last one read, or more bytes than that, is damage inside the log, and
+//! validates, and at most the largest frame's worth of bytes, zeros included, follow the last
+//! valid frame. A valid frame anywhere past the last one read, or more bytes than that, is damage
+//! inside the log, and
 //! fails the read rather than dropping the frames behind it. Damage that leaves no valid frame
 //! after it within that many bytes of the end cannot be told from a torn append, so it reads as
 //! one: the entries there are not replayed. That is the one loss the log can hide, and it hides
@@ -57,7 +59,7 @@ const FILE_NAME_SEALED: &str = "sealed";
 
 /// The [`record_utils`] kind and version of the record's header line.
 const SEALED_RECORD: &str = "sealed";
-const SEALED_VERSION: u32 = 1;
+const SEALED_VERSION: u32 = 2;
 
 /// Opens every frame. Nonzero, so a zero-filled region left by a crash never reads as a frame.
 pub const FRAME_MAGIC: u32 = 0x5345_414C;
@@ -220,13 +222,12 @@ fn read_frame(bytes: &[u8]) -> Option<(&[u8], usize)> {
 }
 
 /// Whether `unread`, everything after the last valid frame, is what a torn append leaves: one
-/// frame's worth of bytes at most before any trailing zeros, and no valid frame among them, since
-/// a frame is synced before the next is written. The torn frame's own header is not trusted for
-/// its length: a header torn inside its length field can name a shorter one.
+/// frame's worth of bytes at most, zeros included (a crash can extend the file over the write it
+/// cut short, and no further), and no valid frame among them, since a frame is synced before the
+/// next is written. The torn frame's own header is not trusted for its length: a header torn
+/// inside its length field can name a shorter one.
 fn is_torn_tail(unread: &[u8]) -> bool {
-    let written = unread.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
-
-    written <= MAX_FRAME_LEN && !(0..written).any(|at| read_frame(&unread[at..]).is_some())
+    unread.len() <= MAX_FRAME_LEN && !(0..unread.len()).any(|at| read_frame(&unread[at..]).is_some())
 }
 
 /// Whether a frame may declare `length` bytes of entries: a whole number of them, at least one,
@@ -262,17 +263,17 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
     let mut offset = header.len();
 
     while let Some((entries, frame_len)) = read_frame(&bytes[offset..]) {
-        let unreadable = || format!(
+        let unreadable = |at: usize| format!(
             "holds an entry at byte {} that this version of Forklift cannot read.",
-            offset
+            at
         );
 
         if !is_entries_len(entries.len()) {
-            return Err(unreadable());
+            return Err(unreadable(offset));
         }
 
-        for entry in entries.chunks(ENTRY_LEN) {
-            let op = SealOp::from_byte(entry[0]).ok_or_else(unreadable)?;
+        for (index, entry) in entries.chunks(ENTRY_LEN).enumerate() {
+            let op = SealOp::from_byte(entry[0]).ok_or_else(|| unreadable(offset + 8 + index * ENTRY_LEN))?;
             set.apply(op, sign_utils::to_hex(&entry[1..]));
         }
 
@@ -523,6 +524,32 @@ mod tests {
     }
 
     #[test]
+    fn zeros_past_one_frame_are_damage_not_a_torn_tail() {
+        // A crash extends the file over the one write it cut short, and no further: a longer run
+        // of zeros is synced frames lost to damage, and must not be cut away as a torn tail.
+        let mut bytes = record(&[(SealOp::Record, A)]);
+        bytes.extend(std::iter::repeat_n(0u8, MAX_FRAME_LEN));
+        assert!(parse(&bytes).is_ok());
+
+        bytes.push(0);
+        assert!(parse(&bytes).unwrap_err().contains("damaged"));
+    }
+
+    #[test]
+    fn an_unreadable_entry_is_named_at_its_own_byte() {
+        let mut bytes = record(&[(SealOp::Record, A)]);
+        let frame_at = bytes.len();
+        let mut entries = vec![1u8];
+        entries.extend_from_slice(&[0xaa; HASH_LEN]);
+        entries.push(9);
+        entries.extend_from_slice(&[0xbb; HASH_LEN]);
+        bytes.extend(frame_with_entry(&entries));
+
+        let err = parse(&bytes).unwrap_err();
+        assert!(err.contains(&format!("at byte {} ", frame_at + 8 + ENTRY_LEN)), "{}", err);
+    }
+
+    #[test]
     fn a_frame_with_a_bad_crc_ends_the_record() {
         let mut bytes = record(&[(SealOp::Record, A), (SealOp::Record, B)]);
         let last = bytes.len() - 1;
@@ -568,7 +595,7 @@ mod tests {
 
     #[test]
     fn another_version_or_no_header_fails_the_read() {
-        let mut other = b"/forklift-sealed 2\n".to_vec();
+        let mut other = b"/forklift-sealed 3\n".to_vec();
         other.extend(encode_frame(SealOp::Record, A).unwrap());
         assert!(parse(&other).unwrap_err().contains("format this version"));
 
@@ -732,7 +759,7 @@ mod tests {
         assert!(compact().unwrap_err().contains("damaged"));
         assert_eq!(std::fs::read(sealed_path()).unwrap(), damaged);
 
-        let other = b"/forklift-sealed 2\n".to_vec();
+        let other = b"/forklift-sealed 3\n".to_vec();
         std::fs::write(sealed_path(), &other).unwrap();
         assert!(append(&[(SealOp::Record, B)]).unwrap_err().contains("format this version"));
         assert_eq!(std::fs::read(sealed_path()).unwrap(), other);
