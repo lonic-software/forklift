@@ -1073,4 +1073,154 @@ mod tests {
         assert!(encode_frame(SealOp::Record, "abc").is_err());
         assert!(encode_frame(SealOp::Record, &"zz".repeat(32)).is_err());
     }
+
+    /// The shared store-access hold, which nothing else contends for in a scratch store.
+    fn hold() -> StoreAccessLock {
+        StoreAccessLock::shared(|| panic!("nothing holds the store exclusively")).unwrap()
+    }
+
+    /// Unsealing a present tree records every absent object its present closure reaches before its
+    /// own record is removed: an absent subtree, blob and recipe, an absent chunk of a present
+    /// recipe, and an absent blob of a present subtree. Nothing present is recorded, nothing
+    /// beneath an absent object is looked for, and an absence already recorded is not recorded
+    /// again.
+    ///
+    /// Mutations, each red on the `pushed_down` assertion: skip any one absence arm of the walk
+    /// (subtree, file, chunk), skip descending a present subtree or recipe, or record what is
+    /// present; and drop the removal → red on the record assertion.
+    #[test]
+    fn unsealing_a_present_tree_records_every_absence_beneath_it() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::{store_chunk, store_recipe, store_tree};
+
+        let (root, _scope) = scratch("unseal-tree");
+        let lost = |digit: char| digit.to_string().repeat(64);
+        let (lost_tree, lost_blob, lost_recipe, lost_chunk, lost_deep, recorded) =
+            (lost('1'), lost('2'), lost('3'), lost('4'), lost('5'), lost('6'));
+
+        let present_chunk = store_chunk(b"a chunk that is present");
+        let recipe = store_recipe(&[(present_chunk.clone(), 23), (lost_chunk.clone(), 23)]);
+        let inner = store_tree(&[("deep.txt", &lost_deep, DirEntryType::Normal)]);
+        let tree = store_tree(&[
+            ("lost", &lost_tree, DirEntryType::Tree),
+            ("lost.txt", &lost_blob, DirEntryType::Normal),
+            ("lost.bin", &lost_recipe, DirEntryType::NormalChunked),
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+            ("inner", &inner, DirEntryType::Tree),
+            ("recorded.txt", &recorded, DirEntryType::Normal),
+            ("here.txt", &present_chunk, DirEntryType::Normal),
+        ]);
+        append(&[(SealOp::Record, &tree), (SealOp::Record, &recorded)]).unwrap();
+
+        let present = present_recorded(&read_sealed().unwrap()).unwrap();
+        assert_eq!(present, vec![tree.clone()]);
+
+        let unsealed = unseal(&hold(), &present).unwrap();
+        assert_eq!(unsealed.removed, vec![tree.clone()]);
+        assert_eq!(unsealed.pushed_down, vec![lost_tree, lost_blob, lost_recipe, lost_chunk, lost_deep]);
+        assert!(unsealed.kept.is_empty(), "{:?}", unsealed.kept);
+
+        let record = read_sealed().unwrap();
+        assert!(!record.contains(&tree), "the present tree is no longer recorded");
+        assert!(record.contains(&recorded));
+        for hash in &unsealed.pushed_down {
+            assert!(record.contains(hash), "{} is recorded", hash);
+        }
+        assert!(present_recorded(&record).unwrap().is_empty(), "nothing present is recorded");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The push-down's records land before the removal: a crash after the first frame of a longer
+    /// append leaves the tree recorded, not its absences exposed. The tree names one absence more
+    /// than a frame holds, so the append is two frames. Mutation: append the removal before the
+    /// records → the first frame holds it → red.
+    #[test]
+    fn the_removal_lands_after_the_push_down() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::store_tree;
+
+        let (root, _scope) = scratch("unseal-order");
+        let names: Vec<(String, String)> = (0..=MAX_FRAME_ENTRIES)
+            .map(|n| (format!("f{}", n), format!("{:064x}", n + 1)))
+            .collect();
+        let entries: Vec<(&str, &str, DirEntryType)> = names.iter()
+            .map(|(name, hash)| (name.as_str(), hash.as_str(), DirEntryType::Normal))
+            .collect();
+        let tree = store_tree(&entries);
+        append(&[(SealOp::Record, &tree)]).unwrap();
+        let before = std::fs::read(sealed_path()).unwrap().len();
+
+        let unsealed = unseal(&hold(), &[tree.clone()]).unwrap();
+        assert_eq!(unsealed.removed, vec![tree.clone()]);
+        assert_eq!(unsealed.pushed_down.len(), MAX_FRAME_ENTRIES + 1);
+
+        // The record as a crash after the first new frame leaves it.
+        let bytes = std::fs::read(sealed_path()).unwrap();
+        let first_frame = parse(&bytes[..before + MAX_FRAME_LEN]).unwrap();
+        assert_eq!(first_frame.valid_len, before + MAX_FRAME_LEN);
+        assert!(first_frame.set.contains(&tree), "the first frame removes nothing");
+        assert!(!parse(&bytes).unwrap().set.contains(&tree));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An object whose closure cannot be walked stays recorded, and so does one not in the store;
+    /// with nothing walked, nothing is written. One that is present but no longer recorded is not
+    /// removed. Mutations: drop the not-in-the-store check → the absent object is removed → red;
+    /// remove what the re-read no longer records → `removed` names it → red.
+    #[test]
+    fn what_cannot_be_walked_or_is_not_recorded_is_not_removed() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::{store_chunk, store_tree};
+
+        let (root, _scope) = scratch("unseal-kept");
+        let chunk = store_chunk(b"not a tree");
+        let broken = store_tree(&[("sub", &chunk, DirEntryType::Tree)]);
+        let absent = "7".repeat(64);
+        append(&[(SealOp::Record, &broken), (SealOp::Record, &absent)]).unwrap();
+        let before = std::fs::read(sealed_path()).unwrap();
+
+        let unsealed = unseal(&hold(), &[broken.clone(), absent.clone()]).unwrap();
+        assert!(unsealed.removed.is_empty() && unsealed.pushed_down.is_empty(), "{:?}", unsealed);
+        let kept: Vec<&str> = unsealed.kept.iter().map(|(hash, _)| hash.as_str()).collect();
+        assert_eq!(kept, vec![broken.as_str(), absent.as_str()]);
+        assert!(unsealed.kept[0].1.contains("not a tree"), "{}", unsealed.kept[0].1);
+        assert_eq!(unsealed.kept[1].1, "it is not in the store");
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), before, "nothing was written");
+
+        // Present, walkable, and not recorded.
+        let unrecorded = store_tree(&[]);
+        let unsealed = unseal(&hold(), &[unrecorded]).unwrap();
+        assert_eq!(unsealed, Unsealed::default());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A walk that fails counts nothing it went through as checked: a later object reaching the
+    /// same subtree walks it again. The first tree reaches `shared` and then fails at `z-broken`
+    /// before descending `shared`'s present child; the second reaches `shared` too. Mutation: mark
+    /// a failed walk's trees closed → the second walk skips `shared` → the absence beneath it is
+    /// not recorded → red.
+    #[test]
+    fn a_failed_walk_closes_nothing_for_the_next() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::{store_chunk, store_tree};
+
+        let (root, _scope) = scratch("unseal-closed");
+        let lost = "8".repeat(64);
+        let deep = store_tree(&[("lost.txt", &lost, DirEntryType::Normal)]);
+        let shared = store_tree(&[("deep", &deep, DirEntryType::Tree)]);
+        let chunk = store_chunk(b"not a tree either");
+        let first = store_tree(&[("shared", &shared, DirEntryType::Tree), ("z-broken", &chunk, DirEntryType::Tree)]);
+        let second = store_tree(&[("shared", &shared, DirEntryType::Tree), ("other", &store_tree(&[]), DirEntryType::Tree)]);
+        append(&[(SealOp::Record, &first), (SealOp::Record, &second)]).unwrap();
+
+        let unsealed = unseal(&hold(), &[first.clone(), second.clone()]).unwrap();
+        assert_eq!(unsealed.removed, vec![second]);
+        assert_eq!(unsealed.pushed_down, vec![lost]);
+        assert_eq!(unsealed.kept.len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
