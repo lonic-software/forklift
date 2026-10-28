@@ -909,8 +909,8 @@ parent that is present names it and the remote holds it. Audit tolerates such an
 is absent, checks nothing beneath it, and reports how many it held (`held_by_hash` under `--json`);
 a recorded object that is present is checked like any other. `--full` cannot re-assemble a large
 file one of whose chunks is held this way, so it re-reads that file's present chunks instead. A
-sealed-object record this version cannot read, or one damaged before its last entry, fails the
-audit rather than being taken as empty.
+sealed-object record this version cannot read, or one with damage that an interrupted last write
+could not have left, fails the audit rather than being taken as empty.
 
 **Run `--full` periodically as your own scrub against bit-rot.** Every `lift`/push used to
 incidentally re-presence-check a pushed pallet's whole tree, chunked files included; a large

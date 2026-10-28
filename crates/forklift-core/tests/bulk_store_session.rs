@@ -214,3 +214,35 @@ fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint(
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn the_sealed_object_record_is_written_through_an_open_session() {
+    use forklift_core::util::sealed_utils::{self, SealOp};
+
+    // The record is appended to in place, so a rewrite of it that the session staged would land
+    // over the appends made before the session finished. Its writes are never staged: each is in
+    // place when it returns, session or not.
+    let _guard = lock_session();
+    let root = std::env::temp_dir().join(format!("forklift-bulk-sealed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+    let _scope = StorageRootScope::enter(&root);
+
+    let a = "aa00000000000000000000000000000000000000000000000000000000000001";
+    let b = "bb00000000000000000000000000000000000000000000000000000000000002";
+    let session = BulkStoreSession::open().unwrap();
+
+    sealed_utils::append(&[(SealOp::Record, a)]).unwrap();
+    assert!(sealed_utils::read_sealed().unwrap().contains(a), "created in place, not staged");
+
+    sealed_utils::append(&[(SealOp::Record, b), (SealOp::Remove, a)]).unwrap();
+    sealed_utils::compact().unwrap();
+    sealed_utils::append(&[(SealOp::Record, a)]).unwrap();
+
+    // Finished: a compaction it had staged would land now, over the append made after it.
+    session.finish().unwrap();
+    let set = sealed_utils::read_sealed().unwrap();
+    assert!(set.contains(a) && set.contains(b), "the compaction and the appends around it all stand");
+
+    std::fs::remove_dir_all(&root).ok();
+}
