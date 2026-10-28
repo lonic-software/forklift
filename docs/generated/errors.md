@@ -24,7 +24,7 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `scope_path_type_changed` | 8 | A scoped bay's spine path flipped dir↔file; scope no longer valid |
 | `sparse_workspace` | 9 | A whole-tree verb is not supported in a scoped (sparse) bay yet |
 | `out_of_scope_conflict` | 10 | A scoped bay merge hit an out-of-scope entry changed on both sides |
-| `non_origin_lift` | 11 | A sparse workspace tried to lift to a remote other than its origin |
+| `non_origin_lift` | 11 | A partial (--only or --cache) warehouse tried to lift to a remote other than its origin |
 | `narrow_unclean` | 12 | "narrow" would delete a subtree that still holds uncommitted work |
 | `scope_prune_blocked` | 13 | "scope-prune" would free a path a checkout still materializes |
 | `chunked_transport_unsupported` | 14 | A chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking |

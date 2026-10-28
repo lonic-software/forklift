@@ -37,6 +37,14 @@ const FILE_NAME_BAY_SCOPE: &str = "scope";
 const FOLDER_NAME_CONFIG: &str = "config";
 const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 
+/// The cache-mode marker inside the configuration folder: present only in a warehouse franchised
+/// with `--cache`. It is a [`record_utils`] file of its own kind holding no entries, written once by
+/// franchise; nothing sets or clears it afterwards, so unlike a configuration value it cannot be
+/// edited into a claim the store does not back.
+const FILE_NAME_CACHE_MODE: &str = "cache-mode";
+const CACHE_MODE_RECORD: &str = "cache-mode";
+const CACHE_MODE_VERSION: u32 = 1;
+
 /// The [`record_utils`] kind and version of every non-full scope file. Format 2 put the root
 /// ignore file in every scope, refusing the unversioned files before it; format 3 escapes each
 /// prefix, so one may hold a line break. A file in either earlier format is refused on read.
@@ -452,11 +460,54 @@ pub fn set_fetch_scope(scope: &MaterializationScope) -> Result<(), String> {
     write_scope_file(&path, scope)
 }
 
-/// Whether the warehouse itself is sparse — its fetch scope is restricted, so some content is
-/// sealed-but-unfetched. A quick gate for the operations that behave differently on a store
-/// that was never fully fetched (the origin-only lift guard, franchise's bundle skip).
-pub fn is_warehouse_sparse() -> Result<bool, String> {
-    Ok(!read_fetch_scope()?.is_full())
+/// Whether the store may lack content its history names: the warehouse is sparse (its fetch scope
+/// is restricted) or a cache (franchised with `--cache`). A quick gate for the operations that need
+/// the whole store, or that must stay with the remote that holds what this one lacks: the
+/// origin-only lift guard, mirror, and serving the warehouse.
+pub fn content_may_be_absent() -> Result<bool, String> {
+    Ok(!read_fetch_scope()?.is_full() || is_cache_mode()?)
+}
+
+/// The path of the cache-mode marker.
+pub fn cache_mode_path() -> PathBuf {
+    globals::forklift_root().join(FOLDER_NAME_CONFIG).join(FILE_NAME_CACHE_MODE)
+}
+
+/// Whether the warehouse was franchised with `--cache`: its marker is present. A marker in any
+/// other form than this build writes is refused rather than read either way.
+pub fn is_cache_mode() -> Result<bool, String> {
+    let path = cache_mode_path();
+
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("Error while reading the cache-mode marker \"{}\": {}", path.to_string_lossy(), e)),
+    };
+
+    let reason = match record_utils::from_bytes(&bytes, CACHE_MODE_RECORD, CACHE_MODE_VERSION) {
+        Ok(entries) if entries.is_empty() => return Ok(true),
+        Ok(_) => "holds entries; this version of Forklift writes none.".to_string(),
+        // No Forklift ever wrote this marker without its header.
+        Err(RecordError::Unversioned) => "does not open with its format header.".to_string(),
+        Err(error) => error.describe(),
+    };
+
+    Err(format!(
+        "The cache-mode marker \"{}\" {} {}",
+        path.to_string_lossy(), reason, REMEDY_REFRANCHISE
+    ))
+}
+
+/// Mark the warehouse as a cache (franchise `--cache` only).
+pub fn set_cache_mode() -> Result<(), String> {
+    let path = cache_mode_path();
+
+    if let Some(parent) = path.parent() {
+        crate::util::file_utils::create_folder_if_not_exists(parent)?;
+    }
+
+    let bytes = record_utils::to_bytes(CACHE_MODE_RECORD, CACHE_MODE_VERSION, std::iter::empty::<&str>());
+    crate::util::file_utils::write_file_atomically(&path, &bytes)
 }
 
 /// Build a classified scope refusal (design §7.4 taxonomy) as a typed [`CoreError::Refusal`]: the
@@ -590,26 +641,26 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
     )
 }
 
-/// A ready-made `non_origin_lift` refusal for a lift from a sparse warehouse to a remote other
-/// than the one it fetched against. A sparse warehouse only ever proved its out-of-scope
-/// closure present on its origin; a different remote may lack objects it never verified there,
-/// so the lift would fail late at the remote's closure check. Refusing up front is the clearer
-/// failure.
+/// A ready-made `non_origin_lift` refusal for a lift from a partial warehouse (franchised with
+/// `--only` or `--cache`) to a remote other than the one it fetched against. A partial warehouse
+/// only ever proved the closure it does not hold present on its origin; a different remote may
+/// lack objects it never verified there, so the lift would fail late at the remote's closure
+/// check. Refusing up front is the clearer failure.
 ///
 /// # Arguments
-/// * `origin` - The remote this warehouse was fetched (scoped) against.
+/// * `origin` - The remote this warehouse was franchised from.
 /// * `other`  - The currently configured remote it is trying to lift to.
 pub fn non_origin_lift_refusal(origin: &str, other: &str) -> CoreError {
     let next_step = format!(
-        "Point \"remote.url\" back at \"{}\", or run a full (unscoped) franchise against \"{}\".",
+        "Point \"remote.url\" back at \"{}\", or franchise \"{}\" without --only or --cache.",
         origin, other
     );
 
     refusal(
         RefusalCode::NonOriginLift,
         format!(
-            "This is a sparse workspace, fetched against \"{}\"; lifting to \"{}\" may fail \
-            because that remote may lack out-of-scope objects this workspace never verified \
+            "This is a partial warehouse, franchised from \"{}\"; lifting to \"{}\" may fail \
+            because that remote may lack objects this warehouse does not hold and never verified \
             there. {}",
             origin, other, next_step
         ),
@@ -1014,5 +1065,64 @@ mod tests {
         let read_back = MaterializationScope::from_bytes(&scope.to_bytes(), "").unwrap();
 
         assert_eq!(read_back, scope);
+    }
+
+    fn scratch(name: &str) -> (PathBuf, globals::StorageRootScope) {
+        let root = std::env::temp_dir().join(format!("forklift-scope-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT).join(FOLDER_NAME_CONFIG)).unwrap();
+        let scope = globals::StorageRootScope::enter(&root);
+        (root, scope)
+    }
+
+    /// No marker is a full warehouse; the one this build writes is a cache, and makes content
+    /// absent-able on its own (a full fetch scope); a sparse scope is absent-able without it.
+    ///
+    /// Revert: leave the marker out of `content_may_be_absent` → red.
+    #[test]
+    fn the_cache_mode_marker_makes_a_full_scope_warehouse_partial() {
+        let (root, _scope) = scratch("cache-mode");
+
+        assert!(!is_cache_mode().unwrap());
+        assert!(!content_may_be_absent().unwrap());
+
+        set_cache_mode().unwrap();
+        assert_eq!(std::fs::read(cache_mode_path()).unwrap(), b"/forklift-cache-mode 1\n");
+        assert!(is_cache_mode().unwrap());
+        assert!(read_fetch_scope().unwrap().is_full());
+        assert!(content_may_be_absent().unwrap());
+
+        std::fs::remove_file(cache_mode_path()).unwrap();
+        set_fetch_scope(&MaterializationScope::from_prefixes(["docs"])).unwrap();
+        assert!(content_may_be_absent().unwrap());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A marker in any other form is refused, never read as present or absent: each refusal names
+    /// the marker and the way out.
+    ///
+    /// Revert: read an unreadable marker as "no marker" → red.
+    #[test]
+    fn a_cache_mode_marker_in_another_form_fails_loudly() {
+        let (root, _scope) = scratch("cache-mode-bad");
+
+        for (bytes, reason) in [
+            (&b"/forklift-cache-mode 2\n"[..], "version"),
+            (&b"/forklift-cache-mode 1\nentry\n"[..], "holds entries"),
+            (&b""[..], "format header"),
+            (&b"yes\n"[..], "format header"),
+            (&b"/forklift-cache-mode 1"[..], ""),
+        ] {
+            std::fs::write(cache_mode_path(), bytes).unwrap();
+
+            for error in [is_cache_mode().unwrap_err(), content_may_be_absent().unwrap_err()] {
+                assert!(error.contains("cache-mode marker"), "{:?}: {}", bytes, error);
+                assert!(error.contains(reason), "{:?}: {}", bytes, error);
+                assert!(error.contains(REMEDY_REFRANCHISE), "{:?}: {}", bytes, error);
+            }
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

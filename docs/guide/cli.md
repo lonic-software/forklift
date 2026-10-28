@@ -197,7 +197,8 @@ and the office, which first catches up with the remote's as a `lower` takes it; 
 against the anchor the remote serves, which a mirror never installs. A head that does not
 verify is that pallet's failure (`history_unverified`), and a changed, stripped or diverged
 trust refuses the run as it would a `lower`. Refuses
-in a scoped bay or a sparse franchise, which hold only part of each tree. Two runs never share
+in a scoped bay or a franchise made with `--only` or `--cache`, which may hold only part of
+each tree. Two runs never share
 the mirror: a run that finds another in progress reports it busy and stops.
 
 If `mirror` reports that `.forklift/mirror.git` holds something it did not write, delete that
@@ -1541,6 +1542,7 @@ forklift franchise <url> <dir> --pallet main --token <secret>
 forklift franchise <url> <dir> --only src/api            # sparse: fetch one subtree
 forklift franchise <url> <dir> --only src/api --only docs # several subtrees
 forklift franchise <url> <dir> --expect <genesis>          # pin the remote's trust anchor
+forklift franchise <url> <dir> --cache                     # a cache (see below)
 ```
 
 Prepares a fresh warehouse in the target directory, remembers the remote, adopts
@@ -1602,6 +1604,14 @@ all work; office and every meta pallet are always fetched in full, so a sparse f
 trusted warehouse still audits offline exactly as a full clone does. Widen later with `expand`.
 A sparse franchise records its origin — see the origin-only lift rule under `lift`.
 
+**Cache franchise (`--cache`).** Marks the warehouse as a cache: one that may lack content its
+history reaches, whose remote holds the rest. Like a sparse franchise, it skips the bundle,
+records its origin (see the origin-only lift rule under `lift`), is never served, and refuses
+`mirror`; `expand` refuses too, since its scope is already the whole tree. `audit` checks the
+content it holds and says the pass is a cache's. Commands that act on a sparse franchise's
+*scope* (scoped bays, `query`'s scope report) do not apply to a cache. It cannot be combined with `--only`. A
+cache does not yet fetch less than a full franchise: that is still being built.
+
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`
 tips the same densify suggestion `import-git` does: those packs are the far end's own bulk
 ingest, unseen by a cross-store `compact --all --redelta` pass.
@@ -1640,11 +1650,12 @@ fast-forwards, or reports `diverged` if you moved too. A bay another bay left be
 its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this auto-merge alike:
 `shift` to the pallet to catch up.
 
-**Origin-only lift from a sparse workspace.** A sparse (`franchise --only`) warehouse only
-ever proved its out-of-scope content present on the remote it fetched from — its origin. Lifting
-to a *different* remote could fail late at that remote's closure check, so `lift` refuses up
-front with the `non_origin_lift` code, naming the origin. Point `remote.url` back at the origin,
-or run a full (unscoped) franchise against the new remote. A full warehouse holds the whole
+**Origin-only lift from a partial warehouse.** A sparse (`franchise --only`) or cache
+(`franchise --cache`) warehouse only ever proved the content it does not hold present on the
+remote it was franchised from — its origin. Lifting to a *different* remote could fail late at
+that remote's closure check, so `lift` refuses up front with the `non_origin_lift` code, naming
+the origin. Point `remote.url` back at the origin, or franchise the new remote without `--only`
+or `--cache`. A full warehouse holds the whole
 closure and can lift anywhere.
 
 **Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch
@@ -1709,7 +1720,9 @@ the same as a bare `lower`.
 **A pallet never points at history this warehouse lacks.** Every command that moves a pallet to a
 parcel it does not already stand on (`stack`, `lower`, `consolidate`, `palletize`, `undo`, and the
 rest) first checks that the parcel's history is completely present, back to what some pallet
-already holds. In a sparse warehouse it checks only what the fetch scope holds. When something
+already holds. In a sparse warehouse it checks only what the fetch scope holds. An object the
+warehouse holds by hash alone (see `audit`) is accepted while it is absent, with nothing beneath
+it checked; once it is present again, what it names is checked as usual. When something
 is missing, for instance after a fetch that stopped part-way, the command refuses, names the
 missing object, and writes nothing; running that fetch again completes the history.
 

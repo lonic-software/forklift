@@ -42,10 +42,10 @@ pub const KEY_REMOTE_URL: &str = "remote.url";
 /// The bearer token for remotes that require one.
 pub const KEY_REMOTE_TOKEN: &str = "remote.token";
 
-/// The remote a sparse (scoped) franchise fetched against — its origin. A sparse warehouse
-/// only proved its out-of-scope closure present on this remote, so `lift` refuses to publish
-/// to a different one (it would fail late at that remote's closure check). Unset for a full
-/// franchise, which has the whole closure and can lift anywhere.
+/// The remote a partial franchise (`--only` or `--cache`) fetched from — its origin. A partial
+/// warehouse only proved the closure it does not hold present on this remote, so `lift` refuses
+/// to publish to a different one (it would fail late at that remote's closure check). Unset for
+/// a full franchise, which has the whole closure and can lift anywhere.
 pub const KEY_REMOTE_ORIGIN: &str = "remote.origin";
 
 /// Whether to reach the remote through a Tor SOCKS proxy — the peer-to-peer transport

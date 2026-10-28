@@ -1846,7 +1846,8 @@ pub fn verify_parcel_closure_with(
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
 ) -> Result<(), String> {
-    // A ref move is a durability promise: the push gate tolerates no recorded absence.
+    // A remote must hold the whole closure of every head it accepts: the push gate tolerates no
+    // recorded absence.
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
 
     verify_closure_core(
@@ -1862,14 +1863,14 @@ struct ClosureSeams<'a> {
     chunks_missing: &'a dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &'a dyn Fn(&str) -> Result<TreeItem, String>,
-    /// The sealed-by-hash record, for the audit; `None` on every ref-moving gate, which tolerates
-    /// no recorded absence.
+    /// The sealed-by-hash record, for the audit and the client's ref gate; `None` on the push
+    /// gate, which tolerates no recorded absence.
     sealed: Option<&'a SealedTolerance<'a>>,
 }
 
-/// The sealed-by-hash record an audit holds absences against, and the absent objects it held.
-/// Only the audit passes one: a ref move is a durability promise, so every ref-moving gate
-/// tolerates no recorded absence.
+/// The sealed-by-hash record a walk holds absences against, and the absent objects it held. The
+/// audit and the client's ref gate pass one; a remote's push gate never does, since a remote must
+/// hold the whole closure of every head it accepts.
 pub struct SealedTolerance<'a> {
     record: &'a SealedSet,
     held: RefCell<HashSet<String>>,
@@ -2231,26 +2232,33 @@ pub fn verify_parcel_closure_scoped(
 /// `known_complete`) is also a candidate base for every new parcel's tree, as each parcel's own
 /// parents are. A parcel no ref reaches is walked down to its root.
 ///
+/// An absent object `sealed` records is held by hash, as content outside the scope is: a cache
+/// fetch records the root trees it skips before the ref that names them moves. A recorded object
+/// that is present seals nothing, so a missing object beneath it still fails.
+///
 /// # Arguments
 /// * `head`           - The parcel the ref is about to hold.
 /// * `known_complete` - The ref heads whose history is known complete.
 /// * `base`           - The ref's current head, when it has one.
 /// * `scope`          - The warehouse fetch scope.
+/// * `sealed`         - The sealed-by-hash record, or `None` to tolerate no recorded absence.
 ///
 /// # Returns
-/// * `Ok(())`      - Everything within the scope is present.
+/// * `Ok(())`      - Everything within the scope is present or held by the record.
 /// * `Err(String)` - What is missing (or unreadable).
 pub fn verify_ref_head_closure(head: &str,
                                known_complete: &[String],
                                base: Option<&str>,
-                               scope: &MaterializationScope) -> Result<(), String> {
+                               scope: &MaterializationScope,
+                               sealed: Option<&SealedSet>) -> Result<(), String> {
     let bounds: Vec<&str> = known_complete.iter().map(String::as_str).collect();
+    let tolerance = sealed.map(SealedTolerance::new);
     let seams = ClosureSeams {
         blob_exists: &|hash| file_utils::does_object_exist(hash),
         chunks_missing: &local_chunks_missing,
         load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
         load_base_tree: &|hash| object_utils::load_tree(hash),
-        sealed: None,
+        sealed: tolerance.as_ref(),
     };
 
     verify_closure_core(head, Some(&bounds), base, scope, false, &seams)
@@ -2599,7 +2607,7 @@ fn verify_tree_closure(tree_hash: &str,
 /// # Arguments
 /// * `recipe_hash`        - The chunked file's tree-entry hash (a recipe).
 /// * `reverify`           - `true` re-reads and re-assembles; `false` presence-checks.
-/// * `sealed`             - The sealed-by-hash record, or `None` on a ref-moving gate.
+/// * `sealed`             - The sealed-by-hash record, or `None` on the push gate.
 /// * `load_recipe_chunks` - Reads the recipe's chunk hashes.
 /// * `chunks_missing`     - Bulk chunk-presence probe: given the recipe's chunk-hash list, returns
 ///                          the subset the store lacks.

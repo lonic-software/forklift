@@ -50,6 +50,9 @@ use crate::output::{self, CommandOutput};
 ///                 hash. The remote's whole-store bundle is skipped, and the remote is
 ///                 recorded as this sparse warehouse's origin (lift refuses to publish
 ///                 elsewhere).
+/// * `cache`     - Franchise as a **cache**: mark the warehouse as one that may lack content
+///                 its history reaches. Like a sparse franchise, it skips the bundle and
+///                 records its origin. Never combined with `only` (the CLI refuses that).
 /// * `expect`    - The genesis the remote's trust anchor must have (an out-of-band pin),
 ///                 checked against the handshake before anything is downloaded or created.
 ///
@@ -64,11 +67,14 @@ pub async fn handle_command(url: &str,
                             pallet: Option<String>,
                             token: Option<String>,
                             only: Vec<String>,
+                            cache: bool,
                             expect: Option<String>) -> Result<(), String> {
     // Normalize the sparse scope up front (before any warehouse is created), so a malformed
     // --only refuses cleanly. An empty list is a full (ordinary) franchise.
     let fetch_scope = resolve_fetch_scope(&only)?;
     let sparse = !fetch_scope.is_full();
+
+    let partial = Partial { sparse, cache };
 
     // Likewise refused before anything is created: an empty token is never what was meant, and
     // left to the configuration write it would fail only after the warehouse existed. The advice
@@ -129,7 +135,7 @@ pub async fn handle_command(url: &str,
     // history is fetched — see the check after `fetch_history_at` below.)
     let resolution = resolve_pallet(&info, pallet.clone())?;
 
-    let request = Request { pallet, only: fetch_scope.prefixes().to_vec() };
+    let request = Request { pallet, only: fetch_scope.prefixes().to_vec(), cache };
 
     // The trust binding: the pin, else the genesis the remote announced. A resume whose record
     // holds none (the remote had no anchor) binds to the one it announces now.
@@ -172,7 +178,7 @@ pub async fn handle_command(url: &str,
     };
 
     let outcome = enter_and_franchise(
-        &mut attempt, &absolute_target, expected, resolution, fetch_scope, sparse, &client, info,
+        &mut attempt, &absolute_target, expected, resolution, fetch_scope, partial, &client, info,
     ).await;
 
     // Drop any mmap'd pack handles this run loaded (reading a franchised bundle's packs while
@@ -404,7 +410,7 @@ async fn enter_and_franchise(
     expected: Expected,
     resolution: PalletResolution,
     fetch_scope: MaterializationScope,
-    sparse: bool,
+    partial: Partial,
     client: &RemoteClient,
     info: WarehouseInfo,
 ) -> Result<(), String> {
@@ -421,15 +427,15 @@ async fn enter_and_franchise(
         attempt.record.last_failure = previous.last_failure.clone();
     }
 
-    // A finished import or a kept download is kept only for a full franchise: a sparse one has no
-    // bundle.
+    // A finished import or a kept download is kept only for a full franchise: a sparse or cache
+    // one has no bundle.
     let keep = match &previous {
-        Some(previous) if !sparse => previous.bundle.clone(),
+        Some(previous) if !partial.any() => previous.bundle.clone(),
         _ => BundleState::None,
     };
 
     let outcome = match start_attempt(attempt, absolute_target, previous.as_ref(), &keep) {
-        Ok(()) => franchise_into_prepared_target(attempt, resolution, fetch_scope, sparse, client, info).await,
+        Ok(()) => franchise_into_prepared_target(attempt, resolution, fetch_scope, partial, client, info).await,
         Err(e) => Err(e),
     };
 
@@ -490,10 +496,11 @@ async fn franchise_into_prepared_target(
     attempt: &mut FranchiseAttempt,
     resolution: PalletResolution,
     fetch_scope: MaterializationScope,
-    sparse: bool,
+    partial: Partial,
     client: &RemoteClient,
     info: WarehouseInfo,
 ) -> Result<(), String> {
+    let sparse = partial.sparse;
     let url = attempt.record.url.clone();
 
     warehouse_utils::prepare_warehouse()?;
@@ -521,13 +528,13 @@ async fn franchise_into_prepared_target(
     };
 
     // The bundle is a fast start, not a requirement: whatever it lacks (or if there is none) is
-    // fetched loose by the history walk below. A sparse franchise skips it entirely — the bundle
-    // is the whole store, which would defeat the point of fetching only a subtree. A resume whose
+    // fetched loose by the history walk below. A sparse or cache franchise skips it entirely —
+    // the bundle is the whole store, which would defeat the point of fetching less. A resume whose
     // earlier attempt finished the import keeps it and skips this too, and one that kept part of
     // the download asks only for the rest.
     attempt.phase = Phase::Bundle;
 
-    if !sparse && attempt.record.bundle != BundleState::Imported {
+    if !partial.any() && attempt.record.bundle != BundleState::Imported {
         if let Some(imported) = fetch_and_import_bundle(attempt, client).await? {
             report.bundle_objects = Some(imported.stored_objects);
             report.bundle_signatures = Some(imported.stored_signatures);
@@ -588,8 +595,9 @@ async fn franchise_into_prepared_target(
         if sparse {
             scope_utils::set_fetch_scope(&fetch_scope)?;
             scope_utils::set_bay_scope(&fetch_scope)?;
-            config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, &url, ConfigScope::Warehouse)?;
         }
+
+        record_partial(partial, &url)?;
 
         attempt.finishing = true;
         franchise_utils::finish(&attempt.forklift)?;
@@ -624,8 +632,11 @@ async fn franchise_into_prepared_target(
 
         scope_utils::set_fetch_scope(&fetch_scope)?;
         scope_utils::set_bay_scope(&fetch_scope)?;
-        config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, &url, ConfigScope::Warehouse)?;
     }
+
+    // Before the pallet's head is written: the ref gate reads the mode to decide whether a
+    // recorded absence may stand.
+    record_partial(partial, &url)?;
 
     // Raised before the pallet's head is written, and finished once the tree is materialized. The
     // franchise record outlives it: a franchise interrupted anywhere is resumed by `franchise`,
@@ -673,6 +684,35 @@ struct PalletResolution {
     pallet_name: String,
     /// `None` when the pallet is unborn on the remote (legitimate — see `resolve_pallet`'s doc).
     remote_head: Option<String>,
+}
+
+/// What a franchise leaves out: content outside its `--only` scope, or (with `--cache`) content
+/// it may fetch only when read.
+#[derive(Clone, Copy)]
+struct Partial {
+    sparse: bool,
+    cache: bool,
+}
+
+impl Partial {
+    /// Whether the warehouse may lack content its history reaches.
+    fn any(self) -> bool {
+        self.sparse || self.cache
+    }
+}
+
+/// Record what makes a partial franchise partial: the cache-mode marker, and the origin (the one
+/// remote that holds what it lacks). Nothing for a full franchise.
+fn record_partial(partial: Partial, url: &str) -> Result<(), String> {
+    if partial.cache {
+        scope_utils::set_cache_mode()?;
+    }
+
+    if partial.any() {
+        config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, url, ConfigScope::Warehouse)?;
+    }
+
+    Ok(())
 }
 
 /// Resolve which pallet franchise should check out, using only the handshake's own answer
@@ -889,13 +929,13 @@ mod tests {
         FranchiseRecord {
             url: "http://example.com:9418".to_string(),
             token: None,
-            request: Request { pallet: None, only: vec!["src/ap".to_string()] },
+            request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false },
             genesis: Some("abc".to_string()),
             bundle: BundleState::None,
             attempt: Attempt::Failed,
             start_census: 3,
             last_failure: Some(Failure {
-                request: Request { pallet: None, only: vec!["src/ap".to_string()] },
+                request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false },
                 phase: Phase::Fetch,
                 cause_code: "only_prefix_not_found".to_string(),
                 retry: Retry::Change,

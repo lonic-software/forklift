@@ -419,8 +419,8 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
         Command::Expand { paths } => commands::expand::handle_command(paths).await,
         Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
-        Command::Franchise { url, directory, pallet, token, only, expect } =>
-            commands::franchise::handle_command(&url, &directory, pallet, token, only, expect).await,
+        Command::Franchise { url, directory, pallet, token, only, cache, expect } =>
+            commands::franchise::handle_command(&url, &directory, pallet, token, only, cache, expect).await,
         Command::Heal => {
             let store_access = store_access.ok_or("heal ran without its store-access hold.")?;
             commands::heal::handle_command(store_access).await

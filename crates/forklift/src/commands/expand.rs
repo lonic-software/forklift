@@ -26,6 +26,15 @@ use crate::output::{self, CommandOutput};
 pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     let current = scope_utils::read_fetch_scope()?;
 
+    // Checked first: a cache's scope is the whole tree, but it does not hold the whole tree.
+    if scope_utils::is_cache_mode()? {
+        return Err(
+            "This warehouse was franchised with --cache: its scope is already the whole tree, so \
+            there is nothing to expand. \"expand\" widens a sparse (\"franchise --only\") \
+            warehouse's fetch scope.".to_string()
+        );
+    }
+
     if current.is_full() {
         return Err(
             "This warehouse already holds the full tree; there is nothing to expand. \"expand\" \

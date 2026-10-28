@@ -5253,6 +5253,66 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     assert!(!forced.status.success(), "a forced non-origin sparse lift must fail loudly: {}", stdout(&forced));
 }
 
+/// A `--cache` franchise is a partial warehouse, as a sparse one is: it skips the bundle, writes
+/// its marker, records its origin and so refuses to lift elsewhere, runs the content audit, and
+/// refuses `expand`. Combined with `--only`, it is refused before anything is created.
+///
+/// Revert: skip the marker or the origin write → the non-origin lift is attempted; leave cache out
+/// of the bundle skip → the bundle is imported; gate the audit on the scope alone → no scope.
+#[test]
+fn a_cache_franchise_is_a_partial_warehouse() {
+    let area = TestArea::new("cache-franchise");
+    let (server, _bundle) = warehouse_with_a_bundle(&area);
+
+    // Signed, so `audit` has something to verify; the bundle is rebuilt over the signed head.
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    area.write_file("a/one.txt", "one signed\n");
+    assert_success(&area.forklift("a", &["load", "one.txt"]));
+    assert_success(&area.forklift("a", &["stack", "signed"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    server.rebuild_bundle(&area);
+
+    // The distinguishing baseline: a full franchise of the same remote imports the bundle.
+    let full = area.forklift(".", &["--json", "franchise", &server.url, "full"]);
+    assert_success(&full);
+    assert!(json_of(&full)["data"].get("bundle_objects").is_some(), "{}", stdout(&full));
+    assert!(!area.path("full/.forklift/config/cache-mode").exists());
+
+    let cached = area.forklift(".", &["--json", "franchise", &server.url, "cached", "--cache"]);
+    assert_success(&cached);
+    assert!(json_of(&cached)["data"].get("bundle_objects").is_none(), "no bundle: {}", stdout(&cached));
+    assert_eq!(std::fs::read(area.path("cached/.forklift/config/cache-mode")).unwrap(), b"/forklift-cache-mode 1\n");
+    assert_eq!(area.read_file("cached/one.txt"), "one signed\n");
+
+    let audit = area.forklift("cached", &["--json", "audit"]);
+    assert_success(&audit);
+    let scope = &json_of(&audit)["data"]["scope"];
+    assert!(scope.is_object(), "the content audit runs: {}", stdout(&audit));
+    assert!(scope["fetch_scope"].is_null(), "a cache is not scoped: {}", stdout(&audit));
+    assert_eq!(scope["cache"], true, "the pass says it is a cache's: {}", stdout(&audit));
+    let human = area.forklift("cached", &["audit"]);
+    assert!(stdout(&human).contains("This warehouse is a cache"), "{}", stdout(&human));
+
+    let expand = area.forklift("cached", &["expand", "docs"]);
+    assert!(!expand.status.success(), "{}", stdout(&expand));
+    assert!(stderr(&expand).contains("--cache") || stdout(&expand).contains("--cache"),
+        "{}{}", stdout(&expand), stderr(&expand));
+
+    let other = Server::start_at(&area, "server-root-2", None);
+    assert_success(&area.forklift("cached", &["config", "remote.url", &other.url]));
+    let refused = area.forklift("cached", &["--json", "lift"]);
+    assert_eq!(refused.status.code(), Some(11), "{}", stdout(&refused));
+    let json = json_of(&refused);
+    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", json);
+    assert!(json["error"]["message"].as_str().unwrap().contains(&server.url), "{}", json);
+    assert!(json["error"]["next_step"].as_str().unwrap().contains("--cache"), "{}", json);
+
+    let both = area.forklift(".", &["franchise", &server.url, "both", "--cache", "--only", "src"]);
+    assert!(!both.status.success(), "{}", stdout(&both));
+    assert!(stderr(&both).contains("--only"), "{}", stderr(&both));
+    assert!(!area.path("both").exists(), "nothing was created");
+}
+
 #[test]
 fn lift_and_franchise_round_trip_a_chunked_file() {
     // Chunk transport, end to end (§9.4b Stage 3). A chunk-aware server advertises `chunking` on

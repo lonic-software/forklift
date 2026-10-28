@@ -115,8 +115,12 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "AuditScope": {
-      "description": "What a content audit checked, and (on a sparse warehouse) the boundary it sealed rather than\nverified. Emitted so a skimming reader or agent can never mistake a sparse pass — which verified\ncontent only within the fetch scope — for a full-clone pass, nor a presence-only pass for a\n`--full` re-read.",
+      "description": "What a content audit checked, and (on a partial warehouse) what it sealed rather than verified.\nEmitted so a skimming reader or agent can never mistake a sparse pass — which verified content\nonly within the fetch scope — or a cache pass — which verified only the content it holds — for\na full-clone pass, nor a presence-only pass for a `--full` re-read.",
       "properties": {
+        "cache": {
+          "description": "The warehouse is a cache (franchised with `--cache`): it may lack content its history\nreaches, held by hash alone and counted in `held_by_hash`. Omitted on any other warehouse.",
+          "type": "boolean"
+        },
         "chunks": {
           "description": "How a chunked file's chunks were checked: `presence-checked` in a normal audit (bounded, no\nbytes re-read), or, under `--full`, re-read and re-hashed with each fully-present file\nre-assembled to verify its recipe's content hash.",
           "type": "string"
@@ -208,7 +212,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "The content audit that ran: present when the warehouse is sparse (to report the sealed\nboundary) or when `--full` re-verified content on a full clone. A normal full-clone audit is\nsignature-only and omits it, so a partial or presence-only pass is never mistaken for a\ncomplete content re-verification."
+      "description": "The content audit that ran: present when the warehouse is partial, sparse or a cache (to\nreport what it may lack), or when `--full` re-verified content on a full clone. A normal full-clone audit is\nsignature-only and omits it, so a partial or presence-only pass is never mistaken for a\ncomplete content re-verification."
     },
     "verified_parcels": {
       "description": "How many signed parcels verified on the pallet.",
