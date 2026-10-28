@@ -1222,9 +1222,9 @@ fn update_pallet_head_checked(
             let current = crate::util::scope_utils::read_fetch_scope()?;
 
             // A record the verification leaned on is read again too: a refill or a repair may
-            // have dropped the entry that held an absence.
+            // have dropped the entry that held an absence. An entry added since undoes nothing.
             let record_moved = match leaned_on {
-                Some(record) => &crate::util::sealed_utils::read_sealed()? != record,
+                Some(record) => !crate::util::sealed_utils::read_sealed()?.holds_all_of(record),
                 None => false,
             };
 
@@ -1328,8 +1328,9 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 /// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
 /// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
 ///
-/// An absent object the sealed-by-hash record holds is tolerated. The record is read only when
-/// the walk without it fails, so a warehouse holding the whole closure never depends on it.
+/// In a partial warehouse (sparse, or a cache), an absent object the sealed-by-hash record holds
+/// is tolerated; a full warehouse tolerates nothing. The mode and the record are read only when
+/// the walk without them fails, so a warehouse holding the whole closure never depends on them.
 ///
 /// # Returns
 /// * `Ok(None)`         - Everything is present.
@@ -1355,6 +1356,17 @@ fn verify_new_head(name: &str,
     let Err(missing) = verify(None) else {
         return Ok(None);
     };
+
+    // Only a partial warehouse holds anything by hash alone: a full one must hold every object.
+    let partial = crate::util::scope_utils::content_may_be_absent().map_err(|error| RefUpdateError::Failed(format!(
+        "Cannot tell whether the history of {} is complete: {}, and whether this warehouse may lack \
+        content cannot be read. {}",
+        &new[..new.len().min(12)], missing.trim_end_matches('.'), error
+    )))?;
+
+    if !partial {
+        return Err(incomplete(missing));
+    }
 
     let record = crate::util::sealed_utils::read_sealed().map_err(|error| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and the record of objects held by \
@@ -2168,6 +2180,7 @@ pub(crate) mod tests {
         #[test]
         fn a_head_whose_root_tree_is_recorded_and_absent_is_accepted() {
             let (_root, _scope) = scratch("closure-recorded");
+            crate::util::scope_utils::set_cache_mode().unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2179,11 +2192,31 @@ pub(crate) mod tests {
             assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
         }
 
+        // Revert: tolerate a recorded absence whatever the mode → the write lands in a full
+        // warehouse over a root it lacks.
+        #[test]
+        fn a_full_warehouse_tolerates_no_recorded_absence() {
+            let (_root, _scope) = scratch("closure-recorded-full");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let root_tree = two_dirs("a1", "b1");
+            let head = parcel(&root_tree, &[&base]);
+            record(&root_tree);
+            remove(&root_tree);
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+
+            // The same absence in a cache moves the ref.
+            crate::util::scope_utils::set_cache_mode().unwrap();
+            write("main", Some(&base), &head).unwrap();
+        }
+
         // Revert: tolerate any absence once a record exists → the write lands over a root no
         // entry names.
         #[test]
         fn a_head_whose_root_tree_is_absent_and_unrecorded_is_refused() {
             let (_root, _scope) = scratch("closure-unrecorded");
+            crate::util::scope_utils::set_cache_mode().unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2200,6 +2233,7 @@ pub(crate) mod tests {
         #[test]
         fn a_present_recorded_tree_with_a_missing_child_is_refused() {
             let (_root, _scope) = scratch("closure-present-recorded");
+            crate::util::scope_utils::set_cache_mode().unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2215,6 +2249,7 @@ pub(crate) mod tests {
         #[test]
         fn a_record_entry_removed_between_the_check_and_the_hold_is_checked_again() {
             let (_root, _scope) = scratch("closure-record-moved");
+            crate::util::scope_utils::set_cache_mode().unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
@@ -2236,6 +2271,7 @@ pub(crate) mod tests {
         #[test]
         fn an_unreadable_record_blocks_only_a_head_that_needs_it() {
             let (_root, _scope) = scratch("closure-record-unreadable");
+            crate::util::scope_utils::set_cache_mode().unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             std::fs::write(crate::util::sealed_utils::sealed_path(), b"not a record").unwrap();

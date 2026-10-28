@@ -1605,9 +1605,11 @@ trusted warehouse still audits offline exactly as a full clone does. Widen later
 A sparse franchise records its origin — see the origin-only lift rule under `lift`.
 
 **Cache franchise (`--cache`).** Marks the warehouse as a cache: one that may lack content its
-history reaches, whose remote holds the rest. It is treated as partial everywhere a sparse
-franchise is: it skips the bundle, records its origin, is never served, and `mirror` and
-`expand` refuse; `audit` checks the content it holds. It cannot be combined with `--only`. A
+history reaches, whose remote holds the rest. Like a sparse franchise, it skips the bundle,
+records its origin (see the origin-only lift rule under `lift`), is never served, and refuses
+`mirror`; `expand` refuses too, since its scope is already the whole tree. `audit` checks the
+content it holds and says the pass is a cache's. Commands that act on a sparse franchise's
+*scope* (scoped bays, `query`'s scope report) do not apply to a cache. It cannot be combined with `--only`. A
 cache does not yet fetch less than a full franchise: that is still being built.
 
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`

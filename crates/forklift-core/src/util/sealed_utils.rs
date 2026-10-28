@@ -143,6 +143,12 @@ impl SealedSet {
         self.hashes.is_empty()
     }
 
+    /// Whether every hash `earlier` holds is still recorded here: only an entry's removal can
+    /// undo what a check that leaned on `earlier` accepted.
+    pub fn holds_all_of(&self, earlier: &SealedSet) -> bool {
+        earlier.hashes.is_subset(&self.hashes)
+    }
+
     /// Apply one entry, as replaying its frame does.
     fn apply(&mut self, op: SealOp, hash: String) {
         match op {

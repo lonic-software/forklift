@@ -5289,6 +5289,9 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     let scope = &json_of(&audit)["data"]["scope"];
     assert!(scope.is_object(), "the content audit runs: {}", stdout(&audit));
     assert!(scope["fetch_scope"].is_null(), "a cache is not scoped: {}", stdout(&audit));
+    assert_eq!(scope["cache"], true, "the pass says it is a cache's: {}", stdout(&audit));
+    let human = area.forklift("cached", &["audit"]);
+    assert!(stdout(&human).contains("This warehouse is a cache"), "{}", stdout(&human));
 
     let expand = area.forklift("cached", &["expand", "docs"]);
     assert!(!expand.status.success(), "{}", stdout(&expand));

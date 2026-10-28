@@ -73,23 +73,26 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         report.legacy_parcels = legacy;
 
         // A partial warehouse (sparse, or a cache) may lack content its history reaches, so
-        // signatures alone cannot speak for what is on disk. Prove the fetched content present and re-hashed (sealing the rest
-        // by the hash a signed parcel commits), and report the boundary so a sparse pass can
-        // never read as a full-clone pass. A full store keeps today's signature-only audit
-        // unchanged — unless `--full` is asked, which re-reads every present chunk and re-verifies
-        // each chunked file's content hash even on a full clone. Object presence is a warehouse
-        // property, so the fetch scope and the cache-mode marker are the seam either way. Whenever the content audit runs, it
-        // counts and reports what the sealed record held by hash alone; a signature-only pass makes
-        // no content claim, so it has nothing of that kind to report.
+        // signatures alone cannot speak for what is on disk. Prove the fetched content present
+        // and re-hashed (sealing the rest by the hash a signed parcel commits), and report the
+        // boundary so a partial pass can never read as a full-clone pass. A full store keeps
+        // today's signature-only audit unchanged — unless `--full` is asked, which re-reads every
+        // present chunk and re-verifies each chunked file's content hash even on a full clone.
+        // Object presence is a warehouse property, so the fetch scope and the cache-mode marker
+        // are the seam either way. Whenever the content audit runs, it counts and reports what
+        // the sealed record held by hash alone; a signature-only pass makes no content claim, so
+        // it has nothing of that kind to report.
         let fetch_scope = scope_utils::read_fetch_scope()?;
         let is_sparse = !fetch_scope.is_full();
+        let is_cache = scope_utils::is_cache_mode()?;
 
-        if is_sparse || full || scope_utils::is_cache_mode()? {
+        if is_sparse || full || is_cache {
             let record = sealed_utils::read_sealed()?;
             let sealed = SealedTolerance::new(&record);
             audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full, Some(&sealed))?;
             report.scope = Some(AuditScope::new(
                 is_sparse.then(|| fetch_scope.prefixes().to_vec()),
+                is_cache,
                 full,
                 sealed.held(),
                 sealed_utils::present_recorded(&record)?.len(),
@@ -129,18 +132,18 @@ pub(crate) struct AuditReport {
     /// normal audit presence-checks chunks without re-reading them.
     full: bool,
 
-    /// The content audit that ran: present when the warehouse is sparse (to report the sealed
-    /// boundary) or when `--full` re-verified content on a full clone. A normal full-clone audit is
+    /// The content audit that ran: present when the warehouse is partial, sparse or a cache (to
+    /// report what it may lack), or when `--full` re-verified content on a full clone. A normal full-clone audit is
     /// signature-only and omits it, so a partial or presence-only pass is never mistaken for a
     /// complete content re-verification.
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<AuditScope>,
 }
 
-/// What a content audit checked, and (on a sparse warehouse) the boundary it sealed rather than
-/// verified. Emitted so a skimming reader or agent can never mistake a sparse pass — which verified
-/// content only within the fetch scope — for a full-clone pass, nor a presence-only pass for a
-/// `--full` re-read.
+/// What a content audit checked, and (on a partial warehouse) what it sealed rather than verified.
+/// Emitted so a skimming reader or agent can never mistake a sparse pass — which verified content
+/// only within the fetch scope — or a cache pass — which verified only the content it holds — for
+/// a full-clone pass, nor a presence-only pass for a `--full` re-read.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct AuditScope {
@@ -149,6 +152,11 @@ pub(crate) struct AuditScope {
     /// sealed by hash, not downloaded.
     #[serde(skip_serializing_if = "Option::is_none")]
     fetch_scope: Option<Vec<String>>,
+
+    /// The warehouse is a cache (franchised with `--cache`): it may lack content its history
+    /// reaches, held by hash alone and counted in `held_by_hash`. Omitted on any other warehouse.
+    #[serde(skip_serializing_if = "crate::output::is_false")]
+    cache: bool,
 
     /// Signatures — the office chain and every parcel — are verified in full regardless of
     /// scope (parcels and their sidecars are always fully present).
@@ -189,14 +197,16 @@ pub(crate) struct AuditScope {
 impl AuditScope {
     /// * `fetch_scope` - `Some(prefixes)` on a sparse warehouse (the sealed boundary), `None` on a
     ///   full clone.
+    /// * `cache`       - Whether the warehouse is a cache.
     /// * `full`        - Whether `--full` re-read and re-verified chunks (vs. presence-checked).
     /// * `held`        - How many absent objects the sealed record held by hash alone.
     /// * `present`     - How many objects the sealed record names that the store holds.
-    fn new(fetch_scope: Option<Vec<String>>, full: bool, held: usize, present: usize) -> AuditScope {
+    fn new(fetch_scope: Option<Vec<String>>, cache: bool, full: bool, held: usize, present: usize) -> AuditScope {
         let sparse = fetch_scope.is_some();
 
         AuditScope {
             fetch_scope,
+            cache,
             signatures: "verified",
             in_scope_content: "verified",
             held_by_hash: held,
@@ -263,6 +273,15 @@ impl CommandOutput for AuditReport {
                 "Out-of-scope content is pinned to the hash a signed parcel commits — it cannot \
                 be forged or substituted, only fetched. The boundary is advisory, not enforced \
                 by the remote."
+            );
+        }
+
+        if let Some(AuditScope { cache: true, held_by_hash, .. }) = &self.scope {
+            println!(
+                "This warehouse is a cache: it may lack content its history reaches. Signatures are \
+                verified in full; every tree it holds was re-hashed and every blob and chunk it \
+                names confirmed present{}.",
+                if *held_by_hash > 0 { ", except those held by hash below" } else { "" }
             );
         }
 

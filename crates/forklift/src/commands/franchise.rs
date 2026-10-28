@@ -74,11 +74,6 @@ pub async fn handle_command(url: &str,
     let fetch_scope = resolve_fetch_scope(&only)?;
     let sparse = !fetch_scope.is_full();
 
-    // A cache-mode fetch is full in scope; combined with a sparse one it is not built yet.
-    if cache && sparse {
-        return Err("--cache cannot be combined with --only.".to_string());
-    }
-
     let partial = Partial { sparse, cache };
 
     // Likewise refused before anything is created: an empty token is never what was meant, and
@@ -639,7 +634,8 @@ async fn franchise_into_prepared_target(
         scope_utils::set_bay_scope(&fetch_scope)?;
     }
 
-    // Before the pallet's head is written: the ref gate reads the mode as it moves the head.
+    // Before the pallet's head is written: the ref gate reads the mode to decide whether a
+    // recorded absence may stand.
     record_partial(partial, &url)?;
 
     // Raised before the pallet's head is written, and finished once the tree is materialized. The
