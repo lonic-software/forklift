@@ -1076,6 +1076,32 @@ fn audit_names_heal_for_a_present_recorded_object_and_heal_clears_it() {
     assert_eq!(after["held_by_hash"], 1, "the subtree is still held: {}", after);
 }
 
+/// A record heal cannot write fails the removal but not the run: the report is still emitted,
+/// with the failure in `unseal_failed`, and the record is left as it was. Mutation: drop the
+/// failure from the report → red.
+#[test]
+fn heal_reports_a_removal_it_could_not_write() {
+    let warehouse = Warehouse::new("sealed-unwritable");
+    let head = warehouse.stack_files(&[("dir/a.txt", "a\n")], "K");
+
+    let dir = warehouse.scoped(|| subtree(&head, "dir"));
+    warehouse.seal(&[&dir]);
+    let path = warehouse.scoped(sealed_utils::sealed_path);
+    let before = std::fs::read(&path).unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+
+    let healed: serde_json::Value = serde_json::from_slice(&warehouse.run_ok(&["heal", "--json"]).stdout).unwrap();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    assert!(healed["data"]["unseal_failed"].is_string(), "{}", healed);
+    assert!(healed["data"].get("unsealed").is_none(), "{}", healed);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
 /// heal pushes a present recorded tree's coverage down before removing its record: a blob beneath
 /// it that is absent and unrecorded is recorded, so it is held by hash after the removal as it is
 /// on the premise of the tree's record. The human report names both. Mutation: drop the push-down

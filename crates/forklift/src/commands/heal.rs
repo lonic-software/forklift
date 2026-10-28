@@ -163,8 +163,8 @@ pub(crate) struct HealReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     newly_held_by_hash: Vec<String>,
 
-    /// Why removing those records failed, if it did. Part of what it would have written may have
-    /// landed, so `unsealed` and `newly_held_by_hash` are then empty whatever the record holds.
+    /// Why removing those records failed, if it did. A failed write may have landed in part, so
+    /// `unsealed` and `newly_held_by_hash` are then empty whatever the record holds.
     /// Running `heal` again retries.
     #[serde(skip_serializing_if = "Option::is_none")]
     unseal_failed: Option<String>,
@@ -259,7 +259,7 @@ impl CommandOutput for HealReport {
 
         if let Some(error) = &self.unseal_failed {
             println!(
-                "The sealed-object records of objects on disk again may be only partly removed: {}",
+                "The sealed-object records of objects on disk again were not all removed: {}",
                 error
             );
             println!("Run \"forklift heal\" again to retry.");

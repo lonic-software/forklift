@@ -1696,7 +1696,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "unseal_failed": {
-      "description": "Why removing those records failed, if it did. Part of what it would have written may have\nlanded, so `unsealed` and `newly_held_by_hash` are then empty whatever the record holds.\nRunning `heal` again retries.",
+      "description": "Why removing those records failed, if it did. A failed write may have landed in part, so\n`unsealed` and `newly_held_by_hash` are then empty whatever the record holds.\nRunning `heal` again retries.",
       "type": [
         "string",
         "null"
