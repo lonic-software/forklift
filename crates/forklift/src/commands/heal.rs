@@ -132,7 +132,8 @@ pub(crate) struct HealReport {
     /// unconditional: a run with nothing left to check after restaging skips the closure walk
     /// entirely (there is nothing for it to resolve), so it reports no pin note even when one
     /// genuinely applies; a run that still has something dangling reports no pin note either, since
-    /// this field only ever appears on a fully-cleared run.
+    /// this field only ever appears on a fully-cleared run. The sealed-object record adds a note
+    /// for each object on disk that keeps its record, and one when the record cannot be read.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
 

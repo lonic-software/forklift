@@ -35,7 +35,7 @@
 //! hide, and it hides only entries: a lost record reads as a missing object, which every walk
 //! reports, and a lost removal leaves a present object recorded. That seals nothing while the
 //! object is present; were it lost later, it would be held by hash as it was before its refill,
-//! on the same premise that the remote holds it.
+//! on the same premise that the remote holds it. `heal` removes such records (see Removing).
 //! A frame that validates but whose entries do not parse fails the read, as does a header naming
 //! another version: neither is guessed at.
 //!
@@ -50,6 +50,18 @@
 //! atomic writes are never staged by a bulk store session (they go through
 //! [`file_utils::replace_file_atomically`]): a rename that waited for the session to finish would
 //! land over the appends made in between.
+//!
+//! ## Removing
+//!
+//! [`unseal`] removes a record once its object is present again. Before it goes,
+//! the coverage it gave is pushed down: every absent object reached from the present object, by a
+//! walk that does not descend into what is absent, is recorded, since an object being recorded
+//! means the remote holds its whole closure. The push-down is keyed by hash alone, never by path
+//! or scope. Its records are written before the removals, so a crash between the two leaves the
+//! object present and recorded, which seals nothing and the next `heal` repairs. The walk runs
+//! without the ref lock, under the caller's store-access hold, so nothing it found present is
+//! deleted under it; the commit re-reads the record under the ref lock and removes only what is
+//! still recorded. An object the walk could not finish keeps its record.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
