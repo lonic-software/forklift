@@ -2191,7 +2191,8 @@ by hash rather than as lost. Before removing an object's record, `heal` records 
 object beneath it, since the remote that held the object holds those too, so nothing the object
 held by hash is reported missing afterwards. The report lists both (`unsealed` and
 `newly_held_by_hash` under `--json`). An object whose content cannot be walked stays recorded,
-with a `Note:` line naming why; so does every object when the record itself cannot be read.
+with a `Note:` line naming why; so does every object when the record cannot be read or written, and
+running `heal` again retries. A parcel keeps its record too.
 
 #### Interrupted operations
 

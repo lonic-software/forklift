@@ -24,8 +24,7 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
-/// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference), or
-///                   the sealed-object record could not be written.
+/// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference).
 pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String> {
     // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
@@ -64,7 +63,7 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     // A refill whose removal was lost leaves an object present and still recorded. That seals
     // nothing while it is present, but were it lost later it would read as held rather than lost.
     let mut notes = outcome.notes;
-    let unsealed = unseal_present(store_access, &mut notes)?;
+    let unsealed = unseal_present(store_access, &mut notes);
 
     output::emit(&HealReport {
         was_tainted: outcome.was_tainted,
@@ -81,21 +80,34 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
 
 /// Remove the sealed-object record of every object the store holds, pushing each one's coverage
 /// down first. A record that cannot be read is noted rather than failing the run: nothing is
-/// written over it, and audit and the torn rescan already refuse over it.
+/// written over it, audit fails over it, and a torn rescan leaves its taint standing over it.
 ///
 /// # Returns
-/// * `Ok(Unsealed)` - What was removed and newly recorded. Each object left recorded gets a note.
-/// * `Err(String)`  - If the store could not be checked or the record could not be written.
-fn unseal_present(store_access: &StoreAccessLock, notes: &mut Vec<String>) -> Result<sealed_utils::Unsealed, String> {
+/// What was removed and newly recorded. Each object left recorded gets a note, and so does a
+/// failure to check the store or write the record.
+fn unseal_present(store_access: &StoreAccessLock, notes: &mut Vec<String>) -> sealed_utils::Unsealed {
     let record = match sealed_utils::read_sealed() {
         Ok(record) => record,
         Err(error) => {
             notes.push(format!("{} No object it names was checked against the store.", error));
-            return Ok(sealed_utils::Unsealed::default());
+            return sealed_utils::Unsealed::default();
         }
     };
 
-    let unsealed = sealed_utils::unseal(store_access, &sealed_utils::present_recorded(&record)?)?;
+    // The recoveries above have landed by now, so a failure here is a note: an error would drop
+    // the report of what they did, and a record left in place seals nothing.
+    let unsealed = match sealed_utils::present_recorded(&record)
+        .and_then(|present| sealed_utils::unseal(store_access, &present))
+    {
+        Ok(unsealed) => unsealed,
+        Err(error) => {
+            notes.push(format!(
+                "The sealed-object records of objects on disk again were not removed: {} Run \"forklift \
+                heal\" again to retry.", error
+            ));
+            return sealed_utils::Unsealed::default();
+        }
+    };
 
     for (hash, reason) in &unsealed.kept {
         notes.push(format!(
@@ -104,7 +116,7 @@ fn unseal_present(store_access: &StoreAccessLock, notes: &mut Vec<String>) -> Re
         ));
     }
 
-    Ok(unsealed)
+    unsealed
 }
 
 /// The result of a `heal` run that fully resolved (or found nothing to resolve).
@@ -212,7 +224,9 @@ impl CommandOutput for HealReport {
                     println!("  resolved (absent and unreferenced): {}", path);
                 }
             }
-        } else if self.operation.is_none() && self.unsealed.is_empty() {
+        } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
+            && self.notes.is_empty()
+        {
             println!("Nothing to heal — no durability taint is standing.");
         }
 
@@ -229,8 +243,8 @@ impl CommandOutput for HealReport {
 
         if !self.newly_held_by_hash.is_empty() {
             println!(
-                "{} absent object(s) beneath them are now held by hash alone, as they were beneath \
-                those records:",
+                "{} absent object(s) beneath recorded objects on disk are now held by hash alone, as \
+                they were beneath their records:",
                 self.newly_held_by_hash.len()
             );
             for hash in &self.newly_held_by_hash {

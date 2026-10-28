@@ -1092,7 +1092,7 @@ fn heal_pushes_a_present_recorded_trees_coverage_down() {
     let healed = warehouse.run_ok(&["heal"]);
     let stdout = String::from_utf8_lossy(&healed.stdout);
     assert!(stdout.contains("1 object(s) are on disk again") && stdout.contains(&dir), "{}", stdout);
-    assert!(stdout.contains("1 absent object(s) beneath them are now held by hash alone") && stdout.contains(&a),
+    assert!(stdout.contains("1 absent object(s) beneath recorded objects on disk are now held by hash alone") && stdout.contains(&a),
         "{}", stdout);
 
     let record = warehouse.scoped(|| sealed_utils::read_sealed().unwrap());

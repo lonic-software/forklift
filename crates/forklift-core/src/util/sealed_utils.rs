@@ -378,14 +378,14 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///                     create failed after its rename. Read the record back to learn which.
 pub fn append_locked(lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
     let ops: Vec<(SealOp, String)> = ops.iter().map(|(op, hash)| (*op, hash.to_string())).collect();
-    append_decided_locked(lock, |_| ops)
+    append_decided_locked(lock, |_| Ok(ops))
 }
 
 /// [`append_locked`] with the ops decided from the set the record replays to when it is re-read
 /// under the lock, so a decision about what is recorded is made on what is recorded.
 fn append_decided_locked(
     _lock: &RefLock,
-    decide: impl FnOnce(&SealedSet) -> Vec<(SealOp, String)>,
+    decide: impl FnOnce(&SealedSet) -> Result<Vec<(SealOp, String)>, String>,
 ) -> Result<SealedSet, String> {
     let path = sealed_path();
     let existing = read_record(&path)?;
@@ -401,7 +401,7 @@ fn append_decided_locked(
         None => (Some(header_bytes()), SealedSet::default()),
     };
 
-    let ops = decide(&set);
+    let ops = decide(&set)?;
     let borrowed: Vec<(SealOp, &str)> = ops.iter().map(|(op, hash)| (*op, hash.as_str())).collect();
     let frames = encode_frames(&borrowed)?;
 
@@ -534,7 +534,9 @@ pub fn present_recorded(record: &SealedSet) -> Result<Vec<String>, String> {
 /// The walk runs without the ref lock. The commit takes it, re-reads the record, and appends the
 /// push-down's records, then the removals of those `hashes` still recorded, synced before this
 /// returns. Records first: a crash between them leaves an object present and recorded, which this
-/// repairs on the next run.
+/// repairs on the next run. Every absence the walks found is recorded, even beneath an object
+/// whose record another writer removed meanwhile: the premise is what the remote holds, and that
+/// object was recorded when it was walked. An absence a fetch has filled since is not.
 ///
 /// # Arguments
 /// * `_hold`  - The caller's store-access hold, shared or exclusive. It must span the whole call,
@@ -577,12 +579,18 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
     let mut pushed_down = Vec::new();
 
     append_decided_locked(&lock, |set| {
-        pushed_down = absent.into_iter().filter(|hash| !set.contains(hash)).collect();
+        // An absence a fetch has filled since the walk is not recorded: recorded and present, it
+        // would be the very state this repairs.
+        for hash in absent.into_iter().filter(|hash| !set.contains(hash)) {
+            if !file_utils::raw_object_present(&hash)? {
+                pushed_down.push(hash);
+            }
+        }
         removed = walked.into_iter().filter(|hash| set.contains(hash)).collect::<BTreeSet<String>>().into_iter().collect();
 
-        pushed_down.iter().map(|hash| (SealOp::Record, hash.clone()))
+        Ok(pushed_down.iter().map(|hash| (SealOp::Record, hash.clone()))
             .chain(removed.iter().map(|hash| (SealOp::Remove, hash.clone())))
-            .collect()
+            .collect())
     })?;
 
     Ok(Unsealed { removed, pushed_down, kept })
@@ -618,8 +626,10 @@ fn closure_absences(hash: &str, closed: &HashSet<String>) -> Result<ClosureAbsen
     match object_utils::peek_object_header(&bytes)?.0 {
         ObjectType::Tree => trees.push_back(hash.to_string()),
         ObjectType::Recipe => recipe_absences(hash, closed, &mut walk)?,
-        // A blob, a chunk or a parcel holds nothing by hash beneath it.
-        _ => {}
+        ObjectType::Blob | ObjectType::Chunk => {}
+        // A parcel names its tree and its parents, a history this walk does not follow, so its
+        // record is not removed on a push-down that would miss them.
+        ObjectType::Parcel => return Err("it is a parcel, and the history it names is not walked here".to_string()),
     }
 
     while let Some(tree_hash) = trees.pop_front() {
@@ -1200,6 +1210,19 @@ mod tests {
         assert!(unsealed.kept[0].1.contains("not a tree"), "{}", unsealed.kept[0].1);
         assert_eq!(unsealed.kept[1].1, "it is not in the store");
         assert_eq!(std::fs::read(sealed_path()).unwrap(), before, "nothing was written");
+
+        // A parcel names a history the walk does not follow. Mutation: treat it as a leaf → its
+        // record is removed → red.
+        let mut object = crate::builder::object::loose_object_builder::LooseObjectBuilder::build_parcel(
+            &crate::model::parcel::Parcel { tree_hash: absent.clone(), parents: Vec::new(), actions: Vec::new(), description: None },
+        );
+        let parcel = object.hash.clone();
+        object.store().unwrap();
+        append(&[(SealOp::Record, &parcel)]).unwrap();
+        let unsealed = unseal(&hold(), &[parcel.clone()]).unwrap();
+        assert!(unsealed.removed.is_empty() && unsealed.pushed_down.is_empty(), "{:?}", unsealed);
+        assert!(unsealed.kept[0].1.contains("parcel"), "{:?}", unsealed);
+        assert!(read_sealed().unwrap().contains(&parcel));
 
         // Present, walkable, and not recorded.
         let unrecorded = store_tree(&[]);
