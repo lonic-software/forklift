@@ -62,8 +62,8 @@ touching it, and a `--warehouses` server answers `409` for a folder whose `.fork
 marker. An empty `.forklift` is prepared with `forklift-server prepare --root …`. One with content
 but no marker dates from before warehouses were marked, or is not a warehouse: move it aside and
 prepare the root. A marker an older Forklift wrote, before the marker recorded what the warehouse
-holds, is refused too: prepare a new root. The new warehouse starts empty and holds only what clients lift into it again;
-nothing is carried over from the folder moved aside.
+holds, is refused too: prepare a new root. The new warehouse starts empty and holds only what
+clients lift into it again; nothing is carried over from the folder moved aside.
 
 ## Serving many warehouses
 

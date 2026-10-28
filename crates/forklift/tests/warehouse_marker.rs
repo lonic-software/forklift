@@ -295,8 +295,6 @@ fn an_empty_forklift_folder_inside_a_bay_names_no_outer_warehouse() {
     assert_eq!(refusal.next_step, format!("Run \"forklift prepare\" in {}.", quoted(&sub)));
 }
 
-/// A marker this build cannot read is said to be one, never answered as "no warehouse here" with
-/// a prepare that would refuse the same marker.
 /// A marker this build cannot read is refused by every command and by `prepare`, never answered
 /// with "prepare" and never read as a full warehouse: one with no mode, two, a mode this build
 /// does not know, or the version 1 marker an older Forklift wrote before the marker recorded the

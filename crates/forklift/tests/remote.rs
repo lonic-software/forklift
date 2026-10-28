@@ -7524,9 +7524,9 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
 fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
     // A fetch scope this build refuses (here one a full warehouse should never hold) skips the
     // user pallets' history fetches. Re-running heal cannot fix that, so the remedy must name the
-    // scope file and its way out, not only the
-    // "once connectivity is restored" wording a transient failure gets, and must keep the
-    // reproduce-it remedy, since the remote was still asked for the object by hash.
+    // scope file and its way out, not only the "once connectivity is restored" wording a
+    // transient failure gets, and must keep the reproduce-it remedy, since the remote was still
+    // asked for the object by hash.
     //
     // Mutation: map the skipped fetch to `ConsultedWithErrors` → the remedy never names the
     // scope file → red.

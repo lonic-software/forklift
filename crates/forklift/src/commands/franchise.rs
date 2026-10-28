@@ -12,7 +12,7 @@ use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::warehouse_utils::PrepareMode;
 use forklift_core::util::{
     bundle_utils, config_utils, file_utils, held_heads, lock_utils, object_utils, operation_utils,
-    pack_utils, pallet_utils, remote_utils, shift_utils, take_utils, trust_utils,
+    pack_utils, pallet_utils, remote_utils, scope_utils, shift_utils, take_utils, trust_utils,
     warehouse_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -506,11 +506,12 @@ async fn franchise_into_prepared_target(
 
     // The mode is on disk from here on, a sparse warehouse's scopes with it, so every ref write
     // below is gated by what this warehouse will hold. A resume clears the marker before this, so
-    // a recorded mode other than the one asked for is never expected; it is refused all the same.
+    // a recorded mode other than the one asked for, or a sparse one over other paths, is never
+    // expected; it is refused all the same, since a standing marker keeps the scopes it has.
     let mode = partial.prepare_mode(&fetch_scope);
     warehouse_utils::prepare_warehouse(mode)?;
 
-    if warehouse_utils::warehouse_mode()? != mode.mode() {
+    if warehouse_utils::warehouse_mode()? != mode.mode() || scope_utils::read_fetch_scope()? != fetch_scope {
         return Err(format!(
             "\"{}\" was already prepared as a different kind of warehouse than this franchise asks for.",
             attempt.directory
