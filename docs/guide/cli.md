@@ -1711,7 +1711,9 @@ the same as a bare `lower`.
 **A pallet never points at history this warehouse lacks.** Every command that moves a pallet to a
 parcel it does not already stand on (`stack`, `lower`, `consolidate`, `palletize`, `undo`, and the
 rest) first checks that the parcel's history is completely present, back to what some pallet
-already holds. In a sparse warehouse it checks only what the fetch scope holds. When something
+already holds. In a sparse warehouse it checks only what the fetch scope holds. An object the
+warehouse holds by hash alone (see `audit`) is accepted while it is absent, with nothing beneath
+it checked; once it is present again, what it names is checked as usual. When something
 is missing, for instance after a fetch that stopped part-way, the command refuses, names the
 missing object, and writes nothing; running that fetch again completes the history.
 
