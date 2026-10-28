@@ -183,7 +183,7 @@ fn encode_frames(ops: &[(SealOp, &str)]) -> Result<Vec<Vec<u8>>, String> {
             let raw = sign_utils::from_hex(hash)
                 .ok()
                 .filter(|raw| raw.len() == HASH_LEN && sign_utils::to_hex(raw) == *hash)
-                .ok_or_else(|| format!("\"{}\" is not an object hash.", hash))?;
+                .ok_or_else(|| format!("\"{}\" is not an object hash (64 lowercase hex characters).", hash))?;
             entries.push(op.to_byte());
             entries.extend_from_slice(&raw);
         }
@@ -285,8 +285,8 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
         offset += frame_len;
     }
 
-    // A torn append leaves at most one frame's bytes, then perhaps zeros the filesystem extended
-    // the file with. Anything longer is not a torn tail: the frames behind it would be lost.
+    // A torn append leaves at most one frame's bytes, zeros the filesystem extended the file with
+    // included. Anything longer is not a torn tail: the frames behind it would be lost.
     if !is_torn_tail(&bytes[offset..]) {
         return Err(format!(
             "is damaged at byte {}: what follows it is not what an interrupted write leaves.",
