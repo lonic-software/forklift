@@ -366,14 +366,15 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
     let path = sealed_path();
     let existing = read_record(&path)?;
 
-    // The bytes are kept only when a torn append follows the valid prefix, to rewrite it.
-    let (torn_prefix, mut set) = match existing {
+    // A prefix to rewrite the record from: the header when there is no record, the valid frames
+    // when a torn append follows them, and none when the frames can be appended in place.
+    let (rewrite_from, mut set) = match existing {
         Some((mut bytes, parsed)) => {
             let torn = parsed.valid_len < bytes.len();
             bytes.truncate(parsed.valid_len);
-            (Some(torn.then_some(bytes)), parsed.set)
+            (torn.then_some(bytes), parsed.set)
         }
-        None => (None, SealedSet::default()),
+        None => (Some(header_bytes()), SealedSet::default()),
     };
 
     for (op, hash) in ops {
@@ -384,17 +385,12 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
         return Ok(set);
     }
 
-    match torn_prefix {
-        Some(None) => append_frames(&path, &frames)?,
-        Some(Some(mut prefix)) => {
+    match rewrite_from {
+        Some(mut prefix) => {
             prefix.extend(frames.concat());
             file_utils::replace_file_atomically(&path, &prefix)?;
         }
-        None => {
-            let mut created = header_bytes();
-            created.extend(frames.concat());
-            file_utils::replace_file_atomically(&path, &created)?;
-        }
+        None => append_frames(&path, &frames)?,
     }
 
     Ok(set)

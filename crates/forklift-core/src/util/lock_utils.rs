@@ -442,16 +442,17 @@ impl MirrorLock {
 }
 
 /// An exclusive lock on the pallet refs (user and meta) and the trust anchor that every bay of a
-/// warehouse shares, held for one read → compare → write and no longer.
+/// warehouse shares, held for a read → compare → write and no longer.
 ///
 /// The bay lock ([`WarehouseLock`]) is bay-local, so it cannot order two bays' ref writes; this
 /// lock lives in the shared forklift root (`forklift_root()/refs.lock`), which is the same file
 /// from every bay. It is a kernel lock on a never-deleted sidecar, like [`StoreAccessLock`], so a
-/// hard-killed holder leaves nothing stale and a writer may wait. A hold spans the reads of the
-/// refs (and anchor) the write's decision consumed, then one durable write (its fsyncs included)
-/// — or, for a trust install, the anchor write and the office write of that one install — and
-/// nothing else, so the wait is short and is not announced; a holder stalled inside a write
-/// stalls every ref writer.
+/// hard-killed holder leaves nothing stale and a writer may wait. A ref write's hold spans the
+/// reads of the refs (and anchor) the write's decision consumed, then one durable write (its
+/// fsyncs included) — or, for a trust install, the anchor write and the office write of that one
+/// install — and nothing else, so the wait is short and is not announced; a holder stalled inside
+/// a write stalls every ref writer. A sealed-object record write holds it longest: it re-reads
+/// the whole record, and a compaction rewrites it, so that wait grows with the record.
 ///
 /// It also orders the fetched-heads ledger of a sparse warehouse
 /// ([`fetch_ledger`](crate::util::fetch_ledger)) against the ref writes and the fetch scope: a
