@@ -1181,13 +1181,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A record whose header is missing is damage too: it is rebuilt as a header alone.
+    /// A record whose header is missing is damage too: its read says it is rebuilt empty, and it is
+    /// rebuilt as a header alone. Mutation: name the salvage step for it → red.
     #[test]
     fn a_record_without_its_header_is_rebuilt_empty() {
         let (root, _scope) = scratch("rebuild-headless");
 
         let headless = encode_frame(SealOp::Record, A).unwrap();
         std::fs::write(sealed_path(), &headless).unwrap();
+        let err = read_sealed().unwrap_err();
+        assert!(err.contains("rebuilds it empty"), "{}", err);
 
         assert_eq!(rebuild().unwrap(), Some(Rebuilt { at: 0, dropped_bytes: headless.len() }));
         assert_eq!(std::fs::read(sealed_path()).unwrap(), header_bytes());
