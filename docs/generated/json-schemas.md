@@ -1703,13 +1703,6 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "description": "The operation this run settled: one interrupted in this bay before it finished, which every\ncommand that changes the bay or commits staged content refused over until now."
     },
-    "record_rebuild_failed": {
-      "description": "Why rebuilding a damaged sealed-object record failed, if it did. A rewrite that failed\nafter its rename has still landed. Running `heal` again retries.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "record_rebuilt": {
       "anyOf": [
         {
