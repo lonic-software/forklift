@@ -109,16 +109,16 @@ impl WarehouseHandle {
     /// good. Clients treat a served head as proof that the server holds its whole closure:
     /// scope-prune frees local copies of what the remote heads reach, so such a root would let a
     /// client free content the server cannot serve back. Checking once, here, is enough because a
-    /// full root never turns into one: of the fetch-scope writers, franchise sets it as it creates
-    /// the warehouse, `expand` never widens one to full, and scope-prune only narrows one that is
-    /// already sparse; the cache-mode marker is written by franchise alone.
+    /// full root never turns into one: the warehouse marker records the mode when the warehouse is
+    /// prepared and nothing rewrites it, and the fetch scope can be set only on a warehouse already
+    /// recorded as sparse.
     fn serving(root: PathBuf, wait: bool) -> Result<WarehouseHandle, ServingRefusal> {
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
         // absolute path or an open file, so they stay valid once the scope drops).
         let (serve_lock, store_access) = {
-            // An unfinished franchise has no settled fetch scope yet (one killed before it wrote the
-            // scope reads as full), so it is refused before the scope is trusted.
+            // An unfinished franchise has not finished fetching, so even one marked full may lack
+            // what its heads name: it is refused before anything it holds is trusted.
             franchise_utils::gate(&root).map_err(|e| ServingRefusal::Unfinished(String::from(e)))?;
 
             let _scope = StorageRootScope::enter(&root);
@@ -157,7 +157,7 @@ enum ServingRefusal {
     /// It holds a franchise that has not finished: it is resumed or deleted first.
     Unfinished(String),
 
-    /// Its fetch scope or cache-mode marker could not be read, or its served mark could not be
+    /// Its warehouse marker or fetch scope could not be read, or its served mark could not be
     /// read or written.
     Unreadable(String),
 
@@ -1808,7 +1808,7 @@ fn create_warehouse_numbered(base: &std::path::Path, id: &str,
     // missing would never be repaired, since a later `PUT` finds it and answers 200.
     let prepared = {
         let _scope = StorageRootScope::enter(&staging);
-        warehouse_utils::prepare_warehouse().map(|_| ())
+        warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).map(|_| ())
     };
 
     if let Err(error) = prepared {
@@ -4613,9 +4613,16 @@ mod tests {
 
     /// Makes `root` a bare warehouse: its `.forklift` folder, holding only the marker.
     fn mark_warehouse(root: &std::path::Path) {
+        mark_warehouse_as(root, "full");
+    }
+
+    /// Mark `root` as a bare warehouse whose marker records `mode` (or any other entry a test wants
+    /// refused).
+    fn mark_warehouse_as(root: &std::path::Path, mode: &str) {
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
-        std::fs::create_dir_all(&forklift).unwrap();
-        std::fs::write(forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 1\n").unwrap();
+        std::fs::create_dir_all(forklift.join("config")).unwrap();
+        std::fs::write(forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER),
+            format!("/forklift-warehouse 2\n{}\n", mode)).unwrap();
     }
 
     /// A multi-mode state over `base` that keeps at most `cap` warehouses live while any is idle,
@@ -4701,6 +4708,7 @@ mod tests {
 
     /// Restrict the fetch scope of the warehouse at `root`, as `franchise --only src` does.
     fn make_sparse(root: &std::path::Path) {
+        mark_warehouse_as(root, "sparse");
         let _scope = StorageRootScope::enter(root);
         scope_utils::set_fetch_scope(&scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
     }
@@ -4738,13 +4746,14 @@ mod tests {
     }
 
     /// The single-root path gets the same refusal from the same funnel, for a sparse root and a
-    /// cache, and a fetch scope or cache-mode marker that cannot be read is refused rather than read
+    /// cache, and a fetch scope or warehouse marker that cannot be read is refused rather than read
     /// as full.
     ///
     /// Revert: drop the sparse check from `serving` → the sparse root is served → red. Revert:
-    /// leave the marker out of `content_may_be_absent` → the cache root is served → red. Revert:
+    /// leave the cache mode out of `content_may_be_absent` → the cache root is served → red. Revert:
     /// read an unreadable fetch scope or marker as full (`unwrap_or(false)`) → the garbled root or
-    /// the cache is served → red.
+    /// the cache is served → red. Revert: read a sparse root without its fetch scope as full → the
+    /// `gone` root is served → red.
     #[test]
     fn serving_refuses_a_partial_root_and_an_unreadable_scope_or_marker() {
         let base = scratch_dir("sparse-single");
@@ -4763,19 +4772,12 @@ mod tests {
 
         // A cache holds its full fetch scope, so only its marker says it may lack content.
         let cache = base.join("cache");
-        mark_warehouse(&cache);
-        {
-            let _scope = StorageRootScope::enter(&cache);
-            scope_utils::set_cache_mode().unwrap();
-        }
+        mark_warehouse_as(&cache, "cache");
         let refused = WarehouseHandle::serving(cache.clone(), false).err().expect("a cache root is refused");
         assert!(matches!(refused, ServingRefusal::Partial), "{:?}", refused);
 
-        // A marker this build cannot read is refused rather than read as absent.
-        {
-            let _scope = StorageRootScope::enter(&cache);
-            std::fs::write(scope_utils::cache_mode_path(), b"/forklift-cache-mode 2\n").unwrap();
-        }
+        // A marker whose mode this build cannot read is refused rather than read as full.
+        mark_warehouse_as(&cache, "shallow");
         let refused = WarehouseHandle::serving(cache, false).err().expect("an unreadable marker is refused");
         assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
 
@@ -4789,12 +4791,27 @@ mod tests {
         let refused = WarehouseHandle::serving(garbled, false).err().expect("an unreadable scope is refused");
         assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
 
+        // The mode is recorded in the marker, so neither deleting a sparse root's fetch scope nor
+        // placing one in a full root makes either servable or reads either as full.
+        let gone = base.join("gone");
+        mark_warehouse(&gone);
+        make_sparse(&gone);
+        std::fs::remove_file(gone.join(FOLDER_NAME_FORKLIFT_ROOT).join("config").join("fetch-scope")).unwrap();
+        let refused = WarehouseHandle::serving(gone, false).err().expect("a sparse root without its scope is refused");
+        assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("is missing")), "{:?}", refused);
+
+        let stray = base.join("stray");
+        mark_warehouse(&stray);
+        std::fs::write(stray.join(FOLDER_NAME_FORKLIFT_ROOT).join("config").join("fetch-scope"), b"").unwrap();
+        let refused = WarehouseHandle::serving(stray, false).err().expect("a full root with a fetch scope is refused");
+        assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("holds a fetch scope")), "{:?}", refused);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A multi-warehouse server refuses an unfinished franchise (503) as single mode does: one
-    /// killed before it wrote its fetch scope reads as full, so its scope cannot be trusted yet. A
-    /// fetch scope that cannot be read is a 500.
+    /// A multi-warehouse server refuses an unfinished franchise (503) as single mode does: it has
+    /// not finished fetching, so what it holds cannot be trusted yet. A fetch scope that cannot be
+    /// read is a 500.
     ///
     /// Revert: drop the franchise gate from `serving` → `unfinished` is served → red.
     #[test]
@@ -4858,7 +4875,7 @@ mod tests {
 
         let hash = {
             let _scope = StorageRootScope::enter(&root);
-            warehouse_utils::prepare_warehouse().unwrap();
+            warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
             let bytes = b"an object only a pack holds";
             let hash = object_utils::hash_object_bytes(bytes);
             object_utils::store_object_bytes(&hash, bytes).unwrap();
@@ -4903,7 +4920,7 @@ mod tests {
         let root = base.join("w1");
         {
             let _scope = StorageRootScope::enter(&root);
-            warehouse_utils::prepare_warehouse().unwrap();
+            warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
         }
 
         let (blob, tree) = {
@@ -5470,7 +5487,7 @@ mod tests {
             std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
 
             let scope = StorageRootScope::enter(&root);
-            warehouse_utils::prepare_warehouse().unwrap();
+            warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
 
             let admin = Operator { identifier: "alice".to_string() };
             let (key_id, public_key) = forklift_core::util::sign_utils::generate_keypair(&admin.identifier).unwrap();
@@ -6150,7 +6167,7 @@ mod tests {
         let _keys_restore = KeysDirRestore(std::env::var("FORKLIFT_KEYS_DIR").ok());
         std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
 
-        warehouse_utils::prepare_warehouse().unwrap();
+        warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
 
         let admin = Operator { identifier: "alice".to_string() };
         let (key_id, public_key) =
@@ -6648,8 +6665,8 @@ mod tests {
     /// A storage-only warehouse entered on this thread, for a test of `PUT /v1/trust`.
     fn trust_warehouse(name: &str) -> (PathBuf, StorageRootScope) {
         let root = scratch_dir(name);
+        mark_warehouse(&root);
         let scope = StorageRootScope::enter(&root);
-        std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
 
         (root, scope)
     }
@@ -6846,7 +6863,7 @@ mod tests {
         let _keys_restore = KeysDirRestore(std::env::var("FORKLIFT_KEYS_DIR").ok());
         std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
 
-        warehouse_utils::prepare_warehouse().unwrap();
+        warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
 
         let actor = Operator { identifier: "alice".to_string() };
         let (key_id, _) = forklift_core::util::sign_utils::generate_keypair(&actor.identifier).unwrap();

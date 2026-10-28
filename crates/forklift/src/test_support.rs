@@ -38,7 +38,11 @@ impl Warehouse {
     fn create(name: &str, cwd: Option<MutexGuard<'static, ()>>) -> Warehouse {
         let root = std::env::temp_dir().join(format!("forklift-bin-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        // A bare full warehouse: its marker is what every ref write reads the mode from.
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+        std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER),
+            b"/forklift-warehouse 2\nfull\n").unwrap();
 
         if cwd.is_some() {
             std::env::set_current_dir(&root).unwrap();

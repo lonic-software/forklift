@@ -609,7 +609,7 @@ fn prepare(root: &str) -> Result<(), String> {
     forklift_core::util::warehouse_utils::check_preparable(&resolved, forklift_core::util::warehouse_utils::Head::Server)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
 
-    let created = forklift_core::util::warehouse_utils::prepare_warehouse()?;
+    let created = forklift_core::util::warehouse_utils::prepare_warehouse(forklift_core::util::warehouse_utils::PrepareMode::Full)?;
 
     if created.is_empty() {
         println!("Nothing to do.");
@@ -1397,7 +1397,7 @@ mod tests {
         let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::NotAWarehouse);
 
-        std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 1\n").unwrap();
+        std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 2\nfull\n").unwrap();
         assert_eq!(server::open_root(root.to_str().unwrap()).unwrap(), std::fs::canonicalize(&root).unwrap());
 
         let _ = std::fs::remove_dir_all(&root);

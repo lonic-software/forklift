@@ -6,8 +6,8 @@ prefixes a scoped bay materializes and operates on. It is used by two files:
   bay checks out, stages and stacks.
 - **Warehouse fetch scope** — `.forklift/config/fetch-scope` (shared across bays). What the
   warehouse has fetched at all. The bay materialization scope is always a subset (⊆) of the
-  fetch scope. In the materialization-only (stage 1) release the store holds everything, so
-  the fetch-scope file is normally absent (= full).
+  fetch scope. Only a warehouse whose [marker](STATE_RECORD_FORMAT.md#files) records it as
+  `sparse` has one; see [the fetch scope and the mode](#the-fetch-scope-and-the-warehouse-mode).
 
 Both files are **local only and never tracked**: scope is a property of *this* checkout, not
 of the project, so it is never written into a parcel, pushed to a remote, or imposed on
@@ -37,6 +37,8 @@ Where:
 - An **absent or empty file** means **full scope** — no restriction, the whole tree is in
   scope. This is what makes a scoped bay opt-in: without a scope file, every scope-aware
   operation behaves exactly as an unscoped workspace.
+  The fetch scope is the exception: whether it may be absent, and whether it may be empty, is
+  decided by the warehouse mode ([below](#the-fetch-scope-and-the-warehouse-mode)).
 - A header followed by no prefix is **refused**, and so is one with a root prefix (an empty
   string or `/`) anywhere among its prefixes, since the root takes in everything. Forklift
   never writes either: the full scope is the empty file.
@@ -51,6 +53,26 @@ Where:
   The way out depends on the file: for the fetch scope or the main tree's scope, franchise
   the remote again, into a new directory; for a bay's scope, remove the bay and add it again
   with `bay add --scope`.
+
+## The fetch scope and the warehouse mode
+The warehouse marker records whether the warehouse is `full`, `sparse` or a `cache`, and the
+fetch-scope file must agree with it. A full warehouse holds every path and a cache fetches
+content as it needs it, so neither has a fetch-scope file. A sparse warehouse
+must have one, naming at least one prefix. Reading the fetch scope refuses every other
+pairing:
+
+- A sparse warehouse whose file is missing or empty is never read as full, since it would then
+  claim content it never fetched. The way out is to franchise the remote again, into a new
+  directory.
+- A full warehouse or a cache with a fetch-scope file is refused whatever the file holds. Only
+  a hand edit puts one there, and the way out is to delete it: the mode, not the file, says
+  what the warehouse holds.
+
+`prepare` is the only writer of the mode. When it makes a sparse warehouse, which only
+`franchise --only` asks for, it writes the fetch scope and the main tree's scope before the
+marker, so no warehouse is ever marked sparse without them. `expand` and `scope-prune` rewrite
+the fetch scope afterwards; a fetch scope can be written only into a warehouse already marked
+sparse.
 
 Against a scope, every user-pallet content path is classified three ways (the classifier the
 sparse walks branch on):

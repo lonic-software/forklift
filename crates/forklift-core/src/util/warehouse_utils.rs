@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, pallet_utils, record_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, pallet_utils, record_utils, scope_utils};
+use crate::util::record_utils::RecordError;
+use crate::util::scope_utils::MaterializationScope;
 
 /// The directory the user invoked forklift from, relative to the warehouse root.
 /// Set once by [`enter_warehouse`]; empty when the user is at the root itself.
@@ -440,13 +442,65 @@ pub fn cwd_relative_to_root() -> PathBuf {
     CWD_RELATIVE_TO_ROOT.get().cloned().unwrap_or_default()
 }
 
-/// The file in a warehouse's `.forklift` folder that says `prepare` finished building it: written
-/// last, so a folder holding it holds every piece of a warehouse.
+/// The file in a warehouse's `.forklift` folder that says `prepare` finished building it, and what
+/// the warehouse holds of the history it names ([`WarehouseMode`]): written last, so a folder
+/// holding it holds every piece of a warehouse.
 pub const FILE_NAME_WAREHOUSE_MARKER: &str = "warehouse";
-/// The record kind and format version of the warehouse marker (see [`record_utils`]). Version 1
-/// holds no entries.
+/// The record kind and format version of the warehouse marker (see [`record_utils`]). Version 2
+/// holds exactly one entry, the mode's word. Version 1 held none and is refused: it predates the
+/// mode, and reading it as any mode would be a guess.
 const WAREHOUSE_MARKER_RECORD: &str = "warehouse";
-const WAREHOUSE_MARKER_VERSION: u32 = 1;
+const WAREHOUSE_MARKER_VERSION: u32 = 2;
+
+/// What a warehouse holds of the history it names, fixed when it is prepared and recorded in its
+/// marker. The marker is the one file whose absence makes a warehouse unopenable, so the mode
+/// cannot be deleted into a claim the store does not back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarehouseMode {
+    /// Everything its history reaches.
+    Full,
+    /// Only the paths of its fetch scope (`franchise --only`).
+    Sparse,
+    /// Content fetched only when read (`franchise --cache`).
+    Cache,
+}
+
+impl WarehouseMode {
+    /// The mode's entry in the marker.
+    pub fn word(self) -> &'static str {
+        match self {
+            WarehouseMode::Full => "full",
+            WarehouseMode::Sparse => "sparse",
+            WarehouseMode::Cache => "cache",
+        }
+    }
+
+    fn from_word(word: &str) -> Option<WarehouseMode> {
+        [WarehouseMode::Full, WarehouseMode::Sparse, WarehouseMode::Cache].into_iter()
+            .find(|mode| mode.word() == word)
+    }
+}
+
+/// The mode [`prepare_warehouse`] gives a warehouse it marks, with what a sparse one needs written
+/// before its marker.
+#[derive(Clone, Copy, Debug)]
+pub enum PrepareMode<'a> {
+    Full,
+    /// The fetch scope, which is also the main tree's first scope. Never full.
+    Sparse(&'a MaterializationScope),
+    Cache,
+}
+
+impl PrepareMode<'_> {
+    /// The mode recorded in the marker.
+    pub fn mode(&self) -> WarehouseMode {
+        match self {
+            PrepareMode::Full => WarehouseMode::Full,
+            PrepareMode::Sparse(_) => WarehouseMode::Sparse,
+            PrepareMode::Cache => WarehouseMode::Cache,
+        }
+    }
+}
 
 /// The lock file in a staging folder of [`place_forklift`], held while the folder is in use.
 const FILE_NAME_STAGING_LOCK: &str = "lock";
@@ -459,11 +513,22 @@ const FILE_NAME_STAGING_LOCK: &str = "lock";
 /// * `Ok(false)`   - It holds none.
 /// * `Err(String)` - The marker cannot be read, or is in a format this build does not know.
 pub fn has_warehouse_marker(forklift: &Path) -> Result<bool, String> {
+    read_warehouse_marker(forklift).map(|mode| mode.is_some())
+}
+
+/// The mode the warehouse marker in `forklift` records.
+///
+/// # Returns
+/// * `Ok(Some(mode))` - It holds a marker this build reads.
+/// * `Ok(None)`       - It holds none.
+/// * `Err(String)`    - The marker cannot be read, is in a format this build does not know, or
+///                      does not name exactly one mode this build knows.
+pub fn read_warehouse_marker(forklift: &Path) -> Result<Option<WarehouseMode>, String> {
     let path = forklift.join(FILE_NAME_WAREHOUSE_MARKER);
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(false),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(None),
         Err(e) => return Err(format!("Error while reading the warehouse marker \"{}\": {}", path.to_string_lossy(), e)),
     };
 
@@ -473,23 +538,67 @@ pub fn has_warehouse_marker(forklift: &Path) -> Result<bool, String> {
     );
 
     match record_utils::from_bytes(&bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
-        Ok(entries) if entries.is_empty() => Ok(true),
-        Ok(_) => Err(unknown("holds entries this version of Forklift does not know.".to_string())),
+        Ok(entries) => match entries.as_slice() {
+            [word] => WarehouseMode::from_word(word).map(Some).ok_or_else(|| unknown(format!(
+                "names a mode this version of Forklift does not know (\"{}\").", word.escape_debug()
+            ))),
+            _ => Err(unknown(format!("holds {} entries where it should hold one, its mode.", entries.len()))),
+        },
+        Err(RecordError::OtherVersion(header)) if header == record_utils::header(WAREHOUSE_MARKER_RECORD, 1) => Err(format!(
+            "The warehouse marker \"{}\" was written by an older version of Forklift, before the marker \
+            recorded what a warehouse holds, so Forklift does not use \"{}\". Make the warehouse again with \
+            this version: franchise it again, or prepare a new one and lower its history into it.",
+            path.to_string_lossy(), forklift.to_string_lossy()
+        )),
         Err(e) => Err(unknown(e.describe())),
     }
 }
 
-/// Write the warehouse marker in `forklift`, atomically and synced with its folder.
-fn write_warehouse_marker(forklift: &Path) -> Result<(), String> {
-    let bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, std::iter::empty::<&str>());
+/// The mode of the warehouse in scope. A forklift root with no marker is an error, never a full
+/// warehouse: what it holds is not recorded.
+pub fn warehouse_mode() -> Result<WarehouseMode, String> {
+    let forklift = forklift_root();
+
+    read_warehouse_marker(&forklift)?.ok_or_else(|| format!(
+        "\"{}\" holds no warehouse marker, so Forklift cannot tell what the warehouse holds.",
+        forklift.to_string_lossy()
+    ))
+}
+
+/// Write the warehouse marker recording `mode` in `forklift`, atomically and synced with its folder.
+fn write_warehouse_marker(forklift: &Path, mode: WarehouseMode) -> Result<(), String> {
+    let bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, [mode.word()]);
 
     file_utils::replace_file_atomically(&forklift.join(FILE_NAME_WAREHOUSE_MARKER), &bytes)
         .map_err(|e| format!("Error while marking \"{}\" as a warehouse: {}", forklift.to_string_lossy(), e))
 }
 
-/// Prepare a warehouse in the current folder (the storage root in scope). Every step is
+/// Record `mode` in the marker of the warehouse in scope, replacing any marker there, for a test
+/// fixture that builds a `.forklift` by hand or changes its mode midway. Writes no scope file.
+#[cfg(test)]
+pub(crate) fn mark_for_test(mode: WarehouseMode) {
+    let forklift = forklift_root();
+    std::fs::create_dir_all(forklift.join("config")).unwrap();
+    write_warehouse_marker(&forklift, mode).unwrap();
+}
+
+/// Mark `forklift` as a warehouse in `mode`. A sparse warehouse's fetch scope and main-tree scope
+/// are written first, so no marker says sparse while either is missing. They are written here
+/// rather than through `scope_utils`' setters, which read the mode this writes.
+fn mark_warehouse(forklift: &Path, mode: PrepareMode) -> Result<(), String> {
+    if let PrepareMode::Sparse(scope) = mode {
+        scope_utils::record_sparse_scopes(forklift, scope)?;
+    }
+
+    write_warehouse_marker(forklift, mode.mode())
+}
+
+/// Prepare a warehouse in `mode` in the current folder (the storage root in scope). Every step is
 /// idempotent: only the pieces that are missing get created, and the warehouse marker
-/// ([`FILE_NAME_WAREHOUSE_MARKER`]) is written last.
+/// ([`FILE_NAME_WAREHOUSE_MARKER`]) is written last. This is the only writer of a warehouse's mode.
+/// A marker already in place is kept as it is, and then no scope is written, so preparing an
+/// existing warehouse never changes its mode or restores a scope file: a caller that needs a
+/// particular mode reads it back.
 ///
 /// Where no `.forklift` stands, or an empty one, the whole folder is built under a staging name and
 /// renamed into place ([`place_forklift`]), so a prepare stopped at any point leaves no half-built
@@ -505,7 +614,7 @@ fn write_warehouse_marker(forklift: &Path) -> Result<(), String> {
 ///                       fully prepared.
 /// * `Err(String)`     - If the folder is a bay's, its marker cannot be read, or a folder or file
 ///                       could not be created.
-pub fn prepare_warehouse() -> Result<Vec<String>, String> {
+pub fn prepare_warehouse(mode: PrepareMode) -> Result<Vec<String>, String> {
     let forklift = forklift_root();
 
     refuse_bay(&forklift)?;
@@ -521,7 +630,7 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
     match std::fs::symlink_metadata(&forklift) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
         Err(e) => return Err(format!("Error while checking \"{}\": {}", forklift.to_string_lossy(), e)),
-        Ok(_) => return fill_in_place(&forklift),
+        Ok(_) => return fill_in_place(&forklift, mode),
     }
 
     let mut notes = Vec::new();
@@ -538,7 +647,7 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
         }
 
         notes = fill(staged, &forklift)?.0;
-        write_warehouse_marker(staged)
+        mark_warehouse(staged, mode)
     })?;
 
     match placement {
@@ -552,7 +661,7 @@ pub fn prepare_warehouse() -> Result<Vec<String>, String> {
             bay_utils::ForkliftKind::Absent => Err(format!(
                 "\"{}\" changed while a warehouse was being prepared there. Try again.", forklift.to_string_lossy()
             )),
-            _ => fill_in_place(&forklift),
+            _ => fill_in_place(&forklift, mode),
         },
     }
 }
@@ -574,7 +683,7 @@ fn refuse_bay(forklift: &Path) -> Result<(), String> {
 /// Add the missing pieces to the existing `.forklift` folder `forklift`, then the marker if it has
 /// none. The folders created are synced into their parents before the marker is written, so a
 /// marker never survives a power loss that the pieces it vouches for did not.
-fn fill_in_place(forklift: &Path) -> Result<Vec<String>, String> {
+fn fill_in_place(forklift: &Path, mode: PrepareMode) -> Result<Vec<String>, String> {
     // Checked again here, not only before: a bay's folder can be put in place since.
     refuse_bay(forklift)?;
 
@@ -591,7 +700,7 @@ fn fill_in_place(forklift: &Path) -> Result<Vec<String>, String> {
     }
 
     if !has_warehouse_marker(forklift)? {
-        write_warehouse_marker(forklift)?;
+        mark_warehouse(forklift, mode)?;
         notes.push(format!("Marked \"{}\" as a warehouse's folder.", FOLDER_NAME_FORKLIFT_ROOT));
     }
 
@@ -960,7 +1069,7 @@ mod tests {
 
     fn prepare_at(root: &Path) -> Result<Vec<String>, String> {
         let _scope = globals::StorageRootScope::enter(root);
-        prepare_warehouse()
+        prepare_warehouse(PrepareMode::Full)
     }
 
     /// The staging folders of `place_forklift` in `dir`.
@@ -987,7 +1096,7 @@ mod tests {
         let notes = prepare_at(&root).unwrap();
 
         assert_eq!(has_warehouse_marker(&forklift), Ok(true));
-        assert_eq!(std::fs::read(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), b"/forklift-warehouse 1\n");
+        assert_eq!(std::fs::read(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), b"/forklift-warehouse 2\nfull\n");
         for piece in ["objects", "inventory", "config"] {
             assert!(forklift.join(piece).is_dir(), "{} must be in place", piece);
         }
@@ -1152,7 +1261,11 @@ mod tests {
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&forklift).unwrap();
 
-        for bad in ["/forklift-warehouse 2\n", "/forklift-warehouse 1\nentry\n", "/forklift-warehouse 1", "warehouse\n"] {
+        // No mode, two modes, a word this build does not know, a newer version, the v1 marker that
+        // recorded no mode at all, and no record header.
+        for bad in ["/forklift-warehouse 2\n", "/forklift-warehouse 2\nfull\nsparse\n",
+                    "/forklift-warehouse 2\nshallow\n", "/forklift-warehouse 3\nfull\n",
+                    "/forklift-warehouse 1\n", "/forklift-warehouse 2", "warehouse\n"] {
             std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), bad).unwrap();
 
             let error = has_warehouse_marker(&forklift).unwrap_err();
@@ -1164,8 +1277,15 @@ mod tests {
         }
 
         std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), "/forklift-warehouse 1\n").unwrap();
-        assert_eq!(has_warehouse_marker(&forklift), Ok(true));
-        assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
+        let error = read_warehouse_marker(&forklift).unwrap_err();
+        assert!(error.contains("older version of Forklift"), "a v1 marker must say how it came to be: {}", error);
+
+        for mode in [WarehouseMode::Full, WarehouseMode::Sparse, WarehouseMode::Cache] {
+            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER),
+                format!("/forklift-warehouse 2\n{}\n", mode.word())).unwrap();
+            assert_eq!(read_warehouse_marker(&forklift), Ok(Some(mode)));
+            assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1197,6 +1317,65 @@ mod tests {
         assert_eq!(has_warehouse_marker(&forklift), Ok(true));
         assert!(forklift.join("objects").is_dir());
         assert_eq!(franchise_utils::read(&forklift), Ok(Some(record)));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The scopes a mode's prepare writes before the marker: both scope files for a sparse
+    /// warehouse, neither for a full one or a cache.
+    fn scope_files(forklift: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        (std::fs::read(forklift.join("config").join("fetch-scope")).ok(), std::fs::read(forklift.join("scope")).ok())
+    }
+
+    /// `prepare_warehouse` records the mode it is given, and a sparse one writes the fetch scope and
+    /// the main tree's scope with it, built under the staging name and filled in place alike. Over
+    /// a marker already standing it keeps the mode and writes no scope, so preparing a sparse
+    /// warehouse again never restores a scope that was deleted.
+    ///
+    /// Revert: write the marker before the scopes, or skip them in place (`fill_in_place` marking
+    /// with `Full`) → the claim reads full; let `fill_in_place` write the scopes over a standing
+    /// marker → the deleted fetch scope comes back.
+    #[test]
+    fn prepare_records_the_mode_and_a_sparse_one_writes_both_scopes_first() {
+        let scope = MaterializationScope::from_prefixes(["src"]);
+        let written = b"/forklift-scope 3\nsrc\n".to_vec();
+
+        let root = fresh_dir("modes");
+        for (name, mode) in [("full", PrepareMode::Full), ("sparse", PrepareMode::Sparse(&scope)), ("cache", PrepareMode::Cache)] {
+            let target = root.join(name);
+            std::fs::create_dir_all(&target).unwrap();
+            let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
+            {
+                let _scope = globals::StorageRootScope::enter(&target);
+                prepare_warehouse(mode).unwrap();
+            }
+            assert_eq!(read_warehouse_marker(&forklift), Ok(Some(mode.mode())), "{}", name);
+            let expected = if name == "sparse" { (Some(written.clone()), Some(written.clone())) } else { (None, None) };
+            assert_eq!(scope_files(&forklift), expected, "{}", name);
+        }
+
+        // Filled in place: a `.forklift` with something in it but no marker, as a franchise's claim is.
+        let target = root.join("claimed");
+        let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+        std::fs::write(forklift.join("keep"), b"").unwrap();
+        {
+            let _scope = globals::StorageRootScope::enter(&target);
+            prepare_warehouse(PrepareMode::Sparse(&scope)).unwrap();
+        }
+        assert_eq!(read_warehouse_marker(&forklift), Ok(Some(WarehouseMode::Sparse)));
+        assert_eq!(scope_files(&forklift), (Some(written.clone()), Some(written.clone())));
+
+        // Prepared again over its marker, with its fetch scope gone: the mode stands and nothing
+        // is restored, so the warehouse stays refused rather than quietly whole again.
+        std::fs::remove_file(forklift.join("config").join("fetch-scope")).unwrap();
+        {
+            let _scope = globals::StorageRootScope::enter(&target);
+            prepare_warehouse(PrepareMode::Full).unwrap();
+            assert!(crate::util::scope_utils::read_fetch_scope().unwrap_err().contains("is missing"));
+        }
+        assert_eq!(read_warehouse_marker(&forklift), Ok(Some(WarehouseMode::Sparse)));
+        assert_eq!(scope_files(&forklift), (None, Some(written)));
 
         std::fs::remove_dir_all(&root).ok();
     }

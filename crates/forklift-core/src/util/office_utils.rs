@@ -2632,7 +2632,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&dir);
-        crate::util::warehouse_utils::prepare_warehouse().unwrap();
+        crate::util::warehouse_utils::prepare_warehouse(crate::util::warehouse_utils::PrepareMode::Full).unwrap();
         (scope, dir)
     }
 

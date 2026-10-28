@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use crate::globals::{self, bay_root};
 use crate::error::{CoreError, RefusalCode};
 use crate::util::record_utils::{self, RecordError};
+use crate::util::warehouse_utils::{self, WarehouseMode};
 
 /// The bay-local file that records a bay's materialization scope (under `<bay_root>/`).
 const FILE_NAME_BAY_SCOPE: &str = "scope";
@@ -36,14 +37,6 @@ const FILE_NAME_BAY_SCOPE: &str = "scope";
 /// warehouse fetch-scope file inside it.
 const FOLDER_NAME_CONFIG: &str = "config";
 const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
-
-/// The cache-mode marker inside the configuration folder: present only in a warehouse franchised
-/// with `--cache`. It is a [`record_utils`] file of its own kind holding no entries, written once by
-/// franchise; nothing sets or clears it afterwards, so unlike a configuration value it cannot be
-/// edited into a claim the store does not back.
-const FILE_NAME_CACHE_MODE: &str = "cache-mode";
-const CACHE_MODE_RECORD: &str = "cache-mode";
-const CACHE_MODE_VERSION: u32 = 1;
 
 /// The [`record_utils`] kind and version of every non-full scope file. Format 2 put the root
 /// ignore file in every scope, refusing the unversioned files before it; format 3 escapes each
@@ -352,11 +345,16 @@ pub fn fetch_scope_path() -> PathBuf {
 /// * `path`   - The scope file.
 /// * `remedy` - The way out when the file is in the older, unversioned format.
 fn read_scope_file(path: &Path, remedy: &str) -> Result<MaterializationScope, String> {
+    Ok(read_scope_file_if_present(path, remedy)?.unwrap_or_else(MaterializationScope::full))
+}
+
+/// [`read_scope_file`], with an absent file as `None`.
+fn read_scope_file_if_present(path: &Path, remedy: &str) -> Result<Option<MaterializationScope>, String> {
     match std::fs::read(path) {
-        Ok(bytes) => MaterializationScope::from_bytes(&bytes, remedy).map_err(|reason| {
+        Ok(bytes) => MaterializationScope::from_bytes(&bytes, remedy).map(Some).map_err(|reason| {
             format!("The scope file \"{}\" {}", path.to_string_lossy(), reason)
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(MaterializationScope::full()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("Error while reading the scope file \"{}\": {}", path.to_string_lossy(), e)),
     }
 }
@@ -378,10 +376,46 @@ pub fn is_scoped() -> Result<bool, String> {
     Ok(!current_scope()?.is_full())
 }
 
-/// The warehouse fetch scope (full when unset — a full franchise; a sparse one records its
-/// fetched prefixes here).
+/// The warehouse fetch scope: full in a full or cache warehouse, and the fetched prefixes in a
+/// sparse one. The file is read against the mode the warehouse marker records, never on its own:
+/// a full or cache warehouse must hold no fetch-scope file and a sparse one a non-full one, so
+/// deleting the file cannot make a sparse warehouse read as full.
 pub fn read_fetch_scope() -> Result<MaterializationScope, String> {
-    read_scope_file(&fetch_scope_path(), REMEDY_REFRANCHISE)
+    Ok(read_fetch_state()?.1)
+}
+
+/// The warehouse's mode and its fetch scope, checked against each other (see [`read_fetch_scope`]).
+fn read_fetch_state() -> Result<(WarehouseMode, MaterializationScope), String> {
+    let mode = warehouse_utils::warehouse_mode()?;
+    let path = fetch_scope_path();
+
+    if mode != WarehouseMode::Sparse {
+        // Only a sparse warehouse is ever given a fetch scope, so one here was put in place by
+        // hand. It is refused whatever it holds rather than parsed, and deleting it is safe: the
+        // mode, not the file, says what the warehouse holds.
+        let kind = if mode == WarehouseMode::Full { "full" } else { "a cache" };
+        return match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((mode, MaterializationScope::full())),
+            Err(e) => Err(format!("Error while reading the scope file \"{}\": {}", path.to_string_lossy(), e)),
+            Ok(_) => Err(format!(
+                "The warehouse is recorded as {} but holds a fetch scope (\"{}\"), which only a sparse \
+                 warehouse has, so Forklift cannot tell what it has fetched. Delete that file: the warehouse \
+                 is {} without it.",
+                kind, path.to_string_lossy(), kind
+            )),
+        };
+    }
+
+    let missing = |found: &str| format!(
+        "The warehouse is recorded as sparse but its fetch scope (\"{}\") {}, so Forklift cannot tell \
+         what it has fetched. {}",
+        path.to_string_lossy(), found, REMEDY_REFRANCHISE
+    );
+    match read_scope_file_if_present(&path, REMEDY_REFRANCHISE)? {
+        Some(scope) if !scope.is_full() => Ok((mode, scope)),
+        Some(_) => Err(missing("names no path")),
+        None => Err(missing("is missing")),
+    }
 }
 
 /// The materialization scope of a named bay (full when the bay has no scope file). Read from
@@ -444,70 +478,58 @@ fn set_bay_scope_at(path: &std::path::Path, scope: &MaterializationScope) -> Res
     write_scope_file(path, scope)
 }
 
-/// Set the warehouse fetch scope (shared across bays). A sparse franchise records the paths it
-/// fetched here; `expand` unions new prefixes into it. A full (empty) scope means the store
-/// holds everything, so every scope-aware fetch and walk collapses to today's behavior.
+/// Replace a sparse warehouse's fetch scope (shared across bays): `expand` unions new prefixes
+/// into it and `scope-prune` drops some. Refused in a warehouse that is not sparse, and for a full
+/// scope, which no sparse warehouse may record: whether a warehouse is sparse is its mode, fixed
+/// when it was prepared ([`warehouse_utils::prepare_warehouse`] writes the first fetch scope).
 ///
 /// # Arguments
 /// * `scope` - The fetch scope to record for the warehouse.
 pub fn set_fetch_scope(scope: &MaterializationScope) -> Result<(), String> {
-    let path = fetch_scope_path();
-
-    if let Some(parent) = path.parent() {
-        crate::util::file_utils::create_folder_if_not_exists(parent)?;
+    if warehouse_utils::warehouse_mode()? != WarehouseMode::Sparse {
+        return Err("Only a sparse warehouse records a fetch scope.".to_string());
     }
 
-    write_scope_file(&path, scope)
+    if scope.is_full() {
+        return Err("A sparse warehouse's fetch scope must name at least one path.".to_string());
+    }
+
+    write_scope_file(&fetch_scope_path(), scope)
 }
 
-/// Whether the store may lack content its history names: the warehouse is sparse (its fetch scope
-/// is restricted) or a cache (franchised with `--cache`). A quick gate for the operations that need
-/// the whole store, or that must stay with the remote that holds what this one lacks: the
-/// origin-only lift guard, mirror, and serving the warehouse.
+/// Write a new sparse warehouse's first fetch scope and main-tree scope into its `.forklift`
+/// folder `forklift`, before its marker exists (`prepare_warehouse` alone). Its configuration
+/// folder must already exist.
+///
+/// # Arguments
+/// * `forklift` - The `.forklift` folder being prepared.
+/// * `scope`    - The fetch scope, which is also the main tree's. Never full.
+pub(crate) fn record_sparse_scopes(forklift: &Path, scope: &MaterializationScope) -> Result<(), String> {
+    if scope.is_full() {
+        return Err("A sparse warehouse's fetch scope must name at least one path.".to_string());
+    }
+
+    let bytes = scope.to_bytes();
+
+    for path in [forklift.join(FOLDER_NAME_CONFIG).join(FILE_NAME_FETCH_SCOPE), forklift.join(FILE_NAME_BAY_SCOPE)] {
+        crate::util::file_utils::replace_file_atomically(&path, &bytes)
+            .map_err(|e| format!("Error while recording the scope \"{}\": {}", path.to_string_lossy(), e))?;
+    }
+
+    Ok(())
+}
+
+/// Whether the store may lack content its history names: the warehouse's mode is not full (it is
+/// sparse or a cache). A quick gate for the operations that need the whole store, or that must
+/// stay with the remote that holds what this one lacks: the origin-only lift guard, mirror, and
+/// serving the warehouse. The fetch scope is checked against the mode on the way.
 pub fn content_may_be_absent() -> Result<bool, String> {
-    Ok(!read_fetch_scope()?.is_full() || is_cache_mode()?)
+    Ok(read_fetch_state()?.0 != WarehouseMode::Full)
 }
 
-/// The path of the cache-mode marker.
-pub fn cache_mode_path() -> PathBuf {
-    globals::forklift_root().join(FOLDER_NAME_CONFIG).join(FILE_NAME_CACHE_MODE)
-}
-
-/// Whether the warehouse was franchised with `--cache`: its marker is present. A marker in any
-/// other form than this build writes is refused rather than read either way.
+/// Whether the warehouse was franchised with `--cache`: its mode is cache.
 pub fn is_cache_mode() -> Result<bool, String> {
-    let path = cache_mode_path();
-
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!("Error while reading the cache-mode marker \"{}\": {}", path.to_string_lossy(), e)),
-    };
-
-    let reason = match record_utils::from_bytes(&bytes, CACHE_MODE_RECORD, CACHE_MODE_VERSION) {
-        Ok(entries) if entries.is_empty() => return Ok(true),
-        Ok(_) => "holds entries; this version of Forklift writes none.".to_string(),
-        // No Forklift ever wrote this marker without its header.
-        Err(RecordError::Unversioned) => "does not open with its format header.".to_string(),
-        Err(error) => error.describe(),
-    };
-
-    Err(format!(
-        "The cache-mode marker \"{}\" {} {}",
-        path.to_string_lossy(), reason, REMEDY_REFRANCHISE
-    ))
-}
-
-/// Mark the warehouse as a cache (franchise `--cache` only).
-pub fn set_cache_mode() -> Result<(), String> {
-    let path = cache_mode_path();
-
-    if let Some(parent) = path.parent() {
-        crate::util::file_utils::create_folder_if_not_exists(parent)?;
-    }
-
-    let bytes = record_utils::to_bytes(CACHE_MODE_RECORD, CACHE_MODE_VERSION, std::iter::empty::<&str>());
-    crate::util::file_utils::write_file_atomically(&path, &bytes)
+    Ok(read_fetch_state()?.0 == WarehouseMode::Cache)
 }
 
 /// Build a classified scope refusal (design §7.4 taxonomy) as a typed [`CoreError::Refusal`]: the
@@ -1067,6 +1089,8 @@ mod tests {
         assert_eq!(read_back, scope);
     }
 
+    use crate::util::warehouse_utils::mark_for_test;
+
     fn scratch(name: &str) -> (PathBuf, globals::StorageRootScope) {
         let root = std::env::temp_dir().join(format!("forklift-scope-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1075,53 +1099,89 @@ mod tests {
         (root, scope)
     }
 
-    /// No marker is a full warehouse; the one this build writes is a cache, and makes content
-    /// absent-able on its own (a full fetch scope); a sparse scope is absent-able without it.
+    /// The mode the marker records decides partiality, and the fetch scope is read against it.
     ///
-    /// Revert: leave the marker out of `content_may_be_absent` → red.
+    /// Revert: read `content_may_be_absent` from the fetch-scope file alone → the cache reads as
+    /// full; or read an absent marker as full → the first assertion goes green on `Ok`.
     #[test]
-    fn the_cache_mode_marker_makes_a_full_scope_warehouse_partial() {
-        let (root, _scope) = scratch("cache-mode");
+    fn the_recorded_mode_decides_whether_content_may_be_absent() {
+        let (root, _scope) = scratch("mode");
 
-        assert!(!is_cache_mode().unwrap());
+        let error = content_may_be_absent().unwrap_err();
+        assert!(error.contains("holds no warehouse marker"), "{}", error);
+
+        mark_for_test(WarehouseMode::Full);
         assert!(!content_may_be_absent().unwrap());
+        assert!(!is_cache_mode().unwrap());
+        assert!(read_fetch_scope().unwrap().is_full());
 
-        set_cache_mode().unwrap();
-        assert_eq!(std::fs::read(cache_mode_path()).unwrap(), b"/forklift-cache-mode 1\n");
+        mark_for_test(WarehouseMode::Cache);
+        assert!(content_may_be_absent().unwrap());
         assert!(is_cache_mode().unwrap());
         assert!(read_fetch_scope().unwrap().is_full());
-        assert!(content_may_be_absent().unwrap());
 
-        std::fs::remove_file(cache_mode_path()).unwrap();
+        mark_for_test(WarehouseMode::Sparse);
         set_fetch_scope(&MaterializationScope::from_prefixes(["docs"])).unwrap();
         assert!(content_may_be_absent().unwrap());
+        assert!(!is_cache_mode().unwrap());
+        assert_eq!(read_fetch_scope().unwrap(), MaterializationScope::from_prefixes(["docs"]));
 
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A marker in any other form is refused, never read as present or absent: each refusal names
-    /// the marker and the way out.
+    /// Every pairing of mode and fetch-scope file but the two a franchise writes is refused, by
+    /// every reader, naming the way out; none reads as full.
     ///
-    /// Revert: read an unreadable marker as "no marker" → red.
+    /// Revert: map a sparse warehouse's missing fetch scope to full → its row goes `Ok`; or skip
+    /// the check for a full or cache mode → the stray-file rows go `Ok`.
     #[test]
-    fn a_cache_mode_marker_in_another_form_fails_loudly() {
-        let (root, _scope) = scratch("cache-mode-bad");
+    fn a_fetch_scope_that_does_not_match_the_mode_is_refused() {
+        let (root, _scope) = scratch("mode-mismatch");
+        let path = fetch_scope_path();
+        let sparse = MaterializationScope::from_prefixes(["docs"]).to_bytes();
 
-        for (bytes, reason) in [
-            (&b"/forklift-cache-mode 2\n"[..], "version"),
-            (&b"/forklift-cache-mode 1\nentry\n"[..], "holds entries"),
-            (&b""[..], "format header"),
-            (&b"yes\n"[..], "format header"),
-            (&b"/forklift-cache-mode 1"[..], ""),
+        // A stray file in a full warehouse or a cache is refused unparsed, so a garbled one says
+        // "delete it" too.
+        for (mode, file, found, remedy) in [
+            (WarehouseMode::Sparse, None, "is missing", REMEDY_REFRANCHISE),
+            (WarehouseMode::Sparse, Some(Vec::new()), "names no path", REMEDY_REFRANCHISE),
+            (WarehouseMode::Full, Some(sparse.clone()), "holds a fetch scope", "Delete that file"),
+            (WarehouseMode::Full, Some(Vec::new()), "holds a fetch scope", "Delete that file"),
+            (WarehouseMode::Full, Some(b"not a scope file".to_vec()), "holds a fetch scope", "Delete that file"),
+            (WarehouseMode::Cache, Some(sparse.clone()), "holds a fetch scope", "Delete that file"),
         ] {
-            std::fs::write(cache_mode_path(), bytes).unwrap();
+            mark_for_test(mode);
+            match &file {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => { let _ = std::fs::remove_file(&path); }
+            }
 
-            for error in [is_cache_mode().unwrap_err(), content_may_be_absent().unwrap_err()] {
-                assert!(error.contains("cache-mode marker"), "{:?}: {}", bytes, error);
-                assert!(error.contains(reason), "{:?}: {}", bytes, error);
-                assert!(error.contains(REMEDY_REFRANCHISE), "{:?}: {}", bytes, error);
+            for error in [read_fetch_scope().unwrap_err(), content_may_be_absent().unwrap_err(), is_cache_mode().unwrap_err()] {
+                assert!(error.contains(found), "{:?} {:?}: {}", mode, file, error);
+                assert!(error.contains(remedy), "{:?} {:?}: {}", mode, file, error);
             }
         }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Only a sparse warehouse's fetch scope can be replaced, and never by a full one.
+    ///
+    /// Revert: drop either check in `set_fetch_scope` → the matching write lands.
+    #[test]
+    fn set_fetch_scope_refuses_a_warehouse_that_is_not_sparse_and_a_full_scope() {
+        let (root, _scope) = scratch("set-fetch-scope");
+        let docs = MaterializationScope::from_prefixes(["docs"]);
+
+        for mode in [WarehouseMode::Full, WarehouseMode::Cache] {
+            mark_for_test(mode);
+            assert!(set_fetch_scope(&docs).unwrap_err().contains("Only a sparse warehouse"), "{:?}", mode);
+            assert!(!fetch_scope_path().exists(), "{:?}", mode);
+        }
+
+        mark_for_test(WarehouseMode::Sparse);
+        assert!(set_fetch_scope(&MaterializationScope::full()).unwrap_err().contains("at least one path"));
+        assert!(!fetch_scope_path().exists());
 
         std::fs::remove_dir_all(&root).ok();
     }

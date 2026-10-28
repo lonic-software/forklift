@@ -1651,6 +1651,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let (start, new) = (crate::util::pallet_utils::tests::stub_parcel("a"), crate::util::pallet_utils::tests::stub_parcel("b"));
         crate::util::pallet_utils::update_pallet_head("main", None, &start, &crate::util::pallet_utils::RefPreconditions::NONE).unwrap();
@@ -1739,6 +1740,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("work")).unwrap();
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = crate::globals::StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let outside = dir.join("outside.txt");
         std::fs::write(&outside, "untouched\n").unwrap();
         let assembled = dir.join("assembled.tmp");

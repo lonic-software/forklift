@@ -130,7 +130,7 @@ impl Scratch {
             .map_err(|e| format!("Error while creating the scratch warehouse: {}", e))?;
 
         let scratch = Scratch { dir, ephemeral };
-        scratch.scoped(|| warehouse_utils::prepare_warehouse().map(|_| ()))?;
+        scratch.scoped(|| warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).map(|_| ()))?;
 
         Ok(scratch)
     }

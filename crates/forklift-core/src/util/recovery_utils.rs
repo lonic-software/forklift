@@ -3043,6 +3043,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let hash = "ab".to_string() + &"cd".repeat(31);
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
@@ -3093,6 +3094,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         let mut tree_object = LooseObjectBuilder::build_tree(&tree);
@@ -3216,6 +3218,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         plant_present_parent_with_absent_subtree_boundary();
 
@@ -3246,6 +3249,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         plant_present_parent_with_absent_subtree_boundary();
@@ -3280,6 +3284,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let vanished_head_hash = "e".repeat(64);
         pallet_utils::tests::update_pallet_head_unverified(
@@ -3314,6 +3319,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let corrupt_hash = "f".repeat(64);
         let mismatched_bytes = zstd::encode_all(
@@ -3357,6 +3363,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let absent_subtree_hash = plant_present_parent_with_absent_subtree_boundary();
 
@@ -3402,6 +3409,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         (dir, scope)
     }
 
@@ -3427,6 +3435,7 @@ mod tests {
         root.add_child(TreeItem::new("docs".to_string(), docs, DirEntryType::Tree));
         root.add_child(TreeItem::new("src".to_string(), src_object.hash.clone(), DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
         scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
@@ -3462,6 +3471,7 @@ mod tests {
 
         // `b` in scope whole (spine, then full), and `b` itself on the spine (spine, then spine).
         for prefixes in [vec!["a/x", "b"], vec!["a/x", "b/lost"]] {
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(prefixes.clone())).unwrap();
             let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
             assert_eq!(walk.hashes, [lost.clone()].into_iter().collect::<BTreeSet<String>>(),
@@ -3505,6 +3515,7 @@ mod tests {
 
         let root = meta_shaped_tree_with_a_lost_cell(&lost);
         plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
         scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
@@ -3624,6 +3635,7 @@ mod tests {
         root.add_child(TreeItem::new("FORKLI~1".to_string(), alias, DirEntryType::Tree));
         root.add_child(TreeItem::new("docs".to_string(), docs, DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
         scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
@@ -3646,6 +3658,7 @@ mod tests {
         let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         root.add_child(TreeItem::new("README".to_string(), sealed.clone(), DirEntryType::Normal));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
         scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
         std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
 
@@ -3856,6 +3869,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let chunk_hash = plant_present_recipe_with_one_chunk();
 
@@ -3885,6 +3899,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let chunk_hash = plant_present_recipe_with_one_chunk();
 
@@ -3954,6 +3969,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         const DEPTH: usize = 2_000;
         const STACK: usize = 256 * 1024;
@@ -4034,6 +4050,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let target_hash = "d".repeat(64);
 
@@ -4087,6 +4104,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let target_hash = "e".repeat(64);
@@ -4124,6 +4142,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         // Bay "b"'s `parked` file is malformed (not 64 hex chars) — `read_parked_in` errors on it.
@@ -4158,6 +4177,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         let target_hash = "f".repeat(64);
@@ -4192,6 +4212,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let target_hash = "1".repeat(64);
 
@@ -4226,6 +4247,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let target_hash = "2".repeat(64);
 
@@ -4276,6 +4298,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // Q: parentless, a trivial empty tree — the ancestry target.
         let q_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
@@ -4421,6 +4444,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let target_hash = "3".repeat(64);
 
@@ -4473,6 +4497,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -4546,6 +4571,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let never_held_hash = "5".repeat(64);
@@ -4615,6 +4641,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
 
         office_utils::write_trust_anchor(&TrustAnchor {
@@ -4676,6 +4703,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         // A key record missing its required "operator" field — present and verified as a blob,
         // but does not parse as a key record.
@@ -4797,6 +4825,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let target_hash = "c".repeat(64);
 
@@ -4918,6 +4947,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -4969,6 +4999,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -5034,6 +5065,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let mut tree_object = LooseObjectBuilder::build_tree(
             &TreeItem::new(String::new(), String::new(), DirEntryType::Tree),
@@ -5083,6 +5115,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let lost = "c".repeat(64);
         let roots = WalkRoots {
@@ -5129,6 +5162,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let mut tree_object = LooseObjectBuilder::build_tree(
             &TreeItem::new(String::new(), String::new(), DirEntryType::Tree),
@@ -5227,6 +5261,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -5320,6 +5355,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -5391,6 +5427,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -5474,6 +5511,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -5717,6 +5755,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let hash = "a".repeat(64);
@@ -5767,6 +5806,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let hash_a = "a".repeat(64);
@@ -5820,6 +5860,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let good_content = b"the genuinely correct content for this object".to_vec();
@@ -5870,6 +5911,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let good_a = b"the first genuinely correct object's content".to_vec();
@@ -5938,6 +5980,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let good_served = b"the object the remote actually has".to_vec();
@@ -6032,6 +6075,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let hash = "e".repeat(64);
@@ -6104,6 +6148,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let h_hash = "c".repeat(64);
@@ -6201,6 +6246,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let good_content = b"a perfectly good copy of H, sitting right where the fan-out path says";
@@ -6293,6 +6339,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -6383,6 +6430,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         // Candidate C: a real file sits at its own canonical fan-out path, but with its read
@@ -6467,6 +6515,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         plant_torn_taint(&forklift, &["objects/ab/cdef"]);
@@ -6541,6 +6590,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let v0 = pallet_utils::tests::stub_parcel("0");
@@ -6612,6 +6662,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
             let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
             let forklift = forklift_root();
 
             pallet_utils::tests::update_pallet_head_unverified(pallet, None, &"0".repeat(64), &pallet_utils::RefPreconditions::NONE)
@@ -6677,6 +6728,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         // Bay "b"'s `parked` file is malformed — the exact same corrupt-file shape both halves of
@@ -6753,6 +6805,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let vanished_hash = "9".repeat(64);
@@ -6798,6 +6851,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let record = mirror_utils::mirror_roots_path();
@@ -6856,6 +6910,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&dir);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
@@ -6909,6 +6964,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         // A real, still-referenced object that vanishes — the ordinary "dangling, remote-refetch-
@@ -6997,6 +7053,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         // A stray, unparseable index: no corresponding `.pack`, garbage where the magic belongs.
@@ -7065,6 +7122,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         // Pack B holds Y — a lone full record in its own pack pair. Orphaned *immediately*,
@@ -7171,6 +7229,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         crate::util::pallet_utils::create_position_if_not_exists().unwrap();
         let forklift = forklift_root();
 
@@ -7233,6 +7292,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         // A stray, unparseable index — unrelated to (and incapable of naming) anything below.
@@ -7319,6 +7379,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
         // The pack folder path is a regular file, not a directory — `read_dir` on it fails with a
@@ -7356,6 +7417,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
 
         let shards = keys.iter().map(|key| {
             let mut inventory = crate::model::inventory::Inventory::new();
@@ -7578,6 +7640,7 @@ mod tests {
         let dir = unreadable_scratch("damaged-pack-warning", Unreadable::CorruptBucket);
         let lines = {
             let _scope = StorageRootScope::enter(&dir);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
             let chunk = store_chunk(b"a chunk in a damaged pack");
             pack_as_unreadable(&chunk, Unreadable::CorruptBucket);
             pack_health_warning_lines().unwrap()
@@ -7603,6 +7666,7 @@ mod tests {
             let dir = unreadable_scratch("walk-unreadable-parcel", how);
             let failure = {
                 let _scope = StorageRootScope::enter(&dir);
+                crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
                 let target = "9".repeat(64);
                 let root_tree = store_tree(&[("x.bin", &target, DirEntryType::Normal)]);
                 let parcel = store_root_parcel(&root_tree);
@@ -7627,6 +7691,7 @@ mod tests {
             let dir = unreadable_scratch("walk-unreadable-recipe", how);
             let failure = {
                 let _scope = StorageRootScope::enter(&dir);
+                crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
                 let chunk = store_chunk(b"chunk under an unreadable recipe");
                 let recipe = store_recipe(&[(chunk.clone(), 32)]);
                 let root_tree = store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]);
@@ -7675,6 +7740,7 @@ mod tests {
             let dir = unreadable_scratch("heal-unreadable-tree", how);
             let failure = {
                 let _scope = StorageRootScope::enter(&dir);
+                crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
                 let forklift = forklift_root();
                 let vanished_hash = "9".repeat(64);
                 let web_tree = plant_target_beneath_an_unreadable_tree(how, &vanished_hash);
@@ -7729,6 +7795,7 @@ mod tests {
             let dir = unreadable_scratch("torn-unreadable-tree", how);
             let failure = {
                 let _scope = StorageRootScope::enter(&dir);
+                crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
                 let forklift = forklift_root();
                 let web_tree = plant_target_beneath_an_unreadable_tree(how, &"9".repeat(64));
                 plant_torn_taint(&forklift, &[]);

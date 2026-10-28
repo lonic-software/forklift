@@ -618,6 +618,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let _scope = crate::globals::StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let operator = Operator { identifier: "test".to_string() };
 
         let signing = resolve_signing_key(&operator).unwrap();
