@@ -511,9 +511,12 @@ async fn franchise_into_prepared_target(
     let mode = partial.prepare_mode(&fetch_scope);
     warehouse_utils::prepare_warehouse(mode)?;
 
-    if warehouse_utils::warehouse_mode()? != mode.mode() || scope_utils::read_fetch_scope()? != fetch_scope {
+    let recorded = (warehouse_utils::warehouse_mode()?, scope_utils::read_fetch_scope()?, scope_utils::read_main_tree_scope()?);
+    if recorded != (mode.mode(), fetch_scope.clone(), fetch_scope.clone()) {
         return Err(format!(
-            "\"{}\" was already prepared as a different kind of warehouse than this franchise asks for.",
+            "\"{}\" already records a warehouse other than the one this franchise asks for: a {} one \
+            fetching {} and checking out {}. Delete \"{}\" and franchise it again.",
+            attempt.directory, recorded.0.word(), describe_scope(&recorded.1), describe_scope(&recorded.2),
             attempt.directory
         ));
     }
@@ -714,6 +717,11 @@ impl Partial {
             PrepareMode::Full
         }
     }
+}
+
+/// A scope as a refusal names it: "every path" when full, else its prefixes.
+fn describe_scope(scope: &MaterializationScope) -> String {
+    if scope.is_full() { "every path".to_string() } else { scope.prefixes().join(", ") }
 }
 
 /// Record the origin of a partial franchise: the one remote that holds what it lacks. Nothing for

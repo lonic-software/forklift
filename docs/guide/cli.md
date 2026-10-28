@@ -50,8 +50,8 @@ made with `--only` or `--cache`, only part of it (`sparse` or `cache`). Nothing 
 the mode afterwards. A marker written by an older Forklift, before it recorded the
 mode, is refused: make the warehouse again, by franchising it again or by preparing a
 new one and lowering its history into it. Every command needs the marker: a
-`.forklift/` without it is no warehouse, and commands run there refuse with `not_a_warehouse` (exit 3) and a next
-step that names the folder. An empty `.forklift/` is one `prepare` can take; when it
+`.forklift/` without it is no warehouse, and commands run there refuse with
+`not_a_warehouse` (exit 3) and a next step that names the folder. An empty `.forklift/` is one `prepare` can take; when it
 sits inside another warehouse, the next step says to remove it first, so the folder
 uses that warehouse. `prepare` refuses a `.forklift/` with something in it but no
 marker, such as one made by a Forklift that did not mark warehouses yet: move it

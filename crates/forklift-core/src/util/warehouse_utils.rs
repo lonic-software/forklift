@@ -467,7 +467,7 @@ pub enum WarehouseMode {
 
 impl WarehouseMode {
     /// The mode's entry in the marker.
-    fn word(self) -> &'static str {
+    pub fn word(self) -> &'static str {
         match self {
             WarehouseMode::Full => "full",
             WarehouseMode::Sparse => "sparse",
