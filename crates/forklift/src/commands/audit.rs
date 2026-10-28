@@ -165,8 +165,8 @@ pub(crate) struct AuditScope {
     held_by_hash: usize,
 
     /// How many objects the sealed record names that are on disk all the same. That fails
-    /// nothing: a recorded object that is present is checked like any other. `heal` removes their
-    /// records. Omitted when none.
+    /// nothing: a recorded object that is present is checked like any other. `heal` removes the
+    /// records it can, and notes each one it keeps. Omitted when none.
     #[serde(skip_serializing_if = "crate::output::is_zero")]
     present_and_recorded: usize,
 
@@ -278,7 +278,7 @@ impl CommandOutput for AuditReport {
         if let Some(AuditScope { present_and_recorded: present @ 1.., .. }) = &self.scope {
             println!(
                 "{} object(s) on disk are still recorded as held by hash alone. That fails nothing, \
-                since a recorded object on disk is checked like any other wherever it is reached. Run \"forklift heal\" to remove their records.",
+                since a recorded object on disk is checked like any other wherever it is reached. Run \"forklift heal\" to remove their records; it notes each one it must keep, and why.",
                 present
             );
         }

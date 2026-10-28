@@ -63,7 +63,7 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     // A refill whose removal was lost leaves an object present and still recorded. That seals
     // nothing while it is present, but were it lost later it would read as held rather than lost.
     let mut notes = outcome.notes;
-    let unsealed = unseal_present(store_access, &mut notes);
+    let (unsealed, unseal_failed) = unseal_present(store_access, &mut notes);
 
     output::emit(&HealReport {
         was_tainted: outcome.was_tainted,
@@ -73,6 +73,7 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
         operation,
         unsealed: unsealed.removed,
         newly_held_by_hash: unsealed.pushed_down,
+        unseal_failed,
     });
 
     Ok(())
@@ -83,30 +84,28 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
 /// written over it, audit fails over it, and a torn rescan leaves its taint standing over it.
 ///
 /// # Returns
-/// What was removed and newly recorded. Each object left recorded gets a note, and so does a
-/// failure to check the store or write the record.
-fn unseal_present(store_access: &StoreAccessLock, notes: &mut Vec<String>) -> sealed_utils::Unsealed {
+/// What was removed and newly recorded, and why the removal failed if it did: a failure to check
+/// the store or write the record, after which part of what it would have written may have landed.
+/// Each object left recorded gets a note.
+fn unseal_present(
+    store_access: &StoreAccessLock,
+    notes: &mut Vec<String>,
+) -> (sealed_utils::Unsealed, Option<String>) {
     let record = match sealed_utils::read_sealed() {
         Ok(record) => record,
         Err(error) => {
             notes.push(format!("{} No object it names was checked against the store.", error));
-            return sealed_utils::Unsealed::default();
+            return (sealed_utils::Unsealed::default(), None);
         }
     };
 
-    // The recoveries above have landed by now, so a failure here is a note: an error would drop
-    // the report of what they did, and a record left in place seals nothing.
+    // The recoveries above have landed by now, so a failure here is reported rather than returned:
+    // an error would drop the report of what they did, and a record left in place seals nothing.
     let unsealed = match sealed_utils::present_recorded(&record)
         .and_then(|present| sealed_utils::unseal(store_access, &present))
     {
         Ok(unsealed) => unsealed,
-        Err(error) => {
-            notes.push(format!(
-                "The sealed-object records of objects on disk again were not removed: {} Run \"forklift \
-                heal\" again to retry.", error
-            ));
-            return sealed_utils::Unsealed::default();
-        }
+        Err(error) => return (sealed_utils::Unsealed::default(), Some(error)),
     };
 
     for (hash, reason) in &unsealed.kept {
@@ -116,7 +115,7 @@ fn unseal_present(store_access: &StoreAccessLock, notes: &mut Vec<String>) -> se
         ));
     }
 
-    unsealed
+    (unsealed, None)
 }
 
 /// The result of a `heal` run that fully resolved (or found nothing to resolve).
@@ -163,6 +162,12 @@ pub(crate) struct HealReport {
     /// removing those records left nothing beneath them unaccounted for.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     newly_held_by_hash: Vec<String>,
+
+    /// Why removing those records failed, if it did. Part of what it would have written may have
+    /// landed, so `unsealed` and `newly_held_by_hash` are then empty whatever the record holds.
+    /// Running `heal` again retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unseal_failed: Option<String>,
 }
 
 /// How `heal` settled an interrupted operation.
@@ -225,7 +230,7 @@ impl CommandOutput for HealReport {
                 }
             }
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
-            && self.notes.is_empty()
+            && self.notes.is_empty() && self.unseal_failed.is_none()
         {
             println!("Nothing to heal — no durability taint is standing.");
         }
@@ -250,6 +255,14 @@ impl CommandOutput for HealReport {
             for hash in &self.newly_held_by_hash {
                 println!("  {}", hash);
             }
+        }
+
+        if let Some(error) = &self.unseal_failed {
+            println!(
+                "The sealed-object records of objects on disk again may be only partly removed: {}",
+                error
+            );
+            println!("Run \"forklift heal\" again to retry.");
         }
 
         for note in &self.notes {

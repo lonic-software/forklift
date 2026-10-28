@@ -156,7 +156,7 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "present_and_recorded": {
-          "description": "How many objects the sealed record names that are on disk all the same. That fails\nnothing: a recorded object that is present is checked like any other. `heal` removes their\nrecords. Omitted when none.",
+          "description": "How many objects the sealed record names that are on disk all the same. That fails\nnothing: a recorded object that is present is checked like any other. `heal` removes the\nrecords it can, and notes each one it keeps. Omitted when none.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -1694,6 +1694,13 @@ A command not listed here either reports only the generic human-message shape `{
         "type": "string"
       },
       "type": "array"
+    },
+    "unseal_failed": {
+      "description": "Why removing those records failed, if it did. Part of what it would have written may have\nlanded, so `unsealed` and `newly_held_by_hash` are then empty whatever the record holds.\nRunning `heal` again retries.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "unsealed": {
       "description": "Objects on disk that the sealed-object record still named as held by hash alone (a refill\nwhose last write was lost leaves one), whose records this run removed.",

@@ -536,7 +536,8 @@ pub fn present_recorded(record: &SealedSet) -> Result<Vec<String>, String> {
 /// returns. Records first: a crash between them leaves an object present and recorded, which this
 /// repairs on the next run. Every absence the walks found is recorded, even beneath an object
 /// whose record another writer removed meanwhile: the premise is what the remote holds, and that
-/// object was recorded when it was walked. An absence a fetch has filled since is not.
+/// object was recorded when it was walked. An absence a fetch has filled since the walk is not,
+/// unless the fill lands after the last check, just before the commit.
 ///
 /// # Arguments
 /// * `_hold`  - The caller's store-access hold, shared or exclusive. It must span the whole call,
@@ -574,18 +575,22 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
         return Ok(Unsealed { kept, ..Unsealed::default() });
     }
 
+    // An absence a fetch has filled since the walk is not recorded: recorded and present, it would
+    // be the very state this repairs. Checked before the lock, so the time it is held does not grow
+    // with the push-down; a fill landing after this check seals nothing, and the next run repairs it.
+    let mut still_absent = Vec::new();
+    for hash in absent {
+        if !file_utils::raw_object_present(&hash)? {
+            still_absent.push(hash);
+        }
+    }
+
     let lock = RefLock::acquire()?;
     let mut removed = Vec::new();
     let mut pushed_down = Vec::new();
 
     append_decided_locked(&lock, |set| {
-        // An absence a fetch has filled since the walk is not recorded: recorded and present, it
-        // would be the very state this repairs.
-        for hash in absent.into_iter().filter(|hash| !set.contains(hash)) {
-            if !file_utils::raw_object_present(&hash)? {
-                pushed_down.push(hash);
-            }
-        }
+        pushed_down = still_absent.into_iter().filter(|hash| !set.contains(hash)).collect();
         removed = walked.into_iter().filter(|hash| set.contains(hash)).collect::<BTreeSet<String>>().into_iter().collect();
 
         Ok(pushed_down.iter().map(|hash| (SealOp::Record, hash.clone()))

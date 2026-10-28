@@ -909,7 +909,7 @@ parent that is present names it and the remote holds it. Audit tolerates such an
 is absent, checks nothing beneath it, and reports how many it held (`held_by_hash` under `--json`);
 a recorded object that is present is checked like any other. Audit also counts the objects
 the record still names that are on disk again (`present_and_recorded`): that fails nothing, and
-`forklift heal` removes their records. `--full` cannot re-assemble a large
+`forklift heal` removes the records it can. `--full` cannot re-assemble a large
 file one of whose chunks is held this way, so it re-reads that file's present chunks instead. A
 sealed-object record this version cannot read, or one with damage that an interrupted last write
 could not have left, fails the audit rather than being taken as empty.
@@ -2191,8 +2191,9 @@ by hash rather than as lost. Before removing an object's record, `heal` records 
 object beneath it, since the remote that held the object holds those too, so nothing the object
 held by hash is reported missing afterwards. The report lists both (`unsealed` and
 `newly_held_by_hash` under `--json`). An object whose content cannot be walked stays recorded,
-with a `Note:` line naming why; so does every object when the record cannot be read or written, and
-running `heal` again retries. A parcel keeps its record too.
+with a `Note:` line naming why; a parcel keeps its record too, and so does every object when the
+record cannot be read. A failure to write the record is reported (`unseal_failed`), and running
+`heal` again retries.
 
 #### Interrupted operations
 
