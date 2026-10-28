@@ -27,12 +27,13 @@
 //! [`append_locked`]), so a torn append is the last frame and only that: nothing after it
 //! validates, and at most the largest frame's worth of bytes, zeros included, follow the last
 //! valid frame. A valid frame anywhere past the last one read, or more bytes than that, is damage
-//! inside the log, and
-//! fails the read rather than dropping the frames behind it. Damage that leaves no valid frame
-//! after it within that many bytes of the end cannot be told from a torn append, so it reads as
-//! one: the entries there are not replayed. That is the one loss the log can hide, and it hides
-//! only entries: a lost record reads as a missing object, which every walk reports, and a lost
-//! removal leaves a present object recorded, which seals nothing.
+//! inside the log, and fails the read rather than dropping the frames behind it. Damage that
+//! leaves no valid frame after it within that many bytes of the end cannot be told from a torn
+//! append, so it reads as one: the entries there are not replayed. That is the one loss the log can
+//! hide, and it hides only entries: a lost record reads as a missing object, which every walk
+//! reports, and a lost removal leaves a present object recorded. That seals nothing while the
+//! object is present; were it lost later, it would be held by hash as it was before its refill,
+//! on the same premise that the remote holds it.
 //! A frame that validates but whose entries do not parse fails the read, as does a header naming
 //! another version: neither is guessed at.
 //!
@@ -40,7 +41,8 @@
 //!
 //! Every write takes the ref lock ([`RefLock`]) and re-reads the record under it, so writes are
 //! ordered and each one sees the last. A record that does not parse is never written over. One
-//! whose valid prefix is followed by a torn append is cut back to that prefix, then appended to.
+//! whose valid prefix is followed by a torn append is rewritten atomically to that prefix and the
+//! new frames: a reader reading the file in pieces must never see a new frame after old torn bytes.
 //! The first write creates the record atomically, so its header is never torn. Compaction
 //! ([`compact`]) rewrites the log as the set it replays to, which drops no recorded hash. The
 //! atomic writes are never staged by a bulk store session (they go through
@@ -132,7 +134,7 @@ impl SealedSet {
 }
 
 /// A parsed record: its replayed set, and how many leading bytes are the header and valid frames.
-/// A writer that finds bytes past `valid_len` cuts the file back to that prefix before appending.
+/// A writer that finds bytes past `valid_len` rewrites the file to that prefix and its new frames.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedSealed {
     pub set: SealedSet,
@@ -342,9 +344,11 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///
 /// The record is re-read under the lock first. A record that does not parse is left as it is. With
 /// no record yet, it is created holding `ops`, atomically. When a torn append follows the valid
-/// frames, the record is cut back to them and synced. Then the frames are appended, each synced
-/// before the next is written, so a torn append can only ever be the last frame. Every way, `ops` are on disk when this returns —
-/// unless fsync is turned off, when a crash may leave the record damaged.
+/// frames, the record is rewritten atomically to them and `ops`, which drops the torn bytes, and a
+/// reader that read the old file in pieces never sees new frames after them. Otherwise the frames
+/// are appended, each synced before the next is written, so a torn append can only ever be the
+/// last frame. Every way, `ops` are on disk when this returns, unless fsync is turned off, when a
+/// crash may leave the record damaged.
 ///
 /// # Arguments
 /// * `_lock` - The held ref lock, which orders this write against every other.
@@ -362,9 +366,13 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
     let path = sealed_path();
     let existing = read_record(&path)?;
 
-    // Only the lengths are kept: the bytes are not needed past the parse.
-    let (lengths, mut set) = match existing {
-        Some((bytes, parsed)) => (Some((bytes.len(), parsed.valid_len)), parsed.set),
+    // The bytes are kept only when a torn append follows the valid prefix, to rewrite it.
+    let (torn_prefix, mut set) = match existing {
+        Some((mut bytes, parsed)) => {
+            let torn = parsed.valid_len < bytes.len();
+            bytes.truncate(parsed.valid_len);
+            (Some(torn.then_some(bytes)), parsed.set)
+        }
         None => (None, SealedSet::default()),
     };
 
@@ -376,8 +384,12 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
         return Ok(set);
     }
 
-    match lengths {
-        Some((len, valid_len)) => append_frames(&path, len, valid_len, &frames)?,
+    match torn_prefix {
+        Some(None) => append_frames(&path, &frames)?,
+        Some(Some(mut prefix)) => {
+            prefix.extend(frames.concat());
+            file_utils::replace_file_atomically(&path, &prefix)?;
+        }
         None => {
             let mut created = header_bytes();
             created.extend(frames.concat());
@@ -388,10 +400,8 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
     Ok(set)
 }
 
-/// Append `frames` to the record at `path`, `len` bytes long, after cutting it back to its first
-/// `valid_len` bytes when a torn append follows them, syncing the cut and each frame before the
-/// next write.
-fn append_frames(path: &Path, len: usize, valid_len: usize, frames: &[Vec<u8>]) -> Result<(), String> {
+/// Append `frames` to the end of the record at `path`, syncing each before writing the next.
+fn append_frames(path: &Path, frames: &[Vec<u8>]) -> Result<(), String> {
     let failed = |e: std::io::Error| format!(
         "Error while appending to the sealed-object record \"{}\": {}",
         path.to_string_lossy(),
@@ -399,16 +409,9 @@ fn append_frames(path: &Path, len: usize, valid_len: usize, frames: &[Vec<u8>]) 
     );
 
     // A write handle that is not an append-only one: Windows flushes only a handle opened for
-    // writing. The ref lock keeps every other writer out, so the length read stays the length.
+    // writing. The ref lock keeps every other writer out, so the end found here stays the end.
     let mut file = std::fs::OpenOptions::new().write(true).open(path).map_err(failed)?;
-
-    if valid_len < len {
-        file.set_len(valid_len as u64).map_err(failed)?;
-        if file_utils::fsync_enabled() {
-            file.sync_all().map_err(failed)?;
-        }
-    }
-    file.seek(std::io::SeekFrom::Start(valid_len as u64)).map_err(failed)?;
+    file.seek(std::io::SeekFrom::End(0)).map_err(failed)?;
 
     for frame in frames {
         file.write_all(frame).map_err(failed)?;

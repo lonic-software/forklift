@@ -239,8 +239,8 @@ fn the_sealed_object_record_is_written_through_an_open_session() {
     sealed_utils::compact().unwrap();
     sealed_utils::append(&[(SealOp::Record, a)]).unwrap();
 
-    // Dropped unfinished: anything it had staged is discarded, and nothing was.
-    drop(session);
+    // Finished: a compaction it had staged would land now, over the append made after it.
+    session.finish().unwrap();
     let set = sealed_utils::read_sealed().unwrap();
     assert!(set.contains(a) && set.contains(b), "the compaction and the appends around it all stand");
 
