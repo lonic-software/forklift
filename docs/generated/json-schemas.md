@@ -1651,6 +1651,28 @@ A command not listed here either reports only the generic human-message shape `{
         "pallet"
       ],
       "type": "object"
+    },
+    "RecordRebuilt": {
+      "description": "What `heal` dropped from a damaged sealed-object record.",
+      "properties": {
+        "at": {
+          "description": "The byte the damage started at. Everything before it was kept.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped_bytes": {
+          "description": "How many bytes from there on were dropped: the damage and any records after it.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "at",
+        "dropped_bytes"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1680,6 +1702,24 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ],
       "description": "The operation this run settled: one interrupted in this bay before it finished, which every\ncommand that changes the bay or commits staged content refused over until now."
+    },
+    "record_rebuild_failed": {
+      "description": "Why rebuilding a damaged sealed-object record failed, if it did. A rewrite that failed\nafter its rename has still landed. Running `heal` again retries.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "record_rebuilt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RecordRebuilt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What this run dropped from a damaged sealed-object record, which it rebuilt as the part\nbefore the damage. An object whose record was dropped reads as missing if it is absent."
     },
     "resolved": {
       "description": "Recorded paths (or hashes) resolved without a rewrite: proven absent and unreferenced by\nthe closure walk, or a vanished inventory shard (a staging concern, never an object-trust\none — see `notes`).",
