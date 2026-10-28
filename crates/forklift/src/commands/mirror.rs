@@ -144,11 +144,11 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
         Err(why) => return Some(PalletMirror::new(pallet, MirrorStatus::Failed, why)),
     };
 
-    match scope_utils::is_scoped().and_then(|scoped| Ok(scoped || scope_utils::is_warehouse_sparse()?)) {
+    match scope_utils::is_scoped().and_then(|scoped| Ok(scoped || scope_utils::content_may_be_absent()?)) {
         Ok(false) => {}
         Ok(true) => return Some(PalletMirror::new(pallet, MirrorStatus::Skipped,
-            "The mirror needs every file of the pallet, and this bay or warehouse holds only part of \
-            each tree. Run \"forklift mirror\" from a full workspace.".to_string())),
+            "The mirror needs every file of the pallet, and this bay or warehouse may hold only \
+            part of it. Run \"forklift mirror\" from a full workspace.".to_string())),
         Err(why) => return Some(PalletMirror::new(pallet, MirrorStatus::Failed, why)),
     }
 
@@ -187,20 +187,21 @@ async fn mirror_trust(client: &RemoteClient, info: &forklift_core::model::remote
     TakeTrust::local()
 }
 
-/// Refuse a view that holds only part of each tree: a scoped bay, or a warehouse whose fetch
-/// scope is path-pruned. An export of a partial tree would be a different commit.
+/// Refuse a view that may hold only part of each tree: a scoped bay, or a partial warehouse (its
+/// fetch scope path-pruned, or franchised with `--cache`). An export of a partial tree would be a
+/// different commit.
 fn refuse_partial_view() -> Result<(), CoreError> {
     crate::commands::scope::refuse_in_scoped_bay(
         "mirror",
         "Run \"forklift mirror\" from a full workspace (or the main tree), not a scoped bay.",
     )?;
 
-    if scope_utils::is_warehouse_sparse()? {
+    if scope_utils::content_may_be_absent()? {
         return Err(CoreError::refusal(
             RefusalCode::SparseWorkspace,
-            "\"mirror\" needs every file of each mirrored pallet, and this warehouse fetched only \
-            part of each tree.",
-            "Run \"forklift mirror\" from a full franchise of the warehouse.",
+            "\"mirror\" needs every file of each mirrored pallet, and this warehouse was franchised \
+            with --only or --cache, so it may lack some of them.",
+            "Run \"forklift mirror\" from a franchise made without --only or --cache.",
         ));
     }
 

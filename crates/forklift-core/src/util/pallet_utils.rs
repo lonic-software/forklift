@@ -3,6 +3,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::scope_utils::MaterializationScope;
+use crate::util::sealed_utils::SealedSet;
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -1131,7 +1132,9 @@ impl VerifiedClosure {
 /// the store-access lock shared, which every deleter needs exclusively. The fetch scope can change
 /// in between, though (an `expand` in another bay commits a widened one under the lock), so the
 /// hold re-reads it, and when it is no longer the scope verified against, the hold is released and
-/// the closure verified again at the new one.
+/// the closure verified again at the new one. A verification that held an absence by the
+/// sealed-by-hash record has the hold re-read the record the same way, since its writers commit
+/// under the lock too.
 ///
 /// A creation's tombstone check works the same way: whether `new` descends from the tombstone's
 /// head is walked before the lock, and the hold re-reads the tombstone, starting over when it
@@ -1149,16 +1152,19 @@ fn update_pallet_head_checked(
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
 
+    // The fetch scope the closure was verified at, and the sealed-by-hash record when an absence
+    // it holds let the head pass.
     let mut verified_at = match closure_to_verify(namespace, expected, new) {
         false => None,
         true => {
             let scope = crate::util::scope_utils::read_fetch_scope()?;
 
-            if !verified.is_some_and(|verified| verified.head == new && verified.scope == scope) {
-                verify_new_head(name, expected, new, &scope)?;
-            }
+            let leaned_on = match verified.is_some_and(|verified| verified.head == new && verified.scope == scope) {
+                true => None,
+                false => verify_new_head(name, expected, new, &scope)?,
+            };
 
-            Some(scope)
+            Some((scope, leaned_on))
         }
     };
 
@@ -1212,13 +1218,20 @@ fn update_pallet_head_checked(
             });
         }
 
-        if let Some(scope) = &verified_at {
+        if let Some((scope, leaned_on)) = &verified_at {
             let current = crate::util::scope_utils::read_fetch_scope()?;
 
-            if &current != scope {
+            // A record the verification leaned on is read again too: a refill or a repair may
+            // have dropped the entry that held an absence.
+            let record_moved = match leaned_on {
+                Some(record) => &crate::util::sealed_utils::read_sealed()? != record,
+                None => false,
+            };
+
+            if &current != scope || record_moved {
                 drop(lock);
-                verify_new_head(name, expected, new, &current)?;
-                verified_at = Some(current);
+                let leaned_on = verify_new_head(name, expected, new, &current)?;
+                verified_at = Some((current, leaned_on));
                 continue;
             }
         }
@@ -1315,22 +1328,47 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 /// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
 /// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
 ///
+/// An absent object the sealed-by-hash record holds is tolerated. The record is read only when
+/// the walk without it fails, so a warehouse holding the whole closure never depends on it.
+///
+/// # Returns
+/// * `Ok(None)`         - Everything is present.
+/// * `Ok(Some(record))` - Everything is present or held by `record`, which the walk leaned on.
+///
 /// [`audit_utils::verify_ref_head_closure`]: crate::util::audit_utils::verify_ref_head_closure
 fn verify_new_head(name: &str,
                    expected: Option<&str>,
                    new: &str,
-                   scope: &MaterializationScope) -> Result<(), RefUpdateError> {
+                   scope: &MaterializationScope) -> Result<Option<SealedSet>, RefUpdateError> {
     let heads: Vec<String> = all_pallet_refs()?.into_iter()
         .filter(|(pallet, _)| pallet.namespace == PalletNamespace::User)
         .map(|(_, head)| head)
         .collect();
 
-    crate::util::audit_utils::verify_ref_head_closure(new, &heads, expected, scope)
-        .map_err(|missing| RefUpdateError::Incomplete {
-            pallet: name.to_string(),
-            head: new.to_string(),
-            missing,
-        })
+    let verify = |sealed| crate::util::audit_utils::verify_ref_head_closure(new, &heads, expected, scope, sealed);
+    let incomplete = |missing| RefUpdateError::Incomplete {
+        pallet: name.to_string(),
+        head: new.to_string(),
+        missing,
+    };
+
+    let Err(missing) = verify(None) else {
+        return Ok(None);
+    };
+
+    let record = crate::util::sealed_utils::read_sealed().map_err(|error| RefUpdateError::Failed(format!(
+        "Cannot tell whether the history of {} is complete: {}, and the record of objects held by \
+        hash cannot be read. {}",
+        &new[..new.len().min(12)], missing.trim_end_matches('.'), error
+    )))?;
+
+    if record.is_empty() {
+        return Err(incomplete(missing));
+    }
+
+    verify(Some(&record)).map_err(incomplete)?;
+
+    Ok(Some(record))
 }
 
 /// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
@@ -2118,6 +2156,100 @@ pub(crate) mod tests {
             })));
 
             assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        /// Record `hash` as held by hash alone.
+        fn record(hash: &str) {
+            crate::util::sealed_utils::append(&[(crate::util::sealed_utils::SealOp::Record, hash)]).unwrap();
+        }
+
+        // Revert: pass no record to the closure check → the write is refused over the recorded
+        // absence.
+        #[test]
+        fn a_head_whose_root_tree_is_recorded_and_absent_is_accepted() {
+            let (_root, _scope) = scratch("closure-recorded");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let root_tree = two_dirs("a1", "b1");
+            let head = parcel(&root_tree, &[&base]);
+            record(&root_tree);
+            remove(&root_tree);
+
+            write("main", Some(&base), &head).unwrap();
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+        }
+
+        // Revert: tolerate any absence once a record exists → the write lands over a root no
+        // entry names.
+        #[test]
+        fn a_head_whose_root_tree_is_absent_and_unrecorded_is_refused() {
+            let (_root, _scope) = scratch("closure-unrecorded");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let root_tree = two_dirs("a1", "b1");
+            let head = parcel(&root_tree, &[&base]);
+            // A record that names something else: the gate reads it and still refuses.
+            record(&blob("elsewhere"));
+            remove(&root_tree);
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: let a recorded hash seal its closure whether or not it is present → the write
+        // lands over the missing blob under the present recorded tree.
+        #[test]
+        fn a_present_recorded_tree_with_a_missing_child_is_refused() {
+            let (_root, _scope) = scratch("closure-present-recorded");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let root_tree = two_dirs("a1", "b1");
+            let head = parcel(&root_tree, &[&base]);
+            record(&root_tree);
+            remove(&blob("b1"));
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: never re-read the record inside the hold → the write lands over a root tree
+        // the record stopped naming.
+        #[test]
+        fn a_record_entry_removed_between_the_check_and_the_hold_is_checked_again() {
+            let (_root, _scope) = scratch("closure-record-moved");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let root_tree = two_dirs("a1", "b1");
+            let head = parcel(&root_tree, &[&base]);
+            record(&root_tree);
+            remove(&root_tree);
+
+            let removed = root_tree.clone();
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                crate::util::sealed_utils::append(&[(crate::util::sealed_utils::SealOp::Remove, removed.as_str())]).unwrap();
+            })));
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
+        // Revert: read the record before the strict check → the complete head is refused over a
+        // record it never needed; or degrade an unreadable record to empty → the incomplete head
+        // is refused as `Incomplete`, hiding that the record could not be read.
+        #[test]
+        fn an_unreadable_record_blocks_only_a_head_that_needs_it() {
+            let (_root, _scope) = scratch("closure-record-unreadable");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            std::fs::write(crate::util::sealed_utils::sealed_path(), b"not a record").unwrap();
+
+            let complete = parcel(&two_dirs("a1", "b1"), &[&base]);
+            write("main", Some(&base), &complete).unwrap();
+
+            let root_tree = two_dirs("a2", "b2");
+            let head = parcel(&root_tree, &[&complete]);
+            remove(&root_tree);
+
+            let result = write("main", Some(&complete), &head);
+            assert!(matches!(&result, Err(RefUpdateError::Failed(message)) if message.contains("cannot be read")), "{:?}", result);
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(complete.as_str()));
         }
 
         // Revert: re-verify a head the caller verified → the write refuses although it was told

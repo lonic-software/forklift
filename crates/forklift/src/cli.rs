@@ -339,6 +339,21 @@ pub enum Command {
         )]
         only: Vec<String>,
 
+        /// Franchise as a bounded cache (in progress: hidden until it fetches less).
+        // Hidden while the cache fetch is unbuilt: today it fetches everything, as a full franchise
+        // does, and only marks the warehouse a cache, which treats it as partial (never served,
+        // lifts only to its origin, no mirror or expand).
+        #[arg(
+            long = "cache",
+            hide = true,
+            conflicts_with = "only",
+            long_help = "Franchise as a bounded cache: mark the warehouse as one that may lack \
+                         content its history reaches. It is then treated as partial: a server \
+                         never serves it, it lifts only to the remote it was franchised from, \
+                         and \"mirror\" and \"expand\" refuse. Cannot be combined with --only."
+        )]
+        cache: bool,
+
         /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
         #[arg(
             long = "expect",

@@ -72,19 +72,19 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         report.verified_parcels = verified;
         report.legacy_parcels = legacy;
 
-        // A sparse warehouse holds only its in-scope content, so signatures alone cannot speak
-        // for what is on disk. Prove the fetched content present and re-hashed (sealing the rest
+        // A partial warehouse (sparse, or a cache) may lack content its history reaches, so
+        // signatures alone cannot speak for what is on disk. Prove the fetched content present and re-hashed (sealing the rest
         // by the hash a signed parcel commits), and report the boundary so a sparse pass can
         // never read as a full-clone pass. A full store keeps today's signature-only audit
         // unchanged — unless `--full` is asked, which re-reads every present chunk and re-verifies
         // each chunked file's content hash even on a full clone. Object presence is a warehouse
-        // property, so the fetch scope is the seam either way. Whenever the content audit runs, it
+        // property, so the fetch scope and the cache-mode marker are the seam either way. Whenever the content audit runs, it
         // counts and reports what the sealed record held by hash alone; a signature-only pass makes
         // no content claim, so it has nothing of that kind to report.
         let fetch_scope = scope_utils::read_fetch_scope()?;
         let is_sparse = !fetch_scope.is_full();
 
-        if is_sparse || full {
+        if is_sparse || full || scope_utils::is_cache_mode()? {
             let record = sealed_utils::read_sealed()?;
             let sealed = SealedTolerance::new(&record);
             audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full, Some(&sealed))?;

@@ -105,12 +105,13 @@ impl WarehouseHandle {
     /// removal there leaves a tombstone, which a client that freed its copy of a head this server
     /// listed relies on.
     ///
-    /// A sparse root (one franchised with `--only`) is refused for good. Clients treat a served
-    /// head as proof that the server holds its whole closure: scope-prune frees local copies of
-    /// what the remote heads reach, so a sparse root would let a client free content the server
-    /// cannot serve back. Checking once, here, is enough because a full root never turns sparse:
-    /// of the fetch-scope writers, franchise sets it as it creates the warehouse, `expand` never
-    /// widens one to full, and scope-prune only narrows one that is already sparse.
+    /// A root that may lack content (one franchised with `--only` or `--cache`) is refused for
+    /// good. Clients treat a served head as proof that the server holds its whole closure:
+    /// scope-prune frees local copies of what the remote heads reach, so such a root would let a
+    /// client free content the server cannot serve back. Checking once, here, is enough because a
+    /// full root never turns into one: of the fetch-scope writers, franchise sets it as it creates
+    /// the warehouse, `expand` never widens one to full, and scope-prune only narrows one that is
+    /// already sparse; the cache-mode marker is written by franchise alone.
     fn serving(root: PathBuf, wait: bool) -> Result<WarehouseHandle, ServingRefusal> {
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
@@ -122,10 +123,10 @@ impl WarehouseHandle {
 
             let _scope = StorageRootScope::enter(&root);
 
-            // Before the locks, so a sparse root under a running scope-prune is told it is sparse,
+            // Before the locks, so a sparse root under a running scope-prune is told it is partial,
             // not busy.
-            if scope_utils::is_warehouse_sparse().map_err(ServingRefusal::Unreadable)? {
-                return Err(ServingRefusal::Sparse);
+            if scope_utils::content_may_be_absent().map_err(ServingRefusal::Unreadable)? {
+                return Err(ServingRefusal::Partial);
             }
 
             let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
@@ -156,11 +157,12 @@ enum ServingRefusal {
     /// It holds a franchise that has not finished: it is resumed or deleted first.
     Unfinished(String),
 
-    /// Its fetch scope could not be read, or its served mark could not be read or written.
+    /// Its fetch scope or cache-mode marker could not be read, or its served mark could not be
+    /// read or written.
     Unreadable(String),
 
-    /// It is sparse, and is never served.
-    Sparse,
+    /// It is sparse or a cache, so it may lack content, and is never served.
+    Partial,
 }
 
 impl ServingRefusal {
@@ -170,11 +172,11 @@ impl ServingRefusal {
             ServingRefusal::Busy(reason)
             | ServingRefusal::Unfinished(reason)
             | ServingRefusal::Unreadable(reason) => reason,
-            ServingRefusal::Sparse => format!(
-                "{} is a sparse warehouse: it was franchised with --only, so it does not hold \
-                every path its pallets reach. A client trusts a server to hold the whole history \
+            ServingRefusal::Partial => format!(
+                "{} is a partial warehouse: it was franchised with --only or --cache, so it may \
+                lack content its pallets reach. A client trusts a server to hold the whole history \
                 it serves, and could free local copies this one cannot send back. Serve a full \
-                warehouse instead: franchise the remote again without --only.",
+                warehouse instead: franchise the remote again without --only or --cache.",
                 name
             ),
         }
@@ -1717,9 +1719,9 @@ fn resolve_warehouse(state: &AppState,
                 ),
             ),
             ServingRefusal::Unreadable(reason) => internal(reason),
-            ServingRefusal::Sparse => (
+            ServingRefusal::Partial => (
                 StatusCode::CONFLICT,
-                ServingRefusal::Sparse.message(&format!("Warehouse \"{}\"", id)),
+                ServingRefusal::Partial.message(&format!("Warehouse \"{}\"", id)),
             ),
         })?
     );
@@ -4724,8 +4726,8 @@ mod tests {
 
         let refused = resolve_warehouse(&state, &warehouse_params("sparse")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
-        assert!(refused.1.starts_with("Warehouse \"sparse\" is a sparse warehouse"), "{}", refused.1);
-        assert!(refused.1.contains("without --only"), "{}", refused.1);
+        assert!(refused.1.starts_with("Warehouse \"sparse\" is a partial warehouse"), "{}", refused.1);
+        assert!(refused.1.contains("without --only or --cache"), "{}", refused.1);
         assert!(!serve_lock_exists(&base, "sparse"), "a refused warehouse keeps no serve lock");
 
         drop(resolve_warehouse(&state, &warehouse_params("full")).unwrap());
@@ -4735,14 +4737,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The single-root path gets the same refusal from the same funnel, and a fetch scope that cannot
-    /// be read is refused rather than read as full.
+    /// The single-root path gets the same refusal from the same funnel, for a sparse root and a
+    /// cache, and a fetch scope or cache-mode marker that cannot be read is refused rather than read
+    /// as full.
     ///
     /// Revert: drop the sparse check from `serving` → the sparse root is served → red. Revert:
-    /// read an unreadable fetch scope as full (`unwrap_or(false)`) → the garbled root is served →
-    /// red.
+    /// leave the marker out of `content_may_be_absent` → the cache root is served → red. Revert:
+    /// read an unreadable fetch scope or marker as full (`unwrap_or(false)`) → the garbled root or
+    /// the cache is served → red.
     #[test]
-    fn serving_refuses_a_sparse_root_and_an_unreadable_fetch_scope() {
+    fn serving_refuses_a_partial_root_and_an_unreadable_scope_or_marker() {
         let base = scratch_dir("sparse-single");
 
         let full = base.join("full");
@@ -4753,9 +4757,27 @@ mod tests {
         mark_warehouse(&sparse);
         make_sparse(&sparse);
         let refused = WarehouseHandle::serving(sparse.clone(), false).err().expect("a sparse root is refused");
-        assert!(matches!(refused, ServingRefusal::Sparse), "{:?}", refused);
+        assert!(matches!(refused, ServingRefusal::Partial), "{:?}", refused);
         let message = refused.message("\"/srv/wh\"");
-        assert!(message.starts_with("\"/srv/wh\" is a sparse warehouse"), "{}", message);
+        assert!(message.starts_with("\"/srv/wh\" is a partial warehouse"), "{}", message);
+
+        // A cache holds its full fetch scope, so only its marker says it may lack content.
+        let cache = base.join("cache");
+        mark_warehouse(&cache);
+        {
+            let _scope = StorageRootScope::enter(&cache);
+            scope_utils::set_cache_mode().unwrap();
+        }
+        let refused = WarehouseHandle::serving(cache.clone(), false).err().expect("a cache root is refused");
+        assert!(matches!(refused, ServingRefusal::Partial), "{:?}", refused);
+
+        // A marker this build cannot read is refused rather than read as absent.
+        {
+            let _scope = StorageRootScope::enter(&cache);
+            std::fs::write(scope_utils::cache_mode_path(), b"/forklift-cache-mode 2\n").unwrap();
+        }
+        let refused = WarehouseHandle::serving(cache, false).err().expect("an unreadable marker is refused");
+        assert!(matches!(refused, ServingRefusal::Unreadable(_)), "{:?}", refused);
 
         let garbled = base.join("garbled");
         mark_warehouse(&garbled);

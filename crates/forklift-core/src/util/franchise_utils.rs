@@ -155,6 +155,9 @@ pub struct Request {
 
     /// The `--only` prefixes, as normalized keys; empty for a full franchise.
     pub only: Vec<String>,
+
+    /// Whether `--cache` was asked for.
+    pub cache: bool,
 }
 
 /// The last failure an attempt recorded.
@@ -272,6 +275,7 @@ impl FranchiseRecord {
                 "token" => token = Some(value),
                 "pallet" => request.pallet = Some(value),
                 "only" => request.only.push(value),
+                "cache" => request.cache = parse_cache(&value).ok_or_else(|| malformed("cache"))?,
                 "genesis" => genesis = Some(value),
                 "bundle" => bundle = Some(match value.as_str() {
                     "none" | "partial" | "imported" => value,
@@ -288,6 +292,7 @@ impl FranchiseRecord {
                 "census" => start_census = Some(value.parse::<u64>().map_err(|_| malformed("census"))?),
                 "failure.pallet" => failure_request.pallet = Some(value),
                 "failure.only" => failure_request.only.push(value),
+                "failure.cache" => failure_request.cache = parse_cache(&value).ok_or_else(|| malformed("failure.cache"))?,
                 "failure.phase" => failure_phase = Some(Phase::parse(&value).ok_or_else(|| malformed("failure.phase"))?),
                 "failure.cause" => failure_cause = Some(value),
                 "failure.retry" => failure_retry = Some(Retry::parse(&value).ok_or_else(|| malformed("failure.retry"))?),
@@ -334,6 +339,15 @@ fn push_request(entries: &mut Vec<String>, prefix: &str, request: &Request) {
     for only in &request.only {
         entries.push(format!("{}only={}", prefix, only));
     }
+
+    if request.cache {
+        entries.push(format!("{}cache=true", prefix));
+    }
+}
+
+/// A recorded `cache` entry: written only when set, so `true` is its one value.
+fn parse_cache(value: &str) -> Option<bool> {
+    (value == "true").then_some(true)
 }
 
 /// Why the record could not be read.
@@ -853,6 +867,10 @@ pub fn resume_command(url: &str, directory: &str, request: &Request) -> String {
         command.push_str(&format!(" --only {}", quote(only)));
     }
 
+    if request.cache {
+        command.push_str(" --cache");
+    }
+
     command
 }
 
@@ -1010,13 +1028,13 @@ mod tests {
         FranchiseRecord {
             url: "http://example.com:9418".to_string(),
             token: Some("se=cret\nline".to_string()),
-            request: Request { pallet: Some("main".to_string()), only: vec!["docs".to_string(), "src/a b".to_string()] },
+            request: Request { pallet: Some("main".to_string()), only: vec!["docs".to_string(), "src/a b".to_string()], cache: false },
             genesis: Some("abc".to_string()),
             bundle: BundleState::Imported,
             attempt: Attempt::Failed,
             start_census: 42,
             last_failure: Some(Failure {
-                request: Request { pallet: None, only: vec!["docs".to_string()] },
+                request: Request { pallet: None, only: Vec::new(), cache: true },
                 phase: Phase::Fetch,
                 cause_code: "error".to_string(),
                 retry: Retry::Unknown,
@@ -1033,6 +1051,24 @@ mod tests {
             token: None, genesis: None, request: Request::default(), last_failure: None, ..record()
         };
         assert_eq!(FranchiseRecord::from_bytes(&bare.to_bytes()), Ok(bare));
+
+        let cache = FranchiseRecord { request: Request { cache: true, ..Request::default() }, ..record() };
+        assert_eq!(FranchiseRecord::from_bytes(&cache.to_bytes()), Ok(cache));
+    }
+
+    /// `cache` is written only when set, so any value but `true` is a torn record, never a
+    /// franchise without `--cache`.
+    ///
+    /// Revert: read any `cache` value as false → red.
+    #[test]
+    fn a_cache_entry_other_than_true_is_torn() {
+        let text = String::from_utf8(record().to_bytes()).unwrap();
+        assert!(text.contains("failure.cache=true\n"), "{}", text);
+
+        for torn in [text.replacen("failure.cache=true\n", "failure.cache=false\n", 1),
+                     text.replacen("failure.cache=true\n", "failure.cache=\n", 1)] {
+            assert!(matches!(FranchiseRecord::from_bytes(torn.as_bytes()), Err(MarkerError::Torn(_))), "{}", torn);
+        }
     }
 
     /// Each bundle state round-trips, a kept download with a tag that holds quotes and the
@@ -1302,11 +1338,14 @@ mod tests {
 
     #[test]
     fn the_resume_command_quotes_what_a_shell_would_split() {
-        let request = Request { pallet: Some("it's".to_string()), only: vec!["a b".to_string(), "docs".to_string()] };
+        let request = Request { pallet: Some("it's".to_string()), only: vec!["a b".to_string(), "docs".to_string()], cache: false };
         assert_eq!(
             resume_command("http://h:1", "/tmp/my dir", &request),
             "forklift franchise http://h:1 '/tmp/my dir' --pallet 'it'\\''s' --only 'a b' --only docs"
         );
+
+        let request = Request { cache: true, ..Request::default() };
+        assert_eq!(resume_command("http://h:1", "d", &request), "forklift franchise http://h:1 d --cache");
     }
 
     #[test]

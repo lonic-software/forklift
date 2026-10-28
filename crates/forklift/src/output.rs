@@ -623,7 +623,7 @@ impl ErrorCode {
             ErrorCode::OutOfScopeConflict =>
                 "A scoped bay merge hit an out-of-scope entry changed on both sides",
             ErrorCode::NonOriginLift =>
-                "A sparse workspace tried to lift to a remote other than its origin",
+                "A partial (--only or --cache) warehouse tried to lift to a remote other than its origin",
             ErrorCode::NarrowUnclean =>
                 "\"narrow\" would delete a subtree that still holds uncommitted work",
             ErrorCode::ScopePruneBlocked =>

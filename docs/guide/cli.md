@@ -197,7 +197,8 @@ and the office, which first catches up with the remote's as a `lower` takes it; 
 against the anchor the remote serves, which a mirror never installs. A head that does not
 verify is that pallet's failure (`history_unverified`), and a changed, stripped or diverged
 trust refuses the run as it would a `lower`. Refuses
-in a scoped bay or a sparse franchise, which hold only part of each tree. Two runs never share
+in a scoped bay or a franchise made with `--only` or `--cache`, which may hold only part of
+each tree. Two runs never share
 the mirror: a run that finds another in progress reports it busy and stops.
 
 If `mirror` reports that `.forklift/mirror.git` holds something it did not write, delete that
@@ -1640,11 +1641,12 @@ fast-forwards, or reports `diverged` if you moved too. A bay another bay left be
 its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this auto-merge alike:
 `shift` to the pallet to catch up.
 
-**Origin-only lift from a sparse workspace.** A sparse (`franchise --only`) warehouse only
-ever proved its out-of-scope content present on the remote it fetched from — its origin. Lifting
-to a *different* remote could fail late at that remote's closure check, so `lift` refuses up
-front with the `non_origin_lift` code, naming the origin. Point `remote.url` back at the origin,
-or run a full (unscoped) franchise against the new remote. A full warehouse holds the whole
+**Origin-only lift from a partial warehouse.** A sparse (`franchise --only`) or cache
+(`franchise --cache`) warehouse only ever proved the content it does not hold present on the
+remote it was franchised from — its origin. Lifting to a *different* remote could fail late at
+that remote's closure check, so `lift` refuses up front with the `non_origin_lift` code, naming
+the origin. Point `remote.url` back at the origin, or franchise the new remote without `--only`
+or `--cache`. A full warehouse holds the whole
 closure and can lift anywhere.
 
 **Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch

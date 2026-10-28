@@ -210,19 +210,19 @@ fn with_drop_hint(error: String, info: &forklift_core::model::remote::WarehouseI
     ))
 }
 
-/// Refuse a lift from a sparse workspace to a remote other than the one it fetched against.
-/// A sparse warehouse only ever proved its out-of-scope closure present on its origin; a
-/// different remote may lack objects it never verified there, so the lift's closure check would
-/// fail late and confusingly. Refusing up front, with the origin named, is the clearer failure.
-/// A no-op for a full (non-sparse) warehouse, which holds the whole closure and can lift
-/// anywhere, and for a sparse warehouse still pointed at its origin.
+/// Refuse a lift from a partial warehouse (franchised with `--only` or `--cache`) to a remote
+/// other than the one it fetched against. A partial warehouse only ever proved the closure it
+/// does not hold present on its origin; a different remote may lack objects it never verified
+/// there, so the lift's closure check would fail late and confusingly. Refusing up front, with
+/// the origin named, is the clearer failure. A no-op for a full warehouse, which holds the whole
+/// closure and can lift anywhere, and for a partial warehouse still pointed at its origin.
 fn ensure_origin_remote() -> Result<(), CoreError> {
-    if !scope_utils::is_warehouse_sparse()? {
+    if !scope_utils::content_may_be_absent()? {
         return Ok(());
     }
 
     let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
-        // A sparse warehouse with no recorded origin predates this guard; leave it to the remote's
+        // A partial warehouse with no recorded origin predates this guard; leave it to the remote's
         // closure check rather than invent an origin.
         return Ok(());
     };

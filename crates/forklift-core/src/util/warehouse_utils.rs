@@ -1180,7 +1180,7 @@ mod tests {
         let record = franchise_utils::FranchiseRecord {
             url: "http://example.com:9418".to_string(),
             token: None,
-            request: franchise_utils::Request { pallet: None, only: Vec::new() },
+            request: franchise_utils::Request::default(),
             genesis: None,
             bundle: franchise_utils::BundleState::None,
             attempt: franchise_utils::Attempt::Running,
