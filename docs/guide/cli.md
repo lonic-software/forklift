@@ -1428,9 +1428,17 @@ forklift scope                                              # show the current s
 
 A **scoped bay** materializes and operates on only the subtree(s) you name, instead of the
 whole working tree — handy for a large monorepo, or to hand an agent exactly the corner it
-should touch. In this release the object store still holds **everything** (the sparseness is
-materialization-only), so a scoped bay is a local view over a full warehouse; nothing changes
-on the remote and nothing is fetched differently.
+should touch. Scoping a bay changes only what it materializes: nothing changes on the remote
+and nothing is fetched differently, so in a full warehouse a scoped bay is a local view over a
+store that holds everything. In a sparse (`franchise --only`) warehouse every checkout is
+scoped within the fetch scope, so `bay add` without `--scope` is refused there, before any bay
+is made.
+
+Every bay records its scope, an unscoped one's included, in `.forklift/bays/<name>/scope`. A
+bay whose scope file is gone is refused by the commands that read it rather than read as
+unscoped; the way out is to remove the bay and add a new one under another name. A sparse
+warehouse's main tree records its scope the same way, and a full warehouse's main tree has
+none: a scope file put there is refused, and deleting it is the way out.
 
 Inside a scoped bay:
 
@@ -1486,8 +1494,8 @@ materialization scope with `narrow`.
 
 A scope recorded by a Forklift older than the one that put the ignore file in every
 scope is refused by every command that reads it. For a sparse warehouse, franchise the
-remote again, into a new directory; for a scoped bay, remove the bay and add it again
-with `bay add --scope`. The same holds for a scope file whose format header names no
+remote again, into a new directory; for a scoped bay, remove the bay and add a new one
+under another name. The same holds for a scope file whose format header names no
 prefix.
 
 ---
@@ -1659,8 +1667,10 @@ its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this aut
 remote it was franchised from — its origin. Lifting to a *different* remote could fail late at
 that remote's closure check, so `lift` refuses up front with the `non_origin_lift` code, naming
 the origin. Point `remote.url` back at the origin, or franchise the new remote without `--only`
-or `--cache`. A full warehouse holds the whole
-closure and can lift anywhere.
+or `--cache`. A partial warehouse whose origin is not recorded (`remote.origin`, which an
+interrupted franchise may not have written, or which was unset) is refused with the same code:
+franchise again, or record the origin with `forklift config remote.origin <url>`. A full
+warehouse holds the whole closure and can lift anywhere.
 
 **Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch
 (tens of thousands of distinct objects — realistic for a single maximal chunked file, or simply a

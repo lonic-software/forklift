@@ -114,9 +114,10 @@ pub enum ScopeClass {
 /// A bay's (or the warehouse's) materialization scope: a set of in-scope path prefixes.
 ///
 /// An empty set means **full scope** — no restriction, so [`classify`](Self::classify)
-/// returns [`ScopeClass::InScope`] for every path. This is what makes a scoped bay opt-in:
-/// a plain bay (or the main tree) has no scope file, reads back as full, and every
-/// scope-aware code path collapses to today's behavior unchanged.
+/// returns [`ScopeClass::InScope`] for every path, and every scope-aware code path collapses to
+/// the unscoped behavior. A full scope is recorded as the empty file; whether a scope file may be
+/// absent is decided by whose it is ([`read_fetch_scope`], [`read_main_tree_scope`],
+/// [`read_bay_scope`]), never by reading an absence as full.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationScope {
     /// Normalized in-scope prefixes: warehouse path keys (no leading/trailing slash, `/`
