@@ -444,20 +444,14 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
 ///
 /// # Returns
 /// * `Ok(Some(Rebuilt))` - The record was damaged and now holds what it held before the damage.
-/// * `Ok(None)`          - There is no record, or it is not damaged.
-/// * `Err(String)`       - If the record cannot be read or the rewrite fails. A rewrite that fails
-///                         after its rename has still replaced the record, so the message says
-///                         what the rewrite drops.
+/// * `Ok(None)`          - There is no record, it is not damaged, or it cannot be read (which the
+///                         record's readers report, as [`rebuild`] leaves them to).
+/// * `Err(String)`       - If the rewrite fails. A rewrite that fails after its rename has still
+///                         replaced the record, so the message says what the rewrite drops.
 fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
     let path = sealed_path();
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!(
-            "Error while reading the sealed-object record \"{}\": {}",
-            path.to_string_lossy(),
-            e
-        )),
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(None);
     };
 
     let Err(Unparsed::Damaged { valid_len, .. }) = parse_classified(&bytes) else {

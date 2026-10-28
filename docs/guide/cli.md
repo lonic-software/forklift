@@ -2194,8 +2194,8 @@ is dropped, intact records after it included, since their order against what the
 unknown: an absent object whose record was among them reads as missing afterwards. A record
 missing its header is rebuilt empty. A record in another version, or one whose first problem is an
 intact entry this version cannot read, is never rewritten; the note names the way out. A rebuild
-that fails stops `heal` before it does anything else, and its message says what the rewrite drops,
-since it may have landed; running `heal` again retries. A record that cannot be read at all is not
+that fails stops `heal` before it does anything else; when the rewrite itself fails, the message
+says what it drops, since it may have landed. Running `heal` again retries. A record that cannot be read at all is not
 known to be damaged, so `heal` carries on and notes it.
 
 Once nothing is left to resolve, `heal` also removes from the sealed-object record every object
