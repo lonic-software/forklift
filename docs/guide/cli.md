@@ -1542,6 +1542,7 @@ forklift franchise <url> <dir> --pallet main --token <secret>
 forklift franchise <url> <dir> --only src/api            # sparse: fetch one subtree
 forklift franchise <url> <dir> --only src/api --only docs # several subtrees
 forklift franchise <url> <dir> --expect <genesis>          # pin the remote's trust anchor
+forklift franchise <url> <dir> --cache                     # a cache (see below)
 ```
 
 Prepares a fresh warehouse in the target directory, remembers the remote, adopts
@@ -1602,6 +1603,12 @@ remote's whole-store bundle is skipped. History, `audit`, `blame` and `diff` on 
 all work; office and every meta pallet are always fetched in full, so a sparse franchise of a
 trusted warehouse still audits offline exactly as a full clone does. Widen later with `expand`.
 A sparse franchise records its origin — see the origin-only lift rule under `lift`.
+
+**Cache franchise (`--cache`).** Marks the warehouse as a cache: one that may lack content its
+history reaches, whose remote holds the rest. It is treated as partial everywhere a sparse
+franchise is: it skips the bundle, records its origin, is never served, and `mirror` and
+`expand` refuse; `audit` checks the content it holds. It cannot be combined with `--only`. A
+cache does not yet fetch less than a full franchise: that is still being built.
 
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`
 tips the same densify suggestion `import-git` does: those packs are the far end's own bulk

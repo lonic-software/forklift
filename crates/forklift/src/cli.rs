@@ -307,7 +307,8 @@ pub enum Command {
                       the history (using the remote's bundle when it has one) and materialize the \
                       chosen pallet in the working directory. With --only, franchise sparsely: \
                       fetch the full signed history but only the named subtree(s) of content, \
-                      leaving the rest sealed by hash."
+                      leaving the rest sealed by hash. With --cache, mark the warehouse as a \
+                      cache, which may lack content its history reaches."
     )]
     Franchise {
         /// The URL of the remote warehouse (e.g. http://forklift.example.com:9418)
@@ -339,18 +340,16 @@ pub enum Command {
         )]
         only: Vec<String>,
 
-        /// Franchise as a bounded cache (in progress: hidden until it fetches less).
-        // Hidden while the cache fetch is unbuilt: today it fetches everything, as a full franchise
-        // does, and only marks the warehouse a cache, which treats it as partial (never served,
-        // lifts only to its origin, no mirror or expand).
+        /// Franchise as a cache: a warehouse that may lack content its history reaches
         #[arg(
             long = "cache",
-            hide = true,
             conflicts_with = "only",
-            long_help = "Franchise as a bounded cache: mark the warehouse as one that may lack \
-                         content its history reaches. It is then treated as partial: a server \
-                         never serves it, it lifts only to the remote it was franchised from, \
-                         and \"mirror\" and \"expand\" refuse. Cannot be combined with --only."
+            long_help = "Franchise as a cache: mark the warehouse as one that may lack content its \
+                         history reaches. It is then treated as partial: a server never serves \
+                         it, it lifts only to the remote it was franchised from, \"mirror\" and \
+                         \"expand\" refuse, and \"audit\" checks the content it holds. The \
+                         remote's bundle is skipped. Fetching less is not built yet: today the \
+                         whole history is still fetched. Cannot be combined with --only."
         )]
         cache: bool,
 

@@ -795,7 +795,7 @@ mod tests {
             r#""token":{"repeat":{"arg":"--token","max":1,"secret":true},"#,
             r#""description":"The bearer token, when the remote requires one (remembered as \"remote.token\")"}"#,
         )), "{franchise}");
-        assert!(franchise.contains(r#""run":"franchise {pallet} {token} {only} {expect} -- {url} {directory}""#), "{franchise}");
+        assert!(franchise.contains(r#""run":"franchise {pallet} {token} {only} {cache} {expect} -- {url} {directory}""#), "{franchise}");
 
         let office = json("office");
         assert!(office.contains(r#""category":"office""#) && office.contains(r#""params":{}"#), "{office}");
