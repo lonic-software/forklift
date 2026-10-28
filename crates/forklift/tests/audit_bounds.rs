@@ -1139,3 +1139,142 @@ fn an_unreadable_record_fails_the_audit() {
         assert!(err.contains("sealed-object record") && err.contains("format"), "{}", err);
     });
 }
+
+/// Write `bytes` as this warehouse's record: the record of `kept` followed by damage that an
+/// interrupted write cannot leave (more garbage than one frame) and an intact frame recording
+/// `lost`. Returns the record's bytes and where the damage starts.
+fn plant_damaged_record(warehouse: &Warehouse, kept: &str, lost: &str) -> (Vec<u8>, usize) {
+    let mut bytes = sealed_utils::header_bytes();
+    bytes.extend(sealed_utils::encode_frame(SealOp::Record, kept).unwrap());
+    let at = bytes.len();
+    bytes.extend(std::iter::repeat_n(0xabu8, 40_000));
+    bytes.extend(sealed_utils::encode_frame(SealOp::Record, lost).unwrap());
+    std::fs::write(warehouse.root.join(".forklift").join("sealed"), &bytes).unwrap();
+
+    (bytes, at)
+}
+
+/// FORK-309: a damaged record fails the audit with `heal` as its next step, and running that step
+/// from the damaged state rebuilds the record from the part before the damage, reports what it
+/// dropped, and the audit passes again with what the kept part holds by hash. A record past the
+/// damage is dropped, so its absent object now reads as missing. Mutations: heal skips the rebuild
+/// → the second audit still fails → red; the rebuild keeps the intact frame past the damage → the
+/// third audit passes → red.
+#[test]
+fn a_damaged_record_names_heal_and_heal_rebuilds_it() {
+    let warehouse = Warehouse::new("sealed-damaged-heal");
+    let head = warehouse.stack_files(&[("a.txt", "a\n"), ("b.txt", "b\n")], "K");
+
+    let (a, b) = warehouse.scoped(|| (file_hash(&head, "a.txt"), file_hash(&head, "b.txt")));
+    warehouse.delete_object(&a);
+    let (bytes, at) = plant_damaged_record(&warehouse, &a, &b);
+
+    let failed = warehouse.run(&["audit", "--full"]);
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success() && stderr.contains("damaged") && stderr.contains("Run \"forklift heal\""),
+        "{}", stderr);
+
+    let healed: serde_json::Value = serde_json::from_slice(&warehouse.run_ok(&["heal", "--json"]).stdout).unwrap();
+    assert_eq!(healed["data"]["record_rebuilt"], serde_json::json!({ "at": at, "dropped_bytes": bytes.len() - at }),
+        "{}", healed);
+    assert_eq!(std::fs::read(warehouse.root.join(".forklift").join("sealed")).unwrap(), bytes[..at].to_vec());
+
+    let scope: serde_json::Value = serde_json::from_slice(&warehouse.run_ok(&["audit", "--full", "--json"]).stdout).unwrap();
+    assert_eq!(scope["data"]["scope"]["held_by_hash"], 1, "{}", scope);
+
+    // The dropped record held `b` by hash: absent now, it is missing rather than held.
+    warehouse.delete_object(&b);
+    assert!(!warehouse.run(&["audit", "--full"]).status.success(), "b's record was dropped with the damage");
+
+    let human = warehouse.run_ok(&["heal"]);
+    assert!(!String::from_utf8_lossy(&human.stdout).contains("rebuilt"), "a sound record is not rebuilt again");
+}
+
+/// The rebuild runs before the taint's recovery, and a run that then refuses still says what it
+/// dropped, in the refusal's message. Mutation: drop the rebuild from the refusal → red.
+#[test]
+fn a_refusing_heal_still_reports_the_rebuild() {
+    let warehouse = Warehouse::new("sealed-damaged-refusal");
+    let head = warehouse.stack_files(&[("a.txt", "a\n"), ("c.txt", "c\n")], "K");
+
+    let (a, c) = warehouse.scoped(|| (file_hash(&head, "a.txt"), file_hash(&head, "c.txt")));
+    let (bytes, at) = plant_damaged_record(&warehouse, &a, &c);
+    // A referenced object that vanished under a taint: heal cannot clear it, so it refuses.
+    warehouse.delete_object(&c);
+    let taint = forklift_core::util::taint_utils::taint_dir_path_under(&warehouse.root);
+    std::fs::create_dir_all(&taint).unwrap();
+    let relative = format!("objects/{}/{}", &c[..2], &c[2..]);
+    std::fs::write(taint.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(&[&relative])).unwrap();
+
+    let refused = warehouse.run(&["heal", "--json"]);
+    assert_eq!(refused.status.code(), Some(21));
+    let value: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("damaged at byte {}", at)) && message.contains("is rebuilt from the part before it"),
+        "{}", message);
+    assert_eq!(std::fs::read(warehouse.root.join(".forklift").join("sealed")).unwrap(), bytes[..at].to_vec());
+}
+
+/// A record in another version is never rebuilt: heal leaves it byte for byte and notes it, naming
+/// that version as the way to read it.
+#[test]
+fn heal_never_rebuilds_a_record_in_another_version() {
+    let warehouse = Warehouse::new("sealed-other-version");
+    warehouse.stack_files(&[("a.txt", "a\n")], "K");
+    let path = warehouse.root.join(".forklift").join("sealed");
+    std::fs::write(&path, b"/forklift-sealed 99\n").unwrap();
+
+    let healed: serde_json::Value = serde_json::from_slice(&warehouse.run_ok(&["heal", "--json"]).stdout).unwrap();
+    assert!(healed["data"].get("record_rebuilt").is_none(), "{}", healed);
+    let notes = healed["data"]["notes"].to_string();
+    assert!(notes.contains("Use the version of Forklift that wrote it"), "{}", notes);
+    assert_eq!(std::fs::read(&path).unwrap(), b"/forklift-sealed 99\n");
+}
+
+/// A damaged record that cannot be rebuilt stops heal with its cause and the retry, said once:
+/// nothing after it runs to tell the user to run heal from inside heal. The ref lock is made
+/// unopenable by a folder in its place. Mutation: carry on past the failure → red.
+#[test]
+fn a_failed_rebuild_stops_heal() {
+    let warehouse = Warehouse::new("sealed-rebuild-failed");
+    warehouse.stack_files(&[("a.txt", "a\n")], "K");
+    let (bytes, _) = plant_damaged_record(&warehouse, &"a".repeat(64), &"b".repeat(64));
+    let lock = warehouse.root.join(".forklift").join("refs.lock");
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir(&lock).unwrap();
+
+    let failed = warehouse.run(&["heal"]);
+    std::fs::remove_dir(&lock).unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+
+    assert!(!failed.status.success(), "{}", stderr);
+    assert!(stderr.contains("Nothing else was healed"), "{}", stderr);
+    assert_eq!(stderr.matches("sealed-object record").count(), 1, "{}", stderr);
+    assert_eq!(std::fs::read(warehouse.root.join(".forklift").join("sealed")).unwrap(), bytes);
+}
+
+/// A record that cannot be read at all is not known to be damaged, so heal carries on past it
+/// (the only way out of a durability taint must not be blocked by it) and notes it once.
+/// Mutation: stop heal on a failed read → red.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_record_does_not_stop_heal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = Warehouse::new("sealed-unreadable-heal");
+    warehouse.stack_files(&[("a.txt", "a\n")], "K");
+    let path = warehouse.root.join(".forklift").join("sealed");
+    std::fs::write(&path, sealed_utils::header_bytes()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        // Running as root: nothing is unreadable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+
+    let healed = warehouse.run_ok(&["heal", "--json"]);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let healed: serde_json::Value = serde_json::from_slice(&healed.stdout).unwrap();
+
+    assert_eq!(healed["data"]["notes"].to_string().matches("sealed-object record").count(), 1, "{}", healed);
+}

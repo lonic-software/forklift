@@ -912,7 +912,9 @@ the record still names that are on disk again (`present_and_recorded`): that fai
 `forklift heal` removes the records it can. `--full` cannot re-assemble a large
 file one of whose chunks is held this way, so it re-reads that file's present chunks instead. A
 sealed-object record this version cannot read, or one with damage that an interrupted last write
-could not have left, fails the audit rather than being taken as empty.
+could not have left, fails the audit rather than being taken as empty. The failure names the way
+out: for damage, `forklift heal`, which rebuilds the record (see `heal`); for a record in another
+version, that version of Forklift.
 
 **Run `--full` periodically as your own scrub against bit-rot.** Every `lift`/push used to
 incidentally re-presence-check a pushed pallet's whole tree, chunked files included; a large
@@ -2183,6 +2185,18 @@ the file to move aside. This appears even when `heal` still has to refuse — as
 clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
 index the refusal itself names (see the bullet above) is part of its cause; the time one coincides
 with a refusal is exactly when an operator most needs to be told about it.
+
+Before anything else, `heal` rebuilds a damaged sealed-object record (one whose damage an
+interrupted last write could not have left, which a crash with fsync turned off can) as the part
+before the damage, and reports where the damage started and how many bytes it dropped
+(`record_rebuilt` under `--json`; a refusal's message says it too). Everything from the damage on
+is dropped, intact records after it included, since their order against what the damage hid is
+unknown: an absent object whose record was among them reads as missing afterwards. A record
+missing its header is rebuilt empty. A record in another version, or one whose first problem is an
+intact entry this version cannot read, is never rewritten; the note names the way out. A rebuild
+that fails stops `heal` before it does anything else; when the rewrite itself fails, the message
+says what it drops, since it may have landed. Running `heal` again retries. A record that cannot be read at all is not
+known to be damaged, so `heal` carries on and notes it.
 
 Once nothing is left to resolve, `heal` also removes from the sealed-object record every object
 that is on disk again, such as one fetched back by a refill whose own removal was interrupted. An

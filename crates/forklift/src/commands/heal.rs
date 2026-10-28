@@ -4,7 +4,8 @@ use forklift_core::util::operation_utils::{self, RecoveryOutcome};
 use forklift_core::util::{recovery_utils, sealed_utils};
 use crate::output::{self, CommandOutput};
 
-/// Handle the `heal` command: run the durability-taint recovery verb
+/// Handle the `heal` command: rebuild a damaged sealed-object record from the part before the
+/// damage (`forklift_core::util::sealed_utils::rebuild`), run the durability-taint recovery verb
 /// (`forklift_core::util::recovery_utils::run`), then settle an operation interrupted in this
 /// bay before it finished, if one is recorded (`forklift_core::util::operation_utils::recover`),
 /// then clear the sealed-object record of every object the store holds again
@@ -24,8 +25,21 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())`      - Nothing was tainted, or the taint is now fully cleared.
-/// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference).
+/// * `Err(String)` - A `durability_taint` refusal (torn, or an unresolved dangling reference), or
+///                   the sealed-object record is damaged and could not be rebuilt, which stops
+///                   the run before anything else.
 pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String> {
+    // First, so the taint's rescan below tells what the record holds by hash from what is lost. The
+    // rebuild writes only the record, which no recovery reads through the taint. A damaged record
+    // it could not rebuild stops the run, since everything after it would read the damage. One
+    // that cannot be read at all does not: the readers below degrade around it and say so.
+    let record_rebuilt = sealed_utils::rebuild()
+        .map_err(|error| format!(
+            "{}{} Nothing else was healed: once that is fixed, run \"forklift heal\" again.",
+            error, if error.ends_with('.') { "" } else { "." },
+        ))?
+        .map(RecordRebuilt::from);
+
     // A torn taint's rescan (§8.3) can take a while on a large or uncompacted store — it reports
     // per-phase/per-count progress through this callback rather than staying silent. `human!` is
     // itself a no-op under `--json` (progress is never part of the result document), and
@@ -35,7 +49,10 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
         Err(error) => {
             // An interrupted operation waits for the taint (below), so the refusal says so: it
             // is not the only thing left standing.
-            let error = String::from(error);
+            let mut error = String::from(error);
+            if let Some(rebuilt) = &record_rebuilt {
+                error = forklift_core::error::append_to_message(error, &rebuilt.sentence());
+            }
             return Err(match operation_utils::read() {
                 Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
                     "An interrupted {} also stands in this bay; heal finishes or undoes it once the \
@@ -47,7 +64,11 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     };
 
     // After the taint: an operation's recovery reads and writes the store the taint vouches for.
-    let operation = operation_utils::recover()?.map(|recovery| OperationRecovery {
+    let recovered = operation_utils::recover().map_err(|error| match &record_rebuilt {
+        Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
+        None => error,
+    })?;
+    let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
         outcome: match recovery.outcome {
             RecoveryOutcome::Finished => OperationOutcome::Finished,
@@ -66,6 +87,7 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     let (unsealed, unseal_failed) = unseal_present(store_access, &mut notes);
 
     output::emit(&HealReport {
+        record_rebuilt,
         was_tainted: outcome.was_tainted,
         restaged: outcome.restaged,
         resolved: outcome.resolved,
@@ -80,8 +102,8 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
 }
 
 /// Remove the sealed-object record of every object the store holds, pushing each one's coverage
-/// down first. A record that cannot be read is noted rather than failing the run: nothing is
-/// written over it, audit fails over it, and a torn rescan leaves its taint standing over it.
+/// down first. A record that cannot be read is noted rather than failing the run: audit fails over
+/// it, and a torn rescan leaves its taint standing over it.
 ///
 /// # Returns
 /// What was removed and newly recorded, and why the removal failed if it did: a failure to check
@@ -122,6 +144,11 @@ fn unseal_present(
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct HealReport {
+    /// What this run dropped from a damaged sealed-object record, which it rebuilt as the part
+    /// before the damage. An object whose record was dropped reads as missing if it is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_rebuilt: Option<RecordRebuilt>,
+
     /// Whether a durability taint was actually standing (an already-healthy warehouse reports
     /// `false`, with `restaged` and `resolved` empty).
     was_tainted: bool,
@@ -170,6 +197,34 @@ pub(crate) struct HealReport {
     unseal_failed: Option<String>,
 }
 
+/// What `heal` dropped from a damaged sealed-object record.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RecordRebuilt {
+    /// The byte the damage started at. Everything before it was kept.
+    at: usize,
+
+    /// How many bytes from there on were dropped: the damage and any records after it.
+    dropped_bytes: usize,
+}
+
+impl From<sealed_utils::Rebuilt> for RecordRebuilt {
+    fn from(rebuilt: sealed_utils::Rebuilt) -> Self {
+        RecordRebuilt { at: rebuilt.at, dropped_bytes: rebuilt.dropped_bytes }
+    }
+}
+
+impl RecordRebuilt {
+    fn sentence(&self) -> String {
+        format!(
+            "The sealed-object record was damaged at byte {} and is rebuilt from the part before it: \
+            the {} byte(s) from there on are dropped. An absent object whose record was among them now \
+            reads as missing.",
+            self.at, self.dropped_bytes
+        )
+    }
+}
+
 /// How `heal` settled an interrupted operation.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
@@ -213,6 +268,10 @@ pub(crate) struct OperationRecovery {
 
 impl CommandOutput for HealReport {
     fn render_human(&self) {
+        if let Some(rebuilt) = &self.record_rebuilt {
+            println!("{}", rebuilt.sentence());
+        }
+
         if let Some(operation) = &self.operation {
             operation.render_human();
         }
@@ -230,7 +289,7 @@ impl CommandOutput for HealReport {
                 }
             }
         } else if self.operation.is_none() && self.unsealed.is_empty() && self.newly_held_by_hash.is_empty()
-            && self.notes.is_empty() && self.unseal_failed.is_none()
+            && self.notes.is_empty() && self.unseal_failed.is_none() && self.record_rebuilt.is_none()
         {
             println!("Nothing to heal — no durability taint is standing.");
         }

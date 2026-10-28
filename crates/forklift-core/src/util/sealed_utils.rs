@@ -29,7 +29,8 @@
 //! damaged rather than torn), so a torn append is the last frame and only that: nothing after it
 //! validates, and at most the largest frame's worth of bytes, zeros included, follow the last
 //! valid frame. A valid frame anywhere past the last one read, or more bytes than that, is damage
-//! inside the log, and fails the read rather than dropping the frames behind it. Damage that
+//! inside the log, and fails the read rather than dropping the frames behind it (until `heal`
+//! rebuilds the record, see Writing). Damage that
 //! leaves no valid frame after it within that many bytes of the end cannot be told from a torn
 //! append, so it reads as one: the entries there are not replayed. That is the one loss the log can
 //! hide, and it hides only entries: a lost record reads as a missing object, which every walk
@@ -42,8 +43,11 @@
 //! ## Writing
 //!
 //! Every write takes the ref lock ([`RefLock`]) and re-reads the record under it, so writes are
-//! ordered and each one sees the last. A record that does not parse is never written over. One
-//! whose valid prefix is followed by a torn append is rewritten atomically to that prefix and the
+//! ordered and each one sees the last. A record that does not parse is never written over, except
+//! that `heal` rebuilds a damaged one ([`rebuild`]) as its header and the frames before the
+//! damage. A header naming another version, or a valid frame whose entries do not parse, is not
+//! damage (an intact frame is not what damage leaves), and a record whose first problem is either
+//! is never rewritten; one that follows damage is dropped with everything else past it. One whose valid prefix is followed by a torn append is rewritten atomically to that prefix and the
 //! new frames: a reader reading the file in pieces must never see a new frame after old torn bytes.
 //! The first write creates the record atomically, so its header is never torn. Compaction
 //! ([`compact`]) rewrites the log as the set it replays to, which drops no recorded hash. The
@@ -253,6 +257,32 @@ fn is_entries_len(length: usize) -> bool {
     length > 0 && length.is_multiple_of(ENTRY_LEN) && length / ENTRY_LEN <= MAX_FRAME_ENTRIES
 }
 
+/// Why a record's bytes do not parse.
+#[derive(Debug, PartialEq, Eq)]
+enum Unparsed {
+    /// Damage: the header is missing, or what follows the valid frames is not what an interrupted
+    /// write leaves. A write with fsync off, a failed sync followed by a later append, or stale
+    /// blocks after a crash can leave it. The first `valid_len` bytes are the header and the frames
+    /// before the damage (none when the header is missing), which [`rebuild`] rewrites the record to.
+    Damaged { reason: String, valid_len: usize },
+
+    /// A header naming another version: that version wrote the record. Never rewritten.
+    OtherVersion(String),
+
+    /// A frame whose CRC holds over entries this version's header does not define, before any
+    /// damage. An intact frame is not what damage leaves, and no version is named to read it, so
+    /// the record is never rewritten.
+    Unreadable(String),
+}
+
+impl Unparsed {
+    fn reason(&self) -> &str {
+        match self {
+            Unparsed::Damaged { reason, .. } | Unparsed::OtherVersion(reason) | Unparsed::Unreadable(reason) => reason,
+        }
+    }
+}
+
 /// Parse a record's bytes (see the module doc comment for the format).
 ///
 /// # Returns
@@ -262,18 +292,26 @@ fn is_entries_len(length: usize) -> bool {
 ///                        what follows the last valid frame is not a torn append: more than one
 ///                        frame's worth of bytes, or a valid frame among them. Phrased to follow "The record ".
 pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
+    parse_classified(bytes).map_err(|unparsed| unparsed.reason().to_string())
+}
+
+/// [`parse`], telling damage, which [`rebuild`] repairs, from what this version does not read.
+fn parse_classified(bytes: &[u8]) -> Result<ParsedSealed, Unparsed> {
     let header = header_bytes();
 
     if !bytes.starts_with(&header) {
         let tag = format!("/forklift-{} ", SEALED_RECORD);
         let first = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
         return Err(if first.starts_with(tag.as_bytes()) {
-            format!(
+            Unparsed::OtherVersion(format!(
                 "is in a format this version of Forklift does not know (\"{}\").",
                 String::from_utf8_lossy(first)
-            )
+            ))
         } else {
-            "does not open with its header, so it is not a sealed-object record.".to_string()
+            Unparsed::Damaged {
+                reason: "does not open with its header, so it is not a sealed-object record.".to_string(),
+                valid_len: 0,
+            }
         });
     }
 
@@ -281,13 +319,13 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
     let mut offset = header.len();
 
     while let Some((entries, frame_len)) = read_frame(&bytes[offset..]) {
-        let unreadable = |at: usize| format!(
+        let unreadable = |at: usize| Unparsed::Unreadable(format!(
             "holds an entry at byte {} that this version of Forklift cannot read.",
             at
-        );
+        ));
 
         if !is_entries_len(entries.len()) {
-            return Err(format!("holds a frame at byte {} of a size no frame has.", offset));
+            return Err(Unparsed::Unreadable(format!("holds a frame at byte {} of a size no frame has.", offset)));
         }
 
         for (index, entry) in entries.chunks(ENTRY_LEN).enumerate() {
@@ -301,10 +339,13 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedSealed, String> {
     // A torn append leaves at most one frame's bytes, zeros the filesystem extended the file with
     // included. Anything longer is not a torn tail: the frames behind it would be lost.
     if !is_torn_tail(&bytes[offset..]) {
-        return Err(format!(
-            "is damaged at byte {}: what follows it is not what an interrupted write leaves.",
-            offset
-        ));
+        return Err(Unparsed::Damaged {
+            reason: format!(
+                "is damaged at byte {}: what follows it is not what an interrupted write leaves.",
+                offset
+            ),
+            valid_len: offset,
+        });
     }
 
     Ok(ParsedSealed { set, valid_len: offset })
@@ -332,9 +373,24 @@ pub fn read_sealed() -> Result<SealedSet, String> {
 /// * `Err(String)`               - If the record cannot be read or parsed.
 fn read_record(path: &Path) -> Result<Option<(Vec<u8>, ParsedSealed)>, String> {
     match std::fs::read(path) {
-        Ok(bytes) => parse(&bytes)
-            .map(|parsed| Some((bytes, parsed)))
-            .map_err(|reason| format!("The sealed-object record \"{}\" {}", path.to_string_lossy(), reason)),
+        Ok(bytes) => match parse_classified(&bytes) {
+            Ok(parsed) => Ok(Some((bytes, parsed))),
+            Err(unparsed) => Err(format!(
+                "The sealed-object record \"{}\" {} {}",
+                path.to_string_lossy(),
+                unparsed.reason(),
+                match unparsed {
+                    Unparsed::Damaged { valid_len: 0, .. } => "Run \"forklift heal\", which rebuilds it empty: \
+                        every record in it is dropped, and an absent object it held by hash then reads as missing.",
+                    Unparsed::Damaged { .. } => "Run \"forklift heal\", which rebuilds it from the part before the \
+                        damage and reports what it drops.",
+                    Unparsed::OtherVersion(_) => "Use the version of Forklift that wrote it: this one never \
+                        writes over it.",
+                    Unparsed::Unreadable(_) => "Nothing rebuilds an intact frame this version cannot read: \
+                        restore the record from a good copy.",
+                }
+            )),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!(
             "Error while reading the sealed-object record \"{}\": {}",
@@ -342,6 +398,77 @@ fn read_record(path: &Path) -> Result<Option<(Vec<u8>, ParsedSealed)>, String> {
             e
         )),
     }
+}
+
+/// What [`rebuild`] dropped from a damaged record.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// The byte the damage starts at: everything before it was kept.
+    pub at: usize,
+
+    /// How many bytes from there on were dropped.
+    pub dropped_bytes: usize,
+}
+
+/// [`rebuild_locked`] under a ref lock it takes and releases, taken only when a read without it
+/// finds the record damaged: a sound record, the usual case, waits on no writer. A record that
+/// cannot be read at all is not known to be damaged, so it is left to the readers after this,
+/// each of which says what it could not read.
+///
+/// # Returns
+/// * `Ok(Some(Rebuilt))` - The record was damaged and now holds what it held before the damage.
+/// * `Ok(None)`          - There is no record, it is not damaged, or it cannot be read.
+/// * `Err(String)`       - The record is damaged and could not be rebuilt.
+pub fn rebuild() -> Result<Option<Rebuilt>, String> {
+    let Ok(bytes) = std::fs::read(sealed_path()) else {
+        return Ok(None);
+    };
+    if !matches!(parse_classified(&bytes), Err(Unparsed::Damaged { .. })) {
+        return Ok(None);
+    }
+
+    let lock = RefLock::acquire()
+        .map_err(|error| format!("The sealed-object record is damaged and could not be rebuilt: {}", error))?;
+    rebuild_locked(&lock)
+}
+
+/// Rewrite a damaged record, atomically, as its header and the frames before the damage.
+///
+/// Only damage is rewritten (see [`parse`]): a record that reads, a torn append included, is left
+/// for the next write, and one this version does not read is left as it is. The frames are kept
+/// as they were and nothing past the damage is salvaged, though intact frames may follow it: their
+/// order against the entries lost in the damage cannot be known, and a frame from stale blocks
+/// could record a hash again. Dropping entries can only lose what the log can already lose (see
+/// the module doc comment): a dropped record reads as a missing object, which every walk reports,
+/// and a dropped removal leaves a present object recorded, which `heal` removes.
+///
+/// # Returns
+/// * `Ok(Some(Rebuilt))` - The record was damaged and now holds what it held before the damage.
+/// * `Ok(None)`          - There is no record, it is not damaged, or it cannot be read (which the
+///                         record's readers report, as [`rebuild`] leaves them to).
+/// * `Err(String)`       - If the rewrite fails. A rewrite that fails after its rename has still
+///                         replaced the record, so the message says what the rewrite drops.
+fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
+    let path = sealed_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(None);
+    };
+
+    let Err(Unparsed::Damaged { valid_len, .. }) = parse_classified(&bytes) else {
+        return Ok(None);
+    };
+
+    let rebuilt = match valid_len {
+        0 => header_bytes(),
+        _ => bytes[..valid_len].to_vec(),
+    };
+    file_utils::replace_file_atomically(&path, &rebuilt).map_err(|error| format!(
+        "Rebuilding the damaged sealed-object record, which drops the {} byte(s) from byte {} on, \
+        failed, though the rewrite may have landed. {}",
+        bytes.len() - valid_len, valid_len, error
+    ))?;
+
+    Ok(Some(Rebuilt { at: valid_len, dropped_bytes: bytes.len() - valid_len }))
 }
 
 /// Whether `hash` is in `sealed`, where `None` means no record applies (the push gate).
@@ -1028,6 +1155,84 @@ mod tests {
         std::fs::write(sealed_path(), &other).unwrap();
         assert!(append(&[(SealOp::Record, B)]).unwrap_err().contains("format this version"));
         assert_eq!(std::fs::read(sealed_path()).unwrap(), other);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FORK-309: heal's rebuild keeps the header and the frames before the damage, verbatim, and
+    /// drops the rest, intact frames after it included; writes then work again. Mutations: rebuild
+    /// to the frames past the damage as well → the removal of A is replayed → red; skip the
+    /// rewrite → the read still fails → red.
+    #[test]
+    fn a_damaged_record_is_rebuilt_from_the_frames_before_the_damage() {
+        let (root, _scope) = scratch("rebuild");
+
+        let mut damaged = record(&[(SealOp::Record, A), (SealOp::Record, B), (SealOp::Remove, A)]);
+        let at = header_bytes().len() + FRAME_LEN;
+        damaged[at + 9] ^= 0xff;
+        std::fs::write(sealed_path(), &damaged).unwrap();
+        let err = read_sealed().unwrap_err();
+        assert!(err.contains("damaged") && err.contains("Run \"forklift heal\""), "{}", err);
+
+        assert_eq!(rebuild().unwrap(), Some(Rebuilt { at, dropped_bytes: damaged.len() - at }));
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), record(&[(SealOp::Record, A)]));
+        assert!(read_sealed().unwrap().contains(A), "the removal past the damage is not replayed");
+        assert_eq!(rebuild().unwrap(), None, "a sound record is not rebuilt again");
+
+        assert!(append(&[(SealOp::Record, B)]).unwrap().contains(B));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A record whose header is missing is damage too: its read says it is rebuilt empty, and it is
+    /// rebuilt as a header alone. Mutation: name the salvage step for it → red.
+    #[test]
+    fn a_record_without_its_header_is_rebuilt_empty() {
+        let (root, _scope) = scratch("rebuild-headless");
+
+        let headless = encode_frame(SealOp::Record, A).unwrap();
+        std::fs::write(sealed_path(), &headless).unwrap();
+        let err = read_sealed().unwrap_err();
+        assert!(err.contains("rebuilds it empty"), "{}", err);
+
+        assert_eq!(rebuild().unwrap(), Some(Rebuilt { at: 0, dropped_bytes: headless.len() }));
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), header_bytes());
+        assert!(read_sealed().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What is not damage is never rebuilt: a record that reads (a torn append left for the next
+    /// write), one in another version, and one holding an intact frame this version cannot read.
+    /// Each is left byte for byte, and the read names a remedy other than heal for the last two.
+    /// Mutation: rebuild every record that does not parse → the other version is rewritten → red.
+    #[test]
+    fn what_is_not_damage_is_never_rebuilt() {
+        let (root, _scope) = scratch("rebuild-refused");
+
+        let mut torn = record(&[(SealOp::Record, A)]);
+        torn.extend(&encode_frame(SealOp::Record, B).unwrap()[..20]);
+        let mut other = b"/forklift-sealed 3\n".to_vec();
+        other.extend(encode_frame(SealOp::Record, A).unwrap());
+        let mut unknown_op = record(&[(SealOp::Record, A)]);
+        let mut entry = vec![9u8];
+        entry.extend_from_slice(&[0u8; HASH_LEN]);
+        unknown_op.extend(frame_with_entry(&entry));
+        unknown_op.extend(std::iter::repeat_n(0xabu8, MAX_FRAME_LEN + 1));
+
+        for (bytes, remedy) in [
+            (&torn, None),
+            (&other, Some("Use the version of Forklift that wrote it")),
+            (&unknown_op, Some("restore the record from a good copy")),
+        ] {
+            std::fs::write(sealed_path(), bytes).unwrap();
+            assert_eq!(rebuild().unwrap(), None);
+            assert_eq!(&std::fs::read(sealed_path()).unwrap(), bytes);
+            if let Some(remedy) = remedy {
+                let err = read_sealed().unwrap_err();
+                assert!(err.contains(remedy) && !err.contains("forklift heal"), "{}", err);
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
