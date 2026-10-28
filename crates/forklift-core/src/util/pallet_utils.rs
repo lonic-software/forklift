@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
+use crate::util::audit_utils::ClosureError;
 use crate::util::scope_utils::MaterializationScope;
 use crate::util::sealed_utils::SealedSet;
 
@@ -729,6 +730,20 @@ pub enum RefUpdateError {
         missing: String,
     },
 
+    /// The new head of a user pallet has, at a parcel the ref would newly reach, a root tree
+    /// holding the metadata folder: the shape only office and meta history may take. Nothing was
+    /// written, and no fetch can mend it.
+    MetaShaped {
+        /// The pallet whose ref was to move.
+        pallet: String,
+
+        /// The refused head.
+        head: String,
+
+        /// The parcel whose root tree has that shape (the head itself, or one of its ancestors).
+        parcel: String,
+    },
+
     /// A creation of a user pallet that was deleted in this served warehouse, whose tombstone
     /// still stands: re-creating the name must acknowledge that tombstone and descend from its
     /// head (see [`update_pallet_head_in`]); nothing was written.
@@ -775,6 +790,13 @@ impl std::fmt::Display for RefUpdateError {
                 warehouse ({}). Nothing was written. If a fetch of it stopped part-way, run that \
                 fetch again before this command.",
                 pallet, &head[..head.len().min(12)], missing
+            ),
+            RefUpdateError::MetaShaped { pallet, head, parcel } => write!(
+                f,
+                "Refusing to set pallet \"{}\" to {}: parcel {} of its history holds a \"{}\" folder \
+                at its root, which only metadata history may hold. Nothing was written.",
+                pallet, &head[..head.len().min(12)], &parcel[..parcel.len().min(12)],
+                crate::globals::FOLDER_NAME_FORKLIFT_ROOT
             ),
             RefUpdateError::AnchorMoved => f.write_str(
                 "Another bay or process changed this warehouse's trust anchor while this command \
@@ -1109,18 +1131,20 @@ pub fn update_pallet_head_verified(
     update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone)
 }
 
-/// That a head's closure was verified, and at which fetch scope. Minted only by the verifier
+/// That a head's closure was verified, at which fetch scope, and for which namespace's pallet: only
+/// a user pallet's walk refuses a meta-shaped root. Minted only by the verifier
 /// ([`audit_utils::verify_parcel_closure_for_write`](crate::util::audit_utils::verify_parcel_closure_for_write)),
 /// so holding one means the check ran.
 #[derive(Clone, Debug)]
 pub struct VerifiedClosure {
     head: String,
     scope: MaterializationScope,
+    namespace: PalletNamespace,
 }
 
 impl VerifiedClosure {
-    pub(crate) fn new(head: &str, scope: MaterializationScope) -> VerifiedClosure {
-        VerifiedClosure { head: head.to_string(), scope }
+    pub(crate) fn new(head: &str, scope: MaterializationScope, namespace: PalletNamespace) -> VerifiedClosure {
+        VerifiedClosure { head: head.to_string(), scope, namespace }
     }
 }
 
@@ -1159,7 +1183,9 @@ fn update_pallet_head_checked(
         true => {
             let scope = crate::util::scope_utils::read_fetch_scope()?;
 
-            let leaned_on = match verified.is_some_and(|verified| verified.head == new && verified.scope == scope) {
+            let leaned_on = match verified.is_some_and(|verified| {
+                verified.head == new && verified.scope == scope && verified.namespace == namespace
+            }) {
                 true => None,
                 false => verify_new_head(name, expected, new, &scope)?,
             };
@@ -1327,6 +1353,8 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 /// Verify that `new`'s history is completely present at the fetch scope `scope`, back to what
 /// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
 /// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
+/// A parcel of that history whose root is meta-shaped is refused with
+/// [`RefUpdateError::MetaShaped`] wherever the walk meets it, and never retried.
 ///
 /// In a partial warehouse (sparse, or a cache), an absent object the sealed-by-hash record holds
 /// is tolerated; a full warehouse tolerates nothing. The mode and the record are read only when
@@ -1352,9 +1380,21 @@ fn verify_new_head(name: &str,
         head: new.to_string(),
         missing,
     };
+    let refused = |error| match error {
+        ClosureError::Incomplete(missing) => incomplete(missing),
+        ClosureError::MetaShapedRoot { parcel } => RefUpdateError::MetaShaped {
+            pallet: name.to_string(),
+            head: new.to_string(),
+            parcel,
+        },
+    };
 
-    let Err(missing) = verify(None) else {
-        return Ok(None);
+    // A meta-shaped root is refused outright: the record of objects held by hash cannot explain it.
+    // The retry below can meet one too, where the first walk stopped earlier at an absence.
+    let missing = match verify(None) {
+        Ok(()) => return Ok(None),
+        Err(ClosureError::Incomplete(missing)) => missing,
+        Err(refusal) => return Err(refused(refusal)),
     };
 
     // Only a partial warehouse holds anything by hash alone: a full one must hold every object.
@@ -1378,7 +1418,7 @@ fn verify_new_head(name: &str,
         return Err(incomplete(missing));
     }
 
-    verify(Some(&record)).map_err(incomplete)?;
+    verify(Some(&record)).map_err(refused)?;
 
     Ok(Some(record))
 }
@@ -1886,7 +1926,7 @@ pub(crate) mod tests {
                                                    expected: Option<&str>,
                                                    new: &str,
                                                    preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-        let verified = VerifiedClosure::new(new, crate::util::scope_utils::read_fetch_scope()?);
+        let verified = VerifiedClosure::new(new, crate::util::scope_utils::read_fetch_scope()?, namespace);
         update_pallet_head_verified(namespace, name, expected, new, preconditions, &verified, None)
     }
 
@@ -2305,18 +2345,18 @@ pub(crate) mod tests {
             remove(&missing);
             let full = MaterializationScope::full();
 
-            let wrong_head = VerifiedClosure::new(&other, full.clone());
+            let wrong_head = VerifiedClosure::new(&other, full.clone(), PalletNamespace::User);
             assert_incomplete(update_pallet_head_verified(
                 PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_head, None
             ), "main", None);
 
-            let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]));
+            let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]), PalletNamespace::User);
             assert_incomplete(update_pallet_head_verified(
                 PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_scope, None
             ), "main", None);
 
             // The token stands for a verification its caller made: the write takes its word.
-            let token = VerifiedClosure::new(&head, full);
+            let token = VerifiedClosure::new(&head, full, PalletNamespace::User);
             update_pallet_head_verified(PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &token, None).unwrap();
         }
 

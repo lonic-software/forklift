@@ -8903,7 +8903,7 @@ mod tests {
             let load_base_tree = |hash: &str| object_utils::load_tree(hash);
 
             crate::util::audit_utils::verify_parcel_closure_with(
-                &merge, known_complete, &blob_exists, &chunks_missing,
+                &merge, known_complete, pallet_utils::PalletNamespace::User, &blob_exists, &chunks_missing,
                 &load_recipe_chunks, &load_base_tree,
             ).expect("the fixture is complete, so the audit must pass");
 

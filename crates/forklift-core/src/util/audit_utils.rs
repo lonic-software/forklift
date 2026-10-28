@@ -10,9 +10,9 @@ use std::sync::{Mutex, OnceLock};
 use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
-use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
+use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, recovery_utils, sign_utils};
 use crate::util::sealed_utils::SealedSet;
-use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
+use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletNamespace, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
 /// inauthentic chain is bad input, while an authentic parcel that oversteps its signer's
@@ -1759,7 +1759,18 @@ pub fn require_adopted_history(
 /// # Returns
 /// * `Ok(())`      - If everything is present.
 /// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable).
+///
+/// The walk is the meta namespace's, so it does not refuse a meta-shaped root: the callers check a
+/// trust anchor's adopted office chain, or prove a history present whatever its shape. A user
+/// pallet's ref update goes through [`verify_parcel_closure_for_write`] with its namespace.
 pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result<(), String> {
+    verify_local_closure(head, known_complete, PalletNamespace::Meta).map_err(|error| error.to_string())
+}
+
+/// [`verify_parcel_closure_with`] over the local object store.
+fn verify_local_closure(head: &str,
+                        known_complete: Option<&str>,
+                        namespace: PalletNamespace) -> Result<(), ClosureError> {
     // The default checks read straight from the local object store; the serverless head passes an
     // S3 HEAD for blob presence, a bounded-concurrency batch of S3 HEADs for the chunk-presence
     // seam, a store-backed recipe read for the chunk descent, and a store-backed tree read for the
@@ -1767,6 +1778,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
     verify_parcel_closure_with(
         head,
         known_complete,
+        namespace,
         &|hash| file_utils::does_object_exist(hash),
         &local_chunks_missing,
         &|hash| object_utils::recipe_chunk_hashes(hash),
@@ -1774,18 +1786,23 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
     )
 }
 
-/// [`verify_parcel_closure`], returning the proof a ref write accepts in place of verifying the
-/// same head again ([`pallet_utils::update_pallet_head_verified`]). The walk is unscoped, so the
-/// proof is for the full scope: in a sparse warehouse the write verifies again at its own.
+/// [`verify_parcel_closure`] for a ref update of a pallet in `namespace`, returning the proof a ref
+/// write accepts in place of verifying the same head again
+/// ([`pallet_utils::update_pallet_head_verified`]). The walk is unscoped, so the proof is for the
+/// full scope: in a sparse warehouse the write verifies again at its own. A user pallet's walk also
+/// refuses a meta-shaped root (see [`verify_parcel_closure_with`]), and the proof records the
+/// namespace it was walked for, so a meta walk's proof never lets a user-pallet write skip that.
 ///
 /// # Returns
 /// * `Ok(VerifiedClosure)` - Everything is present.
-/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable).
+/// * `Err(ClosureError)`   - If a parcel, tree or blob is missing (or unreadable), or a user
+///                           history holds a meta-shaped root.
 pub fn verify_parcel_closure_for_write(head: &str,
-                                       known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, String> {
-    verify_parcel_closure(head, known_complete)?;
+                                       known_complete: Option<&str>,
+                                       namespace: PalletNamespace) -> Result<pallet_utils::VerifiedClosure, ClosureError> {
+    verify_local_closure(head, known_complete, namespace)?;
 
-    Ok(pallet_utils::VerifiedClosure::new(head, MaterializationScope::full()))
+    Ok(pallet_utils::VerifiedClosure::new(head, MaterializationScope::full(), namespace))
 }
 
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
@@ -1797,10 +1814,14 @@ pub fn verify_parcel_closure_for_write(head: &str,
 /// a scratch `.forklift`, but leaves the (large, many) working blobs in object storage
 /// and answers this check with an S3 `HEAD` (DESIGN.html §4.6).
 ///
+/// For a user pallet the walk also refuses any new parcel whose root tree has the shape of
+/// metadata history (see [`ClosureError::MetaShapedRoot`]).
+///
 /// # Arguments
 /// * `head`               - The head parcel whose closure is verified.
 /// * `known_complete`     - A head whose history is already known complete (`None` verifies
 ///                          all the way down).
+/// * `namespace`          - The namespace of the pallet whose ref is to hold `head`.
 /// * `blob_exists`        - Returns whether a file-content blob — or a recipe object, a chunked
 ///                          file's tree-entry — is present at a hash. The plain, per-hash presence
 ///                          seam, left untouched; the many-per-recipe chunk presence goes through
@@ -1841,19 +1862,54 @@ pub fn verify_parcel_closure_for_write(head: &str,
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
+    namespace: PalletNamespace,
     blob_exists: &dyn Fn(&str) -> Result<bool, String>,
     chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
-) -> Result<(), String> {
+) -> Result<(), ClosureError> {
     // A remote must hold the whole closure of every head it accepts: the push gate tolerates no
     // recorded absence.
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
 
     verify_closure_core(
         head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &MaterializationScope::full(),
-        false, &seams,
+        false, namespace == PalletNamespace::User, &seams,
     )
+}
+
+/// Why a closure walk refused a head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClosureError {
+    /// A parcel, tree, blob or chunk of the history is missing or unreadable; the message names it.
+    Incomplete(String),
+
+    /// A new parcel of a user pallet's history has a root tree holding the metadata folder: the
+    /// shape of office and meta history, which heal and scope prune walk in full whatever the
+    /// fetch scope. No fetch can mend it, so it is never reported as missing history.
+    MetaShapedRoot {
+        /// The parcel whose root tree has that shape.
+        parcel: String,
+    },
+}
+
+impl From<String> for ClosureError {
+    fn from(missing: String) -> ClosureError {
+        ClosureError::Incomplete(missing)
+    }
+}
+
+impl std::fmt::Display for ClosureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClosureError::Incomplete(missing) => f.write_str(missing),
+            ClosureError::MetaShapedRoot { parcel } => write!(
+                f,
+                "Parcel {} holds a \"{}\" folder at its root, which only metadata history may hold.",
+                parcel, crate::globals::FOLDER_NAME_FORKLIFT_ROOT
+            ),
+        }
+    }
 }
 
 /// The object-store reads [`verify_closure_core`] varies by head (see
@@ -1918,14 +1974,17 @@ fn holds_absent(sealed: Option<&SealedTolerance>, hash: &str) -> bool {
 /// * `scope`    - The warehouse fetch scope: content outside it is sealed, never loaded. A full
 ///                scope walks everything.
 /// * `reverify` - The `audit --full` content level, threaded down to each chunked file.
+/// * `refuse_meta_roots` - Refuse a parcel of the segment whose root tree is meta-shaped: set for a
+///                         user pallet's ref update.
 fn verify_closure_core(
     head: &str,
     bounds: Option<&[&str]>,
     base: Option<&str>,
     scope: &MaterializationScope,
     reverify: bool,
+    refuse_meta_roots: bool,
     seams: &ClosureSeams,
-) -> Result<(), String> {
+) -> Result<(), ClosureError> {
     let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed } = *seams;
 
     // Only the new segment: the closure behind each bound was proven complete when that head
@@ -2027,6 +2086,9 @@ fn verify_closure_core(
     // excludes — fall through to a load.
     let mut tree_of: HashMap<String, String> = HashMap::new();
 
+    // The root trees whose shape has been checked, so a root shared by several parcels is read once.
+    let mut roots_checked: HashSet<String> = HashSet::new();
+
     // Seed with `base`: it is the boundary parent of every linear push, and its tree was
     // already loaded above for `base_root`. Without this the common case pays a second read of the
     // same parcel purely to learn a hash already in hand.
@@ -2094,6 +2156,17 @@ fn verify_closure_core(
         bases.sort();
         bases.dedup();
 
+        // Heal and scope prune walk a meta-shaped root tree in full whatever the scope, and heal
+        // roots every parcel of a history it reaches, so a user history may take that shape at no
+        // parcel it newly admits. Checked on the root itself, not inside the tree walk below, which
+        // skips a tree it has already seen as a subtree. A root some candidate base carries is
+        // admitted history's, which passed this check when it was admitted. Any other root is read
+        // from the local store, as the walk reads it: the AWS head's scratch mirrors every tree of
+        // the segment, and the one tree it spares, the bound's root, is a candidate base.
+        if refuse_meta_roots && !bases.contains(&parcel.tree_hash) && roots_checked.insert(parcel.tree_hash.clone()) {
+            refuse_meta_shaped_root(hash, &parcel.tree_hash, blob_exists, sealed)?;
+        }
+
         // At a full scope this is the plain tree walk (the root is in scope); in a sparse
         // warehouse it stops at each out-of-scope boundary. The commit gate presence-checks;
         // content re-verification is `audit --full` only.
@@ -2104,6 +2177,26 @@ fn verify_closure_core(
     }
 
     Ok(())
+}
+
+/// Refuse `parcel` when its root tree `tree_hash` is meta-shaped: the test heal's and scope prune's
+/// walks apply at a root ([`recovery_utils::walks_in_full`]), so the two cannot disagree. A root the
+/// sealed-by-hash record holds absent cannot be read, and passes: the remote it came from checked it.
+fn refuse_meta_shaped_root(parcel: &str,
+                           tree_hash: &str,
+                           object_exists: &dyn Fn(&str) -> Result<bool, String>,
+                           sealed: Option<&SealedTolerance>) -> Result<(), ClosureError> {
+    if sealed_absent(sealed, tree_hash, object_exists)? {
+        return Ok(());
+    }
+
+    let tree = object_utils::load_tree(tree_hash)
+        .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
+
+    match recovery_utils::walks_in_full(&tree, "") {
+        true => Err(ClosureError::MetaShapedRoot { parcel: parcel.to_string() }),
+        false => Ok(()),
+    }
 }
 
 /// Order a push's new segment so every parcel follows the parents that are in the segment with it.
@@ -2218,7 +2311,9 @@ pub fn verify_parcel_closure_scoped(
         sealed,
     };
 
-    verify_closure_core(head, known_complete.as_ref().map(std::slice::from_ref), known_complete, scope, reverify, &seams)
+    verify_closure_core(
+        head, known_complete.as_ref().map(std::slice::from_ref), known_complete, scope, reverify, false, &seams,
+    ).map_err(|error| error.to_string())
 }
 
 /// Verify the closure of `head` before a ref is moved to it, in this warehouse: every parcel from
@@ -2244,13 +2339,15 @@ pub fn verify_parcel_closure_scoped(
 /// * `sealed`         - The sealed-by-hash record, or `None` to tolerate no recorded absence.
 ///
 /// # Returns
-/// * `Ok(())`      - Everything within the scope is present or held by the record.
-/// * `Err(String)` - What is missing (or unreadable).
+/// * `Ok(())`            - Everything within the scope is present or held by the record.
+/// * `Err(ClosureError)` - What is missing (or unreadable), or the parcel whose root is
+///                         meta-shaped: the ref is a user pallet's, whose history may not take that
+///                         shape.
 pub fn verify_ref_head_closure(head: &str,
                                known_complete: &[String],
                                base: Option<&str>,
                                scope: &MaterializationScope,
-                               sealed: Option<&SealedSet>) -> Result<(), String> {
+                               sealed: Option<&SealedSet>) -> Result<(), ClosureError> {
     let bounds: Vec<&str> = known_complete.iter().map(String::as_str).collect();
     let tolerance = sealed.map(SealedTolerance::new);
     let seams = ClosureSeams {
@@ -2261,7 +2358,7 @@ pub fn verify_ref_head_closure(head: &str,
         sealed: tolerance.as_ref(),
     };
 
-    verify_closure_core(head, Some(&bounds), base, scope, false, &seams)
+    verify_closure_core(head, Some(&bounds), base, scope, false, true, &seams)
 }
 
 /// [`verify_tree_closure`], threaded with the three-valued sparse classifier so an out-of-scope

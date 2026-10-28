@@ -964,15 +964,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
                 object_utils::parse_tree_bytes(hash, &bytes)
             };
+            // A user pallet's walk also refuses a meta-shaped root; that refusal is a 422 too, never a
+            // missing object a retry could mend.
             audit_utils::verify_parcel_closure_with(
                 &request.new_head,
                 request.old_head.as_deref(),
+                namespace,
                 &blob_exists,
                 &chunks_missing,
                 &load_recipe_chunks,
                 &load_base_tree,
             )
-            .map_err(HeadError::unprocessable)?;
+            .map_err(|refusal| HeadError::unprocessable(refusal.to_string()))?;
 
             // A creation over a tombstone lifts only when it acknowledged the deletion and its
             // new head descends from the deleted one. Checked after the closure, so the walk of
@@ -1632,9 +1635,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             materialize(&self.objects, adopts, true, None, &mut mirror).map_err(HeadError::internal)?;
 
             let verify_closure = |head: &str| {
+                // An office chain: the meta namespace's walk.
                 audit_utils::verify_parcel_closure_with(
                     head,
                     None,
+                    PalletNamespace::Meta,
                     &|hash| self.objects.exists(hash),
                     &|chunks| self.objects.objects_missing(chunks),
                     &|hash| {
@@ -1652,6 +1657,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // A creation (`known_complete: None`) takes no prune candidates.
                     &|hash| Err(format!("Tree {} was read as a prune base, but nothing bounds this walk.", hash)),
                 )
+                .map_err(|missing| missing.to_string())
             };
 
             audit_utils::require_adopted_history(Some(adopts), &verify_closure)

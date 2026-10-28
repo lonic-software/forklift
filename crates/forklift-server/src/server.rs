@@ -1129,6 +1129,7 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             | RefUpdateError::Backward { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
+        refused @ RefUpdateError::MetaShaped { .. } => unprocessable(refused.to_string()),
         RefUpdateError::Failed(message) => internal(message),
     }
 }
@@ -2778,8 +2779,10 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // covers the request's two heads, whose content no other writer can change.
             let verified = match verified_closure.take() {
                 Some(verified) => verified,
-                None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
-                    .map_err(unprocessable)?,
+                // A user pallet's walk also refuses a meta-shaped root: a 422 as well, which no
+                // retry or further upload mends.
+                None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref(), namespace)
+                    .map_err(|refusal| unprocessable(refusal.to_string()))?,
             };
 
             // An early refusal too, after the closure check, so its walk of the new history reads
@@ -2935,7 +2938,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 }
                 // The fast-forward check above refuses such a move first; a conflict all the same.
                 Err(backward @ RefUpdateError::Backward { .. }) => return Err((StatusCode::CONFLICT, backward.to_string())),
-                Err(incomplete @ RefUpdateError::Incomplete { .. }) => return Err(unprocessable(incomplete.to_string())),
+                Err(refused @ (RefUpdateError::Incomplete { .. } | RefUpdateError::MetaShaped { .. })) => {
+                    return Err(unprocessable(refused.to_string()));
+                }
                 Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
                     return Err(pallet_deleted(&pallet, &head, acknowledged));
                 }
