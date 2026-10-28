@@ -214,17 +214,19 @@ fn with_drop_hint(error: String, info: &forklift_core::model::remote::WarehouseI
 /// other than the one it fetched against. A partial warehouse only ever proved the closure it
 /// does not hold present on its origin; a different remote may lack objects it never verified
 /// there, so the lift's closure check would fail late and confusingly. Refusing up front, with
-/// the origin named, is the clearer failure. A no-op for a full warehouse, which holds the whole
-/// closure and can lift anywhere, and for a partial warehouse still pointed at its origin.
+/// the origin named, is the clearer failure, and a partial warehouse with no origin recorded is
+/// refused too. A no-op for a full warehouse, which holds the whole closure and can lift anywhere,
+/// and for a partial warehouse still pointed at its origin.
 fn ensure_origin_remote() -> Result<(), CoreError> {
     if !scope_utils::content_may_be_absent()? {
         return Ok(());
     }
 
     let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
-        // A partial warehouse with no recorded origin predates this guard; leave it to the remote's
-        // closure check rather than invent an origin.
-        return Ok(());
+        // Franchise records the origin before the head, so a partial warehouse without one was left
+        // by an interrupted franchise or had it unset. Its lift is refused rather than left to the
+        // remote's closure check, which would fail late against the wrong remote.
+        return Err(scope_utils::unrecorded_origin_lift_refusal());
     };
 
     let Some((configured, _scope)) = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)? else {
