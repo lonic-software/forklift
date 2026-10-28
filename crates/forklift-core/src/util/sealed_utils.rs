@@ -25,7 +25,8 @@
 //! A reader takes no lock. It stops at the first frame that does not validate, which is how a torn
 //! append reads: everything after the last valid frame is ignored. A region of zeros never
 //! validates, because the magic is nonzero. Every frame is synced before the next is written (see
-//! [`append_locked`]), so a torn append is the last frame and only that: nothing after it
+//! [`append_locked`]; with fsync turned off this does not hold, and a crash may leave the record
+//! damaged rather than torn), so a torn append is the last frame and only that: nothing after it
 //! validates, and at most the largest frame's worth of bytes, zeros included, follow the last
 //! valid frame. A valid frame anywhere past the last one read, or more bytes than that, is damage
 //! inside the log, and fails the read rather than dropping the frames behind it. Damage that

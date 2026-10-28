@@ -999,7 +999,8 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 }
 
 /// Replace a file that is **not store content** — a configuration file, or the sealed-object
-/// record (`sealed_utils`), whose writes must land at once — atomically: a fresh
+/// record (`sealed_utils`) when it is created or rewritten whole, whose writes must never be
+/// staged — atomically: a fresh
 /// temporary file in the same folder, fsynced through its own write handle, renamed over
 /// `file_path`, then the folder fsynced. A reader opening `file_path` at any moment sees the old
 /// file or the new one, complete, never an empty or partial one; that holds even with
