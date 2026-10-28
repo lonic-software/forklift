@@ -2436,8 +2436,9 @@ pub(crate) mod tests {
             let mid = parcel(&tree(&[("nested", &crafted_root, DirEntryType::Tree)]), &[&base]);
             let head = parcel(&crafted_root, &[&mid]);
 
-            // `mid` itself is clean: the shape counts only at a root.
-            write("side", None, &mid).unwrap();
+            // `mid` itself is clean, since the shape counts only at a root. Checked without a ref
+            // write, which would make `mid` reached history and keep the walk below out of it.
+            crate::util::audit_utils::verify_parcel_closure_for_write(&mid, Some(&base), PalletNamespace::User).unwrap();
             assert_meta_shaped(write("main", Some(&base), &head), "main", Some(&base), &head);
         }
 
