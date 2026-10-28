@@ -2670,6 +2670,64 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
     assert_every_entry_in_place("shift", None);
 }
 
+/// In a full warehouse the main tree checks out every path and holds no scope file, while each bay
+/// records its own scope, "every path" included. So a scope file placed in the main tree is
+/// refused, naming its deletion, and a bay whose scope file is gone is refused rather than read as
+/// checking out every path, naming its removal; the other checkouts are unaffected.
+///
+/// Revert: read an absent bay scope as full → the scoped bay's stack goes through, recording
+/// src/web as removed → red. Ignore a main-tree scope file in a full warehouse →
+/// the main tree's stocktake succeeds → red. Skip writing a full bay scope → the plain bay is
+/// refused → red.
+#[test]
+fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
+    let warehouse = TestWarehouse::new("full-checkout-scopes");
+    warehouse.write_file("src/api/a.txt", "api\n");
+    warehouse.write_file("src/web/w.txt", "web\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let plain_dir = warehouse.home.join("bay-plain");
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "plain", plain_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+    let bays = warehouse.root.join(".forklift").join("bays");
+    assert_eq!(std::fs::read(bays.join("plain").join("scope")).unwrap(), b"", "a plain bay records the full scope");
+    assert!(!warehouse.root.join(".forklift").join("scope").exists(), "a full warehouse's main tree has no scope");
+
+    // A scope file placed in the main tree is refused whatever it holds, by the readers of staged
+    // work (a clean stocktake reads no scope); deleting it is the way out.
+    warehouse.write_file("src/web/w.txt", "web v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    std::fs::write(warehouse.root.join(".forklift").join("scope"), "/forklift-scope 3\nsrc/api\n").unwrap();
+    for args in [&["stocktake"][..], &["stack", "second"]] {
+        let refused = warehouse.run(args);
+        assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
+        assert!(stderr(&refused).contains("its main tree holds a scope") && stderr(&refused).contains("Delete that file"),
+            "{:?}: {}", args, stderr(&refused));
+    }
+    std::fs::remove_file(warehouse.root.join(".forklift").join("scope")).unwrap();
+    assert_success(&warehouse.run(&["stack", "second"]));
+
+    // A scoped bay whose scope file is gone is refused the same way, naming its removal, instead of
+    // recording src/web, which it never checked out, as removed.
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    std::fs::remove_file(bays.join("scoped").join("scope")).unwrap();
+    for args in [&["stocktake"][..], &["stack", "third"]] {
+        let refused = warehouse.run_at(&scoped_dir, args);
+        assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
+        assert!(stderr(&refused).contains("The bay's scope") && stderr(&refused).contains("is missing")
+            && stderr(&refused).contains("bay remove"), "{:?}: {}", args, stderr(&refused));
+    }
+
+    // The other checkouts still work.
+    assert_success(&warehouse.run_at(&plain_dir, &["stocktake"]));
+    assert_success(&warehouse.run(&["stocktake"]));
+}
+
 /// A scoped bay over a tree large enough for the inventory build to fan out inventories its scope
 /// and nothing else: every in-scope entry in its own shard and proven, so the bay reads clean and
 /// an edit deep inside it reads as the only change; no shard for the out-of-scope sibling's
@@ -10481,7 +10539,7 @@ fn a_scoped_bay_materializes_only_its_subtree_and_reports_the_scope() {
 }
 
 /// A bay scope recorded in the older, unversioned format is refused, and the way out it names is
-/// the bay's own (add it again), not the sparse warehouse's (franchise again).
+/// the bay's own (a new bay under another name), not the sparse warehouse's (franchise again).
 #[test]
 fn a_scoped_bay_with_an_unversioned_scope_file_names_re_adding_the_bay() {
     let warehouse = scoped_fixture("scoped-legacy");
@@ -10496,7 +10554,7 @@ fn a_scoped_bay_with_an_unversioned_scope_file_names_re_adding_the_bay() {
     let refused = warehouse.run_at(&scoped_dir, &["stocktake"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains("older version of Forklift"), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("Remove the bay and add it again"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("add a new one under another name"), "{}", stderr(&refused));
     assert!(!stderr(&refused).contains("Franchise"), "{}", stderr(&refused));
 }
 

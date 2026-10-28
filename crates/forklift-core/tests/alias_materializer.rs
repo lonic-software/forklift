@@ -43,6 +43,8 @@ fn working_tree(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("forklift-alias-materializer-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join(".forklift")).unwrap();
+    // A full warehouse, so the main tree checks out every path.
+    std::fs::write(root.join(".forklift").join("warehouse"), "/forklift-warehouse 2\nfull\n").unwrap();
     root
 }
 
