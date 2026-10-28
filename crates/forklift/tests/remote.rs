@@ -5371,6 +5371,12 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
     let pallets = area.forklift("sparse", &["palletize"]);
     assert!(!stdout(&pallets).contains("plain"), "no pallet is left behind: {}", stdout(&pallets));
 
+    // A root scope names the whole tree too; the refusal points at the fetch scope, not at the plain
+    // bay refused above.
+    let root = area.forklift("sparse", &["--json", "bay", "add", "plain", bay_dir.to_str().unwrap(), "--scope", "."]);
+    let message = json_of(&root)["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("Name paths within the fetch scope (src/api)") && !message.contains("plain bay"), "{}", message);
+
     assert_success(&area.forklift("sparse", &["bay", "add", "plain", bay_dir.to_str().unwrap(), "--scope", "src/api"]));
     assert_eq!(area.read_file("sparse/.forklift/bays/plain/scope"), "/forklift-scope 3\nsrc/api\n");
 }

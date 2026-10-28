@@ -2723,9 +2723,14 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
             && stderr(&refused).contains("bay remove"), "{:?}: {}", args, stderr(&refused));
     }
 
-    // The other checkouts still work.
-    assert_success(&warehouse.run_at(&plain_dir, &["stocktake"]));
-    assert_success(&warehouse.run(&["stocktake"]));
+    // The other checkouts still read their scopes and work: each stages a change, so the stack
+    // reads the scope.
+    std::fs::write(plain_dir.join("src/web/w.txt"), "web v3\n").unwrap();
+    assert_success(&warehouse.run_at(&plain_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&plain_dir, &["stack", "plain"]));
+    warehouse.write_file("src/web/w.txt", "web v4\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "fourth"]));
 }
 
 /// A scoped bay over a tree large enough for the inventory build to fan out inventories its scope

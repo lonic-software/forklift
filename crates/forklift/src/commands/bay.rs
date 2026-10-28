@@ -172,10 +172,16 @@ fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<Materia
         let path = WarehousePath::from_user_input(raw)?;
 
         if path.is_root() {
-            return Err(
+            return Err(if fetch_scope.is_full() {
                 "A scope of the warehouse root is the whole tree — open a plain bay (without \
                 --scope) instead.".to_string()
-            );
+            } else {
+                format!(
+                    "A scope of the warehouse root is the whole tree, which a bay of this sparse \
+                    warehouse cannot check out. Name paths within the fetch scope ({}) instead.",
+                    fetch_scope.prefixes().join(", ")
+                )
+            });
         }
 
         let key = path.as_key().to_string();
