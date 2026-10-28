@@ -2366,6 +2366,113 @@ pub(crate) mod tests {
             let (_root, _scope) = scratch("closure-meta");
             update_meta_pallet_head(OFFICE, None, &"e".repeat(64), &RefPreconditions::NONE).unwrap();
         }
+
+        /// A root tree holding the metadata folder beside `src/a`: the shape of meta history.
+        fn meta_shaped(tag: &str) -> String {
+            let metadata = tree(&[("state", &blob(tag), DirEntryType::Normal)]);
+            let src = tree(&[("a", &blob(tag), DirEntryType::Normal)]);
+            tree(&[(crate::globals::FOLDER_NAME_FORKLIFT_ROOT, &metadata, DirEntryType::Tree), ("src", &src, DirEntryType::Tree)])
+        }
+
+        fn assert_meta_shaped(result: Result<(), RefUpdateError>, name: &str, expected: Option<&str>, at: &str) {
+            assert!(matches!(&result, Err(RefUpdateError::MetaShaped { parcel, .. }) if parcel == at), "{:?}", result);
+            assert_eq!(get_pallet_head(name).unwrap().as_deref(), expected, "nothing was written");
+        }
+
+        // Revert: drop the shape check from the walk → both writes land on the meta-shaped head.
+        #[test]
+        fn a_user_head_whose_root_is_meta_shaped_is_refused() {
+            let (_root, _scope) = scratch("closure-meta-shaped");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&meta_shaped("m"), &[&base]);
+
+            assert_meta_shaped(write("main", Some(&base), &head), "main", Some(&base), &head);
+            assert_meta_shaped(write("side", None, &head), "side", None, &head);
+            let refusal = write("main", Some(&base), &head).unwrap_err().to_string();
+            assert!(refusal.contains(".forklift") && refusal.contains("Nothing was written"), "{}", refusal);
+        }
+
+        // Revert: check only the head's root → the write lands over the meta-shaped parent.
+        #[test]
+        fn a_meta_shaped_parent_no_ref_reaches_is_refused_by_name() {
+            let (_root, _scope) = scratch("closure-meta-shaped-parent");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let crafted = parcel(&meta_shaped("m"), &[&base]);
+            let head = parcel(&two_dirs("a1", "b1"), &[&crafted]);
+
+            assert_meta_shaped(write("main", Some(&base), &head), "main", Some(&base), &crafted);
+        }
+
+        // Revert: map the sealed retry's refusal to `Incomplete` → the cache reports a missing
+        // object a fetch would mend; or drop the shape check → the write lands.
+        #[test]
+        fn a_meta_shaped_root_first_met_in_the_sealed_retry_is_still_refused_as_such() {
+            let (_root, _scope) = scratch("closure-meta-shaped-retry");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+
+            // The first walk stops at `mid`'s absent root, before it reaches `head`; the record
+            // holds that root, so the retry passes `mid` and meets `head`.
+            let mid_root = two_dirs("a1", "b1");
+            let mid = parcel(&mid_root, &[&base]);
+            let head = parcel(&meta_shaped("m"), &[&mid]);
+            record(&mid_root);
+            remove(&mid_root);
+
+            assert_meta_shaped(write("main", Some(&base), &head), "main", Some(&base), &head);
+        }
+
+        // Revert: run the shape check on the walk's own tree loads → `head`'s root, already walked
+        // as `mid`'s subtree, is skipped and the write lands.
+        #[test]
+        fn a_meta_shaped_root_already_walked_as_a_subtree_is_still_refused() {
+            let (_root, _scope) = scratch("closure-meta-shaped-subtree");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let crafted_root = meta_shaped("m");
+            let mid = parcel(&tree(&[("nested", &crafted_root, DirEntryType::Tree)]), &[&base]);
+            let head = parcel(&crafted_root, &[&mid]);
+
+            // `mid` itself is clean: the shape counts only at a root.
+            write("side", None, &mid).unwrap();
+            assert_meta_shaped(write("main", Some(&base), &head), "main", Some(&base), &head);
+        }
+
+        // Revert: compare only the token's head and scope → a meta walk's token lets the user
+        // write skip the shape check, and it lands.
+        #[test]
+        fn a_meta_walk_token_does_not_let_a_user_write_skip_the_shape_check() {
+            let (_root, _scope) = scratch("closure-meta-token");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&meta_shaped("m"), &[&base]);
+
+            let token = crate::util::audit_utils::verify_parcel_closure_for_write(&head, Some(&base), PalletNamespace::Meta)
+                .expect("a meta walk takes a meta-shaped root");
+            assert_meta_shaped(update_pallet_head_verified(
+                PalletNamespace::User, "main", Some(&base), &head, &RefPreconditions::NONE, &token, None
+            ), "main", Some(&base), &head);
+        }
+
+        // Revert: refuse the shape for every namespace → the meta walks refuse the office-shaped
+        // head too; or for none → the user walk passes it.
+        #[test]
+        fn only_a_user_pallet_walk_refuses_a_meta_shaped_root() {
+            use crate::util::audit_utils::{self, ClosureError};
+            let (_root, _scope) = scratch("closure-meta-walk");
+            let base = parcel(&meta_shaped("m0"), &[]);
+            let head = parcel(&meta_shaped("m1"), &[&base]);
+
+            audit_utils::verify_parcel_closure_for_write(&head, Some(&base), PalletNamespace::Meta).unwrap();
+            audit_utils::verify_parcel_closure_for_write(&head, None, PalletNamespace::Meta).unwrap();
+            audit_utils::verify_parcel_closure(&head, None).unwrap();
+
+            let refused = audit_utils::verify_parcel_closure_for_write(&head, None, PalletNamespace::User).unwrap_err();
+            assert!(matches!(&refused, ClosureError::MetaShapedRoot { parcel } if *parcel == head), "{:?}", refused);
+        }
     }
 
     fn ref_bytes(name: &str) -> Vec<u8> {
