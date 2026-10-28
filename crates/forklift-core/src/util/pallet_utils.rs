@@ -1117,7 +1117,8 @@ pub fn recreate_pallet_head(name: &str,
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
 /// remote's ref update, after its own closure check): the write skips its own verification when
-/// `verified` is for `new` at the current fetch scope, and verifies as usual otherwise. A creation
+/// `verified` is for `new` at the current fetch scope, walked for `namespace`, and verifies as
+/// usual otherwise. A creation
 /// may acknowledge the name's tombstone, as [`recreate_pallet_head`]'s does.
 pub fn update_pallet_head_verified(
     namespace: PalletNamespace,
@@ -1486,9 +1487,9 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 /// It is where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
 /// the hold), is recorded in the fetched-heads ledger, in the same hold as the write. It verifies
 /// no closure, so a user-pallet head write must reach it through [`update_pallet_head_checked`],
-/// which verifies the new head or takes a [`VerifiedClosure`] for exactly that head and scope. Its
-/// one other caller, the trust install, writes the meta office ref, whose writer verifies its own
-/// history.
+/// which verifies the new head or takes a [`VerifiedClosure`] for exactly that head, scope and
+/// namespace. Its one other caller, the trust install, writes the meta office ref, whose writer
+/// verifies its own history.
 pub(crate) fn update_pallet_head_locked(
     lock: &crate::util::lock_utils::RefLock,
     namespace: PalletNamespace,
