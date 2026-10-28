@@ -155,6 +155,12 @@ A command not listed here either reports only the generic human-message shape `{
             "null"
           ]
         },
+        "present_and_recorded": {
+          "description": "How many objects the sealed record names that are on disk all the same. That fails\nnothing: a recorded object that is present is checked like any other. `heal` removes the\nrecords it can, and notes each one it keeps. Omitted when none.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "signatures": {
           "description": "Signatures — the office chain and every parcel — are verified in full regardless of\nscope (parcels and their sidecars are always fully present).",
           "type": "string"
@@ -1650,8 +1656,15 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a `heal` run that fully resolved (or found nothing to resolve).",
   "properties": {
+    "newly_held_by_hash": {
+      "description": "Absent objects beneath those in `unsealed` that the record now holds by hash alone, so that\nremoving those records left nothing beneath them unaccounted for.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "notes": {
-      "description": "Advisory notes that never blocked clearing: a note for each vanished inventory shard in\n`resolved`, a note for each bay whose local state could not be\nread this run (skipped rather than blocking recovery) naming the bay and how to clean it\nup, and — only when this run's own closure walk actually confirmed one — a note for each\ntrust pin (a trust or distrust boundary) that is not held locally. That last kind is never\nunconditional: a run with nothing left to check after restaging skips the closure walk\nentirely (there is nothing for it to resolve), so it reports no pin note even when one\ngenuinely applies; a run that still has something dangling reports no pin note either, since\nthis field only ever appears on a fully-cleared run.",
+      "description": "Advisory notes that never blocked clearing: a note for each vanished inventory shard in\n`resolved`, a note for each bay whose local state could not be\nread this run (skipped rather than blocking recovery) naming the bay and how to clean it\nup, and — only when this run's own closure walk actually confirmed one — a note for each\ntrust pin (a trust or distrust boundary) that is not held locally. That last kind is never\nunconditional: a run with nothing left to check after restaging skips the closure walk\nentirely (there is nothing for it to resolve), so it reports no pin note even when one\ngenuinely applies; a run that still has something dangling reports no pin note either, since\nthis field only ever appears on a fully-cleared run. The sealed-object record adds a note\nfor each object on disk that keeps its record, and one when the record cannot be read.",
       "items": {
         "type": "string"
       },
@@ -1682,8 +1695,22 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "unseal_failed": {
+      "description": "Why removing those records failed, if it did. A failed write may have landed in part, so\n`unsealed` and `newly_held_by_hash` are then empty whatever the record holds.\nRunning `heal` again retries.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "unsealed": {
+      "description": "Objects on disk that the sealed-object record still named as held by hash alone (a refill\nwhose last write was lost leaves one), whose records this run removed.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "was_tainted": {
-      "description": "Whether a durability taint was actually standing (an already-healthy warehouse reports\n`false`, with every other list empty).",
+      "description": "Whether a durability taint was actually standing (an already-healthy warehouse reports\n`false`, with `restaged` and `resolved` empty).",
       "type": "boolean"
     }
   },

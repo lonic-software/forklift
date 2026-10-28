@@ -35,7 +35,7 @@
 //! hide, and it hides only entries: a lost record reads as a missing object, which every walk
 //! reports, and a lost removal leaves a present object recorded. That seals nothing while the
 //! object is present; were it lost later, it would be held by hash as it was before its refill,
-//! on the same premise that the remote holds it.
+//! on the same premise that the remote holds it. `heal` removes such records (see Removing).
 //! A frame that validates but whose entries do not parse fails the read, as does a header naming
 //! another version: neither is guessed at.
 //!
@@ -50,13 +50,26 @@
 //! atomic writes are never staged by a bulk store session (they go through
 //! [`file_utils::replace_file_atomically`]): a rename that waited for the session to finish would
 //! land over the appends made in between.
+//!
+//! ## Removing
+//!
+//! [`unseal`] removes a record once its object is present again. Before it goes,
+//! the coverage it gave is pushed down: every absent object reached from the present object, by a
+//! walk that does not descend into what is absent, is recorded, since an object being recorded
+//! means the remote holds its whole closure. The push-down is keyed by hash alone, never by path
+//! or scope. Its records are written before the removals, so a crash between the two leaves the
+//! object present and recorded, which seals nothing and the next `heal` repairs. The walk runs
+//! without the ref lock, under the caller's store-access hold, so nothing it found present is
+//! deleted under it; the commit re-reads the record under the ref lock and removes only what is
+//! still recorded. An object the walk could not finish keeps its record.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use crate::enums::object_type::ObjectType;
 use crate::globals;
-use crate::util::{file_utils, record_utils, sign_utils};
-use crate::util::lock_utils::RefLock;
+use crate::util::{file_utils, object_utils, pack_utils, record_utils, sign_utils};
+use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
 
 /// The record's file name under the shared forklift root.
 const FILE_NAME_SEALED: &str = "sealed";
@@ -363,8 +376,17 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///                     write may still have landed: some of its frames whole (and perhaps a
 ///                     torn one, which the next write drops), or the whole new record when the
 ///                     create failed after its rename. Read the record back to learn which.
-pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
-    let frames = encode_frames(ops)?;
+pub fn append_locked(lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
+    let ops: Vec<(SealOp, String)> = ops.iter().map(|(op, hash)| (*op, hash.to_string())).collect();
+    append_decided_locked(lock, |_| Ok(ops))
+}
+
+/// [`append_locked`] with the ops decided from the set the record replays to when it is re-read
+/// under the lock, so a decision about what is recorded is made on what is recorded.
+fn append_decided_locked(
+    _lock: &RefLock,
+    decide: impl FnOnce(&SealedSet) -> Result<Vec<(SealOp, String)>, String>,
+) -> Result<SealedSet, String> {
     let path = sealed_path();
     let existing = read_record(&path)?;
 
@@ -379,8 +401,12 @@ pub fn append_locked(_lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSe
         None => (Some(header_bytes()), SealedSet::default()),
     };
 
+    let ops = decide(&set)?;
+    let borrowed: Vec<(SealOp, &str)> = ops.iter().map(|(op, hash)| (*op, hash.as_str())).collect();
+    let frames = encode_frames(&borrowed)?;
+
     for (op, hash) in ops {
-        set.apply(*op, hash.to_string());
+        set.apply(op, hash);
     }
 
     if frames.is_empty() {
@@ -458,6 +484,213 @@ pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
     }
 
     Ok(parsed.set)
+}
+
+/// A hold on the store-access lock: the shared [`StoreAccessLock`], or the [`StoreAccessExclusive`]
+/// a deleter holds. While one is held, no other process deletes an object from the store.
+pub trait StoreAccessHold {}
+
+impl StoreAccessHold for StoreAccessLock {}
+
+impl StoreAccessHold for StoreAccessExclusive {}
+
+/// What [`unseal`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Unsealed {
+    /// The objects whose records were removed, sorted.
+    pub removed: Vec<String>,
+    /// The absent objects beneath them that the record holds now and did not before, sorted.
+    pub pushed_down: Vec<String>,
+    /// The objects left recorded, each with why: one not in the store, or one whose closure could
+    /// not be walked.
+    pub kept: Vec<(String, String)>,
+}
+
+/// The recorded objects the store holds, sorted. Each seals nothing while it is present, and
+/// [`unseal`] removes its record.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The recorded hashes present in the store, loose or packed.
+/// * `Err(String)`     - If the store could not be checked.
+pub fn present_recorded(record: &SealedSet) -> Result<Vec<String>, String> {
+    let mut present = Vec::new();
+
+    for hash in &record.hashes {
+        if file_utils::raw_object_present(hash)? {
+            present.push(hash.clone());
+        }
+    }
+
+    present.sort();
+    Ok(present)
+}
+
+/// Remove the records of the present objects `hashes`, each after a deep push-down: every absent
+/// object its present closure reaches is recorded first, so the removal exposes nothing it held.
+/// An absent object beneath a recorded one is held on the same premise as that one, that the
+/// remote holds its closure. The walk is by hash, not path: it records an absent object whatever
+/// the fetch scope says of the paths that reach it.
+///
+/// The walk runs without the ref lock. The commit takes it, re-reads the record, and appends the
+/// push-down's records, then the removals of those `hashes` still recorded, synced before this
+/// returns. Records first: a crash between them leaves an object present and recorded, which this
+/// repairs on the next run. Every absence the walks found is recorded, even beneath an object
+/// whose record another writer removed meanwhile: the premise is what the remote holds, and that
+/// object was recorded when it was walked. An absence a fetch has filled since the walk is not,
+/// unless the fill lands after the last check, just before the commit.
+///
+/// # Arguments
+/// * `_hold`  - The caller's store-access hold, shared or exclusive. It must span the whole call,
+///              so that nothing deletes an object the walk found present before the commit lands.
+///              This never takes one of its own, so a deleter calling it does not wait on itself.
+/// * `hashes` - The objects to unseal. One not in the store, or whose closure cannot be walked
+///              (an object beneath it is unreadable, or may be in a pack index that cannot be
+///              read), stays recorded and is listed in [`Unsealed::kept`].
+///
+/// # Returns
+/// * `Ok(Unsealed)` - What was removed, pushed down and kept.
+/// * `Err(String)`  - If the record cannot be read or parsed under the lock, the ref lock cannot be
+///                    taken, or the append fails ([`append_locked`] says what a failed append may
+///                    have left).
+pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unsealed, String> {
+    // Trees and recipes whose whole closure a walk that finished has checked: a later walk that
+    // reaches one has nothing more to find beneath it.
+    let mut closed: HashSet<String> = HashSet::new();
+    let mut absent: BTreeSet<String> = BTreeSet::new();
+    let mut walked: Vec<String> = Vec::new();
+    let mut kept: Vec<(String, String)> = Vec::new();
+
+    for hash in hashes {
+        match closure_absences(hash, &closed) {
+            Ok(closure) => {
+                closed.extend(closure.walked);
+                absent.extend(closure.absent);
+                walked.push(hash.clone());
+            }
+            Err(reason) => kept.push((hash.clone(), reason)),
+        }
+    }
+
+    if walked.is_empty() {
+        return Ok(Unsealed { kept, ..Unsealed::default() });
+    }
+
+    // An absence a fetch has filled since the walk is not recorded: recorded and present, it would
+    // be the very state this repairs. Checked before the lock, so the time it is held does not grow
+    // with the push-down; a fill landing after this check seals nothing, and the next run repairs it.
+    let mut still_absent = Vec::new();
+    for hash in absent {
+        if !file_utils::raw_object_present(&hash)? {
+            still_absent.push(hash);
+        }
+    }
+
+    let lock = RefLock::acquire()?;
+    let mut removed = Vec::new();
+    let mut pushed_down = Vec::new();
+
+    append_decided_locked(&lock, |set| {
+        pushed_down = still_absent.into_iter().filter(|hash| !set.contains(hash)).collect();
+        removed = walked.into_iter().filter(|hash| set.contains(hash)).collect::<BTreeSet<String>>().into_iter().collect();
+
+        Ok(pushed_down.iter().map(|hash| (SealOp::Record, hash.clone()))
+            .chain(removed.iter().map(|hash| (SealOp::Remove, hash.clone())))
+            .collect())
+    })?;
+
+    Ok(Unsealed { removed, pushed_down, kept })
+}
+
+/// What one push-down walk found.
+struct ClosureAbsences {
+    /// The trees and recipes it walked.
+    walked: HashSet<String>,
+    /// The absent objects it reached.
+    absent: Vec<String>,
+}
+
+/// Walk the present closure of `hash`, collecting every absent object it reaches. An absent object
+/// is not descended: whatever lies beneath it is held by its own record. A tree or recipe in
+/// `closed` is not walked again.
+///
+/// # Returns
+/// * `Ok(ClosureAbsences)` - What the walk went through and what it found absent.
+/// * `Err(String)`         - Why the closure could not be walked: `hash` is not in the store, or
+///                           an object beneath it could not be read or may be in a pack index
+///                           that cannot be read.
+fn closure_absences(hash: &str, closed: &HashSet<String>) -> Result<ClosureAbsences, String> {
+    let mut walk = ClosureAbsences { walked: HashSet::new(), absent: Vec::new() };
+
+    if !is_present(hash)? {
+        return Err("it is not in the store".to_string());
+    }
+
+    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+    let mut trees: VecDeque<String> = VecDeque::new();
+
+    match object_utils::peek_object_header(&bytes)?.0 {
+        ObjectType::Tree => trees.push_back(hash.to_string()),
+        ObjectType::Recipe => recipe_absences(hash, closed, &mut walk)?,
+        ObjectType::Blob | ObjectType::Chunk => {}
+        // A parcel names its tree and its parents, a history this walk does not follow, so its
+        // record is not removed on a push-down that would miss them.
+        ObjectType::Parcel => return Err("it is a parcel, and the history it names is not walked here".to_string()),
+    }
+
+    while let Some(tree_hash) = trees.pop_front() {
+        if closed.contains(&tree_hash) || !walk.walked.insert(tree_hash.clone()) {
+            continue;
+        }
+
+        let tree = object_utils::load_tree_shared(&tree_hash)?;
+
+        for (_, file) in tree.get_files() {
+            if !is_present(&file.hash)? {
+                walk.absent.push(file.hash.clone());
+            } else if file.item_type.is_chunked() {
+                recipe_absences(&file.hash, closed, &mut walk)?;
+            }
+        }
+
+        for (_, subtree) in tree.get_subtrees() {
+            if is_present(&subtree.hash)? {
+                trees.push_back(subtree.hash.clone());
+            } else {
+                walk.absent.push(subtree.hash.clone());
+            }
+        }
+    }
+
+    Ok(walk)
+}
+
+/// Collect the absent chunks of the present recipe `hash` into `walk`, unless `closed` or `walk`
+/// already holds it.
+fn recipe_absences(hash: &str, closed: &HashSet<String>, walk: &mut ClosureAbsences) -> Result<(), String> {
+    if closed.contains(hash) || !walk.walked.insert(hash.to_string()) {
+        return Ok(());
+    }
+
+    for chunk in object_utils::recipe_chunk_hashes(hash)? {
+        if !is_present(&chunk)? {
+            walk.absent.push(chunk);
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether the store holds `hash`. An object only an unreadable pack index might hold is neither:
+/// its bytes may be on disk, and what it references may be present, so the walk cannot go on.
+fn is_present(hash: &str) -> Result<bool, String> {
+    if file_utils::raw_object_present(hash)? {
+        return Ok(true);
+    }
+
+    match pack_utils::sweep_unreadable_reason(hash)? {
+        None => Ok(false),
+        Some(reason) => Err(format!("{} may be in the store but cannot be read ({})", hash, reason)),
+    }
 }
 
 #[cfg(test)]
@@ -866,5 +1099,168 @@ mod tests {
     fn encode_refuses_what_is_not_a_hash() {
         assert!(encode_frame(SealOp::Record, "abc").is_err());
         assert!(encode_frame(SealOp::Record, &"zz".repeat(32)).is_err());
+    }
+
+    /// The shared store-access hold, which nothing else contends for in a scratch store.
+    fn hold() -> StoreAccessLock {
+        StoreAccessLock::shared(|| panic!("nothing holds the store exclusively")).unwrap()
+    }
+
+    /// Unsealing a present tree records every absent object its present closure reaches before its
+    /// own record is removed: an absent subtree, blob and recipe, an absent chunk of a present
+    /// recipe, and an absent blob of a present subtree. Nothing present is recorded, nothing
+    /// beneath an absent object is looked for, and an absence already recorded is not recorded
+    /// again.
+    ///
+    /// Mutations, each red on the `pushed_down` assertion: skip any one absence arm of the walk
+    /// (subtree, file, chunk), skip descending a present subtree or recipe, or record what is
+    /// present; and drop the removal → red on the record assertion.
+    #[test]
+    fn unsealing_a_present_tree_records_every_absence_beneath_it() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::{store_chunk, store_recipe, store_tree};
+
+        let (root, _scope) = scratch("unseal-tree");
+        let lost = |digit: char| digit.to_string().repeat(64);
+        let (lost_tree, lost_blob, lost_recipe, lost_chunk, lost_deep, recorded) =
+            (lost('1'), lost('2'), lost('3'), lost('4'), lost('5'), lost('6'));
+
+        let present_chunk = store_chunk(b"a chunk that is present");
+        let recipe = store_recipe(&[(present_chunk.clone(), 23), (lost_chunk.clone(), 23)]);
+        let inner = store_tree(&[("deep.txt", &lost_deep, DirEntryType::Normal)]);
+        let tree = store_tree(&[
+            ("lost", &lost_tree, DirEntryType::Tree),
+            ("lost.txt", &lost_blob, DirEntryType::Normal),
+            ("lost.bin", &lost_recipe, DirEntryType::NormalChunked),
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+            ("inner", &inner, DirEntryType::Tree),
+            ("recorded.txt", &recorded, DirEntryType::Normal),
+            ("here.txt", &present_chunk, DirEntryType::Normal),
+        ]);
+        append(&[(SealOp::Record, &tree), (SealOp::Record, &recorded)]).unwrap();
+
+        let present = present_recorded(&read_sealed().unwrap()).unwrap();
+        assert_eq!(present, vec![tree.clone()]);
+
+        let unsealed = unseal(&hold(), &present).unwrap();
+        assert_eq!(unsealed.removed, vec![tree.clone()]);
+        assert_eq!(unsealed.pushed_down, vec![lost_tree, lost_blob, lost_recipe, lost_chunk, lost_deep]);
+        assert!(unsealed.kept.is_empty(), "{:?}", unsealed.kept);
+
+        let record = read_sealed().unwrap();
+        assert!(!record.contains(&tree), "the present tree is no longer recorded");
+        assert!(record.contains(&recorded));
+        for hash in &unsealed.pushed_down {
+            assert!(record.contains(hash), "{} is recorded", hash);
+        }
+        assert!(present_recorded(&record).unwrap().is_empty(), "nothing present is recorded");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The push-down's records land before the removal: a crash after the first frame of a longer
+    /// append leaves the tree recorded, not its absences exposed. The tree names one absence more
+    /// than a frame holds, so the append is two frames. Mutation: append the removal before the
+    /// records → the first frame holds it → red.
+    #[test]
+    fn the_removal_lands_after_the_push_down() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::store_tree;
+
+        let (root, _scope) = scratch("unseal-order");
+        let names: Vec<(String, String)> = (0..=MAX_FRAME_ENTRIES)
+            .map(|n| (format!("f{}", n), format!("{:064x}", n + 1)))
+            .collect();
+        let entries: Vec<(&str, &str, DirEntryType)> = names.iter()
+            .map(|(name, hash)| (name.as_str(), hash.as_str(), DirEntryType::Normal))
+            .collect();
+        let tree = store_tree(&entries);
+        append(&[(SealOp::Record, &tree)]).unwrap();
+        let before = std::fs::read(sealed_path()).unwrap().len();
+
+        let unsealed = unseal(&hold(), &[tree.clone()]).unwrap();
+        assert_eq!(unsealed.removed, vec![tree.clone()]);
+        assert_eq!(unsealed.pushed_down.len(), MAX_FRAME_ENTRIES + 1);
+
+        // The record as a crash after the first new frame leaves it.
+        let bytes = std::fs::read(sealed_path()).unwrap();
+        let first_frame = parse(&bytes[..before + MAX_FRAME_LEN]).unwrap();
+        assert_eq!(first_frame.valid_len, before + MAX_FRAME_LEN);
+        assert!(first_frame.set.contains(&tree), "the first frame removes nothing");
+        assert!(!parse(&bytes).unwrap().set.contains(&tree));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An object whose closure cannot be walked stays recorded, and so does one not in the store;
+    /// with nothing walked, nothing is written. One that is present but no longer recorded is not
+    /// removed. Mutations: drop the not-in-the-store check → the absent object is removed → red;
+    /// remove what the re-read no longer records → `removed` names it → red.
+    #[test]
+    fn what_cannot_be_walked_or_is_not_recorded_is_not_removed() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::{store_chunk, store_tree};
+
+        let (root, _scope) = scratch("unseal-kept");
+        let chunk = store_chunk(b"not a tree");
+        let broken = store_tree(&[("sub", &chunk, DirEntryType::Tree)]);
+        let absent = "7".repeat(64);
+        append(&[(SealOp::Record, &broken), (SealOp::Record, &absent)]).unwrap();
+        let before = std::fs::read(sealed_path()).unwrap();
+
+        let unsealed = unseal(&hold(), &[broken.clone(), absent.clone()]).unwrap();
+        assert!(unsealed.removed.is_empty() && unsealed.pushed_down.is_empty(), "{:?}", unsealed);
+        let kept: Vec<&str> = unsealed.kept.iter().map(|(hash, _)| hash.as_str()).collect();
+        assert_eq!(kept, vec![broken.as_str(), absent.as_str()]);
+        assert!(unsealed.kept[0].1.contains("not a tree"), "{}", unsealed.kept[0].1);
+        assert_eq!(unsealed.kept[1].1, "it is not in the store");
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), before, "nothing was written");
+
+        // A parcel names a history the walk does not follow. Mutation: treat it as a leaf → its
+        // record is removed → red.
+        let mut object = crate::builder::object::loose_object_builder::LooseObjectBuilder::build_parcel(
+            &crate::model::parcel::Parcel { tree_hash: absent.clone(), parents: Vec::new(), actions: Vec::new(), description: None },
+        );
+        let parcel = object.hash.clone();
+        object.store().unwrap();
+        append(&[(SealOp::Record, &parcel)]).unwrap();
+        let unsealed = unseal(&hold(), &[parcel.clone()]).unwrap();
+        assert!(unsealed.removed.is_empty() && unsealed.pushed_down.is_empty(), "{:?}", unsealed);
+        assert!(unsealed.kept[0].1.contains("parcel"), "{:?}", unsealed);
+        assert!(read_sealed().unwrap().contains(&parcel));
+
+        // Present, walkable, and not recorded.
+        let unrecorded = store_tree(&[]);
+        let unsealed = unseal(&hold(), &[unrecorded]).unwrap();
+        assert_eq!(unsealed, Unsealed::default());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A walk that fails counts nothing it went through as checked: a later object reaching the
+    /// same subtree walks it again. The first tree reaches `shared` and then fails at `z-broken`
+    /// before descending `shared`'s present child; the second reaches `shared` too. Mutation: mark
+    /// a failed walk's trees closed → the second walk skips `shared` → the absence beneath it is
+    /// not recorded → red.
+    #[test]
+    fn a_failed_walk_closes_nothing_for_the_next() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::{store_chunk, store_tree};
+
+        let (root, _scope) = scratch("unseal-closed");
+        let lost = "8".repeat(64);
+        let deep = store_tree(&[("lost.txt", &lost, DirEntryType::Normal)]);
+        let shared = store_tree(&[("deep", &deep, DirEntryType::Tree)]);
+        let chunk = store_chunk(b"not a tree either");
+        let first = store_tree(&[("shared", &shared, DirEntryType::Tree), ("z-broken", &chunk, DirEntryType::Tree)]);
+        let second = store_tree(&[("shared", &shared, DirEntryType::Tree), ("other", &store_tree(&[]), DirEntryType::Tree)]);
+        append(&[(SealOp::Record, &first), (SealOp::Record, &second)]).unwrap();
+
+        let unsealed = unseal(&hold(), &[first.clone(), second.clone()]).unwrap();
+        assert_eq!(unsealed.removed, vec![second]);
+        assert_eq!(unsealed.pushed_down, vec![lost]);
+        assert_eq!(unsealed.kept.len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

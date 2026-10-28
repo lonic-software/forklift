@@ -907,7 +907,9 @@ exactly what was re-hashed, presence-checked, and sealed.
 A warehouse can also hold an object **by hash alone**, named in its sealed-object record, when a
 parent that is present names it and the remote holds it. Audit tolerates such an object when it
 is absent, checks nothing beneath it, and reports how many it held (`held_by_hash` under `--json`);
-a recorded object that is present is checked like any other. `--full` cannot re-assemble a large
+a recorded object that is present is checked like any other. Audit also counts the objects
+the record still names that are on disk again (`present_and_recorded`): that fails nothing, and
+`forklift heal` removes the records it can. `--full` cannot re-assemble a large
 file one of whose chunks is held this way, so it re-reads that file's present chunks instead. A
 sealed-object record this version cannot read, or one with damage that an interrupted last write
 could not have left, fails the audit rather than being taken as empty.
@@ -2181,6 +2183,17 @@ the file to move aside. This appears even when `heal` still has to refuse — as
 clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
 index the refusal itself names (see the bullet above) is part of its cause; the time one coincides
 with a refusal is exactly when an operator most needs to be told about it.
+
+Once nothing is left to resolve, `heal` also removes from the sealed-object record every object
+that is on disk again, such as one fetched back by a refill whose own removal was interrupted. An
+object on disk that is still recorded fails nothing, but were it lost later it would read as held
+by hash rather than as lost. Before removing an object's record, `heal` records every absent
+object beneath it, since the remote that held the object holds those too, so nothing the object
+held by hash is reported missing afterwards. The report lists both (`unsealed` and
+`newly_held_by_hash` under `--json`). An object whose content cannot be walked stays recorded,
+with a `Note:` line naming why; a parcel keeps its record too, and so does every object when the
+record cannot be read. A failure to write the record is reported (`unseal_failed`), and running
+`heal` again retries.
 
 #### Interrupted operations
 
