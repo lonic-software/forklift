@@ -147,11 +147,7 @@ fn plan_from(
     removed_heads: &[String],
     sources: recovery_utils::GcRootSources,
 ) -> Result<PrunePlan, String> {
-    let sealed = sealed_utils::read_sealed().map_err(|error| format!(
-        "{}. Make it readable again, restoring it from a good copy or, if another version of \
-        Forklift wrote it, using that version; then run the prune again.",
-        error.trim_end_matches('.')
-    ))?;
+    let sealed = sealed_utils::read_sealed().map_err(|error| format!("{} Then run the prune again.", error))?;
     let (live_parcels, meta_parcels) = reachable_parcels()?;
     // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
     // recorded head, which no ref need still reach.
@@ -2170,6 +2166,7 @@ mod tests {
         let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) else {
             panic!("an unreadable record must fail the plan");
         };
-        assert!(error.contains("sealed-object record") && error.contains(". Make it readable again"), "{}", error);
+        assert!(error.contains("sealed-object record") && error.contains("Run \"forklift heal\"")
+            && error.ends_with("Then run the prune again."), "{}", error);
     }
 }
