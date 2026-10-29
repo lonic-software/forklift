@@ -9343,6 +9343,50 @@ mod tests {
         assert!(candidates.contains(&plain), "the plain sibling still negotiates as a blob");
     }
 
+    /// A cache's lift walk skips a tree or recipe the record holds absent: no candidate, no read.
+    /// A recorded tree that is present seals nothing and is walked, and an absent one the record
+    /// does not name fails the walk rather than being guessed at.
+    ///
+    /// Revert: judge a recorded entry by the record alone → the present recorded tree is skipped;
+    /// skip only trees → the walk reads the absent recipe and fails.
+    #[test]
+    fn the_lift_walk_skips_only_what_the_record_holds_absent() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked, Tree};
+        use crate::util::sealed_utils::{self, SealOp};
+
+        let _scratch = Scratch::new("closure-recorded");
+
+        let (absent_tree, absent_recipe) = ("a".repeat(64), "b".repeat(64));
+        let plain = store_blob("held");
+        let held = store_tree(&[("plain.txt", &plain, Normal)]);
+        let root = store_tree(&[
+            ("gone", &absent_tree, Tree),
+            ("big.bin", &absent_recipe, NormalChunked),
+            ("held", &held, Tree),
+        ]);
+
+        let mut bytes = sealed_utils::header_bytes();
+        for hash in [&absent_tree, &absent_recipe, &held] {
+            bytes.extend(sealed_utils::encode_frame(SealOp::Record, hash).unwrap());
+        }
+        let recorded = sealed_utils::parse(&bytes).unwrap().set;
+
+        let walk = |recorded: Option<&sealed_utils::SealedSet>| {
+            let mut seen_trees = HashSet::new();
+            let mut seen_blobs = HashSet::new();
+            let mut seen_recipes = HashSet::new();
+            let mut candidates = Vec::new();
+            collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
+                                    &mut seen_recipes, &mut candidates, recorded, true)
+                .map(|()| candidates)
+        };
+
+        let candidates = walk(Some(&recorded)).expect("the walk reads nothing the record holds absent");
+        assert_eq!(candidates, vec![root.clone(), held.clone(), plain.clone()]);
+
+        walk(None).expect_err("an absent object the record does not name fails the walk");
+    }
+
     /// Plant a blob above the whole-object ceiling directly, bypassing `LooseObject::store`'s
     /// write-side ceiling with a raw, non-durable write. The only way such an object can exist
     /// locally is if it predates the ceiling — mirrors the grandfathered-giant fixture
