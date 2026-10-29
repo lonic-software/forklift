@@ -4301,10 +4301,10 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         Err(e) => Err(format!("Error while removing {} \"{}\": {}", what, path.to_string_lossy(), e)),
     };
 
+    // A moved signature counts once its table is durable, even if its file was already gone.
     for path in moved {
-        if remove(path, "signature sidecar")? {
-            stats.signatures_moved += 1;
-        }
+        remove(path, "signature sidecar")?;
+        stats.signatures_moved += 1;
     }
 
     for path in leftovers {

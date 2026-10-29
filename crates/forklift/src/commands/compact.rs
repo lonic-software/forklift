@@ -191,13 +191,13 @@ impl Compacted {
         let plural = |count: usize| if count == 1 { "" } else { "s" };
         if self.signatures_moved > 0 {
             println!(
-                "Moved {} signature{} into {} signature table{}.",
+                "Moved {} signature{} into signature tables.",
                 self.signatures_moved, plural(self.signatures_moved),
-                self.signature_tables_written, plural(self.signature_tables_written),
             );
-        } else if self.signature_tables_written > 0 {
+        }
+        if self.signature_tables_written > 0 {
             println!(
-                "Rewrote {} signature table{}.",
+                "Wrote {} signature table{}.",
                 self.signature_tables_written, plural(self.signature_tables_written),
             );
         }
