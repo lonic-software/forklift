@@ -165,8 +165,9 @@ fn serve(requests: mpsc::Receiver<Request>) {
 
 /// Fetch `hashes` from `remote`, sending each object to `reply`: in batches of at most what a head
 /// answers while the origin serves them and more than one is left, then each of the rest on its
-/// own. An origin that cannot be reached ends it at once, so a reading thread offline learns so
-/// from one failed request, not one per object.
+/// own. A failed batch ends the batches, and an origin that cannot be reached ends the rest, so a
+/// reading thread offline learns so from a batch and the first fetches on their own, not one
+/// request per object.
 async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, reply: &mpsc::SyncSender<Reply>) -> Fetched {
     let sent: Arc<Mutex<HashSet<String>>> = Default::default();
     let stopped = Arc::new(AtomicBool::new(false));
@@ -197,11 +198,15 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
             // A remote cut at its byte budget sent what fit: ask again for the rest, while it
             // sends something.
             Ok(BatchOutcome::Partial(_)) if left.len() < before => pending.splice(0..0, left).for_each(drop),
-            // What this batch did not bring is fetched on its own below, and the next batch is
-            // still asked for while the lane is open: every outcome but these two closed it. An
-            // error says nothing this side can classify; a fetch on its own says whether the
-            // origin can be reached.
-            Ok(_) | Err(_) => loose.extend(left),
+            // What this batch did not bring is fetched on its own below; the next batch is asked
+            // for only if this outcome left the lane open.
+            Ok(_) => loose.extend(left),
+            // An error says nothing this side can classify, and may be the origin out of reach:
+            // everything left is fetched on its own, whose first fetch says which.
+            Err(_) => {
+                loose.extend(left);
+                break;
+            }
         }
     }
 

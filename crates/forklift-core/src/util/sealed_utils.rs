@@ -815,25 +815,15 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
 /// # Arguments
 /// * `_hold`   - The caller's store-access hold, spanning the call, so nothing the push-down found
 ///               present is deleted before the objects land above it.
-/// * `objects` - Each recorded object's hash and its bytes, as the remote sent them: verified
-///               against the hash here.
+/// * `objects` - Each recorded object's hash and its bytes, as the remote sent them, each already
+///               verified against its hash by the caller.
 ///
 /// # Returns
 /// * `Ok(())`      - Every object is in the store and the record holds none of them.
-/// * `Err(String)` - If some bytes are not their object's or do not parse, a present object
-///                   beneath one cannot be walked, or as [`append_locked`]. Before the store,
-///                   nothing but push-down records may have been written.
-pub fn refill_all(hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]) -> Result<(), String> {
-    for (hash, bytes) in objects {
-        object_utils::verify_object_bytes(hash, bytes)?;
-    }
-
-    refill_verified(hold, objects)
-}
-
-/// [`refill_all`] of `objects` the caller has already verified against their hashes, one by one as
-/// they arrived.
-pub(crate) fn refill_verified(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]) -> Result<(), String> {
+/// * `Err(String)` - If some bytes do not parse, a present object beneath one cannot be walked,
+///                   or as [`append_locked`]. Before the store, nothing but push-down records may
+///                   have been written.
+pub(crate) fn refill_all(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]) -> Result<(), String> {
     // A tree or recipe child has a closure to walk when present; a leaf (an unchunked file, a
     // chunk, a parcel's parent) is only looked for, never read.
     let mut walked: Vec<String> = Vec::new();

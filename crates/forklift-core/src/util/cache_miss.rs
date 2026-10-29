@@ -314,7 +314,7 @@ impl Group {
         let hold = StoreAccessLock::try_shared()?;
         let refs: Vec<(&str, &[u8])> = objects.iter().map(|(hash, bytes)| (hash.as_str(), bytes.as_slice())).collect();
 
-        sealed_utils::refill_verified(&hold, &refs).map_err(|why| format!(
+        sealed_utils::refill_all(&hold, &refs).map_err(|why| format!(
             "Could not store {}, fetched from the origin: {}", describe_held(&objects), why
         ))
     }
