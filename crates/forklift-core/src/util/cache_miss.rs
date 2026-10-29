@@ -269,16 +269,15 @@ mod tests {
         assert!(refill_with(Some(&hook), &fixture.root).unwrap(), "out of both, it is fetched");
     }
 
-    // Revert: refuse while any thread holds the ref lock → the read refuses instead of waiting out
-    // another thread's hold, which lasts until the hook is asked.
+    // Revert: refuse while any thread holds the ref lock → the read refuses, though the other
+    // thread's hold lasts until the hook is asked.
     #[test]
-    fn another_threads_ref_lock_is_waited_out() {
+    fn another_threads_ref_lock_does_not_stop_a_fetch() {
         let fixture = fixture("held-elsewhere");
         let bytes = fixture.bytes.clone();
         let (release, released) = std::sync::mpsc::channel::<()>();
-        let release = std::sync::Mutex::new(release);
         let (hook, calls) = hook(move || {
-            let _ = release.lock().unwrap().send(());
+            let _ = release.send(());
             Fetched::Bytes(bytes.clone())
         });
 
@@ -295,7 +294,7 @@ mod tests {
         let refilled = refill_with(Some(&hook), &fixture.root);
         holder.join().unwrap();
 
-        assert!(refilled.unwrap(), "the refill waits for the other thread's hold to end");
+        assert!(refilled.unwrap(), "another thread's hold does not stop the fetch");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_recorded(&[&fixture.web]);
     }

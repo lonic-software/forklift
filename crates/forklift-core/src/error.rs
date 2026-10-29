@@ -382,16 +382,9 @@ impl From<String> for CoreError {
 
         // A frame a caller wrapped (`format!("Could not …: {}", e)`) claims no code: text from a
         // remote or off disk can hold a frame too, and only a frame that starts the string is
-        // known to be this process's. It is rendered readable, its next step folded in.
-        // The frame's own fields were sanitized when it was built; the caller's text keeps its
-        // lines, and what it wrote after a frame's detail is kept after the next step.
-        if let Some(at) = message.find(REFUSAL_PREFIX) {
-            let mut fields = message[at + REFUSAL_PREFIX.len()..].splitn(4, REFUSAL_FIELD_SEPARATOR);
-
-            if let (Some(_code), Some(human), Some(next_step)) = (fields.next(), fields.next(), fields.next()) {
-                let after = fields.next().map(after_detail).unwrap_or_default();
-                return CoreError::Other(format!("{}{}{}", &message[..at], with_next_step(human, next_step), after));
-            }
+        // known to be this process's. Each one is rendered readable, its next step folded in.
+        if let Some(rendered) = render_wrapped_frames(&message) {
+            return CoreError::Other(rendered);
         }
 
         CoreError::Other(message)
@@ -453,6 +446,42 @@ pub fn prefix_message(context: &str, error: String) -> String {
         }.into(),
         CoreError::Other(message) => format!("{}: {}", context, message),
     }
+}
+
+/// `message` with every frame inside it rendered as its message and next step, or `None` when it
+/// holds none. A frame runs to the next frame's prefix; what the caller wrote around it keeps its
+/// lines (a frame's own fields were sanitized when it was built). A prefix whose code is not a
+/// code word is not a frame, and is left as it is.
+fn render_wrapped_frames(message: &str) -> Option<String> {
+    let mut rendered = String::new();
+    let mut any = false;
+    let mut rest = message;
+
+    while let Some(at) = rest.find(REFUSAL_PREFIX) {
+        rendered.push_str(&rest[..at]);
+
+        let tail = &rest[at + REFUSAL_PREFIX.len()..];
+        let end = tail.find(REFUSAL_PREFIX).unwrap_or(tail.len());
+        let mut fields = tail[..end].splitn(4, REFUSAL_FIELD_SEPARATOR);
+
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(code), Some(human), Some(next_step))
+                if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => {
+                rendered.push_str(&with_next_step(human, next_step));
+                rendered.push_str(fields.next().map(after_detail).unwrap_or_default());
+                any = true;
+            }
+            _ => {
+                rendered.push_str(REFUSAL_PREFIX);
+                rendered.push_str(&tail[..end]);
+            }
+        }
+
+        rest = &tail[end..];
+    }
+
+    rendered.push_str(rest);
+    any.then_some(rendered)
 }
 
 /// What follows a frame's detail field, `text`: the detail is one JSON value, and anything after it
@@ -682,7 +711,8 @@ mod tests {
     // Revert: decode only a frame that starts the string → the wrapped frame's separators reach
     // the message; decode its code too → the wrapped frame claims `cache_miss`; sanitize the
     // whole message → the caller's line break is lost; drop what follows a detail → so is its
-    // closing sentence.
+    // closing sentence; decode only the first frame → the second's words are lost; take any
+    // prefix for a frame → the text that is not one is reshaped.
     #[test]
     fn a_wrapped_frame_reads_as_plain_text_and_claims_no_code() {
         let framed: String = CoreError::refusal(RefusalCode::CacheMiss, "object x is missing", "Wait for it.").into();
@@ -704,6 +734,19 @@ mod tests {
         match CoreError::from(wrapped) {
             CoreError::Other(message) => assert_eq!(message, "Two reads failed:\nobject y is missing Wait. Nothing was written."),
             other => panic!("a wrapped frame claims no code: {:?}", other),
+        }
+
+        // Each of two frames is rendered, and a prefix with no code word before them is left.
+        let first: String = CoreError::refusal(RefusalCode::CacheMiss, "a is missing", "Wait for A.").into();
+        let second: String = CoreError::refusal(RefusalCode::CacheMiss, "b is missing", "Wait for B.").into();
+        let not_a_frame = format!("{}Not A Code{}x{}y", REFUSAL_PREFIX, REFUSAL_FIELD_SEPARATOR, REFUSAL_FIELD_SEPARATOR);
+        let wrapped = format!("Read {} then:\n{}\n{}", not_a_frame, first, second);
+
+        match CoreError::from(wrapped) {
+            CoreError::Other(message) => assert_eq!(
+                message, format!("Read {} then:\na is missing Wait for A.\nb is missing Wait for B.", not_a_frame)
+            ),
+            other => panic!("wrapped frames claim no code: {:?}", other),
         }
     }
 
