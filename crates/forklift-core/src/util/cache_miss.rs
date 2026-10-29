@@ -223,13 +223,13 @@ fn refill_with(hook: Option<&FetchHook>, absent: &[String]) -> Result<bool, Stri
             RefusalCode::CacheMiss,
             format!(
                 "{} not in this cache warehouse, and its origin could not be reached to fetch {}: {}",
-                describe(&still_absent(&wanted)?).is, named.them, CoreError::from(why)
+                describe(&still_absent(&wanted).unwrap_or(wanted.clone())).is, named.them, CoreError::from(why)
             ),
             format!("Run the command again once the origin ({}) can be reached.", origin),
         ).into()),
         Fetched::Failed(why) => return Err(format!(
             "{} not in this cache warehouse, and fetching {} from the origin failed: {}",
-            describe(&still_absent(&wanted)?).is, named.them, why
+            describe(&still_absent(&wanted).unwrap_or(wanted.clone())).is, named.them, why
         )),
     }
 
@@ -279,8 +279,15 @@ struct Group {
 }
 
 impl Group {
-    /// Gather one object, storing the group once it is full.
+    /// Gather one object, storing the group once it is full. Bytes that are not the object are
+    /// refused on arrival, after storing what was gathered before them, so one bad object loses
+    /// none of the good ones.
     fn add(&mut self, hash: String, bytes: Vec<u8>) -> Result<(), String> {
+        if let Err(why) = object_utils::verify_object_bytes(&hash, &bytes) {
+            self.flush()?;
+            return Err(format!("The origin sent object {} corrupt: {}", hash, why));
+        }
+
         self.bytes += bytes.len();
         self.objects.push((hash, bytes));
 
@@ -624,5 +631,22 @@ mod tests {
         ensure_with(Some(&hook), [fixture.root.as_str()]).unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Revert: verify only when the group is stored → the good root is lost with the bad `web`.
+    #[test]
+    fn a_corrupt_object_in_a_batch_keeps_the_ones_before_it() {
+        let fixture = fixture("corrupt-batch");
+        sealed_utils::append(&[(SealOp::Record, &fixture.web)]).unwrap();
+        let (hook, _) = sending(vec![
+            (fixture.root.clone(), fixture.bytes.clone()),
+            (fixture.web.clone(), fixture.bytes.clone()),
+        ], || Fetched::Done);
+
+        let failed = ensure_with(Some(&hook), [fixture.root.as_str(), fixture.web.as_str()]).unwrap_err();
+
+        assert!(failed.contains("corrupt") && failed.contains(&fixture.web), "{}", failed);
+        assert!(held(&fixture.root) && !held(&fixture.web));
+        assert_recorded(&[&fixture.web]);
     }
 }

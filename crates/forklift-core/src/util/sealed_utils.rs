@@ -798,12 +798,6 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
     Ok(Unsealed { removed, pushed_down, kept })
 }
 
-/// Store `bytes`, fetched for the recorded object `hash`, and remove its record: [`refill_all`]
-/// of the one object.
-pub fn refill(hold: &impl StoreAccessHold, hash: &str, bytes: &[u8]) -> Result<(), String> {
-    refill_all(hold, &[(hash, bytes)])
-}
-
 /// Store `objects`, each the bytes fetched for a recorded object, and remove their records,
 /// pushing their coverage down first as [`unseal`] does: every absent object their closures reach
 /// is recorded, in one synced append, before any of them is stored, and the removals are appended

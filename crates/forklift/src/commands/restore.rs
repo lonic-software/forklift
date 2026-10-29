@@ -123,8 +123,6 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
         ));
     }
 
-    cache_miss::ensure_files_present([(item.hash.as_str(), item.item_type)])?;
-
     // Recording only stat data keeps the rollups (see `ShardMutationBatch`).
     let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
 
@@ -309,6 +307,9 @@ fn restore_entry(parent_key: &str, item: &InventoryItem) -> Result<Restored, Str
         }
     }
 
+    // A directory's restore fetched every file's content already (`ensure_directory_present`); a
+    // single file's is fetched only once it is known to need rewriting.
+    cache_miss::ensure_files_present([(item.hash.as_str(), item.item_type)])?;
     shift_utils::write_tracked_file(&file_path, &item.hash, item.item_type, false)?;
 
     // Anchored and statted right after the write: a file statted later would record an editor's

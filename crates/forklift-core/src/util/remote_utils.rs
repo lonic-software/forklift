@@ -3645,13 +3645,15 @@ impl RemoteClient {
             return Err(self.error_of(response, "the batch fetch").await);
         }
 
-        let admission = bundle_utils::StreamAdmission::Requested(requested);
         let action = "reading the batch response";
         let stats = match read {
-            BatchRead::Import => self.import_response(response, action, body_posture, admission).await?,
+            BatchRead::Import => {
+                let admission = bundle_utils::StreamAdmission::Requested(requested);
+                self.import_response(response, action, body_posture, admission).await?
+            }
             BatchRead::Deliver(deliver) => bundle_utils::ImportStats {
                 stored_objects: self.read_response(response, action, body_posture, move |body| {
-                    bundle_utils::read_streamed_bundle(body, admission, deliver)
+                    bundle_utils::read_streamed_bundle(body, requested, deliver)
                 }).await?,
                 ..Default::default()
             },

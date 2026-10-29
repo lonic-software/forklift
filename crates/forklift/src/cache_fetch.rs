@@ -9,8 +9,10 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use forklift_core::enums::config_scope::ConfigScope;
+use forklift_core::model::remote::MAX_MISSING_BATCH;
 use forklift_core::util::cache_miss::{self, Deliver, Fetched};
 use forklift_core::util::config_utils;
 use forklift_core::util::remote_utils::{BatchOutcome, ObjectFetch, RemoteClient, TorMode, TorSettings};
@@ -18,8 +20,10 @@ use forklift_core::util::remote_utils::{BatchOutcome, ObjectFetch, RemoteClient,
 /// How many objects are fetched on their own at once.
 const LOOSE_FETCHES: usize = 8;
 
-/// How many fetched objects wait for the reading thread before the fetch does.
-const QUEUED_OBJECTS: usize = 16;
+/// How many fetched objects wait for the reading thread before the fetch does. An object may be
+/// as large as the store admits, so this is kept small: what the fetch holds beyond the reading
+/// thread's group is these, plus the one being read.
+const QUEUED_OBJECTS: usize = 2;
 
 /// One fetch, sent to the fetch thread.
 struct Request {
@@ -158,37 +162,55 @@ fn serve(requests: mpsc::Receiver<Request>) {
     }
 }
 
-/// Fetch `hashes` from `remote`, sending each object to `reply`: in batches while the origin
-/// serves them and more than one is left, then each of the rest on its own. An origin that cannot
-/// be reached ends it at once, so a reading thread offline learns so from one failed request, not
-/// one per object.
+/// Fetch `hashes` from `remote`, sending each object to `reply`: in batches of at most what a head
+/// answers while the origin serves them and more than one is left, then each of the rest on its
+/// own. An origin that cannot be reached ends it at once, so a reading thread offline learns so
+/// from one failed request, not one per object.
 async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, reply: &mpsc::SyncSender<Reply>) -> Fetched {
     let sent: Arc<Mutex<HashSet<String>>> = Default::default();
-    let mut left = hashes;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let mut pending = hashes;
+    let mut loose: Vec<String> = Vec::new();
 
-    while left.len() > 1 && remote.batch_lane_open() {
-        let (to, sent_here) = (reply.clone(), sent.clone());
+    while pending.len() > 1 && remote.batch_lane_open() {
+        let rest = pending.split_off(pending.len().min(MAX_MISSING_BATCH));
+        let batch = std::mem::replace(&mut pending, rest);
+        let (to, sent_here, stopped_here) = (reply.clone(), sent.clone(), stopped.clone());
 
-        let outcome = remote.fetch_batch_delivering(&left, move |hash, bytes| {
+        let outcome = remote.fetch_batch_delivering(&batch, move |hash, bytes| {
             sent_here.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(hash.clone());
-            to.send(Reply::Object(hash, bytes)).map_err(|_| "the read stopped taking objects".to_string())
+            to.send(Reply::Object(hash, bytes)).map_err(|_| {
+                stopped_here.store(true, Ordering::SeqCst);
+                "the read stopped taking objects".to_string()
+            })
         }).await;
 
-        let before = left.len();
-        left = unsent(left, &sent);
+        if stopped.load(Ordering::SeqCst) {
+            return Fetched::Failed("the read stopped taking objects".to_string());
+        }
+
+        let before = batch.len();
+        let left = unsent(batch, &sent);
 
         match outcome {
             // A remote cut at its byte budget sent what fit: ask again for the rest, while it
             // sends something.
-            Ok(BatchOutcome::Partial(_)) if left.len() < before => continue,
+            Ok(BatchOutcome::Partial(_)) if left.len() < before => pending.splice(0..0, left).for_each(drop),
+            // What a whole answer lacked, the origin may still serve on its own.
+            Ok(BatchOutcome::Imported(_)) => loose.extend(left),
             // An error says nothing this side can classify: each fetch on its own below says
-            // whether the origin can be reached, at its first.
-            Ok(_) | Err(_) => break,
+            // whether the origin can be reached, at its first. Every other outcome closed the lane.
+            Ok(_) | Err(_) => {
+                loose.extend(left);
+                break;
+            }
         }
     }
 
+    loose.append(&mut pending);
+
     let mut fetches = tokio::task::JoinSet::new();
-    let mut left = left.into_iter();
+    let mut left = loose.into_iter();
 
     loop {
         while fetches.len() < LOOSE_FETCHES {

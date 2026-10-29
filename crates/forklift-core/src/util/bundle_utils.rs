@@ -1143,8 +1143,10 @@ pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R,
     import_record_stream(reader, Admitter::new(admission))
 }
 
-/// Read a streamed partial bundle as [`import_streamed_bundle`] does, handing each admitted
-/// record's hash and bytes to `deliver` instead of storing it. The bytes are unverified: the
+/// Read a streamed bundle answering a request for `requested` (see [`StreamAdmission::Requested`])
+/// as [`import_streamed_bundle`] does, handing each record's hash and bytes to `deliver` instead
+/// of storing it. Only a requested-hash answer is read this way: a closure's admission reads the
+/// trees it admitted back from the store, which delivered records never reach. The bytes are unverified: the
 /// receiver checks them against the hash before it keeps them. Every record is buffered whole,
 /// up to [`object_utils::MAX_OBJECT_BYTES`].
 ///
@@ -1152,7 +1154,7 @@ pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R,
 /// * `Ok(usize)`   - How many records were delivered.
 /// * `Err(String)` - As [`import_streamed_bundle`], or `deliver`'s error, which stops the read.
 pub fn read_streamed_bundle<R: std::io::BufRead>(mut reader: R,
-                                                 admission: StreamAdmission,
+                                                 requested: HashSet<String>,
                                                  mut deliver: impl FnMut(String, Vec<u8>) -> Result<(), String>)
                                                  -> Result<usize, String> {
     let header = read_bundle_header(&mut reader)?;
@@ -1164,7 +1166,7 @@ pub fn read_streamed_bundle<R: std::io::BufRead>(mut reader: R,
         ));
     }
 
-    let stats = read_record_stream(reader, Admitter::new(admission), |hash, mut payload, length| {
+    let stats = read_record_stream(reader, Admitter::new(StreamAdmission::Requested(requested)), |hash, mut payload, length| {
         deliver(hash.to_string(), read_exact_payload(&mut payload, length)?)?;
         Ok(true)
     })?;
