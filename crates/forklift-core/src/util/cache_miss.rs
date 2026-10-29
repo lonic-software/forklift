@@ -302,16 +302,21 @@ mod tests {
         assert_recorded(&[&fixture.root]);
     }
 
-    // Revert: skip the verification → the wrong bytes are stored under the root's hash (and the
-    // record loses it).
+    // Revert: skip the verification → the push-down records the other tree's absent blob before
+    // the store refuses the bytes.
     #[test]
     fn bytes_that_are_not_the_object_are_refused_and_nothing_written() {
         let fixture = fixture("corrupt");
-        let (hook, _) = hook(|| Fetched::Bytes(b"blob 1\0x".to_vec()));
+        let lost = blob("z");
+        let other = tree(&[("z", &lost, DirEntryType::Normal)]);
+        let bytes = file_utils::retrieve_object_by_hash_uncached(&other).unwrap();
+        remove(&other);
+        remove(&lost);
+        let (hook, _) = hook(move || Fetched::Bytes(bytes.clone()));
 
         let refused = refill_with(Some(&hook), &fixture.root).unwrap_err();
-        assert!(refused.contains("corrupt"), "{}", refused);
-        assert!(!held(&fixture.root));
         assert_recorded(&[&fixture.root]);
+        assert!(!held(&fixture.root));
+        assert!(refused.contains("corrupt"), "{}", refused);
     }
 }

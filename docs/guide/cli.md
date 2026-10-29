@@ -1627,8 +1627,12 @@ offline as in a full franchise, but content only for the head a bay checks out: 
 a `lower` of the bay's own pallet and a `lift` that merges a diverged remote fetch that head's
 files whole. Every other file stays with the remote, recorded by hash (`audit` counts them as
 held by hash): an older parcel's, and the head's of a pallet `lower <pallet>` moves without
-checking it out. Reading content a cache lacks (such as `shift` to a pallet lowered that way) is
-not built yet: such a read fails rather than fetching it.
+checking it out. A command that reads content the cache lacks (`show` or `diff` of an older
+parcel, `shift` to a pallet lowered that way) fetches each object it meets from the origin as it
+reads it, and keeps it. The configured remote must be the origin. When the origin cannot be
+reached, the command refuses with exit 36 (`cache_miss`) and names the origin: run it again once
+the origin is back. A read-only command changes nothing when it refuses; one that changes the bay,
+such as `shift`, can refuse partway through with part of its change made.
 
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`
 tips the same densify suggestion `import-git` does: those packs are the far end's own bulk
