@@ -209,9 +209,9 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     // Path-pruned in a sparse warehouse (out-of-scope content stays sealed), whole in a full one
     // — a full fetch scope makes this byte-identical to the unscoped fetch — and in a cache only
-    // the parcels, whose content it records; the head's own is fetched below, once this lower is
-    // known to be checked out here or by a refusal's next step. The office and meta pallets synced above keep routing through the
-    // unscoped fetch, since their audit reads full content.
+    // the parcels, whose content it records; the head's own is fetched below, once the head is
+    // known to be checked out here or by a refusal's next step. The office and meta pallets
+    // synced above keep routing through the unscoped fetch, since their audit reads full content.
     let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, progress).await?;
     report.fetched_objects = stats.fetched_objects;
     report.fetched_signatures = stats.fetched_signatures;

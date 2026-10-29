@@ -5791,10 +5791,9 @@ fn a_dirty_cache_lift_fetches_the_diverged_heads_content() {
 
 /// A content fetch that fails partway has stored its root and some trees but not what lies below
 /// them. Before it returns the error it records those absences, so the closure is whole up to the
-/// record and the warehouse audits clean.
+/// record. No ref moved, so the closing audit only shows the failure left nothing else behind.
 ///
-/// Revert: return the fill's error without recording → the missing file is not recorded, and
-/// `audit` finds the root's closure incomplete.
+/// Revert: return the fill's error without recording → the missing file is not recorded.
 #[test]
 fn a_failed_cache_fill_records_what_it_left_absent() {
     let area = TestArea::new("cache-fill-fails");
