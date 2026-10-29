@@ -1621,8 +1621,13 @@ history reaches, whose remote holds the rest. Like a sparse franchise, it skips 
 records its origin (see the origin-only lift rule under `lift`), is never served, and refuses
 `mirror`; `expand` refuses too, since its scope is already the whole tree. `audit` checks the
 content it holds and says the pass is a cache's. Commands that act on a sparse franchise's
-*scope* (scoped bays, `query`'s scope report) do not apply to a cache. It cannot be combined with `--only`. A
-cache does not yet fetch less than a full franchise: that is still being built.
+*scope* (scoped bays, `query`'s scope report) do not apply to a cache. It cannot be combined with `--only`.
+A cache fetches every parcel and signature of the history, so ancestry and signatures check
+offline as in a full franchise, but content only for the head it checks out: `franchise`,
+`lower` and a `lift` that merges a diverged remote fetch that head's files whole, and the files
+of every older parcel stay with the remote, recorded by hash (`audit` counts them as held by
+hash). Reading content a cache lacks (an old parcel's files) is not built yet: such a read fails
+rather than fetching it.
 
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`
 tips the same densify suggestion `import-git` does: those packs are the far end's own bulk

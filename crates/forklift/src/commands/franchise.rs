@@ -579,7 +579,8 @@ async fn franchise_into_prepared_target(
 
     // The pallet's history is fetched and verified against the anchor the remote serves before
     // that anchor, its office or a meta pallet is installed, so a refusal leaves no trust behind.
-    // At the scope this franchise asks for, which is not on disk yet.
+    // At the scope this franchise asks for, which is not on disk yet. A cache fetches the head's own
+    // content, which it checks out, and records the root of every older parcel.
     let fetched = match &remote_head {
         Some(remote_head) => {
             let stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, HeadContent::Whole, &Progress::NONE).await?;

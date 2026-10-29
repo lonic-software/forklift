@@ -5662,6 +5662,35 @@ fn a_cache_fetch_records_before_it_returns() {
     assert_eq!(pallet_head(&area, "cached", "main"), old_head, "the fetch moves no ref");
 }
 
+/// A lift from a cache onto a diverged remote auto-merges: the merge reads the remote head's tree,
+/// so the fetch before it brings that head's whole closure, and the merged parcel lifts.
+///
+/// Revert: the auto-merge's fetch as `Recorded` → the merge cannot read the remote's tree.
+#[test]
+fn a_cache_lift_auto_merges_a_diverged_remote() {
+    let area = TestArea::new("cache-auto-merge");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    let lifted = area.forklift("cached", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
+    assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
+
+    let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
+    assert!(closure_present(&area, "cached", &their_root), "the merged-in head's closure is held");
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
 #[test]
 fn lift_and_franchise_round_trip_a_chunked_file() {
     // Chunk transport, end to end (§9.4b Stage 3). A chunk-aware server advertises `chunking` on
